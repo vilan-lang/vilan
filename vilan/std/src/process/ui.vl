@@ -1,0 +1,295 @@
+// `std::ui` for `@process` — the server (SSR) view layer (proposal/ssr.md, A7).
+// The exact public surface of the browser `std::ui`, but building an HTML
+// STRING TREE instead of live DOM. A route handler calls the app's own
+// view-building code — the same component functions the client runs — against
+// this layer, `render(view)` serializes the tree to markup, and the handler
+// splices it into its HTML shell. Create-serialize-discard: no effects, no
+// subscriptions, no owner survives the request.
+//
+// READ-ONCE BINDINGS: `bind_text`/`bind_attr`/`bind_class`/`bind_value` embed
+// the signal's value AT RENDER TIME — no subscription is created (the value
+// served is the value the data had). `bind_each` renders the current list;
+// `when`/`swap` render the taken branch. Event and draft binders ACCEPT AND
+// DISCARD: a server-rendered `<button>` is just a button — its handler is
+// client business.
+//
+// OMITTED (proposal/ssr.md §2, §6a): `mount`/`mount_root` do not exist here — a
+// component that mounts is a client entry, not a renderable view; the natural
+// factoring is a shared `fun app(): View` and a per-leg `main`.
+// `std::dom` stays browser-only; a component importing it fails a process build
+// at the `import` with the standard cross-platform error — the correct boundary.
+//
+// Only available when building for a process platform (node).
+
+import pkg::reactive::{ Signal, Owner, owner_scope, run_with_owner, turn_scope, Draft };
+import pkg::shared::Shared;
+import pkg::style::Style;
+import pkg::compare::PartialEq;
+
+/// One attribute in an element's ordered attribute list. Ordering is INSERTION
+/// ORDER — the component wrote them in code order — so serialization is
+/// deterministic by construction (the differential relies on it).
+struct Attribute {
+	name: str,
+	value: str,
+}
+
+/// A node under construction: an HTML element as a string tree. `View` carries
+/// no owner — nothing survives the request — and its mutable parts are `Shared`,
+/// so a `View` is a REFERENCE (like the browser's `Element`): chaining and
+/// passing it share the one node rather than snapshotting it.
+struct View {
+	tag: str,
+	attributes: Shared<List<Attribute>>,
+	children: Shared<List<View>>,
+	text: Shared<str>,
+}
+
+/// A fresh element of the given tag (`view("div")`, `view("button")`, …).
+fun view(tag: str): View {
+	View {
+		tag,
+		attributes = Shared::new([]),
+		children = Shared::new([]),
+		text = Shared::new(""),
+	}
+}
+
+/// Set-or-replace an attribute BY NAME, in place — mirrors the DOM's
+/// `setAttribute`/`className`: a repeated name updates its value and keeps its
+/// position; a new name appends. This is what makes attribute order insertion
+/// order.
+fun set_attribute(attributes: Shared<List<Attribute>>, name: str, value: str) {
+	mut updated: List<Attribute> = [];
+	mut found = false;
+	for attribute in attributes.read() {
+		if attribute.name == name {
+			updated.push(Attribute { name, value });
+			found = true;
+		} else {
+			updated.push(attribute);
+		}
+	}
+	if !found {
+		updated.push(Attribute { name, value });
+	}
+	attributes.write() = updated;
+}
+
+impl View {
+	/// Static text content. Like the DOM's `textContent`, this REPLACES any
+	/// children the node had.
+	fun text(self, content: str): View {
+		self.text.write() = content;
+		self.children.write() = [];
+		self
+	}
+
+	/// Static CSS class.
+	fun class(self, name: str): View {
+		set_attribute(self.attributes, "class", name);
+		self
+	}
+
+	/// Classes from a compiled `Style` (`class_list` is runtime-legal — the
+	/// rules were emitted when the style was constructed).
+	fun styled(self, style: Style): View {
+		set_attribute(self.attributes, "class", style.class_list());
+		self
+	}
+
+	/// A CSS custom property, read once and folded into the `style` attribute —
+	/// the server end of `width(Length::var("--w"))`. (No subscription: the
+	/// value at render time is the value served.)
+	fun style_var(self, name: str, source: Signal<str>): View {
+		mut current = "";
+		for attribute in self.attributes.read() {
+			if attribute.name == "style" {
+				current = attribute.value;
+			}
+		}
+		let declaration = name + ":" + source.get();
+		let next = if current == "" {
+			declaration
+		} else {
+			current + ";" + declaration
+		};
+		set_attribute(self.attributes, "style", next);
+		self
+	}
+
+	/// A static attribute.
+	fun attr(self, name: str, value: str): View {
+		set_attribute(self.attributes, name, value);
+		self
+	}
+
+	/// An event listener — ACCEPTED AND DISCARDED: a server-rendered element
+	/// carries no handler wiring. Kept in the surface so the same component code
+	/// compiles on both legs; the handler is the client's business.
+	fun on(self, event: str, handler: (|| void) context turn_scope): View {
+		self
+	}
+
+	/// Like `on`, but the handler receives the event. Accepted and discarded the
+	/// same way. The event type is GENERIC (`E`) rather than the browser's
+	/// `std::dom::Event`: a server layer cannot name that browser-only type, and a
+	/// discarded handler never touches the event anyway — so any handler shape is
+	/// accepted. (This is what lets a browser module like `std::router`, whose
+	/// `link` binds an `on_event`, still resolve `std::ui` when the analyzer loads
+	/// it to compute a process build's cross-platform requirements.)
+	fun on_event<E>(self, event: str, handler: (|E| void) context turn_scope): View {
+		self
+	}
+
+	/// Append a child view.
+	fun child(self, child: View): View {
+		self.children.write().push(child);
+		self
+	}
+
+	/// Append several child views.
+	fun children(self, items: List<View>): View {
+		for item in items {
+			self.children.write().push(item);
+		}
+		self
+	}
+
+	/// Reactive text content, READ ONCE: embeds `source`'s current value as
+	/// text. No subscription — nothing to notify at serve time.
+	fun bind_text(self, source: Signal<str>): View {
+		self.text.write() = source.get();
+		self.children.write() = [];
+		self
+	}
+
+	/// Reactive CSS class, read once.
+	fun bind_class(self, source: Signal<str>): View {
+		set_attribute(self.attributes, "class", source.get());
+		self
+	}
+
+	/// Reactive attribute, read once.
+	fun bind_attr(self, name: str, source: Signal<str>): View {
+		set_attribute(self.attributes, name, source.get());
+		self
+	}
+
+	/// A two-way input bind, server side: the input renders with its current
+	/// value. The write-back listener is client business — accepted and dropped.
+	fun bind_value(self, signal: Signal<str>): View {
+		set_attribute(self.attributes, "value", signal.get());
+		self
+	}
+
+	/// A local-first editable field, server side: the input renders with the
+	/// draft's current local value. The input listener is dropped.
+	fun bind_draft(self, draft: Draft<str>): View {
+		set_attribute(self.attributes, "value", draft.local.get());
+		self
+	}
+
+	/// A reactive list, rendered from the CURRENT items — one child per element,
+	/// in order, no reconciliation. Each row runs under a fresh throwaway
+	/// `Owner`: `run_with_owner` establishes the `owner_scope` the injected
+	/// `build` closure declares (the closure LITERAL defers, receiving the scope
+	/// from `run_with_owner`), so this method is self-contained — the caller need
+	/// not establish any boundary. Nothing a row registers survives, so the owner
+	/// is discarded. (`List<T>` is annotated so `get`'s element type resolves —
+	/// the two-parameter-generic inference trap.)
+	fun bind_each<T: PartialEq, K: PartialEq>(
+		self,
+		source: Signal<List<T>>,
+		key: sync |T| K,
+		build: (sync |T| View) context owner_scope,
+	): View {
+		let items: List<T> = source.get();
+		for item in items {
+			let owner = Owner::new();
+			self.children.write().push(run_with_owner(owner, || build(item)));
+		}
+		self
+	}
+
+	/// Conditional content: renders the body when `condition` is currently true,
+	/// nothing when false. Read once — no toggling survives the request. The body
+	/// runs under a throwaway owner, like `bind_each`'s rows.
+	fun when(self, condition: Signal<bool>, body: (sync || View) context owner_scope): View {
+		if condition.get() {
+			let owner = Owner::new();
+			self.children.write().push(run_with_owner(owner, body));
+		}
+		self
+	}
+
+	/// The dynamic-subtree swap, server side: renders the branch for `source`'s
+	/// CURRENT value. Read once — there is no later change to follow.
+	fun swap<T: PartialEq>(self, source: Signal<T>, build: (sync |T| View) context owner_scope): View {
+		let value = source.get();
+		let owner = Owner::new();
+		self.children.write().push(run_with_owner(owner, || build(value)));
+		self
+	}
+
+	/// Show or hide on a condition, read once: a hidden element renders with the
+	/// `hidden` attribute (mirrors the DOM's `element.hidden`).
+	fun show(self, condition: Signal<bool>): View {
+		if !condition.get() {
+			set_attribute(self.attributes, "hidden", "");
+		}
+		self
+	}
+}
+
+/// The HTML void elements: they render `<tag …>` with no closing tag, and
+/// children are illegal — so any children of a void are dropped (a documented
+/// no-op; components don't give voids children).
+fun is_void_element(tag: str): bool {
+	match tag {
+		"area" => true,
+		"base" => true,
+		"br" => true,
+		"col" => true,
+		"embed" => true,
+		"hr" => true,
+		"img" => true,
+		"input" => true,
+		"link" => true,
+		"meta" => true,
+		"source" => true,
+		"track" => true,
+		"wbr" => true,
+		_ => false,
+	}
+}
+
+/// Escape a text node: `&`, `<`, `>` become entities (`&` FIRST so entities
+/// aren't double-escaped). Renders `<script>` inert.
+fun escape_text(value: str): str {
+	value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+}
+
+/// Escape a double-quoted attribute value: `&` and `"` become entities.
+fun escape_attribute(value: str): str {
+	value.replace("&", "&amp;").replace("\"", "&quot;")
+}
+
+/// Serialize a `View` to HTML — the SSR entry point. No pretty-printing:
+/// byte-stable output, attributes in insertion order, proper escaping, void
+/// elements without a closing tag.
+fun render(view: View): str {
+	mut out = "<" + view.tag;
+	for attribute in view.attributes.read() {
+		out = out + " " + attribute.name + "=\"" + escape_attribute(attribute.value) + "\"";
+	}
+	out = out + ">";
+	if is_void_element(view.tag) {
+		ret out;
+	}
+	out = out + escape_text(view.text.read());
+	for child in view.children.read() {
+		out = out + render(child);
+	}
+	out + "</" + view.tag + ">"
+}

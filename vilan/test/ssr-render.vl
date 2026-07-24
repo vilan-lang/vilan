@@ -1,0 +1,39 @@
+import std::print;
+import std::reactive::Signal;
+import std::ui::{ View, render, view };
+
+// Server-side rendering (proposal/ssr.md, A7): on `@process`, `std::ui` builds
+// an HTML string tree and `render` serializes it. The component below is the
+// same shape a browser client would `mount` — the layer system gives each leg
+// its own `std::ui`, so the component code is unannotated and identical.
+
+[derive(PartialEq)]
+enum Page {
+	Home,
+	About,
+}
+
+fun app(title: Signal<str>, todos: Signal<List<str>>, page: Signal<Page>): View {
+	let heading = view("h1").bind_text(title);
+	let list = view("ul").bind_each(todos, |todo| todo, |todo| view("li").text(todo));
+	let nav = view("nav").swap(page, |current| match current {
+		Page::Home => view("a").attr("href", "/").text("Home"),
+		Page::About => view("a").attr("href", "/about").text("About & friends"),
+	});
+	view("main").attr("id", "app").child(heading).child(list).child(nav)
+}
+
+fun main() {
+	let title = Signal::new("Tasks <live>");
+	let todos: Signal<List<str>> = Signal::new(["alpha", "beta & gamma"]);
+	let page = Signal::new(Page::About);
+	// The bindings read once — the value at render time is the value served.
+	print(render(app(title, todos, page)));
+
+	// A hostile string renders inert: escaped as text, never markup.
+	print(render(view("p").text("<script>alert(\"&\")</script>")));
+
+	// A void element renders without a closing tag; its attribute value escapes.
+	print(render(view("img").attr("src", "/logo.png").attr("alt", "a & b")));
+}
+main();

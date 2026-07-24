@@ -24736,3 +24736,377 @@ fn a_genuine_non_function_call_still_reports_its_type() {
         "cannot call this as a function — it is i32",
     );
 }
+
+// --- Server-side rendering: the process-layer `std::ui` (A7, proposal/ssr.md) --
+//
+// On `@process` (the default platform here) `std::ui` builds an HTML string tree
+// and `render` serializes it. Each pin is one binding form rendered to an exact
+// string: attributes in insertion order, escaping in text and attribute values,
+// void elements without a closing tag, read-once bindings, discarded handlers.
+
+#[test]
+fn ssr_renders_static_view_with_ordered_attributes_and_nesting() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("div").class("card").attr("data-id", "7").child(view("p").text("hi"))));
+        }
+        "#,
+        "<div class=\"card\" data-id=\"7\"><p>hi</p></div>\n",
+    );
+}
+
+#[test]
+fn ssr_bind_text_embeds_current_signal_value() {
+    // Read-once: `bind_text` takes `signal.get()` at render time — no subscription.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("h1").bind_text(Signal::new("world"))));
+        }
+        "#,
+        "<h1>world</h1>\n",
+    );
+}
+
+#[test]
+fn ssr_bind_class_and_bind_attr_read_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("a").bind_class(Signal::new("active")).bind_attr("href", Signal::new("/x")).text("go")));
+        }
+        "#,
+        "<a class=\"active\" href=\"/x\">go</a>\n",
+    );
+}
+
+#[test]
+fn ssr_bind_each_renders_current_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let items: Signal<List<str>> = Signal::new(["a", "b", "c"]);
+            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+        }
+        "#,
+        "<ul><li>a</li><li>b</li><li>c</li></ul>\n",
+    );
+}
+
+#[test]
+fn ssr_bind_each_over_empty_list_renders_no_rows() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let items: Signal<List<str>> = Signal::new([]);
+            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+        }
+        "#,
+        "<ul></ul>\n",
+    );
+}
+
+#[test]
+fn ssr_when_renders_the_taken_branch_only() {
+    // Both branches: true renders the body, false renders nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("div").when(Signal::new(true), || view("p").text("shown"))));
+            print(render(view("div").when(Signal::new(false), || view("p").text("shown"))));
+        }
+        "#,
+        "<div><p>shown</p></div>\n<div></div>\n",
+    );
+}
+
+#[test]
+fn ssr_swap_renders_the_current_value_branch() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        [derive(PartialEq)]
+        enum Tab { A, B }
+        fun main() {
+            print(render(view("nav").swap(Signal::new(Tab::B), |t| match t {
+                Tab::A => view("a").text("first"),
+                Tab::B => view("a").text("second"),
+            })));
+        }
+        "#,
+        "<nav><a>second</a></nav>\n",
+    );
+}
+
+#[test]
+fn ssr_show_toggles_the_hidden_attribute() {
+    // `show(true)` renders nothing extra; `show(false)` adds `hidden` (mirrors the
+    // DOM's `element.hidden`).
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("span").show(Signal::new(true))));
+            print(render(view("span").show(Signal::new(false))));
+        }
+        "#,
+        "<span></span>\n<span hidden=\"\"></span>\n",
+    );
+}
+
+#[test]
+fn ssr_style_var_folds_into_the_style_attribute() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("div").style_var("--w", Signal::new("40px")).style_var("--h", Signal::new("10px"))));
+        }
+        "#,
+        "<div style=\"--w:40px;--h:10px\"></div>\n",
+    );
+}
+
+#[test]
+fn ssr_bind_value_renders_the_input_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("input").attr("type", "text").bind_value(Signal::new("hello"))));
+        }
+        "#,
+        "<input type=\"text\" value=\"hello\">\n",
+    );
+}
+
+#[test]
+fn ssr_bind_draft_renders_the_local_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::{ Signal, draft, Draft };
+        import std::option::Option::{ self, Some, None };
+        import std::print;
+        fun main() {
+            let name = draft("initial", |value: str| {
+                let _ignore = value;
+                None
+            });
+            print(render(view("input").bind_draft(name)));
+        }
+        "#,
+        "<input value=\"initial\">\n",
+    );
+}
+
+#[test]
+fn ssr_children_appends_all_views() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("ul").children([view("li").text("x"), view("li").text("y")])));
+        }
+        "#,
+        "<ul><li>x</li><li>y</li></ul>\n",
+    );
+}
+
+#[test]
+fn ssr_escapes_text_nodes() {
+    // A hostile string renders inert: `&`, `<`, `>` become entities. The quote is
+    // NOT escaped in a text node (only attribute values need that).
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("p").text("<script>alert(\"&\")</script>")));
+        }
+        "#,
+        "<p>&lt;script&gt;alert(\"&amp;\")&lt;/script&gt;</p>\n",
+    );
+}
+
+#[test]
+fn ssr_escapes_attribute_values() {
+    // Attribute values escape `&` and `"` (the double-quote delimiter); `<`/`>` are
+    // legal inside a quoted attribute and stay literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("a").attr("title", "a \"b\" & <c>")));
+        }
+        "#,
+        "<a title=\"a &quot;b&quot; &amp; <c>\"></a>\n",
+    );
+}
+
+#[test]
+fn ssr_void_elements_have_no_closing_tag() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("br")));
+            print(render(view("img").attr("src", "/x.png")));
+            print(render(view("hr")));
+        }
+        "#,
+        "<br>\n<img src=\"/x.png\">\n<hr>\n",
+    );
+}
+
+#[test]
+fn ssr_void_element_drops_children() {
+    // Children of a void element are illegal HTML — a documented no-op (they are
+    // simply not serialized), not a build error.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("br").child(view("span").text("nope"))));
+        }
+        "#,
+        "<br>\n",
+    );
+}
+
+#[test]
+fn ssr_event_handler_is_discarded_and_never_runs() {
+    // A server-rendered button is just a button: `on` accepts the handler and
+    // drops it. The handler's side effect (a `print`) never fires, so stdout is the
+    // markup alone — an extra line would appear if the closure ran.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("button").text("click me").on("click", || print("HANDLER RAN"))));
+        }
+        "#,
+        "<button>click me</button>\n",
+    );
+}
+
+#[test]
+fn ssr_text_replaces_children() {
+    // `text` mirrors the DOM's `textContent`: it replaces any children the node had.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("div").child(view("span").text("old")).text("new")));
+        }
+        "#,
+        "<div>new</div>\n",
+    );
+}
+
+#[test]
+fn ssr_nested_component_composition() {
+    // A "component" is a function returning a `View`; composition is just calls.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun badge(label: str): View {
+            view("span").class("badge").text(label)
+        }
+        fun main() {
+            print(render(view("div").child(badge("new")).child(badge("hot"))));
+        }
+        "#,
+        "<div><span class=\"badge\">new</span><span class=\"badge\">hot</span></div>\n",
+    );
+}
+
+#[test]
+fn ssr_std_dom_import_fails_on_a_process_build() {
+    // The boundary §2 relies on: a component reaching for raw DOM cannot SSR, and
+    // the existing cross-platform gate says so at the `import` with the standard
+    // error — a process build never resolves `std::dom`.
+    assert_fails_with(
+        r#"
+        import std::dom::{ create_element };
+        import std::print;
+        fun main() {
+            let element = create_element("div");
+            print("built");
+        }
+        "#,
+        "requires the `browser` layer",
+    );
+}
+
+#[test]
+fn ssr_on_event_is_accepted_and_discarded() {
+    // `on_event` mirrors `on`: accepted and dropped. Its event type is generic
+    // (the server layer cannot name the browser-only `std::dom::Event`), so a
+    // handler that ignores the event renders the element and never runs.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("button").text("x").on_event("click", |_event| print("HANDLER RAN"))));
+        }
+        "#,
+        "<button>x</button>\n",
+    );
+}
+
+#[test]
+fn ssr_process_build_can_import_a_browser_module_that_binds_on_event() {
+    // The platform model lets a process program IMPORT a browser module as long
+    // as it never reaches the browser-requiring functions (analysis stays
+    // admissible). `std::router`'s `link` binds `on_event` on a `View`; the
+    // process `ui` must therefore carry `on_event`, or loading `router` to color
+    // the program would fail with "View has no method 'on_event'". `navigate` is
+    // unreached from `main`, so the node build itself stays clean.
+    assert_compiles(
+        r#"
+        import std::router::navigate;
+        import std::print;
+        fun unused() {
+            navigate("/home");
+        }
+        fun main() {
+            print("ok");
+        }
+        "#,
+    );
+}

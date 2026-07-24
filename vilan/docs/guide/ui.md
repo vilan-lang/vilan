@@ -224,6 +224,43 @@ is why there is no unsubscribe code anywhere in a vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
 them where subtrees end.
 
+## Server-side rendering
+
+The same component code runs on the server. On `@process` (a node build)
+`std::ui` builds an HTML **string** instead of live DOM, and `render(view)`
+serializes it — first paint and SEO, before any JavaScript (A7, `proposal/ssr.md`).
+A route handler calls your own `app()` and splices the markup into its HTML shell.
+
+```vilan
+import std::ui::{ view, View, render };
+import std::reactive::Signal;
+import std::print;
+
+fun greeting(name: Signal<str>): View {
+	view("p").class("greeting").bind_text(name)
+}
+
+fun main() {
+	let name = Signal::new("world");
+	print(render(greeting(name)));
+	// <p class="greeting">world</p>
+}
+```
+
+Two rules make one component serve both legs:
+
+- **Bindings read once.** `bind_text`, `bind_attr`, `bind_each`, `when`, and
+  `swap` embed the signal's value *at render time* — no subscription is created,
+  and nothing survives the request (create, serialize, discard). Build pure, bind
+  reactive: a component that leans on effect side-channels at build time renders
+  stale. Text and attribute values are escaped, so a hostile string is inert.
+- **No `mount`/`mount_root` on the server.** Mounting is a client entry, not a
+  renderable view, so the natural factoring is a shared `fun app(): View` with a
+  per-leg `main`: `mount_root("app", app)` in the browser, `render(app())` on the
+  server. Event handlers (`on`) are accepted and discarded — a server-rendered
+  `<button>` is just a button. `std::dom` stays browser-only, so a component
+  reaching for raw DOM cannot SSR; the cross-platform error says so at the import.
+
 ## Escaping to the DOM
 
 `View` is a thin wrapper over `std::dom::Element` (it's right there as

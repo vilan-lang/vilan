@@ -111,14 +111,22 @@ tree:
 
 ## 4. Slices (suite-gated, docs same commit, per-case pins)
 
-1. **S1 — the process-layer `ui` + `render`**: the string-tree View, the
-   full read-once `bind_*`/`when`/`each` surface, escaping/void-element
-   correctness, the deterministic-attribute rule. Pins: per-binding render
-   snapshots (text, attr, class, each over a list, when both branches,
-   nested composition); escaping (a text node containing `<script>`); the
-   **cross-implementation differential** (same view code → browser-stub tree
-   ≡ rendered tree); the platform gate (a `std::dom` import still fails a
-   process build with the standard error).
+1. **S1 — SHIPPED 2026-07-23**: `vilan/std/src/process/ui.vl` (295 lines) —
+   the full read-once surface (`bind_text/class/attr/value/draft`,
+   `bind_each`/`when`/`swap`/`show`, `style_var`), handlers accepted and
+   discarded, `mount`/`mount_root` omitted per §6a. `render`: insertion-order
+   attributes, text/attr escaping, the void set (children of a void drop
+   silently — the recorded §5 risk). 22 pins + corpus `ssr-render.vl`
+   (equivalence-gated) + the cross-implementation differential
+   (`ssr_differential.rs`: property→attribute canonical mapping, browser-stub
+   tree ≡ rendered string **byte-for-byte**) + the `std::dom` platform-gate
+   pin; docs in `guide/ui.md` same commit. One §2 amendment settled in
+   flight: `on_event` must be MIRRORED-and-discarded, not omitted — a
+   process program may import a browser module (the router) it never calls
+   into, and requirement analysis loads it; the handler's event type stays
+   generic (a discarded handler never touches it). Residue: `style_var` is
+   snapshot-pinned but outside the differential (the DOM stub no-ops
+   `style.setProperty`).
 2. **S2 — replace semantics + the full-stack proof**: `mount`/`mount_root`
    clear first (pin: mounting into a container with existing children
    replaces them; every existing example unaffected); the walkthrough (or a
