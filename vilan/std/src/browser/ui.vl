@@ -338,9 +338,15 @@ impl View {
 	}
 }
 
-/// Attach a view to the page element with the given id.
+/// Attach a view to the page element with the given id — CLEARING the container
+/// first (`replaceChildren`) so the freshly built UI REPLACES whatever was there
+/// (proposal/ssr.md §1 step 3). A no-op for the empty container every client app
+/// mounts into today; on a server-rendered page it discards the server markup and
+/// mounts the live tree in its place. Render, then replace — no adoption.
 fun mount(id: str, view: View) {
-	get_element_by_id(id).append(view.element);
+	let element = get_element_by_id(id);
+	element.clear();
+	element.append(view.element);
 }
 
 /// Mount a component ROOT: the body builds under a fresh ambient owner (the

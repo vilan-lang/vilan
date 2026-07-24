@@ -1,0 +1,11 @@
+# The server-side-rendering example (proposal/ssr.md, A7 — render and replace):
+# a browser `client`, a Node `server`, and a shared `common` library holding the
+# one `fun app(): View` both legs build. The server renders that view to an HTML
+# string and splices it into its shell, so the page arrives fully painted (SEO,
+# first paint); the client then builds the same view live and REPLACES the
+# server markup on boot. No hydration — render, then replace.
+#
+#   vilan build .   compiles each app into `dist/` (`client.js` / `server.js`)
+#   vilan run .     builds both and starts the Node server
+[project]
+packages = ["common", "client", "server"]

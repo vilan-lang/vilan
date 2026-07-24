@@ -1,0 +1,6 @@
+[library]
+name = "common"
+# A `[library]` is compiled into EACH consumer, so `std::ui` resolves through the
+# consuming package's platform — the browser `ui` in the client leg, the process
+# `ui` in the server leg — with no annotation. That per-leg shadow is the whole
+# SSR mechanism (proposal/ssr.md §0): one component, two rendered forms.

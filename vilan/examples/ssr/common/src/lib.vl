@@ -1,0 +1,45 @@
+// `common` — the shared component: ONE `fun app(): View` that both legs build
+// (proposal/ssr.md §1, §3). The client mounts it into live DOM; the server
+// renders it to an HTML string. Its data is self-contained (signals seeded in
+// code), so the two legs produce the same markup by construction — and a button
+// drives a live signal so the client can prove its bindings fire after the
+// replace.
+//
+// Build pure, bind reactive (proposal/ssr.md §5): the bindings below all READ
+// ONCE on the server (the value at render time is the value served) and stay live
+// on the client. Nothing here reaches for `std::dom`, so the same source compiles
+// on both platforms. Components are just functions returning a `View`, so the app
+// is composition.
+
+import std::reactive::Signal;
+import std::ui::{ View, view };
+
+// A signal-fed list, a conditional note, an escaped heading, and a button whose
+// click writes a signal bound to its own text.
+fun app(): View {
+	let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
+	let show_note = Signal::new(true);
+	let label = Signal::new("idle");
+	view("main").class("app").child(heading()).child(task_list(tasks)).child(note(show_note)).child(action(label))
+}
+
+// The `&`, `<`, `>` are escaped by `render` — a hostile string renders inert.
+fun heading(): View {
+	view("h1").text("Tasks & <notes>")
+}
+
+// The signal-fed list: one `<li>` per task, read once on the server.
+fun task_list(tasks: Signal<List<str>>): View {
+	view("ul").bind_each(tasks, |task| task, |task| view("li").text(task))
+}
+
+// A conditional note — `when` renders the taken branch on the server.
+fun note(show: Signal<bool>): View {
+	view("section").when(show, || view("p").text("server-rendered, then replaced"))
+}
+
+// A button whose click writes `label`, which is bound to its own text: inert on
+// the server (the handler is discarded), live on the client after the replace.
+fun action(label: Signal<str>): View {
+	view("button").bind_text(label).on("click", || label.set("clicked"))
+}

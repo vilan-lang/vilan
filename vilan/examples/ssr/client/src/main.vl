@@ -1,0 +1,12 @@
+// The client entry: build the same `app()` and mount it. On boot `mount_root`
+// CLEARS the container — the server-rendered nodes — and appends the freshly
+// built live UI: render, then replace (proposal/ssr.md §1 step 3). No adoption,
+// no addressing, no reconciliation; the same component code produced both trees,
+// so when the data matches the swap is imperceptible.
+
+import std::ui::mount_root;
+import common::app;
+
+fun main() {
+	let _root = mount_root("app", || app());
+}

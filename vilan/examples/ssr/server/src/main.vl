@@ -1,0 +1,27 @@
+// The server: read the client bundle and the HTML shell, then serve. On the page
+// route it renders the app to markup with `render(app())` and splices it into the
+// shell at the `<!--ssr-->` marker (proposal/ssr.md §1, §6b — the splice stays in
+// user code, zero new std surface). The page arrives fully painted; `/client.js`
+// carries the bundle that boots and replaces it.
+
+import std::fs;
+import std::http::{ Request, Response, Server };
+import std::print;
+import std::ui::render;
+import common::app;
+
+async fun main() {
+	// Read once at boot; the server runs from the project root (`vilan run .`).
+	let client_js = fs::read_file_to_str("dist/client.js");
+	let shell = fs::read_file_to_str("server/src/app.html");
+
+	Server::builder().port(8791).on_request(|request| {
+		match request.path() {
+			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+			// Create, serialize, discard: a fresh `app()` is built and rendered
+			// per request, its markup spliced into the shell. No effects, no
+			// subscriptions, no owner survives the response.
+			_ => Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build(),
+		}
+	}).on_start(|server| print("ssr example: http://localhost:8791/")).build().start();
+}

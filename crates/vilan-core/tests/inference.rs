@@ -25110,3 +25110,55 @@ fn ssr_process_build_can_import_a_browser_module_that_binds_on_event() {
         "#,
     );
 }
+
+// --- S2: replace semantics + the shared `app()` composition (proposal/ssr.md §1,
+// §4 S2). The RUNTIME replace (mount clears before appending) needs a DOM, so it
+// is pinned end-to-end under the A10 stub in `crates/vilan-cli/tests/ssr_fullstack.rs`
+// (old server nodes detached, live tree in their place, bindings firing). These
+// pin the compile surface and the process-leg markup the browser replaces.
+
+#[test]
+fn ssr_example_app_renders_the_served_markup() {
+    // The `examples/ssr` `app()` composition — a signal-fed list, a `when`, an
+    // escaped heading, and a read-once button — rendered on the process leg is the
+    // exact markup the server splices into its shell: the pre-JS page the client
+    // then replaces (proposal/ssr.md §1, §3).
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun app(): View {
+            let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
+            let show_note = Signal::new(true);
+            let label = Signal::new("idle");
+            view("main")
+                .class("app")
+                .child(view("h1").text("Tasks & <notes>"))
+                .child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
+                .child(view("section").when(show_note, || view("p").text("server-rendered, then replaced")))
+                .child(view("button").bind_text(label).on("click", || label.set("clicked")))
+        }
+        fun main() {
+            print(render(app()));
+        }
+        "#,
+        "<main class=\"app\"><h1>Tasks &amp; &lt;notes&gt;</h1><ul><li>Render on the server</li><li>Replace on boot</li></ul><section><p>server-rendered, then replaced</p></section><button>idle</button></main>\n",
+    );
+}
+
+#[test]
+fn browser_mount_surface_compiles_after_the_replace_change() {
+    // The replace change (mount clears the container before appending) keeps both
+    // the plain `mount` and `mount_root` compiling on the browser leg. The observable
+    // clear is pinned under the DOM stub (see the module note above).
+    assert_compiles_browser(
+        r#"
+        import std::ui::{ view, View, mount, mount_root };
+        fun main() {
+            mount("aside", view("div").text("live"));
+            let _root = mount_root("app", || view("main").text("app"));
+        }
+        "#,
+    );
+}

@@ -127,15 +127,31 @@ tree:
    generic (a discarded handler never touches it). Residue: `style_var` is
    snapshot-pinned but outside the differential (the DOM stub no-ops
    `style.setProperty`).
-2. **S2 — replace semantics + the full-stack proof**: `mount`/`mount_root`
-   clear first (pin: mounting into a container with existing children
-   replaces them; every existing example unaffected); the walkthrough (or a
-   new `examples/ssr`) server renders its initial view into the shell at the
-   mount marker; a CLI e2e asserts the served HTML **contains the rendered
-   content before any JS runs** (curl the route, assert markup), and the
-   A10 headless stub then boots the client bundle and asserts the container
-   was replaced with the live UI (old server nodes gone, bindings firing).
-   kolt as the real-world adoption once the example proves the loop.
+2. **S2 — SHIPPED 2026-07-23**: `mount` clears before appending
+   (`mount_root` inherits; the HMR teardown clear composes untouched; no
+   golden churned — every existing container was empty). New
+   `examples/ssr` (3-package workspace, `common` holds `fun app(): View`,
+   the server splices `render(app())` at the `<!--ssr-->` marker); the
+   full-stack e2e asserts the served HTML carries the rendered content
+   **before any JS** (escaped text, signal-fed list, the `when` branch)
+   and that the client boot **replaces** — one live root, server nodes
+   detached and unupdated, a click propagating to the new tree.
+   `guide/ssr.md` + sidebar, same commit.
+
+   > **Amendment (2026-07-23 — the kolt finding, v1's applicability
+   > boundary):** kolt cannot SSR in v1, for three verified reasons: its
+   > views read the live rpc client during the BUILD (not in discarded
+   > handlers), every handler captures that client (which the server — the
+   > rpc *host* — has no value for), and they import browser-layer modules
+   > (`router`, `storage`) so a process build correctly refuses at the
+   > import. The walkthrough shares the shape. **v1 render-and-replace
+   > fits self-contained and server-data-seeded apps** — the pattern
+   > `examples/ssr` demonstrates — not client-mirror-threaded ones. The
+   > path for the latter is a factoring question (shell renders
+   > server-side; mirror-bound regions stay client-only) plus S3's seeded
+   > data where the double-fetch bites; neither is v1 scope. This is the
+   > §6c demand signal recorded honestly: kolt's SSR waits on that
+   > factoring, not on this arc.
 3. **S3 (optional, gated on §6c) — the initial-state blob**: server
    `embed`/client `adopt` over `Wire`, keyed like HMR's stash; the client's
    first fetch skipped when the blob answers. Recorded here so its absence

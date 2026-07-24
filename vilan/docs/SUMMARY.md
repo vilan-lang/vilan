@@ -24,6 +24,7 @@
 - [Routing](guide/routing.md)
 - [Services & RPC](guide/services.md)
 - [Persistence and the server](guide/persistence.md)
+- [Server-side rendering](guide/ssr.md)
 - [A full-stack walkthrough](guide/walkthrough.md)
 - [The dev loop](guide/dev-loop.md)
 
