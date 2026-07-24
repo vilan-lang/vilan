@@ -1341,7 +1341,7 @@ pub struct Analyzer<'src> {
     // is precisely an unloaded one). The index is built lazily on the FIRST
     // failed resolution — a cold path — through the process-global parse
     // cache, then reused.
-    std_module_files: Vec<(String, String)>,
+    std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
     // Per generated-items walk: the ENTITY-ID range it produced, the origin
     // (the attribute/invocation span in the user's file), and the origin's
@@ -21581,10 +21581,19 @@ pub struct Program<'src> {
     // (`content_hash`; 0 for a source that failed to load) — the watch loop's
     // per-leg reuse verification (backlog E12).
     pub source_hashes: Vec<u64>,
+    // Parallel to `sources`: each source path through `util::canonical_path`.
+    // `sources` is what diagnostics PRINT (the spelling the user gave); this is
+    // what platform coloring COMPARES against `layer_platforms`' equally
+    // canonicalized roots, so a canonicalized root and a join-built source path
+    // meet instead of silently failing `starts_with` (`windows-support.md` §5).
+    // Computed once here because the coloring walk asks per reachable node.
+    pub canonical_sources: Vec<PathBuf>,
     pub source_ranges: Vec<SourceRange>,
     // Library layer roots with their platform patterns (plus base roots with
     // empty patterns, marking library territory) — the seeds and the
-    // user-code test for platform coloring (`platform_color`).
+    // user-code test for platform coloring (`platform_color`). Roots are
+    // canonicalized (see `canonical_sources`) so both sides of the containment
+    // test are in one form.
     pub layer_platforms: Vec<(PathBuf, String, String, Vec<PlatformPattern>)>,
     // Use-site identifier spans for field accesses / method calls (`.x`), keyed
     // by the access expr id — drives rename and go-to-definition on members.
@@ -21807,25 +21816,21 @@ pub(crate) struct LoadedModule {
 /// The open-document overlay (backlog E6): the language server registers each
 /// open document's CURRENT buffer, so a dependent file's re-analysis sees
 /// unsaved edits instead of the on-disk content (module loading is otherwise
-/// disk-backed, and `did_save` used to be what closed the gap). Keys are
-/// canonicalized where possible so the loader's join-built paths and the
-/// server's URI-derived paths meet. The content-addressed parse cache below
-/// is unaffected — an overlay only changes WHICH content gets loaded.
+/// disk-backed, and `did_save` used to be what closed the gap). Keys go through
+/// the one canonicalization helper (`util::canonical_path`), so the loader's
+/// join-built paths and the server's URI-derived paths meet — including for a
+/// buffer whose file is not on disk yet, where the old raw-string fallback let
+/// two spellings of one path miss each other. The content-addressed parse cache
+/// below is unaffected — an overlay only changes WHICH content gets loaded.
 static DOCUMENT_OVERLAY: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
+    std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
 > = std::sync::OnceLock::new();
-
-fn overlay_key(path: &str) -> String {
-    std::fs::canonicalize(path)
-        .map(|canonical| canonical.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string())
-}
 
 /// Register (`Some`) or clear (`None`) an open document's buffer. The
 /// language server calls this on open/change/close; nothing else should.
 pub fn set_document_overlay(path: &Path, text: Option<String>) {
     let overlay = DOCUMENT_OVERLAY.get_or_init(Default::default);
-    let key = overlay_key(&path.to_string_lossy());
+    let key = crate::util::canonical_path(path);
     let mut overlay = overlay.lock().unwrap();
     match text {
         Some(text) => {
@@ -21837,13 +21842,13 @@ pub fn set_document_overlay(path: &Path, text: Option<String>) {
     }
 }
 
-fn document_overlay_get(path: &str) -> Option<String> {
+fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
     let overlay = overlay.lock().unwrap();
-    overlay.get(&overlay_key(path)).cloned()
+    overlay.get(&crate::util::canonical_path(path)).cloned()
 }
 
-pub(crate) fn load_package_module(path: &str) -> Option<LoadedModule> {
+pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -21954,9 +21959,9 @@ pub(crate) fn load_package_module(path: &str) -> Option<LoadedModule> {
 /// Pushes one diagnostic per swallowed lex/parse error in a loaded package
 /// module, naming the file (module spans are offsets into *that* file, so the
 /// rendered position rides in the message).
-fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &str, loaded: &LoadedModule) {
+fn report_module_parse_errors(diagnostics: &mut Vec<Error>, path: &Path, loaded: &LoadedModule) {
     for rendered in loaded.parse_errors {
-        let msg = format!("parse error in `{path}`: {rendered}");
+        let msg = format!("parse error in `{}`: {rendered}", path.display());
         // The same module loads through several seams (a lib re-export and a
         // direct import, say) and the cache hands each the same errors — one
         // diagnostic per distinct error is enough.
@@ -22763,8 +22768,23 @@ fn enum_wire_visitor_impls(enum_name: &str, variants: &[(&str, Vec<String>)]) ->
 }
 
 /// Builds the path to a module file under the `std` package's source root.
-fn std_module_path(std_root: &Path, file: &str) -> String {
-    std_root.join(file).to_string_lossy().into_owned()
+fn std_module_path(std_root: &Path, file: &str) -> PathBuf {
+    std_root.join(file)
+}
+
+/// A module resolution: the file that answers an `import`, plus what the caller
+/// must report about *how* it answered. Paths stay `PathBuf` the whole way — a
+/// `to_string_lossy` round-trip through a `String` would open the WRONG file for
+/// a path Rust cannot spell in UTF-8 (`windows-support.md` §5).
+struct ModuleResolution {
+    /// The resolved source file.
+    path: PathBuf,
+    /// Both `name.vl` and `name/lib.vl` exist under the winning root.
+    ambiguous: bool,
+    /// The root the module resolved under, and the components joined onto it —
+    /// what [`case_exact_mismatch`] needs to check the on-disk spelling.
+    root: PathBuf,
+    relative: PathBuf,
 }
 
 /// Resolves a module `name` under `root` to its source file. A module may be a
@@ -22773,15 +22793,75 @@ fn std_module_path(std_root: &Path, file: &str) -> String {
 /// when both somehow exist), and a flag set when *both* exist (an ambiguity the
 /// caller reports). `None` when neither exists — the name isn't a module here
 /// (e.g. the `print` in `std::print`), which the caller simply skips.
-fn resolve_module_file(root: &Path, name: &str) -> (Option<String>, bool) {
-    let flat = root.join(format!("{name}.vl"));
-    let nested = root.join(name).join("lib.vl");
-    let to_string = |path: &Path| path.to_string_lossy().into_owned();
+fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
+    let flat_relative = PathBuf::from(format!("{name}.vl"));
+    let nested_relative = Path::new(name).join("lib.vl");
+    let flat = root.join(&flat_relative);
+    let nested = root.join(&nested_relative);
+    let resolution = |relative: PathBuf, path: PathBuf, ambiguous: bool| ModuleResolution {
+        path,
+        ambiguous,
+        root: root.to_path_buf(),
+        relative,
+    };
     match (flat.exists(), nested.exists()) {
-        (true, both_exist) => (Some(to_string(&flat)), both_exist),
-        (false, true) => (Some(to_string(&nested)), false),
-        (false, false) => (None, false),
+        (true, both_exist) => Some(resolution(flat_relative, flat, both_exist)),
+        (false, true) => Some(resolution(nested_relative, nested, false)),
+        (false, false) => None,
     }
+}
+
+/// Verifies that every component of `relative` names an on-disk entry under
+/// `root` **byte-for-byte**, and reports the first that does not as
+/// `(requested, on-disk)`.
+///
+/// A case-insensitive filesystem (NTFS, and APFS by default) answers
+/// `Path::exists` for `foo.vl` when the file on disk is `Foo.vl`, so `import
+/// foo` resolves there and the same program fails on Linux — a program that
+/// builds on one machine and not another, which is exactly what the
+/// platform-independence invariant forbids (`windows-support.md` §5, ratified
+/// call (c)). Enforcing exact case is the general fix; this is the check.
+///
+/// `None` when the names agree, or when a directory cannot be read — an
+/// unreadable directory is a different failure, not this check's to report.
+///
+/// The `read_dir` is deliberately **not cached, and must not be**: a memoized
+/// directory listing goes stale the moment a file is renamed, and a long-lived
+/// process (`run --watch`, the language server) would then invent a case
+/// mismatch for a file that is now spelled correctly — inventing a diagnostic
+/// is far worse than the cost. Measured on `examples/walkthrough`: 179 calls
+/// per build, each one `read_dir` of a ~50-entry directory, median build 1986 ms
+/// with the check against 1980 ms without — inside the run-to-run noise.
+fn case_exact_mismatch(root: &Path, relative: &Path) -> Option<(String, String)> {
+    let mut directory = root.to_path_buf();
+    for component in relative.components() {
+        let requested = component.as_os_str();
+        let entries = std::fs::read_dir(&directory).ok()?;
+        let mut on_disk: Option<std::ffi::OsString> = None;
+        let mut exact = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == requested {
+                exact = true;
+                break;
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&requested.to_string_lossy())
+            {
+                on_disk = Some(name);
+            }
+        }
+        if !exact {
+            let on_disk = on_disk?;
+            return Some((
+                requested.to_string_lossy().into_owned(),
+                on_disk.to_string_lossy().into_owned(),
+            ));
+        }
+        directory.push(requested);
+    }
+    None
 }
 
 /// Collects package modules referenced via `<root>::<module>::..` in a node list's
@@ -22844,6 +22924,11 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// `name/lib.vl` (the two forms an importer can't tell apart). Returns each
 /// `(module name, file path)` in a stable (sorted) order, so diagnostics built from
 /// it are deterministic.
+///
+/// The PATH is kept as a `PathBuf` (never a lossy `String`), so a file under a
+/// directory Rust cannot spell in UTF-8 still opens. The NAME must be `str` — a
+/// module name is a vilan identifier, and a non-UTF-8 file stem can never be
+/// one, so such a file is deliberately not listed as a module.
 fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
     let mut modules = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -22851,7 +22936,7 @@ fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("vl") {
+        if path.extension() == Some(std::ffi::OsStr::new("vl")) {
             if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
                 modules.push((name.to_string(), path.clone()));
             }
@@ -22903,21 +22988,19 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
     let all_roots = spec.search_roots(Platform::None);
     for (served, root) in &layers {
         for (importer, path) in modules_in_root(root) {
-            let Some(loaded) = load_package_module(&path.to_string_lossy()) else {
+            let Some(loaded) = load_package_module(&path) else {
                 continue;
             };
-            report_module_parse_errors(&mut diagnostics, &path.to_string_lossy(), &loaded);
+            report_module_parse_errors(&mut diagnostics, &path, &loaded);
             let ast = loaded.ast;
             for (module, span) in collect_module_refs(&ast.0, "pkg") {
-                if resolve_module_in_roots(&all_roots, module).0.is_none() {
+                if resolve_module_in_roots(&all_roots, module).is_none() {
                     continue; // not a module file anywhere — an item re-export or a typo
                 }
                 let unavailable: Vec<String> = served
                     .iter()
                     .filter(|platform| {
-                        resolve_module_in_roots(&spec.available_roots(**platform), module)
-                            .0
-                            .is_none()
+                        resolve_module_in_roots(&spec.available_roots(**platform), module).is_none()
                     })
                     .map(|platform| platform.name())
                     .collect();
@@ -23037,14 +23120,10 @@ impl PackageSpec {
 /// `name.vl` or directory `name/lib.vl` wins (so an earlier root shadows a later
 /// one). Returns the existing path and whether *that root* was ambiguous (both
 /// forms present); `None` if no root has the module.
-fn resolve_module_in_roots(roots: &[&Path], name: &str) -> (Option<String>, bool) {
-    for root in roots {
-        let (path, ambiguous) = resolve_module_file(root, name);
-        if path.is_some() {
-            return (path, ambiguous);
-        }
-    }
-    (None, false)
+fn resolve_module_in_roots(roots: &[&Path], name: &str) -> Option<ModuleResolution> {
+    roots
+        .iter()
+        .find_map(|root| resolve_module_file(root, name))
 }
 
 /// The dependency graph available to a program: the flat set of reachable
@@ -23095,7 +23174,11 @@ pub fn analyze<'src>(
     // The std module inventory for the B4 import steer (module name, path) —
     // every layer's `*.vl` except the package surface itself. Recorded
     // eagerly (a cheap directory walk); parsed lazily, only if a resolution
-    // ever fails.
+    // ever fails. The path stays a `PathBuf`: a `to_str()` gate here used to
+    // drop a perfectly good module because some ANCESTOR directory was not
+    // UTF-8 (`windows-support.md` §5). The module NAME still has to be `str` —
+    // it is a vilan identifier, which a non-UTF-8 stem can never be, so such a
+    // file is deliberately not a steerable module.
     for root in std::iter::once(&std.base_root).chain(std.layers.iter().map(|layer| &layer.root)) {
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
@@ -23103,12 +23186,10 @@ pub fn analyze<'src>(
                 if path.extension().is_some_and(|extension| extension == "vl")
                     && path.file_stem().is_some_and(|stem| stem != "lib")
                 {
-                    if let (Some(stem), Some(path_str)) =
-                        (path.file_stem().and_then(|s| s.to_str()), path.to_str())
-                    {
+                    if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
                         analyzer
                             .std_module_files
-                            .push((stem.to_string(), path_str.to_string()));
+                            .push((stem.to_string(), path.clone()));
                     }
                 }
             }
@@ -23182,7 +23263,7 @@ pub fn analyze<'src>(
         analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
     }
     let lib_ast = lib_loaded.map(|loaded| loaded.ast);
-    sources.push(PathBuf::from(&lib_path));
+    sources.push(lib_path);
     source_hashes.push(lib_loaded.map_or(0, |loaded| crate::content_hash(loaded.text)));
     let lib_source_id = SourceId((sources.len() - 1) as u32);
     let mut module_scopes: HashMap<&str, Id> = HashMap::new();
@@ -23227,12 +23308,14 @@ pub fn analyze<'src>(
     // `import pkg::..` siblings live in. When it is one of `std`'s own layer roots
     // we're compiling std itself (or a std file opened in an editor), so every
     // module is `Std` and the single-package behavior is preserved exactly.
-    let canonical =
-        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let pkg_root_canonical = canonical(pkg_root);
+    // Through the one canonicalization helper (`windows-support.md` §5): the
+    // raw-path fallback this replaces compared two spellings as strings, so a
+    // std root reached by a different spelling than `pkg_root` read as a
+    // different package.
+    let pkg_root_canonical = crate::util::canonical_path(pkg_root);
     let compiling_std = std::iter::once(&std.base_root)
         .chain(std.layers.iter().map(|layer| &layer.root))
-        .any(|root| canonical(root) == pkg_root_canonical);
+        .any(|root| crate::util::canonical_path(root) == pkg_root_canonical);
     let entry_pkg_origin = if compiling_std {
         Origin::Std
     } else {
@@ -23392,7 +23475,7 @@ pub fn analyze<'src>(
             report_module_parse_errors(&mut analyzer.diagnostics, &lib_path, &lib_loaded);
             analyzer.attribute_new_diagnostics(diagnostics_before, SourceId(sources.len() as u32));
             let lib_ast = lib_loaded.ast;
-            sources.push(PathBuf::from(&lib_path));
+            sources.push(lib_path);
             source_hashes.push(crate::content_hash(lib_loaded.text));
             let lib_source_id = SourceId((sources.len() - 1) as u32);
             analyzer
@@ -23417,12 +23500,9 @@ pub fn analyze<'src>(
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "dep".to_string());
             for (module, _) in collect_module_refs(&lib_ast.0, "pkg") {
-                if resolve_module_file(&spec.base_root, module).0.is_some() {
+                if resolve_module_file(&spec.base_root, module).is_some() {
                     to_load.push((Origin::Dep(index), module));
-                } else if resolve_module_in_roots(&spec.search_roots(platform), module)
-                    .0
-                    .is_some()
-                {
+                } else if resolve_module_in_roots(&spec.search_roots(platform), module).is_some() {
                     analyzer.diagnostics.push(Error {
                         note: None,
                         span: EMPTY_SPAN,
@@ -23537,13 +23617,13 @@ pub fn analyze<'src>(
             // skipped here: it loads so its signatures bind and the rest of the file
             // types cleanly. The cross-target diagnostic is reported once, at the user's
             // `import`, where the load is seeded (P3/L1).
-            let (resolved_path, ambiguous) = resolve_module_in_roots(&search_roots, name);
-            let Some(module_path) = resolved_path else {
+            let Some(resolution) = resolve_module_in_roots(&search_roots, name) else {
                 // Not a module file here (a non-module name, or a missing import the
                 // resolver below will report) — skip, as the previous loader did.
                 continue;
             };
-            if ambiguous {
+            let module_path = resolution.path;
+            if resolution.ambiguous {
                 analyzer.diagnostics.push(Error {
                     note: None,
                     span: EMPTY_SPAN,
@@ -23553,13 +23633,28 @@ pub fn analyze<'src>(
                     ),
                 });
             }
-            let is_entry_module = match (
-                std::fs::canonicalize(&module_path),
-                std::fs::canonicalize(entry_path),
-            ) {
-                (Ok(module_canonical), Ok(entry_canonical)) => module_canonical == entry_canonical,
-                _ => false,
-            };
+            // Exact case is part of the resolution (`windows-support.md` §5, call
+            // (c)): a case-insensitive filesystem answers `import foo` with
+            // `Foo.vl`, and that program then fails to build on Linux. This is the
+            // ONE place it is checked — every origin (std, `pkg::`, a dependency)
+            // reaches its module through this loop, and it runs once per module
+            // actually LOADED, never on a resolution probe.
+            if let Some((requested, on_disk)) =
+                case_exact_mismatch(&resolution.root, &resolution.relative)
+            {
+                analyzer.diagnostics.push(Error {
+                    note: None,
+                    span: EMPTY_SPAN,
+                    msg: format!(
+                        "module `{name}` resolved to `{on_disk}` on disk, but it is imported as \
+                         `{requested}` — vilan matches module files by exact case, so this \
+                         builds only where the filesystem ignores case; rename one to match \
+                         the other"
+                    ),
+                });
+            }
+            let is_entry_module = crate::util::canonical_path(&module_path)
+                == crate::util::canonical_path(entry_path);
             // Use the entry's (buffer) AST for its own module; load the rest from
             // disk. The entry module keeps SourceId 0 so editor features resolve to
             // the open document.
@@ -23577,7 +23672,7 @@ pub fn analyze<'src>(
                         diagnostics_before,
                         SourceId(sources.len() as u32),
                     );
-                    sources.push(PathBuf::from(&module_path));
+                    sources.push(module_path);
                     source_hashes.push(crate::content_hash(loaded.text));
                     (
                         loaded.ast,
@@ -24842,17 +24937,21 @@ pub fn analyze<'src>(
     // knows library territory.
     let layer_platforms = {
         let mut recorded: Vec<(PathBuf, String, String, Vec<PlatformPattern>)> = Vec::new();
+        // Both sides of the containment test go through the one canonicalization
+        // helper (`windows-support.md` §5): a `\\?\`-prefixed root never
+        // `starts_with`-matches a plain source path, and library frames silently
+        // degrade to "user code".
         let record = |name: &str, spec: &PackageSpec, recorded: &mut Vec<_>| {
             for layer in &spec.layers {
                 recorded.push((
-                    layer.root.clone(),
+                    crate::util::canonical_path(&layer.root),
                     name.to_string(),
                     format!("the `{}` layer of `{name}`", layer.name),
                     layer.patterns.clone(),
                 ));
             }
             recorded.push((
-                spec.base_root.clone(),
+                crate::util::canonical_path(&spec.base_root),
                 name.to_string(),
                 format!("`{name}`"),
                 Vec::new(),
@@ -24925,6 +25024,7 @@ pub fn analyze<'src>(
         type_id_to_type_map: analyzer.type_id_to_type_map,
         variables: analyzer.variables,
         parameters: analyzer.parameters,
+        canonical_sources: sources.iter().map(crate::util::canonical_path).collect(),
         sources,
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
@@ -25010,5 +25110,111 @@ pub fn check_context_drops(program: &mut Program) {
                  work to an owner inside the turn"
             ),
         });
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    //! Path and filesystem semantics for module loading (`windows-support.md`
+    //! §5): exact-case resolution and the open-document overlay's key.
+
+    use super::{case_exact_mismatch, document_overlay_get, set_document_overlay};
+    use std::path::{Path, PathBuf};
+
+    /// A fresh, empty scratch directory for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-path-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the scratch directory");
+        directory
+    }
+
+    #[test]
+    fn a_wrong_case_module_file_is_named_on_both_sides() {
+        // The mismatch arm. Linux is case-sensitive, so a wrong-case import
+        // never RESOLVES here and this arm cannot fire end to end — the
+        // windows-latest CI leg is that e2e. The checker itself is
+        // platform-independent, so it is pinned directly.
+        let root = scratch("case-flat");
+        std::fs::write(root.join("Foo.vl"), "").expect("write Foo.vl");
+        let mismatch = case_exact_mismatch(&root, Path::new("foo.vl"));
+        assert_eq!(
+            mismatch,
+            Some(("foo.vl".to_string(), "Foo.vl".to_string())),
+            "the diagnostic must name the imported spelling AND the on-disk one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_exact_case_module_file_is_no_mismatch() {
+        let root = scratch("case-exact");
+        std::fs::write(root.join("foo.vl"), "").expect("write foo.vl");
+        assert_eq!(case_exact_mismatch(&root, Path::new("foo.vl")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_component_of_a_nested_module_is_checked() {
+        // `import foo` may resolve `foo/lib.vl`, so the DIRECTORY's case counts
+        // too — and so does the fixed `lib.vl`.
+        let root = scratch("case-nested");
+        std::fs::create_dir_all(root.join("Foo")).expect("create Foo/");
+        std::fs::write(root.join("Foo").join("lib.vl"), "").expect("write lib.vl");
+        assert_eq!(
+            case_exact_mismatch(&root, &Path::new("foo").join("lib.vl")),
+            Some(("foo".to_string(), "Foo".to_string()))
+        );
+        // The directory agrees, the file does not.
+        std::fs::create_dir_all(root.join("bar")).expect("create bar/");
+        std::fs::write(root.join("bar").join("Lib.vl"), "").expect("write Lib.vl");
+        assert_eq!(
+            case_exact_mismatch(&root, &Path::new("bar").join("lib.vl")),
+            Some(("lib.vl".to_string(), "Lib.vl".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_absent_file_is_not_a_case_mismatch() {
+        // A missing module is the resolver's business (it never gets here);
+        // and an unreadable directory is a different failure entirely.
+        let root = scratch("case-absent");
+        assert_eq!(case_exact_mismatch(&root, Path::new("foo.vl")), None);
+        assert_eq!(
+            case_exact_mismatch(&root.join("nope"), Path::new("foo.vl")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_overlay_registered_by_one_spelling_is_found_by_another() {
+        // The overlay key goes through `util::canonical_path`, so the loader's
+        // join-built path meets the server's URI-derived one even when the file
+        // is NOT on disk yet — where the old raw-string fallback made an
+        // unsaved buffer silently invisible (windows-support.md §5).
+        let root = scratch("overlay");
+        let registered = root.join("src/./pkg/../pkg/notes.vl");
+        let looked_up = root.join("src/pkg/notes.vl");
+        assert!(!looked_up.exists(), "the pin needs a path not on disk");
+
+        set_document_overlay(&registered, Some("fun main() {}\n".to_string()));
+        assert_eq!(
+            document_overlay_get(&looked_up).as_deref(),
+            Some("fun main() {}\n"),
+            "a differently spelled path must reach the same buffer"
+        );
+        set_document_overlay(&looked_up, None);
+        assert_eq!(
+            document_overlay_get(&registered),
+            None,
+            "and clearing through either spelling must clear the one entry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

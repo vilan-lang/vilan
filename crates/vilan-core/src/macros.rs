@@ -19,6 +19,7 @@
 //! interpreter is deterministic by construction. Both caches hold leaked,
 //! process-global data, mirroring `load_package_module`'s parse cache.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -838,7 +839,7 @@ impl Expander<'_, '_> {
             // expanded (splice syntax is program-code-only).
             Node::MacroFun(_) => {}
             Node::MacroAttribute(name, name_span, argument_spans, item) => {
-                let arguments: Vec<&str> = argument_spans
+                let arguments: Vec<Cow<str>> = argument_spans
                     .iter()
                     .map(|span| slice(text, *span))
                     .collect();
@@ -906,7 +907,7 @@ impl Expander<'_, '_> {
             }
             // An ITEM invocation: the output parses as items and appends.
             Node::MacroInvocation(name, name_span, argument_spans) => {
-                let arguments: Vec<&str> = argument_spans
+                let arguments: Vec<Cow<str>> = argument_spans
                     .iter()
                     .map(|span| slice(text, *span))
                     .collect();
@@ -934,7 +935,7 @@ impl Expander<'_, '_> {
         match &node.0 {
             Node::MacroFun(_) => {}
             Node::MacroInvocation(name, name_span, argument_spans) => {
-                let arguments: Vec<&str> = argument_spans
+                let arguments: Vec<Cow<str>> = argument_spans
                     .iter()
                     .map(|span| slice(text, *span))
                     .collect();
@@ -1077,7 +1078,7 @@ impl Expander<'_, '_> {
         name: &str,
         site: Span,
         item: &Spanned<Node>,
-        arguments: &[&str],
+        arguments: &[Cow<'_, str>],
         text: &str,
         depth: u32,
     ) {
@@ -1122,7 +1123,7 @@ impl Expander<'_, '_> {
             def,
             name,
             site,
-            item_text,
+            &item_text,
             arguments,
             call_arguments,
             depth,
@@ -1137,7 +1138,7 @@ impl Expander<'_, '_> {
         &mut self,
         name: &str,
         site: Span,
-        arguments: &[&str],
+        arguments: &[Cow<'_, str>],
         depth: u32,
         expression_site: Option<usize>,
     ) {
@@ -1206,7 +1207,7 @@ impl Expander<'_, '_> {
         name: &str,
         site: Span,
         item_text: &str,
-        arguments: &[&str],
+        arguments: &[Cow<'_, str>],
         call_arguments: Vec<js::Node<'static>>,
         depth: u32,
         expression_site: Option<usize>,
@@ -1396,7 +1397,7 @@ fn cached_run(
     entry: &str,
     name: &str,
     item_text: &str,
-    arguments: &[&str],
+    arguments: &[Cow<'_, str>],
     call_arguments: &[js::Node<'static>],
     fuel: u64,
 ) -> Result<&'static str, String> {
@@ -1478,10 +1479,23 @@ fn preview(text: &str) -> String {
     }
 }
 
-fn slice<'a>(text: &'a str, span: Span) -> &'a str {
+/// The source text a macro OBSERVES at `span` — an argument's text, a type's
+/// spelling, an item's body.
+///
+/// Every one of this function's uses is a VALUE (what the macro sees in
+/// `Arguments`, `Field`, `FunctionItem`) or the expansion cache's key, never
+/// span-addressed re-emission — `vilan fmt`'s verbatim printing reads the raw
+/// source itself, in `formatter.rs`, and never comes through here. So the
+/// `\r\n`-is-one-line-terminator rule applies (`windows-support.md` §2): a
+/// macro that string-compares or measures an argument must see the same text
+/// whatever the file's on-disk encoding. An all-LF file (every file in the
+/// tree) borrows and allocates nothing.
+fn slice<'a>(text: &'a str, span: Span) -> Cow<'a, str> {
     let range = span.into_range();
-    text.get(range.start.min(text.len())..range.end.min(text.len()))
-        .unwrap_or("")
+    let raw = text
+        .get(range.start.min(text.len())..range.end.min(text.len()))
+        .unwrap_or("");
+    crate::util::normalize_newlines(raw)
 }
 
 /// The content-addressed parse cache for macro output — re-analyses skip both
@@ -1573,7 +1587,10 @@ fn construct_type_expr(node: &Spanned<Node>, text: &str) -> js::Node<'static> {
                     .collect(),
             ),
         ]),
-        _ => array(vec![string_literal(slice(text, node.1)), array(Vec::new())]),
+        _ => array(vec![
+            string_literal(&slice(text, node.1)),
+            array(Vec::new()),
+        ]),
     }
 }
 
@@ -1710,7 +1727,7 @@ pub(crate) fn construct_service(
         .collect();
     let mut methods = Vec::new();
     let mut input = String::new();
-    input.push_str(slice(text, item.1));
+    input.push_str(&slice(text, item.1));
     input.push('\u{0}');
     input.push_str(&client);
     for (node, _span) in nodes {
@@ -1735,7 +1752,7 @@ pub(crate) fn construct_service(
             }
             methods.push(construct_function_item(function, text));
             input.push('\u{0}');
-            input.push_str(slice(text, *member_span));
+            input.push_str(&slice(text, *member_span));
         }
     }
     let literal = array(vec![
@@ -1751,7 +1768,7 @@ pub(crate) fn construct_service(
 }
 
 /// `Arguments { values }` — the invocation's argument source texts.
-fn construct_arguments(arguments: &[&str]) -> js::Node<'static> {
+fn construct_arguments(arguments: &[Cow<'_, str>]) -> js::Node<'static> {
     array(vec![array(
         arguments
             .iter()

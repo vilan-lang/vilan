@@ -111,9 +111,115 @@ pub fn materialize_into(cache_root: &Path) -> Result<PathBuf, String> {
 /// The user's home directory, from the environment. `std::env::home_dir` is
 /// avoided for its Windows history; the plain variables are exactly what the
 /// install script and shells define.
+///
+/// The ORDER is per-platform (`windows-support.md` §5). On Windows
+/// `USERPROFILE` is the native variable and is consulted first: Git-Bash/MSYS
+/// also set `HOME`, to a `/`-rooted MSYS pseudo-path that Win32 cannot
+/// resolve, so preferring it would put the std cache somewhere unusable rather
+/// than fall through. Unix keeps `HOME` first, exactly as before. Each
+/// candidate is checked for emptiness on its own, so a set-but-empty variable
+/// falls through to the next instead of ending the search.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    home_dir_from(cfg!(windows), |name| std::env::var_os(name))
+}
+
+/// [`home_dir`]'s decision, with the platform and the environment as plain
+/// inputs — so both orders are pinnable from either platform without mutating
+/// the process environment (which no test may do safely in parallel).
+fn home_dir_from(
+    windows: bool,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let variable = |name: &str| {
+        lookup(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let order = if windows {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    order.into_iter().find_map(variable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::home_dir_from;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// A stand-in environment: `(name, value)` pairs, absent names missing.
+    fn environment<'pairs>(
+        pairs: &'pairs [(&'pairs str, &'pairs str)],
+    ) -> impl Fn(&str) -> Option<OsString> + 'pairs {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn unix_prefers_home() {
+        let both = environment(&[("HOME", "/srv/dev"), ("USERPROFILE", "/srv/profile")]);
+        assert_eq!(home_dir_from(false, &both), Some(PathBuf::from("/srv/dev")));
+    }
+
+    #[test]
+    fn windows_prefers_userprofile_over_an_msys_home() {
+        // Git-Bash/MSYS sets HOME to a pseudo-path Win32 cannot resolve, so
+        // preferring it would pick an unusable cache root
+        // (windows-support.md §5).
+        let both = environment(&[("HOME", "/msys/dev"), ("USERPROFILE", r"C:\profiles\dev")]);
+        assert_eq!(
+            home_dir_from(true, &both),
+            Some(PathBuf::from(r"C:\profiles\dev"))
+        );
+    }
+
+    #[test]
+    fn each_platform_falls_back_to_the_other_variable() {
+        // The install-test shape: HOME seeded, USERPROFILE removed. It must
+        // keep working on Windows too, where HOME is now the fallback.
+        let home_only = environment(&[("HOME", "/scratch/home")]);
+        assert_eq!(
+            home_dir_from(true, &home_only),
+            Some(PathBuf::from("/scratch/home"))
+        );
+        let profile_only = environment(&[("USERPROFILE", r"C:\profiles\dev")]);
+        assert_eq!(
+            home_dir_from(false, &profile_only),
+            Some(PathBuf::from(r"C:\profiles\dev"))
+        );
+    }
+
+    #[test]
+    fn a_set_but_empty_variable_falls_through() {
+        // Each candidate is tested for emptiness on its own. This CHANGED unix
+        // behavior too — the non-empty filter used to sit after the `or_else`,
+        // so an empty `HOME` ended the search at `None` instead of falling
+        // through — so both platforms' cells are pinned.
+        let empty_first = environment(&[("USERPROFILE", ""), ("HOME", "/scratch/home")]);
+        assert_eq!(
+            home_dir_from(true, &empty_first),
+            Some(PathBuf::from("/scratch/home"))
+        );
+        let empty_home = environment(&[("HOME", ""), ("USERPROFILE", "/srv/profile")]);
+        assert_eq!(
+            home_dir_from(false, &empty_home),
+            Some(PathBuf::from("/srv/profile")),
+            "an empty HOME falls through to USERPROFILE on unix as well"
+        );
+        // Nothing left to fall through to, on either platform.
+        assert_eq!(home_dir_from(true, environment(&[("HOME", "")])), None);
+        assert_eq!(home_dir_from(false, environment(&[("HOME", "")])), None);
+    }
+
+    #[test]
+    fn no_home_variable_at_all_is_none() {
+        assert_eq!(home_dir_from(false, environment(&[])), None);
+        assert_eq!(home_dir_from(true, environment(&[])), None);
+    }
 }

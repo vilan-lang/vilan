@@ -25311,6 +25311,42 @@ fn emitted_javascript_from_crlf_source_has_no_carriage_return_through_a_macro() 
 }
 
 #[test]
+fn a_macro_observing_a_multi_line_argument_sees_lf_from_crlf_source() {
+    // The macro layer hands a macro its argument TEXT as a VALUE (`Arguments`,
+    // `Field`, `FunctionItem`), so §2's rule applies there too (S3's tail): a
+    // macro that MEASURES or string-compares a multi-line argument must see the
+    // same text whatever the file's on-disk encoding. The argument below is
+    // deliberately laid out so its text is exactly `1 +\n2` (5 bytes) — an
+    // un-normalized CRLF twin measures 6 and `width()` returns a different
+    // number, which the byte-identity assertion catches.
+    let javascript = assert_crlf_twin_emits_identically(
+        r#"
+        import std::print;
+
+        macro fun measure(arguments: Arguments): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Arguments, Source };
+
+            let text = arguments.values[0];
+            source(i"fun width(): i32 \{
+    {text.len()}
+\}
+")
+        }
+
+        macro measure(1 +
+2);
+
+        fun main() {
+            print(width());
+        }
+        "#,
+    );
+    assert!(javascript.contains("return 5"), "{javascript}");
+    assert!(!javascript.contains('\r'), "{javascript}");
+}
+
+#[test]
 fn a_lone_carriage_return_in_a_string_literal_is_preserved() {
     // Classic-Mac endings are deliberately NOT blessed (windows-support.md §2):
     // a `\r` with no following `\n` stays a character of the value. Pinned so
@@ -25362,4 +25398,99 @@ fn a_backslash_before_a_crlf_break_after_a_hole_emits_lf() {
         "fun main(): str {\n    let n = \"x\";\n    i\"a{n}\\\nb\"\n}\n",
     );
     assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+// --- Path semantics: library territory is decided on canonicalized paths ---
+// (windows-support.md §5)
+
+/// Analyzes `entry` (whose text is `source`) against the real std spec for the
+/// browser platform, and returns how many of the ENTRY file's own functions
+/// platform coloring gave a layer requirement — the observable that says
+/// whether the file was recognized as library territory or silently demoted to
+/// "user code".
+fn entry_functions_with_a_requirement(entry: &Path) -> (usize, usize) {
+    let std = std_spec();
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(entry)
+            .expect("read the entry module")
+            .into_boxed_str(),
+    );
+    let (program, _diagnostics) = analyze_source(
+        source,
+        &std,
+        &std.base_root,
+        entry,
+        Some(Platform::Browser),
+        &Workspace::default(),
+    );
+    let program = program.expect("the module analyzes");
+    let requirements = vilan_core::platform_color::requirements(&program);
+    let entry_functions: Vec<_> = program
+        .functions
+        .keys()
+        .filter(|id| program.source_of(**id) == Some(vilan_core::analyzer::SourceId(0)))
+        .collect();
+    let described = entry_functions
+        .iter()
+        .filter(|id| requirements.contains_key(**id))
+        .count();
+    (described, entry_functions.len())
+}
+
+// A symlink is the portable-on-unix way to give one file two spellings that
+// only `canonicalize` can reconcile. On Windows the same disagreement is
+// unconditional (a canonicalized root carries the `\\?\` verbatim prefix, a
+// join-built path never does), and the windows-latest CI leg is that half.
+#[cfg(unix)]
+#[test]
+fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
+    // Platform coloring tests each source path against the library LAYER ROOTS.
+    // The two sides are produced by different routes — a root from the package
+    // spec, a source from whatever path the caller opened — so the comparison
+    // is only sound once BOTH go through `util::canonical_path`. Reached
+    // through this symlink the raw paths share no prefix at all, so without the
+    // canonicalization the module's functions lose their layer requirement
+    // entirely: a library frame silently demoted to user code, which is a wrong
+    // platform diagnostic rather than a missing one.
+    let browser = std_spec()
+        .layers
+        .iter()
+        .find(|layer| layer.name == "browser")
+        .expect("std has a browser layer")
+        .root
+        .clone();
+    let real = browser
+        .canonicalize()
+        .expect("the browser layer is on disk");
+
+    let scratch = std::env::temp_dir().join(format!(
+        "vilan-layer-symlink-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("create the scratch directory");
+    let link = scratch.join("layer");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink the browser layer");
+
+    let through_link = link.join("dev.vl");
+    assert!(
+        !through_link.starts_with(&browser) && !through_link.starts_with(&real),
+        "the pin needs a spelling that shares no prefix with the recorded root"
+    );
+
+    let (described, total) = entry_functions_with_a_requirement(&through_link);
+    assert!(total > 0, "the opened module defines functions");
+    assert_eq!(
+        described, total,
+        "every function of a browser-layer module keeps its layer's requirement \
+         when the module is reached by a different spelling of its root"
+    );
+
+    // The control: the same file by its ordinary spelling behaves identically,
+    // so the assertion above is about the SPELLING and not about `dev.vl`.
+    let (direct_described, direct_total) = entry_functions_with_a_requirement(&real.join("dev.vl"));
+    assert_eq!((direct_described, direct_total), (described, total));
+
+    let _ = std::fs::remove_dir_all(&scratch);
 }

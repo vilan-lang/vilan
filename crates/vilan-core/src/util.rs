@@ -4,7 +4,7 @@ pub fn plural(n: usize, singular: &str, plural: &str) -> String {
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// The byte-order mark, U+FEFF, as UTF-8 — what a Windows editor writes at the
 /// head of a "UTF-8 with BOM" file.
@@ -41,6 +41,102 @@ pub fn normalize_newlines(text: &str) -> Cow<'_, str> {
         return Cow::Borrowed(text);
     }
     Cow::Owned(text.replace("\r\n", "\n"))
+}
+
+/// Windows' verbatim (`\\?\`) path prefix — what `fs::canonicalize` returns on
+/// Windows, and what nothing else in a build ever produces.
+const VERBATIM_PREFIX: &str = r"\\?\";
+
+/// Rewrites a Windows verbatim path (`\\?\C:\src`, `\\?\UNC\host\share\src`) to
+/// its ordinary spelling (`C:\src`, `\\host\share\src`), so a canonicalized path
+/// compares with a join-built one (`windows-support.md` §5). Anything that is not
+/// a verbatim path — every path on unix — is returned unchanged.
+///
+/// A verbatim device path (`\\?\Volume{…}`) has no ordinary spelling and stays
+/// verbatim. The strip is UNCONDITIONAL for the two forms it does handle: the
+/// result is a comparison key, never a path we reopen, so the "is it still
+/// openable" caveats that make `dunce` keep some verbatim paths as they are
+/// would only reintroduce the mixed-form mismatch this exists to kill.
+fn strip_verbatim_prefix(path: &str) -> Cow<'_, str> {
+    let Some(rest) = path.strip_prefix(VERBATIM_PREFIX) else {
+        return Cow::Borrowed(path);
+    };
+    if let Some(share) = rest.strip_prefix(r"UNC\") {
+        return Cow::Owned(format!(r"\\{share}"));
+    }
+    // A drive-letter verbatim path: `\\?\C:` or `\\?\C:\…`.
+    let mut characters = rest.chars();
+    let drive = characters.next();
+    let colon = characters.next();
+    let separator = characters.next();
+    if drive.is_some_and(|drive| drive.is_ascii_alphabetic())
+        && colon == Some(':')
+        && matches!(separator, None | Some('\\'))
+    {
+        return Cow::Borrowed(rest);
+    }
+    Cow::Borrowed(path)
+}
+
+/// Folds away the components that make two spellings of one path compare
+/// unequal: a `.` anywhere, and a `..` that has a real component to cancel.
+/// Purely lexical — this is the arm for a path that is NOT on disk, where
+/// there is nothing to resolve. A leading `..` (nothing to pop) is kept, and an
+/// empty result becomes `.` so it stays a path.
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            // `Path::components` already folds an interior `.`; a LEADING one
+            // survives, and dropping it is what makes `./a` and `a` agree.
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
+/// THE canonical form of a path, for comparing two paths and for keying a map
+/// by one (`windows-support.md` §5). One helper, so every such comparison is
+/// like with like:
+///
+/// - On disk: `fs::canonicalize`, with Windows' `\\?\` verbatim prefix stripped
+///   — otherwise a canonicalized library root never `starts_with`-matches a
+///   join-built source path, and mixed keys duplicate a map entry.
+/// - Not on disk (an unsaved buffer, a dependency directory that does not
+///   exist): the components are normalized instead, so `a/./b` and `a/b` are
+///   one key rather than two raw strings that happen to differ.
+///
+/// The result is for comparison, not for reopening: it is not guaranteed to be
+/// the longest-path-safe spelling, and it is never shown to the user (the
+/// original path is what diagnostics print).
+pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return normalize_components(path);
+    };
+    // A path Windows cannot spell in UTF-8 (an unpaired surrogate) keeps its
+    // verbatim form: it is still a consistent key, just a longer one.
+    match canonical.to_str() {
+        Some(text) => match strip_verbatim_prefix(text) {
+            Cow::Borrowed(stripped) if stripped.len() == text.len() => canonical,
+            stripped => PathBuf::from(stripped.into_owned()),
+        },
+        None => canonical,
+    }
 }
 
 thread_local! {
@@ -154,7 +250,108 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_newlines, strip_bom, trim_multiline_string};
+    use super::{
+        canonical_path, normalize_components, normalize_newlines, strip_bom, strip_verbatim_prefix,
+        trim_multiline_string,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_verbatim_drive_path_loses_its_prefix() {
+        // `fs::canonicalize` on Windows returns this form; a join-built path
+        // never does, so the two only meet once the prefix is gone.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\src\lib.vl"),
+            r"C:\src\lib.vl"
+        );
+        assert_eq!(strip_verbatim_prefix(r"\\?\c:\"), r"c:\");
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:"), r"C:");
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_becomes_its_ordinary_share_spelling() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\host\share\src\lib.vl"),
+            r"\\host\share\src\lib.vl"
+        );
+    }
+
+    #[test]
+    fn a_non_verbatim_or_unspellable_path_is_untouched() {
+        // Ordinary paths (every path on unix) pass through byte-for-byte…
+        assert_eq!(strip_verbatim_prefix("/srv/app/lib.vl"), "/srv/app/lib.vl");
+        assert_eq!(strip_verbatim_prefix(r"C:\src\lib.vl"), r"C:\src\lib.vl");
+        // …and a device path has no ordinary spelling, so it keeps the prefix.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\Volume{deadbeef}\src"),
+            r"\\?\Volume{deadbeef}\src"
+        );
+        // `\\?\pipe\name` is not a drive letter either.
+        assert_eq!(strip_verbatim_prefix(r"\\?\pipe\vilan"), r"\\?\pipe\vilan");
+    }
+
+    #[test]
+    fn components_normalize_away_dot_and_parent() {
+        assert_eq!(
+            normalize_components(Path::new("a/./b")),
+            PathBuf::from("a/b")
+        );
+        assert_eq!(
+            normalize_components(Path::new("./a/b")),
+            PathBuf::from("a/b")
+        );
+        assert_eq!(
+            normalize_components(Path::new("a/c/../b")),
+            PathBuf::from("a/b")
+        );
+        // Nothing to cancel: a leading `..` is kept rather than silently eaten.
+        assert_eq!(
+            normalize_components(Path::new("../a")),
+            PathBuf::from("../a")
+        );
+        // An all-`.` path stays a path.
+        assert_eq!(normalize_components(Path::new("./")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn a_path_not_on_disk_still_has_one_canonical_form() {
+        // The fallback arm — the one that used to compare raw strings, so an
+        // unsaved buffer registered as `a/./b` was invisible to a lookup of
+        // `a/b`. Neither spelling exists on disk here.
+        let base = std::env::temp_dir().join(format!(
+            "vilan-canonical-missing-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let spelled = base.join("pkg/./src/../src/main.vl");
+        let plain = base.join("pkg/src/main.vl");
+        assert!(!plain.exists(), "the probe path must not be on disk");
+        assert_eq!(canonical_path(&spelled), canonical_path(&plain));
+    }
+
+    #[test]
+    fn a_path_on_disk_canonicalizes_through_its_spellings() {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-canonical-real-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let nested = directory.join("src");
+        std::fs::create_dir_all(&nested).expect("create the probe directory");
+        let file = nested.join("main.vl");
+        std::fs::write(&file, "fun main() {}\n").expect("write the probe file");
+        let round_about = directory.join("src/../src/./main.vl");
+        assert_eq!(canonical_path(&round_about), canonical_path(&file));
+        // And the canonical form of a real path is absolute and prefix-free.
+        let canonical = canonical_path(&file);
+        assert!(canonical.is_absolute(), "{}", canonical.display());
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            canonical.display()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn a_leading_byte_order_mark_is_dropped() {

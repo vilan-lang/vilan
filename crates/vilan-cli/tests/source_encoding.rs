@@ -203,3 +203,36 @@ fn a_crlf_module_import_compiles_like_its_lf_twin() {
     );
     cleanup(&dir);
 }
+
+#[test]
+fn a_bom_prefixed_manifest_builds_like_its_clean_twin() {
+    // `vilan.toml` is read like any other file a Windows editor may save with
+    // a BOM. Stripping happens at `Manifest::parse`, the choke point every
+    // reader goes through (windows-support.md §2). A GUARD: `toml` 0.8 already
+    // tolerates a leading BOM (measured), so this pins the end-to-end
+    // guarantee rather than a failure observed today.
+    let clean = temp_project("manifest_clean");
+    let marked = temp_project("manifest_bom");
+    let manifest = b"[package]\nname = \"encoding\"\nroot = \".\"\ntarget = \"node\"\n";
+    write_bytes(&clean, "vilan.toml", manifest);
+    write_bytes(&marked, "vilan.toml", &[BOM, manifest.as_slice()].concat());
+
+    let source = "import std::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n";
+    write_bytes(&clean, "main.vl", source.as_bytes());
+    write_bytes(&marked, "main.vl", source.as_bytes());
+
+    let plain = vilan(&clean, &["build", "main.vl", "--stdout"]);
+    let windows = vilan(&marked, &["build", "main.vl", "--stdout"]);
+    assert!(plain.status.success(), "{}", combined(&plain));
+    assert!(
+        windows.status.success(),
+        "a BOM'd vilan.toml must build: {}",
+        combined(&windows)
+    );
+    assert_eq!(
+        plain.stdout, windows.stdout,
+        "a BOM'd manifest must produce the same bundle as its clean twin"
+    );
+    cleanup(&clean);
+    cleanup(&marked);
+}

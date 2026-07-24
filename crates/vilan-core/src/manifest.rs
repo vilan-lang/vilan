@@ -215,6 +215,14 @@ impl Manifest {
     /// non-fatal warnings (e.g. unknown top-level keys, which a forward-compatible
     /// reader ignores rather than rejects). Structural / type errors are `Err`.
     pub fn parse(text: &str) -> Result<(Manifest, Vec<String>), String> {
+        // A leading BOM is an encoding marker, not TOML (`windows-support.md`
+        // §2) — a Windows editor's default "UTF-8 with BOM". This is the choke
+        // point every manifest read goes through, so stripping here covers all
+        // of them, and it matches `util::read_source`: no reader in the
+        // toolchain hands a BOM to a parser. MEASURED: `toml` 0.8 already
+        // tolerates a leading BOM, so this is the guarantee rather than a fix
+        // for an observed failure — the pins below are guards.
+        let text = crate::util::strip_bom(text);
         let manifest: Manifest = toml::from_str(text).map_err(|error| error.to_string())?;
         // Unknown top-level keys are ignored (forward-compat), but worth flagging
         // so a typo doesn't silently do nothing. A second, untyped parse keeps the
@@ -584,8 +592,12 @@ fn resolve_dependency_edges(
             continue;
         };
         let dependency_dir = base_dir.join(relative);
-        let canonical =
-            std::fs::canonicalize(&dependency_dir).unwrap_or_else(|_| dependency_dir.clone());
+        // The dedup map's key AND the cycle set's member. Both must be one
+        // canonical form (`windows-support.md` §5): a raw-string fallback lets
+        // `../lib` and `../lib/.` key two entries for one package, and Windows'
+        // `\\?\` prefix would do the same for a mix of on-disk and not-yet-on-disk
+        // directories — duplicating a package, or hiding a cycle.
+        let canonical = crate::util::canonical_path(&dependency_dir);
         if let Some(&index) = index_by_path.get(&canonical) {
             edges.push((import_name.clone(), index));
             continue;
@@ -665,6 +677,80 @@ mod tests {
 
     fn parse(text: &str) -> Manifest {
         Manifest::parse(text).expect("parses").0
+    }
+
+    #[test]
+    fn a_byte_order_marked_manifest_parses_like_its_clean_twin() {
+        // "UTF-8 with BOM" is a Windows editor default. A GUARD, not a
+        // discriminator: `toml` 0.8 happens to tolerate a leading BOM today
+        // (measured), so this pins the guarantee against a parser that does
+        // not — and against the strip being dropped.
+        let clean = "[package]\nname = \"web\"\ntarget = \"browser\"\n";
+        let marked = format!("\u{feff}{clean}");
+        let (clean_manifest, clean_warnings) = Manifest::parse(clean).expect("the clean twin");
+        let (marked_manifest, marked_warnings) =
+            Manifest::parse(&marked).expect("a BOM'd manifest parses");
+        assert_eq!(
+            marked_manifest.package.as_ref().map(|p| p.name.clone()),
+            clean_manifest.package.as_ref().map(|p| p.name.clone())
+        );
+        assert_eq!(
+            marked_manifest
+                .package
+                .as_ref()
+                .and_then(|p| p.resolved_target()),
+            Some(Platform::Browser)
+        );
+        assert_eq!(marked_warnings, clean_warnings);
+        assert!(marked_manifest.validate().is_empty());
+    }
+
+    #[test]
+    fn an_interior_feff_is_still_a_syntax_error() {
+        // Only offset 0 is an encoding marker; the strip must not swallow one
+        // that appears as content.
+        assert!(Manifest::parse("[package]\n\u{feff}name = \"web\"\n").is_err());
+    }
+
+    #[test]
+    fn one_dependency_reached_by_two_spellings_is_one_package() {
+        // The dedup map's key and the cycle set's member go through
+        // `util::canonical_path` (windows-support.md §5). Before that, `../lib`
+        // and `../lib/.` keyed two entries for one package — and on Windows a
+        // `\\?\` mix would do the same.
+        let root = std::env::temp_dir().join(format!("vilan-dep-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let library = root.join("lib");
+        std::fs::create_dir_all(library.join("src")).expect("create the library");
+        std::fs::write(library.join("vilan.toml"), "[library]\nname = \"lib\"\n")
+            .expect("manifest");
+        std::fs::write(library.join("src").join("lib.vl"), "").expect("lib.vl");
+        let application = root.join("app");
+        std::fs::create_dir_all(application.join("src")).expect("create the app");
+
+        let mut packages = Vec::new();
+        let mut index_by_path = HashMap::new();
+        let mut visiting = HashSet::new();
+        let mut dependencies = BTreeMap::new();
+        let path_dependency = |path: &str| Dependency::Detailed {
+            version: None,
+            registry: None,
+            path: Some(PathBuf::from(path)),
+        };
+        dependencies.insert("plain".to_string(), path_dependency("../lib"));
+        dependencies.insert("roundabout".to_string(), path_dependency("../lib/./../lib"));
+        let edges = resolve_dependency_edges(
+            &dependencies,
+            &application,
+            &mut packages,
+            &mut index_by_path,
+            &mut visiting,
+        )
+        .expect("both spellings resolve");
+        assert_eq!(packages.len(), 1, "one package, not one per spelling");
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].1, edges[1].1, "both edges point at the same index");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

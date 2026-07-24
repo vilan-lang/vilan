@@ -98,23 +98,18 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
     ProjectContext::none()
 }
 
-/// Whether two paths name the same file (canonicalizing when possible).
+/// Whether two paths name the same file. Both sides go through the one
+/// canonicalization helper (`windows-support.md` §5), so the comparison is like
+/// with like whether or not the file is on disk yet — the raw-string fallback
+/// this replaces made a not-yet-saved buffer invisible whenever the two
+/// spellings differed by a `.` or a `..`.
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
+    vilan_core::util::canonical_path(a) == vilan_core::util::canonical_path(b)
 }
 
-/// Whether `file` lives within `directory` (canonicalizing when possible).
+/// Whether `file` lives within `directory`, through the same helper.
 fn is_within(directory: &Path, file: &Path) -> bool {
-    match (
-        std::fs::canonicalize(directory),
-        std::fs::canonicalize(file),
-    ) {
-        (Ok(directory), Ok(file)) => file.starts_with(directory),
-        _ => file.starts_with(directory),
-    }
+    vilan_core::util::canonical_path(file).starts_with(vilan_core::util::canonical_path(directory))
 }
 
 /// A package source root for a file with no manifest: its own directory.
@@ -2450,6 +2445,42 @@ pub(crate) mod tests {
         std::env::var_os("VILAN_STD")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"))
+    }
+
+    // `same_file` / `is_within` decide a document's package and platform, so a
+    // false negative silently drops a file's project context. Both go through
+    // `vilan_core::util::canonical_path` (windows-support.md §5) — including
+    // the arm where the path is NOT on disk, which used to compare raw strings.
+    #[test]
+    fn same_file_agrees_across_spellings_of_a_path_not_on_disk() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-samefile-{}", std::process::id()));
+        let spelled = root.join("src/./pkg/../pkg/main.vl");
+        let plain = root.join("src/pkg/main.vl");
+        assert!(!plain.exists(), "the pin needs a path not on disk");
+        assert!(same_file(&spelled, &plain));
+        assert!(!same_file(&plain, &root.join("src/pkg/other.vl")));
+    }
+
+    #[test]
+    fn is_within_agrees_across_spellings_of_a_path_not_on_disk() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-within-{}", std::process::id()));
+        let directory = root.join("pkg/./src");
+        let file = root.join("pkg/src/deep/main.vl");
+        assert!(!file.exists(), "the pin needs a path not on disk");
+        assert!(is_within(&directory, &file));
+        assert!(!is_within(&root.join("pkg/other"), &file));
+    }
+
+    #[test]
+    fn same_file_and_is_within_agree_on_a_path_that_is_on_disk() {
+        let root = std::env::temp_dir().join(format!("vilan-lsp-ondisk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/main.vl");
+        std::fs::write(&file, "fun main() {}\n").unwrap();
+        assert!(same_file(&root.join("src/../src/./main.vl"), &file));
+        assert!(is_within(&root.join("./src"), &file));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A throwaway on-disk package: `files` written under a fresh temp dir,

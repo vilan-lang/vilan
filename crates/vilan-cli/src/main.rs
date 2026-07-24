@@ -378,7 +378,7 @@ fn run_watch(
         activate_hmr(&file, hmr_port)
     };
     let mut state = WatchState::default();
-    watch_loop(&roots, move || match &channel {
+    let code = watch_loop(&roots, move || match &channel {
         Some(channel) => {
             child = hmr_round(
                 channel,
@@ -396,10 +396,23 @@ fn run_watch(
             if let Some(mut previous) = child.take() {
                 let _ = previous.kill();
                 let _ = previous.wait();
+                // The child is reaped, so nothing holds the round's temp script
+                // any more and it can be removed before the next one writes it.
+                remove_watch_script();
             }
             child = build_and_spawn_run(file.clone(), &args, entry.as_deref());
         }
-    })
+    });
+    // Reached ONLY when there was nothing to watch — i.e. before any script was
+    // written. The delivered half of the cleanup is the per-round delete above,
+    // which is what closes the Windows sharing violation (the script is never
+    // rewritten while a `node` child holds it). The Ctrl-C path does NOT run
+    // this: `watch_loop` never returns from its loop, so ending a watch session
+    // leaks exactly one `vilan-watch-<pid>.js`. Installing an exit hook is
+    // process-lifecycle work and belongs to `windows-support.md` §6 (S4), not
+    // here.
+    remove_watch_script();
+    code
 }
 
 /// The carried-over state of an HMR `run --watch` across rounds (backlog E12):
@@ -752,6 +765,30 @@ fn manifest_fingerprint(root: &Path) -> u64 {
     hasher.finish()
 }
 
+/// The temp script a single-package `run --watch` round executes. One per
+/// process (the pid keys it), rewritten each round.
+fn watch_script_path() -> PathBuf {
+    env::temp_dir().join(format!("vilan-watch-{}.js", std::process::id()))
+}
+
+/// Removes the round's temp script, best effort. Called once the child that was
+/// executing it is killed AND reaped: Windows has no unlink-while-open, so
+/// rewriting the file under a live `node` is an intermittent sharing violation
+/// — and leaving it behind is a temp-directory leak on every platform
+/// (`windows-support.md` §5). A missing file is success.
+fn remove_watch_script() {
+    let script = watch_script_path();
+    if let Err(error) = fs::remove_file(&script) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "{} cannot remove {}: {error}",
+                paint::warning_prefix(),
+                script.display()
+            );
+        }
+    }
+}
+
 /// Builds the run target and spawns it with Node **without waiting**, returning the
 /// child so the next `run --watch` round can stop it. `None` after reporting a
 /// compile error or a non-runnable project.
@@ -794,7 +831,7 @@ fn build_and_spawn_run(
             // S0); the workspace arm below gets this for free via
             // `build_workspace_artifacts`.
             write_assets(&unit.entry.with_extension("js"), &assets);
-            let script = env::temp_dir().join(format!("vilan-watch-{}.js", std::process::id()));
+            let script = watch_script_path();
             if let Err(error) = fs::write(&script, javascript) {
                 eprintln!(
                     "{} cannot write {}: {error}",
@@ -2153,5 +2190,28 @@ mod tests {
         assert_eq!(scan_vl(&roots), after_js, "a new `.js` is not a change");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The `run --watch` temp script used to be rewritten every round and never
+    // removed: a temp-directory leak everywhere, and an intermittent sharing
+    // violation on Windows, which has no unlink-while-open
+    // (windows-support.md §5). The restart round removes it once the child that
+    // was executing it is killed and reaped; the loop is interactive, so what is
+    // pinnable in-process is the cleanup helper itself.
+    #[test]
+    fn the_watch_script_is_removed_and_a_missing_one_is_not_an_error() {
+        let script = watch_script_path();
+        assert!(
+            script.starts_with(env::temp_dir()),
+            "the round's script lives in the temp directory: {}",
+            script.display()
+        );
+        fs::write(&script, "// a round's compiled program\n").unwrap();
+        assert!(script.exists());
+        remove_watch_script();
+        assert!(!script.exists(), "the round's script must not survive it");
+        // Idempotent: the loop-exit call runs after the round already removed it.
+        remove_watch_script();
+        assert!(!script.exists());
     }
 }

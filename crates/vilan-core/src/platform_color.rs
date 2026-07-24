@@ -515,7 +515,9 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
         return None;
     }
     let source = program.source_of(node)?;
-    let path = program.sources.get(source.0 as usize)?;
+    // Canonicalized on both sides — `layer_platforms`' roots and
+    // `canonical_sources` alike (`windows-support.md` §5).
+    let path = program.canonical_sources.get(source.0 as usize)?;
     for (root, _library, label, patterns) in &program.layer_platforms {
         if !patterns.is_empty() && path.starts_with(root) {
             return Some(Requirement { label, patterns });
@@ -534,13 +536,19 @@ fn frame_label(program: &Program, id: Id) -> String {
     }
     let module = program
         .source_of(id)
-        .and_then(|source| program.sources.get(source.0 as usize))
-        .and_then(|path| {
+        .and_then(|source| {
+            // The STEM comes from the spelling the user gave; the containment
+            // test from the canonical form (`windows-support.md` §5).
+            let path = program.sources.get(source.0 as usize)?;
+            let canonical = program.canonical_sources.get(source.0 as usize)?;
+            Some((path, canonical))
+        })
+        .and_then(|(path, canonical)| {
             let stem = path.file_stem()?.to_string_lossy().into_owned();
             let library = program
                 .layer_platforms
                 .iter()
-                .find(|(root, _, _, _)| path.starts_with(root))
+                .find(|(root, _, _, _)| canonical.starts_with(root))
                 .map(|(_, library, _, _)| library.clone())?;
             Some(if stem == "lib" {
                 library
@@ -560,7 +568,9 @@ fn is_user_code(program: &Program, id: Id) -> bool {
     let Some(source) = program.source_of(id) else {
         return false;
     };
-    let Some(path) = program.sources.get(source.0 as usize) else {
+    // Canonicalized on both sides (`windows-support.md` §5) — a mismatch here
+    // silently reclassifies library code as the user's own.
+    let Some(path) = program.canonical_sources.get(source.0 as usize) else {
         return false;
     };
     !program

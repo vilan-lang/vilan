@@ -44,6 +44,13 @@ The path names a module file that doesn't exist. `pkg::routes` means
 the package you're in.
 → [Hello vilan](../tour/hello-vilan.md)
 
+**"module '…' resolved to '…' on disk, but it is imported as '…'"**
+Your filesystem ignores case (NTFS, and macOS by default) and answered
+the import with a differently-cased file. Module names match byte for
+byte (§4.2), so this would fail to build on a case-sensitive filesystem
+— rename the file or the import so the two agree.
+→ [Names, modules, and packages](../spec/names.md)
+
 ## Types and generics
 
 **"Expected …, but got … instead."**
