@@ -8,11 +8,22 @@
 //! two: the fake release binaries are `#!/bin/sh` scripts, they are made
 //! executable through `PermissionsExt`'s `0o755` (the import below does not
 //! even exist on Windows — unconditionally it makes `cargo test` fail to
-//! COMPILE there), the fixture tree is built with `tar`/`sha256sum`, and the
-//! `file://` base URL is assembled by string concatenation from a unix path.
-//! A Windows twin arrives with S6's upgrade work — which is what teaches
-//! `vilan upgrade` the `.zip` asset, the in-process checksum and the
-//! rename-the-running-exe dance — not before. Listed, never silently skipped.
+//! COMPILE there), the fixture tree is built with `tar`/`sha256sum`, the
+//! stale-cache entry is backdated with `touch -d`, and the `file://` base URL
+//! is assembled by string concatenation from a unix path.
+//!
+//! S6 taught `vilan upgrade` the `.zip` asset, the in-process checksum and the
+//! rename-the-running-exe dance, and **a Windows twin of this file did not
+//! land with it**: every fixture ingredient above is unix-shaped, and the one
+//! portable substitute for the shell-script payload (a copy of the real
+//! `vilan.exe`) makes the swap unobservable — the before and after banners
+//! would be identical, which is precisely what these tests assert on. The
+//! Windows-specific behavior is instead pinned where it can actually be
+//! *executed* from either platform: `upgrade.rs`'s `install_binaries` takes
+//! the rename-aside strategy as a parameter, and its unit tests run both arms
+//! and assert they differ. What remains Windows-only — that the aside rename
+//! succeeds against a *running* executable — is S6's live-host item.
+//! Listed, never silently skipped.
 #![cfg(unix)]
 
 use std::fs;

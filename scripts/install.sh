@@ -34,7 +34,8 @@ target() {
             esac
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
-            fail "native Windows isn't supported yet — install inside WSL (https://learn.microsoft.com/windows/wsl/install) and re-run this script there"
+            fail "this script installs the unix build — for native Windows, run the PowerShell installer instead:
+    irm https://github.com/$REPO/releases/latest/download/install.ps1 | iex"
             ;;
         *) fail "unsupported platform: $os" ;;
     esac

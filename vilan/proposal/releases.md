@@ -152,6 +152,10 @@ is proven. Homebrew tap alongside it.
      rename-the-running-exe dance on Windows), updating `vilan-lsp`
      beside it.
   - `vilan upgrade --check` does steps 1–2 only.
+  - *Implemented*, dance included, in windows-support.md's S6: the running
+    `vilan.exe` is renamed aside to `vilan.exe.old` and swept at the start
+    of the next upgrade run; the sha256 moved in-process (`sha2`) on every
+    platform, so step 3 no longer needs `sha256sum`/`shasum`.
 - **No passive checks.** The CLI never touches the network unless the
   user runs `upgrade`. This is a privacy stance, stated in the docs.
 - **The extension**: point it at `~/.vilan/bin/vilan-lsp` in its binary

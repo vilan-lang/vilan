@@ -3,16 +3,28 @@
 //!
 //! The CLI never touches the network except here, on explicit request. The
 //! work is delegated to the same tools the install script already requires
-//! (`curl`, `tar`, `sha256sum`/`shasum`), so upgrading works exactly where
-//! installing worked and the binary carries no HTTP/TLS machinery.
+//! (`curl`, `tar`), so upgrading works exactly where installing worked and the
+//! binary carries no HTTP/TLS machinery. The checksum is the one deliberate
+//! exception: it is computed in-process, because Windows ships neither
+//! `sha256sum` nor `shasum` — one code path on every platform, and the "no
+//! sha256 tool found" failure class is gone (windows-support.md §8, §10e).
 //!
-//! Release assets are versionless (`vilan-<target>.tar.gz`), so the newest
-//! version is discovered without an API round-trip: `releases/latest`
-//! redirects to `releases/tag/v<version>`, and the assets are then fetched
-//! from that tag's own download path (pinned — a release published mid-run
-//! can't mix versions). The swap is atomic per binary: the new file is staged
-//! *inside* the install directory and renamed over the old one (same
-//! filesystem, and a running executable keeps its inode on unix).
+//! Release assets are versionless (`vilan-<target>.tar.gz`, or `.zip` on the
+//! Windows targets), so the newest version is discovered without an API
+//! round-trip: `releases/latest` redirects to `releases/tag/v<version>`, and
+//! the assets are then fetched from that tag's own download path (pinned — a
+//! release published mid-run can't mix versions).
+//!
+//! The swap is atomic per binary — the replacement is staged *inside* the
+//! install directory and renamed into place, same filesystem — but the two
+//! platforms reach that rename differently:
+//!
+//! - **unix** renames straight over the old file; a running executable keeps
+//!   its inode, so the upgrading process is unharmed.
+//! - **Windows** forbids renaming over (or deleting) a running executable, but
+//!   it does permit renaming it *aside* — so the old file moves to
+//!   `vilan.exe.old` first, and the leftovers are swept at the start of the
+//!   next upgrade run. Exactly the dance releases.md §6 recorded.
 //!
 //! Test seams (undocumented, for the integration tests): `$VILAN_UPGRADE_BASE`
 //! replaces the repository base URL (a `file://` tree works — `curl` speaks
@@ -21,7 +33,13 @@
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use sha2::{Digest, Sha256};
+
 use crate::paint::{self, Style};
+
+/// The platform's discard sink for `curl -o` (`/dev/null` has no Windows
+/// equivalent path, but `NUL` is the same idea).
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 const DEFAULT_BASE: &str = "https://github.com/ReedSyllas/vilan";
 
@@ -75,7 +93,11 @@ fn run(check_only: bool) -> Result<(), String> {
         .ok_or_else(|| "the running binary has no parent directory".to_string())?
         .to_path_buf();
 
-    let asset = format!("vilan-{}.tar.gz", env!("VILAN_TARGET"));
+    // A previous Windows upgrade renamed the then-running executable aside;
+    // that process is gone now, so its leftover is finally deletable.
+    sweep_aside_leftovers(&install_dir);
+
+    let asset = asset_name(env!("VILAN_TARGET"));
     let download_base = format!("{base}/releases/download/v{latest_label}");
     let workdir = std::env::temp_dir().join(format!("vilan-upgrade-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&workdir);
@@ -116,8 +138,12 @@ fn download_verify_swap(
     )?;
     verify_checksum(workdir, asset)?;
 
+    // `-xf`, not `-xzf`: both tars in play detect the compression themselves
+    // (GNU tar since 1.15, bsdtar always), and bsdtar — the `tar` Windows
+    // ships — additionally reads the `.zip` asset, which `-z` would reject.
+    // One command for every platform and both archive kinds.
     let status = Command::new("tar")
-        .args(["-xzf", asset])
+        .args(["-xf", asset])
         .current_dir(workdir)
         .status()
         .map_err(|error| format!("cannot run tar: {error}"))?;
@@ -126,7 +152,7 @@ fn download_verify_swap(
     }
 
     // Sanity before touching anything: the downloaded binary must execute.
-    let unpacked = workdir.join("vilan");
+    let unpacked = workdir.join(format!("vilan{}", std::env::consts::EXE_SUFFIX));
     let version_probe = Command::new(&unpacked)
         .arg("--version")
         .output()
@@ -135,21 +161,12 @@ fn download_verify_swap(
         return Err("the downloaded vilan does not report a version".to_string());
     }
 
-    // Stage inside the install directory, then rename — atomic on the same
-    // filesystem, and safe over a running executable on unix. `vilan-lsp`
-    // first so the pair is never newer-cli/older-lsp.
-    for binary in ["vilan-lsp", "vilan"] {
-        let staged = install_dir.join(format!(".{binary}.upgrade-{}", std::process::id()));
-        std::fs::copy(workdir.join(binary), &staged)
-            .map_err(|error| format!("cannot stage into {}: {error}", install_dir.display()))?;
-        std::fs::rename(&staged, install_dir.join(binary)).map_err(|error| {
-            let _ = std::fs::remove_file(&staged);
-            format!(
-                "cannot replace {}: {error}",
-                install_dir.join(binary).display()
-            )
-        })?;
-    }
+    install_binaries(
+        workdir,
+        install_dir,
+        std::env::consts::EXE_SUFFIX,
+        cfg!(windows),
+    )?;
 
     let installed = String::from_utf8_lossy(&version_probe.stdout)
         .trim()
@@ -185,6 +202,80 @@ fn download_verify_swap(
     Ok(())
 }
 
+/// The release asset for `target`. The Windows targets ship a `.zip` (the
+/// platform's convention, and what `install.ps1` consumes); everyone else a
+/// gzipped tarball.
+fn asset_name(target: &str) -> String {
+    let extension = if target.contains("windows-msvc") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("vilan-{target}.{extension}")
+}
+
+/// Move the freshly unpacked binaries from `workdir` into `install_dir`.
+///
+/// `rename_aside` selects the Windows strategy — move the old file to
+/// `<name>.old` before renaming the replacement in, because it may be the
+/// running executable — over unix's rename-over. It is a parameter rather than
+/// a `cfg!` so that both strategies, and the difference between them, are
+/// exercisable from either platform's tests.
+fn install_binaries(
+    workdir: &Path,
+    install_dir: &Path,
+    executable_suffix: &str,
+    rename_aside: bool,
+) -> Result<(), String> {
+    // `vilan-lsp` first so the pair is never newer-cli/older-lsp.
+    for binary in ["vilan-lsp", "vilan"] {
+        let name = format!("{binary}{executable_suffix}");
+        let destination = install_dir.join(&name);
+        let staged = install_dir.join(format!(".{name}.upgrade-{}", std::process::id()));
+        std::fs::copy(workdir.join(&name), &staged)
+            .map_err(|error| format!("cannot stage into {}: {error}", install_dir.display()))?;
+        if rename_aside && destination.exists() {
+            let aside = install_dir.join(format!("{name}.old"));
+            let _ = std::fs::remove_file(&aside);
+            std::fs::rename(&destination, &aside).map_err(|error| {
+                let _ = std::fs::remove_file(&staged);
+                format!("cannot move {} aside: {error}", destination.display())
+            })?;
+        }
+        std::fs::rename(&staged, &destination).map_err(|error| {
+            let _ = std::fs::remove_file(&staged);
+            format!("cannot replace {}: {error}", destination.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Does `file_name` name an executable a previous upgrade renamed aside?
+/// Selection only, no filesystem, so both platforms' spellings are pinnable
+/// from either.
+fn is_aside_leftover(file_name: &str, executable_suffix: &str) -> bool {
+    ["vilan", "vilan-lsp"]
+        .iter()
+        .any(|binary| file_name == format!("{binary}{executable_suffix}.old"))
+}
+
+/// Best-effort removal of the executables a previous upgrade renamed aside.
+/// One still locked by a running process simply waits for the run after this
+/// one; nothing here is allowed to fail an upgrade.
+fn sweep_aside_leftovers(install_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(install_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if is_aside_leftover(
+            &entry.file_name().to_string_lossy(),
+            std::env::consts::EXE_SUFFIX,
+        ) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// The newest release's version label (no `v`), from `$VILAN_UPGRADE_LATEST`
 /// or the `releases/latest` redirect.
 fn discover_latest(base: &str) -> Result<String, String> {
@@ -195,7 +286,7 @@ fn discover_latest(base: &str) -> Result<String, String> {
         .args([
             "-fsSLI",
             "-o",
-            "/dev/null",
+            NULL_DEVICE,
             "-w",
             "%{url_effective}",
             &format!("{base}/releases/latest"),
@@ -226,31 +317,44 @@ fn fetch(url: &str, to: &Path) -> Result<(), String> {
 }
 
 /// Verify `asset` against the release's `sha256sums.txt` (both already in
-/// `workdir`), with whichever checksum tool the platform has.
+/// `workdir`). The hash is computed in-process on every platform — see the
+/// module doc.
 fn verify_checksum(workdir: &Path, asset: &str) -> Result<(), String> {
     let sums = std::fs::read_to_string(workdir.join("sha256sums.txt"))
         .map_err(|error| format!("cannot read sha256sums.txt: {error}"))?;
-    let line = sums
-        .lines()
-        .find(|line| line.ends_with(&format!(" {asset}")))
+    let expected = recorded_checksum(&sums, asset)
         .ok_or_else(|| format!("sha256sums.txt has no entry for {asset}"))?;
-    let expectation = workdir.join(".expected-sum");
-    std::fs::write(&expectation, format!("{line}\n"))
-        .map_err(|error| format!("cannot write the checksum expectation: {error}"))?;
-
-    for tool in [&["sha256sum", "-c"][..], &["shasum", "-a", "256", "-c"][..]] {
-        let run = Command::new(tool[0])
-            .args(&tool[1..])
-            .arg(&expectation)
-            .current_dir(workdir)
-            .output();
-        match run {
-            Err(_) => continue, // tool not present; try the next
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(_) => return Err(format!("checksum mismatch for {asset} — aborting")),
-        }
+    let actual = sha256_file(&workdir.join(asset))?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!("checksum mismatch for {asset} — aborting"));
     }
-    Err("no sha256 tool found (sha256sum or shasum) — cannot verify the download".to_string())
+    Ok(())
+}
+
+/// The hash `sha256sums.txt` records for `asset`. The format is `sha256sum`'s
+/// own: the hash, two spaces (or ` *` in binary mode), the file name.
+fn recorded_checksum<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
+    sums.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let hash = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name == asset && fields.next().is_none()).then_some(hash)
+    })
+}
+
+/// The SHA-256 of a file, lowercase hex — streamed, so a release tarball is
+/// never held in memory whole.
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// `".../releases/tag/v0.3.0"` → `"0.3.0"`.
@@ -278,7 +382,20 @@ fn parse_version(label: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, version_from_tag_url};
+    use super::{
+        asset_name, install_binaries, is_aside_leftover, parse_version, recorded_checksum,
+        sha256_file, sweep_aside_leftovers, verify_checksum, version_from_tag_url,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A scratch directory of this test's own, removed on the next run.
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("vilan-upgrade-unit-{name}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create the scratch directory");
+        path
+    }
 
     #[test]
     fn versions_parse_and_order() {
@@ -315,5 +432,254 @@ mod tests {
             version_from_tag_url("https://github.com/x/y/releases/tag/nightly"),
             None
         );
+    }
+
+    #[test]
+    fn the_asset_extension_follows_the_target() {
+        assert_eq!(
+            asset_name("x86_64-pc-windows-msvc"),
+            "vilan-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            asset_name("aarch64-pc-windows-msvc"),
+            "vilan-aarch64-pc-windows-msvc.zip"
+        );
+        for target in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ] {
+            assert_eq!(asset_name(target), format!("vilan-{target}.tar.gz"));
+        }
+        // This binary's own target must name an asset the release workflow
+        // actually publishes.
+        let own = asset_name(env!("VILAN_TARGET"));
+        assert!(
+            own.ends_with(".zip") == cfg!(windows),
+            "the running platform asks for the wrong archive kind: {own}"
+        );
+    }
+
+    #[test]
+    fn the_recorded_checksum_is_found_by_exact_file_name() {
+        let sums = "\
+1111111111111111111111111111111111111111111111111111111111111111  install.sh
+2222222222222222222222222222222222222222222222222222222222222222 *vilan-x86_64-pc-windows-msvc.zip
+3333333333333333333333333333333333333333333333333333333333333333  vilan-x86_64-unknown-linux-musl.tar.gz
+";
+        assert_eq!(
+            recorded_checksum(sums, "install.sh"),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        // Binary-mode (`*`) entries are the same entries.
+        assert_eq!(
+            recorded_checksum(sums, "vilan-x86_64-pc-windows-msvc.zip"),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            recorded_checksum(sums, "vilan-x86_64-unknown-linux-musl.tar.gz"),
+            Some("3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        assert_eq!(
+            recorded_checksum(sums, "vilan-aarch64-apple-darwin.tar.gz"),
+            None
+        );
+        // A suffix of a recorded name is not that name (the old shell-out
+        // matched with a trailing-space grep, which this must not regress to).
+        assert_eq!(recorded_checksum(sums, "musl.tar.gz"), None);
+        assert_eq!(recorded_checksum(sums, "sh"), None);
+        assert_eq!(recorded_checksum("", "anything"), None);
+    }
+
+    #[test]
+    fn the_hash_matches_the_published_sha256_vectors() {
+        let directory = scratch("hash");
+        // FIPS 180-2 vectors: the empty input and "abc".
+        for (content, expected) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            let file = directory.join("payload");
+            fs::write(&file, content).expect("write the payload");
+            assert_eq!(sha256_file(&file).expect("hash the payload"), expected);
+        }
+        assert!(
+            sha256_file(&directory.join("absent")).is_err(),
+            "a missing file is an error, not a hash"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn verification_accepts_the_real_hash_and_rejects_a_flipped_one() {
+        let directory = scratch("verify");
+        fs::write(directory.join("asset.tar.gz"), "the release payload").expect("write the asset");
+        let real = sha256_file(&directory.join("asset.tar.gz")).expect("hash the asset");
+        fs::write(
+            directory.join("sha256sums.txt"),
+            format!("{real}  asset.tar.gz\ndeadbeef  other.zip\n"),
+        )
+        .expect("write the sums");
+        assert!(verify_checksum(&directory, "asset.tar.gz").is_ok());
+        // Uppercase hex is the same hash (`Get-FileHash` writes it that way).
+        fs::write(
+            directory.join("sha256sums.txt"),
+            format!("{}  asset.tar.gz\n", real.to_uppercase()),
+        )
+        .expect("write the sums");
+        assert!(verify_checksum(&directory, "asset.tar.gz").is_ok());
+
+        let flipped: String = real
+            .chars()
+            .enumerate()
+            .map(|(index, digit)| {
+                if index > 0 {
+                    digit
+                } else if digit == '0' {
+                    'f'
+                } else {
+                    '0'
+                }
+            })
+            .collect();
+        fs::write(
+            directory.join("sha256sums.txt"),
+            format!("{flipped}  asset.tar.gz\n"),
+        )
+        .expect("write the sums");
+        let error = verify_checksum(&directory, "asset.tar.gz").expect_err("a flipped hash fails");
+        assert!(error.contains("checksum mismatch"), "{error}");
+        // An asset with no entry at all is its own, distinct failure.
+        let error = verify_checksum(&directory, "absent.zip").expect_err("no entry fails");
+        assert!(error.contains("no entry for absent.zip"), "{error}");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn only_the_renamed_aside_executables_are_leftovers() {
+        for (suffix, aside) in [("", "vilan.old"), (".exe", "vilan.exe.old")] {
+            assert!(is_aside_leftover(aside, suffix));
+            assert!(is_aside_leftover(&format!("vilan-lsp{suffix}.old"), suffix));
+            // Not the live binaries, not a staged copy, not a user's file.
+            assert!(!is_aside_leftover(&format!("vilan{suffix}"), suffix));
+            assert!(!is_aside_leftover(".vilan.upgrade-1234", suffix));
+            assert!(!is_aside_leftover("notes.old", suffix));
+            assert!(!is_aside_leftover("vilan.old.old", suffix));
+        }
+        // The suffixes do not cross: an `.exe.old` is not a leftover on unix.
+        assert!(!is_aside_leftover("vilan.exe.old", ""));
+        assert!(!is_aside_leftover("vilan.old", ".exe"));
+    }
+
+    #[test]
+    fn the_sweep_removes_the_leftovers_and_nothing_else() {
+        let directory = scratch("sweep");
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let leftovers = [
+            format!("vilan{suffix}.old"),
+            format!("vilan-lsp{suffix}.old"),
+        ];
+        let keepers = [
+            format!("vilan{suffix}"),
+            format!("vilan-lsp{suffix}"),
+            "notes.old".to_string(),
+        ];
+        for name in leftovers.iter().chain(keepers.iter()) {
+            fs::write(directory.join(name), name).expect("seed the install directory");
+        }
+        sweep_aside_leftovers(&directory);
+        for name in &leftovers {
+            assert!(!directory.join(name).exists(), "{name} survived the sweep");
+        }
+        for name in &keepers {
+            assert!(directory.join(name).exists(), "{name} was swept away");
+        }
+        // A directory that does not exist is not an error.
+        sweep_aside_leftovers(&directory.join("absent"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The swap dance, both strategies, from this platform — and the assertion
+    /// that they differ, so neither arm can quietly become the other.
+    #[test]
+    fn the_swap_renames_aside_only_when_asked() {
+        for (rename_aside, name) in [(true, "aside"), (false, "over")] {
+            let root = scratch(&format!("swap-{name}"));
+            let workdir = root.join("work");
+            let install = root.join("bin");
+            fs::create_dir_all(&workdir).expect("create the work directory");
+            fs::create_dir_all(&install).expect("create the install directory");
+            for binary in ["vilan", "vilan-lsp"] {
+                fs::write(
+                    workdir.join(format!("{binary}.exe")),
+                    format!("new {binary}"),
+                )
+                .expect("stage the replacement");
+                fs::write(
+                    install.join(format!("{binary}.exe")),
+                    format!("old {binary}"),
+                )
+                .expect("seed the installed binary");
+            }
+
+            install_binaries(&workdir, &install, ".exe", rename_aside).expect("swap");
+
+            for binary in ["vilan", "vilan-lsp"] {
+                assert_eq!(
+                    fs::read_to_string(install.join(format!("{binary}.exe"))).expect("read"),
+                    format!("new {binary}"),
+                    "the replacement is in place either way"
+                );
+                let aside = install.join(format!("{binary}.exe.old"));
+                if rename_aside {
+                    assert_eq!(
+                        fs::read_to_string(&aside).expect("the old binary was moved aside"),
+                        format!("old {binary}"),
+                        "the old file survives under .old, deletable next run"
+                    );
+                } else {
+                    assert!(!aside.exists(), "unix renames straight over — no .old");
+                }
+            }
+            // Nothing staged is left behind on either path.
+            let strays: Vec<_> = fs::read_dir(&install)
+                .expect("list")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|entry| entry.contains(".upgrade-"))
+                .collect();
+            assert!(strays.is_empty(), "staging leftovers: {strays:?}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A first install (nothing to move aside) works under the Windows
+    /// strategy too — the `.old` step is conditional on there being an old.
+    #[test]
+    fn the_aside_swap_handles_an_empty_install_directory() {
+        let root = scratch("swap-first");
+        let workdir = root.join("work");
+        let install = root.join("bin");
+        fs::create_dir_all(&workdir).expect("create the work directory");
+        fs::create_dir_all(&install).expect("create the install directory");
+        for binary in ["vilan", "vilan-lsp"] {
+            fs::write(workdir.join(binary), format!("new {binary}")).expect("stage");
+        }
+        install_binaries(&workdir, &install, "", true).expect("swap");
+        for binary in ["vilan", "vilan-lsp"] {
+            assert_eq!(
+                fs::read_to_string(install.join(binary)).expect("read"),
+                format!("new {binary}")
+            );
+            assert!(!install.join(format!("{binary}.old")).exists());
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

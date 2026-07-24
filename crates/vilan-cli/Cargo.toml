@@ -15,6 +15,7 @@ vilan-embedded-std = { path = "../vilan-embedded-std" }
 ariadne = "0.6.0"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.5.2"
+sha2 = "0.10"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Console"] }

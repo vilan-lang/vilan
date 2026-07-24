@@ -44,6 +44,8 @@ jobs:
             runner: macos-latest
           - target: aarch64-apple-darwin
             runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -67,25 +69,49 @@ jobs:
           echo "musl-tools install failed after 5 attempts"
           exit 1
       - name: Build (build paths remapped away)
+        # `shell: bash` here and below: git-bash is preinstalled on the Windows
+        # runners, so one script serves every leg (the default shell there is
+        # pwsh, which speaks none of this).
+        shell: bash
         # The CC_/LINKER variables point cc-rs (psm, via chumsky's stacker)
-        # and the linker at musl-gcc; they are unused on the mac targets.
+        # and the linker at musl-gcc; they are unused on the mac and Windows
+        # targets.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          export RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=/vilan"
+          # git-bash spells $HOME and $PWD the POSIX way (a leading /<drive>
+          # and forward slashes), but the paths rustc embeds on Windows are the
+          # native ones — remap (and, in the next step, grep for) those instead,
+          # or the reproducibility check would pass by never matching anything.
+          if [ "${{ runner.os }}" = Windows ]; then
+              build_home="$USERPROFILE"
+              build_root="$GITHUB_WORKSPACE"
+              echo "EXE=.exe" >> "$GITHUB_ENV"
+          else
+              build_home="$HOME"
+              build_root="$PWD"
+              echo "EXE=" >> "$GITHUB_ENV"
+          fi
+          echo "BUILD_HOME=$build_home" >> "$GITHUB_ENV"
+          export RUSTFLAGS="--remap-path-prefix=$build_home=~ --remap-path-prefix=$build_root=/vilan"
           cargo build --release --target ${{ matrix.target }} -p vilan-cli -p vilan-lsp
       - name: No build-machine paths in the binaries
+        shell: bash
         run: |
           for binary in vilan vilan-lsp; do
-            if grep -q "$HOME" "target/${{ matrix.target }}/release/$binary"; then
+            # -F, not a regex: the Windows home is spelled with backslashes,
+            # which a basic regex would swallow and then never match.
+            if grep -qF "$BUILD_HOME" "target/${{ matrix.target }}/release/$binary$EXE"; then
               echo "$binary embeds the build home directory — remap failed"
               exit 1
             fi
           done
       - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir dist
           cp "target/${{ matrix.target }}/release/vilan" \
@@ -93,10 +119,28 @@ jobs:
              LICENSE-MIT LICENSE-APACHE dist/
           tar -czf "vilan-${{ matrix.target }}.tar.gz" -C dist \
               vilan vilan-lsp LICENSE-MIT LICENSE-APACHE
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        # A `.zip` is the Windows convention, and what `install.ps1` and
+        # `vilan upgrade` consume. `Compress-Archive` rather than one more
+        # bash step running `tar -a -cf …zip`: under `shell: bash` the `tar` on
+        # PATH is Git-for-Windows' GNU tar, whose `-a` cannot write zip and
+        # instead produces an *uncompressed tar named `.zip`* — exit 0, no
+        # warning (probe-verified with GNU tar 1.35). Compress-Archive has no
+        # such failure mode, and this is the only step that needs a second
+        # shell. Entries land at the archive root, matching the tarball layout.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/vilan.exe",
+                    "target/${{ matrix.target }}/release/vilan-lsp.exe",
+                    LICENSE-MIT, LICENSE-APACHE dist/
+          Compress-Archive -Path dist/* -DestinationPath "vilan-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: vilan-*.tar.gz
+          # `.tar.gz` or `.zip` — one archive per leg either way.
+          path: vilan-${{ matrix.target }}.*
           if-no-files-found: error
 
   vsix:
@@ -128,9 +172,11 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: assets
-      - name: Checksums + the install script
+      - name: Checksums + the install scripts
         run: |
-          cp scripts/install.sh assets/
+          cp scripts/install.sh scripts/install.ps1 assets/
+          # Hashes whatever assets exist, so the Windows .zip needs no
+          # special-casing here.
           cd assets && sha256sum * > sha256sums.txt
       - name: Release notes from the changelog
         run: |

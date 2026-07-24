@@ -94,15 +94,23 @@ test suite builds it on every run.
 
 ## Getting started
 
-Install the toolchain (Linux, macOS, or Windows via WSL; you'll also
-need [node](https://nodejs.org) to run what you build):
+Install the toolchain (Linux, macOS, or Windows; you'll also need
+[node](https://nodejs.org) to run what you build) — on Linux and macOS:
 
 ```sh
 curl -fsSL https://github.com/ReedSyllas/vilan/releases/latest/download/install.sh | sh
 ```
 
-That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` and prints the PATH
-line to add. Update any time with `vilan upgrade` (it only touches the
+and on Windows, in PowerShell:
+
+```powershell
+irm https://github.com/ReedSyllas/vilan/releases/latest/download/install.ps1 | iex
+```
+
+That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` — on Windows,
+`%USERPROFILE%\.vilan\bin`. The unix script prints the PATH line to add;
+the PowerShell one adds the directory to your user PATH itself, so open a
+new terminal afterwards. Update any time with `vilan upgrade` (it only touches the
 network when you run it). Each [release](https://github.com/ReedSyllas/vilan/releases)
 also carries `vilan-vscode.vsix` — the VS Code extension: highlighting,
 diagnostics, hover with docs on everything (keywords included),
@@ -119,15 +127,19 @@ cd vilan
 cargo install --path crates/vilan-cli   # installs the `vilan` binary
 ```
 
-Then:
+Then put this in `hello.vl`:
 
-```sh
-echo 'import std::print;
+```vilan
+import std::print;
 
 fun main() {
 	print("hello");
-}' > hello.vl
+}
+```
 
+and run it:
+
+```sh
 vilan run hello.vl
 ```
 
