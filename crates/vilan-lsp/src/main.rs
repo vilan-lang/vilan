@@ -745,7 +745,10 @@ impl Backend {
         if let Some(cached) = self.line_indices.get(path) {
             return Some(Arc::clone(cached.value()));
         }
-        let text = std::fs::read_to_string(path).ok()?;
+        // BOM-stripped, matching the analyzer's read of the same file
+        // (windows-support.md §2), so this index and the spans it converts
+        // index the same text.
+        let text = vilan_core::util::read_source(path).ok()?;
         let line_index = Arc::new(LineIndex::new(&text));
         self.line_indices
             .insert(path.to_path_buf(), Arc::clone(&line_index));

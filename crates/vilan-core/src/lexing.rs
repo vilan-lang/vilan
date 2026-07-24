@@ -417,7 +417,19 @@ impl<'src> Lexer<'src> {
                             .chars()
                             .next()
                             .expect("byte present implies a character");
-                        let end = self.position + 1 + escaped.len_utf8();
+                        let mut end = self.position + 1 + escaped.len_utf8();
+                        // A CRLF is ONE line terminator (windows-support.md §2), so
+                        // an escape whose escaped character is the CR must take the
+                        // whole pair. This is the only scanner that ends a fragment
+                        // on a character COUNT rather than a delimiter, so it is the
+                        // only one that could split a pair across two `String`
+                        // tokens — where the per-token normalization that builds the
+                        // value can no longer see it, and the CR would survive into
+                        // a value its LF twin does not have. (A plain `"…"` is one
+                        // contiguous token, so it cannot split.)
+                        if escaped == '\r' && self.bytes.get(end) == Some(&b'\n') {
+                            end += 1;
+                        }
                         parts.push(IStringPart::Text(&self.source[self.position..end]));
                         self.position = end;
                     }
@@ -776,6 +788,12 @@ mod tests {
         );
         // A `"…"` string may span lines.
         assert_eq!(lex("\"a\nb\""), vec![Token::String("a\nb")]);
+        // …including with CRLF endings, which the token keeps RAW like every
+        // other body character. The `\r\n`-is-one-line-terminator rule
+        // (windows-support.md §2, spec §2) applies where the literal's VALUE is
+        // built — `transformer::unescape_string` — not here, so that spans keep
+        // addressing the file exactly as it sits on disk.
+        assert_eq!(lex("\"a\r\nb\""), vec![Token::String("a\r\nb")]);
         // A triple-quoted string runs to the first `"""` and may hold a lone `"`.
         assert_eq!(
             lex(r#""""with " inner""""#),
@@ -819,6 +837,57 @@ mod tests {
                 Token::String("x"),
                 Token::Op("+"),
                 Token::String("}"),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escaped_crlf_stays_in_one_interpolated_fragment() {
+        // The fragment scanner ends an escape on a character COUNT, so `\` before
+        // a CRLF would otherwise end the fragment BETWEEN the CR and the LF —
+        // splitting one line terminator across two `String` tokens, where the
+        // per-token normalization that builds the value can no longer see the
+        // pair (windows-support.md §2). The pair must ride in one fragment.
+        assert_eq!(
+            lex("i\"a\\\r\nb\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("\\\r\n"),
+                Token::Op("+"),
+                Token::String("b"),
+                Token::Ctrl(')'),
+            ]
+        );
+        // A LONE `\r` after the backslash is not a line terminator, so the escape
+        // takes exactly the CR — one character, as before.
+        assert_eq!(
+            lex("i\"a\\\rb\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("\\\r"),
+                Token::Op("+"),
+                Token::String("b"),
+                Token::Ctrl(')'),
+            ]
+        );
+        // An UNESCAPED CRLF needs nothing: the text run is delimiter-driven, so
+        // the pair is already contiguous inside one fragment.
+        assert_eq!(
+            lex("i\"a\r\nb\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a\r\nb"),
                 Token::Ctrl(')'),
             ]
         );

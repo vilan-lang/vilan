@@ -25184,3 +25184,182 @@ fn browser_mount_surface_compiles_after_the_replace_change() {
         "#,
     );
 }
+
+// === Windows support S2: newline and BOM correctness (windows-support.md §2) ===
+//
+// A `\r\n` in source is ONE line terminator (spec §2), so a string literal's
+// value is built from the normalized text: a multi-line literal carries `\n` per
+// source line break whatever the file's on-disk encoding. The property that
+// matters is byte identity — the same program checked out on Windows and on
+// Linux must emit the same JavaScript — so every pin here compiles the SAME
+// source twice, once as written and once as its CRLF twin, and compares the
+// emitted JS byte for byte.
+
+/// The CRLF twin of an LF source: what the same file looks like checked out
+/// (or saved by an editor) with Windows line endings.
+fn crlf(source: &str) -> String {
+    source.replace('\n', "\r\n")
+}
+
+/// Compiles `source` and its CRLF twin and asserts the emitted JS is
+/// byte-identical, returning it for further assertions.
+fn assert_crlf_twin_emits_identically(source: &str) -> String {
+    let lf = compile(source).expect("the LF source compiles");
+    let windows = compile(&crlf(source)).expect("the CRLF twin compiles");
+    assert_eq!(
+        lf, windows,
+        "the CRLF twin must emit byte-identical JavaScript"
+    );
+    lf
+}
+
+#[test]
+fn a_multi_line_plain_string_from_crlf_source_emits_lf() {
+    // THE miscompile this slice exists to kill: a plain `"…"` spanning lines
+    // kept the `\r` in its VALUE, so a Windows checkout printed different text.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    let text = \"alpha\nbeta\";\n    text\n}\n",
+    );
+    assert!(javascript.contains(r#""alpha\nbeta""#), "{javascript}");
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn a_multi_line_interpolated_string_from_crlf_source_emits_lf() {
+    // The load-bearing form: multi-line `i"…"` is how a macro authors the source
+    // it returns (corpus `macro-derive.vl`), so it gets the same normalization.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    let who = \"world\";\n    i\"hello {who}\nagain\"\n}\n",
+    );
+    assert!(javascript.contains(r#""hello ""#), "{javascript}");
+    assert!(javascript.contains(r#""\nagain""#), "{javascript}");
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn a_multi_line_triple_quoted_string_from_crlf_source_emits_lf() {
+    // Triple-quoted literals already stripped CR deliberately; this pins that
+    // the single-quoted forms joining them did not disturb it.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    \"\"\"\n    a\n    b\n    \"\"\"\n}\n",
+    );
+    assert!(javascript.contains(r#""a\nb""#), "{javascript}");
+}
+
+#[test]
+fn a_mixed_crlf_program_emits_byte_identical_javascript() {
+    // Corpus-shaped: comments, imports, several declarations, single- and
+    // multi-line strings, an interpolation. The whole file, not one literal.
+    let javascript = assert_crlf_twin_emits_identically(
+        r#"
+        import std::print;
+
+        // A greeting, with a comment above it.
+        fun greeting(name: str): str {
+            i"hello, {name}!"
+        }
+
+        struct Note {
+            title: str,
+            body: str,
+        }
+
+        fun main() {
+            let note = Note { title = "one", body = "first line
+second line" };
+            print(greeting(note.title));
+            print(note.body);
+        }
+        "#,
+    );
+    assert!(!javascript.contains('\r'), "{javascript}");
+}
+
+#[test]
+fn emitted_javascript_from_crlf_source_has_no_carriage_return_through_a_macro() {
+    // The verbatim paths at once: a macro whose returned source is a multi-line
+    // i-string, invoked from a CRLF file. A macro's arguments and world text are
+    // raw source slices, so this is where a stray `\r` would ride into the
+    // generated code and out into the bundle.
+    let javascript = assert_crlf_twin_emits_identically(
+        r#"
+        import std::print;
+
+        macro fun constants(arguments: Arguments): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Arguments, Source };
+
+            mut body = "";
+            for name in arguments.values {
+                body = body + i"fun {name}(): i32 \{
+    7
+\}
+";
+            }
+            source(body)
+        }
+
+        macro constants(seven);
+
+        fun main() {
+            print(seven());
+        }
+        "#,
+    );
+    assert!(!javascript.contains('\r'), "{javascript}");
+    assert!(javascript.contains("function seven()"), "{javascript}");
+}
+
+#[test]
+fn a_lone_carriage_return_in_a_string_literal_is_preserved() {
+    // Classic-Mac endings are deliberately NOT blessed (windows-support.md §2):
+    // a `\r` with no following `\n` stays a character of the value. Pinned so
+    // the non-blessing is a decision rather than an oversight.
+    let javascript = compile("fun main(): str {\n    \"a\rb\"\n}\n").expect("compiles");
+    assert!(javascript.contains(r#""a\rb""#), "{javascript}");
+}
+
+#[test]
+fn a_backslash_before_a_crlf_line_break_in_an_interpolated_string_emits_lf() {
+    // The i-string fragment scanner ends an escape on a character COUNT, so a
+    // `\` immediately before a line break used to end its fragment BETWEEN the
+    // CR and the LF — one line terminator split across two `String` tokens,
+    // where per-token normalization can no longer see the pair, and the CR rode
+    // into the value. The same program, two encodings, one bundle.
+    let javascript = assert_crlf_twin_emits_identically("fun main(): str {\n    i\"a\\\nb\"\n}\n");
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn a_backslash_before_a_crlf_line_break_in_a_plain_string_emits_lf() {
+    // The plain `"…"` twin of the case above. It needs no lexer change — the
+    // whole body is ONE contiguous token, so the pair can never split — but it
+    // is the reason the fix belongs in the i-string scanner alone, so it is
+    // pinned rather than assumed.
+    let javascript = assert_crlf_twin_emits_identically("fun main(): str {\n    \"a\\\nb\"\n}\n");
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn an_escape_immediately_before_a_crlf_line_break_composes() {
+    // The multi-escape edge: a real escape adjacent to the line break, so the
+    // fragment boundary lands right at the CR from the other side. `\\` then a
+    // break, and `\n` then a break.
+    for body in [
+        "fun main(): str {\n    i\"a\\\\\nb\"\n}\n",
+        "fun main(): str {\n    i\"a\\n\nb\"\n}\n",
+    ] {
+        let javascript = assert_crlf_twin_emits_identically(body);
+        assert!(!javascript.contains(r"\r"), "{body}\n{javascript}");
+    }
+}
+
+#[test]
+fn a_backslash_before_a_crlf_break_after_a_hole_emits_lf() {
+    // …and with a hole before it, so the fragment the escape starts is not the
+    // first one in the i-string.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    let n = \"x\";\n    i\"a{n}\\\nb\"\n}\n",
+    );
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}

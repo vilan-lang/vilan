@@ -21860,9 +21860,13 @@ pub(crate) fn load_package_module(path: &str) -> Option<LoadedModule> {
     static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
     let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
+    // A disk read drops a leading BOM (`windows-support.md` §2) so spans index
+    // the source proper. An editor's buffered text is left exactly as the client
+    // sent it — the client's own line index is authoritative for its buffers,
+    // and VS Code already strips the BOM over the wire.
     let source = match document_overlay_get(path) {
         Some(buffered) => buffered,
-        None => std::fs::read_to_string(path).ok()?,
+        None => crate::util::read_source(path).ok()?,
     };
     let key = {
         let mut hasher = DefaultHasher::new();

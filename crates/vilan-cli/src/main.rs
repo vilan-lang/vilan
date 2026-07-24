@@ -502,7 +502,10 @@ fn hmr_round(
     state.manifest = Some(manifest);
     let force_full = hmr::round_forces_full(state.legs.is_empty(), state.failed, manifest_changed);
     let current_hash = |path: &Path| -> Option<u64> {
-        fs::read_to_string(path)
+        // Read the same way the compiler reads (BOM dropped,
+        // windows-support.md §2), or the hash recorded from the text it
+        // consumed could never match.
+        vilan_core::util::read_source(path)
             .ok()
             .map(|text| vilan_core::content_hash(&text))
     };
@@ -1726,7 +1729,10 @@ fn compile_to_js(
     // passes `None` and pays nothing.
     overlay: Option<&mut String>,
 ) -> Result<(String, Vec<(String, String)>, Vec<(PathBuf, u64)>), ExitCode> {
-    let src = match fs::read_to_string(file) {
+    // `read_source` drops a leading BOM so spans — and the ariadne rendering
+    // below, which indexes this same text — address the source proper
+    // (windows-support.md §2).
+    let src = match vilan_core::util::read_source(file) {
         Ok(src) => src,
         Err(error) => {
             eprintln!(
@@ -1853,7 +1859,7 @@ fn compile_to_js(
                         .source
                         .and_then(|source| {
                             let path = program.source_path(source)?;
-                            let text = fs::read_to_string(path).ok()?;
+                            let text = vilan_core::util::read_source(path).ok()?;
                             Some((path.display().to_string(), text))
                         })
                         // The note's file may BE the entry — same-file

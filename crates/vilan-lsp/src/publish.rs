@@ -134,7 +134,7 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                     // fresh index for that file's positions.
                     let located = match note_path {
                         None => Some((owner.clone(), document.line_index.range(note_span))),
-                        Some(path) => std::fs::read_to_string(path)
+                        Some(path) => vilan_core::util::read_source(path)
                             .ok()
                             .map(|text| LineIndex::new(&text).range(note_span))
                             .and_then(|range| {
@@ -152,11 +152,14 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
             }
             Some(path) => {
                 // A fresh (uncached) read: module files change across saves,
-                // so a session-cached index would misplace ranges.
+                // so a session-cached index would misplace ranges. The BOM is
+                // dropped exactly as the analyzer's own read drops it
+                // (windows-support.md §2), so the index and the spans agree on
+                // line 0.
                 let index = extra_indices
                     .entry(path.clone())
                     .or_insert_with(|| {
-                        std::fs::read_to_string(path)
+                        vilan_core::util::read_source(path)
                             .ok()
                             .map(|text| Arc::new(LineIndex::new(&text)))
                     })
@@ -226,6 +229,49 @@ mod tests {
         let mut visible = editor.clone();
         visible.retain(|_, group| !group.is_empty());
         visible
+    }
+
+    // A BOM'd module on disk publishes its diagnostic at the right COLUMN
+    // (windows-support.md §2). Two reads have to agree: the analyzer's, which
+    // produces the span, and the planner's, which builds the `LineIndex` that
+    // converts it. Both now drop a leading BOM, so line 0's columns are counted
+    // from the source proper — which is what VS Code (it strips the BOM before
+    // sending a buffer) has always assumed. Disagreeing shifted every line-0
+    // column, and before the strip the module did not lex at all.
+    #[test]
+    fn a_byte_order_marked_module_publishes_its_diagnostic_at_the_right_column() {
+        // The whole module on ONE line, so the error sits on line 0 — the line
+        // the BOM would shift.
+        let stripped = "fun answer(): i32 { \"not a number\" }\n";
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::marked::answer;\nfun main() { print(answer()); }\n",
+            ),
+            ("marked.vl", &format!("\u{feff}{stripped}")),
+        ]);
+        let mut state = PublishState::new();
+        let (main_uri, main_document) = open(&dir, "main.vl");
+        let published = state.plan_publish(&main_uri, &main_document);
+        let group = published
+            .iter()
+            .find(|(target, _)| target.path().ends_with("marked.vl"))
+            .map(|(_, group)| group)
+            .expect("the module error publishes at marked.vl");
+        let diagnostic = group
+            .iter()
+            .find(|item| item.message.contains("Expected i32"))
+            .expect("the module's type error is published");
+        let column = stripped.find("\"not a number\"").unwrap() as u32;
+        assert_eq!(
+            (
+                diagnostic.range.start.line,
+                diagnostic.range.start.character
+            ),
+            (0, column),
+            "line-0 columns must be counted past the BOM"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The E6 lifecycle property: after every open/edit/close, what the

@@ -103,9 +103,19 @@ pub fn transform_functions<'src>(
 /// denote (`\n` -> newline, `\t`, `\r`, `\"`, `\\`, `\0`), so the value is the
 /// real text — the JS formatter then re-escapes it for output. Borrows the slice
 /// unchanged when it has no escapes. An unknown escape keeps both characters.
+///
+/// This is where a string literal's VALUE is built from source text — for a
+/// plain `"…"` and for each literal fragment of an `i"…"` alike (the lexer
+/// desugars an i-string into `String` tokens) — so it is where the
+/// `\r\n`-is-one-line-terminator rule lands (`windows-support.md` §2,
+/// specification §2.1): a multi-line literal's value carries `\n` per source
+/// line break whatever the file's on-disk encoding, exactly as a triple-quoted
+/// literal already does. An ESCAPED `\r` is unaffected — it is written, not read
+/// from the line ending — and a lone `\r` in the text is preserved.
 fn unescape_string(raw: &str) -> Cow<'_, str> {
+    let raw = crate::util::normalize_newlines(raw);
     if !raw.contains('\\') {
-        return Cow::Borrowed(raw);
+        return raw;
     }
     let mut result = String::with_capacity(raw.len());
     let mut characters = raw.chars();
@@ -5846,4 +5856,53 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     let mut rename = HashMap::new();
     allocate_scope(&global, &reserved, release, &source_of, &mut rename);
     rename_nodes(nodes, &rename);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unescape_string;
+
+    /// A string literal's value is built from the NORMALIZED source text
+    /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line
+    /// terminator, so a multi-line literal carries `\n` however the file was
+    /// saved. Plain `"…"` and the literal fragments of an `i"…"` both arrive
+    /// here, so both are covered.
+    #[test]
+    fn a_crlf_line_break_in_a_literal_becomes_one_newline() {
+        assert_eq!(unescape_string("alpha\r\nbeta"), "alpha\nbeta");
+        assert_eq!(unescape_string("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_in_a_literal_is_preserved() {
+        // Classic-Mac endings are deliberately NOT blessed: a `\r` with no
+        // following `\n` is an ordinary character of the value.
+        assert_eq!(unescape_string("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn an_escaped_carriage_return_survives_normalization() {
+        // `\r` WRITTEN in the literal is a value the author asked for — only a
+        // line ending read off the file normalizes. `\r\n` typed as escapes
+        // stays a two-character CRLF.
+        assert_eq!(unescape_string(r"a\r\nb"), "a\r\nb");
+        assert_eq!(unescape_string(r"a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn a_literal_needing_neither_pass_is_borrowed() {
+        let raw = "plain text";
+        match unescape_string(raw) {
+            std::borrow::Cow::Borrowed(borrowed) => assert!(std::ptr::eq(borrowed, raw)),
+            std::borrow::Cow::Owned(_) => {
+                panic!("an escape-free, CR-free literal must not allocate")
+            }
+        }
+    }
+
+    #[test]
+    fn escapes_and_a_crlf_line_break_compose() {
+        // Both passes on one literal: the CRLF folds, the escapes interpret.
+        assert_eq!(unescape_string("a\\t\r\nb\\\"c"), "a\t\nb\"c");
+    }
 }

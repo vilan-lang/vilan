@@ -5,6 +5,20 @@ Source text is UTF-8. Lexing converts it to a token stream; **trivia**
 file consisting only of trivia lexes to an empty token stream (and parses
 as an empty module).
 
+**Line terminators.** A line terminator is `\n`, and the two-character
+sequence `\r\n` is **one** line terminator. Text built from source — the
+value of any string literal — is built from the normalized text, so a
+literal spanning lines carries `\n` per source line break and never
+`\r\n`, whatever the file's on-disk encoding. A lone `\r` (no following
+`\n`) is not a line terminator: between tokens it is ordinary whitespace,
+and inside a string literal it is an ordinary character, preserved. A
+leading U+FEFF byte-order mark is an encoding marker rather than source
+text: it is ignored, and positions are counted from the byte after it. A
+U+FEFF anywhere else is content. Together these make a program's meaning
+independent of how an editor saved it — the same source is the same
+program on every platform. (See `proposal/windows-support.md` §2; the
+canonical on-disk form is LF with no BOM, and `vilan fmt` writes it.)
+
 ## 2.1 Comments
 
 A comment begins with `//` and runs to the end of the line. There are no
@@ -81,6 +95,11 @@ string is **raw** (a backslash is a backslash) and runs to the first
 `"""`; the whitespace prefix of the line containing the closing delimiter
 is stripped from every line of the content.
 
+Both forms may span lines, and in both a source line break contributes a
+single `\n` to the value per the line-terminator rule above. An escaped
+`\r` is unaffected: it is written into the literal, not read off the end
+of a line.
+
 ### Interpolated strings
 
 `i"…"` is an interpolated string: `{expr}` holes embed expressions; `\{`
@@ -97,6 +116,11 @@ delimit the hole; string literals inside a hole may still contain braces)
 and parsed as a single parenthesized expression. The result of the whole
 form is `str`; each part must therefore be valid as a `+` operand with
 `str` (§5's operator dispatch).
+
+An interpolated string may also span lines — the multi-line
+`source(i"…")` form is how a macro writes the code it returns — and its
+literal fragments follow the same line-terminator rule: one `\n` per
+source line break.
 
 *Implementation note: because a hole is re-lexed as ordinary tokens, a
 string literal inside a hole cannot use `\"` escapes — nested quoting

@@ -518,15 +518,27 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
     tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
 }
 
-/// Formats `source`, returning the reprinted text. Returns the input unchanged if
-/// it doesn't lex/parse, if the printer hits a construct it doesn't yet handle, or
-/// if the reprint would change the code (see the safety note).
-pub fn format(source: &str) -> String {
-    let Some(original) = code_tokens(source) else {
-        return source.to_string();
+/// Formats `original`, returning the reprinted text. Returns the input unchanged
+/// if it doesn't lex/parse, if the printer hits a construct it doesn't yet handle,
+/// or if the reprint would change the code (see the safety note).
+///
+/// Canonical Vilan is LF and carries no BOM (`windows-support.md` §2), so the
+/// whole reprint runs over the NORMALIZED text: a CRLF file formats to its LF
+/// form exactly once and is idempotent after, the same way indentation is
+/// canonicalized. Normalizing here rather than at each emission site is what
+/// keeps the verbatim slices — macro arguments, an `i"…"` literal, a plain or
+/// triple-quoted string's raw text — free of `\r`, and it keeps the token-stream
+/// safety net comparing like with like (both sides lex from LF text). A bail
+/// still returns the ORIGINAL bytes: a file the formatter does not fully
+/// understand is not one to rewrite, not even its line endings.
+pub fn format(original: &str) -> String {
+    let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
+    let source: &str = &normalized;
+    let Some(original_tokens) = code_tokens(source) else {
+        return original.to_string();
     };
     let Some(items) = parse(source) else {
-        return source.to_string();
+        return original.to_string();
     };
     let mut printer = Printer {
         out: String::new(),
@@ -541,14 +553,14 @@ pub fn format(source: &str) -> String {
     printer.flush_comments_before(source.len(), prev_end);
     printer.out.push('\n');
     if printer.bailed {
-        return source.to_string();
+        return original.to_string();
     }
     let matches = code_tokens(&printer.out)
-        .is_some_and(|reprinted| normalize(reprinted) == normalize(original));
+        .is_some_and(|reprinted| normalize(reprinted) == normalize(original_tokens));
     if matches {
         printer.out
     } else {
-        source.to_string()
+        original.to_string()
     }
 }
 
@@ -828,8 +840,15 @@ impl<'src> Printer<'src> {
         // blank line is left behind.
         if entries.is_empty() {
             let mut deletion_end = source_end;
-            if self.source.as_bytes().get(deletion_end) == Some(&b'\n') {
-                deletion_end += 1;
+            // The whole line break, `\r\n` included — a CRLF buffer would
+            // otherwise keep the stray `\r` as an empty line (windows-support.md
+            // §2). The organizer edits the buffer as written, so unlike `format`
+            // it meets both endings head-on instead of normalizing its input.
+            let bytes = self.source.as_bytes();
+            match bytes.get(deletion_end) {
+                Some(b'\n') => deletion_end += 1,
+                Some(b'\r') if bytes.get(deletion_end + 1) == Some(&b'\n') => deletion_end += 2,
+                _ => {}
             }
             return Some(ImportRunEdit {
                 span: Span::from(run_start..deletion_end),
@@ -857,8 +876,16 @@ impl<'src> Printer<'src> {
             }
         }
 
-        // An already-organized run offers no edit.
-        if self.source.get(run_start..source_end) == Some(replacement.as_str()) {
+        // An already-organized run offers no edit. The comparison ignores the
+        // line ENDING: the canonical text is `\n`-joined while the buffer may be
+        // CRLF, and Organize Imports is not a line-ending converter (that is
+        // `fmt`'s job). Comparing raw would offer the action forever on a CRLF
+        // buffer — and rewrite the run to LF on every format-on-save.
+        let current = self
+            .source
+            .get(run_start..source_end)
+            .map(crate::util::normalize_newlines);
+        if current.as_deref() == Some(replacement.as_str()) {
             return None;
         }
         Some(ImportRunEdit {
@@ -3093,5 +3120,131 @@ mod organize {
             ),
             "import std::a::{ keep };\nimport std::z;\n",
         );
+    }
+
+    // --- CRLF buffers (windows-support.md §2) --------------------------------
+    //
+    // The organizer works on the buffer AS WRITTEN — its edits are spans into the
+    // client's text, so unlike `format` it must never normalize its input. That
+    // makes the two byte-level line-break checks its own responsibility.
+
+    /// The CRLF twin of a buffer.
+    fn crlf(source: &str) -> String {
+        source.replace('\n', "\r\n")
+    }
+
+    // The permanent-dirty case: an already-organized CRLF run must offer NO edit.
+    // Comparing the canonical (`\n`-joined) text against the raw slice never
+    // matched, so the action was offered forever — and `codeActionsOnSave`
+    // rewrote the run to LF on every single save.
+    #[test]
+    fn an_already_organized_crlf_run_offers_no_edit() {
+        assert_no_edit(
+            &crlf("import std::a;\nimport std::z;\n\nfun main() {}\n"),
+            &[],
+        );
+    }
+
+    // A CRLF run that really is out of order still reorders — the EOL-insensitive
+    // comparison must not swallow a genuine edit.
+    #[test]
+    fn an_unsorted_crlf_run_still_reorders() {
+        assert_eq!(
+            organize(&crlf("import std::z;\nimport std::a;\n"), &[]),
+            "import std::a;\nimport std::z;\r\n",
+        );
+    }
+
+    // Deleting a fully-dead run takes the whole `\r\n`, not just the `\n` —
+    // otherwise a stray `\r` is left behind as an empty line.
+    #[test]
+    fn a_fully_dead_crlf_run_is_deleted_with_its_whole_line_break() {
+        let organized = organize(&crlf("import std::dead;\nfun main() {}\n"), &["dead"]);
+        assert_eq!(organized, "fun main() {}\r\n");
+        assert!(
+            !organized.starts_with('\r'),
+            "a stray CR is left behind: {organized:?}"
+        );
+    }
+}
+
+/// Canonical Vilan is LF with no BOM (windows-support.md §2 (b)): `vilan fmt`
+/// converting a CRLF file is a correct reformat, not a bug — one canonical form,
+/// exactly as with indentation. These pin that the conversion happens once, is
+/// idempotent after, and does NOT trip the token-stream safety net (which would
+/// silently leave the file untouched).
+#[cfg(test)]
+mod newlines {
+    use super::format;
+
+    /// The LF twin of `source`, i.e. what a CRLF file must format to.
+    fn crlf(source: &str) -> String {
+        source.replace('\n', "\r\n")
+    }
+
+    #[test]
+    fn a_crlf_file_formats_to_its_lf_form_exactly_once() {
+        let canonical = "fun main() {\n\tlet x = 1;\n}\n";
+        let formatted = format(&crlf(canonical));
+        assert_eq!(formatted, canonical);
+        // Idempotent after: the second pass is a no-op, so a file converges
+        // rather than oscillating between two "canonical" forms.
+        assert_eq!(format(&formatted), canonical);
+    }
+
+    #[test]
+    fn a_crlf_multi_line_string_does_not_bail_the_safety_net() {
+        // The net compares the input's token stream against the reprint's. A
+        // plain multi-line string's token carries its RAW body, so without
+        // normalizing the input the two sides would disagree on `\r\n` vs `\n`
+        // and the formatter would bail — leaving CRLF on disk forever.
+        let canonical = "fun main() {\n\tlet text = \"alpha\nbeta\";\n}\n";
+        assert_eq!(format(&crlf(canonical)), canonical);
+    }
+
+    #[test]
+    fn a_crlf_interpolated_string_reprints_without_carriage_returns() {
+        // An i-string is recovered VERBATIM from source, so its slice is the
+        // path a `\r` would ride into formatted output.
+        let canonical = "fun main() {\n\tlet who = \"w\";\n\tlet t = i\"hi {who}\nbye\";\n}\n";
+        let formatted = format(&crlf(canonical));
+        assert!(!formatted.contains('\r'), "{formatted:?}");
+        assert_eq!(formatted, canonical);
+    }
+
+    #[test]
+    fn crlf_macro_arguments_reprint_without_carriage_returns() {
+        // Macro arguments are syntax, reprinted verbatim from their spans — the
+        // other verbatim path into the output.
+        let canonical = "fun main() {\n\tmacro unroll(2, |i: i32| i\n\t\t+ 1);\n}\n";
+        let formatted = format(&crlf(canonical));
+        assert!(!formatted.contains('\r'), "{formatted:?}");
+        // …and the CRLF file formats to exactly what its LF twin formats to,
+        // which is also what proves the net did not silently bail.
+        assert_eq!(formatted, format(canonical));
+    }
+
+    #[test]
+    fn a_crlf_triple_quoted_string_reprints_without_carriage_returns() {
+        // A triple-quoted body reprints verbatim (its whitespace is semantic),
+        // so it is a third verbatim path; its VALUE already strips CR.
+        let canonical = "fun main() {\n\tlet t = \"\"\"\n\ta\n\tb\n\t\"\"\";\n}\n";
+        let formatted = format(&crlf(canonical));
+        assert!(!formatted.contains('\r'), "{formatted:?}");
+        assert_eq!(formatted, canonical);
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_dropped_by_a_successful_format() {
+        let canonical = "fun main() {}\n";
+        assert_eq!(format(&format!("\u{feff}{canonical}")), canonical);
+    }
+
+    #[test]
+    fn a_file_the_formatter_bails_on_keeps_its_original_bytes() {
+        // A bail returns the input untouched — a file we do not fully
+        // understand is not one to rewrite, not even its line endings.
+        let broken = crlf("fun main( {\n");
+        assert_eq!(format(&broken), broken);
     }
 }

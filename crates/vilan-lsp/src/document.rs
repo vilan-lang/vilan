@@ -1068,7 +1068,9 @@ impl Document {
             &self.text
         } else {
             let path = program.source_path(source)?;
-            owned = std::fs::read_to_string(path).ok()?;
+            // BOM-stripped so `name_span` (from the analyzer's read) slices
+            // this text at the right offset (windows-support.md §2).
+            owned = vilan_core::util::read_source(path).ok()?;
             &owned
         };
         let start = name_span.into_range().start.min(text.len());

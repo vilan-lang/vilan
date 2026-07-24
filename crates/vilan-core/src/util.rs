@@ -2,7 +2,46 @@ pub fn plural(n: usize, singular: &str, plural: &str) -> String {
     if n == 1 { singular } else { plural }.to_string()
 }
 
+use std::borrow::Cow;
 use std::cell::Cell;
+use std::path::Path;
+
+/// The byte-order mark, U+FEFF, as UTF-8 — what a Windows editor writes at the
+/// head of a "UTF-8 with BOM" file.
+const BYTE_ORDER_MARK: &str = "\u{feff}";
+
+/// Drops a LEADING byte-order mark: it is an encoding marker, not source text
+/// (`windows-support.md` §2), so the lexer must never see it. Only at offset 0 —
+/// an interior U+FEFF is content and stays.
+pub fn strip_bom(text: &str) -> &str {
+    text.strip_prefix(BYTE_ORDER_MARK).unwrap_or(text)
+}
+
+/// Reads a source file and drops its leading BOM, so every reader — the module
+/// loader, the CLI, the language server's disk reads — indexes the same text.
+/// Line endings are NOT touched here: spans must keep addressing the file as it
+/// sits on disk (an editor's line index is built from the same bytes), and the
+/// `\r\n`-is-one-terminator rule applies where a *value* is built, not to the
+/// span space.
+pub fn read_source(path: impl AsRef<Path>) -> std::io::Result<String> {
+    let contents = std::fs::read_to_string(path)?;
+    match contents.strip_prefix(BYTE_ORDER_MARK) {
+        Some(stripped) => Ok(stripped.to_string()),
+        None => Ok(contents),
+    }
+}
+
+/// Rewrites `\r\n` to `\n`: a CRLF is ONE line terminator (`windows-support.md`
+/// §2), so text built from source carries `\n` per source line break whatever
+/// the file's on-disk encoding. A LONE `\r` is not a line terminator we bless —
+/// it is left exactly as it is. Borrows unchanged when there is no `\r` at all,
+/// so an all-LF file (every file in the tree) pays one scan and no allocation.
+pub fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n"))
+}
 
 thread_local! {
     static RECURSION_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -115,7 +154,53 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
 
 #[cfg(test)]
 mod tests {
-    use super::trim_multiline_string;
+    use super::{normalize_newlines, strip_bom, trim_multiline_string};
+
+    #[test]
+    fn a_leading_byte_order_mark_is_dropped() {
+        assert_eq!(
+            strip_bom("\u{feff}import std::print;"),
+            "import std::print;"
+        );
+    }
+
+    #[test]
+    fn a_source_without_a_byte_order_mark_is_untouched() {
+        assert_eq!(strip_bom("import std::print;"), "import std::print;");
+        // Byte-for-byte the same slice, not a re-derived equal one.
+        let text = "fun main() {}";
+        assert!(std::ptr::eq(strip_bom(text), text));
+    }
+
+    #[test]
+    fn an_interior_byte_order_mark_is_content() {
+        // Only offset 0 is an encoding marker; a U+FEFF inside a string
+        // literal is a character the program means to carry.
+        assert_eq!(strip_bom("let a = \"\u{feff}\";"), "let a = \"\u{feff}\";");
+    }
+
+    #[test]
+    fn crlf_becomes_one_line_terminator() {
+        assert_eq!(normalize_newlines("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_left_alone() {
+        // Classic-Mac line endings are not blessed (windows-support.md §2):
+        // a `\r` with no following `\n` stays exactly what it is.
+        assert_eq!(normalize_newlines("a\rb"), "a\rb");
+        // …including one directly before a CRLF, where only the pair folds.
+        assert_eq!(normalize_newlines("a\r\r\nb"), "a\r\nb");
+    }
+
+    #[test]
+    fn an_lf_only_text_is_borrowed_unchanged() {
+        let text = "a\nb\n";
+        match normalize_newlines(text) {
+            std::borrow::Cow::Borrowed(borrowed) => assert!(std::ptr::eq(borrowed, text)),
+            std::borrow::Cow::Owned(_) => panic!("an all-LF text must not allocate"),
+        }
+    }
 
     #[test]
     fn trims_each_line_by_the_closing_indentation() {
