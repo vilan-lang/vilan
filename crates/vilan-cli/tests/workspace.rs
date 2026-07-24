@@ -96,8 +96,9 @@ fn workspace_builds_each_host_member() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A command's combined stdout + stderr (errors render to stdout, resolution
-/// failures to stderr — a test asserting on a message wants both).
+/// A command's combined stdout + stderr. Every diagnostic goes to stderr now
+/// (windows-support.md §6), but `--stdout` builds and program output do not, so
+/// a test asserting on "what the CLI said" still wants both.
 fn combined(output: &Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));

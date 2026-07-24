@@ -230,6 +230,10 @@ cost a Windows contributor hours; it is also just better on Linux.
   equivalent is a Job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
   assigned at spawn, `cfg(windows)`-gated. This needs the `windows-sys`
   crate (§10d).
+  This slice also delivers the exit half of §5's watch temp-script cleanup,
+  which S3 deferred here: a `Ctrl-C` hook removes the session's
+  `vilan-watch-<pid>.js` — `watch_loop` never returns from its loop, so the
+  per-round delete alone leaked one file per watch session.
 - **Virtual terminal enablement**: `paint.rs`'s gate init additionally
   enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on Windows consoles (same
   `windows-sys`), so ANSI renders on conhost, not just Windows Terminal.

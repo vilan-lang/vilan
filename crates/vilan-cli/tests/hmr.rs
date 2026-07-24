@@ -22,7 +22,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -204,6 +204,15 @@ fn wait_for_file(path: &Path, deadline: Duration) -> bool {
     false
 }
 
+/// Drains one child stream on a thread, forwarding every line into `sender`.
+fn drain_into(stream: impl Read + Send + 'static, sender: mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
+}
+
 /// Drains the watcher's stdout on a thread, forwarding every line to a channel.
 /// The Node server's `print` output flows here too — `spawn_node` gives the child
 /// no stdio of its own, so it inherits the watcher's stdout (the piped fd) — which
@@ -211,11 +220,16 @@ fn wait_for_file(path: &Path, deadline: Duration) -> bool {
 /// boot marker printed by the freshly spawned child.
 fn drain_stdout(stdout: ChildStdout) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = sender.send(line);
-        }
-    });
+    drain_into(stdout, sender);
+    receiver
+}
+
+/// Both streams into one channel — for a test that watches stdout markers *and*
+/// a diagnostic, which since `windows-support.md` §6 renders to stderr.
+fn drain_both(stdout: ChildStdout, stderr: ChildStderr) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    drain_into(stdout, sender.clone());
+    drain_into(stderr, sender);
     receiver
 }
 
@@ -272,12 +286,16 @@ fn the_dev_channel_drives_the_watch_round() {
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn run --watch");
 
-    // Drain stdout on a thread (so the pipe never fills), forwarding every line.
-    let lines = drain_stdout(watcher.stdout.take().unwrap());
+    // Drain BOTH streams on threads (so neither pipe fills), forwarding every
+    // line: the boot markers arrive on stdout, the ariadne diagnostic on stderr.
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let deadline = Duration::from_secs(20);
@@ -327,8 +345,9 @@ fn the_dev_channel_drives_the_watch_round() {
             "the generic fallback string must be gone now that real text is threaded: {error_event}"
         );
         // Terminal-unchanged A/B: the SAME diagnostic is still rendered to the
-        // watcher's stdout (ariadne), in the same round — the overlay capture is
-        // additive (a second sink), never a redirect.
+        // watcher's terminal (ariadne, on stderr since windows-support.md §6),
+        // in the same round — the overlay capture is additive (a second sink),
+        // never a redirect.
         assert!(
             wait_for_line(&lines, "expected", deadline),
             "the terminal must still print the diagnostic (the overlay capture is additive)"
@@ -628,19 +647,22 @@ fn a_broken_build_still_renders_the_terminal_diagnostic() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(!output.status.success(), "a broken build must fail");
-    // ariadne renders diagnostics to STDOUT; strip ANSI to assert the plain shape.
-    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    // ariadne renders diagnostics to STDERR (windows-support.md §6, ratified
+    // call (f) — they used to go to stdout, where they could corrupt
+    // `build --stdout`). Strip ANSI to assert the plain shape regardless of
+    // whether the stream was colored.
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
     assert!(
-        stdout.contains("Error:"),
-        "the ariadne error header is present:\n{stdout}"
+        stderr.contains("Error:"),
+        "the ariadne error header is present:\n{stderr}"
     );
     assert!(
-        stdout.contains("expected"),
-        "the real diagnostic message is present:\n{stdout}"
+        stderr.contains("expected"),
+        "the real diagnostic message is present:\n{stderr}"
     );
     assert!(
-        stdout.contains("main.vl"),
-        "the diagnostic names the source file:\n{stdout}"
+        stderr.contains("main.vl"),
+        "the diagnostic names the source file:\n{stderr}"
     );
 }
 

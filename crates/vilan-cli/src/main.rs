@@ -2,16 +2,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
-    process::{Child, ExitCode},
+    process::ExitCode,
     time::{Duration, SystemTime},
 };
 
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
 mod hmr;
+mod job;
 mod paint;
 mod upgrade;
 
+use job::ManagedChild;
 use vilan_core::analyzer::{analyze, check_library_contract};
 use vilan_core::async_infer;
 use vilan_core::call_graph::CallGraph;
@@ -316,15 +318,47 @@ fn scan_vl(roots: &[PathBuf]) -> BTreeMap<PathBuf, SystemTime> {
         .collect()
 }
 
+/// The exit code a watch session reports when `Ctrl-C` ends it: the shell
+/// convention for "terminated by SIGINT" (128 + 2), used on every platform so
+/// the two legs agree.
+const WATCH_INTERRUPT_EXIT_CODE: i32 = 130;
+
+/// Installs the `Ctrl-C` exit hook for a watch session.
+///
+/// [`watch_loop`] never returns from its loop, so without a hook the session's
+/// temp script (`vilan-watch-<pid>.js`) outlives it — one leaked file per watch
+/// session (`windows-support.md` §6; the per-round delete in [`run_watch`]
+/// covers only restarts). The hook is deliberately tiny: remove the script,
+/// exit. Removal is silent here, unlike the per-round one — the process is on
+/// its way out and a warning would race the child's own shutdown.
+///
+/// It does not touch the child, and must not: on unix the terminal delivers
+/// `SIGINT` to the whole process group, so the `node` child is already stopping
+/// on its own; on Windows the child's kill-on-close Job object (see [`job`])
+/// reaps its tree the moment this process exits. `ctrlc` runs the closure on
+/// its own thread rather than inside the signal handler, which is what makes
+/// filesystem work legal here at all — a raw `SIGINT` handler may not allocate
+/// the path or run `atexit`.
+fn install_watch_interrupt_hook() {
+    // Best effort: a watch session is not worth failing over a handler the OS
+    // (or a second install) refused.
+    let _ = ctrlc::set_handler(|| {
+        let _ = fs::remove_file(watch_script_path());
+        std::process::exit(WATCH_INTERRUPT_EXIT_CODE);
+    });
+}
+
 /// Runs `action`, then re-runs it whenever a watched `.vl` file changes — polling
 /// every [`WATCH_POLL_INTERVAL`]. Returns only when there's nothing to watch;
-/// otherwise loops until `Ctrl-C` (which, via the shared terminal process group,
-/// also stops any `run --watch` child).
+/// otherwise loops until `Ctrl-C` — which stops any `run --watch` child (via the
+/// shared terminal process group on unix, via the child's Job object on Windows)
+/// and runs [`install_watch_interrupt_hook`]'s cleanup.
 fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
     if roots.iter().all(|root| !root.exists()) {
         eprintln!("{} nothing to watch (no such path)", paint::error_prefix());
         return ExitCode::FAILURE;
     }
+    install_watch_interrupt_hook();
     let watched = roots
         .iter()
         .map(|root| root.display().to_string())
@@ -371,7 +405,7 @@ fn run_watch(
     entry: Option<String>,
 ) -> ExitCode {
     let roots = watch_roots(&file);
-    let mut child: Option<Child> = None;
+    let mut child: Option<ManagedChild> = None;
     let channel = if no_hmr {
         None
     } else {
@@ -404,13 +438,11 @@ fn run_watch(
         }
     });
     // Reached ONLY when there was nothing to watch — i.e. before any script was
-    // written. The delivered half of the cleanup is the per-round delete above,
-    // which is what closes the Windows sharing violation (the script is never
-    // rewritten while a `node` child holds it). The Ctrl-C path does NOT run
-    // this: `watch_loop` never returns from its loop, so ending a watch session
-    // leaks exactly one `vilan-watch-<pid>.js`. Installing an exit hook is
-    // process-lifecycle work and belongs to `windows-support.md` §6 (S4), not
-    // here.
+    // written. The other two cleanup paths are the per-round delete above (which
+    // closes the Windows sharing violation: the script is never rewritten while
+    // a `node` child holds it) and `install_watch_interrupt_hook`, which covers
+    // the way a watch session actually ends — `Ctrl-C`, from inside a loop that
+    // never returns.
     remove_watch_script();
     code
 }
@@ -484,9 +516,9 @@ fn hmr_round(
     file: Option<PathBuf>,
     args: &[String],
     state: &mut WatchState,
-    child: Option<Child>,
+    child: Option<ManagedChild>,
     entry: Option<&str>,
-) -> Option<Child> {
+) -> Option<ManagedChild> {
     let (root, members) = match resolve_project(file) {
         Ok(Project::Workspace { root, members }) => (root, members),
         // The project stopped being an HMR-eligible workspace (a manifest edit,
@@ -796,7 +828,7 @@ fn build_and_spawn_run(
     file: Option<PathBuf>,
     args: &[String],
     entry: Option<&str>,
-) -> Option<Child> {
+) -> Option<ManagedChild> {
     let project = match resolve_project(file) {
         Ok(project) => project,
         Err(message) => {
@@ -2011,13 +2043,18 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// program's `process.argv` `[node, script, ...args]`, so its `args()` (argv.slice(2))
 /// sees exactly `args`. The caller either waits on it (`vilan run`) or holds the
 /// handle to stop it on the next change (`vilan run --watch`).
-fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<Child> {
+///
+/// Every spawned child goes through [`ManagedChild::adopt`], so on Windows it is
+/// assigned to a kill-on-close Job object (`windows-support.md` §6) — a restart
+/// round's kill takes the program's whole process tree, and the CLI's own death
+/// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
+fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
     command.arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.spawn()
+    command.spawn().map(ManagedChild::adopt)
 }
 
 /// Maps a launched process's result to an `ExitCode`, reporting a launch failure.
@@ -2051,6 +2088,25 @@ fn write_debug(file: &Path, extension: &str, contents: &str) {
     }
 }
 
+/// The shared ariadne configuration for every diagnostic the CLI renders
+/// (`windows-support.md` §6). Two things beyond the byte indexing:
+///
+/// * **color follows `paint.rs`'s gate.** ariadne colors unconditionally by
+///   default — it leaves the terminal check to its caller — so before this,
+///   `NO_COLOR=1 vilan build broken.vl 2> file` still wrote ANSI escapes into
+///   the file, contradicting the per-stream contract every other CLI line
+///   obeys. Every report goes to **stderr**, so the stderr gate is the one that
+///   decides.
+/// * that stderr routing is itself the other half: errors used to `.print()` to
+///   stdout while warnings already went to stderr *specifically* so they could
+///   not corrupt `build --stdout`'s JavaScript. Errors can corrupt it just as
+///   well; they join the warnings (ratified call (f)).
+fn diagnostic_config() -> ariadne::Config {
+    ariadne::Config::new()
+        .with_index_type(ariadne::IndexType::Byte)
+        .with_color(paint::stderr_enabled())
+}
+
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
 /// analyzer/codegen diagnostics with ariadne. Analyzer diagnostics arrive
 /// pre-rendered as `(span, message)`; parse errors carry the structured
@@ -2068,7 +2124,7 @@ fn report(
     );
     for (span, message) in diagnostics {
         Report::build(ReportKind::Error, (filename.to_string(), span.clone()))
-            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_config(diagnostic_config())
             .with_message(&message)
             .with_label(
                 Label::new((filename.to_string(), span))
@@ -2076,7 +2132,9 @@ fn report(
                     .with_color(Color::Red),
             )
             .finish()
-            .print(sources([(filename.to_string(), src.to_string())]))
+            // stderr, like the warnings (ratified call (f)): a diagnostic must
+            // never land in `build --stdout`'s JavaScript.
+            .eprint(sources([(filename.to_string(), src.to_string())]))
             .unwrap()
     }
 }
@@ -2108,7 +2166,7 @@ fn report_error_with_note(
         ReportKind::Error,
         (filename.to_string(), error.span.into_range()),
     )
-    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+    .with_config(diagnostic_config())
     .with_message(error.msg.clone())
     .with_label(
         Label::new((filename.to_string(), error.span.into_range()))
@@ -2121,7 +2179,8 @@ fn report_error_with_note(
             .with_color(Color::Yellow),
     )
     .finish()
-    .print(sources(files))
+    // stderr, like the warnings (ratified call (f)).
+    .eprint(sources(files))
     .unwrap();
 }
 
@@ -2129,7 +2188,7 @@ fn report_error_with_note(
 /// `report`, but `ReportKind::Warning` and non-fatal.
 fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, message: &str) {
     Report::build(ReportKind::Warning, (filename.to_string(), span.clone()))
-        .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+        .with_config(diagnostic_config())
         .with_message(message)
         .with_label(
             Label::new((filename.to_string(), span))
@@ -2137,7 +2196,8 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
                 .with_color(Color::Yellow),
         )
         .finish()
-        // stderr, so it doesn't corrupt `build --stdout` JS.
+        // stderr, so it doesn't corrupt `build --stdout` JS — the call the
+        // errors now match too.
         .eprint(sources([(filename.to_string(), src.to_string())]))
         .unwrap();
 }
