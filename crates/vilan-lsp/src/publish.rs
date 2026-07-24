@@ -10,6 +10,17 @@
 //! group for it, so two open documents importing the same broken module
 //! cannot overwrite each other's view — closing or fixing one leaves the
 //! other's diagnostics standing.
+//!
+//! Identity and address are two different things here (`windows-support.md` §7).
+//! Every owner and every target is *keyed* by its canonical form (`uri::normalize`),
+//! so the client's spelling of a file and the server's own always land in one
+//! slot — on Windows they are different strings (`file:///c%3A/…` vs
+//! `file:///C:/…`) and a raw-`Url` key duplicated the diagnostics into two
+//! entries that never cleared each other. What goes back *on the wire* is the
+//! spelling the file was last named with — the client's own for an open document
+//! (its key is authoritative for its buffer), the analysis-minted one otherwise
+//! (which inherits the client's spelling of the workspace, symlinks and all, so
+//! the squiggle lands on the file the user actually opened).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -23,17 +34,41 @@ use crate::document::Document;
 use crate::line_index::LineIndex;
 
 /// The bookkeeping for everything published so far: each owner's last
-/// diagnostic groups, keyed by owner then target. `BTreeMap` so merged
-/// unions list owners in a stable order (diagnostics-standard.md C1 —
-/// republishing without a change must not reorder).
+/// diagnostic groups, keyed by owner then target — both in canonical form
+/// (`uri::normalize`), so one file is one slot however it was spelled.
+/// `BTreeMap` so merged unions list owners in a stable order
+/// (diagnostics-standard.md C1 — republishing without a change must not
+/// reorder).
 pub struct PublishState {
     owned: BTreeMap<Url, Vec<(Url, Vec<Diagnostic>)>>,
+    /// Key → the spelling the client used for that OPEN document. Authoritative
+    /// while it is open: a notification about a buffer goes back in the client's
+    /// own URI, never in a form the server invented for it.
+    open_spellings: BTreeMap<Url, Url>,
+    /// Key → the spelling the analysis last minted for a file that is not open.
+    /// Kept because it inherits the client's spelling of the workspace (module
+    /// paths are built from the entry path), which the canonical key does not —
+    /// canonicalizing resolves symlinks, and publishing to the resolved path
+    /// would put the squiggle on a file the user never opened. Not pruned: it is
+    /// bounded by the files that have carried a diagnostic this session, and an
+    /// entry is only ever read for a key that is publishing again.
+    minted_addresses: BTreeMap<Url, Url>,
+    /// Whether to apply the Windows drive-letter rule when keying. `cfg!(windows)`
+    /// in production; a test can plan for the other platform (see `uri`).
+    windows: bool,
 }
 
 impl PublishState {
     pub fn new() -> Self {
+        PublishState::for_platform(cfg!(windows))
+    }
+
+    pub fn for_platform(windows: bool) -> Self {
         PublishState {
             owned: BTreeMap::new(),
+            open_spellings: BTreeMap::new(),
+            minted_addresses: BTreeMap::new(),
+            windows,
         }
     }
 
@@ -47,21 +82,32 @@ impl PublishState {
         owner: &Url,
         document: &Document,
     ) -> Vec<(Url, Vec<Diagnostic>)> {
-        let groups = diagnostic_groups(document, owner);
+        let owner_key = self.key(owner);
+        // The groups come back addressed (the owner's own URI, each module's
+        // minted one); key them, and remember the address each key was seen at.
+        let groups: Vec<(Url, Vec<Diagnostic>)> = diagnostic_groups(document, owner)
+            .into_iter()
+            .map(|(address, group)| {
+                let key = self.key(&address);
+                self.minted_addresses.insert(key.clone(), address);
+                (key, group)
+            })
+            .collect();
+        self.open_spellings.insert(owner_key.clone(), owner.clone());
         let mut affected: Vec<Url> = groups.iter().map(|(target, _)| target.clone()).collect();
-        if let Some(previous) = self.owned.get(owner) {
+        if let Some(previous) = self.owned.get(&owner_key) {
             for (target, _) in previous {
                 if !affected.contains(target) {
                     affected.push(target.clone());
                 }
             }
         }
-        self.owned.insert(owner.clone(), groups);
+        self.owned.insert(owner_key, groups);
         affected
             .into_iter()
             .map(|target| {
                 let merged = self.merged(&target);
-                (target, merged)
+                (self.address(&target), merged)
             })
             .collect()
     }
@@ -70,16 +116,37 @@ impl PublishState {
     /// actions for every target it contributed to — each now the remaining
     /// owners' merged view, empty where it was the only contributor.
     pub fn plan_close(&mut self, owner: &Url) -> Vec<(Url, Vec<Diagnostic>)> {
-        let Some(previous) = self.owned.remove(owner) else {
+        let owner_key = self.key(owner);
+        let Some(previous) = self.owned.remove(&owner_key) else {
+            self.open_spellings.remove(&owner_key);
             return Vec::new();
         };
-        previous
+        // Addressed BEFORE the spelling is dropped, so the closing document's own
+        // clear still reaches the URI the client opened it under.
+        let actions: Vec<(Url, Vec<Diagnostic>)> = previous
             .into_iter()
             .map(|(target, _)| {
                 let merged = self.merged(&target);
-                (target, merged)
+                (self.address(&target), merged)
             })
-            .collect()
+            .collect();
+        self.open_spellings.remove(&owner_key);
+        actions
+    }
+
+    /// The canonical key for a URL, under this planner's platform rule.
+    fn key(&self, url: &Url) -> Url {
+        crate::uri::normalize(url, self.windows)
+    }
+
+    /// Where a notification for `key` is sent: the client's spelling while the
+    /// file is open, else the one the analysis minted, else the key itself.
+    fn address(&self, key: &Url) -> Url {
+        self.open_spellings
+            .get(key)
+            .or_else(|| self.minted_addresses.get(key))
+            .unwrap_or(key)
+            .clone()
     }
 
     /// The union of every owner's group for `target`, deduplicated — two
@@ -271,6 +338,145 @@ mod tests {
             (0, column),
             "line-0 columns must be counted past the BOM"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE Windows bug (`windows-support.md` §7): VS Code sends
+    // `file:///c%3A/…` and the server mints `file:///C:/…` for one file, so a
+    // raw-`Url` planner held TWO slots — the squiggle appeared twice and fixing
+    // the code cleared only one of them. Both spellings are constructed from
+    // strings here, which is exactly what arrives on the wire; the planner is
+    // asked to key by the Windows rule (`for_platform`), the way the S3 helpers
+    // make both platforms' path rules testable from either one.
+    //
+    // Asserted on the planner's slot rather than on a replayed editor map,
+    // because a real client never spells ONE open buffer two ways — the two
+    // producers in the wild are an open document and another owner's cross-file
+    // group (pinned end-to-end by the next test).
+    #[test]
+    fn the_two_windows_spellings_of_one_file_share_one_planner_slot() {
+        let (dir, _) =
+            analyze_workspace(&[("solo.vl", "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n")]);
+        let (_, broken) = open(&dir, "solo.vl");
+        std::fs::write(
+            dir.join("solo.vl"),
+            "fun main() {\n\tlet right: i32 = 1;\n}\n",
+        )
+        .unwrap();
+        let (_, fixed) = open(&dir, "solo.vl");
+
+        let minted = Url::parse("file:///C:/project/solo.vl").unwrap();
+        let from_client = Url::parse("file:///c%3A/project/solo.vl").unwrap();
+        assert_ne!(minted, from_client, "the fixture must start apart");
+
+        for windows in [true, false] {
+            let mut state = PublishState::for_platform(windows);
+            let published = state.plan_publish(&minted, &broken);
+            assert_eq!(published.len(), 1, "the entry is its own only target");
+            assert_eq!(published[0].1.len(), 1, "the error publishes once");
+
+            // The same file, arriving under the client's spelling, now analyzing
+            // clean. One slot ⇒ the error is gone; two slots ⇒ the first
+            // spelling keeps a squiggle nothing can ever clear.
+            let republished = state.plan_publish(&from_client, &fixed);
+            assert_eq!(
+                republished[0].0, from_client,
+                "an open document is addressed in the client's own spelling"
+            );
+            let key = state.key(&minted);
+            assert_eq!(
+                (state.owned.len(), state.merged(&key).len()),
+                if windows { (1, 0) } else { (2, 1) },
+                "windows={windows}: one file must occupy one slot under the \
+                 Windows rule, and the unix rule is what leaves it duplicated"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The same collision end to end, in the shape it actually takes: a module is
+    // open under the client's spelling AND is a cross-file target of an open
+    // importer, which addresses it by the spelling the analysis minted. Two keys
+    // meant the one error rendered twice, in two Problems entries. The
+    // percent-encoding divergence used here is the portable stand-in for the
+    // drive-letter one — same mechanism, observable on every platform.
+    #[test]
+    fn an_open_module_and_its_importer_publish_one_merged_view() {
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::broken::answer;\nfun main() { print(answer()); }\n",
+            ),
+            ("broken.vl", "fun answer(): i32 {\n\t\"not a number\"\n}\n"),
+        ]);
+        let (minted_module_uri, module_document) = open(&dir, "broken.vl");
+        let (main_uri, main_document) = open(&dir, "main.vl");
+        // What the client sends for the module. `Url::from_file_path` never
+        // writes this form; `Url::parse` is the wire.
+        let module_from_client = Url::parse(
+            &minted_module_uri
+                .as_str()
+                .replace("/broken.vl", "/%62roken.vl"),
+        )
+        .unwrap();
+        assert_ne!(module_from_client, minted_module_uri, "spellings differ");
+
+        let mut state = PublishState::new();
+        let mut editor: BTreeMap<Url, Vec<Diagnostic>> = BTreeMap::new();
+        apply(
+            &mut editor,
+            state.plan_publish(&module_from_client, &module_document),
+        );
+        apply(&mut editor, state.plan_publish(&main_uri, &main_document));
+
+        let showing = visible(&editor);
+        assert_eq!(
+            showing.keys().collect::<Vec<_>>(),
+            vec![&module_from_client],
+            "one entry, at the URI the client opened the module with"
+        );
+        assert_eq!(
+            showing[&module_from_client].len(),
+            1,
+            "the importer's view of the module error merges with the module's own"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The address rule: an open document's notifications carry the client's
+    // exact URI, publish and close alike, even though the planner keys on the
+    // canonical form. The client's key is authoritative for its own buffers
+    // (the §2 principle for buffer text, applied to addressing).
+    #[test]
+    fn an_open_documents_notification_keeps_the_clients_spelling() {
+        let (dir, _) =
+            analyze_workspace(&[("solo.vl", "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n")]);
+        let (canonical_uri, document) = open(&dir, "solo.vl");
+        let from_client =
+            Url::parse(&canonical_uri.as_str().replace("/solo.vl", "/%73olo.vl")).unwrap();
+        assert_ne!(from_client, canonical_uri, "the fixture must start apart");
+        assert_eq!(
+            crate::uri::normalize(&from_client, cfg!(windows)),
+            canonical_uri,
+            "…yet name one file"
+        );
+
+        let mut state = PublishState::new();
+        let published = state.plan_publish(&from_client, &document);
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].0, from_client,
+            "published at the client's spelling, not the planner's key"
+        );
+        assert!(!published[0].1.is_empty(), "the error is there to publish");
+
+        let closed = state.plan_close(&from_client);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(
+            closed[0].0, from_client,
+            "the clear reaches the same URI the diagnostic went to"
+        );
+        assert!(closed[0].1.is_empty(), "closing clears it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

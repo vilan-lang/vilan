@@ -5,6 +5,7 @@
 mod document;
 mod line_index;
 mod publish;
+mod uri;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

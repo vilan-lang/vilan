@@ -24,6 +24,17 @@ import {
 let client: LanguageClient | undefined;
 let outputChannel: OutputChannel | undefined;
 
+/// Windows executables carry a `.exe` suffix and nothing else does, so every use
+/// below collapses to exactly the pre-Windows expression on Linux and macOS
+/// (`windows-support.md` §7). Without it the four discovery candidates never
+/// match on Windows and the documented "developer builds outrank the release
+/// install" ordering silently never holds.
+const executableSuffix = process.platform === 'win32' ? '.exe' : '';
+const serverBinary = `vilan-lsp${executableSuffix}`;
+
+/// The install location the toolchain manages, as the user would type it.
+const installDirectory = process.platform === 'win32' ? '%USERPROFILE%\\.vilan\\bin' : '~/.vilan/bin';
+
 /// The feature settings the server reads (gating inlay hints / semantic tokens,
 /// and — for WO-3 — completion's call style). Sent as `initializationOptions` at
 /// startup and re-sent via `workspace/didChangeConfiguration` on change. Shaped
@@ -46,22 +57,39 @@ function readFeatureConfig(): object {
 /// and fall back to `vilan-lsp` on PATH. Developer builds outrank the release
 /// install on purpose.
 function resolveServerPath(context: ExtensionContext, configured: string): string {
-    if (configured && configured !== 'vilan-lsp') {
+    // Both spellings of the default are the sentinel: a Windows user who writes
+    // the setting out as `vilan-lsp.exe` means "find it for me", not "this exact
+    // relative file", and must not bypass discovery.
+    if (configured && configured !== 'vilan-lsp' && configured !== serverBinary) {
         return configured;
     }
     const repoRoot = path.resolve(context.extensionPath, '..', '..');
     const candidates = [
-        path.join(repoRoot, 'target', 'release', 'vilan-lsp'),
-        path.join(repoRoot, 'target', 'debug', 'vilan-lsp'),
-        path.join(os.homedir(), '.cargo', 'bin', 'vilan-lsp'),
-        path.join(os.homedir(), '.vilan', 'bin', 'vilan-lsp'),
+        path.join(repoRoot, 'target', 'release', serverBinary),
+        path.join(repoRoot, 'target', 'debug', serverBinary),
+        path.join(os.homedir(), '.cargo', 'bin', serverBinary),
+        path.join(os.homedir(), '.vilan', 'bin', serverBinary),
     ];
     for (const candidate of candidates) {
         if (fs.existsSync(candidate)) {
             return candidate;
         }
     }
-    return 'vilan-lsp';
+    return serverBinary;
+}
+
+/// The spelling of `command` that is actually on disk: as written, or with the
+/// platform's executable suffix. A Windows `vilan.server.path` is as likely to
+/// name `C:\…\vilan-lsp` as `C:\…\vilan-lsp.exe`, and only one of them is a file
+/// — accepting either beats rejecting a correct setting before the spawn. Off
+/// Windows the suffix is empty, so this is the single `existsSync` it was.
+function existingExecutable(command: string): string | undefined {
+    for (const candidate of [command, `${command}${executableSuffix}`]) {
+        if (fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+    return undefined;
 }
 
 /// A clear, actionable error when the server can't be launched — instead of the
@@ -69,9 +97,9 @@ function resolveServerPath(context: ExtensionContext, configured: string): strin
 function reportMissingServer(command: string): void {
     const message =
         `Vilan: couldn't start the language server (\`${command}\`). ` +
-        'Install the toolchain (the install script puts `vilan-lsp` in `~/.vilan/bin`), ' +
+        `Install the toolchain (the install script puts \`${serverBinary}\` in \`${installDirectory}\`), ` +
         'or build it with `cargo build --release -p vilan-lsp` and set ' +
-        '`vilan.server.path` to the binary — or put `vilan-lsp` on your PATH.';
+        `\`vilan.server.path\` to the binary — or put \`${serverBinary}\` on your PATH.`;
     window.showErrorMessage(message, 'Open Settings').then((choice) => {
         if (choice === 'Open Settings') {
             commands.executeCommand('workbench.action.openSettings', 'vilan.server.path');
@@ -90,14 +118,15 @@ async function startClient(context: ExtensionContext): Promise<void> {
     }
 
     const config = workspace.getConfiguration('vilan');
-    const command = resolveServerPath(context, config.get<string>('server.path') || 'vilan-lsp');
+    const requested = resolveServerPath(context, config.get<string>('server.path') || 'vilan-lsp');
     const stdPath = config.get<string>('stdPath') || '';
 
     // A configured/in-repo path that doesn't exist is a clear misconfiguration —
     // report it up front rather than letting the spawn fail opaquely. (A bare
     // `vilan-lsp` is a PATH lookup, so it's checked by the `start()` failure.)
-    if (path.isAbsolute(command) && !fs.existsSync(command)) {
-        reportMissingServer(command);
+    const command = path.isAbsolute(requested) ? existingExecutable(requested) : requested;
+    if (command === undefined) {
+        reportMissingServer(requested);
         return;
     }
 

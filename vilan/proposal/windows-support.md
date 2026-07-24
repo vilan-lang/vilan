@@ -258,6 +258,22 @@ cost a Windows contributor hours; it is also just better on Linux.
   `from_file_path`), while *publishing* to the client's original URI when
   the document is open (the client's key is authoritative for its own
   buffers). Pinned by a unit test feeding both forms.
+  - *Delta (S5, as built):* the seam lives in its own `vilan-lsp/src/uri.rs`
+    rather than in `publish.rs`, and takes the drive-letter rule as a
+    parameter (`normalize(url, windows)`) so both platforms' behavior is
+    pinnable from either — the `home_dir_from` precedent. Two findings
+    forced small additions to the sketch. First, the round trip alone does
+    not fold the drive letter: `to_file_path` decodes `%3A` but keeps the
+    letter's *case*, and only `fs::canonicalize` folds case — which speaks
+    only for files that exist — so the fold happens on the URL, before the
+    round trip. Second, the client's spelling is kept for **every** open
+    document, not only the owner's own target (an open module that is also
+    an importer's cross-file target is exactly where the duplicate
+    appears), and a target that is *not* open keeps the
+    analysis-minted spelling rather than the canonical key — canonicalizing
+    resolves symlinks, and publishing to the resolved path would put the
+    squiggle on a file the user never opened. Identity is normalized;
+    addressing is not.
 - **Extension `.exe` discovery** — one expression: `const exe =
   process.platform === 'win32' ? '.exe' : ''` applied to the four
   candidates, the `'vilan-lsp'` sentinel comparison (so a user-set
