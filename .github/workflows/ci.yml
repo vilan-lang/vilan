@@ -1,0 +1,54 @@
+# PR CI (proposal/windows-support.md §8, slice S0). Until now the suite ran
+# exactly once per release — at tag push, on ubuntu only (release.yml's `gate`
+# job). This runs it on every PR and every push to `next`/`main`, on ubuntu
+# **and** windows.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [next, main]
+
+# A superseded run on the same ref is cancelled; the newest push is the one
+# whose result matters.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      # Both legs always run: the windows result is the deliverable here, so a
+      # red ubuntu leg must not cancel it.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # The windows leg is EXPECTED RED and deliberately allowed to fail, for now.
+    #
+    # Why it exists before it can pass: it is the instrument. The Windows audit
+    # (windows-support.md §0) is mostly read-from-source inference, and two of
+    # its claims cannot be settled anywhere but on a real Windows host —
+    #
+    #   1. whether `vilan-embedded-std`'s build.rs `include_str!` of a
+    #      *canonicalized* path compiles, since Windows `canonicalize` yields a
+    #      `\\?\C:\...` verbatim path (the arc's only potential BUILD-time
+    #      failure — everything else is at worst a failing test), and
+    #   2. whether NTFS case-insensitivity lets `import foo` resolve `Foo.vl`,
+    #      which decides §5's case policy.
+    #
+    # This leg answers both, plus produces the real failure list that S1
+    # ("compile-clean, suite-green") is scoped against. It stays allowed-fail
+    # only until S1 lands; at that point this `continue-on-error` line is
+    # DELETED and the leg becomes required (§8, §9).
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      # Many tests shell out to `node` (the macro/native equivalence gate, every
+      # e2e suite). Pinned to the same version release.yml's gate job uses.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The suite is green
+        run: cargo test --workspace

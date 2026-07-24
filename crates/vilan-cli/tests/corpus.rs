@@ -8,6 +8,7 @@
 //! binary can no longer write or check goldens. A deliberate output change
 //! still regenerates goldens by hand; this gate then verifies the commit.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,18 +20,147 @@ fn std_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std")
 }
 
-/// First differing line between golden and rebuilt output, for the report.
+/// The first difference between golden and rebuilt output, reported at BYTE
+/// granularity, for the report.
+///
+/// Byte-level deliberately (`windows-support.md` §3). The previous version
+/// zipped `golden.lines()` with `rebuilt.lines()`, and `str::lines()` strips a
+/// trailing `\r` — so a CRLF-vs-LF mismatch (the wholesale failure mode of a
+/// Git-for-Windows `autocrlf` checkout, which §3's `.gitattributes` now
+/// prevents) compared *equal* on every line and fell through to "lengths differ
+/// (golden 412 lines, rebuilt 412)": a diagnostic that hides the cause and
+/// states two identical numbers as though they differed. Excerpts are
+/// `{:?}`-escaped so an invisible byte — `\r` above all — is visible in the
+/// failure message.
 fn first_difference(golden: &str, rebuilt: &str) -> String {
-    for (line, (a, b)) in golden.lines().zip(rebuilt.lines()).enumerate() {
-        if a != b {
-            return format!("line {}: golden {a:?} vs rebuilt {b:?}", line + 1);
-        }
-    }
+    let mismatch = golden
+        .as_bytes()
+        .iter()
+        .zip(rebuilt.as_bytes())
+        .position(|(golden_byte, rebuilt_byte)| golden_byte != rebuilt_byte);
+    let Some(offset) = mismatch else {
+        // Nothing differs in the overlap: one side is a strict prefix of the
+        // other (or — unreachable from the gate, which only calls this after an
+        // inequality — they are identical).
+        let (golden_length, rebuilt_length) = (golden.len(), rebuilt.len());
+        return match golden_length.cmp(&rebuilt_length) {
+            Ordering::Equal => "no difference (identical bytes)".to_string(),
+            Ordering::Less => format!(
+                "golden is a strict prefix of rebuilt (golden {golden_length} bytes, \
+                 rebuilt {rebuilt_length} bytes); rebuilt continues at byte \
+                 {golden_length} (line {}) with {:?}",
+                line_number(rebuilt, golden_length),
+                line_at(rebuilt, golden_length)
+            ),
+            Ordering::Greater => format!(
+                "rebuilt is a strict prefix of golden (golden {golden_length} bytes, \
+                 rebuilt {rebuilt_length} bytes); golden continues at byte \
+                 {rebuilt_length} (line {}) with {:?}",
+                line_number(golden, rebuilt_length),
+                line_at(golden, rebuilt_length)
+            ),
+        };
+    };
+    // Every byte before `offset` matches, so both sides agree on the line number.
     format!(
-        "lengths differ (golden {} lines, rebuilt {})",
-        golden.lines().count(),
-        rebuilt.lines().count()
+        "first difference at byte {offset} (line {}): golden {:?} vs rebuilt {:?}",
+        line_number(golden, offset),
+        line_at(golden, offset),
+        line_at(rebuilt, offset)
     )
+}
+
+/// The 1-based line number containing `offset`. An offset pointing AT a `\n`
+/// belongs to the line that newline terminates.
+fn line_number(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+        + 1
+}
+
+/// The line containing `offset`, without its terminating `\n` — but *with* any
+/// `\r`, since naming that byte is the whole point. Sliced only at newline
+/// boundaries (always char boundaries), so a mid-codepoint `offset` cannot panic.
+fn line_at(text: &str, offset: usize) -> &str {
+    let bytes = text.as_bytes();
+    let offset = offset.min(bytes.len());
+    let start = bytes[..offset]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let end = bytes[offset..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(bytes.len(), |index| offset + index);
+    &text[start..end]
+}
+
+/// The EOL class the old `lines()` diagnostic could not name (§3): a CRLF golden
+/// against an LF rebuild must report the `\r` itself, not "lengths differ" with
+/// two equal numbers.
+#[test]
+fn first_difference_names_a_carriage_return() {
+    let message = first_difference("let a = 1;\r\nlet b = 2;\r\n", "let a = 1;\nlet b = 2;\n");
+    assert!(
+        message.contains(r"\r"),
+        "the carriage return is not named: {message}"
+    );
+    assert!(
+        message.contains("byte 10") && message.contains("line 1"),
+        "wrong position for the first differing byte: {message}"
+    );
+    assert!(
+        !message.contains("lengths differ"),
+        "still reporting the old (and, for this input, equal-numbered) line-count \
+         diagnostic: {message}"
+    );
+}
+
+/// A difference inside a line reports its byte offset and line number.
+#[test]
+fn first_difference_locates_a_mid_line_change() {
+    let golden = "fun main() {\n\tprint(1);\n}\n";
+    let rebuilt = "fun main() {\n\tprint(2);\n}\n";
+    let message = first_difference(golden, rebuilt);
+    // "fun main() {\n" is 13 bytes; "\tprint(" a further 7 — the digit is byte 20.
+    assert_eq!(golden.as_bytes()[20], b'1');
+    assert!(
+        message.contains("byte 20") && message.contains("line 2"),
+        "wrong position for the first differing byte: {message}"
+    );
+    assert!(
+        message.contains(r#""\tprint(1);""#) && message.contains(r#""\tprint(2);""#),
+        "both sides' lines are not shown: {message}"
+    );
+}
+
+/// Truncated output (a rebuild that stopped early) is named as such, with both
+/// byte lengths — the case the old diagnostic reported in *lines*.
+#[test]
+fn first_difference_reports_a_strict_prefix() {
+    let message = first_difference("alpha\nbeta\n", "alpha\n");
+    assert!(
+        message.contains("rebuilt is a strict prefix of golden"),
+        "the prefix relation is not named: {message}"
+    );
+    assert!(
+        message.contains("golden 11 bytes") && message.contains("rebuilt 6 bytes"),
+        "both byte lengths are not reported: {message}"
+    );
+    assert!(
+        message.contains(r#""beta""#),
+        "the first unmatched line is not shown: {message}"
+    );
+
+    let reversed = first_difference("alpha\n", "alpha\nbeta\n");
+    assert!(
+        reversed.contains("golden is a strict prefix of rebuilt")
+            && reversed.contains("golden 6 bytes")
+            && reversed.contains("rebuilt 11 bytes"),
+        "the reversed prefix case is wrong: {reversed}"
+    );
 }
 
 #[test]
