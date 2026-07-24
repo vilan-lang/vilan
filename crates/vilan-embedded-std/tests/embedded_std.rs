@@ -120,16 +120,12 @@ fn pruning_removes_only_entries_older_than_the_guard() {
     ] {
         fs::create_dir_all(cache_root.join(entry).join("std")).expect("create entry");
     }
+    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
+    let long_ago = std::time::SystemTime::now() - 2 * one_day;
     for stale in ["stale-entry", ".staging-stale"] {
-        let backdate = std::process::Command::new("touch")
-            .args(["-d", "2020-01-01"])
-            .arg(cache_root.join(stale))
-            .status()
-            .expect("touch");
-        assert!(backdate.success());
+        backdate(&cache_root.join(stale), long_ago);
     }
 
-    let one_day = std::time::Duration::from_secs(24 * 60 * 60);
     assert_eq!(
         prune_stale(&cache_root, one_day),
         2,
@@ -149,6 +145,33 @@ fn pruning_removes_only_entries_older_than_the_guard() {
     // A missing root is a quiet no-op, not an error.
     let _ = fs::remove_dir_all(&cache_root);
     assert_eq!(prune_stale(&cache_root, one_day), 0);
+}
+
+/// Set a cache entry's modification time, so the prune guard sees it as old.
+///
+/// Replaces a `touch -d 2020-01-01` shell-out, which is coreutils and does not
+/// exist on Windows (windows-support.md §4). The subject is a DIRECTORY —
+/// `prune_stale` reads directory mtimes — and that is what makes the open
+/// platform-shaped: unix opens a directory read-only and `futimens` is happy,
+/// while Windows will not hand out a directory handle at all without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and `SetFileInformationByHandle` wants write
+/// access. That is exactly the dance the `filetime` crate does; two cfg'd lines
+/// are cheaper than the dependency.
+fn backdate(directory: &Path, to: std::time::SystemTime) {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(directory)
+        .expect("open the cache entry")
+        .set_modified(to)
+        .expect("backdate the cache entry");
 }
 
 /// The build script's collection rule, restated independently: every `.vl` and

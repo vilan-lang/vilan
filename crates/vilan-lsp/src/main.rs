@@ -294,7 +294,6 @@ fn discover_std_dir(start: &Path) -> PathBuf {
 #[cfg(test)]
 mod std_discovery_tests {
     use super::discover_std_dir;
-    use std::path::Path;
 
     #[test]
     fn a_document_outside_any_checkout_falls_back_to_the_embedded_std() {
@@ -302,7 +301,20 @@ mod std_discovery_tests {
         // must be the server's own materialized std — a real, complete package
         // directory that resolves from anywhere — not a compile-time path into
         // the machine the server happened to be built on.
-        let discovered = discover_std_dir(Path::new("/tmp/definitely/not/a/checkout/main.vl"));
+        //
+        // Built from the temp dir rather than written as a `/tmp/...` literal so
+        // the "no ancestor is a checkout" premise holds on Windows too, where a
+        // unix-absolute literal is a RELATIVE path and its ancestors are the
+        // current directory's — i.e. this very checkout (windows-support.md §4).
+        // The directories are never created, so nothing on the walk exists.
+        let outside = std::env::temp_dir()
+            .join("definitely")
+            .join("not")
+            .join("a")
+            .join("checkout")
+            .join("main.vl");
+        assert!(!outside.exists(), "the fixture path must not exist");
+        let discovered = discover_std_dir(&outside);
         assert!(
             discovered.is_absolute()
                 && discovered.join("vilan.toml").is_file()

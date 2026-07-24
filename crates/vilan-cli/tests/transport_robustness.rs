@@ -8,10 +8,17 @@
 //! the mirror RE-SYNCS to the restarted server's value through the re-attach
 //! hook, and calls work again afterwards.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+// The reconnect test drives the server with `kill -STOP`/`-KILL`; everything
+// that exists only to serve it is unix-gated with it (see the test).
+#[cfg(unix)]
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc::Receiver;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 fn temp_project(tag: &str) -> PathBuf {
@@ -26,12 +33,27 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
+/// Bind an ephemeral port, then release it — a free port for the server (a small
+/// TOCTOU window, standard for this kind of test; the pattern `ssr_fullstack.rs`
+/// already uses). Fixed literals are unbindable outright inside Windows'
+/// Hyper-V/WSL reserved ranges (windows-support.md §4).
+#[cfg(unix)]
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// A node child whose stdout lines stream to a channel; killed on drop.
+#[cfg(unix)]
 struct LineChild {
     child: Child,
     lines: Receiver<String>,
 }
 
+#[cfg(unix)]
 impl LineChild {
     fn spawn(bundle: &Path, argument: Option<&str>) -> LineChild {
         let mut command = Command::new("node");
@@ -77,6 +99,10 @@ impl LineChild {
         }
     }
 
+    /// Send a signal by name (`-STOP`, `-KILL`) via `kill(1)`. Unix-only and
+    /// permanently so: Windows has no pause/resume analogue for a process
+    /// (windows-support.md §1's non-goals) — `SuspendThread` is per-thread and
+    /// documented as debugger-only, not a process freeze.
     fn signal(&self, name: &str) {
         let status = Command::new("kill")
             .args([name, &self.child.id().to_string()])
@@ -86,6 +112,7 @@ impl LineChild {
     }
 }
 
+#[cfg(unix)]
 impl Drop for LineChild {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -114,6 +141,7 @@ impl StatusBoard {
 }
 "#;
 
+#[cfg(unix)]
 const SERVER: &str = r#"import std::print;
 import std::reactive::Signal;
 import std::json::json_codec;
@@ -138,6 +166,7 @@ async fun main() {
 }
 "#;
 
+#[cfg(unix)]
 const CLIENT: &str = r#"import std::print;
 import std::shared::Shared;
 import std::json::json_codec;
@@ -200,9 +229,17 @@ async fun main() {
 }
 "#;
 
+/// UNIX-ONLY, permanently (windows-support.md §1 non-goals, §4): phase 2 freezes
+/// the server with `kill -STOP` so a call is caught in flight, which has no
+/// Windows analogue. The rest of the K6 contract (fail-fast, typed rejection,
+/// mirror re-sync) is only observable *because* the server can be frozen
+/// mid-call, so the test is not splittable into a portable half.
+#[cfg(unix)]
 #[test]
 fn a_dropped_connection_reconnects_and_resyncs() {
     let dir = temp_project("reconnect");
+    // An ephemeral port, substituted into both halves of the pair.
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -220,8 +257,8 @@ fn a_dropped_connection_reconnects_and_resyncs() {
         "[package]\nname = \"client\"\ntarget = \"node\"\n\n[package.dependencies]\ncommon = { path = \"../common\" }\n",
     );
     write(&dir, "common/src/lib.vl", COMMON);
-    write(&dir, "server/src/main.vl", SERVER);
-    write(&dir, "client/src/main.vl", CLIENT);
+    write(&dir, "server/src/main.vl", &SERVER.replace("9297", &port));
+    write(&dir, "client/src/main.vl", &CLIENT.replace("9297", &port));
 
     let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", dir.to_str().unwrap()])

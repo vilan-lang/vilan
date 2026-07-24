@@ -10,10 +10,25 @@
 //! processes come and go.
 
 use std::io::Read;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+
+/// Bind an ephemeral port, then release it — a free port for the server the
+/// program under test starts (a small TOCTOU window, standard for this kind of
+/// test; the pattern `ssr_fullstack.rs` already uses). The port is substituted
+/// into the `.vl` source, both at the `serve_*` call and in the client's URL.
+/// Fixed literals collide between runs and, on Windows, sit inside ranges
+/// Hyper-V/WSL reserve outright (windows-support.md §4).
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
 
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
@@ -143,6 +158,7 @@ impl Drop for StreamingServer {
 #[test]
 fn rpc_round_trips_over_real_http() {
     let dir = temp_project("round_trip");
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -151,7 +167,7 @@ fn rpc_round_trips_over_real_http() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::result::Result::{ self, Ok, Err };
@@ -196,7 +212,8 @@ fun run_client() {
 	}
 	exit(0);
 }
-"#,
+"#
+        .replace("45177", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     assert!(
@@ -217,6 +234,7 @@ fn realtime_sync_reaches_every_session_over_sse() {
     // reactive channels, and one session's RPC mutation is observed by BOTH —
     // multi-session sync over a real wire.
     let dir = temp_project("realtime");
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -225,7 +243,7 @@ fn realtime_sync_reaches_every_session_over_sse() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -315,7 +333,8 @@ fun run_clients() {
 	sleep(300);   // let the SSE deliveries land
 	exit(0);
 }
-"#,
+"#
+        .replace("9273", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -341,6 +360,9 @@ fn a_closed_connection_tears_its_session_down_and_spares_the_rest() {
     // and disposing it must not disturb another session subscribed to the SAME
     // signal, which still sees a later mutation.
     let server_dir = temp_project("close_server");
+    // One port for the three projects: the server's, and the URL both client
+    // processes dial.
+    let port = free_port().to_string();
     write(
         &server_dir,
         "vilan.toml",
@@ -349,7 +371,7 @@ fn a_closed_connection_tears_its_session_down_and_spares_the_rest() {
     write(
         &server_dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
@@ -415,7 +437,8 @@ fun main() {
 		|| print("ready"),
 	);
 }
-"#,
+"#
+        .replace("47161", &port),
     );
 
     // The client processes speak the §4.1 foundation directly (`call`), since
@@ -451,6 +474,7 @@ fun main() {{
 }}
 "#
         )
+        .replace("47161", &port)
     };
 
     let doomed_dir = temp_project("close_doomed");
@@ -512,6 +536,7 @@ fn realtime_sync_over_a_true_websocket() {
     // promise — this is the SSE realtime test with `connect_split` swapped for
     // `connect_socket`, nothing else.
     let dir = temp_project("websocket");
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -520,7 +545,7 @@ fn realtime_sync_over_a_true_websocket() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -615,7 +640,8 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#,
+"#
+        .replace("9291", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -640,6 +666,7 @@ fn rpc_and_realtime_multiplex_over_one_socket() {
     // exercising the correlation ids) and the reactive updates ALL ride each
     // client's one WebSocket; no HTTP requests after the upgrade.
     let dir = temp_project("multiplex");
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -648,7 +675,7 @@ fn rpc_and_realtime_multiplex_over_one_socket() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -748,7 +775,8 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#,
+"#
+        .replace("9293", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -780,6 +808,7 @@ fn the_binary_codec_rides_the_socket_end_to_end() {
     // lanes answering in kind on the server. Same scenario as the text
     // multiplex test: interleaved adds from two clients, fan-out to both.
     let dir = temp_project("binary-socket");
+    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -788,7 +817,7 @@ fn the_binary_codec_rides_the_socket_end_to_end() {
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::shared::Shared;
 import std::process::exit;
 import std::time::sleep;
@@ -886,7 +915,8 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#,
+"#
+        .replace("9294", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [

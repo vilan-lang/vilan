@@ -825,6 +825,19 @@ fn compile_and_run(source: &str) -> Result<String, Vec<String>> {
     }
 }
 
+/// Bind an ephemeral port, then release it — a free port for a program that
+/// serves one (a small TOCTOU window, standard for this kind of test; the
+/// pattern `ssr_fullstack.rs` already uses). Fixed literals both collide
+/// between runs and, on Windows, land in ranges Hyper-V/WSL reserve outright
+/// (windows-support.md §4).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
+
 #[track_caller]
 fn assert_compiles_and_runs(source: &str, expected_stdout: &str) {
     match compile_and_run(source) {
@@ -5141,8 +5154,15 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // the generated __attach against the runtime session registry
     // (serve_service), and wires one RemoteSource mirror per [expose]d field
     // in declaration order — both mirrors deliver.
+    //
+    // The two ports are ephemeral, not literals: 48411/48412 collided in the
+    // v0.12.0 release gate (EADDRINUSE on a re-run), and on Windows the
+    // 45000-48500 band sits inside the ranges Hyper-V/WSL reserve outright
+    // (windows-support.md §4).
+    let board_port = free_port().to_string();
+    let other_port = free_port().to_string();
     assert_compiles_and_runs(
-        r#"
+        &r#"
 import std::print;
         import std::process::exit;
         import std::time::sleep;
@@ -5235,7 +5255,9 @@ import std::print;
         	}
         }
 
-        "#,
+        "#
+        .replace("48411", &board_port)
+        .replace("48412", &other_port),
         "count = 0\ncount = 7\nlabel = sum 7\nadd -> 7\ndrift: {\"Contract\":\"the server reports a different service surface\"}\n",
     );
 }

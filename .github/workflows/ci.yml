@@ -39,8 +39,11 @@ jobs:
     #
     # This leg answers both, plus produces the real failure list that S1
     # ("compile-clean, suite-green") is scoped against. It stays allowed-fail
-    # only until S1 lands; at that point this `continue-on-error` line is
-    # DELETED and the leg becomes required (§8, §9).
+    # until the windows leg is OBSERVED GREEN: S1 makes the suite compile and
+    # pass, but S2-S5 may each turn it red again on the way through, so the
+    # flip is a call made on evidence from an actual run — not on a slice
+    # count. At that point this `continue-on-error` line is DELETED and the leg
+    # becomes required (§8, §9).
     continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4

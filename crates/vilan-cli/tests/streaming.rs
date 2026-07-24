@@ -7,9 +7,23 @@
 //! surface directly.
 
 use std::io::Read;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Bind an ephemeral port, then release it — a free port for the program under
+/// test (a small TOCTOU window, standard for this kind of test; the pattern
+/// `ssr_fullstack.rs` already uses). Fixed literals collide between runs and, on
+/// Windows, sit inside ranges Hyper-V/WSL reserve outright
+/// (windows-support.md §4).
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
 
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_stream_{tag}_{}", std::process::id()));
@@ -71,10 +85,11 @@ fn a_streaming_response_delivers_chunks_until_close() {
         "vilan.toml",
         "[package]\nname = \"app\"\ntarget = \"node\"\n",
     );
+    let port = free_port().to_string();
     write(
         &dir,
         "src/main.vl",
-        r#"import std::print;
+        &r#"import std::print;
 import std::process::exit;
 import std::time::sleep;
 import std::http::{ Server, Response };
@@ -123,7 +138,8 @@ fun run_client() {
 	print(received);
 	exit(0);
 }
-"#,
+"#
+        .replace("45213", &port),
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(45));
     let one = stdout.find("one").expect("first chunk missing");

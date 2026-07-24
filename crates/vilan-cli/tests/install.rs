@@ -23,8 +23,17 @@ impl Machine {
         let _ = fs::remove_dir_all(&root);
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create scratch home");
-        let binary = root.join("vilan");
-        fs::copy(env!("CARGO_BIN_EXE_vilan"), &binary).expect("copy the binary out of the repo");
+        // The destination keeps the SOURCE's file name, so the copy is
+        // `vilan.exe` on Windows without a second spelling of the name to keep
+        // in sync (windows-support.md §4). Every later use goes through
+        // `self.binary`, so there is nothing else to derive.
+        let source = Path::new(env!("CARGO_BIN_EXE_vilan"));
+        let binary = root.join(
+            source
+                .file_name()
+                .expect("the built binary has a file name"),
+        );
+        fs::copy(source, &binary).expect("copy the binary out of the repo");
         Machine { root, home, binary }
     }
 
