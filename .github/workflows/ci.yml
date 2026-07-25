@@ -53,5 +53,8 @@ jobs:
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
+      # --no-fail-fast: one failing target must not hide the rest of the run —
+      # this workflow is the instrument that produces the COMPLETE failure list
+      # per push (the exit code still gates; cargo reports failure regardless).
       - name: The suite is green
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast

@@ -218,16 +218,19 @@ mod tests {
 
     /// Runs on the Windows CI leg only (`windows-support.md` §8): the Job
     /// object is the whole point of this module and cannot be exercised from
-    /// unix. `cmd.exe /C timeout` gives a two-deep tree — `cmd.exe` is the
-    /// child, `timeout.exe` its own child — so "the job kill takes the tree"
-    /// is a real claim and not just "kill killed the child".
+    /// unix. `cmd.exe /C ping` gives a two-deep tree — `cmd.exe` is the
+    /// child, `ping.exe` its own child — so "the job kill takes the tree"
+    /// is a real claim and not just "kill killed the child". `ping -n 30` is
+    /// the long-lived grandchild rather than `timeout /T 30` because
+    /// `timeout.exe` refuses a non-console stdin ("Input redirection is not
+    /// supported") and exits immediately — caught by this test's first CI run.
     #[cfg(windows)]
     #[test]
     fn a_job_kill_takes_the_whole_child_tree() {
         use std::time::{Duration, Instant};
 
         let child = std::process::Command::new("cmd.exe")
-            .args(["/C", "timeout", "/T", "30", "/NOBREAK"])
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
             .spawn()
