@@ -366,3 +366,76 @@ jobs:
           npx --yes ovsx publish vilan-vscode.vsix \
             -p "$OVSX_TOKEN" \
             --skip-duplicate
+
+  # The Homebrew tap (proposal/distribution.md §4): one formula in
+  # vilan-lang/homebrew-vilan, repointed at this release.
+  #
+  # The formula is generated, never hand-written — `scripts/brew-formula.sh`
+  # renders it from a version and the release's own `sha256sums.txt`, and
+  # `homebrew/Formula/vilan.rb` in this repository is that script's output for
+  # the current release (the bytes that seeded the tap).
+  # crates/vilan-cli/tests/brew_formula.rs re-runs the script and compares, so
+  # what this job pushes and what a reviewer reads cannot drift apart.
+  publish-brew:
+    # `publish` for the reason publish-npm waits on it, and more sharply: every
+    # `url` in the formula points at a release asset, so a tap updated before
+    # the release exists advertises four downloads that 404 — and Homebrew
+    # caches by checksum, so a user who hits that window gets an error, not a
+    # retry. `build` is named too because those are the archives being pointed
+    # at.
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Is there a token to push with?
+        id: brew
+        # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
+        # `secrets`, so the secret's presence becomes a step output the rest of
+        # the job conditions on (distribution.md §6 — every publish job lands
+        # disabled-until-secret-exists). TAP_TOKEN needs contents:write on
+        # vilan-lang/homebrew-vilan and nothing else.
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Homebrew tap not updated::TAP_TOKEN is not configured, so vilan-lang/homebrew-vilan still points at the previous release. The rest of the release is unaffected."
+          fi
+      - name: The release's own checksums
+        if: steps.brew.outputs.publish == 'true'
+        # Taken from the release rather than recomputed from the build
+        # artifacts: this is the same file `install.sh` verifies downloads
+        # against, so the tap's four hashes are by construction the ones the
+        # release page publishes — there is no second computation that could
+        # disagree with it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --pattern sha256sums.txt
+      - name: Update the tap
+        if: steps.brew.outputs.publish == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:$TAP_TOKEN@github.com/vilan-lang/homebrew-vilan.git" tap
+          # `Formula/` is where `brew tap` looks; the seeded tap already has
+          # it, and a tap that somehow does not still gets a working formula
+          # rather than a redirect into a missing directory.
+          mkdir -p tap/Formula
+          scripts/brew-formula.sh "$VERSION" sha256sums.txt > tap/Formula/vilan.rb
+          git -C tap add Formula/vilan.rb
+          # Re-running a release must be harmless: the formula is a pure
+          # function of the version and the checksums, so a second run produces
+          # the same bytes and there is simply nothing to commit.
+          if git -C tap diff --cached --quiet; then
+            echo "::notice title=Homebrew tap already current::the tap's formula is already vilan $VERSION — nothing to push."
+            exit 0
+          fi
+          git -C tap \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "vilan $VERSION"
+          git -C tap push
