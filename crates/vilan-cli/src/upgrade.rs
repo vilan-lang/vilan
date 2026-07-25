@@ -43,6 +43,30 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 const DEFAULT_BASE: &str = "https://github.com/vilan-lang/vilan";
 
+/// The vilan mark as half-block art, shown once after a successful
+/// `vilan upgrade`. Rows are rasterized from
+/// assets/branding/dark_logo_flat.svg — do not hand-edit; regenerate this
+/// whole block with `python3 scripts/ascii_logo.py --rust`.
+///
+/// `concat!` of one literal per row — never a `"\` line-continuation
+/// literal: a trailing `\` in a Rust string skips the newline **and all
+/// following whitespace**, which silently eats each row's leading
+/// indentation and flush-lefts the mark (pinned by
+/// `the_mark_is_eleven_clean_lines_of_half_blocks`).
+const UPGRADE_LOGO: &str = concat!(
+    " ▄▄                                      ▄▄\n",
+    "  ▀██▄                                ▄██▀\n",
+    "    ▀                             ▄▄███▀\n",
+    "        ▄▄██▄                  ▄█████▀\n",
+    "        ▀██████▄▄          ▄▄██████▀\n",
+    "          ▀███████▄▄     ▄███████▀\n",
+    "            ▀█████████▄▄  ▀▀███▀\n",
+    "              ▀██████████▄▄\n",
+    "                ▀██████████▀\n",
+    "                  ▀██████▀\n",
+    "                    ▀██▀",
+);
+
 pub fn upgrade(check_only: bool) -> ExitCode {
     match run(check_only) {
         Ok(()) => ExitCode::SUCCESS,
@@ -168,14 +192,18 @@ fn download_verify_swap(
         cfg!(windows),
     )?;
 
+    // The one point at which the swap has happened and the new version is
+    // known — so the mark rides the line the upgrade has always ended on
+    // rather than being a second announcement of the same fact.
     let installed = String::from_utf8_lossy(&version_probe.stdout)
         .trim()
         .to_string();
     println!(
         "{}",
-        paint::out(
-            Style::GREEN,
-            &format!("installed {installed} to {}", install_dir.display())
+        success_banner(
+            paint::stdout_enabled(),
+            &installed,
+            &install_dir.display().to_string(),
         )
     );
 
@@ -200,6 +228,28 @@ fn download_verify_swap(
         );
     }
     Ok(())
+}
+
+/// What a finished upgrade prints: the mark, then the success line naming the
+/// version that is now installed and where it went.
+///
+/// One string from one `colored` verdict, taken as a parameter the way
+/// `paint.rs`'s own rule is — so both arms are pinned without a terminal, and
+/// so the art and its caption cannot drift apart or be printed twice. The sole
+/// caller sits after the swap has succeeded; every other exit from `run`
+/// (already newest, `--check`, any error) returns before reaching it.
+fn success_banner(colored: bool, installed: &str, destination: &str) -> String {
+    // Tinted line by line rather than as one span: a color that crossed a
+    // newline would be carried into whatever a pager, `head`, or a CI log
+    // collector re-emitted next.
+    let mark = UPGRADE_LOGO
+        .lines()
+        .map(|line| paint::wrap(colored, Style::LAVENDER, line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line = format!("installed {installed} to {destination}");
+    let caption = paint::wrap(colored, Style::GREEN, &line);
+    format!("\n{mark}\n\n{caption}")
 }
 
 /// The release asset for `target`. The Windows targets ship a `.zip` (the
@@ -383,8 +433,9 @@ fn parse_version(label: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        asset_name, install_binaries, is_aside_leftover, parse_version, recorded_checksum,
-        sha256_file, sweep_aside_leftovers, verify_checksum, version_from_tag_url,
+        UPGRADE_LOGO, asset_name, install_binaries, is_aside_leftover, parse_version,
+        recorded_checksum, sha256_file, success_banner, sweep_aside_leftovers, verify_checksum,
+        version_from_tag_url,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -681,5 +732,140 @@ mod tests {
             assert!(!install.join(format!("{binary}.old")).exists());
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The generated art is what a terminal has to survive, so its shape is
+    /// pinned rather than trusted: regenerating it with different parameters
+    /// (or hand-editing it) has to trip this, not a user's console.
+    #[test]
+    fn the_mark_is_eleven_clean_lines_of_half_blocks() {
+        let lines: Vec<&str> = UPGRADE_LOGO.lines().collect();
+        assert_eq!(lines.len(), 11, "the generator emits 11 rows");
+        for (index, line) in lines.iter().enumerate() {
+            let columns = line.chars().count();
+            assert!(
+                columns <= 44,
+                "line {index} is {columns} columns wide — 44 is what fits an \
+                 80-column terminal beside a caption: {line:?}"
+            );
+            assert!(
+                line.chars()
+                    .all(|glyph| matches!(glyph, ' ' | '▀' | '▄' | '█')),
+                "line {index} has a glyph outside the four CP437 half-blocks: {line:?}"
+            );
+            assert_eq!(
+                line.trim_end(),
+                *line,
+                "line {index} carries trailing whitespace"
+            );
+        }
+        // Not blank and not shrunk: below ~32 columns the full mark stops
+        // reading, which is what the simplified icon SVGs are for.
+        let widest = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .expect("eleven lines");
+        assert!(
+            (33..=44).contains(&widest),
+            "the mark renders at {widest} columns"
+        );
+        for glyph in ['▀', '▄', '█'] {
+            assert!(UPGRADE_LOGO.contains(glyph), "the art lost {glyph:?}");
+        }
+
+        // The indentation *is* the mark: it is a chevron converging downward,
+        // so no row is flush-left and the indents never step back. This is the
+        // pin that catches the mark being pasted back into a `"\` line-
+        // continuation literal, whose escape eats leading whitespace and
+        // silently flush-lefts every row (the shape survives nothing else in
+        // this test — the widths, the glyph set and the trailing-space check
+        // all still pass on the wreckage).
+        let indents: Vec<usize> = lines
+            .iter()
+            .map(|line| line.len() - line.trim_start_matches(' ').len())
+            .collect();
+        assert!(
+            indents.iter().all(|indent| *indent > 0),
+            "a row is flush-left — the indentation was eaten: {indents:?}"
+        );
+        assert!(
+            indents.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the mark stopped converging: {indents:?}"
+        );
+        // No blank frame baked into the const — the banner owns its spacing.
+        assert!(!UPGRADE_LOGO.starts_with('\n'), "leading empty line");
+        assert!(!UPGRADE_LOGO.ends_with('\n'), "trailing empty line");
+        assert!(!lines[0].trim().is_empty() && !lines[10].trim().is_empty());
+    }
+
+    /// The colored arm with every SGR sequence removed — what the terminal
+    /// actually shows once it has consumed them.
+    fn strip_escapes(text: &str) -> String {
+        let mut visible = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('\x1b') {
+            visible.push_str(&rest[..start]);
+            let sequence = &rest[start..];
+            let end = sequence.find('m').expect("an SGR sequence ends in `m`");
+            rest = &sequence[end + 1..];
+        }
+        visible.push_str(rest);
+        visible
+    }
+
+    /// Both arms of the success banner. `colored` is a parameter, so a piped
+    /// stream, `NO_COLOR`, and a real terminal are all pinned without one.
+    #[test]
+    fn the_success_banner_prints_the_mark_and_one_caption_in_both_arms() {
+        // A synthetic install directory: the real one lives under `$HOME`, and
+        // the hygiene gate rejects an absolute home path in a tracked file.
+        let plain = success_banner(false, "vilan 9.9.9 (fake)", "/opt/vilan/bin");
+        let colored = success_banner(true, "vilan 9.9.9 (fake)", "/opt/vilan/bin");
+
+        // Piped or `NO_COLOR`: not one escape byte, and the glyphs are the
+        // const's own bytes, unmangled.
+        assert!(
+            !plain.contains('\x1b'),
+            "escapes on the plain path: {plain:?}"
+        );
+        assert!(plain.contains(UPGRADE_LOGO), "the art is missing:\n{plain}");
+
+        // Colored: the brand lavender opens the art, the caption keeps its own
+        // green, and the whole thing closes on a reset.
+        assert!(
+            colored.contains("\x1b[38;2;212;205;255m"),
+            "no lavender: {colored:?}"
+        );
+        assert!(colored.contains("\x1b[32m"), "the caption lost green");
+        assert!(colored.ends_with("\x1b[0m"), "unterminated: {colored:?}");
+        // One span per art line plus one for the caption — no span crosses a
+        // newline, so a pager cannot carry the color into what it prints next.
+        assert_eq!(colored.matches("\x1b[").count(), 2 * (11 + 1));
+        for line in colored.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.starts_with('\x1b') && line.ends_with("\x1b[0m"),
+                "a line is not self-contained: {line:?}"
+            );
+        }
+
+        // Both arms name the new version exactly once, on the one success line
+        // the upgrade has always ended on — the art joins that message rather
+        // than repeating it.
+        for banner in [&plain, &colored] {
+            assert_eq!(
+                strip_escapes(banner)
+                    .matches("installed vilan 9.9.9 (fake) to /opt/vilan/bin")
+                    .count(),
+                1,
+                "the caption is not printed exactly once:\n{banner}"
+            );
+        }
+        // Escapes are the *only* difference between the arms.
+        assert_eq!(strip_escapes(&colored), plain);
+
+        // Visible in `cargo test -- --nocapture`, captured otherwise: the
+        // sample a reviewer wants without running a real upgrade.
+        println!("{plain}");
     }
 }

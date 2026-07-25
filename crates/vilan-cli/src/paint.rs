@@ -1,13 +1,21 @@
 //! Coloring for the CLI's output — the `Compiled …`, `[watch] …`, `hmr: …`,
-//! `error:`/`warning:` prefixes, and the test-runner summary, which this module
-//! dresses directly; and the ariadne diagnostics, which render themselves but
-//! now take their color/no-color verdict from here (see below).
+//! `error:`/`warning:` prefixes, the test-runner summary, and the mark
+//! `vilan upgrade` prints on success, which this module dresses directly; and
+//! the ariadne diagnostics, which render themselves but now take their
+//! color/no-color verdict from here (see below).
 //!
 //! Hand-rolled ANSI rather than ariadne's `Color`: ariadne's `Fmt` emits codes
 //! unconditionally (it leaves the terminal check to the `Report` renderer), so
 //! reusing it would mean either driving yansi's global enable state or always
 //! allocating a styled wrapper. A handful of SGR constants gate explicitly, once
 //! per stream, and hand back the input unchanged on the plain path.
+//!
+//! A [`Style`] is just an SGR *parameter body*, so the palette is not limited to
+//! the classic 3-bit codes: [`Style::LAVENDER`] carries the brand color as a
+//! 24-bit `38;2;r;g;b` body through the same constant, the same [`wrap`], and
+//! the same gate. Status lines stay on the classic codes (they must read on
+//! whatever palette the user has themed); the one truecolor style exists because
+//! the brand mark is the brand's actual color or it is nothing.
 //!
 //! Gating (both must hold for a stream to be colored): the stream is a terminal
 //! (`IsTerminal`, checked on stdout and stderr separately) **and** `NO_COLOR` is
@@ -43,13 +51,21 @@ impl Style {
     pub const BOLD_RED: Style = Style("1;31");
     pub const BOLD_GREEN: Style = Style("1;32");
     pub const BOLD_YELLOW: Style = Style("1;33");
+    /// The brand lavender `#D4CDFF` as a 24-bit foreground — the one style that
+    /// names an exact color rather than a palette slot, for the mark itself.
+    pub const LAVENDER: Style = Style("38;2;212;205;255");
 }
 
 /// Wraps `text` in `style`'s SGR codes when `enabled`; otherwise hands it back
 /// borrowed and byte-identical — the plain path allocates nothing and never
 /// reformats. Kept pure (the flag is a parameter) so the pins exercise both arms
 /// without a real terminal.
-fn wrap(enabled: bool, style: Style, text: &str) -> Cow<'_, str> {
+///
+/// [`out`] and [`err`] are this with their stream's verdict supplied, and are
+/// what a single line should use. Reach for `wrap` directly when a caller
+/// composes a *block* from one verdict — see `upgrade::success_banner`, which
+/// takes `colored` as a parameter for exactly the reason this function does.
+pub fn wrap(enabled: bool, style: Style, text: &str) -> Cow<'_, str> {
     if enabled {
         Cow::Owned(format!("\x1b[{}m{}\x1b[0m", style.0, text))
     } else {
@@ -120,7 +136,11 @@ fn decide(stream: Stream, is_terminal: bool) -> bool {
 
 // Each stream's verdict is computed once, on first paint — a build or watch run
 // dresses many lines but probes the terminal (and `NO_COLOR`) a single time.
-fn stdout_enabled() -> bool {
+
+/// Whether stdout may carry ANSI. Public for the same reason
+/// [`stderr_enabled`] is: a caller that formats a whole block from one verdict
+/// (`upgrade::success_banner`) must read the same gate every status line does.
+pub fn stdout_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| decide(Stream::Stdout, std::io::stdout().is_terminal()))
 }
@@ -201,6 +221,21 @@ mod tests {
         assert_eq!(decide(Stream::Stderr, false), gate(false, no_color()));
         assert_eq!(decide(Stream::Stdout, true), gate(true, no_color()));
         assert_eq!(decide(Stream::Stderr, true), gate(true, no_color()));
+    }
+
+    #[test]
+    fn the_brand_lavender_rides_the_same_style_encoding_as_the_classic_codes() {
+        // `#D4CDFF` → the 24-bit foreground body `38;2;212;205;255`. Nothing
+        // about `wrap` knows this is a truecolor style: a `Style` is its SGR
+        // parameter body, so there is no parallel color path to keep in sync.
+        assert_eq!(
+            wrap(true, Style::LAVENDER, "▀██▀"),
+            "\x1b[38;2;212;205;255m▀██▀\x1b[0m"
+        );
+        // ...and it obeys the one gate like every other style.
+        let plain = wrap(false, Style::LAVENDER, "▀██▀");
+        assert_eq!(plain, "▀██▀");
+        assert!(matches!(plain, Cow::Borrowed(_)));
     }
 
     #[test]

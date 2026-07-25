@@ -148,6 +148,17 @@ fn upgrade_swaps_both_binaries_and_reports_the_new_version() {
         stdout.contains("installed vilan 9.9.9 (fake)"),
         "reports the swapped version: {stdout}"
     );
+    // The brand mark rides the success banner — and only here; the other
+    // three paths pin its absence. A piped stream stays escape-free, so this
+    // also exercises the TTY gate end to end.
+    assert!(
+        stdout.contains("▀██████████▄▄"),
+        "the mark is missing from the success banner: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\x1b'),
+        "escape bytes on a piped stream: {stdout:?}"
+    );
 
     // The running binary's path now holds the new release, lsp beside it.
     assert_eq!(fixture.installed_banner(), "vilan 9.9.9 (fake)");
@@ -185,6 +196,10 @@ fn upgrade_check_reports_and_changes_nothing() {
     );
     assert!(!fixture.bin.join("vilan-lsp").exists());
     assert!(fixture.cache_entry("stale-entry").is_dir());
+    assert!(
+        !stdout.chars().any(|glyph| matches!(glyph, '▀' | '▄' | '█')),
+        "`--check` must not print the mark: {stdout}"
+    );
 }
 
 #[test]
@@ -194,6 +209,10 @@ fn upgrade_declines_when_already_the_newest() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("is the newest release"), "{stdout}");
+    assert!(
+        !stdout.chars().any(|glyph| matches!(glyph, '▀' | '▄' | '█')),
+        "an up-to-date install must not print the mark: {stdout}"
+    );
     assert!(
         fixture
             .installed_banner()
@@ -219,6 +238,11 @@ fn upgrade_aborts_on_a_checksum_mismatch_without_touching_the_install() {
         String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"),
         "names the problem: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.chars().any(|glyph| matches!(glyph, '▀' | '▄' | '█')),
+        "a failed upgrade must not print the mark: {stdout}"
     );
     assert!(
         fixture

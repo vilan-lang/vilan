@@ -80,3 +80,8 @@ Open the SVG in a browser and capture at the needed scale (devtools
 screenshot, or print-to-PDF for vector handoff). For flat files any SVG
 rasterizer is fine. The VS Code marketplace requires PNG icons — export
 `dark_icon.svg` at 128×128 when the extension adopts the brand.
+
+The CLI's post-upgrade banner (`UPGRADE_LOGO` in
+`crates/vilan-cli/src/upgrade.rs`) is half-block art generated from
+`dark_logo_flat.svg` by `scripts/ascii_logo.py` — regenerate with
+`python3 scripts/ascii_logo.py --rust` after any change to the mark.
