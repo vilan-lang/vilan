@@ -185,6 +185,14 @@ npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
 marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + `TAP_TOKEN`.
 
+*S2 additions (2026-07-25):* Open VSX does **not** auto-create
+namespaces — before the first tagged release with `OVSX_TOKEN` set, run
+`npx ovsx create-namespace vilan-lang -p <token>` once. And the day
+`VSCE_PAT` lands, flip README's extension-install sentence from
+"Install from VSIX" to "search Vilan in the marketplace" (recorded in
+the S2 slice report; a documented install that doesn't exist yet is
+worse than none, so the sentence waits for the channel).
+
 ## 8. Open calls
 
 (a) **npm naming** — recommend: take bare `vilan` for the meta package

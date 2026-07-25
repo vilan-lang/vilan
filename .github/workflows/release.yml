@@ -273,3 +273,96 @@ jobs:
             [ "$package" = npm-dist/vilan/ ] || publish "$package"
           done
           publish npm-dist/vilan
+
+  # The editor galleries (proposal/distribution.md §3): the `.vsix` the release
+  # already carries, uploaded to the VS Code Marketplace and to Open VSX.
+  #
+  # Neither job checks the repository out. The artifact `vsix` built is the
+  # entire input, so what the galleries serve is byte-for-byte the file on the
+  # GitHub Release — there is no second packaging run to disagree with it.
+  #
+  # Idempotence is `--skip-duplicate`, which both tools implement as their own
+  # already-published predicate rather than a message match: vsce skips when the
+  # version is in the extension's version list or the upload comes back 409, and
+  # ovsx when the registry answers "… is already published." Everything else —
+  # a revoked token, a namespace this account cannot publish to — still throws,
+  # so a re-run of a half-finished release is safe and a broken one is not
+  # silently green.
+  publish-marketplace:
+    # `vsix` for the package, `publish` for the same rule publish-npm follows: a
+    # marketplace version can be unpublished but never replaced, so it must not
+    # carry a version whose GitHub Release failed to go out.
+    needs: [vsix, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Is there a token to publish with?
+        id: marketplace
+        # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
+        # `secrets`, so the secret's presence becomes a step output the rest of
+        # the job conditions on (distribution.md §6 — every publish job lands
+        # disabled-until-secret-exists).
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -n "$VSCE_PAT" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Marketplace publish skipped::VSCE_PAT is not configured, so the extension was not published to the VS Code Marketplace. The rest of the release is unaffected."
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.marketplace.outputs.publish == 'true'
+        with:
+          name: release-vsix
+      - name: Publish
+        if: steps.marketplace.outputs.publish == 'true'
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          npx --yes @vscode/vsce publish \
+            --packagePath vilan-vscode.vsix \
+            --pat "$VSCE_PAT" \
+            --skip-duplicate
+
+  publish-openvsx:
+    # The same extension for VSCodium / Cursor / Theia (distribution.md §3).
+    # Separate from the marketplace job on purpose: one gallery being down, or
+    # one token missing, must not hold the other back.
+    needs: [vsix, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Is there a token to publish with?
+        id: openvsx
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+        run: |
+          if [ -n "$OVSX_TOKEN" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Open VSX publish skipped::OVSX_TOKEN is not configured, so the extension was not published to Open VSX. The rest of the release is unaffected."
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.openvsx.outputs.publish == 'true'
+        with:
+          name: release-vsix
+      - name: Publish
+        if: steps.openvsx.outputs.publish == 'true'
+        # Open VSX has no auto-created namespaces: the `vilan-lang` namespace
+        # must exist before the first publish, once, by hand —
+        # `npx ovsx create-namespace vilan-lang -p <token>`. That is part of
+        # provisioning the account (distribution.md §7), like owning the npm
+        # scope; publishing into a namespace that does not exist fails the job
+        # rather than inventing one.
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+        run: |
+          npx --yes ovsx publish vilan-vscode.vsix \
+            -p "$OVSX_TOKEN" \
+            --skip-duplicate

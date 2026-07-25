@@ -1,14 +1,30 @@
 {
   "name": "vilan",
   "displayName": "Vilan",
-  "description": "Language support for Vilan: syntax highlighting, diagnostics, hover, go-to-definition, find references, and rename.",
+  "description": "Language support for Vilan: live diagnostics, completion with signatures, hover, inlay hints, semantic highlighting, go to definition, find references, rename, formatting, and Organize Imports.",
   "version": "0.14.0",
   "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#110C31",
+    "theme": "dark"
+  },
+  "homepage": "https://vilan-lang.github.io/vilan/",
   "repository": {
     "type": "git",
     "url": "https://github.com/vilan-lang/vilan"
   },
+  "bugs": {
+    "url": "https://github.com/vilan-lang/vilan/issues"
+  },
+  "keywords": [
+    "vilan",
+    "language",
+    "lsp",
+    "full-stack",
+    "reactive"
+  ],
   "engines": {
     "vscode": "^1.75.0"
   },

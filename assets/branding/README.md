@@ -78,8 +78,14 @@ mark's visual mass.
 
 Open the SVG in a browser and capture at the needed scale (devtools
 screenshot, or print-to-PDF for vector handoff). For flat files any SVG
-rasterizer is fine. The VS Code marketplace requires PNG icons — export
-`dark_icon.svg` at 128×128 when the extension adopts the brand.
+rasterizer is fine.
+
+The VS Code marketplace takes PNG only, and the extension's `icon.png` is
+already derived: `dark_icon.svg` at 256×256 on the deep-indigo ground,
+rendered by `python3 scripts/icon_png.py` (regenerate after any change to
+the mark). The ground is not decoration — gallery pages render the icon on
+a white card and the editor renders it on the user's theme, so a
+transparent icon can only read against one of the two.
 
 The CLI's post-upgrade banner (`UPGRADE_LOGO` in
 `crates/vilan-cli/src/upgrade.rs`) is half-block art generated from
