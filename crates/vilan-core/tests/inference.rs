@@ -25494,3 +25494,782 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
 
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+// --- B33: module initialization order (b33-emission-order.md) --------------
+
+/// Compile a MULTI-FILE package: `files` (relative path → contents) are written
+/// into a fresh temp directory used as the package root, `entry` is analyzed
+/// against it, and the emitted JS comes back. The B33 pins need real modules on
+/// disk — the load-time relation and the canonical tie-break both span files,
+/// and the naive-sort counterexample is only expressible across two of them.
+fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<String>> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("vilan_init_order_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    for (relative, contents) in files {
+        let path = directory.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = directory.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+
+    let result = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    &directory,
+                    &entry_path,
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                let compiled = match program {
+                    Some(program) if errors.is_empty() => {
+                        transform(&program, &BuildOptions::default())
+                            .map_err(|error| vec![error.msg])
+                    }
+                    _ => Err(errors.into_iter().map(|error| error.msg).collect()),
+                };
+                let _ = std::fs::remove_dir_all(&directory);
+                compiled
+            }))
+            .unwrap_or_else(|_| Err(vec!["compiler panicked".to_string()]))
+        })
+        .expect("spawn worker")
+        .join()
+        .unwrap_or_else(|_| Err(vec!["compiler thread aborted".to_string()]));
+    result
+}
+
+/// [`compile_package`] plus a `node` run: returns `(emitted JS, stdout)`.
+fn compile_and_run_package(
+    files: &[(&str, &str)],
+    entry: &str,
+) -> Result<(String, String), Vec<String>> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let js = compile_package(files, entry)?;
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "vilan_init_order_run_{}_{unique}.js",
+        std::process::id()
+    ));
+    std::fs::write(&path, &js).map_err(|error| vec![error.to_string()])?;
+    let output = std::process::Command::new("node").arg(&path).output();
+    let _ = std::fs::remove_file(&path);
+    match output {
+        Ok(output) if output.status.success() => {
+            Ok((js, String::from_utf8_lossy(&output.stdout).into_owned()))
+        }
+        Ok(output) => Err(vec![String::from_utf8_lossy(&output.stderr).into_owned()]),
+        Err(error) => Err(vec![format!("could not run node: {error}")]),
+    }
+}
+
+/// The index at which `needle` appears in `js`, for asserting relative
+/// declaration order.
+#[track_caller]
+fn declaration_position(js: &str, needle: &str) -> usize {
+    js.find(needle)
+        .unwrap_or_else(|| panic!("emitted JS has no `{needle}`:\n{js}"))
+}
+
+#[test]
+fn module_binding_may_reference_one_declared_below_it() {
+    // B33 pin 1 (§1's first consequence): same-module bindings are order-free.
+    // Before the dependency order this built cleanly and crashed at load with
+    // `Cannot access 'B' before initialization` — `const` is not hoisted, and
+    // emission followed declaration order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let A: i32 = B * 2;
+        let B: i32 = 21;
+        fun main() {
+            print(A);
+            print(B);
+        }
+        "#,
+        "42\n21\n",
+    );
+}
+
+#[test]
+fn a_dependency_in_a_later_loading_module_is_declared_first() {
+    // B33 pin 2 — the naive-sort counterexample from the proposal's §0, stated
+    // as a program: `alpha` loads BEFORE `zeta` canonically (module names sort),
+    // so `A`'s entity id is lower than `Z`'s — yet `A`'s initializer reads `Z`.
+    // Sorting by the canonical key alone (id or name) emits `A` first and
+    // TDZ-crashes; the load-time relation puts `Z` first.
+    let (js, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                 fun main() { print(A); print(Z); }\n",
+            ),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Z };\nlet A: i32 = Z * 2;\n",
+            ),
+            ("zeta.vl", "let Z: i32 = 21;\n"),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "42\n21\n");
+    assert!(
+        declaration_position(&js, "const Z = 21;") < declaration_position(&js, "const A = Z * 2;"),
+        "the dependency must be DECLARED first, not merely happen to run:\n{js}"
+    );
+}
+
+#[test]
+fn import_statement_order_cannot_change_module_binding_order() {
+    // The other half of pin 2: the SAME program with its two imports swapped
+    // emits identical bytes. Before B33 this flipped the declaration order (the
+    // entry scope's insertion order decided it) and one spelling TDZ-crashed.
+    let module_files: [(&str, &str); 2] = [
+        (
+            "alpha.vl",
+            "import pkg::zeta::{ Z };\nlet A: i32 = Z * 2;\n",
+        ),
+        ("zeta.vl", "let Z: i32 = 21;\n"),
+    ];
+    let alpha_first = "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                       fun main() { print(A); print(Z); }\n";
+    let zeta_first = "import std::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
+                      fun main() { print(A); print(Z); }\n";
+
+    let mut with_alpha_first = vec![("main.vl", alpha_first)];
+    with_alpha_first.extend(module_files);
+    let mut with_zeta_first = vec![("main.vl", zeta_first)];
+    with_zeta_first.extend(module_files);
+
+    let first = compile_package(&with_alpha_first, "main.vl").expect("clean compile");
+    let second = compile_package(&with_zeta_first, "main.vl").expect("clean compile");
+    assert_eq!(
+        first, second,
+        "permuting the import statements must not change a byte"
+    );
+}
+
+#[test]
+fn mutually_recursive_module_closures_stay_legal() {
+    // B33 pin 3 — the §5(a) guard. EVEN and ODD each CREATE a closure whose body
+    // calls the other; neither EVALUATES the other at load. Creation is inert, so
+    // the relation has no edge here and no cycle. Building the order on the call
+    // graph's raw `successors` would charge each body to its creator and reject
+    // this working program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let EVEN: |i32| bool = |n: i32| {
+            if n == 0 { true } else { ODD(n - 1) }
+        };
+        let ODD: |i32| bool = |n: i32| {
+            if n == 0 { false } else { EVEN(n - 1) }
+        };
+        fun main() {
+            print(EVEN(4));
+            print(ODD(4));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn edgeless_module_closures_emit_in_canonical_order() {
+    // The second half of pin 3: with NO edges between them, EVEN and ODD fall to
+    // the canonical tie-break — declaration order within the file, which is
+    // entity-id order. (This is also what proves the relation found no edge: a
+    // spurious one would have to reorder them or make them cycle leftovers.)
+    let js = compile(
+        r#"
+        import std::print;
+        let EVEN: |i32| bool = |n: i32| {
+            if n == 0 { true } else { ODD(n - 1) }
+        };
+        let ODD: |i32| bool = |n: i32| {
+            if n == 0 { false } else { EVEN(n - 1) }
+        };
+        fun main() { print(EVEN(4)); print(ODD(4)); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        declaration_position(&js, "const EVEN =") < declaration_position(&js, "const ODD ="),
+        "no edges means canonical order:\n{js}"
+    );
+}
+
+#[test]
+fn a_call_through_a_global_orders_what_that_body_reads() {
+    // B33 pin 4 — §2's "call through a value". `X`'s initializer calls `FETCH`,
+    // a binding holding a closure; the closure's body reads `Y`, so `Y` charges
+    // to X (the EVALUATOR), not to FETCH. Probed before the fix: `Y` emitted
+    // last and the run died with `Cannot access 'Y' before initialization`.
+    let js = compile(
+        r#"
+        import std::print;
+        let FETCH: || i32 = || { Y };
+        let X: i32 = FETCH();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        declaration_position(&js, "const Y = 7;") < declaration_position(&js, "const X ="),
+        "the closure body's read must order Y before X:\n{js}"
+    );
+    assert!(
+        declaration_position(&js, "const FETCH =") < declaration_position(&js, "const Y = 7;"),
+        "FETCH itself stays UNORDERED w.r.t. Y — canonical order keeps it first:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let FETCH: || i32 = || { Y };
+        let X: i32 = FETCH();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_direct_call_at_init_orders_what_the_callee_reads() {
+    // The transitive half of §2: a plain function call at init is entered, and
+    // the callee's global reads charge to the initializing binding.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun read_y(): i32 { Y * 3 }
+        let X: i32 = read_y();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "21\n",
+    );
+}
+
+#[test]
+fn unrelated_effectful_initializers_run_in_canonical_order() {
+    // B33 pin 5 — the §5(d) spec pin. Two initializers with NO dependency
+    // between them, in two modules: their observable order is the canonical one
+    // (module name, so `alpha` before `zeta`) whatever order the ENTRY lists its
+    // imports in. Before B33 the entry's import listing decided, so this printed
+    // "zeta" first.
+    let (_js, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::zeta::{ Z };\nimport pkg::alpha::{ A };\n\
+                 fun main() { print(A + Z); }\n",
+            ),
+            (
+                "util.vl",
+                "import std::print;\nfun announce(label: str): i32 { print(label); 1 }\n",
+            ),
+            (
+                "alpha.vl",
+                "import pkg::util::{ announce };\nlet A: i32 = announce(\"alpha\");\n",
+            ),
+            (
+                "zeta.vl",
+                "import pkg::util::{ announce };\nlet Z: i32 = announce(\"zeta\");\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "alpha\nzeta\n2\n");
+}
+
+#[test]
+fn a_const_binding_still_folds_and_orders_as_a_plain_value() {
+    // B33 pin 6. A `const`-marked initializer runs in the compile-time
+    // interpreter, so the call graph never collects it and it has NO outgoing
+    // edges. It stays a legitimate ordering TARGET, though: the folded
+    // `const STEP = 7;` declaration must still precede the binding that reads it.
+    let js = compile(
+        r#"
+        import std::print;
+        fun seven(): i32 { 7 }
+        let DOUBLE: i32 = STEP * 2;
+        let STEP: i32 = const seven();
+        fun main() { print(DOUBLE); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        js.contains("const STEP = 7;"),
+        "the const initializer still folds to a literal:\n{js}"
+    );
+    assert!(
+        declaration_position(&js, "const STEP = 7;") < declaration_position(&js, "const DOUBLE ="),
+        "a const binding is still ordered before its reader:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun seven(): i32 { 7 }
+        let DOUBLE: i32 = STEP * 2;
+        let STEP: i32 = const seven();
+        fun main() { print(DOUBLE); }
+        "#,
+        "14\n",
+    );
+}
+
+#[test]
+fn a_dispatching_initializer_is_accepted_and_ordered() {
+    // B33 pin 7 — the §5(b) risk probe. `TOTAL`'s initializer calls a
+    // trait-bounded generic, so the relation follows EVERY dispatch candidate
+    // (the standing over-approximation): both `weight` impls read `BASE`, and
+    // `total` itself reads `OFFSET`. No real cycle exists, so the program is
+    // accepted and both reads are ordered before `TOTAL`.
+    let js = compile(
+        r#"
+        import std::print;
+        trait Weight { fun weight(self): i32; }
+        struct Feather {}
+        struct Anvil {}
+        impl Feather with Weight { fun weight(self): i32 { BASE } }
+        impl Anvil with Weight { fun weight(self): i32 { BASE * 100 } }
+        fun total<T: Weight>(item: T): i32 { item.weight() + OFFSET }
+        let TOTAL: i32 = total(Feather {});
+        let BASE: i32 = 3;
+        let OFFSET: i32 = 1;
+        fun main() { print(TOTAL); print(total(Anvil {})); }
+        "#,
+    )
+    .expect("clean compile");
+    let total = declaration_position(&js, "const TOTAL =");
+    assert!(
+        declaration_position(&js, "const BASE = 3;") < total
+            && declaration_position(&js, "const OFFSET = 1;") < total,
+        "both candidates' reads order before the dispatching initializer:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Weight { fun weight(self): i32; }
+        struct Feather {}
+        struct Anvil {}
+        impl Feather with Weight { fun weight(self): i32 { BASE } }
+        impl Anvil with Weight { fun weight(self): i32 { BASE * 100 } }
+        fun total<T: Weight>(item: T): i32 { item.weight() + OFFSET }
+        let TOTAL: i32 = total(Feather {});
+        let BASE: i32 = 3;
+        let OFFSET: i32 = 1;
+        fun main() { print(TOTAL); print(total(Anvil {})); }
+        "#,
+        "4\n301\n",
+    );
+}
+
+#[test]
+fn a_self_referential_binding_still_builds_in_s1() {
+    // B33 pin 8 — S1's CURRENT behavior, pinned so S2's flip is deliberate.
+    // `let A = A + 1` is a 1-cycle: Kahn can never release it, so it lands in
+    // the leftover set and is appended in canonical order. S1 emits no
+    // diagnostic, and the program keeps the failure mode it has today (a runtime
+    // TDZ). S2 REWRITES THIS TEST into an `assert_fails_with` naming the cycle;
+    // until then, `assert_compiles` documents that S1 neither panics, hangs, nor
+    // changes the outcome for a cyclic program.
+    assert_compiles(
+        r#"
+        import std::print;
+        let A: i32 = A + 1;
+        fun main() { print(A); }
+        "#,
+    );
+    let js = compile(
+        r#"
+        import std::print;
+        let A: i32 = A + 1;
+        fun main() { print(A); }
+        "#,
+    )
+    .expect("S1 still compiles a cyclic program");
+    assert!(
+        js.contains("const A = A + 1;"),
+        "the leftover is emitted unchanged (today's runtime-TDZ class):\n{js}"
+    );
+}
+
+#[test]
+fn a_cycle_does_not_disturb_the_bindings_around_it() {
+    // The other half of pin 8: a cycle must not scramble the rest. `A` is a
+    // 1-cycle nothing else depends on, so it stays in its own component and
+    // keeps its canonical position; `OK` is unaffected either way. (The sort
+    // condenses strongly connected components rather than sweeping every
+    // undrained binding to the end — see
+    // `a_binding_downstream_of_a_false_cycle_still_orders_after_it`.)
+    let js = compile(
+        r#"
+        import std::print;
+        let A: i32 = A + 1;
+        let OK: i32 = 5;
+        fun main() { print(OK); print(A); }
+        "#,
+    )
+    .expect("S1 still compiles a cyclic program");
+    assert!(
+        declaration_position(&js, "const A = A + 1;") < declaration_position(&js, "const OK = 5;"),
+        "a self-cycle is its own component and keeps its canonical position:\n{js}"
+    );
+}
+
+#[test]
+fn a_call_through_a_closure_built_by_a_function_is_ordered() {
+    // §2's "def chain": `MAKER`'s value came out of `make()`, so the call
+    // `MAKER()` can reach any closure `make` creates — and that closure's read
+    // of `Y` charges to `X`. Note `MAKER` itself stays unordered w.r.t. `Y`
+    // (`make`'s own body reads nothing).
+    let js = compile(
+        r#"
+        import std::print;
+        fun make(): || i32 { || { Y } }
+        let MAKER: || i32 = make();
+        let X: i32 = MAKER();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        declaration_position(&js, "const Y = 7;") < declaration_position(&js, "const X ="),
+        "the created closure's read must order Y before X:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): || i32 { || { Y } }
+        let MAKER: || i32 = make();
+        let X: i32 = MAKER();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_call_through_a_struct_field_closure_is_ordered() {
+    // A closure reached by PROJECTION out of a binding: the field read resolves
+    // to the binding, whose initializer created the closure. Probed as a live
+    // TDZ before the projection arms existed.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { get: || i32 }
+        let HOLDER: Holder = Holder { get = || { Y } };
+        let X: i32 = (HOLDER.get)();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_call_through_an_indexed_closure_is_ordered() {
+    // The same projection rule through a list index and a tuple index — three
+    // distinct `Expr` arms, so three cases.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let TABLE: List<|| i32> = [|| { Y }];
+        let X: i32 = TABLE[0]();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let PAIR: (|| i32, i32) = (|| { Y }, 1);
+        let X: i32 = (PAIR.0)();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_const_binding_contributes_no_ordering_edges() {
+    // The other half of pin 6: a `const`-marked initializer is EXEMPT as a
+    // source. `STEP` reads `BASE`, but both fold at compile time, so neither the
+    // emitted code nor the relation carries that read — `STEP` keeps its
+    // canonical (declaration-first) position instead of being pushed after
+    // `BASE`, and no cycle can be manufactured out of const chains.
+    let js = compile(
+        r#"
+        import std::print;
+        let STEP: i32 = const BASE * 2;
+        let BASE: i32 = const 6;
+        fun main() { print(STEP); print(BASE); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        js.contains("const STEP = 12;") && js.contains("const BASE = 6;"),
+        "both fold to literals:\n{js}"
+    );
+    assert!(
+        declaration_position(&js, "const STEP = 12;")
+            < declaration_position(&js, "const BASE = 6;"),
+        "a folded read is not an ordering edge — canonical order stands:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let STEP: i32 = const BASE * 2;
+        let BASE: i32 = const 6;
+        fun main() { print(STEP); print(BASE); }
+        "#,
+        "12\n6\n",
+    );
+}
+
+// --- B33 S1, adversarial-review round: values handed to a load-time call ----
+//
+// A function VALUE passed into a call that runs at load may be invoked by the
+// callee. Before the review, the relation resolved only a call's SUBJECT, so
+// every shape below lost the closure body's global read — and since the
+// surrounding order is now DERIVED, a lost edge is a live miscompile, not a
+// preserved status quo. Each is cross-module with the dependency in the
+// LATER-loading module (`zeta` > `alpha`), which is what makes the canonical
+// tie-break put the reader first unless the edge exists. Each was probed
+// TDZ-crashing before the fix.
+
+/// The shared entry for the argument-passing fixtures: `alpha` holds the
+/// binding under test, `zeta` holds the global its closure reads.
+const ARGUMENT_ENTRY: &str = "import std::print;\nimport pkg::zeta::{ Y };\n\
+                              import pkg::alpha::{ A };\nfun main() { print(A); }\n";
+
+#[test]
+fn a_closure_global_passed_as_an_argument_is_entered() {
+    // (a) `apply(CB)` — CB is a module binding holding a closure; `apply` calls
+    // it, so CB's body's read of `Y` charges to `A`.
+    let (_js, stdout) = compile_and_run_package(
+        &[
+            ("main.vl", ARGUMENT_ENTRY),
+            ("zeta.vl", "let Y: i32 = 7;\n"),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Y };\nlet CB: || i32 = || { Y };\n\
+                 fun apply(f: || i32): i32 { f() }\nlet A: i32 = apply(CB);\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "7\n");
+}
+
+#[test]
+fn an_inline_closure_argument_is_entered() {
+    // (b) `apply(|| { Y })` — the closure never becomes a binding at all, so
+    // `A`'s initializer had NO edges before the fix.
+    let (_js, stdout) = compile_and_run_package(
+        &[
+            ("main.vl", ARGUMENT_ENTRY),
+            ("zeta.vl", "let Y: i32 = 7;\n"),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Y };\nfun apply(f: || i32): i32 { f() }\n\
+                 let A: i32 = apply(|| { Y });\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "7\n");
+}
+
+#[test]
+fn a_closure_argument_to_a_std_iterator_method_is_entered() {
+    // (c) The plain-idiom case: `LIST.map(|e| e + Y)`. `map` lowers through an
+    // emitted helper, so following only resolved CALL TARGETS dead-ends and the
+    // closure's read of `Y` vanished. Nothing about this program is exotic.
+    let (_js, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::zeta::{ Y };\nimport pkg::alpha::{ A };\n\
+                 fun main() { print(A.len()); }\n",
+            ),
+            ("zeta.vl", "let Y: i32 = 7;\n"),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Y };\nlet LIST: List<i32> = [1, 2, 3];\n\
+                 let A: List<i32> = LIST.map(|e: i32| { e + Y });\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "3\n");
+}
+
+#[test]
+fn a_method_receivers_field_closure_is_entered() {
+    // (d) `HOLDER.run()`, where `run` invokes `(self.get)()`. The receiver is
+    // argument 0, so resolving a call's arguments reaches the closures `HOLDER`
+    // holds; resolving only the subject (the method) reached nothing.
+    let (_js, stdout) = compile_and_run_package(
+        &[
+            ("main.vl", ARGUMENT_ENTRY),
+            ("zeta.vl", "let Y: i32 = 7;\n"),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Y };\nstruct Holder { get: || i32 }\n\
+                 impl Holder { fun run(self): i32 { (self.get)() } }\n\
+                 let HOLDER: Holder = Holder { get = || { Y } };\nlet A: i32 = HOLDER.run();\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "7\n");
+}
+
+#[test]
+fn a_two_level_def_chain_is_followed() {
+    // The def chain must reach through the callee's OWN calls: `make` creates
+    // nothing itself — `inner` does — so reading only the immediate callee's
+    // created closures missed `Y`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun inner(): || i32 { || { Y } }
+        fun make(): || i32 { inner() }
+        let MAKER: || i32 = make();
+        let X: i32 = MAKER();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_conditional_call_subject_enters_both_branches() {
+    // `(if FLAG { CB_A } else { CB_B })()` — a reachable call subject whose
+    // value is an `Expr::If`. Both branch values must be entered; the
+    // exhaustive match is what forces this arm to exist.
+    let js = compile(
+        r#"
+        import std::print;
+        let FLAG: bool = true;
+        let CB_A: || i32 = || { Y };
+        let CB_B: || i32 = || { 0 };
+        let X: i32 = (if FLAG { CB_A } else { CB_B })();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        declaration_position(&js, "const Y = 7;") < declaration_position(&js, "const X ="),
+        "either branch's body can run, so its reads order before X:\n{js}"
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let FLAG: bool = true;
+        let CB_A: || i32 = || { Y };
+        let CB_B: || i32 = || { 0 };
+        let X: i32 = (if FLAG { CB_A } else { CB_B })();
+        let Y: i32 = 7;
+        fun main() { print(X); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn a_binding_downstream_of_a_false_cycle_still_orders_after_it() {
+    // The §5(b) over-approximation can manufacture a FALSE cycle: `TOTAL` calls
+    // a trait-bounded generic, so every candidate's reads charge to it — and
+    // `Anvil`'s reads `TOTAL`. `DOWNSTREAM` genuinely depends on `TOTAL`, and
+    // that edge is RECORDED, so it must be honored even though `TOTAL` is
+    // undrainable. Appending the whole undrained remainder in canonical order
+    // instead emits `DOWNSTREAM` first (it loads earlier: `alpha` < `zeta`) and
+    // TDZ-crashes a program that runs correctly today — probed.
+    let (js, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
+                 import pkg::alpha::{ DOWNSTREAM };\n\
+                 fun main() { print(DOWNSTREAM); print(total(Anvil {})); }\n",
+            ),
+            (
+                "zeta.vl",
+                "trait Weight { fun weight(self): i32; }\nstruct Feather {}\nstruct Anvil {}\n\
+                 impl Feather with Weight { fun weight(self): i32 { 1 } }\n\
+                 impl Anvil with Weight { fun weight(self): i32 { TOTAL } }\n\
+                 fun total<T: Weight>(item: T): i32 { item.weight() }\n\
+                 let TOTAL: i32 = total(Feather {});\n",
+            ),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ TOTAL };\nlet DOWNSTREAM: i32 = TOTAL + 1;\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "2\n1\n");
+    assert!(
+        declaration_position(&js, "const TOTAL =")
+            < declaration_position(&js, "const DOWNSTREAM = TOTAL + 1;"),
+        "the cycle member is declared before the binding that reads it:\n{js}"
+    );
+}
+
+#[test]
+fn an_unreachable_dispatch_candidates_reads_still_order() {
+    // The over-approximation is LIVE, not theoretical: only `Anvil`'s `weight`
+    // reads `ONLY_ANVIL`, and `TOTAL` only ever instantiates `Feather` — yet the
+    // read is ordered, because dispatch candidates are followed wholesale. This
+    // pins the behavior §5(b) accepted, so a later narrowing is a deliberate
+    // decision rather than a silent drift.
+    let js = compile(
+        r#"
+        import std::print;
+        trait Weight { fun weight(self): i32; }
+        struct Feather {}
+        struct Anvil {}
+        impl Feather with Weight { fun weight(self): i32 { 1 } }
+        impl Anvil with Weight { fun weight(self): i32 { ONLY_ANVIL } }
+        fun total<T: Weight>(item: T): i32 { item.weight() }
+        let TOTAL: i32 = total(Feather {});
+        let ONLY_ANVIL: i32 = 99;
+        fun main() { print(TOTAL); print(Anvil {}.weight()); }
+        "#,
+    )
+    .expect("clean compile");
+    assert!(
+        declaration_position(&js, "const ONLY_ANVIL = 99;")
+            < declaration_position(&js, "const TOTAL ="),
+        "every dispatch candidate's reads order, reachable in this instance or not:\n{js}"
+    );
+}

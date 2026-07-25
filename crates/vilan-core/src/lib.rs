@@ -10,6 +10,7 @@ pub mod context;
 pub mod error;
 pub mod formatter;
 pub mod id;
+pub mod init_order;
 pub mod interpreter;
 pub mod leak_tally;
 pub mod lexing;

@@ -55,7 +55,10 @@ pub fn transform_functions<'src>(
 ) -> Result<(JsProgram<'src>, HashMap<Id, String>), Error> {
     let mut transformer = Transformer::new(program, options);
 
-    let global_variables = program.module_level_bindings();
+    // The macro world emits the same `const` declarations as a normal build, so
+    // it needs the same initialization order (`b33-emission-order.md` §4).
+    let graph = crate::call_graph::CallGraph::build(program);
+    let global_variables = crate::init_order::initialization_order(program, &graph);
     let t_global_variables = transformer.walk_list(&global_variables);
 
     let mut names = HashMap::new();
@@ -838,11 +841,6 @@ impl<'src> Transformer<'src> {
             .get(&self.program.global_scope_id)
             .unwrap();
 
-        // Every module-level binding, in declaration order — the entry's own
-        // globals plus loaded modules' top-level `let`s (one shared
-        // definition; platform coloring admits the same set it emits).
-        let global_variables = self.program.module_level_bindings();
-
         let main_fn = global_scope
             .name_to_id_map
             .get("main")
@@ -854,7 +852,16 @@ impl<'src> Transformer<'src> {
             })?;
         let main_is_async = self.program.async_functions.contains(&main_fn.id);
 
-        // Walk the module-level bindings the entry can REACH, in declaration
+        // Every module-level binding, in INITIALIZATION order — dependency
+        // order over the load-time relation, ties broken by the canonical key
+        // (`b33-emission-order.md`). A module-level `let` emits a non-hoisted
+        // `const`, so declaration order IS initialization order: a binding
+        // whose initializer evaluates another must be declared after it. The
+        // call graph serves both this and the reachability filter below.
+        let graph = crate::call_graph::CallGraph::build(self.program);
+        let global_variables = crate::init_order::initialization_order(self.program, &graph);
+
+        // Walk the module-level bindings the entry can REACH, in initialization
         // order, keeping each binding's nodes separate (F6 — a binding emits
         // only if something reachable references it; the stated semantics: a
         // dropped binding's initializer does not run — module state exists
@@ -867,7 +874,6 @@ impl<'src> Transformer<'src> {
         // referenced (dispatch candidates over-approximate reachability, like
         // everywhere else — such a binding is walked but then dropped here,
         // and it was admission-checked by the same graph).
-        let graph = crate::call_graph::CallGraph::build(self.program);
         let reachable_bindings =
             crate::platform_color::reachable_bindings(self.program, &graph, main_fn.id);
         let binding_nodes: Vec<(Id, Vec<js::Node<'src>>)> = global_variables
@@ -5071,7 +5077,11 @@ pub fn transform_const_program<'src>(
     let mut unresolved: Vec<Id> = Vec::new();
     let mut prelude: Vec<js::Node<'src>> = Vec::new();
     loop {
-        let pending: Vec<Id> = transformer
+        // `referenced_globals` is a `HashSet`, so sort each round's batch by
+        // entity id — the canonical key — or the prelude's declaration order
+        // (and any diagnostic order derived from it) would vary run to run
+        // (`b33-emission-order.md` §4).
+        let mut pending: Vec<Id> = transformer
             .referenced_globals
             .iter()
             .copied()
@@ -5080,6 +5090,7 @@ pub fn transform_const_program<'src>(
         if pending.is_empty() {
             break;
         }
+        pending.sort_by_key(|id| id.0);
         for binding in pending {
             declared.insert(binding);
             // Non-variable references (functions, struct names) emit through

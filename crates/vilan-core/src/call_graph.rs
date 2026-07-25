@@ -121,7 +121,10 @@ impl CallGraph {
     /// Builds the call graph for a fully analyzed program.
     pub fn build(program: &Program) -> CallGraph {
         let mut graph = CallGraph::default();
-        let module_bindings: HashSet<Id> = program.module_level_bindings().into_iter().collect();
+        // Built once and reused below — the vector is not free to rebuild
+        // (`b33-emission-order.md` §4).
+        let bindings = program.module_level_bindings();
+        let module_bindings: HashSet<Id> = bindings.iter().copied().collect();
         let const_exprs: HashSet<Id> = program.const_exprs.iter().copied().collect();
 
         for (id, function) in &program.functions {
@@ -156,7 +159,7 @@ impl CallGraph {
         // inference keeps its exact node set). A `const`-marked initializer is
         // evaluated by the compile-time interpreter and serialized as a value,
         // so at runtime it is data, not code — skipped.
-        for binding in program.module_level_bindings() {
+        for &binding in &bindings {
             let Some(initial) = program
                 .variables
                 .get(&binding)

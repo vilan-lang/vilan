@@ -21755,14 +21755,22 @@ impl<'src> Program<'src> {
         self.sources.get(source.0 as usize).map(PathBuf::as_path)
     }
 
-    /// Every module-level `let` binding of the program, in declaration order:
-    /// the globals of the entry (reached through the global scope's names,
-    /// recursing into user modules) plus the top-level `let`s of loaded (std)
-    /// modules, whose items live in their module's scope with an empty
-    /// `Module.body`. One definition shared by the transformer (F6 — a
-    /// binding emits only if something reachable references it), the call
-    /// graph, and platform coloring, so "which initializers run" can never
-    /// mean different things to emission and admission.
+    /// Every module-level `let` binding of the program: the globals of the
+    /// entry (reached through the global scope's names, recursing into user
+    /// modules) plus the top-level `let`s of loaded (std) modules, whose items
+    /// live in their module's scope with an empty `Module.body`. One definition
+    /// shared by the transformer (F6 — a binding emits only if something
+    /// reachable references it), the call graph, and platform coloring, so
+    /// "which initializers run" can never mean different things to emission and
+    /// admission.
+    ///
+    /// This is the SET; the vector's order is an artifact (the entry scope's
+    /// insertion order — i.e. import-statement order — then each loaded
+    /// module's own declarations). **Emission does not use it**: the order a
+    /// binding's initializer runs in is
+    /// [`crate::init_order::initialization_order`], dependency order over the
+    /// load-time relation (`b33-emission-order.md`). Consumers that only need
+    /// membership or a per-binding pass read this directly.
     pub fn module_level_bindings(&self) -> Vec<Id> {
         fn from_names(program: &Program, names: &[Id], bindings: &mut Vec<Id>) {
             for id in names {
@@ -21782,13 +21790,29 @@ impl<'src> Program<'src> {
                 .collect();
             from_names(self, &names, &mut bindings);
         }
-        for module in self.modules.values() {
-            let module_scope = module.body.1;
-            for variable_id in self.variables.keys() {
-                if self.entity_scope_map.get(variable_id) == Some(&module_scope) {
-                    bindings.push(*variable_id);
-                }
+        // A loaded module's top-level `let`s are the variables whose scope is
+        // that module's. Bucketed in ONE pass over the variables rather than one
+        // pass per module: this was O(modules × variables) and every consumer
+        // rebuilds the vector (`b33-emission-order.md` §4). The concatenation
+        // reproduces the nested loops' grouping exactly — modules in registration
+        // order, each module's variables in `variables` insertion order.
+        let module_slot: HashMap<Id, usize> = self
+            .modules
+            .values()
+            .enumerate()
+            .map(|(slot, module)| (module.body.1, slot))
+            .collect();
+        let mut by_module: Vec<Vec<Id>> = vec![Vec::new(); self.modules.len()];
+        for variable_id in self.variables.keys() {
+            let Some(scope_id) = self.entity_scope_map.get(variable_id) else {
+                continue;
+            };
+            if let Some(slot) = module_slot.get(scope_id) {
+                by_module[*slot].push(*variable_id);
             }
+        }
+        for module_bindings in by_module {
+            bindings.extend(module_bindings);
         }
         let mut seen = std::collections::HashSet::new();
         bindings.retain(|id| seen.insert(*id));
