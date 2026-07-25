@@ -1,0 +1,39 @@
+{
+  "name": "@vilan-lang/vilan",
+  "version": "0.0.0-placeholder",
+  "description": "The vilan toolchain — the vilan compiler and the vilan-lsp language server",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vilan-lang/vilan"
+  },
+  "homepage": "https://vilan-lang.github.io/vilan/",
+  "bugs": "https://github.com/vilan-lang/vilan/issues",
+  "keywords": [
+    "vilan",
+    "compiler",
+    "language",
+    "cli",
+    "language-server"
+  ],
+  "bin": {
+    "vilan": "bin/vilan.js",
+    "vilan-lsp": "bin/vilan-lsp.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@vilan-lang/darwin-arm64": "0.0.0-placeholder",
+    "@vilan-lang/darwin-x64": "0.0.0-placeholder",
+    "@vilan-lang/linux-arm64": "0.0.0-placeholder",
+    "@vilan-lang/linux-x64": "0.0.0-placeholder",
+    "@vilan-lang/win32-x64": "0.0.0-placeholder"
+  }
+}

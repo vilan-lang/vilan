@@ -193,3 +193,83 @@ jobs:
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --title "vilan ${GITHUB_REF_NAME#v}" \
             --notes-file notes.md
+
+  # The npm channel (proposal/distribution.md §2): the same artifacts, repacked
+  # as the six packages `npm install -g @vilan-lang/vilan` delivers. Sources in
+  # npm/, assembly in scripts/npm-package.sh, stubs pinned by
+  # crates/vilan-cli/tests/npm_stub.rs.
+  publish-npm:
+    # After `publish`, not beside it: an npm version can be deprecated but
+    # never replaced, so npm must not carry a version whose GitHub Release
+    # failed to go out.
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          # Writes the .npmrc that reads $NODE_AUTH_TOKEN below.
+          registry-url: https://registry.npmjs.org
+      - name: Is there a token to publish with?
+        id: npm
+        # A job-level `if:` cannot read `secrets`, so the secret's presence
+        # becomes a step output that the rest of the job conditions on. No
+        # token means the channel is not live yet: skip with a notice and stay
+        # green (distribution.md §6 — every publish job lands
+        # disabled-until-secret-exists).
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=npm publish skipped::NPM_TOKEN is not configured, so the six @vilan-lang packages were not published. The rest of the release is unaffected."
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.npm.outputs.publish == 'true'
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Assemble the six packages
+        if: steps.npm.outputs.publish == 'true'
+        # Every package.json under npm/ carries `0.0.0-placeholder`; the script
+        # stamps this tag's version over all six (the meta package's
+        # optionalDependencies included, so they stay locked to the exact
+        # version) and re-reads them to prove the stamping took. That is why
+        # scripts/bump-version.sh knows nothing about npm.
+        run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" release-assets npm-dist
+      - name: Publish
+        if: steps.npm.outputs.publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish() {
+            log="$(mktemp)"
+            if npm publish --access public "$1" > "$log" 2>&1; then
+              cat "$log"
+              return 0
+            fi
+            cat "$log"
+            # The one error a re-run must survive: this exact version is
+            # already on the registry. Matched on the registry's own words, so
+            # that every *other* 403 — a revoked token, a scope this account
+            # does not own — still fails the job.
+            if grep -qE 'EPUBLISHCONFLICT|cannot publish over the previously published version' "$log"; then
+              echo "::notice title=npm publish skipped::$1 is already published at this version — left alone."
+              return 0
+            fi
+            return 1
+          }
+          # Platform packages first, the meta package last: it depends on them
+          # by exact version, so the other order would leave a window in which
+          # `npm install -g @vilan-lang/vilan` resolves nothing to run.
+          # Iterating what the assembly produced, rather than a list spelled
+          # out again here, keeps this from becoming one more place a new
+          # target would have to be added.
+          for package in npm-dist/*/; do
+            [ "$package" = npm-dist/vilan/ ] || publish "$package"
+          done
+          publish npm-dist/vilan

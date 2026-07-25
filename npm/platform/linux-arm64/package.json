@@ -1,0 +1,23 @@
+{
+  "name": "@vilan-lang/linux-arm64",
+  "version": "0.0.0-placeholder",
+  "description": "The vilan toolchain binaries for Linux arm64 (musl — statically linked, so it runs on any distribution) — installed for you by @vilan-lang/vilan",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vilan-lang/vilan"
+  },
+  "homepage": "https://vilan-lang.github.io/vilan/",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "preferUnplugged": true
+}

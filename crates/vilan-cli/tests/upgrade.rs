@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// A scratch install: a copied `vilan` in its own bin dir, plus a fake
@@ -103,6 +103,40 @@ impl Fixture {
 
     fn cache_entry(&self, name: &str) -> PathBuf {
         self.home.join(".vilan/std-cache").join(name)
+    }
+
+    /// A second copy of the binary, where npm would have put it. The path is
+    /// the whole point: `vilan upgrade` reads its own location to decide
+    /// whether these files are its to replace (distribution.md §2, call (b)).
+    fn npm_install(&self) -> PathBuf {
+        let bin = self.root.join("node_modules/@vilan-lang/linux-x64/bin");
+        fs::create_dir_all(&bin).expect("create the npm install directory");
+        let binary = bin.join("vilan");
+        fs::copy(env!("CARGO_BIN_EXE_vilan"), &binary).expect("copy the binary");
+        binary
+    }
+
+    /// `vilan upgrade` from an arbitrary copy, with both seams spelled out:
+    /// `latest: None` leaves `$VILAN_UPGRADE_LATEST` unset, so discovery would
+    /// have to go through `base` — which a steered channel must never do.
+    fn upgrade_from(
+        &self,
+        binary: &Path,
+        arguments: &[&str],
+        base: &str,
+        latest: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new(binary);
+        command
+            .arg("upgrade")
+            .args(arguments)
+            .env("HOME", &self.home)
+            .env("VILAN_UPGRADE_BASE", base)
+            .env_remove("VILAN_UPGRADE_LATEST");
+        if let Some(latest) = latest {
+            command.env("VILAN_UPGRADE_LATEST", latest);
+        }
+        run_retrying(&mut command)
     }
 
     fn upgrade(&self, arguments: &[&str], latest: &str) -> Output {
@@ -250,6 +284,90 @@ fn upgrade_aborts_on_a_checksum_mismatch_without_touching_the_install() {
             .starts_with(&format!("vilan {}", env!("CARGO_PKG_VERSION")))
     );
     assert!(!fixture.bin.join("vilan-lsp").exists());
+}
+
+/// An npm-owned install is steered instead of replaced — and steered *without
+/// touching the network*, which is what the unreachable base URL below proves:
+/// discovery through it would fail the run, so a passing test is a run that
+/// never tried. (`vilan upgrade`'s answer cannot depend on the release page
+/// when it is not allowed to act on it either way.)
+#[test]
+fn an_npm_install_is_steered_without_reaching_the_network() {
+    let fixture = Fixture::new("npm-steer");
+    let binary = fixture.npm_install();
+    let output = fixture.upgrade_from(&binary, &[], "file:///vilan-no-such-release-tree", None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "the steer answered the question, so it exits 0:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "a steer is not an error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("was installed by npm")
+            && stdout.contains("npm update -g @vilan-lang/vilan"),
+        "does not steer: {stdout}"
+    );
+
+    // Nothing was downloaded, nothing was swapped, and the mark — which only a
+    // completed upgrade prints — stayed away.
+    assert!(!binary.with_file_name("vilan-lsp").exists());
+    assert!(
+        !stdout.chars().any(|glyph| matches!(glyph, '▀' | '▄' | '█')),
+        "a steer must not print the mark: {stdout}"
+    );
+    assert!(
+        banner(&binary).starts_with(&format!("vilan {}", env!("CARGO_PKG_VERSION"))),
+        "the binary was replaced"
+    );
+    assert!(
+        fixture.cache_entry("stale-entry").is_dir(),
+        "the cache was pruned"
+    );
+}
+
+/// `--check` under a steered channel still answers what it was asked — the
+/// newest version — and only then points at the owner's command. Still no
+/// download and no swap.
+#[test]
+fn a_steered_check_reports_the_new_version_and_swaps_nothing() {
+    let fixture = Fixture::new("npm-check");
+    let binary = fixture.npm_install();
+    let output = fixture.upgrade_from(&binary, &["--check"], &fixture.base_url, Some("9.9.9"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("→ 9.9.9 available") && stdout.contains("npm update -g @vilan-lang/vilan"),
+        "the discovery half still runs, the steer replaces only the command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("run `vilan upgrade`"),
+        "steering back to the command that just declined: {stdout}"
+    );
+    assert!(!binary.with_file_name("vilan-lsp").exists());
+    assert!(banner(&binary).starts_with(&format!("vilan {}", env!("CARGO_PKG_VERSION"))));
+
+    // And when there is nothing newer, the same channel is reported rather
+    // than steered — there is nothing to run.
+    let current = fixture.upgrade_from(&binary, &["--check"], &fixture.base_url, Some("0.1.0"));
+    let stdout = String::from_utf8_lossy(&current.stdout);
+    assert!(current.status.success());
+    assert!(
+        stdout.contains("is the newest release (installed by npm)"),
+        "names the channel without a pointless command: {stdout}"
+    );
+}
+
+/// `<binary> --version`, trimmed — a swapped-in fake release identifies itself
+/// differently, so this is how a test sees whether the swap happened.
+fn banner(binary: &Path) -> String {
+    let output = run_retrying(Command::new(binary).arg("--version"));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn run_ok(command: &mut Command) -> Output {
