@@ -185,7 +185,15 @@ fn watch_round_refreshes_the_sidecar() {
         .expect("spawn run --watch");
 
     let css = dir.join("app.css");
-    let deadline = Duration::from_secs(20);
+    // The deadline exists to catch a HUNG watch loop, not to race a loaded
+    // scheduler: under the full parallel suite a round (poll → detect →
+    // recompile → node run → sidecar write) legitimately runs long, and 20s
+    // lost that race three times in two days — 20.25s local, 20.5s on the
+    // ubuntu leg, 20.97s on the windows leg, each a bare overshoot on a round
+    // that then completed (backlog E20; the eventual real fix is an injected
+    // change event instead of racing the poller). 120s still fails a genuine
+    // hang promptly enough for CI.
+    let deadline = Duration::from_secs(120);
     let round_one = wait_for_contents(&css, ".v1{color:red}\n", deadline);
 
     // A watch round must rewrite the sidecar from the edited source.
