@@ -13,8 +13,9 @@
 > **Status: RATIFIED 2026-07-25 — calls (a)–(f) all per recommendation**
 > (bare `vilan` + `@vilan-lang` scope; upgrade steers; Open VSX yes;
 > publisher `vilan`-if-free + minimal wordmark; F5 = git dependencies v1;
-> F5 rides this arc). **(g) — B33-before-implementation — remains open at
-> the implementation fork.** Two additions from ratification (user,
+> F5 rides this arc). **(g) — RESOLVED 2026-07-25: B33 goes first**
+> (proposal/b33-emission-order.md, ratified same day); F7 S1 starts when
+> B33's arc lands.** Two additions from ratification (user,
 > 2026-07-25): **winget** is a recorded follow-up (§10 — user accepts
 > deferral; it needs its own plan, and it is where the signing decision
 > stops being deferrable) and **the repo-to-org question is filed as
