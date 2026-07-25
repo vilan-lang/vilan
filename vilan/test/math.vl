@@ -1,8 +1,8 @@
 // std::math (backlog K2): constants, the moved Ord free functions, the f64
 // method family, sized-type parity, and truncated `rem`. Every printed value
 // is exactly representable, so the output is deterministic.
+import std::math::{ E, EPSILON, INFINITY, NAN, PI, TAU, max, min, minmax };
 import std::print;
-import std::math::{ PI, TAU, E, EPSILON, INFINITY, NAN, min, max, minmax };
 
 fun main() {
 	// Constants.

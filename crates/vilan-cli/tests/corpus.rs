@@ -283,45 +283,78 @@ fn no_corpus_golden_carries_hmr_instrumentation() {
     assert!(checked > 60, "suspiciously few goldens swept: {checked}");
 }
 
-/// WO-1b: the emitted JS must not depend on the order of a file's import
-/// STATEMENTS (which modules load and in what order). `vilan fmt` sorts imports
-/// canonically (WO-1); before this change a pure import-statement reorder churned
-/// the JS bytes, because module load order — and so entity-id assignment, and so
-/// the id-sorted declaration emission — was LIFO of import order. The analyzer
-/// now drains modules in a canonical order (`analyzer.rs`, `load_order_key`), so
-/// permuting the import statements compiles to identical bytes.
+/// The emitted JS must not depend on how a file SPELLS its imports — neither
+/// the order of the import STATEMENTS (which modules load, and in what order)
+/// nor the order of the names inside a `{ .. }` brace set. `vilan fmt` sorts
+/// both canonically (WO-1), so a reformat must never change a program's bytes.
 ///
-/// SCOPE: this pins the module-walk mechanism only. A DISTINCT sensitivity —
-/// the emission order of imported module-level CONSTANTS, which follows the
-/// order names are listed inside a `{ .. }` brace set (`module_level_bindings`
-/// iterates the entry scope's insertion-ordered `IndexMap`) — is deliberately
-/// NOT exercised here: it is unaddressed by WO-1b and cannot be fixed by simply
-/// sorting globals by id (that reorders semantically-significant, non-hoisted
-/// `const` declarations and miscompiles a cross-module module-level dependency
-/// into a TDZ error). So this test permutes only whole import statements, never
-/// names within a brace set.
+/// Two mechanisms had to fall for that to hold, and this pins both:
 ///
-/// Non-vacuous by construction: `std::base64` and `std::display` both sit
-/// OUTSIDE the always-loaded prelude closure (unlike `std::bytes`, which
-/// `std::json` pulls in transitively, fixing its load order regardless of the
-/// entry's imports). With two such modules present, their relative load order —
-/// and the order of the helper functions they emit — did depend on import order
-/// under the old LIFO drain (a measured 6-line churn). Reverting the drain to
-/// LIFO fails this test.
+/// - **The module walk** (WO-1b). Load order was LIFO of import order, and it
+///   decided entity-id assignment and so function emission. `analyzer.rs`'s
+///   `load_order_key` now drains modules canonically.
+/// - **Module-level binding emission** (B33). Emission used to hand the
+///   transformer `Program::module_level_bindings()`, whose first half is the
+///   entry scope's insertion-ordered `IndexMap` — import statement order ×
+///   brace order. So the declaration order of imported CONSTANTS was a
+///   spelling detail, and since a module-level `let` emits a non-hoisted
+///   `const`, a *dependency* between two of them could land the wrong way
+///   round and TDZ-crash at load. Emission now runs
+///   `init_order::initialization_order`: a topological sort of the load-time
+///   relation, ties broken by the canonical key.
+///
+/// The reasoning trail, because it is the reason B33 was not a one-liner:
+/// sorting the globals by id ALONE does not work. Canonical load order walks
+/// module names in order, so a module whose binding is *depended on* can load
+/// second and get the higher id — `alpha.vl`'s `let A = Z * 2;` against
+/// `zeta.vl`'s `let Z = 21;` — and an id sort then emits `A` first, which is
+/// exactly the TDZ miscompile. The topological sort is what makes the
+/// canonical tie-break safe; `inference.rs`'s
+/// `a_dependency_in_a_later_loading_module_is_declared_first` pins that shape.
+///
+/// Non-vacuous by construction, in both halves:
+///
+/// - `std::base64` and `std::display` both sit OUTSIDE the always-loaded
+///   prelude closure (unlike `std::bytes`, which `std::json` pulls in
+///   transitively, fixing its load order regardless of the entry's imports).
+///   With two such modules present, their relative load order — and the order
+///   of the helper functions they emit — depended on import-statement order
+///   under the old LIFO drain (a measured 6-line churn). Reverting the drain to
+///   LIFO fails this test.
+/// - The `std::math` brace set carries six module-level constants, permuted
+///   between the variants, and the program declares one of its own that reads
+///   `TAU`. Reverting emission to `module_level_bindings()` order fails this
+///   test (verified: the six `const` declarations churn to match each variant's
+///   brace order).
 #[test]
 fn emitted_js_is_independent_of_import_order() {
-    // A shared program body; only the leading import block's order differs
-    // between the two variants. `encode_url`/`encode_utf8`/`format` keep every
-    // module's functions reachable (and thus emitted).
-    let body =
-        "\n\nfun main() {\n\tprint(encode_url(encode_utf8(\"vilan\")));\n\tprint(format(42));\n}\n";
+    // A shared program body; only the leading import block differs between the
+    // two variants — statement order AND the order inside `std::math`'s brace
+    // set. `encode_url`/`encode_utf8`/`format` keep every module's functions
+    // reachable (and thus emitted); the six constants are all read, so all six
+    // are emitted; and `QUARTER_TURN` gives the entry a module-level binding
+    // that DEPENDS on an imported one (`TAU` must be declared before it in
+    // either spelling).
+    let body = "\nlet QUARTER_TURN: f64 = TAU / 4f;\n\n\
+                fun main() {\n\
+                \tprint(encode_url(encode_utf8(\"vilan\")));\n\
+                \tprint(format(42));\n\
+                \tprint(PI + E + EPSILON + QUARTER_TURN);\n\
+                \tprint(INFINITY.is_infinite() && NAN.is_nan());\n}\n";
     let print_import = "import std::print;\n";
     let bytes_import = "import std::bytes::{ encode_utf8 };\n";
     let base64_import = "import std::base64::{ encode_url };\n";
     let display_import = "import std::display::{ format };\n";
-    let order_a = format!("{print_import}{bytes_import}{base64_import}{display_import}{body}");
-    // A genuine shuffle of the same four imports.
-    let order_b = format!("{display_import}{base64_import}{print_import}{bytes_import}{body}");
+    let math_import_sorted = "import std::math::{ E, EPSILON, INFINITY, NAN, PI, TAU };\n";
+    // The same six names, shuffled inside the brace set.
+    let math_import_shuffled = "import std::math::{ TAU, NAN, PI, INFINITY, E, EPSILON };\n";
+    let order_a = format!(
+        "{math_import_sorted}{print_import}{bytes_import}{base64_import}{display_import}{body}"
+    );
+    // A genuine shuffle of the same five imports, and of the brace set.
+    let order_b = format!(
+        "{display_import}{base64_import}{print_import}{bytes_import}{math_import_shuffled}{body}"
+    );
 
     let work = std::env::temp_dir().join(format!("vilan_import_order_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -351,6 +384,8 @@ fn emitted_js_is_independent_of_import_order() {
     let _ = std::fs::remove_dir_all(&work);
     assert_eq!(
         js_a, js_b,
-        "emitted JS differs under an import reorder — the module walk order is not canonical"
+        "emitted JS differs under an import reorder — either the module walk is no \
+         longer canonical (function order churns) or module-level bindings are no \
+         longer emitted in initialization order (`const` order churns)"
     );
 }

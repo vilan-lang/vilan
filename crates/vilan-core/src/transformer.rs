@@ -57,8 +57,7 @@ pub fn transform_functions<'src>(
 
     // The macro world emits the same `const` declarations as a normal build, so
     // it needs the same initialization order (`b33-emission-order.md` §4).
-    let graph = crate::call_graph::CallGraph::build(program);
-    let global_variables = crate::init_order::initialization_order(program, &graph);
+    let global_variables = crate::init_order::initialization_order(program, program.call_graph());
     let t_global_variables = transformer.walk_list(&global_variables);
 
     let mut names = HashMap::new();
@@ -857,9 +856,11 @@ impl<'src> Transformer<'src> {
         // (`b33-emission-order.md`). A module-level `let` emits a non-hoisted
         // `const`, so declaration order IS initialization order: a binding
         // whose initializer evaluates another must be declared after it. The
-        // call graph serves both this and the reachability filter below.
-        let graph = crate::call_graph::CallGraph::build(self.program);
-        let global_variables = crate::init_order::initialization_order(self.program, &graph);
+        // call graph serves both this and the reachability filter below — and
+        // it is the one the post-`analyze()` cycle check already built
+        // ([`Program::call_graph`]), not a second build of the same thing.
+        let graph = self.program.call_graph();
+        let global_variables = crate::init_order::initialization_order(self.program, graph);
 
         // Walk the module-level bindings the entry can REACH, in initialization
         // order, keeping each binding's nodes separate (F6 — a binding emits

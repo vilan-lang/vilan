@@ -122,8 +122,10 @@ pub fn check_cycles(program: &mut Program) {
     if !program.diagnostics.is_empty() {
         return;
     }
-    let graph = CallGraph::build(program);
-    let found = cycle_diagnostics(program, &graph);
+    // The settled graph, built here and kept on the program: emission needs the
+    // same one moments later, and building it twice cost ~3% of a clean compile
+    // (`b33-emission-order.md` §4).
+    let found = cycle_diagnostics(program, program.call_graph());
     // `diagnostic_sources` runs parallel to `diagnostics` and tells the editor
     // which file to publish each one in, so a cross-module cycle squiggles in
     // the module it is about. The guard above means both vectors are empty

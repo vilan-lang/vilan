@@ -1,5 +1,22 @@
 # B33 — module initialization order: dependency-ordered, specified, cycle-checked
 
+> **SHIPPED 2026-07-25 — the whole arc, three slices in one day.**
+> S1 f9dec2f (the relation + the order; adversarially reviewed — TWO
+> blockers fixed pre-commit: argument-passed closures entered, SCC
+> condensation), S2 3f82aa2 (the cycle diagnostic, ledger row 209),
+> S3 (spec §7.1/§7.6, the widened import-order pin, math.vl reformatted,
+> the shared-CallGraph perf rider, changelog staged). **Two premise
+> corrections recorded**: (1) §1/§6/§7 said math.vl's golden would be
+> "regenerated and verified" — the reformat is GOLDEN-NEUTRAL (S1's
+> canonical order made brace order irrelevant before fmt touched it);
+> (2) the canonical fallback's dependency clause is dependency-graph
+> post-order, NOT "manifest order" (Manifest.dependencies is a BTreeMap;
+> resolve_dependency_edges is a post-order DFS — probed both ways); the
+> spec states the corrected rule. Residuals: cross-PACKAGE order is
+> probed but carries no permanent pin (needs a vilan-cli workspace
+> fixture — small follow-up if ever demanded); E16/E17 (filed) cover the
+> CLI cross-module render + LSP note-drop this arc surfaced.
+>
 > **Status: RATIFIED 2026-07-25 — all §5 calls per recommendation** ((a)
 > the load-time relation as specified; (b) strict cycles with chains,
 > revisit on first false positive; (c) same-module order-freedom; (d)

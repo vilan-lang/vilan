@@ -26684,3 +26684,56 @@ fn a_cycle_through_a_const_binding_cannot_form() {
         "#,
     );
 }
+
+#[test]
+fn the_call_graph_is_built_once_and_stays_current() {
+    // B33 §4's rider. The cycle check and emission each used to build their own
+    // `CallGraph` over the same settled program — ~3% of a clean compile spent
+    // twice — so the program now memoizes one and hands it to both
+    // (`Program::call_graph`). Two properties keep that honest, and this pins
+    // both: the memo is HANDED OUT rather than rebuilt (pointer identity), and
+    // it is not STALE — bit-for-bit what a build at emission time produces.
+    // Analysis is the only thing that fills those tables; if a pass ever starts
+    // rewriting them afterwards, the second assertion is what fails.
+    let source = r#"
+        import std::print;
+        let SEED: i32 = 21;
+        let DOUBLE: i32 = double(SEED);
+        fun double(value: i32): i32 { value * 2 }
+        fun main() { print(DOUBLE); }
+        "#;
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let first = program.call_graph();
+            let second = program.call_graph();
+            assert!(
+                std::ptr::eq(first, second),
+                "the call graph is rebuilt per consumer instead of being memoized"
+            );
+            let fresh = vilan_core::call_graph::CallGraph::build(&program);
+            assert_eq!(
+                first.debug_dump(&program),
+                fresh.debug_dump(&program),
+                "the memoized call graph no longer describes the program"
+            );
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}

@@ -363,6 +363,22 @@ thing has no name — an adopted async closure applied directly, a
 until called.)
 → [Async](../tour/async.md)
 
+**"`…` form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order"**
+Module-level bindings initialize in dependency order (spec §7.1): each
+one runs after everything its initializer evaluates at load — the
+bindings it reads, plus whatever is read inside anything it *calls* on
+the way. A cycle among those evaluations has no valid order, so it is
+refused at compile time; the message names the round trip (`via A → B
+→ A`) and each participant's declaration. The self-referential form —
+"`…`'s initializer evaluates `…` itself, which has not initialized
+yet" — is the one-binding case of the same rule. Creating a closure
+evaluates nothing, so two module-level closures may name each other
+freely; moving one of the cycle's reads inside a closure is the usual
+fix. If the chain runs through a dispatched call, every implementation
+of that method participates — including one your program never
+instantiates; the message says so when it applies.
+→ [Execution](../spec/execution.md)
+
 **"`!` requires the nearest enclosing function to declare an `Option`/`Result`-compatible return type …"**
 `!` propagates the failure by *returning* it, so the surrounding
 function must return an `Option`/`Result` that can carry it. Inside a

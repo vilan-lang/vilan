@@ -6,6 +6,17 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.github.io/vilan/) always
 tracks the latest state.
 
+<!-- STAGED for the next release — NOT a released version, and deliberately not
+     a `## v…` heading (the release workflow greps for one and would cut notes
+     from it). Fold these paragraphs into the next version's section at cut
+     time and delete this block. Kept inside an HTML comment so the published
+     changelog shows nothing until then.
+
+**Module bindings initialize in dependency order.** A top-level `let` now runs after every binding its initializer actually evaluates — the ones it reads, plus everything read inside whatever it calls on the way — so a binding may reference one declared below it, in the same file or in another module, exactly as a function may call one declared later. Creating a closure evaluates nothing, so two module-level closures may still name each other freely. This kills a real miscompile: declaration order used to follow the order names happened to be listed in your *imports*, so a constant that depended on another could be emitted before it and crash at load with `Cannot access 'X' before initialization` — with nothing at compile time to warn you. v0.12.0 made the emitted JavaScript independent of import *statement* order; this closes the other half, the names inside a `{ … }` brace set, so **no spelling of your imports can change what your program does or the bytes it compiles to** — `vilan fmt` can sort them freely. And a genuine cycle among initializers (including a binding that reads itself) is now a compile error that names the round trip (`via A → B → A`), anchored at the read that closes it and noting each participant's declaration, instead of a crash at load. The order is specified rather than incidental: spec §7.1 fixes dependency order first, then a canonical module order — the standard library first, then dependency packages, then your own, modules within a package by name, the entry file last — for bindings that depend on nothing from each other.
+
+**One behavior note.** A module initializer with *side effects* — a top-level `let` that prints, registers, or opens something — may now run in a different relative order than it did before. The old order was whatever your import listing happened to produce; the new one is the rule above. Bindings that actually depend on one another are unaffected: those were the broken case.
+-->
+
 ## v0.14.0 — 2026-07-24
 
 **Vilan runs on Windows.** Native, not WSL: install with one PowerShell line (`irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex`), and the whole toolchain is there — `vilan.exe` and `vilan-lsp.exe`, the compiler, `run --watch` with hot reload, `fmt`, `test`, and `vilan upgrade` (which learned the Windows swap: a running executable can't be replaced in place, so the old one steps aside and is swept on the next run). The VS Code extension finds the server on Windows now, and the language server treats every spelling of a file — `C:` vs `c%3A`, even DOS-era `RUNNER~1` short names — as the one file it is, so diagnostics never duplicate or stick. Stopping a watch round kills the *whole* process tree (a forking dev server can't hold its port hostage), colors render in both Windows Terminal and classic conhost, and the entire test suite now runs green on Windows in CI as a required check on every change — this isn't a port that will quietly rot.

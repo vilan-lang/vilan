@@ -21705,6 +21705,9 @@ pub struct Program<'src> {
     // level pass); consulted only when `BuildOptions.hmr` is set, so it never
     // changes non-HMR output.
     pub hmr_bindings: HashMap<Id, HmrBinding>,
+    /// The settled call graph, memoized — see [`Program::call_graph`]. Derived
+    /// data, not analysis output: every entry above is its input.
+    call_graph_memo: std::sync::OnceLock<crate::call_graph::CallGraph>,
 }
 
 /// One module-level binding's HMR transfer descriptor (`hmr.md` §4).
@@ -21753,6 +21756,22 @@ impl<'src> Program<'src> {
     /// The filesystem path of a source file.
     pub fn source_path(&self, source: SourceId) -> Option<&Path> {
         self.sources.get(source.0 as usize).map(PathBuf::as_path)
+    }
+
+    /// The program's call graph, built on first use and kept.
+    ///
+    /// **Only for consumers that run once analysis has settled** — the
+    /// post-`analyze()` checks and emission. The passes *inside* the analysis
+    /// sequence (context threading, async inference, platform coloring, const
+    /// evaluation) rewrite the tables this graph is derived from, so each of
+    /// them still builds its own; a memo shared with them would be stale by
+    /// construction. Nothing mutates entities after that sequence, which is why
+    /// the cycle check (`init_order::check_cycles`) and the transformer can
+    /// share one build — a `CallGraph::build` is ~3% of a clean compile, and
+    /// they used to pay it twice (`b33-emission-order.md` §4).
+    pub fn call_graph(&self) -> &crate::call_graph::CallGraph {
+        self.call_graph_memo
+            .get_or_init(|| crate::call_graph::CallGraph::build(self))
     }
 
     /// Every module-level `let` binding of the program: the globals of the
@@ -25081,6 +25100,7 @@ pub fn analyze<'src>(
         scalar_view_refs,
         scalar_view_calls,
         hmr_bindings,
+        call_graph_memo: std::sync::OnceLock::new(),
     }
 }
 

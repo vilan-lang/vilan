@@ -8,6 +8,36 @@ function named `main` at the entry module's top level is the
 statements. (An explicit top-level `main();` call is redundant — the
 program still runs `main` once.)
 
+**Module-level bindings initialize before `main`, in dependency order.**
+A binding's initializer runs after the initializer of every binding it
+**evaluates at load time**: the bindings its own initializer reads, and
+everything read inside whatever it calls while initializing. *Creating* a
+closure evaluates nothing — a closure body runs only when something calls
+it, so the bindings it mentions order nothing (two module-level closures
+may name each other freely). Textual position carries no meaning: a
+binding may read one declared below it, in the same file or another,
+exactly as a function may call one declared later (§4.4). A **cycle** in
+that relation is a compile error, since no order satisfies it — including
+the one-binding cycle of an initializer that reads itself. A `const`
+initializer evaluates during compilation (§9), so it evaluates nothing at
+load time and waits for nothing; a binding that reads *it* still
+initializes after it.
+
+Where the relation leaves two bindings unordered, the one whose module
+loaded first initializes first. Modules load in a canonical order: the
+standard library's first, then the dependency packages' — each package
+after the packages it depends on, in an order the dependency graph fixes
+rather than the manifest's listing — then the program's own; within one
+package, modules load by name. Each package's root module follows, in
+that same package order, and the entry file is last. Within one file,
+bindings initialize in declaration order. Nothing here depends on how a
+file spells its imports, so reordering import statements, or the names
+inside a `{ .. }` list, cannot change what a program does.
+
+Only a binding something reachable from `main` references initializes at
+all (§11.2's reachability rule): an unreferenced binding's initializer
+never runs, so load-time side effects are not a promise.
+
 On process platforms (node/deno/bun), the process **exits when no live
 work remains**: after `main` completes, only live host handles — a
 running timer, an open socket, a listening server — keep it alive, per
@@ -169,13 +199,14 @@ these primitives, not part of the language.
 ## 7.6 Emission guarantees (observable behavior)
 
 A conforming implementation targeting JavaScript guarantees: the
-entrypoint contract of §7.1; `print` writing one line per call to the
-host console; panics rejecting/aborting with the given message;
-left-to-right evaluation per §7.2; truncating integer division and
-two's-complement `as_*` folds (overflow excepted — §7.2a); and `i53`
-exactness over the wire across its whole range. Everything
-else about the emitted code — names, formatting, module layout, the
-`[build]` knobs — is implementation-defined.
+entrypoint contract of §7.1, and the module-level initialization order
+it fixes; `print` writing one line per call to the host console; panics
+rejecting/aborting with the given message; left-to-right evaluation per
+§7.2; truncating integer division and two's-complement `as_*` folds
+(overflow excepted — §7.2a); and `i53` exactness over the wire across
+its whole range. Everything else about the emitted code — names,
+formatting, module layout beyond that order, the `[build]` knobs — is
+implementation-defined.
 
 ## 7.7 Nurseries
 
