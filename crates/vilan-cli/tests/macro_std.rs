@@ -27,15 +27,26 @@ fn vilan(args: &[&str]) -> Output {
 
 #[test]
 fn the_reflection_surface_works_end_to_end() {
+    // `canonical_path`, not `canonicalize`: on Windows the latter returns a
+    // `\\?\D:\…` verbatim path, and the verbatim prefix has no business in a
+    // manifest. The path is then written as a TOML **literal** string (single
+    // quotes), which processes no escapes — a basic `"…"` string turns every
+    // `\` of a native Windows path into an invalid escape sequence, which is
+    // exactly how this fixture failed on the first windows-latest CI run.
     let macro_std = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/macro_std");
-    let macro_std = macro_std.canonicalize().expect("macro_std path");
+    let macro_std = vilan_core::util::canonical_path(&macro_std);
+    assert!(
+        macro_std.is_dir(),
+        "macro_std path: {}",
+        macro_std.display()
+    );
     let dir = temp_project("surface");
     write(&dir, "vilan.toml", "[project]\npackages = [\"app\"]\n");
     write(
         &dir,
         "app/vilan.toml",
         &format!(
-            "[package]\nname = \"app\"\ntarget = \"node\"\n\n[package.dependencies]\nmacro_std = {{ path = \"{}\" }}\n",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n\n[package.dependencies]\nmacro_std = {{ path = '{}' }}\n",
             macro_std.display()
         ),
     );

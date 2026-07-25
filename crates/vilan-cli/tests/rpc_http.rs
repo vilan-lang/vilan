@@ -79,11 +79,38 @@ fn vilan_run_with_timeout(dir: &Path, timeout: Duration) -> String {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
+    let unexpected: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_node_windows_teardown_noise(line))
+        .collect();
     assert!(
-        stderr.trim().is_empty(),
+        unexpected.is_empty(),
         "vilan run wrote to stderr:\n{stderr}\nstdout:\n{stdout}"
     );
     stdout
+}
+
+/// Windows only: node's own shutdown race, not output from the program.
+///
+/// `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c`
+/// is libuv's `uv_async_send` refusing a handle that is already closing. Calling
+/// `process.exit()` after a native `fetch()` races undici's socket teardown
+/// against libuv's shutdown; the assertion exists only in libuv's *Windows*
+/// `uv_async_send` (the POSIX one has no such check), which is why the identical
+/// sequence is silent on Linux. Upstream: nodejs/node#56645 and nodejs/node#58091,
+/// unfixed in every released node — including the CI leg's pinned v24.18.0.
+///
+/// Not ours to fix, on the evidence: the emitted program calls `process.exit(0)`
+/// exactly once and closes no libuv handle at all (only node internals own async
+/// handles, which JS cannot reach), and the first windows-latest suite run
+/// produced the crash strictly AFTER the program's complete stdout while five
+/// sibling tests of the same shape passed in the same run. Exactly this
+/// assertion line is tolerated; anything else on stderr still fails the test.
+fn is_node_windows_teardown_noise(line: &str) -> bool {
+    cfg!(windows)
+        && line.starts_with("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)")
+        && line.contains("async.c")
 }
 
 /// A long-running server child whose stdout lines stream to a channel (a reader

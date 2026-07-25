@@ -389,3 +389,31 @@ The distribution slice inherits a Windows-ready release: `.exe` assets,
 `.zip` + checksums, `install.ps1`, a green windows CI leg. npm/brew/
 marketplace packaging, winget/MSI/signing, and registry-dependency loading
 stay F7/F5 scope — nothing in this arc pre-empts their design.
+
+## 12. Residuals (recorded post-CI, 2026-07-24)
+
+- **Upstream node/libuv exit race (windows-only):** `rpc_http.rs`'s
+  `vilan_run_with_timeout` tolerates exactly one stderr line on Windows —
+  `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file
+  src\win\async.c` — libuv's Windows-only `uv_async_send` guard tripping
+  when `process.exit()` races undici's teardown after a native `fetch()`
+  (nodejs/node#56645, #58091; unfixed as of node v24.18.0; the POSIX
+  `uv_async_send` has no such check, so the identical sequence is silent on
+  Linux). Our emitted runtime calls `process.exit(0)` once and closes no
+  handle — verified against the emitted JS, no close-order bug of ours.
+  Revisit when node ships the fix. `cancellation.rs`/`streaming.rs` share
+  the exit-after-async shape and passed this run; give them the same
+  tolerance only if the flake ever bites them.
+- **8.3 short-filename boundary:** the canonical seam merges an 8.3
+  spelling (`RUNNER~1`) with its long form for any file **on disk**
+  (`fs::canonicalize` = `GetFinalPathNameByHandleW`, returns the long final
+  path — proven by the first CI run's failure itself). Two spellings of a
+  *non-existent* file stay apart (the lexical miss arm cannot expand short
+  names); no producer for that case is known.
+- **Entry-file case check:** the entry path named on the command line /
+  `[entry.<name>]` is never case-checked (§5 scoped the rule to module
+  resolution) — `vilan build Main.vl` on NTFS builds and fails on Linux.
+- **Watch e2e teardown leaves temp scripts:** the hmr/assets e2e tests kill
+  the CLI with SIGKILL, which no handler can catch — ~4 `vilan-watch-*.js`
+  per full suite run in the temp dir. Test-harness-only; sessions ended by
+  Ctrl-C clean up (S4).

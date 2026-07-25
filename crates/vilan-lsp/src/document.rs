@@ -4591,7 +4591,13 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
+// Linux-only, and specifically Linux rather than unix: the harness reads
+// resident-set size from `/proc/self/statm`, which Windows does not have (the
+// CI run failed with `NotFound`) and macOS does not have either. The E3 Phase-1
+// leak claims these pin are Linux-measured — the leak sites themselves are
+// platform-independent counters, so a Linux measurement speaks for all hosts;
+// what is Linux-only is the *instrument*, not the claim.
+#[cfg(all(test, target_os = "linux"))]
 mod leak_measurement {
     use super::*;
     use crate::document::tests::std_root;

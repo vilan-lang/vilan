@@ -96,6 +96,14 @@ mod tests {
             "file:///C:/project/src/main.vl",
             "the folded form is what `Url::from_file_path` writes on Windows"
         );
+        // Host-dependent, so it is pinned only where it can be observed: the
+        // round trip inside `normalize` (`to_file_path` → `from_file_path`) is
+        // the OS's OWN — the url crate compiles a different pair per platform —
+        // and on a Windows host it decodes `%3A` and writes `C:` back whatever
+        // rule we pass, folding the two spellings even under the unix rule. The
+        // fold's non-vacuity is therefore a Linux-side observation; the
+        // Windows-rule claims above run on both hosts.
+        #[cfg(not(windows))]
         assert_ne!(
             normalize(&from_client, false),
             normalize(&from_server, false),
@@ -151,9 +159,21 @@ mod tests {
     // is the same class as the `%3A` bug and is observable on Linux.
     #[test]
     fn percent_encoding_folds_through_the_round_trip() {
-        let encoded = url("file:///srv/dev/%73olo.vl");
+        // A drive-lettered fixture, so the claim runs on BOTH hosts: `/C:/…` maps
+        // to a path on Windows (a drive path) and on Linux (an ordinary directory
+        // literally named `C:`), and neither exists, so `canonical_path` takes its
+        // lexical arm on both and only the percent-decoding is under test.
         assert_eq!(
-            normalize(&encoded, false).as_str(),
+            normalize(&url("file:///C:/dev/%73olo.vl"), false).as_str(),
+            "file:///C:/dev/solo.vl"
+        );
+        // The unix-path spelling of the same claim is host-dependent: Windows has
+        // no path for `file:///srv/…` (no drive letter), so `to_file_path` fails
+        // and `normalize` passes the URL through untouched — there is no round
+        // trip to observe the fold in.
+        #[cfg(not(windows))]
+        assert_eq!(
+            normalize(&url("file:///srv/dev/%73olo.vl"), false).as_str(),
             "file:///srv/dev/solo.vl"
         );
     }

@@ -384,12 +384,27 @@ mod tests {
                 "an open document is addressed in the client's own spelling"
             );
             let key = state.key(&minted);
-            assert_eq!(
-                (state.owned.len(), state.merged(&key).len()),
-                if windows { (1, 0) } else { (2, 1) },
-                "windows={windows}: one file must occupy one slot under the \
-                 Windows rule, and the unix rule is what leaves it duplicated"
-            );
+            let slots = (state.owned.len(), state.merged(&key).len());
+            if windows {
+                assert_eq!(
+                    slots,
+                    (1, 0),
+                    "one file must occupy one slot under the Windows rule"
+                );
+            } else {
+                // The non-vacuity half, host-dependent so pinned only where it
+                // can be observed: `normalize`'s `to_file_path` → `from_file_path`
+                // round trip is the OS's own, and on a Windows host it folds
+                // `c%3A` → `C:` under EITHER rule — so the duplication the unix
+                // rule leaves behind shows up on Linux only. The production claim
+                // above runs on both hosts.
+                #[cfg(not(windows))]
+                assert_eq!(
+                    slots,
+                    (2, 1),
+                    "the unix rule is what leaves one file duplicated"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -451,13 +466,19 @@ mod tests {
     fn an_open_documents_notification_keeps_the_clients_spelling() {
         let (dir, _) =
             analyze_workspace(&[("solo.vl", "fun main() {\n\tlet wrong: i32 = \"text\";\n}\n")]);
-        let (canonical_uri, document) = open(&dir, "solo.vl");
+        let (minted_uri, document) = open(&dir, "solo.vl");
         let from_client =
-            Url::parse(&canonical_uri.as_str().replace("/solo.vl", "/%73olo.vl")).unwrap();
-        assert_ne!(from_client, canonical_uri, "the fixture must start apart");
+            Url::parse(&minted_uri.as_str().replace("/solo.vl", "/%73olo.vl")).unwrap();
+        assert_ne!(from_client, minted_uri, "the fixture must start apart");
+        // The claim is that the two spellings share ONE key — so both sides go
+        // through the seam, against a file that exists. The minted spelling is
+        // not itself the key: it is whatever `temp_dir()` handed the fixture, and
+        // on a Windows runner that is an 8.3 short name (`…\RUNNER~1\…` for a
+        // `runneradmin` profile) which `fs::canonicalize` expands inside the seam
+        // and `Url::from_file_path` does not.
         assert_eq!(
             crate::uri::normalize(&from_client, cfg!(windows)),
-            canonical_uri,
+            crate::uri::normalize(&minted_uri, cfg!(windows)),
             "…yet name one file"
         );
 
