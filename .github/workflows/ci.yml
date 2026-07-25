@@ -24,27 +24,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # The windows leg is EXPECTED RED and deliberately allowed to fail, for now.
-    #
-    # Why it exists before it can pass: it is the instrument. The Windows audit
-    # (windows-support.md §0) is mostly read-from-source inference, and two of
-    # its claims cannot be settled anywhere but on a real Windows host —
-    #
-    #   1. whether `vilan-embedded-std`'s build.rs `include_str!` of a
-    #      *canonicalized* path compiles, since Windows `canonicalize` yields a
-    #      `\\?\C:\...` verbatim path (the arc's only potential BUILD-time
-    #      failure — everything else is at worst a failing test), and
-    #   2. whether NTFS case-insensitivity lets `import foo` resolve `Foo.vl`,
-    #      which decides §5's case policy.
-    #
-    # This leg answers both, plus produces the real failure list that S1
-    # ("compile-clean, suite-green") is scoped against. It stays allowed-fail
-    # until the windows leg is OBSERVED GREEN: S1 makes the suite compile and
-    # pass, but S2-S5 may each turn it red again on the way through, so the
-    # flip is a call made on evidence from an actual run — not on a slice
-    # count. At that point this `continue-on-error` line is DELETED and the leg
-    # becomes required (§8, §9).
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # Both legs are REQUIRED. The windows leg ran allowed-fail while it was
+    # the arc's instrument (windows-support.md §8-§9: it settled the
+    # include_str `\\?\` build risk and the NTFS case behavior, and produced
+    # the failure list the fix rounds worked from); observed fully green
+    # 2026-07-25 (run 30136463220), and the allowance was removed per the
+    # recorded plan.
     steps:
       - uses: actions/checkout@v4
       # Many tests shell out to `node` (the macro/native equivalence gate, every
