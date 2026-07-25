@@ -38,11 +38,13 @@ In one sitting, so nothing sits half-claimed:
 2. **npm org `vilan-lang`** — creating it claims the `@vilan-lang` scope
    and settles the one unverifiable availability fact. *Contingency if
    taken (unlikely — the GitHub name is free): stop and re-decide naming
-   as a pair; do not improvise a mismatched scope at the keyboard.* Also
-   claim the bare **`vilan` package name** now (an empty placeholder
-   publish, deprecated immediately with "real package coming" — npm has no
-   reservation mechanism; a placeholder is the accepted idiom) so the
-   ratified F7 (a) call cannot be squatted between now and S1.
+   as a pair; do not improvise a mismatched scope at the keyboard.*
+   ~~Also claim the bare `vilan` package name via placeholder publish.~~
+   **OBSOLETE (2026-07-25, executed and refuted)**: npm's typosquat rule
+   403-blocks bare `vilan` ("too similar to vibas, livan") — nobody can
+   claim it, us included, so there is nothing to squat-proof. The meta
+   package is **`@vilan-lang/vilan`** (distribution.md status amendment);
+   the scope the org owns is the whole protection.
 3. **VS Code Marketplace publisher `vilan-lang`** (via Azure DevOps) —
    registration only; publishing is F7 S2.
 4. **Open VSX namespace `vilan-lang`** — per F7's ratified (c).

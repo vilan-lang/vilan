@@ -1,5 +1,15 @@
 # Distribution — npm, marketplace, brew (F7) + the project-model deferrals (F5)
 
+> **AMENDMENT 2026-07-25 — call (a) re-decided by registry fact**: npm's
+> typosquat protection **blocks bare `vilan`** (403 at publish: "too
+> similar to existing packages vibas, livan" — a registry rule, not
+> appealable in practice). The meta package is **`@vilan-lang/vilan`**
+> (the call's recorded alternative, user-confirmed): install =
+> `npm install -g @vilan-lang/vilan`; the **command stays `vilan`** (the
+> `bin` field names it). Silver lining: the org owns the scope, so the
+> placeholder-publish idea (org-migration.md §1.2) is obsolete — nothing
+> inside `@vilan-lang` can be squatted.
+>
 > **Status: RATIFIED 2026-07-25 — calls (a)–(f) all per recommendation**
 > (bare `vilan` + `@vilan-lang` scope; upgrade steers; Open VSX yes;
 > publisher `vilan`-if-free + minimal wordmark; F5 = git dependencies v1;
@@ -67,7 +77,9 @@ network call to the toolchain itself.
 **Pattern: per-platform packages, not postinstall download** — the
 esbuild/swc/turbo shape, which is the proven one:
 
-- `vilan` (meta): `bin` stubs for `vilan` and `vilan-lsp`;
+- `@vilan-lang/vilan` (meta; *amended 2026-07-25 — bare `vilan` is blocked
+  by npm's similarity rule, see the status block*): `bin` stubs for `vilan`
+  and `vilan-lsp`;
   `optionalDependencies` on the five platform packages. The stub resolves
   the platform package and hands off (`spawnSync` with inherited stdio and
   the real argv — no shim logic beyond resolution).
