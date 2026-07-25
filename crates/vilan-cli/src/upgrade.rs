@@ -41,7 +41,7 @@ use crate::paint::{self, Style};
 /// equivalent path, but `NUL` is the same idea).
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
-const DEFAULT_BASE: &str = "https://github.com/ReedSyllas/vilan";
+const DEFAULT_BASE: &str = "https://github.com/vilan-lang/vilan";
 
 pub fn upgrade(check_only: bool) -> ExitCode {
     match run(check_only) {
@@ -420,12 +420,12 @@ mod tests {
     #[test]
     fn the_release_tag_comes_from_the_redirect_url() {
         assert_eq!(
-            version_from_tag_url("https://github.com/ReedSyllas/vilan/releases/tag/v0.3.0"),
+            version_from_tag_url("https://github.com/vilan-lang/vilan/releases/tag/v0.3.0"),
             Some("0.3.0".to_string())
         );
         // No tag in the URL (e.g. no releases yet → /releases) or garbage: None.
         assert_eq!(
-            version_from_tag_url("https://github.com/ReedSyllas/vilan/releases"),
+            version_from_tag_url("https://github.com/vilan-lang/vilan/releases"),
             None
         );
         assert_eq!(

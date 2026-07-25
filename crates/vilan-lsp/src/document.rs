@@ -251,7 +251,7 @@ pub enum CompletionKind {
 }
 
 /// The vilan book's published base URL — keyword hovers deep-link into it.
-const BOOK_BASE: &str = "https://reedsyllas.github.io/vilan/";
+const BOOK_BASE: &str = "https://vilan-lang.github.io/vilan/";
 
 /// Every keyword the lexer classifies (`token.rs`), each with a one-line
 /// meaning and a deep link into the book: `(keyword, sentence, page#anchor)`.
@@ -3226,7 +3226,7 @@ pub(crate) mod tests {
         );
         assert!(
             hover.contains(
-                "https://reedsyllas.github.io/vilan/spec/memory.html#68-resources-and-destruction"
+                "https://vilan-lang.github.io/vilan/spec/memory.html#68-resources-and-destruction"
             ),
             "{hover}"
         );
@@ -3237,7 +3237,7 @@ pub(crate) mod tests {
         .expect("hover on `own`");
         assert!(hover.contains("moves ownership into the callee"), "{hover}");
         assert!(
-            hover.contains("https://reedsyllas.github.io/vilan/spec/memory.html#63-rule-3"),
+            hover.contains("https://vilan-lang.github.io/vilan/spec/memory.html#63-rule-3"),
             "{hover}"
         );
 
@@ -3246,7 +3246,7 @@ pub(crate) mod tests {
                 .expect("hover on `for`");
         assert!(hover.contains("Iterates over the elements"), "{hover}");
         assert!(
-            hover.contains("https://reedsyllas.github.io/vilan/tour/control-flow.html#loops"),
+            hover.contains("https://vilan-lang.github.io/vilan/tour/control-flow.html#loops"),
             "{hover}"
         );
     }

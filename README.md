@@ -103,20 +103,20 @@ Install the toolchain (Linux, macOS, or Windows; you'll also need
 [node](https://nodejs.org) to run what you build) — on Linux and macOS:
 
 ```sh
-curl -fsSL https://github.com/ReedSyllas/vilan/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh
 ```
 
 and on Windows, in PowerShell:
 
 ```powershell
-irm https://github.com/ReedSyllas/vilan/releases/latest/download/install.ps1 | iex
+irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 ```
 
 That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` — on Windows,
 `%USERPROFILE%\.vilan\bin`. The unix script prints the PATH line to add;
 the PowerShell one adds the directory to your user PATH itself, so open a
 new terminal afterwards. Update any time with `vilan upgrade` (it only touches the
-network when you run it). Each [release](https://github.com/ReedSyllas/vilan/releases)
+network when you run it). Each [release](https://github.com/vilan-lang/vilan/releases)
 also carries `vilan-vscode.vsix` — the VS Code extension: highlighting,
 diagnostics, hover with docs on everything (keywords included),
 go-to-definition, rename, call-shaped completion with signatures, inlay
@@ -127,7 +127,7 @@ Install from VSIX".
 Or build the project from source (Rust required) with:
 
 ```sh
-git clone https://github.com/ReedSyllas/vilan
+git clone https://github.com/vilan-lang/vilan
 cd vilan
 cargo install --path crates/vilan-cli   # installs the `vilan` binary
 ```
@@ -156,7 +156,7 @@ From there, read the book. It starts with
 [Coming from JavaScript](vilan/docs/tour/coming-from-javascript.md) and
 ends with the full-stack walkthrough:
 
-- **Rendered** (search + sidebar): https://reedsyllas.github.io/vilan/ —
+- **Rendered** (search + sidebar): https://vilan-lang.github.io/vilan/ —
   or locally, `cargo install mdbook && mdbook serve vilan/docs`.
 - **As files**: start at [vilan/docs/README.md](vilan/docs/README.md).
 

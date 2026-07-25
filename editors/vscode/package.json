@@ -3,11 +3,11 @@
   "displayName": "Vilan",
   "description": "Language support for Vilan: syntax highlighting, diagnostics, hover, go-to-definition, find references, and rename.",
   "version": "0.14.0",
-  "publisher": "vilan",
+  "publisher": "vilan-lang",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ReedSyllas/vilan"
+    "url": "https://github.com/vilan-lang/vilan"
   },
   "engines": {
     "vscode": "^1.75.0"

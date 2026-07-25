@@ -61,7 +61,7 @@ without the curl script being the only door:
 
 ```
 npm install -g vilan        # the JS/TS audience — vilan's actual audience
-brew install reedsyllas/vilan/vilan
+brew install vilan-lang/vilan/vilan
 code --install-extension …  # or just: search "vilan" in VS Code
 ```
 
@@ -108,10 +108,10 @@ that).
 
 ## 3. VS Code marketplace (+ Open VSX)
 
-- **Publisher registration** is a user action under the pseudonym
-  discipline: a marketplace publisher id (the `vilan` id if free, else
-  `reedsyllas`), created via Azure DevOps, PAT stored as `VSCE_PAT`.
-  `package.json.publisher` updates to the real id.
+- **Publisher registration** — *done 2026-07-25 under F9*: the publisher
+  is **`vilan-lang`** (registered via Azure DevOps as part of the org
+  claim sitting); `package.json.publisher` already updated in F9's sweep.
+  What remains for S2 is the `VSCE_PAT` secret.
 - **An icon is required in practice** (the marketplace renders a gray box
   otherwise) — a small deliverable this arc: simple wordmark/glyph, no
   branding ambitions, checked into `editors/vscode/`.
@@ -126,7 +126,7 @@ that).
 A tap, not homebrew-core (core has notability requirements and review
 latency; a tap ships today and migrates later if ever wanted):
 
-- New repo `ReedSyllas/homebrew-vilan` with `Formula/vilan.rb` — per-target
+- New repo `vilan-lang/homebrew-vilan` with `Formula/vilan.rb` — per-target
   `url` + `sha256` (from `sha256sums.txt`), installing both binaries.
   macOS x64/arm64 + linux x64/arm64 all supported by `on_macos`/`on_linux`
   + `Hardware::CPU` branches over the existing tarballs.
@@ -194,9 +194,8 @@ says yes); the `homebrew-vilan` repo + `TAP_TOKEN`.
     npm/brew-owned files). Alternative: hard-refuse with no hint (hostile),
     or allow-with-warning (breaks the package manager's ledger).
 (c) **Open VSX** — recommend: yes.
-(d) **Marketplace publisher id** — `vilan` if free, else `reedsyllas`;
-    needs your registration either way. Icon: minimal wordmark unless you
-    want to supply one.
+(d) **Marketplace publisher id** — RESOLVED by F9: `vilan-lang`,
+    registered 2026-07-25. Icon: minimal wordmark unless you supply one.
 (e) **F5 registry model** — recommend: git dependencies v1, registry
     demand-gated to D5. This is the one *language-adjacent* call here.
 (f) **F5 in this arc or split** — recommend: S4/S5 ride this arc after
@@ -232,7 +231,7 @@ because it differs from the other three in kind:
   pseudonym discipline, or waiting for reputation to accrue) is the real
   content of the winget plan, not the manifest syntax.
 - Interacts with F9 (the org question): the manifest's publisher/moniker
-  fields and the package identifier (`ReedSyllas.vilan` vs an org name)
+  fields and the package identifier (now settled by F9: `VilanLang.Vilan`)
   are permanent-ish; sequencing winget after F9 is decided costs nothing
   and avoids a rename PR.
 

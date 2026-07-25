@@ -5,7 +5,7 @@ you can see the layers meet: **Notes** — sign in, a note list that syncs
 live between browser windows, and an editor that saves as you type.
 
 The finished app lives in the repo at
-[`vilan/examples/walkthrough/`](https://github.com/ReedSyllas/vilan/tree/main/vilan/examples/walkthrough/), about 500
+[`vilan/examples/walkthrough/`](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/walkthrough/), about 500
 lines in **one package**. Every snippet below is quoted from those files,
 and the test suite builds the app on every run, so this chapter can't
 quietly rot. To run it:
@@ -66,7 +66,7 @@ state, and drafts smooth over the last inch (the input you're typing in).
 
 ## The wire types
 
-[`src/notes.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/notes.vl)
+[`src/notes.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/notes.vl)
 declares the payloads both sides speak. This is most of the
 client/server contract — there is no schema file, no endpoint list, no
 client SDK to regenerate:
@@ -82,7 +82,7 @@ struct Note {
 
 ## The service: next to its resources
 
-[`src/store.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/store.vl)
+[`src/store.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/store.vl)
 is the heart of the app. Its database is **module-level** — opened once at
 startup, process-lifetime, closed only when the process ends:
 
@@ -156,7 +156,7 @@ startup; `boot()` loads the mirror once from the already-open database.
 
 ## The server entry: read, boot, serve
 
-[`src/server.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/server.vl)
+[`src/server.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/server.vl)
 is now the boring file, which is the point:
 
 ```vilan,fragment
@@ -185,7 +185,7 @@ server entry builds.
 
 ## The client entry: four signals and a mount
 
-[`src/client.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/client.vl) is
+[`src/client.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/client.vl) is
 the whole wiring diagram:
 
 ```vilan,fragment
@@ -212,7 +212,7 @@ Everything after this line is just views reading those signals.
 
 ## Routes
 
-[`src/routes.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/routes.vl)
+[`src/routes.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/routes.vl)
 is the enum-router pattern from [Routing](routing.md), at its smallest:
 
 ```vilan,fragment
@@ -229,7 +229,7 @@ plus `parse` and `href` as the inverse pair, and pages that `swap` on
 
 ## The views
 
-[`src/views.vl`](https://github.com/ReedSyllas/vilan/blob/main/vilan/examples/walkthrough/src/views.vl)
+[`src/views.vl`](https://github.com/vilan-lang/vilan/blob/main/vilan/examples/walkthrough/src/views.vl)
 has three layers, each one guide's idea:
 
 **The gate.** The sign-in panel `show`s while the token is empty; the

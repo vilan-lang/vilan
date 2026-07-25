@@ -2,13 +2,13 @@
 # The vilan installer — downloads the latest release for this platform into
 # ~/.vilan/bin (override with $VILAN_INSTALL_DIR):
 #
-#   curl -fsSL https://github.com/ReedSyllas/vilan/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh
 #
 # Idempotent: re-running it updates in place. It only ever touches the
 # install directory.
 set -eu
 
-REPO="ReedSyllas/vilan"
+REPO="vilan-lang/vilan"
 BASE_URL="https://github.com/$REPO/releases/latest/download"
 BIN_DIR="${VILAN_INSTALL_DIR:-$HOME/.vilan/bin}"
 
@@ -90,7 +90,7 @@ main() {
             ;;
     esac
     say ""
-    say "get started: https://reedsyllas.github.io/vilan/"
+    say "get started: https://vilan-lang.github.io/vilan/"
 }
 
 main

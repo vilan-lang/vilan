@@ -1,12 +1,12 @@
 # The vilan installer for Windows — downloads the latest release into
 # %USERPROFILE%\.vilan\bin (override with $env:VILAN_INSTALL_DIR):
 #
-#   irm https://github.com/ReedSyllas/vilan/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 #
 # Idempotent: re-running it updates in place. It only ever touches the install
 # directory and the *user* PATH, so it needs no administrator rights.
 
-$repo = 'ReedSyllas/vilan'
+$repo = 'vilan-lang/vilan'
 $baseUrl = "https://github.com/$repo/releases/latest/download"
 $binDir = if ($env:VILAN_INSTALL_DIR) {
     $env:VILAN_INSTALL_DIR
@@ -133,7 +133,7 @@ function Main {
         Say "verify with: vilan --version"
     }
     Say ""
-    Say "get started: https://reedsyllas.github.io/vilan/"
+    Say "get started: https://vilan-lang.github.io/vilan/"
 }
 
 Main

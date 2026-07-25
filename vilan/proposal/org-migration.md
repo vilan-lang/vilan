@@ -116,7 +116,7 @@ Grep-verified inventory (2026-07-25) — seven live sites plus history:
 | `editors/vscode/package.json` | `repository`, and `publisher` → `vilan-lang` (the string only; registration is §1, publishing is F7 S2) |
 | `README.md` | install one-liners + book link |
 | `CHANGELOG.md` | 7 historical book links — swept too (cheap; the tombstone covers stragglers, but shipping new copies of old links is silly) |
-| `vilan/docs/**` | links relatively — **no change needed** (verified) |
+| `vilan/docs/**` | book links relative — but **inventory correction (S4, 2026-07-25)**: `guide/walkthrough.md` carried 7 absolute *repo* links (`github.com/ReedSyllas/vilan/tree|blob/…`) the "all relative" claim missed; swept. CHANGELOG was 9 lines/11 URLs, not 7. |
 
 Sweep = one implementer slice: replace, then **gate on the grep** — a new
 test in the hygiene family: no tracked file may contain `ReedSyllas/vilan`
