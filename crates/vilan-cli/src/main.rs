@@ -1909,6 +1909,12 @@ fn compile_to_js(
         program.const_assets = const_assets;
         program.diagnostics.extend(const_errors);
 
+        // A dependency cycle among module-level initializers has no valid
+        // declaration order (b33-emission-order.md §3), so it is an error
+        // rather than a load-time `ReferenceError`. Runs last: the relation is
+        // only meaningful for a program that analyzed cleanly.
+        vilan_core::init_order::check_cycles(&mut program);
+
         for error in &program.diagnostics {
             // Capture every diagnostic for the overlay (message + note verbatim);
             // the terminal rendering below is unchanged.

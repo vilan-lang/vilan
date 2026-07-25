@@ -307,6 +307,11 @@ pub fn analyze_source(
         program.const_results = const_results;
         program.const_assets = const_assets;
         program.diagnostics.extend(const_errors);
+        // A dependency cycle among module-level initializers has no valid
+        // declaration order (b33-emission-order.md §3), so it is an error
+        // rather than a load-time `ReferenceError`. Runs last: the relation is
+        // only meaningful for a program that analyzed cleanly.
+        init_order::check_cycles(&mut program);
         program
     }));
     match analyzed {

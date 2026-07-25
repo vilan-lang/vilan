@@ -50,22 +50,25 @@
 //!
 //! # Cycles
 //!
-//! S1 does not diagnose them, but it must not let one corrupt the order of
-//! bindings that are merely *downstream* of it. The sort therefore runs over
-//! the **condensation**: strongly connected components first, then a
-//! topological order of the resulting DAG (which is acyclic by construction, so
-//! it always drains completely). Only the members of a genuine cycle are
-//! ordered arbitrarily — among themselves, canonically; everything that merely
-//! depends on a cycle still orders after it. S2 turns exactly the
-//! multi-member/self-looping components into the compile error.
+//! A cycle has no valid initialization order, so it is a **compile error**
+//! ([`check_cycles`], §3). The sort must still produce something sane for the
+//! bindings around one — a cycle must not corrupt the order of bindings that
+//! are merely *downstream* of it — so it runs over the **condensation**:
+//! strongly connected components first, then a topological order of the
+//! resulting DAG (which is acyclic by construction, so it always drains
+//! completely). Only the members of a genuine cycle are ordered arbitrarily —
+//! among themselves, canonically; everything that merely depends on a cycle
+//! still orders after it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use indexmap::IndexMap;
 
-use crate::analyzer::{Expr, ExprIfBranch, Program};
+use crate::analyzer::{Expr, ExprIfBranch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::error::{Error, Note};
 use crate::id::Id;
+use crate::span::Span;
 
 /// Every module-level binding, in the order its initializer runs: dependency
 /// order over the load-time relation, ties broken by the canonical key.
@@ -87,20 +90,308 @@ pub fn initialization_order(program: &Program, graph: &CallGraph) -> Vec<Id> {
 /// The load-time relation: for each module-level binding, the bindings its
 /// initializer evaluates at load time, ascending by canonical key.
 ///
-/// Keyed in canonical order, so a consumer that iterates it (S2's cycle
+/// Keyed in canonical order, so a consumer that iterates it (the cycle
 /// diagnostic) is deterministic too.
 pub fn load_time_dependencies(program: &Program, graph: &CallGraph) -> IndexMap<Id, Vec<Id>> {
     let mut bindings = program.module_level_bindings();
     bindings.sort_by_key(canonical_key);
-    let mut walk = LoadTimeWalk {
-        program,
-        graph,
-        entered: HashMap::new(),
-    };
+    let mut walk = LoadTimeWalk::new(program, graph);
     bindings
         .iter()
         .map(|binding| (*binding, walk.evaluated_globals(*binding)))
         .collect()
+}
+
+/// The cycle check (§3): a dependency cycle among module-level initializers is
+/// a compile error, because no declaration order can satisfy it — whichever
+/// member is declared first reads a `const` that has not initialized yet, which
+/// is a temporal-dead-zone `ReferenceError` at load.
+///
+/// One diagnostic per cycle, not per member (the B29 lesson: one diagnostic per
+/// mistake). A cycle is a strongly connected component of the load-time
+/// relation with more than one member, or a single binding whose initializer
+/// evaluates itself.
+///
+/// Runs post-`analyze()` beside the const pass, and — like it — only on a
+/// program that analyzed cleanly. Two reasons: the relation is read out of the
+/// call graph, whose per-node tables a failed analysis may have left partial
+/// (a false cycle out of half-resolved data would be worse than a late one),
+/// and B5 keeps one root cause on screen at a time. A cycle survives its
+/// program's other errors, so it surfaces on the next analysis.
+pub fn check_cycles(program: &mut Program) {
+    if !program.diagnostics.is_empty() {
+        return;
+    }
+    let graph = CallGraph::build(program);
+    let found = cycle_diagnostics(program, &graph);
+    // `diagnostic_sources` runs parallel to `diagnostics` and tells the editor
+    // which file to publish each one in, so a cross-module cycle squiggles in
+    // the module it is about. The guard above means both vectors are empty
+    // here; the length check keeps that assumption honest rather than silently
+    // misattributing diagnostics if it ever stops holding.
+    let attributed = program.diagnostics.len() == program.diagnostic_sources.len();
+    for (error, source) in found {
+        program.diagnostics.push(error);
+        if attributed {
+            program.diagnostic_sources.push(source);
+        }
+    }
+}
+
+/// Every initialization cycle in the program, as diagnostics paired with the
+/// source file each is anchored in, ordered by the canonical key of each
+/// cycle's first member.
+fn cycle_diagnostics(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> {
+    let dependencies = load_time_dependencies(program, graph);
+    let bindings: Vec<Id> = dependencies.keys().copied().collect();
+    let members: HashSet<Id> = bindings.iter().copied().collect();
+    let mut components = strongly_connected_components(&bindings, &dependencies, &members);
+    for component in &mut components {
+        component.sort_by_key(canonical_key);
+    }
+    components.sort_by_key(|component| canonical_key(&component[0]));
+
+    let mut walk = LoadTimeWalk::new(program, graph);
+    components
+        .iter()
+        .filter(|component| is_cycle(component, &dependencies))
+        .map(|component| cycle_error(program, &mut walk, component, &dependencies))
+        .collect()
+}
+
+/// Whether a component is a cycle: more than one member, or one that depends
+/// on itself. A lone binding with no self-edge is just a binding.
+fn is_cycle(component: &[Id], dependencies: &IndexMap<Id, Vec<Id>>) -> bool {
+    component.len() > 1
+        || dependencies
+            .get(&component[0])
+            .is_some_and(|edges| edges.contains(&component[0]))
+}
+
+/// One cycle, rendered (diagnostics-standard.md): anchored at a read that
+/// closes it (A1 — the narrowest expression that identifies the problem, not
+/// the whole initializer), with a `via` chain, the participants' declarations,
+/// and a note at the declaration the anchored read names (C3).
+fn cycle_error(
+    program: &Program,
+    walk: &mut LoadTimeWalk,
+    component: &[Id],
+    dependencies: &IndexMap<Id, Vec<Id>>,
+) -> (Error, SourceId) {
+    let chain = shortest_cycle(component, dependencies);
+    let witnesses: Vec<Option<ReadWitness>> = chain
+        .windows(2)
+        .map(|step| walk.read_witness(step[0], step[1]))
+        .collect();
+    // The read that closes the cycle, from the member that starts the chain —
+    // the canonically first, so the anchor never depends on enumeration order.
+    let anchor = witnesses
+        .first()
+        .and_then(|witness| witness.as_ref())
+        .map(|witness| witness.reference)
+        // Defensive: an edge is only ever recorded because a read produced it,
+        // so the witness walk finds one. Falling back to the declaration keeps
+        // this a total function rather than a panic in a diagnostic path.
+        .unwrap_or(chain[0]);
+    let via_dispatch = witnesses
+        .iter()
+        .any(|witness| witness.as_ref().is_some_and(|witness| witness.via_dispatch));
+
+    let names: Vec<String> = component
+        .iter()
+        .map(|member| format!("`{}`", binding_name(program, *member)))
+        .collect();
+    let mut message = if component.len() == 1 {
+        // The degenerate case reads as what it is — a binding that evaluates
+        // itself — rather than as a `via A → A` chain.
+        format!(
+            "`{}`'s initializer evaluates `{0}` itself, which has not initialized yet",
+            binding_name(program, component[0])
+        )
+    } else {
+        format!(
+            "{} form an initialization cycle: module-level bindings initialize in dependency \
+             order, and a cycle has no such order",
+            join_and(&names)
+        )
+    };
+    if chain.len() > 2 {
+        let steps: Vec<String> = chain
+            .iter()
+            .map(|member| format!("`{}`", binding_name(program, *member)))
+            .collect();
+        message.push_str(&format!("\n  via {}", steps.join(" → ")));
+    }
+    if component.len() > 1 {
+        let declarations: Vec<String> = component
+            .iter()
+            .map(|member| declaration_label(program, *member))
+            .collect();
+        message.push_str(&format!("\n  declared: {}", declarations.join(", ")));
+    }
+    if via_dispatch {
+        // §5(b): the relation follows every candidate of a dispatched call, so
+        // a cycle can be built out of an implementation this program never
+        // instantiates. Saying so makes a false positive self-explaining.
+        message.push_str(
+            "\n  the cycle runs through a dispatched call, so it includes every implementation \
+             of that method — one this program never instantiates still participates",
+        );
+    }
+    if component.len() > 1 {
+        // The escape hatch, and the rule behind it: creating a closure is not
+        // evaluating it (§2), which is why mutually-recursive module closures
+        // are legal.
+        message.push_str(
+            "\n  a closure's body is not evaluated at load — moving one of these reads inside a \
+             closure breaks the cycle",
+        );
+    }
+
+    // The note names the declaration the anchored read reached for. For a
+    // self-cycle that is the binding itself; otherwise it is the next member of
+    // the chain, whose own initializer carries the cycle onward — and it is
+    // often in another file, which is exactly what a note is for. It is dropped
+    // when it would add nothing: a note whose span CONTAINS the primary one, in
+    // the same file, points at a declaration the reader is already looking at
+    // (`let A = A + 1`).
+    let noted = chain.get(1).copied().unwrap_or(chain[0]);
+    let anchor_span = span_of(program, anchor);
+    let noted_span = span_of(program, noted);
+    let already_shown = program.source_of(noted) == program.source_of(anchor)
+        && noted_span.start <= anchor_span.start
+        && anchor_span.end <= noted_span.end;
+    let note = (!already_shown).then(|| Note {
+        span: noted_span,
+        msg: format!("`{}` is declared here", binding_name(program, noted)),
+        // The contract on `Note::source`: name the file only when it differs
+        // from the primary span's.
+        source: program
+            .source_of(noted)
+            .filter(|source| Some(*source) != program.source_of(anchor)),
+    });
+    (
+        Error {
+            span: anchor_span,
+            msg: message,
+            note,
+        },
+        program.source_of(anchor).unwrap_or(SourceId(0)),
+    )
+}
+
+/// A shortest cycle through the component's canonically first member, as the
+/// member sequence `A → … → A` (so the first and last entries are the same
+/// binding). A self-edge yields `[A, A]`.
+///
+/// The whole component is reported as the cycle's participants, but the CHAIN
+/// shows one concrete round trip: a strongly connected component need not have
+/// a cycle through every member at once, so a "chain" over all of them would be
+/// a fiction. Shortest, so the witness is the simplest one available; rooted at
+/// the canonically first member and walking edges in canonical order, so it is
+/// a pure function of the program.
+fn shortest_cycle(component: &[Id], dependencies: &IndexMap<Id, Vec<Id>>) -> Vec<Id> {
+    let start = component[0];
+    let inside: HashSet<Id> = component.iter().copied().collect();
+    let edges_of = |node: Id| -> &[Id] {
+        dependencies
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    if edges_of(start).contains(&start) {
+        return vec![start, start];
+    }
+    let mut previous: HashMap<Id, Id> = HashMap::new();
+    let mut seen: HashSet<Id> = HashSet::new();
+    seen.insert(start);
+    let mut queue: VecDeque<Id> = VecDeque::new();
+    queue.push_back(start);
+    while let Some(node) = queue.pop_front() {
+        for next in edges_of(node) {
+            if !inside.contains(next) {
+                continue;
+            }
+            if *next == start {
+                // Nodes leave the queue in nondecreasing distance order, so the
+                // first edge back to the start closes a shortest cycle. Walk
+                // the predecessors back to the start, then reverse.
+                let mut chain = vec![node];
+                let mut cursor = node;
+                while let Some(step) = previous.get(&cursor) {
+                    chain.push(*step);
+                    cursor = *step;
+                }
+                chain.reverse();
+                chain.push(start);
+                return chain;
+            }
+            if seen.insert(*next) {
+                previous.insert(*next, node);
+                queue.push_back(*next);
+            }
+        }
+    }
+    // Unreachable for a genuine component (strong connectivity guarantees a
+    // round trip). Kept total: a diagnostic must not panic.
+    let mut chain = component.to_vec();
+    chain.push(start);
+    chain
+}
+
+/// A binding's declaration span — the whole `let` (`span_map`'s entry), which
+/// is where a note points.
+fn span_of(program: &Program, id: Id) -> Span {
+    program
+        .span_map
+        .get(&id)
+        .map(|span| **span)
+        .unwrap_or(Span { start: 0, end: 0 })
+}
+
+fn binding_name(program: &Program, id: Id) -> String {
+    program
+        .variables
+        .get(&id)
+        .map(|variable| variable.name.to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// `` `A` in `alpha.vl` `` — the participant plus the file it is declared in,
+/// so a cross-module cycle names both ends. The file name is what the user
+/// wrote the module as; a binding with no recorded source (none exist today —
+/// every module binding comes out of a file walk) renders as the bare name.
+fn declaration_label(program: &Program, id: Id) -> String {
+    let name = binding_name(program, id);
+    let file = program
+        .source_of(id)
+        .and_then(|source| program.source_path(source))
+        .and_then(|path| path.file_name())
+        .map(|file| file.to_string_lossy().into_owned());
+    match file {
+        Some(file) => format!("`{name}` in `{file}`"),
+        None => format!("`{name}`"),
+    }
+}
+
+/// `` `A` and `B` ``, `` `A`, `B` and `C` `` — the participants, in the order
+/// they are given.
+fn join_and(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Where a cycle's edge was read, and how the walk got there.
+struct ReadWitness {
+    /// The reference expression that reads the edge's target.
+    reference: Id,
+    /// Whether every path from the initializer to that read went through a
+    /// dispatched call's candidate list (§5(b)'s over-approximation).
+    via_dispatch: bool,
 }
 
 /// The canonical key of a binding: its entity id.
@@ -327,18 +618,38 @@ fn strongly_connected_components(
     components
 }
 
+/// How a unit was entered: by a call the walk could resolve, or through the
+/// dispatch over-approximation (§5(b) — every trait candidate of a bounded
+/// call, instantiated or not). Only the cycle diagnostic distinguishes them;
+/// the ordering relation treats both as "entered".
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum EnteredVia {
+    /// Sorts first, so a unit entered BOTH ways classifies as direct.
+    Direct,
+    Dispatch,
+}
+
 /// Walks the load-time relation, memoizing the part that is context-free.
 struct LoadTimeWalk<'a, 'src> {
     program: &'a Program<'src>,
     graph: &'a CallGraph,
     /// Code unit → the units its execution ENTERS (its resolved callees, with
-    /// dispatch and every function value passed through a call expanded). This
-    /// depends only on the unit, never on which binding's initialization
-    /// reached it, so it is computed once and shared by every binding's walk.
-    entered: HashMap<Id, Vec<Id>>,
+    /// dispatch and every function value passed through a call expanded), each
+    /// tagged with how it was reached. This depends only on the unit, never on
+    /// which binding's initialization reached it, so it is computed once and
+    /// shared by every binding's walk.
+    entered: HashMap<Id, Vec<(Id, EnteredVia)>>,
 }
 
-impl LoadTimeWalk<'_, '_> {
+impl<'a, 'src> LoadTimeWalk<'a, 'src> {
+    fn new(program: &'a Program<'src>, graph: &'a CallGraph) -> Self {
+        LoadTimeWalk {
+            program,
+            graph,
+            entered: HashMap::new(),
+        }
+    }
+
     /// The module-level bindings `binding`'s initializer evaluates at load
     /// time, ascending by canonical key. Includes `binding` itself when its
     /// initializer reads it (a 1-cycle) — the ordering pass must see that, not
@@ -352,13 +663,64 @@ impl LoadTimeWalk<'_, '_> {
             for (_reference, global) in self.graph.global_references_of(unit) {
                 reads.insert(canonical_key(global));
             }
-            for next in self.entered_by(unit) {
+            for (next, _via) in self.entered_by(unit) {
                 if seen.insert(next) {
                     pending.push(next);
                 }
             }
         }
         reads.into_iter().map(Id).collect()
+    }
+
+    /// A witness for the relation's edge `binding → target`: the reference
+    /// expression that reads `target` during `binding`'s initialization, and
+    /// whether reaching it required the dispatch over-approximation.
+    ///
+    /// The same walk as [`Self::evaluated_globals`], carrying two extra things
+    /// the ordering pass has no use for: *where* the read is, and how it was
+    /// reached. Ties are broken toward a DIRECT path and then the lowest
+    /// reference id, so the chosen witness is a pure function of the program —
+    /// and `via_dispatch` is true only when *every* path to a read of `target`
+    /// went through a dispatched call's candidates, which is exactly when the
+    /// §5(b) note applies.
+    fn read_witness(&mut self, binding: Id, target: Id) -> Option<ReadWitness> {
+        // Unit → whether the best path to it so far crossed a dispatch edge.
+        // `false` is the better value, so a unit already reached directly is
+        // never re-queued, and one first reached by dispatch is re-queued if a
+        // direct path turns up later.
+        let mut dispatched_at: HashMap<Id, bool> = HashMap::new();
+        dispatched_at.insert(binding, false);
+        let mut queue: VecDeque<Id> = VecDeque::new();
+        queue.push_back(binding);
+        let mut best: Option<(bool, u32)> = None;
+        let graph = self.graph;
+        while let Some(unit) = queue.pop_front() {
+            let dispatched = dispatched_at[&unit];
+            for (reference, global) in graph.global_references_of(unit) {
+                if *global != target {
+                    continue;
+                }
+                let candidate = (dispatched, reference.0);
+                if best.is_none_or(|current| candidate < current) {
+                    best = Some(candidate);
+                }
+            }
+            for (next, via) in self.entered_by(unit) {
+                let next_dispatched = dispatched || via == EnteredVia::Dispatch;
+                if dispatched_at
+                    .get(&next)
+                    .is_some_and(|reached| *reached <= next_dispatched)
+                {
+                    continue;
+                }
+                dispatched_at.insert(next, next_dispatched);
+                queue.push_back(next);
+            }
+        }
+        best.map(|(via_dispatch, reference)| ReadWitness {
+            reference: Id(reference),
+            via_dispatch,
+        })
     }
 
     /// The code units executing `unit` enters. Only CALLS are followed: a
@@ -369,19 +731,21 @@ impl LoadTimeWalk<'_, '_> {
     /// here — the call graph files a binding's calls under `initializer_calls`
     /// and a node's under `calls`, and each is empty for the other kind, so
     /// chaining them reads whichever applies.
-    fn entered_by(&mut self, unit: Id) -> Vec<Id> {
+    fn entered_by(&mut self, unit: Id) -> Vec<(Id, EnteredVia)> {
         if let Some(cached) = self.entered.get(&unit) {
             return cached.clone();
         }
         let graph = self.graph;
-        let mut entered = Vec::new();
+        let mut entered: Vec<(Id, EnteredVia)> = Vec::new();
         for call in graph
             .calls_of(unit)
             .iter()
             .chain(graph.initializer_calls_of(unit))
         {
             match call.target {
-                CallTarget::Function(callee) | CallTarget::Closure(callee) => entered.push(callee),
+                CallTarget::Function(callee) | CallTarget::Closure(callee) => {
+                    entered.push((callee, EnteredVia::Direct))
+                }
                 // An extern is a leaf with no Vilan body; a variant constructor
                 // builds a value and calls nothing. (Neither is a dead end for
                 // the values passed to it — see below.)
@@ -390,11 +754,13 @@ impl LoadTimeWalk<'_, '_> {
                 CallTarget::Indirect(IndirectReason::Value) => {}
                 // A generic/trait dispatch follows the same over-approximation
                 // async inference and platform coloring use: every candidate.
-                // §5(b) records the false-cycle risk this carries.
-                CallTarget::Indirect(_) => entered.extend(crate::async_infer::dispatch_candidates(
-                    self.program,
-                    call.call_id,
-                )),
+                // §5(b) records the false-cycle risk this carries — and tags
+                // it, so a cycle built out of such an edge can say so.
+                CallTarget::Indirect(_) => entered.extend(
+                    crate::async_infer::dispatch_candidates(self.program, call.call_id)
+                        .into_iter()
+                        .map(|candidate| (candidate, EnteredVia::Dispatch)),
+                ),
             }
             // Every function VALUE this call can hand to its callee is entered
             // too: a call that runs at load may invoke what it was given, and
@@ -405,14 +771,18 @@ impl LoadTimeWalk<'_, '_> {
             // too. Conservative: it only ever ADDS edges.
             if let Some(function_call) = self.program.function_calls.get(&call.call_id) {
                 let mut seen = HashSet::new();
-                self.value_bodies(function_call.subject_id, &mut entered, &mut seen);
+                let mut values = Vec::new();
+                self.value_bodies(function_call.subject_id, &mut values, &mut seen);
                 for argument in &function_call.argument_ids {
-                    self.value_bodies(*argument, &mut entered, &mut seen);
+                    self.value_bodies(*argument, &mut values, &mut seen);
                 }
+                entered.extend(values.into_iter().map(|body| (body, EnteredVia::Direct)));
             }
         }
-        entered.sort_by_key(canonical_key);
-        entered.dedup();
+        // By canonical key, then by provenance — so a unit entered both ways
+        // keeps its `Direct` tag when the duplicate is dropped.
+        entered.sort_by_key(|(body, via)| (canonical_key(body), *via));
+        entered.dedup_by_key(|(body, _via)| *body);
         self.entered.insert(unit, entered.clone());
         entered
     }
@@ -782,5 +1152,89 @@ mod tests {
             "the deepest dependency initializes first"
         );
         assert_eq!(order[depth as usize - 1], Id(1));
+    }
+
+    // --- The cycle diagnostic's rendering machinery (S2) --------------------
+    //
+    // The message is built from a program, but the two decisions that make it
+    // deterministic — which component counts as a cycle, and which round trip
+    // the `via` chain shows — are pure functions of the relation, so they pin
+    // here where every shape is expressible.
+
+    fn cycle_through(component: &[u32], edges: &[(u32, &[u32])]) -> Vec<u32> {
+        let dependencies = relation(edges);
+        let component: Vec<Id> = component.iter().copied().map(Id).collect();
+        shortest_cycle(&component, &dependencies)
+            .into_iter()
+            .map(|id| id.0)
+            .collect()
+    }
+
+    #[test]
+    fn a_self_edge_is_a_cycle_and_a_lone_binding_is_not() {
+        let dependencies = relation(&[(1, &[1]), (2, &[])]);
+        assert!(is_cycle(&[Id(1)], &dependencies));
+        assert!(!is_cycle(&[Id(2)], &dependencies));
+    }
+
+    #[test]
+    fn a_self_cycles_chain_is_the_binding_twice() {
+        assert_eq!(cycle_through(&[1], &[(1, &[1])]), vec![1, 1]);
+    }
+
+    #[test]
+    fn a_two_binding_cycles_chain_is_the_round_trip() {
+        assert_eq!(
+            cycle_through(&[1, 2], &[(1, &[2]), (2, &[1])]),
+            vec![1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn a_longer_cycles_chain_names_every_step() {
+        assert_eq!(
+            cycle_through(&[1, 2, 3], &[(1, &[2]), (2, &[3]), (3, &[1])]),
+            vec![1, 2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn the_chain_is_the_shortest_round_trip_through_the_first_member() {
+        // One component, two ways home: 1 → 2 → 1 and 1 → 3 → 4 → 1. The chain
+        // shows the short one, and always starts at the canonically first
+        // member, so the rendered witness never depends on edge order.
+        assert_eq!(
+            cycle_through(
+                &[1, 2, 3, 4],
+                &[(1, &[2, 3]), (2, &[1]), (3, &[4]), (4, &[1])]
+            ),
+            vec![1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn a_component_wider_than_its_chain_still_renders_one_round_trip() {
+        // 1 ↔ 2 with 3 hanging off 2 and back into 1: all three are one
+        // component (each reaches the others), but no single round trip visits
+        // all three, so the chain shows one and the message names the rest.
+        assert_eq!(
+            cycle_through(&[1, 2, 3], &[(1, &[2]), (2, &[1, 3]), (3, &[1])]),
+            vec![1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn participants_read_as_a_sentence() {
+        let names = |count: usize| {
+            join_and(
+                &["`A`", "`B`", "`C`"][..count]
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(names(1), "`A`");
+        assert_eq!(names(2), "`A` and `B`");
+        assert_eq!(names(3), "`A`, `B` and `C`");
     }
 }

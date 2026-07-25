@@ -2570,6 +2570,104 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A published set's messages — `PublishedDiagnostic` is not `Debug`, and
+    /// the message is what an assertion failure needs to read.
+    fn messages(published: &[PublishedDiagnostic]) -> Vec<&str> {
+        published.iter().map(|item| item.message.as_str()).collect()
+    }
+
+    // An initialization cycle (b33-emission-order.md §3) reaches the editor
+    // like any other analyzer diagnostic: `check_cycles` runs inside
+    // `analyze_source`, so it is in `program.diagnostics` by the time the
+    // document is built. It carries the C3 note, and its `diagnostic_sources`
+    // entry publishes a cross-module cycle in the module holding the read that
+    // closes it, spanned in THAT file's text.
+    #[test]
+    fn an_initialization_cycle_publishes_to_the_file_that_closes_it() {
+        let alpha = "import pkg::zeta::{ Z };\nlet A: i32 = Z + 1;\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                 fun main() { print(A); print(Z); }\n",
+            ),
+            ("alpha.vl", alpha),
+            (
+                "zeta.vl",
+                "import pkg::alpha::{ A };\nlet Z: i32 = A + 2;\n",
+            ),
+        ]);
+        let published = document.published_diagnostics();
+        assert_eq!(
+            published.len(),
+            1,
+            "one diagnostic per cycle: {:?}",
+            messages(&published)
+        );
+        let item = &published[0];
+        assert!(
+            item.message
+                .contains("`A` and `Z` form an initialization cycle")
+                && item.message.contains("via `A` → `Z` → `A`"),
+            "the cycle and its chain are published: {}",
+            item.message
+        );
+        let path = item.path.as_ref().expect("attributed to the module file");
+        assert!(path.ends_with("alpha.vl"), "{path:?}");
+        let read = alpha.find("Z + 1").expect("the read is in alpha.vl");
+        assert_eq!(
+            item.span.into_range(),
+            read..read + 1,
+            "spanned at the read, in alpha.vl's own text"
+        );
+        // The diagnostic's note ("`Z` is declared here") is dropped here, not
+        // by the check: `published_diagnostics` carries notes only on the
+        // ENTRY-attributed branch above. That predates this diagnostic (it is
+        // where every module-attributed diagnostic loses its note) and is
+        // pinned as the current truth rather than quietly worked around.
+        assert!(
+            item.note.is_none(),
+            "a module-attributed diagnostic publishes without its note today"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The same-file half: a cycle in the open document publishes on the entry
+    // (no path), so the squiggle lands under the read the user is looking at.
+    #[test]
+    fn an_entry_file_initialization_cycle_publishes_on_the_entry() {
+        let entry = "import std::print;\nlet A: i32 = B + 1;\nlet B: i32 = A + 2;\n\
+                     fun main() { print(A); print(B); }\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", entry)]);
+        let published = document.published_diagnostics();
+        assert_eq!(
+            published.len(),
+            1,
+            "one diagnostic per cycle: {:?}",
+            messages(&published)
+        );
+        assert!(
+            published[0].path.is_none(),
+            "entry diagnostics carry no path"
+        );
+        let read = entry.find("B + 1").expect("the read is in the entry");
+        assert_eq!(published[0].span.into_range(), read..read + 1);
+        // The entry-attributed branch keeps the C3 note, so the editor can show
+        // the other member's declaration as related information.
+        let (note_span, note_message, note_path) = published[0]
+            .note
+            .as_ref()
+            .expect("the C3 declaration note survives publishing");
+        assert!(
+            note_message.contains("`B` is declared here"),
+            "{note_message}"
+        );
+        assert!(note_path.is_none(), "same file: {note_path:?}");
+        let declaration = entry.find("let B: i32 = A + 2").expect("B's declaration");
+        assert_eq!(note_span.into_range().start, declaration);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The staleness half: fixing the imported file on disk and re-analyzing the
     // SAME entry clears the module's diagnostics — what `reanalyze_dependents`
     // relies on (a dependent's re-analysis reads the dependency fresh).

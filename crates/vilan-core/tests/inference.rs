@@ -25503,6 +25503,27 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
 /// disk — the load-time relation and the canonical tie-break both span files,
 /// and the naive-sort counterexample is only expressible across two of them.
 fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<String>> {
+    let outcome = analyze_package(files, entry);
+    match outcome.javascript {
+        Some(javascript) => Ok(javascript),
+        None => Err(outcome
+            .diagnostics
+            .into_iter()
+            .map(|(message, _span, _file)| message)
+            .collect()),
+    }
+}
+
+/// What compiling a multi-file package produced: the JS if it compiled, and
+/// every diagnostic with its span AND the file it is attributed to
+/// (`Program::diagnostic_sources` — what the editor publishes it against).
+/// A cross-module diagnostic can only be pinned to a *file* through this.
+struct PackageOutcome {
+    javascript: Option<String>,
+    diagnostics: Vec<(String, std::ops::Range<usize>, Option<String>)>,
+}
+
+fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -25517,7 +25538,7 @@ fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<St
     let entry_path = directory.join(entry);
     let source = std::fs::read_to_string(&entry_path).unwrap();
 
-    let result = std::thread::Builder::new()
+    std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -25530,22 +25551,56 @@ fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<St
                     Some(Platform::default()),
                     &Workspace::default(),
                 );
-                let compiled = match program {
+                // `errors` is the entry's own parse errors followed by the
+                // program's, and `diagnostic_sources` is parallel to the
+                // program's half — the same arithmetic the language server does.
+                let prefix = errors.len()
+                    - program
+                        .as_ref()
+                        .map(|program| program.diagnostics.len())
+                        .unwrap_or(0);
+                let mut diagnostics: Vec<(String, std::ops::Range<usize>, Option<String>)> = errors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, error)| {
+                        let file = index.checked_sub(prefix).and_then(|offset| {
+                            let program = program.as_ref()?;
+                            let source = program.diagnostic_sources.get(offset)?;
+                            let path = program.source_path(*source)?;
+                            Some(path.file_name()?.to_string_lossy().into_owned())
+                        });
+                        (error.msg.clone(), error.span.into_range(), file)
+                    })
+                    .collect();
+                let javascript = match program {
                     Some(program) if errors.is_empty() => {
-                        transform(&program, &BuildOptions::default())
-                            .map_err(|error| vec![error.msg])
+                        match transform(&program, &BuildOptions::default()) {
+                            Ok(javascript) => Some(javascript),
+                            Err(error) => {
+                                diagnostics.push((error.msg, error.span.into_range(), None));
+                                None
+                            }
+                        }
                     }
-                    _ => Err(errors.into_iter().map(|error| error.msg).collect()),
+                    _ => None,
                 };
                 let _ = std::fs::remove_dir_all(&directory);
-                compiled
+                PackageOutcome {
+                    javascript,
+                    diagnostics,
+                }
             }))
-            .unwrap_or_else(|_| Err(vec!["compiler panicked".to_string()]))
+            .unwrap_or_else(|_| PackageOutcome {
+                javascript: None,
+                diagnostics: vec![("compiler panicked".to_string(), 0..0, None)],
+            })
         })
         .expect("spawn worker")
         .join()
-        .unwrap_or_else(|_| Err(vec!["compiler thread aborted".to_string()]));
-    result
+        .unwrap_or_else(|_| PackageOutcome {
+            javascript: None,
+            diagnostics: vec![("compiler thread aborted".to_string(), 0..0, None)],
+        })
 }
 
 /// [`compile_package`] plus a `node` run: returns `(emitted JS, stdout)`.
@@ -25881,55 +25936,64 @@ fn a_dispatching_initializer_is_accepted_and_ordered() {
 }
 
 #[test]
-fn a_self_referential_binding_still_builds_in_s1() {
-    // B33 pin 8 — S1's CURRENT behavior, pinned so S2's flip is deliberate.
-    // `let A = A + 1` is a 1-cycle: Kahn can never release it, so it lands in
-    // the leftover set and is appended in canonical order. S1 emits no
-    // diagnostic, and the program keeps the failure mode it has today (a runtime
-    // TDZ). S2 REWRITES THIS TEST into an `assert_fails_with` naming the cycle;
-    // until then, `assert_compiles` documents that S1 neither panics, hangs, nor
-    // changes the outcome for a cyclic program.
-    assert_compiles(
+fn a_self_referential_binding_is_an_initialization_cycle() {
+    // B33 S2 pin 1 — the degenerate cycle. `let A = A + 1` emitted
+    // `const A = A + 1;` and TDZ-crashed at load; S1 pinned that status quo
+    // (`a_self_referential_binding_still_builds_in_s1`) precisely so this flip
+    // would be deliberate. It is now an error, worded for what it is — a
+    // binding evaluating itself — rather than as a `via A → A` chain.
+    assert_fails_with(
         r#"
         import std::print;
         let A: i32 = A + 1;
         fun main() { print(A); }
         "#,
+        "`A`'s initializer evaluates `A` itself, which has not initialized yet",
     );
-    let js = compile(
-        r#"
+}
+
+#[test]
+fn a_self_referential_binding_is_spanned_at_the_read_and_carries_no_note() {
+    // The anchor rule (diagnostics-standard A1): the primary span is the READ
+    // that closes the cycle, not the whole `let`. And the C3 note is dropped
+    // when it would add nothing — here the declaration CONTAINS the anchored
+    // read, so "`A` is declared here" would point at what the reader is
+    // already looking at.
+    let source = r#"
         import std::print;
         let A: i32 = A + 1;
         fun main() { print(A); }
-        "#,
-    )
-    .expect("S1 still compiles a cyclic program");
+        "#;
+    assert_fails_spanning_nth(source, "A", 1, "evaluates `A` itself");
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert_eq!(diagnostics.len(), 1, "one diagnostic: {diagnostics:#?}");
     assert!(
-        js.contains("const A = A + 1;"),
-        "the leftover is emitted unchanged (today's runtime-TDZ class):\n{js}"
+        diagnostics[0].2.is_none(),
+        "a self-cycle's declaration note is redundant and dropped: {diagnostics:#?}"
     );
 }
 
 #[test]
 fn a_cycle_does_not_disturb_the_bindings_around_it() {
-    // The other half of pin 8: a cycle must not scramble the rest. `A` is a
-    // 1-cycle nothing else depends on, so it stays in its own component and
-    // keeps its canonical position; `OK` is unaffected either way. (The sort
-    // condenses strongly connected components rather than sweeping every
-    // undrained binding to the end — see
-    // `a_binding_downstream_of_a_false_cycle_still_orders_after_it`.)
-    let js = compile(
+    // A cycle must not scramble the rest of the program — the property S1's
+    // condensation bought. Under S2 the program no longer compiles, so the
+    // ORDER is pinned where it can be observed directly: over the synthetic
+    // relation, in `init_order.rs`'s unit tests (`a_self_dependency_is_its_own
+    // _component`, `a_cycle_does_not_displace_unrelated_bindings`). What is
+    // still observable here is that the unrelated binding is not dragged into
+    // the diagnostic: exactly one error, naming only the cycle's member.
+    let diagnostics = failure_diagnostics(
         r#"
         import std::print;
         let A: i32 = A + 1;
         let OK: i32 = 5;
         fun main() { print(OK); print(A); }
         "#,
-    )
-    .expect("S1 still compiles a cyclic program");
+    );
+    assert_eq!(diagnostics.len(), 1, "one diagnostic: {diagnostics:#?}");
     assert!(
-        declaration_position(&js, "const A = A + 1;") < declaration_position(&js, "const OK = 5;"),
-        "a self-cycle is its own component and keeps its canonical position:\n{js}"
+        !diagnostics[0].0.contains("OK"),
+        "a binding outside the cycle is never named: {diagnostics:#?}"
     );
 }
 
@@ -26205,15 +26269,18 @@ fn a_conditional_call_subject_enters_both_branches() {
 }
 
 #[test]
-fn a_binding_downstream_of_a_false_cycle_still_orders_after_it() {
-    // The §5(b) over-approximation can manufacture a FALSE cycle: `TOTAL` calls
-    // a trait-bounded generic, so every candidate's reads charge to it — and
-    // `Anvil`'s reads `TOTAL`. `DOWNSTREAM` genuinely depends on `TOTAL`, and
-    // that edge is RECORDED, so it must be honored even though `TOTAL` is
-    // undrainable. Appending the whole undrained remainder in canonical order
-    // instead emits `DOWNSTREAM` first (it loads earlier: `alpha` < `zeta`) and
-    // TDZ-crashes a program that runs correctly today — probed.
-    let (js, stdout) = compile_and_run_package(
+fn a_dispatch_manufactured_cycle_is_an_error_that_explains_the_over_approximation() {
+    // B33 S2 pin 5 — the §5(b) call, ratified (b): ship STRICT. The
+    // over-approximation can manufacture a cycle out of an implementation this
+    // program never instantiates — `TOTAL` calls a trait-bounded generic with a
+    // `Feather`, and it is `Anvil`'s `weight` that reads `TOTAL` — and that is
+    // an error all the same, with the full chain, so a false positive is
+    // self-explaining. S1 pinned this fixture as a clean run
+    // (`a_binding_downstream_of_a_false_cycle_still_orders_after_it`, which
+    // proved the condensation kept `DOWNSTREAM` ordered after the false cycle);
+    // that ORDERING property now lives in `init_order.rs`'s unit tests over the
+    // synthetic relation, where a rejected program cannot hide it.
+    let errors = compile_package(
         &[
             (
                 "main.vl",
@@ -26236,12 +26303,55 @@ fn a_binding_downstream_of_a_false_cycle_still_orders_after_it() {
         ],
         "main.vl",
     )
-    .expect("expected a clean run");
-    assert_eq!(stdout, "2\n1\n");
+    .expect_err("a dispatch-manufactured cycle is rejected under the ratified (b) call");
+    assert_eq!(errors.len(), 1, "one diagnostic per cycle: {errors:#?}");
     assert!(
-        declaration_position(&js, "const TOTAL =")
-            < declaration_position(&js, "const DOWNSTREAM = TOTAL + 1;"),
-        "the cycle member is declared before the binding that reads it:\n{js}"
+        errors[0].contains("`TOTAL`'s initializer evaluates `TOTAL` itself"),
+        "the cycle is reported: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains(
+            "the cycle runs through a dispatched call, so it includes every implementation \
+             of that method — one this program never instantiates still participates"
+        ),
+        "the over-approximation states itself in the diagnostic: {errors:#?}"
+    );
+}
+
+#[test]
+fn a_binding_downstream_of_a_cycle_is_not_named_in_the_error() {
+    // B33 S2 pin 6. `DOWNSTREAM` reads a cycle member; it is not a member
+    // itself, so it is not a participant and is never named — only true members
+    // are. (Same fixture as the pin above: the point here is what the message
+    // does NOT say.)
+    let errors = compile_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::zeta::{ TOTAL, total, Anvil };\n\
+                 import pkg::alpha::{ DOWNSTREAM };\n\
+                 fun main() { print(DOWNSTREAM); print(total(Anvil {})); }\n",
+            ),
+            (
+                "zeta.vl",
+                "trait Weight { fun weight(self): i32; }\nstruct Feather {}\nstruct Anvil {}\n\
+                 impl Feather with Weight { fun weight(self): i32 { 1 } }\n\
+                 impl Anvil with Weight { fun weight(self): i32 { TOTAL } }\n\
+                 fun total<T: Weight>(item: T): i32 { item.weight() }\n\
+                 let TOTAL: i32 = total(Feather {});\n",
+            ),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ TOTAL };\nlet DOWNSTREAM: i32 = TOTAL + 1;\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect_err("the cycle is rejected");
+    assert_eq!(errors.len(), 1, "one diagnostic per cycle: {errors:#?}");
+    assert!(
+        !errors[0].contains("DOWNSTREAM"),
+        "a binding merely downstream of the cycle is not a participant: {errors:#?}"
     );
 }
 
@@ -26271,5 +26381,306 @@ fn an_unreachable_dispatch_candidates_reads_still_order() {
         declaration_position(&js, "const ONLY_ANVIL = 99;")
             < declaration_position(&js, "const TOTAL ="),
         "every dispatch candidate's reads order, reachable in this instance or not:\n{js}"
+    );
+}
+
+// --- B33 S2: the initialization-cycle diagnostic (§3) -----------------------
+//
+// A dependency cycle among module-level initializers has no valid declaration
+// order, so it is a compile error rather than the load-time
+// `Cannot access 'B' before initialization` it produced through S1. One
+// diagnostic per cycle (not per member), anchored at a read that closes it,
+// carrying a `via` chain and the participants' declarations.
+
+#[test]
+fn two_bindings_that_read_each_other_are_an_initialization_cycle() {
+    // B33 S2 pin 2 — the smallest true cycle, with the chain text asserted.
+    assert_fails_with(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#,
+        "`A` and `B` form an initialization cycle: module-level bindings initialize in \
+         dependency order, and a cycle has no such order",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#,
+        "via `A` → `B` → `A`",
+    );
+}
+
+#[test]
+fn a_two_binding_cycle_is_spanned_at_the_read_that_closes_it() {
+    // The anchor (diagnostics-standard A1/A3): the read of `B` inside the
+    // canonically FIRST member's initializer — not the `let`, not the second
+    // member's read, and not a function of enumeration order.
+    let source = r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#;
+    // The first `B` in the source is the read inside `A`'s initializer.
+    assert_fails_spanning(source, "B", "form an initialization cycle");
+}
+
+#[test]
+fn a_two_binding_cycle_notes_the_other_declaration() {
+    // The C3 note: the read is anchored, and the binding it names is declared
+    // over here. (For a cross-module cycle this is what carries the second
+    // file — see `a_cross_module_cycle_is_reported_in_the_module_that_reads`.)
+    assert_fails_noting(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#,
+        "form an initialization cycle",
+        // The declaration span stops before the `;`.
+        "let B: i32 = A + 2",
+        "`B` is declared here",
+    );
+}
+
+#[test]
+fn a_three_binding_cycle_renders_the_whole_round_trip() {
+    // The chain is a real path, not a pair: three members, one diagnostic, and
+    // every participant named once. The `via` walk is rooted at the
+    // canonically first member and takes the shortest way back to it.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = C + 2;
+        let C: i32 = A + 3;
+        fun main() { print(A); print(B); print(C); }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one diagnostic per cycle: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0]
+            .0
+            .contains("`A`, `B` and `C` form an initialization cycle"),
+        "every participant is named: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].0.contains("via `A` → `B` → `C` → `A`"),
+        "the chain is the whole round trip: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_cycle_closed_through_a_load_time_call_is_reported() {
+    // B33 S2 pin 4 — §2's transitive half. `A`'s initializer CALLS a function
+    // that reads `B`; `B`'s initializer reads `A`. Neither initializer names
+    // the other binding directly, so only the load-time relation sees this —
+    // and the anchor lands on the read inside the callee, which is the read
+    // that closes the cycle.
+    let source = r#"
+        import std::print;
+        fun read_b(): i32 { B * 2 }
+        let A: i32 = read_b() + 1;
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#;
+    assert_fails_with(source, "`A` and `B` form an initialization cycle");
+    assert_fails_with(source, "via `A` → `B` → `A`");
+    // The first `B` in the source is the one inside `read_b`'s body.
+    assert_fails_spanning(source, "B", "form an initialization cycle");
+}
+
+#[test]
+fn a_cycle_closed_through_a_closure_held_by_a_global_is_reported() {
+    // The other transitive shape (§2's "call through a value"): the call goes
+    // through a binding holding a closure, whose body reads the cycle's other
+    // member. `FETCH` itself is not a participant — it is only entered.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::print;
+        let FETCH: || i32 = || { B };
+        let A: i32 = FETCH();
+        let B: i32 = A + 2;
+        fun main() { print(A); print(B); }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one diagnostic per cycle: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0]
+            .0
+            .contains("`A` and `B` form an initialization cycle"),
+        "the cycle is between A and B: {diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics[0].0.contains("FETCH"),
+        "a binding merely entered on the way is not a participant: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_cross_module_cycle_is_reported_in_the_module_that_reads() {
+    // B33 S2 pin 3 — the cross-module cycle: `alpha`'s `A` reads `zeta`'s `Z`
+    // and back. The chain names both, the declarations line names both FILES,
+    // and the diagnostic is attributed to `alpha.vl` — the file holding the
+    // read that closes the cycle — with the span of that read, which is what
+    // the editor publishes it against.
+    let alpha = "import pkg::zeta::{ Z };\nlet A: i32 = Z + 1;\n";
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                 fun main() { print(A); print(Z); }\n",
+            ),
+            ("alpha.vl", alpha),
+            (
+                "zeta.vl",
+                "import pkg::alpha::{ A };\nlet Z: i32 = A + 2;\n",
+            ),
+        ],
+        "main.vl",
+    );
+    assert!(
+        outcome.javascript.is_none(),
+        "a cross-module cycle does not compile"
+    );
+    assert_eq!(
+        outcome.diagnostics.len(),
+        1,
+        "one diagnostic per cycle: {:#?}",
+        outcome.diagnostics
+    );
+    let (message, span, file) = &outcome.diagnostics[0];
+    assert!(
+        message.contains("`A` and `Z` form an initialization cycle"),
+        "both members are named: {message}"
+    );
+    assert!(
+        message.contains("via `A` → `Z` → `A`"),
+        "the chain names both: {message}"
+    );
+    assert!(
+        message.contains("declared: `A` in `alpha.vl`, `Z` in `zeta.vl`"),
+        "each participant's declaration site is named: {message}"
+    );
+    assert_eq!(
+        file.as_deref(),
+        Some("alpha.vl"),
+        "the diagnostic belongs to the file with the closing read: {message}"
+    );
+    let read = alpha.find("Z + 1").expect("the read is in alpha.vl");
+    assert_eq!(
+        *span,
+        read..read + 1,
+        "spanned at the read of `Z` in alpha.vl: {message}"
+    );
+}
+
+#[test]
+fn a_cycle_is_the_only_diagnostic_however_often_its_members_are_used() {
+    // B33 S2 pin 8 — no cascade (diagnostics-standard B5). The members are read
+    // from several places, including a function and another binding; the cycle
+    // is reported once and nothing downstream of it produces a second error.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        let USES: i32 = A + B;
+        fun consume(): i32 { A + B + USES }
+        fun main() { print(A); print(B); print(USES); print(consume()); }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "exactly one diagnostic for one cycle: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_analysis_error_suppresses_the_cycle_check() {
+    // The composition rule, pinned so it is a decision and not an accident:
+    // the check runs only on a program that analyzed cleanly (the `const` pass
+    // takes the same stance, and diagnostics-standard B5 keeps one root cause
+    // on screen). The relation is read out of the call graph, which a failed
+    // analysis can leave partial — a cycle invented out of half-resolved data
+    // would be worse than one reported on the next round. Fixing the type error
+    // surfaces the cycle, which the pins above cover.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        let BROKEN: i32 = "not a number";
+        fun main() { print(A); print(B); print(BROKEN); }
+        "#,
+    );
+    assert_eq!(diagnostics.len(), 1, "one root cause: {diagnostics:#?}");
+    assert!(
+        !diagnostics[0].0.contains("initialization cycle"),
+        "the analysis error is the one reported: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn two_independent_cycles_report_one_diagnostic_each_in_canonical_order() {
+    // Per cycle, not per member and not per program: two disjoint cycles are
+    // two diagnostics, ordered by their first member's canonical key (which is
+    // declaration order here) — deterministic, per diagnostics-standard C1.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::print;
+        let A: i32 = B + 1;
+        let B: i32 = A + 2;
+        let Y: i32 = Z + 1;
+        let Z: i32 = Y + 2;
+        fun main() { print(A); print(B); print(Y); print(Z); }
+        "#,
+    );
+    assert_eq!(diagnostics.len(), 2, "one per cycle: {diagnostics:#?}");
+    assert!(
+        diagnostics[0]
+            .0
+            .contains("`A` and `B` form an initialization cycle"),
+        "the canonically first cycle is reported first: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[1]
+            .0
+            .contains("`Y` and `Z` form an initialization cycle"),
+        "then the second: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_cycle_through_a_const_binding_cannot_form() {
+    // `const`-marked initializers fold before any of this and contribute no
+    // edges (S1's pin 6/12), so a "cycle" written through one is not a cycle:
+    // the const chain is a compile-time evaluation, with its own diagnostic if
+    // it is circular. Guards against the cycle check inheriting an edge class
+    // the ordering relation deliberately does not have.
+    assert_compiles(
+        r#"
+        import std::print;
+        let STEP: i32 = const 6;
+        let DOUBLE: i32 = STEP * 2;
+        fun main() { print(DOUBLE); }
+        "#,
     );
 }
