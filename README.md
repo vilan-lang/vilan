@@ -1,4 +1,9 @@
-# vilan
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/dark_logo_beside_text.svg">
+    <img src="assets/branding/light_logo_beside_text.svg" alt="vilan" width="520">
+  </picture>
+</p>
 
 vilan is a language for building full-stack web apps. It compiles to
 JavaScript and runs on node and in the browser, but it is not JavaScript:
@@ -192,6 +197,10 @@ Licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+The vilan logo, wordmark, and the other brand assets under
+[assets/branding/](assets/branding/) are excluded from the above and are
+covered by [their own license](assets/branding/LICENSE) instead.
 
 Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in vilan by you, as defined in the Apache-2.0

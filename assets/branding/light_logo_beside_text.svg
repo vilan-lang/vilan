@@ -1,0 +1,45 @@
+<svg width="880" height="320" viewBox="-32 -32 880 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g filter="url(#mark-glow-light)">
+<path d="M221.285 141.569L274.85 172.515L223.5 224L100.625 100.805L125.77 86.2797L221.285 141.569Z" fill="#110C31"/>
+<path d="M289.586 157.74L243.633 131.196L415 32L289.586 157.74Z" fill="#110C31"/>
+<path d="M87.109 63.9002L72.3307 72.4362L32 32L87.109 63.9002Z" fill="#110C31"/>
+</g>
+<g transform="translate(489.24 64.02) scale(1.18)">
+<g filter="url(#word-glow-light)">
+<path d="M39.0313 32L52.0313 68.4375L65 32H72.0313L56.125 76.4375H47.9063L32 32H39.0313ZM87.2875 32H93.8813V76.4375H87.2875V32ZM112.263 32H118.825V64C118.825 65.625 119.398 67.0104 120.544 68.1562C121.69 69.3021 123.065 69.875 124.669 69.875H146.7V76.4375H124.669C122.398 76.4375 120.315 75.8854 118.419 74.7812C116.544 73.6562 115.044 72.1562 113.919 70.2812C112.815 68.3854 112.263 66.2917 112.263 64V32ZM174.706 32H182.925L198.831 76.4375H191.8L186.956 63.0625H174.55L176.925 56.5H184.581L178.831 40.625L165.831 76.4375H158.8L174.706 32ZM214.088 32H222.65L241.994 66.9062V32H248.588V76.4375H240.025L220.681 42V76.4375H214.088V32Z" fill="#110C31"/>
+</g>
+</g>
+<defs>
+<filter id="mark-glow-light" x="-32" y="-32" width="511" height="320" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset dy="2"/>
+<feGaussianBlur stdDeviation="6"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0.952941 0 0 0 0 0.0784314 0 0 0 0 0.355359 0 0 0 0.75 0"/>
+<feBlend mode="normal" in2="BackgroundImageFix" result="pinkShadow"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset/>
+<feGaussianBlur stdDeviation="16"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.15 0"/>
+<feBlend mode="normal" in2="pinkShadow" result="darkGlow"/>
+<feBlend mode="normal" in="SourceGraphic" in2="darkGlow" result="shape"/>
+<feGaussianBlur in="shape" stdDeviation="0.5" result="softened"/>
+<feTurbulence type="fractalNoise" baseFrequency="0.999 0.999" numOctaves="3" seed="9866" result="noise"/>
+<feDisplacementMap in="softened" in2="noise" scale="20" xChannelSelector="R" yChannelSelector="G"/>
+</filter>
+<filter id="word-glow-light" x="-32" y="-32" width="345" height="173" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset/>
+<feGaussianBlur stdDeviation="16"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.15 0"/>
+<feBlend mode="normal" in2="BackgroundImageFix" result="darkGlow"/>
+<feBlend mode="normal" in="SourceGraphic" in2="darkGlow" result="shape"/>
+<feTurbulence type="fractalNoise" baseFrequency="0.0416667 0.0416667" numOctaves="3" seed="2641" result="noise"/>
+<feDisplacementMap in="shape" in2="noise" scale="2" xChannelSelector="R" yChannelSelector="G"/>
+</filter>
+</defs>
+</svg>
