@@ -1037,7 +1037,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vilan-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "ariadne",
  "clap",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "indexmap",
  "serde",
@@ -1059,11 +1059,11 @@ dependencies = [
 
 [[package]]
 name = "vilan-embedded-std"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "vilan-lsp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "dashmap 6.2.1",
  "serde_json",
