@@ -47,6 +47,15 @@ pub struct Manifest {
     pub client: Option<EntrySection>,
 }
 
+/// Every top-level section a `vilan.toml` may contain — the whitelist behind
+/// the unknown-key warning, and the set any surface that *describes* the
+/// manifest (the language server's completion, the editor's JSON schema) is
+/// pinned against. `server` / `client` are here only so [`Manifest::validate`]
+/// can point their users at the replacement; they are not valid content.
+pub const KNOWN_SECTIONS: &[&str] = &[
+    "package", "library", "project", "build", "macro", "entry", "server", "client",
+];
+
 /// The `[macro]` section: per-package expansion budgets.
 #[derive(Debug, Default, Deserialize)]
 pub struct MacroSection {
@@ -153,8 +162,9 @@ pub struct EntrySection {
 /// A dependency: either a bare version string (`dep = "1.2"`, a registry
 /// dependency) or the table form (`{ version, registry, path, git, tag, rev }`).
 /// A `path` makes it a local *path dependency*, a `git` a *git dependency*
-/// (proposal `distribution.md` §5); with neither it is a *registry dependency*,
-/// which nothing resolves yet.
+/// (proposal `distribution.md` §5); `project = true` *inherits* the workspace
+/// root's declaration (§5's rider); with none of them it is a *registry
+/// dependency*, which nothing resolves yet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Dependency {
@@ -172,10 +182,14 @@ pub enum Dependency {
         /// Parsed only to reject it: a branch moves, so it cannot pin anything
         /// (the error steers to `tag`/`rev`).
         branch: Option<String>,
+        /// `project = true`: take this dependency's whole declaration from the
+        /// enclosing workspace root's `[project.dependencies]`. Opt-in, per
+        /// member, per dependency — never automatic (see [`enclosing_project`]).
+        project: Option<bool>,
     },
 }
 
-/// What a dependency resolves against — the three kinds [`Dependency::source`]
+/// What a dependency resolves against — the four kinds [`Dependency::source`]
 /// distinguishes once, for both validation and resolution.
 pub enum DependencySource<'declaration> {
     /// A local directory, relative to the declaring manifest.
@@ -183,6 +197,10 @@ pub enum DependencySource<'declaration> {
     /// One immutable point of one repository, materialized into the git cache
     /// and then treated exactly like a path dependency.
     Git(GitSource),
+    /// `project = true` — whatever the enclosing `[project.dependencies]` says
+    /// this name is, resolved against the *project root* (the manifest that
+    /// declares it), not the member's directory.
+    Inherited,
     /// A bare version / `registry` dependency: parsed, never resolved.
     Registry,
 }
@@ -213,11 +231,43 @@ impl Dependency {
             tag,
             rev,
             branch,
+            project,
         } = self
         else {
             // A bare version string.
             return Ok(DependencySource::Registry);
         };
+        // Inheritance is decided FIRST: `{ project = true, path = "…" }` is a
+        // contradiction about where the dependency comes from, and saying so
+        // beats diagnosing the leftover key as if it stood alone.
+        if let Some(project) = project {
+            if !project {
+                return Err(
+                    "sets `project = false` — a dependency either inherits the workspace \
+                     root's declaration (`project = true`) or declares its own source; \
+                     drop the key to declare your own"
+                        .to_string(),
+                );
+            }
+            for (key, present) in [
+                ("version", version.is_some()),
+                ("registry", registry.is_some()),
+                ("path", path.is_some()),
+                ("git", git.is_some()),
+                ("tag", tag.is_some()),
+                ("rev", rev.is_some()),
+                ("branch", branch.is_some()),
+            ] {
+                if present {
+                    return Err(format!(
+                        "sets `project = true` alongside `{key}` — an inherited dependency \
+                         takes its WHOLE declaration from `[project.dependencies]`, so drop \
+                         `{key}` (or drop `project = true` and declare it here)"
+                    ));
+                }
+            }
+            return Ok(DependencySource::Inherited);
+        }
         let Some(url) = git else {
             // A git key without `git` is a declaration that does nothing — the
             // one thing a manifest error is for.
@@ -350,12 +400,9 @@ impl Manifest {
         // so a typo doesn't silently do nothing. A second, untyped parse keeps the
         // typed deserialize free of a catch-all field.
         let table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
-        const KNOWN: &[&str] = &[
-            "package", "library", "project", "build", "macro", "entry", "server", "client",
-        ];
         let warnings = table
             .keys()
-            .filter(|key| !KNOWN.contains(&key.as_str()))
+            .filter(|key| !KNOWN_SECTIONS.contains(&key.as_str()))
             .map(|key| format!("unknown `vilan.toml` key `{key}` (ignored)"))
             .collect();
         Ok((manifest, warnings))
@@ -400,15 +447,29 @@ impl Manifest {
         if let Some(library) = &self.library {
             self.validate_library(library, &mut errors);
         }
-        for dependencies in [
-            self.package.as_ref().map(|p| &p.dependencies),
-            self.library.as_ref().map(|l| &l.dependencies),
-            self.project.as_ref().map(|p| &p.dependencies),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            validate_dependencies(dependencies, &mut errors);
+        // The `[project.dependencies]` table is the one members inherit FROM,
+        // so it is the one table that cannot itself inherit.
+        for (table, inheritable, dependencies) in [
+            (
+                "[package.dependencies]",
+                true,
+                self.package.as_ref().map(|p| &p.dependencies),
+            ),
+            (
+                "[library.dependencies]",
+                true,
+                self.library.as_ref().map(|l| &l.dependencies),
+            ),
+            (
+                "[project.dependencies]",
+                false,
+                self.project.as_ref().map(|p| &p.dependencies),
+            ),
+        ] {
+            let Some(dependencies) = dependencies else {
+                continue;
+            };
+            validate_dependencies(table, inheritable, dependencies, &mut errors);
         }
         if let Some(build) = &self.build {
             if let Some(preset) = &build.preset {
@@ -543,19 +604,85 @@ impl Manifest {
     }
 }
 
-/// Checks every dependency declaration: a malformed git dependency names its
-/// mistake, and a registry dependency is still unsupported. Reported as errors
-/// so a declared dependency is never silently ignored.
-fn validate_dependencies(dependencies: &BTreeMap<String, Dependency>, errors: &mut Vec<String>) {
+/// Checks every dependency declaration in the `table` named (`[package.
+/// dependencies]`, …): a malformed git dependency names its mistake, a registry
+/// dependency is still unsupported, and only a *member's* table may inherit —
+/// the workspace root's own declarations are what inheritance reads. Reported as
+/// errors so a declared dependency is never silently ignored.
+fn validate_dependencies(
+    table: &str,
+    inheritable: bool,
+    dependencies: &BTreeMap<String, Dependency>,
+    errors: &mut Vec<String>,
+) {
     for (name, dependency) in dependencies {
         match dependency.source() {
             Ok(DependencySource::Path(_)) | Ok(DependencySource::Git(_)) => {}
+            Ok(DependencySource::Inherited) if !inheritable => errors.push(format!(
+                "`{table} {name}` sets `project = true`, but this IS the project's table — \
+                 `project = true` is how a member package opts in to a dependency declared \
+                 here, so give `{name}` a `path` or a `git` source"
+            )),
+            Ok(DependencySource::Inherited) => {}
             Ok(DependencySource::Registry) => errors.push(format!(
                 "registry dependency `{name}` is not yet supported (a dependency is a \
                  local `path` or a `git` repository today)"
             )),
             Err(problem) => errors.push(format!("dependency `{name}` {problem}")),
         }
+    }
+}
+
+/// Why [`resolve_workspace`] failed. The two kinds are carried structurally
+/// rather than sniffed out of a message because their **severity differs where
+/// they are reported**: something broken is an error wherever it appears, while
+/// an unfetched git dependency means every manifest is correct and a single
+/// `vilan build` fixes it — a warning in the editor, which never fetches
+/// (proposal `distribution.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceError {
+    /// A manifest is invalid, a dependency does not resolve, the graph has a
+    /// cycle, a fetch failed — something the user must fix.
+    Broken(String),
+    /// A declared git dependency is not in the cache and this caller's policy
+    /// is cache-only, so nothing fetched it. Nothing is *wrong*.
+    Unfetched(String),
+}
+
+impl WorkspaceError {
+    /// The message, without the kind.
+    pub fn message(&self) -> &str {
+        match self {
+            WorkspaceError::Broken(message) | WorkspaceError::Unfetched(message) => message,
+        }
+    }
+
+    /// Whether the only thing standing in the way is an unfetched git
+    /// dependency (see [`WorkspaceError::Unfetched`]).
+    pub fn is_unfetched(&self) -> bool {
+        matches!(self, WorkspaceError::Unfetched(_))
+    }
+
+    /// The same kind with its message rewritten — a caller adding context
+    /// (`git dependency `x`: …`) must not flatten the kind away, which is the
+    /// whole reason the kind is carried.
+    pub fn map_message(self, rewrite: impl FnOnce(String) -> String) -> WorkspaceError {
+        match self {
+            WorkspaceError::Broken(message) => WorkspaceError::Broken(rewrite(message)),
+            WorkspaceError::Unfetched(message) => WorkspaceError::Unfetched(rewrite(message)),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl From<String> for WorkspaceError {
+    fn from(message: String) -> Self {
+        WorkspaceError::Broken(message)
     }
 }
 
@@ -570,7 +697,7 @@ fn validate_dependencies(dependencies: &BTreeMap<String, Dependency>, errors: &m
 /// `git` decides what a git dependency may do here — fetch on a cache miss (a
 /// build) or read a warm cache only (the editor; see [`GitDeps`]). It is an
 /// explicit parameter precisely so every caller states its policy.
-pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace, String> {
+pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace, WorkspaceError> {
     let manifest = load_manifest(package_dir)?;
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
@@ -703,10 +830,73 @@ fn load_manifest(directory: &Path) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
+/// The nearest enclosing workspace root of `package_dir` — the closest ancestor
+/// (starting at `package_dir` itself) whose `vilan.toml` declares a `[project]`
+/// — together with that project's `[project.dependencies]`, the table a member
+/// inherits from.
+///
+/// Two properties are deliberate. **The walk is lazy**: it runs only when a
+/// manifest actually writes `project = true`, so a package that inherits
+/// nothing reads no file outside its own directory and behaves exactly as it
+/// did before inheritance existed. And **membership is not required**: as in
+/// P2's Q5, `[project] packages` is the *build set*, not a visibility list, so
+/// what makes a package a member for inheritance is simply living under the
+/// project root.
+///
+/// A `vilan.toml` on the way up that is not a `[project]` (the member's own,
+/// a nested package) is skipped; one that cannot be read or parsed stops the
+/// walk with that error, since staying quiet would report "no workspace" for a
+/// workspace that is merely broken.
+fn enclosing_project(
+    package_dir: &Path,
+) -> Result<Option<(PathBuf, BTreeMap<String, Dependency>)>, String> {
+    let start = crate::util::canonical_path(package_dir);
+    for directory in start.ancestors() {
+        let manifest_path = directory.join("vilan.toml");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+        let (manifest, _warnings) = Manifest::parse(&contents)
+            .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+        if manifest.project.is_none() {
+            continue;
+        }
+        // The project root is about to be read for its declarations, so it is
+        // held to the same standard as any manifest resolution reads.
+        let errors = manifest.validate();
+        if !errors.is_empty() {
+            return Err(format!(
+                "invalid {}:\n  - {}",
+                manifest_path.display(),
+                errors.join("\n  - ")
+            ));
+        }
+        let project = manifest.project.expect("checked just above");
+        return Ok(Some((directory.to_path_buf(), project.dependencies)));
+    }
+    Ok(None)
+}
+
+/// What a dependency table declares, for an error that has to say what IS
+/// available: ``it declares `a`, `b` `` — or that it declares nothing.
+fn declared_names(dependencies: &BTreeMap<String, Dependency>) -> String {
+    if dependencies.is_empty() {
+        return "its `[project.dependencies]` is empty".to_string();
+    }
+    let names: Vec<String> = dependencies
+        .keys()
+        .map(|name| format!("`{name}`"))
+        .collect();
+    format!("its `[project.dependencies]` declares {}", names.join(", "))
+}
+
 /// Resolves one package's dependency edges to `(import name, index)` pairs,
 /// loading each referenced package (transitively) into `packages`. `index_by_path`
 /// dedups a shared dependency; `visiting` is the in-progress stack for cycle
-/// detection. Paths are relative to `base_dir` (the depending package's directory).
+/// detection. Paths are relative to `base_dir` (the depending package's directory)
+/// — or, for an inherited declaration, to the workspace root that declared it.
 ///
 /// A **git** dependency is materialized into the cache *here* and then continues
 /// down the same path as a local directory — which is why a git dependency
@@ -720,18 +910,55 @@ fn resolve_dependency_edges(
     index_by_path: &mut HashMap<PathBuf, usize>,
     visiting: &mut HashSet<PathBuf>,
     git: &GitDeps,
-) -> Result<Vec<(String, usize)>, String> {
+) -> Result<Vec<(String, usize)>, WorkspaceError> {
     let mut edges = Vec::new();
+    // The enclosing workspace root, read at most once per manifest and only if
+    // some declaration actually asks to inherit.
+    let mut project: Option<(PathBuf, BTreeMap<String, Dependency>)> = None;
+    let mut project_searched = false;
     for (import_name, dependency) in dependencies {
-        // `validate` has already rejected registry dependencies and malformed
-        // git ones, so only resolvable declarations reach here.
-        let dependency_dir = match dependency.source() {
-            Ok(DependencySource::Path(relative)) => base_dir.join(relative),
-            Ok(DependencySource::Git(source)) => {
-                crate::git_dep::materialize(&source, git, import_name)
-                    .map_err(|error| format!("git dependency `{import_name}`: {error}"))?
+        // `project = true` substitutes the workspace root's declaration — and
+        // with it the directory the declaration's `path` is relative to. A path
+        // written in `[project.dependencies]` is written from the project root,
+        // which is the whole point of declaring it in one place.
+        let (declaration, declaration_dir) = match dependency.source() {
+            Ok(DependencySource::Inherited) => {
+                if !project_searched {
+                    project = enclosing_project(base_dir)?;
+                    project_searched = true;
+                }
+                let Some((project_dir, declared)) = &project else {
+                    return Err(WorkspaceError::Broken(format!(
+                        "dependency `{import_name}` sets `project = true`, but `{}` is not \
+                         inside a workspace — inheritance reads the `[project.dependencies]` \
+                         of the nearest ancestor `vilan.toml` that declares a `[project]`",
+                        base_dir.display()
+                    )));
+                };
+                let Some(inherited) = declared.get(import_name) else {
+                    return Err(WorkspaceError::Broken(format!(
+                        "dependency `{import_name}` sets `project = true`, but {} declares \
+                         no `{import_name}` — {}",
+                        project_dir.join("vilan.toml").display(),
+                        declared_names(declared)
+                    )));
+                };
+                (inherited.clone(), project_dir.clone())
             }
-            Ok(DependencySource::Registry) | Err(_) => continue,
+            _ => (dependency.clone(), base_dir.to_path_buf()),
+        };
+        // `validate` has already rejected registry dependencies, malformed
+        // git ones, and an inheriting `[project.dependencies]` entry, so only
+        // resolvable declarations reach here.
+        let dependency_dir = match declaration.source() {
+            Ok(DependencySource::Path(relative)) => declaration_dir.join(relative),
+            Ok(DependencySource::Git(source)) => {
+                crate::git_dep::materialize(&source, git, import_name).map_err(|error| {
+                    error
+                        .map_message(|message| format!("git dependency `{import_name}`: {message}"))
+                })?
+            }
+            Ok(DependencySource::Inherited) | Ok(DependencySource::Registry) | Err(_) => continue,
         };
         // The dedup map's key AND the cycle set's member. Both must be one
         // canonical form (`windows-support.md` §5): a raw-string fallback lets
@@ -744,10 +971,10 @@ fn resolve_dependency_edges(
             continue;
         }
         if !visiting.insert(canonical.clone()) {
-            return Err(format!(
+            return Err(WorkspaceError::Broken(format!(
                 "dependency cycle through `{}`",
                 dependency_dir.display()
-            ));
+            )));
         }
         let manifest = load_manifest(&dependency_dir)
             .map_err(|error| format!("dependency `{import_name}`: {error}"))?;
@@ -761,10 +988,10 @@ fn resolve_dependency_edges(
             (Some(_), _) => (Some(manifest.library.unwrap()), None),
             (None, Some(package)) => (None, Some(package.dependencies.clone())),
             (None, None) => {
-                return Err(format!(
+                return Err(WorkspaceError::Broken(format!(
                     "dependency `{import_name}` at `{}` is not a `[library]` or `[package]`",
                     dependency_dir.display()
-                ));
+                )));
             }
         };
         // Resolve the library's own dependencies first, so they take lower indices
@@ -831,6 +1058,7 @@ mod tests {
             tag: None,
             rev: None,
             branch: None,
+            project: None,
         }
     }
 
@@ -1348,11 +1576,476 @@ mod tests {
 
         let error = resolve_workspace(&application, &GitDeps::cache_only(&cache))
             .expect_err("a cold cache-only resolution fails");
-        assert!(error.contains("git dependency `shapes`"), "{error}");
-        assert!(error.contains("not in the local cache"), "{error}");
-        assert!(error.contains("vilan build"), "{error}");
+        assert!(error.is_unfetched(), "a cache miss is not a fault: {error}");
+        assert!(
+            error.message().contains("git dependency `shapes`"),
+            "{error}"
+        );
+        assert!(
+            error.message().contains("not in the local cache"),
+            "{error}"
+        );
+        assert!(error.message().contains("vilan build"), "{error}");
         assert!(!cache.exists(), "cache-only must not create the cache root");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── `[project.dependencies]` inheritance (proposal/distribution.md §5's
+    // riders; the P2 Q4 deferral) ──
+    //
+    // The shape: a workspace root declares a dependency once, and a member opts
+    // IN per dependency with `project = true`. Nothing is inherited implicitly,
+    // so there is no shadowing question to answer — a member either inherits or
+    // declares, never both, and `validate` says so.
+
+    /// Writes `files` (relative path → contents) under a fresh temp directory
+    /// named after `label`, returning the root. Directories are created as
+    /// needed, so a whole workspace is one literal.
+    fn workspace_tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("vilan-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (relative, contents) in files {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("a parent directory"))
+                .expect("create the directory");
+            std::fs::write(&path, contents).expect("write the file");
+        }
+        root
+    }
+
+    /// A `[library]` package's two files at `directory`, for a tree literal.
+    /// The library's name is the directory's last segment.
+    fn library_files(directory: &str) -> [(String, String); 2] {
+        let name = directory.rsplit('/').next().expect("a last segment");
+        [
+            (
+                format!("{directory}/vilan.toml"),
+                format!("[library]\nname = \"{name}\"\n"),
+            ),
+            (format!("{directory}/src/lib.vl"), String::new()),
+        ]
+    }
+
+    #[test]
+    fn a_member_inherits_the_projects_declaration_by_opting_in() {
+        let root = workspace_tree(
+            "inherit-optin",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { path = \"shapes\" }\n",
+                ),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("the member inherits `shapes`");
+        assert_eq!(workspace.entry_dependencies.len(), 1);
+        assert_eq!(workspace.entry_dependencies[0].0, "shapes");
+        assert_eq!(workspace.packages.len(), 1);
+        assert!(
+            workspace.packages[0]
+                .base_root
+                .ends_with(Path::new("shapes").join("src")),
+            "{:?}",
+            workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_inherited_path_is_relative_to_the_project_root_not_the_member() {
+        // THE base-directory rule, pinned against a decoy: `path = "shapes"` in
+        // `[project.dependencies]` is written from the project root, so a
+        // same-named library sitting next to the member must NOT be the one
+        // that resolves. (Without the rule the decoy wins, silently.)
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "vilan.toml".to_string(),
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { path = \"shapes\" }\n"
+                    .to_string(),
+            ),
+            (
+                "app/vilan.toml".to_string(),
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { project = true }\n"
+                    .to_string(),
+            ),
+            ("app/src/main.vl".to_string(), String::new()),
+        ];
+        files.extend(library_files("shapes"));
+        files.extend(library_files("app/shapes"));
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let root = workspace_tree("inherit-basedir", &borrowed);
+
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("the inherited path resolves");
+        let resolved = &workspace.packages[0].base_root;
+        assert!(
+            resolved.starts_with(crate::util::canonical_path(&root).join("shapes"))
+                || resolved.starts_with(root.join("shapes")),
+            "expected the project root's `shapes`, got {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_git_dependency_inherits_identically() {
+        // Inheritance substitutes the DECLARATION, whatever kind it is — a git
+        // dependency needs nothing of its own (and the warm cache keeps this
+        // offline).
+        let root = workspace_tree(
+            "inherit-git",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { git = \"https://example.invalid/org/shapes\", tag = \"v1.2.0\" }\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let cache = root.join("cache");
+        let source = crate::git_dep::GitSource {
+            url: "https://example.invalid/org/shapes".to_string(),
+            reference: GitRef::Tag("v1.2.0".to_string()),
+        };
+        seed_cache_entry(&cache, &source, "shapes");
+
+        let workspace = resolve_workspace(&root.join("app"), &GitDeps::cache_only(&cache))
+            .expect("the inherited git dependency resolves from the warm cache");
+        assert_eq!(workspace.entry_dependencies.len(), 1);
+        assert!(
+            workspace.packages[0]
+                .base_root
+                .starts_with(crate::git_dep::entry_path(&cache, &source)),
+            "{:?}",
+            workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dependency_of_a_member_inherits_from_the_same_project() {
+        // Inheritance lives in the general edge loop, not in a special case for
+        // the entry package: a library inside the workspace opts in the same
+        // way, and its own inherited path is relative to the project root too.
+        let root = workspace_tree(
+            "inherit-transitive",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { path = \"shapes\" }\n",
+                ),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+                (
+                    "middle/vilan.toml",
+                    "[library]\nname = \"middle\"\n[library.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("middle/src/lib.vl", ""),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     middle = { path = \"../middle\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("the library's own inherited dependency resolves");
+        assert_eq!(workspace.packages.len(), 2, "shapes and middle");
+        let middle = workspace
+            .packages
+            .iter()
+            .find(|spec| spec.base_root.ends_with(Path::new("middle").join("src")))
+            .expect("middle is in the workspace");
+        assert_eq!(
+            middle.dependencies.len(),
+            1,
+            "middle depends on the inherited shapes"
+        );
+        assert_eq!(middle.dependencies[0].0, "shapes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_member_that_does_not_opt_in_inherits_nothing() {
+        // Inheritance is ADDITIVE and opt-in: declaring dependencies at the
+        // workspace root changes nothing for a member that never asks — which
+        // is also why there is no shadowing rule to learn.
+        let root = workspace_tree(
+            "inherit-optout",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { path = \"shapes\" }\n",
+                ),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+                ("app/vilan.toml", "[package]\nname = \"app\"\n"),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("resolves");
+        assert!(workspace.entry_dependencies.is_empty());
+        assert!(workspace.packages.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_members_own_declaration_of_the_same_name_is_the_one_that_resolves() {
+        // The "override" question, answered by construction: a member that
+        // declares its own `shapes` never consults the project's, because
+        // inheritance only happens where `project = true` is written.
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "vilan.toml".to_string(),
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { path = \"shapes\" }\n"
+                    .to_string(),
+            ),
+            (
+                "app/vilan.toml".to_string(),
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { path = \"own_shapes\" }\n"
+                    .to_string(),
+            ),
+            ("app/src/main.vl".to_string(), String::new()),
+        ];
+        files.extend(library_files("shapes"));
+        files.extend(library_files("app/own_shapes"));
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let root = workspace_tree("inherit-own", &borrowed);
+
+        let workspace = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("resolves");
+        assert!(
+            workspace.packages[0]
+                .base_root
+                .ends_with(Path::new("own_shapes").join("src")),
+            "{:?}",
+            workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_nearest_enclosing_project_is_the_one_inherited_from() {
+        // Nested workspaces: the walk stops at the FIRST ancestor that declares
+        // a `[project]`, so an inner workspace's declarations win over an outer
+        // one's — the ordering-sensitive case of the ancestor walk.
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "vilan.toml".to_string(),
+                "[project]\npackages = []\n[project.dependencies]\n\
+                 shapes = { path = \"outer_shapes\" }\n"
+                    .to_string(),
+            ),
+            (
+                "inner/vilan.toml".to_string(),
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { path = \"inner_shapes\" }\n"
+                    .to_string(),
+            ),
+            (
+                "inner/app/vilan.toml".to_string(),
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { project = true }\n"
+                    .to_string(),
+            ),
+            ("inner/app/src/main.vl".to_string(), String::new()),
+        ];
+        files.extend(library_files("outer_shapes"));
+        files.extend(library_files("inner/inner_shapes"));
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let root = workspace_tree("inherit-nested", &borrowed);
+
+        let workspace = resolve_workspace(
+            &root.join("inner").join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect("resolves");
+        assert!(
+            workspace.packages[0]
+                .base_root
+                .ends_with(Path::new("inner_shapes").join("src")),
+            "{:?}",
+            workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opting_in_to_an_undeclared_name_names_the_projects_set() {
+        let root = workspace_tree(
+            "inherit-undeclared",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     geometry = { path = \"geometry\" }\n",
+                ),
+                ("geometry/vilan.toml", "[library]\nname = \"geometry\"\n"),
+                ("geometry/src/lib.vl", ""),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("nothing to inherit");
+        assert!(
+            !error.is_unfetched(),
+            "a manifest mistake, not a cold cache"
+        );
+        let message = error.message();
+        assert!(message.contains("dependency `shapes`"), "{message}");
+        assert!(message.contains("declares no `shapes`"), "{message}");
+        assert!(
+            message.contains("`[project.dependencies]` declares `geometry`"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opting_in_outside_a_workspace_is_an_error_that_says_so() {
+        let root = workspace_tree(
+            "inherit-no-project",
+            &[
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("there is no project to inherit from");
+        let message = error.message();
+        assert!(message.contains("is not inside a workspace"), "{message}");
+        assert!(message.contains("[project.dependencies]"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_true_alongside_any_other_key_is_an_error() {
+        // An inherited dependency takes its WHOLE declaration from the project,
+        // so a leftover key is a contradiction about where it comes from — one
+        // message per key, naming the key.
+        for (key, declaration) in [
+            ("path", "{ project = true, path = \"../shapes\" }"),
+            (
+                "git",
+                "{ project = true, git = \"https://example.invalid/s\" }",
+            ),
+            ("tag", "{ project = true, tag = \"v1\" }"),
+            ("rev", "{ project = true, rev = \"0123456\" }"),
+            ("branch", "{ project = true, branch = \"main\" }"),
+            ("version", "{ project = true, version = \"1.2\" }"),
+            ("registry", "{ project = true, registry = \"r\" }"),
+        ] {
+            let (_, errors) = dependency_declaration(declaration);
+            assert!(
+                errors.iter().any(|error| error
+                    .contains(&format!("sets `project = true` alongside `{key}`"))
+                    && error.contains("WHOLE declaration")),
+                "{declaration}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_false_is_an_error_rather_than_a_no_op() {
+        let (_, errors) = dependency_declaration("{ project = false }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("sets `project = false`")
+                    && error.contains("declares its own source")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_projects_own_table_cannot_inherit_from_itself() {
+        let manifest = parse(
+            "[project]\npackages = []\n[project.dependencies]\nshapes = { project = true }\n",
+        );
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|error| error.contains("`[project.dependencies] shapes`")
+                    && error.contains("this IS the project's table")),
+            "{:?}",
+            manifest.validate()
+        );
+    }
+
+    #[test]
+    fn an_inheriting_declaration_is_not_a_registry_dependency() {
+        // `project = true` must not fall through to the registry stub's "not
+        // yet supported" — it is a supported declaration with a source.
+        let (manifest, errors) = dependency_declaration("{ project = true }");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            matches!(source_of(&manifest), DependencySource::Inherited),
+            "expected an inherited source"
+        );
     }
 
     #[test]

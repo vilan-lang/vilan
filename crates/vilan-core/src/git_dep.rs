@@ -46,7 +46,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, WorkspaceError};
 
 /// The immutable point of a repository a dependency pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,17 +206,26 @@ pub fn entry_path(cache_root: &Path, source: &GitSource) -> PathBuf {
 ///
 /// A warm entry short-circuits before anything else: no network, no `git`, not
 /// even a directory listing beyond the one `is_dir`.
-pub fn materialize(source: &GitSource, config: &GitDeps, label: &str) -> Result<PathBuf, String> {
+///
+/// The failure is typed ([`WorkspaceError`]) because a cache miss under a
+/// cache-only policy is not a *fault*: every manifest is right and one
+/// `vilan build` fixes it. Only the caller that knows where it is reporting can
+/// pick the severity, and it can only pick it from a kind it is told.
+pub fn materialize(
+    source: &GitSource,
+    config: &GitDeps,
+    label: &str,
+) -> Result<PathBuf, WorkspaceError> {
     let entry = entry_path(&config.cache_root, source);
     if entry.is_dir() {
         return Ok(entry);
     }
     if config.policy == GitPolicy::CacheOnly {
-        return Err(format!(
+        return Err(WorkspaceError::Unfetched(format!(
             "{} is not in the local cache, and this command does not fetch — \
              run `vilan build` (or `vilan check`) once to fetch it",
             source.describe()
-        ));
+        )));
     }
     if let Some(report) = config.report {
         report(&format!(
@@ -241,7 +250,7 @@ pub fn materialize(source: &GitSource, config: &GitDeps, label: &str) -> Result<
     let _ = std::fs::remove_dir_all(&staging);
     if let Err(error) = fetch(source, &staging).and_then(|()| verify_library(&staging, source)) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(error);
+        return Err(WorkspaceError::Broken(error));
     }
     match std::fs::rename(&staging, &entry) {
         Ok(()) => Ok(entry),
@@ -252,10 +261,10 @@ pub fn materialize(source: &GitSource, config: &GitDeps, label: &str) -> Result<
                 // winner's checkout is the same content by construction.
                 return Ok(entry);
             }
-            Err(format!(
+            Err(WorkspaceError::Broken(format!(
                 "cannot move the fetched checkout into place at {}: {error}",
                 entry.display()
-            ))
+            )))
         }
     }
 }
@@ -641,8 +650,12 @@ mod tests {
         let source = tagged("https://example.invalid/org/shapes", "v1.0.0");
         let error = materialize(&source, &GitDeps::cache_only(&root), "shapes")
             .expect_err("a cold cache-only miss is an error");
-        assert!(error.contains("not in the local cache"), "{error}");
-        assert!(error.contains("vilan build"), "{error}");
+        assert!(error.is_unfetched(), "a cache miss is not a fault: {error}");
+        assert!(
+            error.message().contains("not in the local cache"),
+            "{error}"
+        );
+        assert!(error.message().contains("vilan build"), "{error}");
         assert!(!root.exists(), "cache-only must not create the cache root");
     }
 

@@ -185,6 +185,19 @@ npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
 marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + `TAP_TOKEN`.
 
+*S5 residuals (2026-07-25):* **version skew** — an updated extension
+registers `**/vilan.toml` with whatever `vilan-lsp` it discovers; an
+OLDER server runs the manifest through the vilan pipeline and squiggles
+it (not defensible client-side: the documentSelector is fixed before
+`initialize`, and probing the old server hangs). Transient — upgrading
+the toolchain clears it; marketplace installs get both halves new.
+Also: with the manifest in the selector the server advertises
+formatting for it (the zero-bail net returns it unchanged — harmless,
+but a "multiple formatters" prompt may appear beside a TOML extension).
+And the inherited-declaration gap: when the PROJECT's declaration is
+what's broken, the diagnostic lands on the member manifest that opted
+in, not the project root. All v1-accepted.
+
 *S4 residuals (2026-07-25):* a crashed fetch's `.staging-…` leftover in
 `~/.vilan/git-deps/` is never swept (the natural home — `vilan
 upgrade`'s prune — is release machinery, deliberately not touched by

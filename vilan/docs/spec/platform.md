@@ -68,6 +68,11 @@ The manifest declares what a directory builds. Sections:
   (`root`, `platform = ["…"]`) for per-platform sources.
 - **`[project]`** — a workspace: `packages = ["member", …]` (paths);
   building the project builds every member against its own manifest.
+  Its own `dependencies` are declared once for the members to share: a
+  member writes `dep = { project = true }` to take that declaration
+  (paths in it resolve against the **project root**). Inheritance is
+  per dependency and opt-in — nothing is inherited implicitly — and
+  `project = true` combines with no other key.
 - **`[build]`** — codegen options: `preset` (`"debug"` | `"release"`)
   and the per-feature overrides `indent`, `spaces`, `debug-names`.
   Build options never change program semantics (§7.6), only the

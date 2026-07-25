@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "vilan.toml",
-  "description": "A Vilan package or project (workspace) manifest.",
+  "description": "A Vilan package, library, or project (workspace) manifest.",
   "type": "object",
   "additionalProperties": true,
   "properties": {
@@ -27,13 +27,13 @@
         },
         "entry": {
           "type": "string",
-          "description": "The `build`/`run` entry file, resolved against `root`. Default: `main.vl`.",
+          "description": "The `build`/`run` entry file, resolved against `root`. Default: `main.vl`. Replaced by `[entry.<name>]` sections.",
           "default": "main.vl"
         },
         "target": {
           "type": "string",
-          "description": "The default build target. `none` is a pure library (core std only) — type-checkable but not buildable without a host.",
-          "enum": ["node", "browser", "none"],
+          "description": "The default build platform. `none` is a pure library (core std only) — type-checkable but not buildable without a host.",
+          "enum": ["node", "deno", "bun", "browser", "none"],
           "default": "node"
         },
         "dependencies": {
@@ -41,18 +41,97 @@
         }
       }
     },
+    "library": {
+      "type": "object",
+      "description": "A library: an importable unit with a `lib.vl` surface, no entry, and per-platform layers instead of one target.",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "How dependents import this library. A valid identifier (letters, digits, underscore; no leading digit).",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "description": {
+          "type": "string",
+          "description": "A short, free-text description of the library."
+        },
+        "root": {
+          "type": "string",
+          "description": "The base (shared) source root, relative to this manifest. Default: `src`.",
+          "default": "src"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/dependencies"
+        },
+        "layer": {
+          "type": "object",
+          "description": "Overlay layers, keyed by layer name (`process`, `browser`, …). A module in a layer shadows the base for the platforms that layer serves.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "root": {
+                "type": "string",
+                "description": "The layer's source root, relative to this manifest. Default: `src/<layer name>`."
+              },
+              "platform": {
+                "type": "array",
+                "description": "The platforms this layer serves — at least one. A runtime, a runtime version, or a family like `@process`.",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "@process",
+                    "node",
+                    "node:24",
+                    "node:*",
+                    "deno",
+                    "deno:2",
+                    "deno:*",
+                    "bun",
+                    "bun:1",
+                    "bun:*",
+                    "browser"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "project": {
       "type": "object",
-      "description": "A workspace root: a set of member packages plus dependencies they inherit.",
+      "description": "A workspace root: member packages, plus dependencies they can inherit.",
       "additionalProperties": false,
       "properties": {
         "packages": {
           "type": "array",
-          "description": "Paths to the member package directories.",
+          "description": "Paths to the member package directories — the build set of `vilan build .` at the root.",
           "items": { "type": "string" }
         },
         "dependencies": {
           "$ref": "#/definitions/dependencies"
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "description": "Build entries of a multi-entry package, keyed by name; each name labels its `dist/<name>.js` output.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The entry file, resolved against the package `root`. Default: `<name>.vl`."
+          },
+          "target": {
+            "type": "string",
+            "description": "The entry's build platform. Must be a host — an entry is something to run.",
+            "enum": ["node", "deno", "bun", "browser", "none"],
+            "default": "node"
+          }
         }
       }
     },
@@ -85,45 +164,72 @@
         }
       }
     },
-    "server": {
-      "$ref": "#/definitions/entrySection",
-      "description": "Legacy full-stack server entry (a Node build). Superseded by a `[package]` with a `target`."
-    },
-    "client": {
-      "$ref": "#/definitions/entrySection",
-      "description": "Legacy full-stack client entry (a browser build). Superseded by a `[package]` with a `target`."
+    "macro": {
+      "type": "object",
+      "description": "The compile-time interpreter's budget.",
+      "additionalProperties": false,
+      "properties": {
+        "fuel": {
+          "type": "integer",
+          "description": "Interpreter steps per macro/const run (default 1000000)."
+        },
+        "depth": {
+          "type": "integer",
+          "description": "Nested expansion rounds before the fixpoint gives up (default 16)."
+        }
+      }
     }
   },
   "definitions": {
-    "entrySection": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "entry": {
-          "type": "string",
-          "description": "The entry file, relative to this manifest."
-        }
-      }
-    },
     "dependencies": {
       "type": "object",
-      "description": "Package dependencies. A bare version string is a registry dependency; the table form may instead give a local `path`.",
+      "description": "Package dependencies, keyed by the name they are imported under. A table gives a local `path`, a `git` repository pinned to a `tag` or `rev`, or `project = true` to take the workspace root's declaration.",
       "additionalProperties": {
         "oneOf": [
           {
             "type": "string",
-            "description": "A registry dependency version requirement (e.g. \"1.2\")."
+            "description": "A registry dependency version requirement (e.g. \"1.2\"). Registry dependencies are not resolved yet."
           },
-          {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "version": { "type": "string", "description": "The version requirement." },
-              "registry": { "type": "string", "description": "The registry to fetch from." },
-              "path": { "type": "string", "description": "A local path dependency, relative to this manifest." }
-            }
-          }
+          { "$ref": "#/definitions/dependency" }
         ]
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "A local directory, relative to this manifest."
+        },
+        "git": {
+          "type": "string",
+          "description": "The repository URL of a git dependency. The checkout must be a `[library]` with its `vilan.toml` at the root."
+        },
+        "tag": {
+          "type": "string",
+          "description": "The tag a git dependency pins (exactly one of `tag` / `rev`). A branch cannot be pinned — it moves."
+        },
+        "rev": {
+          "type": "string",
+          "description": "The commit SHA a git dependency pins (exactly one of `tag` / `rev`)."
+        },
+        "branch": {
+          "type": "string",
+          "description": "Rejected: a branch moves, so it pins nothing. Use `tag` or `rev`."
+        },
+        "project": {
+          "type": "boolean",
+          "description": "`project = true` takes this dependency's whole declaration from the workspace root's `[project.dependencies]` (paths there are relative to the project root). Combines with no other key."
+        },
+        "version": {
+          "type": "string",
+          "description": "A registry dependency's version requirement. Registry dependencies are not resolved yet."
+        },
+        "registry": {
+          "type": "string",
+          "description": "The registry to fetch from. Not resolved yet."
+        }
       }
     }
   }

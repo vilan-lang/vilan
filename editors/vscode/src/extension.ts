@@ -139,7 +139,15 @@ async function startClient(context: ExtensionContext): Promise<void> {
     const serverOptions: ServerOptions = { run, debug: run };
 
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: 'file', language: 'vilan' }],
+        documentSelector: [
+            { scheme: 'file', language: 'vilan' },
+            // The manifest, by PATH rather than language id: `vilan.toml` is
+            // `toml` only if the user has a TOML extension installed, and
+            // `plaintext` otherwise — matching on the name catches both. The
+            // server routes these to its manifest handler (completion only);
+            // they never reach the vilan pipeline.
+            { scheme: 'file', pattern: '**/vilan.toml' },
+        ],
         synchronize: {
             fileEvents: workspace.createFileSystemWatcher('**/*.vl'),
         },

@@ -89,7 +89,27 @@ A workspace groups several packages so they build together with one
 ```toml
 [project]
 packages = ["common", "client", "server"]
+
+[project.dependencies]
+shapes = { git = "https://github.com/someone/shapes", tag = "v1.2.0" }
 ```
+
+Dependencies declared at the workspace root are there for the members to
+share, so the version lives in one file. A member takes one by name:
+
+```toml
+[package.dependencies]
+shapes = { project = true }
+```
+
+That is the whole form — `project = true` and nothing else, once per
+dependency you want. It is opt-in on purpose: a member that stays silent
+gets nothing, so adding a dependency at the root can never change what
+another package sees. A `path` written at the root is relative to the
+*root*, since that is where you wrote it. And a member that declares its
+own `shapes = { path = "…" }` simply uses that one — there is no
+shadowing rule to remember, because inheritance only happens where you
+ask for it.
 
 By default the source root is the package directory and the entry file is
 `main.vl`. You can point elsewhere with `root = "src"` and

@@ -29,6 +29,10 @@ struct ProjectContext {
     /// The file's resolved dependency workspace (P2), so cross-package imports
     /// (`import <dep>::..`) type-check in the editor.
     workspace: BuildWorkspace,
+    /// Why the project didn't resolve, when it didn't (F5 S5). Everything below
+    /// still degrades exactly as it did — the difference is that the reason is
+    /// now published instead of swallowed.
+    manifest_problem: Option<ManifestProblem>,
 }
 
 impl ProjectContext {
@@ -37,8 +41,24 @@ impl ProjectContext {
             platform: None,
             pkg_root: None,
             workspace: BuildWorkspace::default(),
+            manifest_problem: None,
         }
     }
+}
+
+/// A `vilan.toml` failure, as the editor reports it: the manifest it belongs
+/// to, the message (the CLI's own — one wording for both surfaces), and whether
+/// it is a warning.
+///
+/// The severity split is the point of carrying this at all: a manifest that
+/// does not parse, or a dependency that does not resolve, is an **error**; a
+/// git dependency that simply has not been fetched yet is a **warning**,
+/// because nothing is wrong — the editor never fetches (proposal
+/// `distribution.md` §5) and one `vilan build` fixes it.
+struct ManifestProblem {
+    path: PathBuf,
+    message: String,
+    warning: bool,
 }
 
 /// Resolves a file's [`ProjectContext`] from the nearest ancestor `vilan.toml`.
@@ -62,8 +82,21 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
     let Ok(contents) = std::fs::read_to_string(&manifest_path) else {
         return ProjectContext::none();
     };
-    let Ok((manifest, _warnings)) = Manifest::parse(&contents) else {
-        return ProjectContext::none();
+    let manifest = match Manifest::parse(&contents) {
+        Ok((manifest, _warnings)) => manifest,
+        // A manifest that doesn't parse resolves nothing, and until F5 S5 said
+        // nothing either — the file the user is editing just quietly lost its
+        // package. The wording is the CLI's, so both surfaces agree.
+        Err(error) => {
+            return ProjectContext {
+                manifest_problem: Some(ManifestProblem {
+                    path: manifest_path.clone(),
+                    message: format!("invalid {}: {error}", manifest_path.display()),
+                    warning: false,
+                }),
+                ..ProjectContext::none()
+            };
+        }
     };
 
     // A package: root `pkg::` at its declared source root and resolve its
@@ -95,11 +128,29 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         // always had for an unresolvable manifest.
         let git =
             vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
-        let workspace = vilan_core::manifest::resolve_workspace(root, &git).unwrap_or_default();
+        // The resolution failure is no longer swallowed (F5 S5): the workspace
+        // still degrades to none — imports into a dependency stay unresolved
+        // either way — but the REASON is published on the manifest, so the wall
+        // of "cannot find module" errors has something to point at. A git
+        // dependency the editor hasn't been allowed to fetch is a warning: that
+        // manifest is correct, and `vilan build` is the whole fix.
+        let (workspace, manifest_problem) =
+            match vilan_core::manifest::resolve_workspace(root, &git) {
+                Ok(workspace) => (workspace, None),
+                Err(error) => (
+                    BuildWorkspace::default(),
+                    Some(ManifestProblem {
+                        path: manifest_path.clone(),
+                        warning: error.is_unfetched(),
+                        message: error.message().to_string(),
+                    }),
+                ),
+            };
         return ProjectContext {
             platform,
             pkg_root: Some(pkg_root),
             workspace,
+            manifest_problem,
         };
     }
 
@@ -614,6 +665,9 @@ pub struct Document {
     /// rendered lines like ``requires the `process` layer of `std` (via `…`)``
     /// — appended to the hover of any function that carries one.
     platform_requirements: HashMap<Id, String>,
+    /// The `vilan.toml` failure behind this analysis, if any — published as one
+    /// diagnostic on the manifest itself (see [`ManifestProblem`]).
+    manifest_problem: Option<ManifestProblem>,
 }
 
 /// A semantic-token classification (E2): precision highlighting from the
@@ -726,6 +780,7 @@ impl Document {
         // its `vilan.toml`); fall back to inferring the platform from imports and
         // rooting `pkg::` at the file's own directory.
         let context = resolve_project_context(entry_path);
+        let manifest_problem = context.manifest_problem;
         let pkg_root = context
             .pkg_root
             .unwrap_or_else(|| pkg_root_fallback(entry_path));
@@ -800,6 +855,7 @@ impl Document {
             text_hash,
             entity_spans,
             platform_requirements,
+            manifest_problem,
         }
     }
 
@@ -869,6 +925,23 @@ impl Document {
                 span: warning.span,
                 message: warning.msg.clone(),
                 warning: true,
+                note: None,
+            });
+        }
+        // The manifest channel (F5 S5): ONE diagnostic, on `vilan.toml` itself
+        // — which is where the mistake is, and where the planner already knows
+        // how to publish (it addresses every non-entry file the same way, open
+        // or not). The span is the start of the file: the failure belongs to
+        // the manifest as a whole, and locating a TOML key would mean parsing
+        // TOML for spans, which this slice deliberately does not do. Two open
+        // files in one broken package publish the identical diagnostic, and the
+        // planner's union dedups it to one.
+        if let Some(problem) = &self.manifest_problem {
+            published.push(PublishedDiagnostic {
+                path: Some(problem.path.clone()),
+                span: Span::from(0..0),
+                message: problem.message.clone(),
+                warning: problem.warning,
                 note: None,
             });
         }
@@ -2822,6 +2895,160 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── the `vilan.toml` diagnostic channel (F5 S5; distribution.md §7's S4
+    // residual: manifest failures were swallowed) ──
+    //
+    // The whole channel is ONE diagnostic per analysis, addressed to the
+    // manifest, with the severity the failure deserves.
+
+    /// The manifest diagnostic in `document`'s published set, if any: the one
+    /// item attributed to a `vilan.toml`.
+    fn manifest_diagnostic(document: &Document) -> Option<PublishedDiagnostic> {
+        document.published_diagnostics().into_iter().find(|item| {
+            item.path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("vilan.toml"))
+        })
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_parse_publishes_on_the_manifest() {
+        let (dir, document) = analyze_workspace(&[
+            ("src/main.vl", "fun main() {}\n"),
+            // An unterminated table header: TOML, not vilan, so nothing in the
+            // pipeline would ever have said a word about it.
+            ("vilan.toml", "[package\nname = \"app\"\n"),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the parse failure is published");
+        assert!(!item.warning, "a manifest that does not parse is an error");
+        assert!(item.message.contains("invalid"), "{}", item.message);
+        assert!(item.message.contains("vilan.toml"), "{}", item.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unresolvable_dependency_publishes_the_reason_on_the_manifest() {
+        // The wall-of-unresolved-imports case: the manifest parses, but its
+        // dependency does not resolve, so the workspace is empty and every
+        // `import shapes::…` fails. Before this channel, the *reason* was
+        // dropped on the floor.
+        let (dir, document) = analyze_workspace(&[
+            ("src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { path = \"../nowhere\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the resolution failure is published");
+        assert!(!item.warning, "an unresolvable dependency is an error");
+        assert!(
+            item.message.contains("dependency `shapes`"),
+            "{}",
+            item.message
+        );
+        // ...and the import diagnostic it explains is still there.
+        assert!(
+            document
+                .published_diagnostics()
+                .iter()
+                .any(|other| other.message.contains("shapes") && other.path.is_none()),
+            "the unresolved import stays"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cold_git_dependency_steers_to_vilan_build_as_a_warning() {
+        // The steer S4 handed to S5. The URL is unreachable by construction and
+        // the editor's policy never fetches, so this entry can never be in the
+        // real cache — the diagnostic is deterministic. It is a WARNING: the
+        // manifest is correct and one build fixes it.
+        let (dir, document) = analyze_workspace(&[
+            ("src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { git = \"https://example.invalid/org/shapes\", tag = \"v9.9.9\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the cold cache is published");
+        assert!(item.warning, "a cache miss is a steer, not a fault");
+        assert!(
+            item.message.contains("git dependency `shapes`"),
+            "{}",
+            item.message
+        );
+        assert!(
+            item.message.contains("not in the local cache"),
+            "{}",
+            item.message
+        );
+        assert!(item.message.contains("vilan build"), "{}", item.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_healthy_project_publishes_no_manifest_diagnostic() {
+        // The silence half: a project that resolves says nothing about its
+        // manifest — the channel must not become ambient noise.
+        let (dir, document) = analyze_workspace(&[
+            ("app/src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { path = \"../shapes\" }\n",
+            ),
+            ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+            ("shapes/src/lib.vl", "fun area(): i32 { 1 }\n"),
+        ]);
+        assert!(
+            manifest_diagnostic(&document).is_none(),
+            "a healthy project publishes nothing about its manifest: {:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| (item.path.clone(), item.message.clone()))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_inherited_dependency_resolves_in_the_editor_too() {
+        // The other half of Task 1 in the editor: a member that opts in to the
+        // workspace root's declaration type-checks its import — the CLI and the
+        // LSP resolve through the same `resolve_workspace`.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "app/src/main.vl",
+                "import shapes::area;\n\nfun main() {\n\tlet size = area();\n}\n",
+            ),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { project = true }\n",
+            ),
+            (
+                "vilan.toml",
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { path = \"shapes\" }\n",
+            ),
+            ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+            ("shapes/src/lib.vl", "fun area(): i32 { 1 }\n"),
+        ]);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| item.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── platform coloring in the editor (proposal/platform-coloring.md, phase 2) ──

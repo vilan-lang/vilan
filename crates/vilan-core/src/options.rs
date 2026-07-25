@@ -27,6 +27,13 @@ impl Preset {
         }
     }
 
+    /// Every preset — the closed set the manifest's `preset = "…"` accepts, for
+    /// the surfaces that enumerate it (the language server's completion, and
+    /// the editor schema pinned against it).
+    pub fn all() -> [Preset; 2] {
+        [Preset::Debug, Preset::Release]
+    }
+
     /// The preset's name, as written in `vilan.toml`.
     pub fn name(self) -> &'static str {
         match self {

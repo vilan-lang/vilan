@@ -1326,9 +1326,14 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
 /// has no dependencies. Delegates to the shared `vilan_core::manifest::resolve_workspace`
 /// so the CLI and LSP resolve identically. (The build platform isn't needed — the
 /// graph is platform-independent; the analyzer reports any cross-platform import.)
+///
+/// The resolution error's *kind* is the editor's concern (an unfetched git
+/// dependency is a warning there); here every failure stops the build, so the
+/// message is all that survives.
 fn resolve_workspace(unit: &Unit) -> Result<Workspace, String> {
     match &unit.package_dir {
-        Some(package_dir) => vilan_core::manifest::resolve_workspace(package_dir, &git_deps()),
+        Some(package_dir) => vilan_core::manifest::resolve_workspace(package_dir, &git_deps())
+            .map_err(|error| error.to_string()),
         None => Ok(Workspace::default()),
     }
 }

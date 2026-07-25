@@ -4,6 +4,7 @@
 
 mod document;
 mod line_index;
+mod manifest_completion;
 mod publish;
 mod uri;
 
@@ -99,6 +100,32 @@ impl Config {
             };
         }
         config
+    }
+}
+
+/// Convert a manifest completion candidate to an LSP `CompletionItem` (F5 S5).
+/// The item carries an explicit `TextEdit` rather than a bare insertion: a
+/// manifest value owns its quotes, so what gets replaced is decided by the
+/// schema side (`manifest_completion::completions`), never by the client's idea
+/// of where a word starts.
+fn to_manifest_item(
+    completion: manifest_completion::ManifestCompletion,
+    line_index: &LineIndex,
+) -> CompletionItem {
+    let range = line_index.range(&Span::from(completion.replace));
+    CompletionItem {
+        label: completion.label,
+        kind: Some(if completion.is_key {
+            CompletionItemKind::PROPERTY
+        } else {
+            CompletionItemKind::VALUE
+        }),
+        documentation: completion.documentation.map(Documentation::String),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: completion.insert,
+        })),
+        ..Default::default()
     }
 }
 
@@ -238,9 +265,42 @@ fn to_lsp_symbol(symbol: Symbol, line_index: &LineIndex) -> DocumentSymbol {
     }
 }
 
+/// An open `vilan.toml`: its text and a line index, which is everything
+/// manifest completion needs (no analysis, no diagnostics of its own — the
+/// manifest's diagnostics come from the packages that read it, see
+/// `document::ManifestProblem`).
+struct ManifestDocument {
+    text: String,
+    line_index: LineIndex,
+}
+
+impl ManifestDocument {
+    fn new(text: String) -> ManifestDocument {
+        ManifestDocument {
+            line_index: LineIndex::new(&text),
+            text,
+        }
+    }
+}
+
+/// Whether `uri` names a `vilan.toml`. The extension registers manifests with
+/// the server by PATH (any language id), so this is the routing question every
+/// document notification asks first.
+fn is_manifest(uri: &Url) -> bool {
+    uri.path()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "vilan.toml")
+}
+
 struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
+    /// Open `vilan.toml` buffers (F5 S5). A manifest is TOML, not vilan: it is
+    /// kept HERE rather than in `documents` so nothing ever hands it to
+    /// `Document::analyze`, which would publish a wall of lexer errors on a
+    /// perfectly good manifest. Completion is all it feeds.
+    manifests: Arc<DashMap<Url, ManifestDocument>>,
     /// The latest edit generation per document, so a debounced analysis can tell
     /// whether a newer edit (or a close) has superseded it before it runs.
     pending: Arc<DashMap<Url, u64>>,
@@ -395,6 +455,72 @@ mod config_tests {
             config.completion_function_call,
             CompletionFunctionCall::Full
         );
+    }
+}
+
+#[cfg(test)]
+mod manifest_routing_tests {
+    use super::{ManifestDocument, is_manifest, to_manifest_item};
+    use crate::manifest_completion;
+    use tower_lsp::lsp_types::{CompletionItemKind, CompletionTextEdit, Url};
+
+    // The routing question every notification asks. A manifest must never reach
+    // `Document::analyze` (TOML through the vilan lexer is a wall of nonsense),
+    // and a vilan file must never reach the manifest handler.
+    #[test]
+    fn only_a_file_named_vilan_toml_routes_to_the_manifest_handler() {
+        let manifest = |path: &str| is_manifest(&Url::parse(path).expect("a url"));
+        assert!(manifest("file:///work/app/vilan.toml"));
+        assert!(manifest("file:///vilan.toml"));
+        assert!(!manifest("file:///work/app/src/main.vl"));
+        assert!(!manifest("file:///work/app/vilan.toml.bak"));
+        assert!(!manifest("file:///work/app/Cargo.toml"));
+        // A directory that merely CONTAINS the name is not the manifest.
+        assert!(!manifest("file:///work/vilan.toml/notes.txt"));
+    }
+
+    // The completion an editor actually receives: an explicit text edit whose
+    // range is the value token (quotes included), so applying it leaves valid
+    // TOML rather than `""node"`.
+    #[test]
+    fn a_value_completion_arrives_as_a_text_edit_over_the_value_token() {
+        let text = "[package]\nname = \"app\"\ntarget = \"\"\n";
+        let offset = text.find("\"\"\n").expect("the empty value") + 1;
+        let manifest = ManifestDocument::new(text.to_string());
+        let item = manifest_completion::completions(&manifest.text, offset)
+            .into_iter()
+            .find(|item| item.label == "browser")
+            .expect("`browser` is offered for a target");
+        let converted = to_manifest_item(item, &manifest.line_index);
+        assert_eq!(converted.kind, Some(CompletionItemKind::VALUE));
+        let Some(CompletionTextEdit::Edit(edit)) = converted.text_edit else {
+            panic!("a manifest completion carries its own edit");
+        };
+        assert_eq!(edit.new_text, "\"browser\"");
+        // Line 2 (`target = …`), over both quotes.
+        assert_eq!(edit.range.start.line, 2);
+        assert_eq!(edit.range.start.character, 9);
+        assert_eq!(edit.range.end.line, 2);
+        assert_eq!(edit.range.end.character, 11);
+    }
+
+    #[test]
+    fn a_key_completion_arrives_as_a_property() {
+        let text = "[build]\npres\n";
+        let offset = text.find("\npres").expect("the partial key") + 5;
+        let manifest = ManifestDocument::new(text.to_string());
+        let item = manifest_completion::completions(&manifest.text, offset)
+            .into_iter()
+            .find(|item| item.label == "preset")
+            .expect("`preset` is offered in `[build]`");
+        let converted = to_manifest_item(item, &manifest.line_index);
+        assert_eq!(converted.kind, Some(CompletionItemKind::PROPERTY));
+        let Some(CompletionTextEdit::Edit(edit)) = converted.text_edit else {
+            panic!("a manifest completion carries its own edit");
+        };
+        assert_eq!(edit.new_text, "preset");
+        assert_eq!(edit.range.start.character, 0);
+        assert_eq!(edit.range.end.character, 4);
     }
 }
 
@@ -891,6 +1017,16 @@ impl LanguageServer for Backend {
         // — still finds it. (The debounced change path runs off the async thread,
         // but there a previous analysis is always already in place.)
         let uri = params.text_document.uri;
+        // A manifest is not a vilan source file: it feeds completion and
+        // nothing else. It is deliberately NOT registered as a document
+        // overlay either — project resolution reads `vilan.toml` from disk, so
+        // an unsaved manifest edit takes effect on save (which re-analyzes
+        // every open document through `did_save`).
+        if is_manifest(&uri) {
+            self.manifests
+                .insert(uri, ManifestDocument::new(params.text_document.text));
+            return;
+        }
         let path = uri.to_file_path().unwrap_or_default();
         // Register the buffer so OTHER documents' analyses load this one's
         // live content instead of the file on disk (backlog E6).
@@ -904,6 +1040,11 @@ impl LanguageServer for Backend {
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.pop() {
             let uri = params.text_document.uri;
+            if is_manifest(&uri) {
+                self.manifests
+                    .insert(uri, ManifestDocument::new(change.text));
+                return;
+            }
             // Apply the new text to the open document immediately so a completion
             // request arriving before the debounced re-analysis still sees the
             // just-typed character (e.g. the `.` that selects member completion).
@@ -942,6 +1083,14 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        // A closed manifest publishes nothing and clears nothing: the
+        // diagnostic ON it belongs to the packages that read it, which are
+        // still open (see `document::ManifestProblem`). Falling through would
+        // reach the unconditional clear below and wipe a live diagnostic.
+        if is_manifest(&uri) {
+            self.manifests.remove(&uri);
+            return;
+        }
         // Disk truth returns for other documents' analyses.
         if let Ok(path) = uri.to_file_path() {
             vilan_core::analyzer::set_document_overlay(&path, None);
@@ -1053,6 +1202,17 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        if is_manifest(&uri) {
+            let Some(manifest) = self.manifests.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = manifest.line_index.offset(position);
+            let items = manifest_completion::completions(&manifest.text, offset)
+                .into_iter()
+                .map(|item| to_manifest_item(item, &manifest.line_index))
+                .collect();
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
@@ -1228,6 +1388,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         documents: Arc::new(DashMap::new()),
+        manifests: Arc::new(DashMap::new()),
         publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
         pending: Arc::new(DashMap::new()),
         line_indices: Arc::new(DashMap::new()),

@@ -32,7 +32,8 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:vilan"
+    "onLanguage:vilan",
+    "workspaceContains:**/vilan.toml"
   ],
   "main": "./out/extension.js",
   "contributes": {
