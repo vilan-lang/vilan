@@ -371,8 +371,17 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
             &format!("[watch] watching {watched} for `.vl` changes — Ctrl-C to stop")
         )
     );
-    action();
+    // The baseline snapshot is taken BEFORE the first action, never after: the
+    // initial build can run for seconds, and a save landing inside it must
+    // trigger a round, not vanish into the baseline. With the old order (build,
+    // then snapshot) an edit made between the build's output appearing and the
+    // snapshot being taken was baked in and silently never detected — E20's
+    // four deadline-exhausted strikes across three environments were exactly
+    // this window, widened by suite load; a human saving during the initial
+    // build hit the same swallowed edit. Cost of this order: an edit during
+    // the initial build causes one extra round — which is the correct behavior.
     let mut snapshot = scan_vl(roots);
+    action();
     loop {
         std::thread::sleep(WATCH_POLL_INTERVAL);
         let next = scan_vl(roots);
