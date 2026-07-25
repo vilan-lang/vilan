@@ -32,9 +32,25 @@ pub fn materialize() -> Result<PathBuf, String> {
 /// temp directory when no home is available. Shared by [`materialize`] and the
 /// upgrade command's cache pruning.
 pub fn default_cache_root() -> PathBuf {
+    toolchain_cache("std-cache")
+}
+
+/// Where **git dependencies** are cached: `~/.vilan/git-deps`, beside the std
+/// cache and under the same home-directory rules (`home_dir`, below). The
+/// toolchain's `~/.vilan` layout lives in one crate so the CLI and the language
+/// server can never disagree about where a cache is — the fetching and the
+/// pruning of that tree are `vilan_core::git_dep`'s (its entries are keyed by
+/// content, so unlike a std tree they are never stale and are not age-pruned).
+pub fn default_git_dep_root() -> PathBuf {
+    toolchain_cache("git-deps")
+}
+
+/// One `~/.vilan/<leaf>` cache root, falling back to a temp directory (named
+/// `vilan-<leaf>`) when the environment names no home.
+fn toolchain_cache(leaf: &str) -> PathBuf {
     home_dir()
-        .map(|home| home.join(".vilan").join("std-cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("vilan-std-cache"))
+        .map(|home| home.join(".vilan").join(leaf))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("vilan-{leaf}")))
 }
 
 /// Remove cache entries (content-hash trees and crashed `.staging-*`

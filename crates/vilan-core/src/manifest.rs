@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::analyzer::{Layer, PackageSpec, Workspace};
+use crate::git_dep::{GitDeps, GitRef, GitSource};
 use crate::options::{BuildOptions, Preset};
 use crate::target::{Platform, PlatformPattern};
 
@@ -150,8 +151,10 @@ pub struct EntrySection {
 }
 
 /// A dependency: either a bare version string (`dep = "1.2"`, a registry
-/// dependency) or the table form (`{ version, registry, path }`). A `path` makes
-/// it a local *path dependency*; otherwise it is a *registry dependency*.
+/// dependency) or the table form (`{ version, registry, path, git, tag, rev }`).
+/// A `path` makes it a local *path dependency*, a `git` a *git dependency*
+/// (proposal `distribution.md` §5); with neither it is a *registry dependency*,
+/// which nothing resolves yet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Dependency {
@@ -160,7 +163,28 @@ pub enum Dependency {
         version: Option<String>,
         registry: Option<String>,
         path: Option<PathBuf>,
+        /// The repository URL of a git dependency.
+        git: Option<String>,
+        /// The tag it pins (exactly one of `tag` / `rev`).
+        tag: Option<String>,
+        /// The commit SHA it pins (exactly one of `tag` / `rev`).
+        rev: Option<String>,
+        /// Parsed only to reject it: a branch moves, so it cannot pin anything
+        /// (the error steers to `tag`/`rev`).
+        branch: Option<String>,
     },
+}
+
+/// What a dependency resolves against — the three kinds [`Dependency::source`]
+/// distinguishes once, for both validation and resolution.
+pub enum DependencySource<'declaration> {
+    /// A local directory, relative to the declaring manifest.
+    Path(&'declaration Path),
+    /// One immutable point of one repository, materialized into the git cache
+    /// and then treated exactly like a path dependency.
+    Git(GitSource),
+    /// A bare version / `registry` dependency: parsed, never resolved.
+    Registry,
 }
 
 impl Dependency {
@@ -174,9 +198,107 @@ impl Dependency {
         }
     }
 
-    /// A registry dependency is one without a local `path` — P1 can't resolve it.
-    pub fn is_registry(&self) -> bool {
-        self.path().is_none()
+    /// What this dependency resolves against, or the reason its declaration is
+    /// not a dependency at all. One place decides, so `validate` and
+    /// `resolve_dependency_edges` can never disagree about a manifest.
+    ///
+    /// The messages name the mistake and the fix; the caller prefixes them with
+    /// the dependency's name (the manifest keys are per-dependency).
+    pub fn source(&self) -> Result<DependencySource<'_>, String> {
+        let Dependency::Detailed {
+            version,
+            registry,
+            path,
+            git,
+            tag,
+            rev,
+            branch,
+        } = self
+        else {
+            // A bare version string.
+            return Ok(DependencySource::Registry);
+        };
+        let Some(url) = git else {
+            // A git key without `git` is a declaration that does nothing — the
+            // one thing a manifest error is for.
+            for (key, value) in [("tag", tag), ("rev", rev), ("branch", branch)] {
+                if value.is_some() {
+                    return Err(format!(
+                        "declares `{key}` without `git` — `{key}` only means something on a \
+                         git dependency, so add `git = \"<repository url>\"` or drop `{key}`"
+                    ));
+                }
+            }
+            return Ok(match path {
+                Some(path) => DependencySource::Path(path),
+                None => DependencySource::Registry,
+            });
+        };
+        if path.is_some() {
+            return Err(
+                "sets both `git` and `path` — a dependency is either a local directory \
+                 or a repository checkout, not both"
+                    .to_string(),
+            );
+        }
+        if version.is_some() || registry.is_some() {
+            return Err(
+                "sets `version`/`registry` alongside `git` — a git dependency is pinned by \
+                 its `tag`/`rev`; there is no version resolution to take part in"
+                    .to_string(),
+            );
+        }
+        if let Some(branch) = branch {
+            return Err(format!(
+                "pins the branch `{branch}` — a branch moves, so it cannot pin anything; \
+                 use `tag = \"v1.2.0\"` for a release or `rev = \"<commit sha>\"` for an \
+                 exact commit"
+            ));
+        }
+        if !crate::git_dep::is_usable_url(url) {
+            return Err(format!(
+                "has `git = \"{url}\"`, which is not a repository URL (it cannot be empty \
+                 or start with `-`)"
+            ));
+        }
+        let reference = match (tag, rev) {
+            (Some(tag), None) => {
+                if !crate::git_dep::is_usable_tag(tag) {
+                    return Err(format!(
+                        "has `tag = \"{tag}\"`, which is not a usable git tag name (no \
+                         leading `-`, no whitespace, none of `~^:?*[\\`)"
+                    ));
+                }
+                GitRef::Tag(tag.clone())
+            }
+            (None, Some(rev)) => {
+                if !crate::git_dep::is_commit_sha(rev) {
+                    return Err(format!(
+                        "has `rev = \"{rev}\"`, which is not a commit SHA (7 to 40 \
+                         hexadecimal digits) — a branch or tag name goes in `tag`"
+                    ));
+                }
+                GitRef::Rev(rev.clone())
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "sets both `tag` and `rev` — a git dependency pins exactly one point, \
+                     so pick the release (`tag`) or the commit (`rev`)"
+                        .to_string(),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    "has a `git` URL but no point to pin — add `tag = \"v1.2.0\"` or \
+                     `rev = \"<commit sha>\"` (there are no version ranges to fall back on)"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(DependencySource::Git(GitSource {
+            url: url.clone(),
+            reference,
+        }))
     }
 }
 
@@ -421,28 +543,34 @@ impl Manifest {
     }
 }
 
-/// Rejects registry dependencies (P1 resolves neither; path dependencies parse
-/// but load later — see the roadmap). Reported as errors so a declared dependency
-/// is never silently ignored.
+/// Checks every dependency declaration: a malformed git dependency names its
+/// mistake, and a registry dependency is still unsupported. Reported as errors
+/// so a declared dependency is never silently ignored.
 fn validate_dependencies(dependencies: &BTreeMap<String, Dependency>, errors: &mut Vec<String>) {
     for (name, dependency) in dependencies {
-        if dependency.is_registry() {
-            errors.push(format!(
-                "registry dependency `{name}` is not yet supported \
-                 (only local `path` dependencies are recognized)"
-            ));
+        match dependency.source() {
+            Ok(DependencySource::Path(_)) | Ok(DependencySource::Git(_)) => {}
+            Ok(DependencySource::Registry) => errors.push(format!(
+                "registry dependency `{name}` is not yet supported (a dependency is a \
+                 local `path` or a `git` repository today)"
+            )),
+            Err(problem) => errors.push(format!("dependency `{name}` {problem}")),
         }
     }
 }
 
 /// Resolves the dependency [`Workspace`] for the package rooted at `package_dir`
-/// (P2): every reachable local `path` dependency, transitively, with cycle
+/// (P2): every reachable `path` and `git` dependency, transitively, with cycle
 /// detection. Each `PackageSpec` records its declared `target`, but the graph
 /// itself is target-independent — the target-compatibility *diagnostic* is the
 /// analyzer's, reported at the import (P3). A directory whose manifest declares no
 /// `[package]` (and a bare file, which has no manifest) yields an empty workspace.
 /// Shared by the CLI and the language server so both resolve imports identically.
-pub fn resolve_workspace(package_dir: &Path) -> Result<Workspace, String> {
+///
+/// `git` decides what a git dependency may do here — fetch on a cache miss (a
+/// build) or read a warm cache only (the editor; see [`GitDeps`]). It is an
+/// explicit parameter precisely so every caller states its policy.
+pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace, String> {
     let manifest = load_manifest(package_dir)?;
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
@@ -468,6 +596,7 @@ pub fn resolve_workspace(package_dir: &Path) -> Result<Workspace, String> {
         &mut packages,
         &mut index_by_path,
         &mut visiting,
+        git,
     )?;
     Ok(Workspace {
         packages,
@@ -574,24 +703,36 @@ fn load_manifest(directory: &Path) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
-/// Resolves one package's `path` dependency edges to `(import name, index)` pairs,
+/// Resolves one package's dependency edges to `(import name, index)` pairs,
 /// loading each referenced package (transitively) into `packages`. `index_by_path`
 /// dedups a shared dependency; `visiting` is the in-progress stack for cycle
 /// detection. Paths are relative to `base_dir` (the depending package's directory).
+///
+/// A **git** dependency is materialized into the cache *here* and then continues
+/// down the same path as a local directory — which is why a git dependency
+/// needs no machinery of its own: it dedups, cycle-detects, layers and recurses
+/// (into its own `path` **and** `git` dependencies) exactly like a path
+/// dependency, through this one loop.
 fn resolve_dependency_edges(
     dependencies: &BTreeMap<String, Dependency>,
     base_dir: &Path,
     packages: &mut Vec<PackageSpec>,
     index_by_path: &mut HashMap<PathBuf, usize>,
     visiting: &mut HashSet<PathBuf>,
+    git: &GitDeps,
 ) -> Result<Vec<(String, usize)>, String> {
     let mut edges = Vec::new();
     for (import_name, dependency) in dependencies {
-        // `validate` rejects registry dependencies, so only `path` deps reach here.
-        let Some(relative) = dependency.path() else {
-            continue;
+        // `validate` has already rejected registry dependencies and malformed
+        // git ones, so only resolvable declarations reach here.
+        let dependency_dir = match dependency.source() {
+            Ok(DependencySource::Path(relative)) => base_dir.join(relative),
+            Ok(DependencySource::Git(source)) => {
+                crate::git_dep::materialize(&source, git, import_name)
+                    .map_err(|error| format!("git dependency `{import_name}`: {error}"))?
+            }
+            Ok(DependencySource::Registry) | Err(_) => continue,
         };
-        let dependency_dir = base_dir.join(relative);
         // The dedup map's key AND the cycle set's member. Both must be one
         // canonical form (`windows-support.md` §5): a raw-string fallback lets
         // `../lib` and `../lib/.` key two entries for one package, and Windows'
@@ -642,6 +783,7 @@ fn resolve_dependency_edges(
             packages,
             index_by_path,
             visiting,
+            git,
         )?;
         visiting.remove(&canonical);
         let index = packages.len();
@@ -677,6 +819,36 @@ mod tests {
 
     fn parse(text: &str) -> Manifest {
         Manifest::parse(text).expect("parses").0
+    }
+
+    /// A `{ path = "…" }` declaration, built directly (no TOML round-trip).
+    fn path_dependency(path: &str) -> Dependency {
+        Dependency::Detailed {
+            version: None,
+            registry: None,
+            path: Some(PathBuf::from(path)),
+            git: None,
+            tag: None,
+            rev: None,
+            branch: None,
+        }
+    }
+
+    /// The single dependency of a `[package]` manifest whose `[package.dependencies]`
+    /// section is `shapes = <declaration>`.
+    fn dependency_declaration(declaration: &str) -> (Manifest, Vec<String>) {
+        let manifest = parse(&format!(
+            "[package]\nname = \"app\"\n[package.dependencies]\nshapes = {declaration}\n"
+        ));
+        let errors = manifest.validate();
+        (manifest, errors)
+    }
+
+    /// The declared dependency's resolved source (panicking if it is malformed).
+    fn source_of(manifest: &Manifest) -> DependencySource<'_> {
+        manifest.package.as_ref().unwrap().dependencies["shapes"]
+            .source()
+            .expect("a well-formed declaration")
     }
 
     #[test]
@@ -732,11 +904,6 @@ mod tests {
         let mut index_by_path = HashMap::new();
         let mut visiting = HashSet::new();
         let mut dependencies = BTreeMap::new();
-        let path_dependency = |path: &str| Dependency::Detailed {
-            version: None,
-            registry: None,
-            path: Some(PathBuf::from(path)),
-        };
         dependencies.insert("plain".to_string(), path_dependency("../lib"));
         dependencies.insert("roundabout".to_string(), path_dependency("../lib/./../lib"));
         let edges = resolve_dependency_edges(
@@ -745,6 +912,7 @@ mod tests {
             &mut packages,
             &mut index_by_path,
             &mut visiting,
+            &GitDeps::cache_only(root.join("unused-git-cache")),
         )
         .expect("both spellings resolve");
         assert_eq!(packages.len(), 1, "one package, not one per spelling");
@@ -925,6 +1093,266 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("registry dependency"))
         );
+    }
+
+    // ── git dependencies (proposal/distribution.md §5) ──
+    //
+    // The declaration matrix, one case per test: what a git dependency may say,
+    // and — for each way of saying it wrong — that the manifest says so cleanly
+    // instead of resolving something surprising.
+
+    #[test]
+    fn a_git_dependency_pinned_to_a_tag_is_accepted() {
+        let (manifest, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", tag = \"v1.2.0\" }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let DependencySource::Git(source) = source_of(&manifest) else {
+            panic!("expected a git source");
+        };
+        assert_eq!(source.url, "https://example.com/org/shapes");
+        assert_eq!(source.reference, GitRef::Tag("v1.2.0".to_string()));
+    }
+
+    #[test]
+    fn a_git_dependency_pinned_to_a_rev_is_accepted() {
+        let (manifest, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", rev = \"0123456789abcdef0123456789abcdef01234567\" }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let DependencySource::Git(source) = source_of(&manifest) else {
+            panic!("expected a git source");
+        };
+        assert_eq!(
+            source.reference,
+            GitRef::Rev("0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+    }
+
+    #[test]
+    fn a_git_dependency_setting_both_tag_and_rev_is_an_error() {
+        let (_, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", tag = \"v1\", rev = \"0123456\" }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dependency `shapes`")
+                    && error.contains("both `tag` and `rev`")
+                    && error.contains("exactly one point")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_dependency_pinning_nothing_is_an_error() {
+        let (_, errors) = dependency_declaration("{ git = \"https://example.com/org/shapes\" }");
+        assert!(
+            errors.iter().any(|error| error.contains("no point to pin")
+                && error.contains("tag")
+                && error.contains("rev")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_branch_is_an_error_that_steers_to_tag_or_rev() {
+        // The one deliberate omission of v1: a branch moves, so it pins
+        // nothing. The error has to say what to write instead.
+        let (_, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", branch = \"main\" }",
+        );
+        assert!(
+            errors.iter().any(|error| error.contains("branch `main`")
+                && error.contains("tag = \"v1.2.0\"")
+                && error.contains("rev = \"<commit sha>\"")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn git_and_path_together_is_an_error() {
+        let (_, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", tag = \"v1\", path = \"../shapes\" }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("both `git` and `path`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_alongside_git_is_an_error() {
+        // There is no resolver, so a `version` next to a `git` would be a
+        // silently ignored constraint — the exact thing a manifest error is for.
+        let (_, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", tag = \"v1\", version = \"1.2\" }",
+        );
+        assert!(
+            errors.iter().any(
+                |error| error.contains("`version`/`registry`") && error.contains("`tag`/`rev`")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_rev_that_is_not_a_commit_sha_is_an_error() {
+        let (_, errors) =
+            dependency_declaration("{ git = \"https://example.com/org/shapes\", rev = \"main\" }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("not a commit SHA") && error.contains("goes in `tag`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_tag_that_would_read_as_a_git_option_is_an_error() {
+        // `--upload-pack=…` as a "tag" must never reach the command line.
+        let (_, errors) = dependency_declaration(
+            "{ git = \"https://example.com/org/shapes\", tag = \"--upload-pack=touch owned\" }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("not a usable git tag name")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_url_that_would_read_as_a_git_option_is_an_error() {
+        let (_, errors) =
+            dependency_declaration("{ git = \"--upload-pack=touch owned\", tag = \"v1\" }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("not a repository URL")),
+            "{errors:?}"
+        );
+        let (_, empty) = dependency_declaration("{ git = \"\", tag = \"v1\" }");
+        assert!(
+            empty
+                .iter()
+                .any(|error| error.contains("not a repository URL")),
+            "{empty:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_key_without_git_is_an_error() {
+        for (key, declaration) in [
+            ("tag", "{ path = \"../shapes\", tag = \"v1\" }"),
+            ("rev", "{ path = \"../shapes\", rev = \"0123456\" }"),
+            ("branch", "{ path = \"../shapes\", branch = \"main\" }"),
+        ] {
+            let (_, errors) = dependency_declaration(declaration);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains(&format!("declares `{key}` without `git`"))),
+                "{declaration}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_version_dependency_is_still_not_yet_supported() {
+        // Unchanged by git dependencies: the registry stub stays a stub, and
+        // now says what a dependency CAN be.
+        for declaration in [
+            "\"1.2\"",
+            "{ version = \"1.2\" }",
+            "{ registry = \"crates\" }",
+        ] {
+            let (_, errors) = dependency_declaration(declaration);
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("registry dependency `shapes` is not yet supported")
+                    && error.contains("`git`")),
+                "{declaration}: {errors:?}"
+            );
+        }
+    }
+
+    /// Writes a cache entry by hand: a `[library]` checkout at exactly the key
+    /// `source` hashes to. Everything the cache does at *read* time flows
+    /// through this — no git, no network.
+    fn seed_cache_entry(cache_root: &Path, source: &crate::git_dep::GitSource, name: &str) {
+        let entry = crate::git_dep::entry_path(cache_root, source);
+        std::fs::create_dir_all(entry.join("src")).expect("create the cache entry");
+        std::fs::write(
+            entry.join("vilan.toml"),
+            format!("[library]\nname = \"{name}\"\n"),
+        )
+        .expect("the checkout's manifest");
+        std::fs::write(entry.join("src").join("lib.vl"), "").expect("the checkout's lib.vl");
+    }
+
+    #[test]
+    fn a_warm_cache_resolves_a_git_dependency_with_no_network_at_all() {
+        // The offline guarantee, and the editor's policy in one: `CacheOnly`
+        // never fetches, and the URL below is unreachable by construction — so
+        // a resolved workspace can only have come from the cache.
+        let root = std::env::temp_dir().join(format!("vilan-git-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let source = crate::git_dep::GitSource {
+            url: "https://example.invalid/org/shapes".to_string(),
+            reference: GitRef::Tag("v1.2.0".to_string()),
+        };
+        seed_cache_entry(&cache, &source, "shapes");
+        let application = root.join("app");
+        std::fs::create_dir_all(application.join("src")).expect("create the app");
+        std::fs::write(
+            application.join("vilan.toml"),
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             shapes = { git = \"https://example.invalid/org/shapes\", tag = \"v1.2.0\" }\n",
+        )
+        .expect("the app manifest");
+
+        let workspace = resolve_workspace(&application, &GitDeps::cache_only(&cache))
+            .expect("a warm cache resolves offline");
+        assert_eq!(workspace.packages.len(), 1);
+        assert_eq!(workspace.entry_dependencies.len(), 1);
+        assert_eq!(workspace.entry_dependencies[0].0, "shapes");
+        assert!(
+            workspace.packages[0]
+                .base_root
+                .starts_with(crate::git_dep::entry_path(&cache, &source)),
+            "the dependency's source root is the cached checkout: {:?}",
+            workspace.packages[0].base_root
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cold_cache_under_the_editors_policy_is_a_steer_not_a_fetch() {
+        // What the language server does with an unfetched dependency: it says
+        // so, and it touches nothing (no directory, no `git`, no network).
+        let root = std::env::temp_dir().join(format!("vilan-git-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        let application = root.join("app");
+        std::fs::create_dir_all(application.join("src")).expect("create the app");
+        std::fs::write(
+            application.join("vilan.toml"),
+            "[package]\nname = \"app\"\n[package.dependencies]\n\
+             shapes = { git = \"https://example.invalid/org/shapes\", tag = \"v1.2.0\" }\n",
+        )
+        .expect("the app manifest");
+
+        let error = resolve_workspace(&application, &GitDeps::cache_only(&cache))
+            .expect_err("a cold cache-only resolution fails");
+        assert!(error.contains("git dependency `shapes`"), "{error}");
+        assert!(error.contains("not in the local cache"), "{error}");
+        assert!(error.contains("vilan build"), "{error}");
+        assert!(!cache.exists(), "cache-only must not create the cache root");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

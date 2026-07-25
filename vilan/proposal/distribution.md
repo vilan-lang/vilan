@@ -185,6 +185,18 @@ npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
 marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + `TAP_TOKEN`.
 
+*S4 residuals (2026-07-25):* a crashed fetch's `.staging-…` leftover in
+`~/.vilan/git-deps/` is never swept (the natural home — `vilan
+upgrade`'s prune — is release machinery, deliberately not touched by
+S4; a follow-up call). The git cache deliberately has NO age-pruning:
+a std tree re-materializes free, a git entry needs the network, so an
+mtime sweep would delete exactly what makes offline-with-warm-cache
+true. `vilan test` compiles with an empty workspace (pre-existing), so
+`*_test.vl` can import neither path nor git deps — more visible now,
+recorded. The LSP has no `vilan.toml` diagnostic channel (manifest
+failures are swallowed today); a git-dep cache miss therefore degrades
+to unresolved-import diagnostics — the channel is S5-adjacent work.
+
 *S2 additions (2026-07-25):* Open VSX does **not** auto-create
 namespaces — before the first tagged release with `OVSX_TOKEN` set, run
 `npx ovsx create-namespace vilan-lang -p <token>` once. And the day

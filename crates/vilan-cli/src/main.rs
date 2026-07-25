@@ -1328,9 +1328,22 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
 /// graph is platform-independent; the analyzer reports any cross-platform import.)
 fn resolve_workspace(unit: &Unit) -> Result<Workspace, String> {
     match &unit.package_dir {
-        Some(package_dir) => vilan_core::manifest::resolve_workspace(package_dir),
+        Some(package_dir) => vilan_core::manifest::resolve_workspace(package_dir, &git_deps()),
         None => Ok(Workspace::default()),
     }
+}
+
+/// The CLI's git-dependency policy: **fetch on a cache miss**. This is a command
+/// the user ran to build their project, so materializing a declared dependency
+/// is the work they asked for — and it is the only thing in the toolchain that
+/// reaches the network, still never passively (no build, no fetch).
+///
+/// The status line goes to **stderr**: it is progress, and stdout has to stay
+/// byte-clean for `build --stdout`. Dim like `vilan upgrade`'s download line,
+/// TTY-gated by `paint` like every other status line.
+fn git_deps() -> vilan_core::git_dep::GitDeps {
+    vilan_core::git_dep::GitDeps::fetching(vilan_embedded_std::default_git_dep_root())
+        .reporting(|message| eprintln!("{}", paint::err(paint::Style::DIM, message)))
 }
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the

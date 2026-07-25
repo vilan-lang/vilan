@@ -9,6 +9,7 @@ pub mod const_eval;
 pub mod context;
 pub mod error;
 pub mod formatter;
+pub mod git_dep;
 pub mod id;
 pub mod init_order;
 pub mod interpreter;

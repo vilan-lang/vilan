@@ -86,7 +86,16 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
                     .then(|| entry.resolved_target().unwrap_or_default())
             })
         };
-        let workspace = vilan_core::manifest::resolve_workspace(root).unwrap_or_default();
+        // The editor's git-dependency policy: **the cache, never the network**
+        // (proposal/distribution.md §5). Analysis runs on every keystroke and
+        // must never block on a repository — nor fetch behind the user's back —
+        // so a dependency that no build has fetched yet is simply not in the
+        // workspace, and its imports stay unresolved until `vilan build` (or
+        // `vilan check`) fetches it. That degradation is the one this call has
+        // always had for an unresolvable manifest.
+        let git =
+            vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
+        let workspace = vilan_core::manifest::resolve_workspace(root, &git).unwrap_or_default();
         return ProjectContext {
             platform,
             pkg_root: Some(pkg_root),
@@ -2725,6 +2734,94 @@ pub(crate) mod tests {
             warning.message
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── git dependencies in the editor (proposal/distribution.md §5) ──
+
+    // The editor's half of the git-dependency policy: **it never fetches**.
+    // The repository below is real, local, correct and one `clone` away — and
+    // the language server still must not take it, because analysis runs on
+    // every keystroke and must not reach the network (nor write into the
+    // user's cache) behind their back. The dependency simply stays unresolved
+    // until a `vilan build` fetches it, which is the same degradation this
+    // call has always had for an unresolvable manifest.
+    #[test]
+    fn the_editor_never_fetches_a_git_dependency() {
+        let root = std::env::temp_dir().join(format!("vilan_lsp_gitdep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repository = root.join("shapes");
+        std::fs::create_dir_all(repository.join("src")).unwrap();
+        std::fs::write(
+            repository.join("vilan.toml"),
+            "[library]\nname = \"shapes\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repository.join("src/lib.vl"),
+            "fun greeting(): str { \"hi\" }\n",
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=vilan test",
+                    "-c",
+                    "user.email=test@vilan.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(arguments)
+                .current_dir(&repository)
+                .output()
+                .expect("git must be installed for this pin");
+            assert!(output.status.success(), "git {arguments:?} failed");
+        };
+        git(&["init", "--quiet", "."]);
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        git(&["tag", "v1.0.0"]);
+        let url = format!("file://{}", repository.display());
+
+        let (dir, document) = analyze_workspace(&[
+            (
+                "src/main.vl",
+                "import shapes::greeting;\n\nfun main() {\n\tgreeting();\n}\n",
+            ),
+            (
+                "vilan.toml",
+                &format!(
+                    "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+                     shapes = {{ git = \"{url}\", tag = \"v1.0.0\" }}\n"
+                ),
+            ),
+        ]);
+        let published = document.published_diagnostics();
+        assert!(
+            published
+                .iter()
+                .any(|item| item.message.contains("cannot find module 'shapes'") && !item.warning),
+            "an unfetched git dependency stays unresolved: {:?}",
+            published
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        // ...and nothing was written into the real cache: the entry for this
+        // (unique, temp-directory) URL must not exist.
+        let source = vilan_core::git_dep::GitSource {
+            url,
+            reference: vilan_core::git_dep::GitRef::Tag("v1.0.0".to_string()),
+        };
+        let entry =
+            vilan_core::git_dep::entry_path(&vilan_embedded_std::default_git_dep_root(), &source);
+        assert!(
+            !entry.exists(),
+            "the editor must not populate the git cache: {}",
+            entry.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── platform coloring in the editor (proposal/platform-coloring.md, phase 2) ──

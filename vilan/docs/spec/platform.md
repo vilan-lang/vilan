@@ -55,8 +55,10 @@ The manifest declares what a directory builds. Sections:
 - **`[package]`** — an application or plain package: `name`,
   `description`, `root` (source root; default `src/`), `entry` (the
   entry file, when there is exactly one), `target` (a platform;
-  default `node`), and `dependencies` (name → `{ path = "…" }`; path
-  dependencies only — registry dependencies are future work).
+  default `node`), and `dependencies` (name → `{ path = "…" }` for a
+  local directory, or `{ git = "…", tag | rev = "…" }` for a `[library]`
+  repository pinned to exactly one of a tag or a commit — registry
+  dependencies are future work).
 - **`[entry.<name>]`** — one build entry per table: `path` (default
   `<root>/<name>.vl`) and `target` (default `node`). A package with
   entries builds each for its own platform; reachability (§11.2) is

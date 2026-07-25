@@ -67,6 +67,22 @@ imported by other packages:
 name = "common"
 ```
 
+A dependency can also live in a git repository, pinned to one exact
+point — a tag or a commit, never a branch:
+
+```toml
+[package.dependencies]
+shapes = { git = "https://github.com/someone/shapes", tag = "v1.2.0" }
+pinned = { git = "https://github.com/someone/other", rev = "9f2c1ab" }
+```
+
+The repository must be a `[library]` with its `vilan.toml` at the root.
+`vilan build` (or `check`, or `run`) fetches it once into
+`~/.vilan/git-deps/` and reuses that checkout forever after — so builds
+work offline, and a moved tag cannot change what you already built.
+Nothing else fetches: the editor uses the cache when it's there and
+never reaches the network.
+
 A workspace groups several packages so they build together with one
 `vilan build .` at the root:
 
