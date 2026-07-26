@@ -2609,8 +2609,17 @@ impl<'src> Analyzer<'src> {
 
     /// A field type is Wire iff it is a Wire scalar
     /// (`str`/`i32`/`u32`/`i64`/`f64`/`bool`), a `List`/`Option` of Wire
-    /// (recursing into the element), or a named `[derive(Wire)]` type.
-    /// Everything else is not Wire.
+    /// (recursing into the element), or a named `[derive(Wire)]` type —
+    /// including an *applied* one (`Handle<Node>`). Everything else is not Wire.
+    ///
+    /// A derived type's generic arguments are deliberately unconstrained (C7's
+    /// phantom-parameter condition): a `[derive(Wire)]` type can only ever have
+    /// PHANTOM parameters, because a field typed by a parameter (`value: T`, or
+    /// `List<T>`) fails this very check at the type's own declaration — the
+    /// derive emits no generic impls. So the arguments cannot reach the payload,
+    /// and `Handle<Database>` is as sendable as `Handle<i32>` (a name is not the
+    /// thing it names). If generic Wire derives ever land, the argument check
+    /// lands with them.
     fn is_wire_type(&self, node: &Node) -> bool {
         match node {
             Node::Accessor(name) => {
@@ -2618,6 +2627,9 @@ impl<'src> Analyzer<'src> {
                     || self.wire_names.contains(*name)
             }
             Node::AccessorWithGenerics(name, arguments) => {
+                if self.wire_names.contains(*name) {
+                    return true;
+                }
                 matches!(*name, "List" | "Option")
                     && arguments
                         .0

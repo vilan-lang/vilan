@@ -589,3 +589,192 @@ fn the_walkthrough_example_builds() {
     assert!(example.join("dist/client.css").is_file());
     assert!(example.join("dist/server.js").is_file());
 }
+
+// --- A15's follow-up: the manifest-designated default `run` entry -----------
+
+/// A node entry whose stdout says which leg ran.
+fn marker_source(marker: &str) -> String {
+    format!("import std::print;\n\nfun main() {{\n\tprint(\"{marker}\");\n}}\n")
+}
+
+#[test]
+fn a_workspace_runs_its_designated_default_member() {
+    // Two node members, so `run` used to demand `--entry`; `[project]
+    // default-entry` designates one and the flag becomes optional.
+    let dir = temp_project("default_member");
+    write(
+        &dir,
+        "vilan.toml",
+        "[project]\npackages = [\"api\", \"jobs\"]\ndefault-entry = \"jobs\"\n",
+    );
+    write(&dir, "api/vilan.toml", "[package]\nname = \"api\"\n");
+    write(&dir, "api/src/main.vl", &marker_source("API_RAN"));
+    write(&dir, "jobs/vilan.toml", "[package]\nname = \"jobs\"\n");
+    write(&dir, "jobs/src/main.vl", &marker_source("JOBS_RAN"));
+
+    let designated = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&designated);
+    assert!(
+        designated.status.success() && text.contains("JOBS_RAN") && !text.contains("API_RAN"),
+        "the designated member should have run: {text}"
+    );
+
+    // The flag still wins — a one-off overrides the standing designation.
+    let overridden = vilan(&["run", "--entry", "api", dir.to_str().unwrap()]);
+    let text = combined(&overridden);
+    assert!(
+        overridden.status.success() && text.contains("API_RAN") && !text.contains("JOBS_RAN"),
+        "`--entry` should override the manifest: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_multi_entry_package_runs_its_designated_default_entry() {
+    // The other shape with the same problem: one package, several node
+    // `[entry.<name>]` sections. The same key, on `[package]`.
+    let dir = temp_project("default_entry");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+         [entry.server]\n\n[entry.probe]\n",
+    );
+    write(&dir, "src/server.vl", &marker_source("SERVER_RAN"));
+    write(&dir, "src/probe.vl", &marker_source("PROBE_RAN"));
+
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && text.contains("SERVER_RAN") && !text.contains("PROBE_RAN"),
+        "the designated entry should have run: {text}"
+    );
+    // The non-selected entry still compiles into the project.
+    assert!(dir.join("dist/probe.js").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_undesignated_multi_node_project_names_both_ways_to_choose() {
+    let dir = temp_project("undesignated");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.server]\n\n[entry.probe]\n",
+    );
+    write(&dir, "src/server.vl", &marker_source("SERVER_RAN"));
+    write(&dir, "src/probe.vl", &marker_source("PROBE_RAN"));
+
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success()
+            && text.contains("--entry <name>")
+            && text.contains("`[package] default-entry`")
+            && text.contains("probe, server"),
+        "unexpected output: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- A9: `[build] run` hooks ------------------------------------------------
+
+#[test]
+fn a_build_hook_runs_before_the_build_that_consumes_it() {
+    // The ordering is observable, not asserted: the hook GENERATES a module the
+    // entry imports. If hooks ran after the build (or not at all), the compile
+    // would fail on the missing module.
+    let dir = temp_project("hook_before");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[build]\n\
+         run = \"printf 'fun generated(): i32 { 41 }\\n' > src/generated.vl\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::print;\nimport pkg::generated::generated;\n\
+         fun main() { print(generated() + 1) }\n",
+    );
+    // The generated module does not exist yet — only the hook creates it.
+    assert!(!dir.join("src/generated.vl").exists());
+
+    let output = vilan(&["run", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && text.contains("42"),
+        "the hook should have produced the module the build consumed: {text}"
+    );
+    assert!(dir.join("src/generated.vl").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failing_build_hook_fails_the_build_and_names_the_command() {
+    let dir = temp_project("hook_fails");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[build]\nrun = [\"exit 3\", \"touch never-reached\"]\n",
+    );
+    write(&dir, "src/main.vl", &marker_source("APP_RAN"));
+
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("exit 3"),
+        "the failure should name the command: {text}"
+    );
+    // The build never happened, and neither did the hook after the failing one.
+    assert!(!dir.join("src/main.js").exists());
+    assert!(!dir.join("never-reached").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hooks_run_in_declaration_order_from_the_manifests_directory() {
+    // Sequential, in order, with the manifest's directory as the working
+    // directory — so a relative path in a hook means what it says in the file
+    // that declares it.
+    let dir = temp_project("hook_order");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[build]\n\
+         run = [\"echo one > order.txt\", \"echo two >> order.txt\"]\n",
+    );
+    write(&dir, "src/main.vl", &marker_source("APP_RAN"));
+
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let order = std::fs::read_to_string(dir.join("order.txt")).expect("the hooks wrote it");
+    assert_eq!(order, "one\ntwo\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_hooks_is_no_change_and_check_never_runs_them() {
+    // Two halves of "costs nothing": a manifest with no `[build] run` builds
+    // exactly as before, and `vilan check` — which produces no artifacts — runs
+    // no hooks even when they are declared.
+    let plain = temp_project("hook_absent");
+    write(&plain, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&plain, "src/main.vl", &marker_source("APP_RAN"));
+    let output = vilan(&["build", plain.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(plain.join("src/main.js").is_file());
+    let _ = std::fs::remove_dir_all(&plain);
+
+    let checked = temp_project("hook_check");
+    write(
+        &checked,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[build]\nrun = [\"touch ran-during-check\"]\n",
+    );
+    write(&checked, "src/main.vl", &marker_source("APP_RAN"));
+    let output = vilan(&["check", checked.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(!checked.join("ran-during-check").exists());
+    let _ = std::fs::remove_dir_all(&checked);
+}

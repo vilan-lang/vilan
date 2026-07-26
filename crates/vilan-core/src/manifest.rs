@@ -76,6 +76,10 @@ pub struct Package {
     /// The default build platform (`node` / `deno` / `bun` / `browser` / `none`).
     /// Default `node`.
     pub target: Option<String>,
+    /// Which `[entry.<name>]` `vilan run` executes when the package declares
+    /// several node entries (A15's follow-up). `--entry` still overrides it.
+    #[serde(rename = "default-entry")]
+    pub default_entry: Option<String>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
 }
@@ -122,6 +126,11 @@ impl Library {
 pub struct Project {
     #[serde(default)]
     pub packages: Vec<PathBuf>,
+    /// Which member `vilan run` executes when the workspace has several node
+    /// packages (A15's follow-up) — the member's `[package] name`. `--entry`
+    /// still overrides it.
+    #[serde(rename = "default-entry")]
+    pub default_entry: Option<String>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
 }
@@ -352,10 +361,33 @@ impl Dependency {
     }
 }
 
-/// The `[build]` code-generation knobs, deserialized before resolving against a
-/// preset (see [`Manifest::build_options`]).
+/// The `[build] run` hooks (A9): external commands run before each build. One
+/// command may be written bare (`run = "npx tailwindcss …"`); several go in a
+/// list, and run in declaration order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RunHooks {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RunHooks {
+    /// The declared commands, in order.
+    pub fn commands(&self) -> &[String] {
+        match self {
+            RunHooks::One(command) => std::slice::from_ref(command),
+            RunHooks::Many(commands) => commands,
+        }
+    }
+}
+
+/// The `[build]` section: the code-generation knobs, deserialized before
+/// resolving against a preset (see [`Manifest::build_options`]), plus the `run`
+/// hooks.
 #[derive(Debug, Default, Deserialize)]
 pub struct Build {
+    /// Commands to run before each build (A9). See [`Manifest::build_hooks`].
+    pub run: Option<RunHooks>,
     pub preset: Option<String>,
     pub indent: Option<bool>,
     pub spaces: Option<bool>,
@@ -447,6 +479,19 @@ impl Manifest {
         if let Some(library) = &self.library {
             self.validate_library(library, &mut errors);
         }
+        // A workspace's default entry names a MEMBER package, whose name is
+        // validated in that member's own manifest — all this one can check is
+        // the shape (a name that isn't an identifier could never match).
+        if let Some(project) = &self.project {
+            if let Some(name) = &project.default_entry {
+                if !is_identifier(name) {
+                    errors.push(format!(
+                        "`[project] default-entry` must name a member package \
+                         (got `{name}`)"
+                    ));
+                }
+            }
+        }
         // The `[project.dependencies]` table is the one members inherit FROM,
         // so it is the one table that cannot itself inherit.
         for (table, inheritable, dependencies) in [
@@ -479,6 +524,20 @@ impl Manifest {
                     ));
                 }
             }
+            // A blank hook would spawn a shell to do nothing, and fail
+            // confusingly; a declaration that does nothing is what a manifest
+            // error is for.
+            if self
+                .build_hooks()
+                .iter()
+                .any(|command| command.trim().is_empty())
+            {
+                errors.push(
+                    "`[build] run` has an empty command — each entry is a command line \
+                     for the platform shell (`npx tailwindcss -i src/app.css -o dist/app.css`)"
+                        .to_string(),
+                );
+            }
         }
         errors
     }
@@ -494,6 +553,25 @@ impl Manifest {
         if let Some(target) = &package.target {
             if let Err(error) = Platform::parse(target) {
                 errors.push(format!("invalid `[package] target`: {error}"));
+            }
+        }
+        // The designated default entry names one of this package's
+        // `[entry.<name>]` sections — checkable right here, so a typo is a
+        // manifest error rather than a `run` that picks the wrong leg.
+        if let Some(name) = &package.default_entry {
+            if self.entries.is_empty() {
+                errors.push(format!(
+                    "`[package] default-entry = \"{name}\"` has nothing to choose \
+                     between — it names one of several `[entry.<name>]` sections, \
+                     and this package declares none (its single `entry` is already \
+                     what `vilan run` runs)"
+                ));
+            } else if !self.entries.contains_key(name) {
+                errors.push(format!(
+                    "`[package] default-entry = \"{name}\"` names no `[entry.{name}]` \
+                     section — declared entries: {}",
+                    self.entries.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
             }
         }
     }
@@ -582,6 +660,32 @@ impl Manifest {
                 }
             }
         }
+    }
+
+    /// The build unit `vilan run` executes when this manifest offers a choice
+    /// (A15's follow-up): the `[entry.<name>]` a `[package]` designates, or the
+    /// member package a `[project]` does. One accessor, because the two shapes
+    /// lower onto the same workspace orchestration — both name a build unit.
+    /// `--entry` overrides it; `None` means no designation.
+    pub fn default_entry(&self) -> Option<&str> {
+        self.package
+            .as_ref()
+            .and_then(|package| package.default_entry.as_deref())
+            .or_else(|| {
+                self.project
+                    .as_ref()
+                    .and_then(|project| project.default_entry.as_deref())
+            })
+    }
+
+    /// The `[build] run` hooks (A9), in declaration order — the commands to run
+    /// before each build. Empty when none are declared.
+    pub fn build_hooks(&self) -> &[String] {
+        self.build
+            .as_ref()
+            .and_then(|build| build.run.as_ref())
+            .map(RunHooks::commands)
+            .unwrap_or_default()
     }
 
     /// Resolves the `[build]` options: a `preset` (default `debug`) initializes
@@ -2151,6 +2255,81 @@ mod tests {
                 .validate()
                 .iter()
                 .any(|e| e.contains("free of `..`"))
+        );
+    }
+
+    // --- A15's follow-up: a manifest-designated default `run` entry ---------
+
+    #[test]
+    fn a_package_designates_a_default_entry() {
+        // The single-package multi-entry shape: `default-entry` names one of the
+        // `[entry.<name>]` sections, and the accessor hands it to the CLI.
+        let manifest = parse(
+            "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+             [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+        );
+        assert!(manifest.validate().is_empty());
+        assert_eq!(manifest.default_entry(), Some("server"));
+    }
+
+    #[test]
+    fn a_project_designates_a_default_member() {
+        // The workspace shape: the same key on `[project]`, naming a member
+        // package. One accessor covers both shapes.
+        let manifest =
+            parse("[project]\npackages = [\"api\", \"jobs\"]\ndefault-entry = \"jobs\"\n");
+        assert!(manifest.validate().is_empty());
+        assert_eq!(manifest.default_entry(), Some("jobs"));
+    }
+
+    #[test]
+    fn no_designation_is_no_designation() {
+        // Absent in both shapes — the CLI falls back to a lone Node leg or the
+        // ambiguity error.
+        assert_eq!(
+            parse("[package]\nname = \"app\"\n\n[entry.a]\n\n[entry.b]\n").default_entry(),
+            None
+        );
+        assert_eq!(
+            parse("[project]\npackages = [\"a\"]\n").default_entry(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_package_default_entry_must_name_a_declared_entry() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\ndefault-entry = \"workr\"\n\n\
+             [entry.client]\ntarget = \"browser\"\n\n[entry.worker]\n",
+        );
+        assert!(manifest.validate().iter().any(
+            |e| e.contains("names no `[entry.workr]` section") && e.contains("client, worker")
+        ));
+    }
+
+    #[test]
+    fn a_package_default_entry_needs_entries_to_choose_between() {
+        // A single-entry package already has exactly one thing to run, so the
+        // key would designate nothing — say so rather than ignore it.
+        let manifest = parse("[package]\nname = \"app\"\ndefault-entry = \"app\"\n");
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|e| e.contains("has nothing to choose between"))
+        );
+    }
+
+    #[test]
+    fn a_project_default_entry_must_look_like_a_package_name() {
+        // A member's name is validated in the member's own manifest, so all this
+        // one can catch is a name no package could ever have.
+        let manifest = parse("[project]\npackages = [\"api\"]\ndefault-entry = \"not an id\"\n");
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|e| e.contains("`[project] default-entry` must name a member package"))
         );
     }
 

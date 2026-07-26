@@ -478,45 +478,68 @@ pub fn classify(
 /// unbounded event payload.
 pub const OVERLAY_DIAGNOSTIC_CAP: usize = 20;
 
-/// One diagnostic bound for the browser error overlay: a byte span into the
-/// entry source, the already-built message (the SAME text the terminal renders —
-/// an analyzer `error.msg`, or the parser's `render` — this module never rebuilds
-/// it, only frames it), and an optional note.
+/// One diagnostic bound for the browser error overlay: the **file it belongs
+/// to** with the 1-based location inside it, the already-built message (the SAME
+/// text the terminal renders — an analyzer `error.msg`, or the parser's `render`
+/// — this module never rebuilds it, only frames it), and an optional note.
+///
+/// The location is resolved at capture time rather than at render time (E16's
+/// residual): a diagnostic's span indexes into *its own* file, so only the
+/// caller — which holds every loaded source — can map it. Rendering then needs
+/// no source text at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayDiagnostic {
-    pub span: std::ops::Range<usize>,
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
     pub message: String,
     pub note: Option<String>,
 }
 
+impl OverlayDiagnostic {
+    /// Captures a diagnostic against the source its span indexes into: `file`
+    /// names that source and `text` is its content, so a module diagnostic
+    /// resolves in the module and the entry's in the entry.
+    pub fn located(
+        file: &str,
+        text: &str,
+        span: std::ops::Range<usize>,
+        message: String,
+        note: Option<String>,
+    ) -> OverlayDiagnostic {
+        let (line, column) = line_col(text, span.start);
+        OverlayDiagnostic {
+            file: file.to_string(),
+            line,
+            column,
+            message,
+            note,
+        }
+    }
+}
+
 /// Renders a failed leg's diagnostics as ANSI-free plain text for the `error`
-/// event (the in-page overlay, hmr.md §§2/§6). A per-file header line, then each
-/// diagnostic as `<file>:<line>:<col>  <message>` with any note indented beneath,
-/// diagnostics separated by a blank line. Line/column are 1-based, computed from
-/// the byte span against `src` — the same source the terminal renders — mirroring
-/// the LSP's byte→line/col mapping without depending on that crate. Capped at
-/// `cap`; the remainder collapses to a trailing "… and N more". The terminal path
-/// is untouched: this is a second, additive rendering of the same messages.
-pub fn render_overlay(
-    filename: &str,
-    src: &str,
-    diagnostics: &[OverlayDiagnostic],
-    cap: usize,
-) -> String {
+/// event (the in-page overlay, hmr.md §§2/§6). A header line naming the leg,
+/// then each diagnostic as `<file>:<line>:<col>` / `<message>` with any note
+/// indented beneath, diagnostics separated by a blank line. Each diagnostic
+/// names **its own** file (E16), so a module error points at the module rather
+/// than at the leg's entry. Capped at `cap`; the remainder collapses to a
+/// trailing "… and N more". The terminal path is untouched: this is a second,
+/// additive rendering of the same messages.
+pub fn render_overlay(leg_file: &str, diagnostics: &[OverlayDiagnostic], cap: usize) -> String {
     use std::fmt::Write;
     let shown = diagnostics.len().min(cap);
-    let mut out = format!("{filename} — {} error", diagnostics.len());
+    let mut out = format!("{leg_file} — {} error", diagnostics.len());
     if diagnostics.len() != 1 {
         out.push('s');
     }
     for diagnostic in diagnostics.iter().take(cap) {
-        let (line, column) = line_col(src, diagnostic.span.start);
         // `file:line:col` on its own line (the shim styles it as a distinct
         // location line), then the message — the SAME text the terminal renders.
         let _ = write!(
             out,
-            "\n\n{filename}:{line}:{column}\n{}",
-            diagnostic.message
+            "\n\n{}:{}:{}\n{}",
+            diagnostic.file, diagnostic.line, diagnostic.column, diagnostic.message
         );
         if let Some(note) = &diagnostic.note {
             let _ = write!(out, "\n    note: {note}");
@@ -755,18 +778,16 @@ mod tests {
         // `broken` starts at byte 22 (line 2, column 10 — after "\tlet x = ",
         // the leading tab counting as one column).
         let diagnostics = vec![
-            OverlayDiagnostic {
-                span: 22..28,
-                message: "cannot find `broken` in this scope".to_string(),
-                note: Some("declared nowhere".to_string()),
-            },
-            OverlayDiagnostic {
-                span: 0..3,
-                message: "second problem".to_string(),
-                note: None,
-            },
+            OverlayDiagnostic::located(
+                "src/app.vl",
+                src,
+                22..28,
+                "cannot find `broken` in this scope".to_string(),
+                Some("declared nowhere".to_string()),
+            ),
+            OverlayDiagnostic::located("src/app.vl", src, 0..3, "second problem".to_string(), None),
         ];
-        let rendered = render_overlay("src/app.vl", src, &diagnostics, OVERLAY_DIAGNOSTIC_CAP);
+        let rendered = render_overlay("src/app.vl", &diagnostics, OVERLAY_DIAGNOSTIC_CAP);
         assert_eq!(
             rendered,
             "src/app.vl — 2 errors\n\n\
@@ -781,16 +802,41 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_names_each_diagnostics_own_file() {
+        // E16's residual: the leg's entry heads the overlay, but a diagnostic
+        // that belongs to a MODULE names that module — and its line/column are
+        // resolved against the module's own text, not the entry's.
+        let entry = "import pkg::helper;\n\nfun main() {\n\thelper::go()\n}\n";
+        let module = "fun go() {\n\tlet x = broken\n}\n";
+        let diagnostics = vec![OverlayDiagnostic::located(
+            "src/helper.vl",
+            module,
+            // `broken` starts at byte 20 of the MODULE (line 2, column 10).
+            20..26,
+            "cannot find `broken` in this scope".to_string(),
+            None,
+        )];
+        let rendered = render_overlay("src/main.vl", &diagnostics, OVERLAY_DIAGNOSTIC_CAP);
+        assert_eq!(
+            rendered,
+            "src/main.vl — 1 error\n\n\
+             src/helper.vl:2:10\n\
+             cannot find `broken` in this scope"
+        );
+        // The entry's own text would have put the same offset elsewhere — the
+        // pin is that the module's text decided.
+        assert_ne!(line_col(entry, 20), (2, 10));
+    }
+
+    #[test]
     fn the_overlay_caps_and_counts_the_remainder() {
         let src = "x\n";
         let diagnostics: Vec<OverlayDiagnostic> = (0..25)
-            .map(|index| OverlayDiagnostic {
-                span: 0..1,
-                message: format!("problem {index}"),
-                note: None,
+            .map(|index| {
+                OverlayDiagnostic::located("a.vl", src, 0..1, format!("problem {index}"), None)
             })
             .collect();
-        let rendered = render_overlay("a.vl", src, &diagnostics, 20);
+        let rendered = render_overlay("a.vl", &diagnostics, 20);
         assert!(rendered.starts_with("a.vl — 25 errors\n"));
         assert!(rendered.contains("a.vl:1:1\nproblem 0"));
         assert!(rendered.contains("a.vl:1:1\nproblem 19"));

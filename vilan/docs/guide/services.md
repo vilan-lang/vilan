@@ -142,6 +142,50 @@ The codec is chosen at connect time: `json_codec()` for a readable wire,
 `binary_codec()` for a compact one. Client and server must use the same
 one.
 
+## Naming server entities: `Handle<T>`
+
+Payloads carry *data*. When a client needs to talk about a **thing the
+server owns** — the node to update, the draft to commit, the route's
+entity — it needs a name for it, and the name has to survive the round
+trip. That name is `Handle<T>` from `std::arena`, which is `Wire`:
+
+```vilan,fragment
+[derive(Wire)]
+struct Rename { node: Handle<Doc>, title: str }
+
+[service]
+struct Docs {
+	docs: Arena<Doc>,
+}
+```
+
+The server hands out handles; the client stores them and quotes them
+back. Only `{ index, generation }` travels — the `T` is phantom — so the
+entity itself never has to be Wire, and never has to leave the server.
+
+The payoff is what happens when the entity is gone. The arena's
+generation check answers a stale handle with `None`, so a client acting
+on something another client just deleted gets a clean "not there"
+instead of a phantom write into a reused slot. It is the same rule local
+code already lives by, extended to the wire, and it is why a handle
+beats an integer id you check by hand.
+
+**Scope the arena to the session.** `(index, generation)` is guessable, so
+an arena shared across tenants hands every client names that mean
+something to the others. Create the arena when the session is
+established and drop it with the session: a handle from one session then
+names nothing in another, by construction. Authorize the session first;
+then look the handle up in that session's arena.
+
+When the arena genuinely has to be shared, `Arena::branded()` numbers its
+generations from a random base instead of `0`, so its handles resolve to
+`None` in any other arena rather than naming the slot of the same index.
+Nothing else changes — staleness, reuse and the `None` answer are as
+before. Treat it as a confusion guard, not an authorization check: the
+brand rides inside the handles it issues, so a client with one valid
+handle can derive it. It keeps tenants' names from colliding; the session
+check is still what decides who may act.
+
 ## What rpc calls do
 
 - On the client they return `Result<T, RpcError>` and are implicitly

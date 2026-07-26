@@ -36,6 +36,11 @@
           "enum": ["node", "deno", "bun", "browser", "none"],
           "default": "node"
         },
+        "default-entry": {
+          "type": "string",
+          "description": "Which `[entry.<name>]` `vilan run` executes when several are runnable. `--entry` overrides it.",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
         "dependencies": {
           "$ref": "#/definitions/dependencies"
         }
@@ -110,6 +115,11 @@
           "description": "Paths to the member package directories — the build set of `vilan build .` at the root.",
           "items": { "type": "string" }
         },
+        "default-entry": {
+          "type": "string",
+          "description": "Which member package `vilan run` executes when several are runnable. `--entry` overrides it.",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
         "dependencies": {
           "$ref": "#/definitions/dependencies"
         }
@@ -137,9 +147,16 @@
     },
     "build": {
       "type": "object",
-      "description": "Code-generation options. A `preset` initializes every knob; individual keys then override it.",
+      "description": "Build settings: the `run` hooks, plus the code-generation options (a `preset` initializes every knob; individual keys then override it).",
       "additionalProperties": false,
       "properties": {
+        "run": {
+          "description": "Commands to run through the platform shell BEFORE each build, in this manifest's directory. One bare command, or several in a list, run in order. A failure fails the build.",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
         "preset": {
           "type": "string",
           "description": "A named starting point. `debug` is readable (indented, source names); `release` is minified and obfuscated.",

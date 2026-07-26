@@ -21,7 +21,7 @@ function sum_from(arena, handle) {
 	return $z;
 }
 function $a() {
-	return [ [  ], [  ] ];
+	return [ [  ], [  ], 0 ];
 }
 function $b(self, value) {
 	const $c = __list_pop(self[1]);
@@ -32,8 +32,8 @@ function $b(self, value) {
 		$d = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;
-		self[0].push([ 0, value ]);
-		$d = [ index2, 0 ];
+		self[0].push([ self[2], value ]);
+		$d = [ index2, self[2] ];
 	}
 	return $d;
 }
@@ -90,7 +90,7 @@ function $p(self) {
 	return $q[0] === 0;
 }
 function $r() {
-	return [ [  ], [  ] ];
+	return [ [  ], [  ], 0 ];
 }
 function $s(self, value) {
 	const $t = __list_pop(self[1]);
@@ -101,8 +101,8 @@ function $s(self, value) {
 		$u = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;
-		self[0].push([ 0, value ]);
-		$u = [ index2, 0 ];
+		self[0].push([ self[2], value ]);
+		$u = [ index2, self[2] ];
 	}
 	return $u;
 }

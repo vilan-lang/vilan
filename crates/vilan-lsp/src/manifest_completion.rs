@@ -195,6 +195,12 @@ pub const TABLES: &[Table] = &[
                 values: ValueSet::Platform,
             },
             Key {
+                name: "default-entry",
+                documentation: "Which `[entry.<name>]` `vilan run` executes when several \
+                                are runnable. `--entry` overrides it.",
+                values: ValueSet::Open,
+            },
+            Key {
                 name: "dependencies",
                 documentation: "The packages this one may import, by the name it imports \
                                 them under. Usually written as `[package.dependencies]`.",
@@ -267,6 +273,12 @@ pub const TABLES: &[Table] = &[
                 values: ValueSet::Open,
             },
             Key {
+                name: "default-entry",
+                documentation: "Which member package `vilan run` executes when several are \
+                                runnable. `--entry` overrides it.",
+                values: ValueSet::Open,
+            },
+            Key {
                 name: "dependencies",
                 documentation: "Dependencies declared once for the members. A member takes \
                                 one with `dep = { project = true }`. Usually written as \
@@ -296,10 +308,17 @@ pub const TABLES: &[Table] = &[
     },
     Table {
         path: "build",
-        documentation: "Code-generation options. A `preset` initializes every knob; \
-                        individual keys then override it. Build options never change program \
-                        semantics, only the emitted text.",
+        documentation: "Build settings: the `run` hooks, plus the code-generation knobs (a \
+                        `preset` initializes every knob; individual keys then override it). \
+                        The knobs never change program semantics, only the emitted text.",
         keys: &[
+            Key {
+                name: "run",
+                documentation: "Commands to run through the platform shell BEFORE each \
+                                build, in the manifest's directory. One bare, or several in \
+                                a list. A failure fails the build.",
+                values: ValueSet::Open,
+            },
             Key {
                 name: "preset",
                 documentation: "A named starting point: `debug` is readable, `release` is \

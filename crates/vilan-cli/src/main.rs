@@ -228,19 +228,38 @@ fn build_once(
     platform: Option<String>,
     debug: bool,
 ) -> ExitCode {
-    with_project(file, |project| match project {
-        Project::Single {
-            unit,
-            platform: package_platform,
-        } => match effective_platform(platform.as_deref(), package_platform) {
-            Ok(Platform::None) => no_host_platform(),
-            Ok(platform) => build_single(&unit, stdout, platform, debug),
-            Err(message) => report_error(&message),
-        },
-        // A workspace builds each member for its own declared platform, so the
-        // `--platform` flag doesn't apply.
-        Project::Workspace { root, members } => build_workspace(&root, &members, debug),
-        Project::Library { name, .. } => not_buildable_library(&name),
+    with_project(file, |project| {
+        if let Err(code) = run_build_hooks(&project) {
+            return code;
+        }
+        match project {
+            Project::Single {
+                unit,
+                platform: package_platform,
+                ..
+            } => match effective_platform(platform.as_deref(), package_platform) {
+                Ok(Platform::None) => no_host_platform(),
+                Ok(platform) => build_single(&unit, stdout, platform, debug),
+                Err(message) => report_error(&message),
+            },
+            // A workspace builds each member for its own declared platform, so the
+            // `--platform` flag doesn't apply.
+            Project::Workspace { root, members, .. } => build_workspace(&root, &members, debug),
+            Project::Library { name, .. } => not_buildable_library(&name),
+        }
+    })
+}
+
+/// Runs the project's `[build] run` hooks before it is built (A9), reporting
+/// and failing on the first that fails. `vilan check` deliberately doesn't call
+/// this: it produces no artifacts, so there is nothing for a hook to feed.
+fn run_build_hooks(project: &Project) -> Result<(), ExitCode> {
+    let Some(hooks) = project.hooks() else {
+        return Ok(());
+    };
+    hooks.run().map_err(|message| {
+        eprintln!("{} {message}", paint::error_prefix());
+        ExitCode::FAILURE
     })
 }
 
@@ -251,6 +270,7 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> E
         Project::Single {
             unit,
             platform: package_platform,
+            ..
         } => match effective_platform(platform.as_deref(), package_platform) {
             // A `none` package is a pure library — not buildable, but type-checkable
             // (against the base layer only).
@@ -266,22 +286,32 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> E
 /// propagating its code (the blocking, non-`--watch` path). `entry` picks the
 /// Node leg to run in a multi-node workspace (A15).
 fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> ExitCode {
-    with_project(file, |project| match project {
-        Project::Single { unit, platform } => {
-            let platform = platform.unwrap_or_default();
-            if matches!(platform, Platform::Node { .. }) {
-                run_single(&unit, args)
-            } else {
-                eprintln!(
-                    "{} `vilan run` executes with Node, but the package platform is `{}`",
-                    paint::error_prefix(),
-                    platform.name()
-                );
-                ExitCode::FAILURE
-            }
+    with_project(file, |project| {
+        if let Err(code) = run_build_hooks(&project) {
+            return code;
         }
-        Project::Workspace { root, members } => run_workspace(&root, &members, args, entry),
-        Project::Library { name, .. } => not_buildable_library(&name),
+        match project {
+            Project::Single { unit, platform, .. } => {
+                let platform = platform.unwrap_or_default();
+                if matches!(platform, Platform::Node { .. }) {
+                    run_single(&unit, args)
+                } else {
+                    eprintln!(
+                        "{} `vilan run` executes with Node, but the package platform is `{}`",
+                        paint::error_prefix(),
+                        platform.name()
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+            Project::Workspace {
+                root,
+                members,
+                default_entry,
+                ..
+            } => run_workspace(&root, &members, args, entry, &default_entry),
+            Project::Library { name, .. } => not_buildable_library(&name),
+        }
     })
 }
 
@@ -499,7 +529,7 @@ struct WatchState {
 /// project isn't HMR-eligible.
 fn activate_hmr(file: &Option<PathBuf>, port: u16) -> Option<hmr::DevChannel> {
     let project = resolve_project(file.clone()).ok()?;
-    let Project::Workspace { root, members } = &project else {
+    let Project::Workspace { root, members, .. } = &project else {
         return None;
     };
     if !members
@@ -544,8 +574,13 @@ fn hmr_round(
     child: Option<ManagedChild>,
     entry: Option<&str>,
 ) -> Option<ManagedChild> {
-    let (root, members) = match resolve_project(file) {
-        Ok(Project::Workspace { root, members }) => (root, members),
+    let (root, members, default_entry, hooks) = match resolve_project(file) {
+        Ok(Project::Workspace {
+            root,
+            members,
+            default_entry,
+            hooks,
+        }) => (root, members, default_entry, hooks),
         // The project stopped being an HMR-eligible workspace (a manifest edit,
         // say). Report it as a failed round: overlay + keep the last good build.
         Ok(_) | Err(_) => {
@@ -558,6 +593,17 @@ fn hmr_round(
             return child;
         }
     };
+
+    // The `[build] run` hooks run once per round, before this round's compile
+    // (A9) — a Tailwind bridge regenerates its CSS from the sources that just
+    // changed. A failing hook fails the round like a failing compile: report,
+    // overlay, keep the last good build.
+    if let Err(message) = hooks.run() {
+        eprintln!("{} {message}", paint::error_prefix());
+        state.failed = true;
+        channel.push("error", Some("build failed — see the terminal"));
+        return child;
+    }
 
     // Decide which legs this round may SKIP — reuse the previous artifact for
     // rather than recompile (backlog E12, half b). Reuse is decided by CONTENT,
@@ -674,7 +720,7 @@ fn hmr_round(
     // served — a change to one of them drives no restart (the classifier keys the
     // restart on the SELECTED leg only). An ambiguous choice is reported below,
     // when a restart is actually attempted.
-    let selection = select_node_entry(&members, entry);
+    let selection = select_node_entry(&members, entry, &default_entry);
     let server_leg = match &selection {
         Ok(Some(unit)) => Some(unit.name.as_str()),
         _ => None,
@@ -861,6 +907,10 @@ fn build_and_spawn_run(
             return None;
         }
     };
+    // The plain (non-HMR) watch round builds too, so its hooks run first (A9).
+    if run_build_hooks(&project).is_err() {
+        return None;
+    }
     let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd) {
         Ok(child) => Some(child),
         Err(error) => {
@@ -869,7 +919,7 @@ fn build_and_spawn_run(
         }
     };
     match project {
-        Project::Single { unit, platform } => {
+        Project::Single { unit, platform, .. } => {
             let platform = platform.unwrap_or_default();
             if !matches!(platform, Platform::Node { .. }) {
                 eprintln!(
@@ -899,8 +949,13 @@ fn build_and_spawn_run(
             }
             launch(&script, None)
         }
-        Project::Workspace { root, members } => {
-            let server = match select_node_entry(&members, entry) {
+        Project::Workspace {
+            root,
+            members,
+            default_entry,
+            ..
+        } => {
+            let server = match select_node_entry(&members, entry, &default_entry) {
                 Ok(Some(unit)) => unit,
                 Ok(None) => {
                     eprintln!(
@@ -1107,6 +1162,110 @@ struct Unit {
     options: BuildOptions,
 }
 
+/// The `[build] run` hooks of the addressed manifest (A9): external commands —
+/// a Tailwind bridge, an asset pipeline, a codegen sidecar — run **before** each
+/// build, in the manifest's own directory, in declaration order.
+///
+/// Before, because a hook exists to produce something the build then consumes
+/// (generated CSS to copy, generated sources to compile); a hook that
+/// post-processes the emitted bundle is a different feature and is not this one.
+/// A hook that fails fails the build, naming the command: a build that silently
+/// continued past a broken asset step would emit a bundle nobody asked for.
+#[derive(Debug, Clone, Default)]
+struct BuildHooks {
+    /// The manifest's directory — the hooks' working directory, so a command's
+    /// relative paths mean what they say in the file that declares them.
+    dir: PathBuf,
+    commands: Vec<String>,
+}
+
+impl BuildHooks {
+    fn from_manifest(dir: &Path, manifest: &Manifest) -> BuildHooks {
+        BuildHooks {
+            dir: dir.to_path_buf(),
+            commands: manifest.build_hooks().to_vec(),
+        }
+    }
+
+    /// Runs every hook, in order, stopping at the first failure. Each command
+    /// goes through the **platform shell** (`sh -c` / `cmd /C`) — hooks are
+    /// shell one-liners with globs, pipes and `&&`, and an argv array would make
+    /// the user hand-split them and lose all three. Streams are inherited, so a
+    /// hook's output (and its TTY colors) reach the terminal as if run by hand;
+    /// under `vilan build --stdout` that means a chatty hook shares the JS
+    /// stream — redirect it in the command if that matters.
+    fn run(&self) -> Result<(), String> {
+        for command in &self.commands {
+            eprintln!("{} {command}", paint::err(paint::Style::CYAN, "Running"));
+            let spawned = shell_command(command).current_dir(&self.dir).spawn();
+            let mut child = match spawned {
+                // The Job object costs nothing here and buys the Windows
+                // tree-kill: a hook that spawns a watcher of its own dies with
+                // this process instead of outliving the session.
+                Ok(child) => ManagedChild::adopt(child),
+                Err(error) => {
+                    return Err(format!(
+                        "`[build] run` could not start `{command}`: {error}"
+                    ));
+                }
+            };
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    return Err(format!(
+                        "`[build] run` command failed ({}): {command}",
+                        status
+                            .code()
+                            .map(|code| format!("exit code {code}"))
+                            .unwrap_or_else(|| "killed by a signal".to_string())
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("`[build] run` lost `{command}`: {error}"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One hook command, wrapped for the platform shell.
+fn shell_command(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut shell = std::process::Command::new("cmd");
+        shell.arg("/C").arg(command);
+        shell
+    }
+    #[cfg(not(windows))]
+    {
+        let mut shell = std::process::Command::new("sh");
+        shell.arg("-c").arg(command);
+        shell
+    }
+}
+
+/// How a workspace designates the Node leg `vilan run` executes without
+/// `--entry` (A15's follow-up: kolt needs no flag). The two workspace shapes
+/// spell the designation in their own section — `[package] default-entry` names
+/// an `[entry.<name>]`, `[project] default-entry` names a member package — so
+/// the key travels with the name and every message quotes the one the user
+/// would actually write.
+#[derive(Debug, Clone)]
+struct DefaultEntry {
+    key: &'static str,
+    name: Option<String>,
+}
+
+impl DefaultEntry {
+    fn new(key: &'static str, name: Option<&str>) -> DefaultEntry {
+        DefaultEntry {
+            key,
+            name: name.map(str::to_string),
+        }
+    }
+}
+
 /// A project to act on: a lone package / bare file (its platform chosen with the
 /// `--platform` flag, defaulting to the package's), or a workspace of members each
 /// built for its own fixed platform. The legacy `[server]`/`[client]` pair lowers
@@ -1117,15 +1276,33 @@ enum Project {
         /// The package's declared `target` platform, if any (`None` ⇒ the `node`
         /// default).
         platform: Option<Platform>,
+        /// The `[build] run` hooks to run before building it (A9).
+        hooks: BuildHooks,
     },
     Workspace {
         root: PathBuf,
         members: Vec<(Unit, Platform)>,
+        /// Which member `vilan run` executes without `--entry` (A15's
+        /// follow-up).
+        default_entry: DefaultEntry,
+        /// The `[build] run` hooks to run before building it (A9).
+        hooks: BuildHooks,
     },
     /// A standalone `[library]`, addressed directly. Not a buildable app (a library
     /// is compiled only as a dependency), but `vilan check` verifies its platform
     /// contract. `dir` is the library's package directory; `name` labels diagnostics.
     Library { dir: PathBuf, name: String },
+}
+
+impl Project {
+    /// The `[build] run` hooks to run before building this project (A9). A
+    /// `[library]` is never built on its own, so it declares none here.
+    fn hooks(&self) -> Option<&BuildHooks> {
+        match self {
+            Project::Single { hooks, .. } | Project::Workspace { hooks, .. } => Some(hooks),
+            Project::Library { .. } => None,
+        }
+    }
 }
 
 /// Resolves the project from an optional path, then runs `action`. An explicit
@@ -1157,6 +1334,8 @@ fn resolve_project(path: Option<PathBuf>) -> Result<Project, String> {
                 options: BuildOptions::default(),
             },
             platform: None,
+            // A bare file has no manifest, so it declares no hooks.
+            hooks: BuildHooks::default(),
         }),
         // No path: find the enclosing project from the working directory.
         None => {
@@ -1311,6 +1490,8 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
         return Ok(Project::Workspace {
             root: directory.to_path_buf(),
             members,
+            default_entry: DefaultEntry::new("[project] default-entry", manifest.default_entry()),
+            hooks: BuildHooks::from_manifest(directory, &manifest),
         });
     }
 
@@ -1338,12 +1519,15 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
         return Ok(Project::Workspace {
             root: directory.to_path_buf(),
             members,
+            default_entry: DefaultEntry::new("[package] default-entry", manifest.default_entry()),
+            hooks: BuildHooks::from_manifest(directory, &manifest),
         });
     }
 
     Ok(Project::Single {
         unit: unit_from_package(directory, package, options),
         platform: package.resolved_target(),
+        hooks: BuildHooks::from_manifest(directory, &manifest),
     })
 }
 
@@ -1538,29 +1722,46 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
 }
 
 /// Selects the ONE Node leg a `run` executes from a workspace's members (A15).
-/// An explicit `--entry <name>` picks it by package name; a lone Node leg is
-/// picked automatically; a browser-only workspace has none (`Ok(None)`). The
-/// non-selected Node legs are still compiled by the caller — they are part of
-/// the workspace — but never launched. `Err` when the choice is ambiguous
-/// (2+ Node legs, no `--entry`) or names a package that isn't a runnable Node
-/// leg; the message lists the candidates and the flag.
+/// The order of authority: an explicit `--entry <name>`, then the manifest's
+/// `default-entry`, then a lone Node leg; a browser-only workspace has none
+/// (`Ok(None)`). The non-selected Node legs are still compiled by the caller —
+/// they are part of the workspace — but never launched. `Err` when the choice is
+/// ambiguous (2+ Node legs, nothing designating one) or when a designation names
+/// something that isn't a runnable Node leg; the message lists the candidates
+/// and names the flag or the manifest key that made the choice.
 fn select_node_entry<'members>(
     members: &'members [(Unit, Platform)],
     entry: Option<&str>,
+    default_entry: &DefaultEntry,
 ) -> Result<Option<&'members Unit>, String> {
     let node_members: Vec<&Unit> = members
         .iter()
         .filter(|(_, platform)| matches!(platform, Platform::Node { .. }))
         .map(|(unit, _)| unit)
         .collect();
-    match (entry, node_members.as_slice()) {
-        (Some(name), _) => match node_members.iter().find(|unit| unit.name == name) {
-            Some(unit) => Ok(Some(unit)),
-            None => Err(no_such_node_entry(name, &node_members)),
-        },
-        (None, []) => Ok(None),
-        (None, [unit]) => Ok(Some(unit)),
-        (None, _) => Err(ambiguous_node_entry(&node_members)),
+    let find = |name: &str| node_members.iter().find(|unit| unit.name == name).copied();
+    if let Some(name) = entry {
+        // The flag wins over the manifest — that is what a flag is for.
+        return find(name).map(Some).ok_or_else(|| {
+            format!(
+                "no `node` package named `{name}` to run{}",
+                candidate_tail(&node_members)
+            )
+        });
+    }
+    if let Some(name) = &default_entry.name {
+        return find(name).map(Some).ok_or_else(|| {
+            format!(
+                "`{} = \"{name}\"` names no `node` package to run{}",
+                default_entry.key,
+                candidate_tail(&node_members)
+            )
+        });
+    }
+    match node_members.as_slice() {
+        [] => Ok(None),
+        [unit] => Ok(Some(unit)),
+        _ => Err(ambiguous_node_entry(&node_members, default_entry.key)),
     }
 }
 
@@ -1574,25 +1775,26 @@ fn node_entry_candidates(node_members: &[&Unit]) -> String {
         .join(", ")
 }
 
-/// The message for a `run` on a multi-node workspace with no `--entry` (A15).
-fn ambiguous_node_entry(node_members: &[&Unit]) -> String {
+/// The message for a `run` on a multi-node workspace with nothing designating a
+/// leg (A15): both ways to designate one, the flag for this run and the
+/// manifest key for every run.
+fn ambiguous_node_entry(node_members: &[&Unit], default_entry_key: &str) -> String {
     format!(
         "this workspace has more than one `node` package to run — pick one with \
-         --entry <name>: {}",
+         --entry <name>, or designate one for good with `{default_entry_key}` in \
+         vilan.toml: {}",
         node_entry_candidates(node_members)
     )
 }
 
-/// The message for `--entry <name>` naming a package that isn't a runnable Node
-/// leg (A15).
-fn no_such_node_entry(name: &str, node_members: &[&Unit]) -> String {
+/// The tail of a "no such entry" message: the candidates, or the reason there
+/// are none. Shared by the `--entry` and `default-entry` failures so a mistyped
+/// name reads the same whichever named it.
+fn candidate_tail(node_members: &[&Unit]) -> String {
     if node_members.is_empty() {
-        format!("no `node` package named `{name}` to run (this workspace runs no `node` package)")
+        " (this workspace runs no `node` package)".to_string()
     } else {
-        format!(
-            "no `node` package named `{name}` to run — candidates: {}",
-            node_entry_candidates(node_members)
-        )
+        format!(" — candidates: {}", node_entry_candidates(node_members))
     }
 }
 
@@ -1603,8 +1805,9 @@ fn run_workspace(
     members: &[(Unit, Platform)],
     args: &[String],
     entry: Option<&str>,
+    default_entry: &DefaultEntry,
 ) -> ExitCode {
-    let server = match select_node_entry(members, entry) {
+    let server = match select_node_entry(members, entry, default_entry) {
         Ok(Some(unit)) => unit,
         Ok(None) => {
             eprintln!(
@@ -1971,13 +2174,18 @@ fn compile_to_js(
         for (index, error) in program.diagnostics.iter().enumerate() {
             let source = program.diagnostic_source(index);
             load_diagnostic_file(&mut diagnostic_files, &program, source);
-            // Capture every diagnostic for the overlay (message + note verbatim);
-            // the terminal rendering below is unchanged.
-            overlay_diagnostics.push(hmr::OverlayDiagnostic {
-                span: error.span.into_range(),
-                message: error.msg.clone(),
-                note: error.note.as_ref().map(|note| note.msg.clone()),
-            });
+            // Capture every diagnostic for the overlay (message + note verbatim),
+            // located in the file its span indexes into (E16) — a module error
+            // names the module, not the leg's entry; the terminal rendering
+            // below is unchanged.
+            let (overlay_name, overlay_text) = diagnostic_file(&diagnostic_files, source);
+            overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
+                overlay_name,
+                overlay_text,
+                error.span.into_range(),
+                error.msg.clone(),
+                error.note.as_ref().map(|note| note.msg.clone()),
+            ));
             // A note-carrying diagnostic renders directly (two labels — the
             // shared ariadne path has nowhere to put the secondary location);
             // plain ones keep the shared path.
@@ -2035,11 +2243,13 @@ fn compile_to_js(
                     ))
                 }
                 Err(error) => {
-                    overlay_diagnostics.push(hmr::OverlayDiagnostic {
-                        span: error.span.into_range(),
-                        message: error.msg.clone(),
-                        note: error.note.as_ref().map(|note| note.msg.clone()),
-                    });
+                    overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
+                        &filename,
+                        source_ref,
+                        error.span.into_range(),
+                        error.msg.clone(),
+                        error.note.as_ref().map(|note| note.msg.clone()),
+                    ));
                     // A codegen failure carries no source of its own (it is a
                     // compiler bug, not a located user error): the entry.
                     analyzer_errors.push((SourceId(0), error.span.into_range(), error.msg));
@@ -2057,18 +2267,19 @@ fn compile_to_js(
     if let Some(sink) = overlay {
         if !clean {
             for error in &parse_errors {
-                overlay_diagnostics.push(hmr::OverlayDiagnostic {
-                    span: error.span.into_range(),
-                    message: vilan_core::parsing::render(error),
-                    note: None,
-                });
+                // The entry's own parse errors: located in the entry (a module
+                // that fails to parse reports through the analyzer path above,
+                // carrying its own source).
+                overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
+                    &filename,
+                    source_ref,
+                    error.span.into_range(),
+                    vilan_core::parsing::render(error),
+                    None,
+                ));
             }
-            *sink = hmr::render_overlay(
-                &filename,
-                source_ref,
-                &overlay_diagnostics,
-                hmr::OVERLAY_DIAGNOSTIC_CAP,
-            );
+            *sink =
+                hmr::render_overlay(&filename, &overlay_diagnostics, hmr::OVERLAY_DIAGNOSTIC_CAP);
         }
     }
     // The entry's parse errors belong to the entry; the analyzer's carry their
@@ -2345,6 +2556,104 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- A15's follow-up: the manifest-designated default `run` entry -------
+
+    /// A Node/browser build unit named `name`, enough for `select_node_entry`.
+    fn member(name: &str, platform: Platform) -> (Unit, Platform) {
+        (
+            Unit {
+                name: name.to_string(),
+                entry: PathBuf::from(format!("src/{name}.vl")),
+                pkg_root: PathBuf::from("src"),
+                package_dir: None,
+                options: BuildOptions::default(),
+            },
+            platform,
+        )
+    }
+
+    fn node_platform() -> Platform {
+        Platform::parse("node").expect("`node` is a platform")
+    }
+
+    #[test]
+    fn a_designated_default_entry_picks_the_leg_without_a_flag() {
+        let members = vec![
+            member("server", node_platform()),
+            member("worker", node_platform()),
+            member("client", Platform::Browser),
+        ];
+        let designated = DefaultEntry::new("[package] default-entry", Some("worker"));
+        let chosen = select_node_entry(&members, None, &designated).expect("a clean choice");
+        assert_eq!(chosen.map(|unit| unit.name.as_str()), Some("worker"));
+    }
+
+    #[test]
+    fn the_entry_flag_overrides_the_designated_default() {
+        let members = vec![
+            member("server", node_platform()),
+            member("worker", node_platform()),
+        ];
+        let designated = DefaultEntry::new("[project] default-entry", Some("worker"));
+        let chosen =
+            select_node_entry(&members, Some("server"), &designated).expect("a clean choice");
+        assert_eq!(chosen.map(|unit| unit.name.as_str()), Some("server"));
+    }
+
+    #[test]
+    fn a_designated_entry_that_is_not_a_node_leg_names_the_manifest_key() {
+        // A typo, or a designation pointing at the browser leg: the message
+        // quotes the key the user wrote, not the flag they didn't.
+        let members = vec![
+            member("server", node_platform()),
+            member("client", Platform::Browser),
+        ];
+        let designated = DefaultEntry::new("[project] default-entry", Some("client"));
+        let error = match select_node_entry(&members, None, &designated) {
+            Err(error) => error,
+            Ok(_) => panic!("a browser leg is not a runnable node entry"),
+        };
+        assert!(
+            error.contains("`[project] default-entry = \"client\"`")
+                && error.contains("candidates: server"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn the_ambiguity_error_offers_both_the_flag_and_the_manifest_key() {
+        // 2+ Node legs with nothing designating one: the error now teaches the
+        // permanent fix alongside the one-off flag.
+        let members = vec![
+            member("server", node_platform()),
+            member("worker", node_platform()),
+        ];
+        let undesignated = DefaultEntry::new("[package] default-entry", None);
+        let error = match select_node_entry(&members, None, &undesignated) {
+            Err(error) => error,
+            Ok(_) => panic!("two node legs with no designation is ambiguous"),
+        };
+        assert!(
+            error.contains("--entry <name>")
+                && error.contains("`[package] default-entry`")
+                && error.contains("server, worker"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn a_lone_node_leg_still_needs_no_designation() {
+        // The undesignated single-leg path is unchanged — the common shape pays
+        // nothing for the new key.
+        let members = vec![
+            member("server", node_platform()),
+            member("client", Platform::Browser),
+        ];
+        let undesignated = DefaultEntry::new("[project] default-entry", None);
+        let chosen = select_node_entry(&members, None, &undesignated).expect("a clean choice");
+        assert_eq!(chosen.map(|unit| unit.name.as_str()), Some("server"));
+    }
 
     #[test]
     fn watch_roots_from_a_file_is_its_parent_directory() {

@@ -1747,6 +1747,235 @@ fn arena_set_under_a_live_get_view_is_accepted() {
     );
 }
 
+// --- C7: wire-blessed handles (`claims-and-epochs.md` §6) -------------------
+// A handle is a NAME — durable identity plus the epoch to re-validate against —
+// so it is the one alias that crosses the wire. `Handle<T>` now carries
+// `[derive(Wire)]`; the `T` is phantom, so the payload is exactly the two
+// integers, and a `[derive(Wire)]` type may carry a handle field.
+
+#[test]
+fn a_handle_round_trips_through_the_json_codec() {
+    // The naming-layer idiom end to end: a handle issued by a server-side arena
+    // encodes as `{index, generation}`, decodes back, and still resolves.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::json::{ encode_json, decode_json };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut arena: Arena<i32> = Arena::new();
+            let handle = arena.insert(7);
+            let text = encode_json(handle);
+            print(text);
+            let back: Result<Handle<i32>, str> = decode_json(text);
+            match back {
+                Ok(let name) => print(arena.get(name).unwrap_or(-1)),
+                Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "{\"index\":0,\"generation\":0}\n7\n",
+    );
+}
+
+#[test]
+fn a_handle_round_trips_through_the_binary_codec() {
+    // The same name over the binary codec — the visitor impls the derive emits
+    // are codec-neutral, so both channels rebuild the same two integers.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::binary::{ encode_binary, decode_binary };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut arena: Arena<i32> = Arena::new();
+            let a = arena.insert(5);
+            let b = arena.insert(6);
+            let back: Result<Handle<i32>, str> = decode_binary(encode_binary(b));
+            match back {
+                Ok(let name) => print(arena.get(name).unwrap_or(-1)),
+                Err(let reason) => print(reason),
+            }
+            print(arena.get(a).unwrap_or(-1));
+        }
+        "#,
+        "6\n5\n",
+    );
+}
+
+#[test]
+fn a_stale_handle_from_the_wire_resolves_to_none() {
+    // The distributed staleness story: a client acting on an entity another
+    // client deleted gets the SAME clean `None` as local code holding a stale
+    // handle — no phantom write, one rule from a local `List` to an RPC
+    // boundary.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::json::{ encode_json, decode_json };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut arena: Arena<i32> = Arena::new();
+            let handle = arena.insert(7);
+            let quoted = encode_json(handle);        // the client keeps the name
+            arena.remove(handle);                    // someone else deletes it
+            let back: Result<Handle<i32>, str> = decode_json(quoted);
+            match back {
+                Ok(let name) => print(arena.get(name).unwrap_or(-1)),  // -1
+                Err(let reason) => print(reason),
+            }
+            // `set` through a stale name changes nothing, and reports it.
+            match back {
+                Ok(let name) => print(arena.set(name, 99)),            // false
+                Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "-1\nfalse\n",
+    );
+}
+
+#[test]
+fn a_wire_type_may_carry_a_handle_field() {
+    // The phantom-parameter case the derive had to tolerate: `Handle<T>` is an
+    // APPLIED derived type, which the all-fields Wire check used to reject
+    // outright ("which is not Wire"). The `T` never reaches the payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::json::{ encode_json, decode_json };
+        import std::result::Result::{ self, Ok, Err };
+        import std::option::Option::{ self, Some, None };
+        [derive(Wire)]
+        struct Rename { node: Handle<str>, title: str }
+        fun main() {
+            mut arena: Arena<str> = Arena::new();
+            let handle = arena.insert("old");
+            let command = Rename { node = handle, title = "new" };
+            let text = encode_json(command);
+            print(text);
+            let back: Result<Rename, str> = decode_json(text);
+            match back {
+                Ok(let request) => {
+                    arena.set(request.node, request.title);
+                    print(arena.get(request.node).unwrap_or("gone"));
+                }
+                Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "{\"node\":{\"index\":0,\"generation\":0},\"title\":\"new\"}\nnew\n",
+    );
+}
+
+#[test]
+fn a_handle_names_an_entity_whose_type_is_not_itself_wire() {
+    // A name is not the thing it names: `Handle<T>` is sendable whatever `T` is
+    // — the point of the naming layer (the entity stays on the server). The
+    // generic argument is deliberately unconstrained, which is sound only
+    // because a derived type's parameters are necessarily phantom
+    // (`a_wire_type_with_a_parameter_typed_field_is_rejected` is the other half).
+    assert_compiles(
+        r#"
+        import std::arena::{ Arena, Handle };
+        struct Session { socket: |str| void }
+        [derive(Wire)]
+        struct Close { target: Handle<Session> }
+        fun main() {
+            mut sessions: Arena<Session> = Arena::new();
+            let handle = sessions.insert(Session { socket = |line| {} });
+            let close = Close { target = handle };
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_wire_type_with_a_parameter_typed_field_is_rejected() {
+    // The guard behind C7's unconstrained generic arguments: a `[derive(Wire)]`
+    // type whose field is typed by a PARAMETER is rejected at its own
+    // declaration (the derive emits no generic impls), so no derived type can
+    // put a generic argument on the wire. If generic Wire derives ever land,
+    // `is_wire_type` must start checking the arguments.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        struct Pair<T> { value: T, count: i32 }
+        "#,
+        "which is not Wire",
+    );
+}
+
+#[test]
+fn a_branded_arena_rejects_a_foreign_handle() {
+    // `claims-and-epochs.md` §6's capability note: per-session arenas are the
+    // blessed default, and anything cross-tenant adds a per-arena random brand
+    // so a handle from one arena names nothing in another. Without a brand, an
+    // equal-index/equal-generation handle from a DIFFERENT arena resolves —
+    // which is why the per-session scoping stays the rule and the brand is the
+    // belt to it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            // The UNBRANDED control first — it is what makes this pin
+            // discriminate: two plain arenas number from 0, so the foreign
+            // handle resolves to the other arena's slot of the same index.
+            mut plain: Arena<i32> = Arena::new();
+            mut plain_other: Arena<i32> = Arena::new();
+            let loose = plain.insert(7);
+            plain_other.insert(9);
+            print(plain_other.get(loose).unwrap_or(-1));   // 9 — the confusion
+
+            mut mine: Arena<i32> = Arena::branded();
+            mut theirs: Arena<i32> = Arena::branded();
+            let handle = mine.insert(7);
+            theirs.insert(9);
+            print(theirs.get(handle).unwrap_or(-1));   // -1 — a foreign name
+            print(mine.get(handle).unwrap_or(-1));     // 7
+        }
+        "#,
+        "9\n-1\n7\n",
+    );
+}
+
+#[test]
+fn a_branded_arenas_generational_cycle_is_unchanged() {
+    // Branding only moves where the counters START, so every generational rule
+    // holds above the brand: removal bumps the slot, the old handle goes stale,
+    // and a reused slot issues a fresh handle that reads. (The plain-arena twin
+    // is `arena_get_on_a_stale_handle_is_none`.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::arena::{ Arena, Handle };
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut arena: Arena<i32> = Arena::branded();
+            let handle = arena.insert(7);
+            print(arena.get(handle).unwrap_or(-1));     // 7
+            arena.remove(handle);
+            print(arena.get(handle).unwrap_or(-1));     // -1 — stale
+            let reused = arena.insert(30);              // reuses the slot
+            print(arena.get(reused).unwrap_or(-1));     // 30
+            print(arena.get(handle).unwrap_or(-1));     // -1 — stays stale
+            print(arena.set(handle, 99));               // false — no phantom write
+            print(arena.len());                         // 1
+        }
+        "#,
+        "7\n-1\n30\n-1\nfalse\n1\n",
+    );
+}
+
 // --- rule4-completion S1: the `borrows` root-set (inference only) -----------
 // `Function.borrows` records *which* parameter positions a returned view
 // projects (receiver = position 0), inferred and chained. Inference-only: no

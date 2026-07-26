@@ -116,35 +116,87 @@ something minted inside a function, reach for the manual channel —
 - **A browser refresh** is always a full, clean reset — seed state lives only
   in the page's heap, so reloading throws all of it away.
 
+## Running something alongside the build
+
+A project that needs a step Vilan doesn't do — a Tailwind pass, an asset
+pipeline, a codegen sidecar — declares it in the manifest:
+
+```toml
+[build]
+run = "npx tailwindcss -i src/app.css -o dist/app.css"
+```
+
+Several steps go in a list and run in order:
+
+```toml
+[build]
+run = [
+	"npx tailwindcss -i src/app.css -o dist/app.css",
+	"node scripts/generate-icons.mjs",
+]
+```
+
+The rules are short:
+
+- They run **before** each build — including every `--watch` round — because a
+  hook exists to produce something the build then consumes.
+- Each is a command line for your shell (`sh -c` / `cmd /C`), so pipes, globs
+  and `&&` work; the working directory is the manifest's own, so relative paths
+  mean what they say in the file you wrote them in.
+- A hook that exits non-zero **fails the build**, naming the command. Nothing
+  after it runs.
+- Output goes straight to your terminal. (Under `vilan build --stdout`, which
+  writes the emitted JS to stdout, a chatty hook shares that stream — redirect
+  it in the command if you pipe the build.)
+- `vilan check` produces no artifacts, so it runs no hooks.
+
 ## Picking which server to run
 
-You only need this section if you use the
-[workspace shape](../tour/platforms.md#full-stack-packages) — a
-`[project]` of several packages. The default one-package app has a single
-node entry, so `run` just runs it.
+You only need this section if your project has **two or more** runnable node
+legs — a `[project]` of several packages, or one package with several node
+`[entry.<name>]` sections. The usual one-package app has a single node entry,
+so `run` just runs it.
 
-`run` (and `run --watch`) executes one Node leg. A workspace with a single
-`node` package needs no help — that one runs. A workspace with **two or more**
-`node` packages (say a `server` and a diagnostics `probe`) has to be told which,
-with `--entry <name>`:
+`run` (and `run --watch`) executes one Node leg. A project with a single `node`
+leg needs no help — that one runs. With two or more (say a `server` and a
+diagnostics `probe`), designate one in the manifest:
+
+```toml
+# one package, several entries
+[package]
+name = "app"
+default-entry = "server"
+```
+
+```toml
+# a workspace of packages
+[project]
+packages = ["client", "server", "probe"]
+default-entry = "server"
+```
+
+Then `vilan run .` needs no flag. For a one-off — running the probe instead —
+`--entry <name>` overrides the manifest:
 
 ```sh
-vilan run --watch --entry server .
+vilan run --watch --entry probe .
 ```
 
-Without it, `run` stops and lists the candidates:
+With neither, `run` stops and lists the candidates:
 
 ```text
-error: this workspace has more than one `node` package to run — pick one with --entry <name>: probe, server
+error: this workspace has more than one `node` package to run — pick one with --entry <name>, or designate one for good with `[project] default-entry` in vilan.toml: probe, server
 ```
 
-The non-selected Node legs still **compile** as part of the workspace — their
+A `default-entry` that names nothing runnable is an error too, rather than a
+silent fallback — it names an `[entry.<name>]` section in the package shape, and
+a member package's `name` in the workspace shape.
+
+The non-selected Node legs still **compile** as part of the project — their
 bundles land in `dist/` and a shared edit still recompiles them — they just
 aren't launched. Under `--watch` the browser legs hot-swap exactly as usual; the
 chosen server restarts on its own edits, and a change to a leg that isn't running
-does nothing visible (its `dist/` bundle refreshes, but nothing restarts). Which
-leg is the default is a per-workspace choice we may add to the manifest later;
-for now it's the flag.
+does nothing visible (its `dist/` bundle refreshes, but nothing restarts).
 
 ## The CSS `<link>` idiom
 

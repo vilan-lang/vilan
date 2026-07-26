@@ -62,21 +62,27 @@ The manifest declares what a directory builds. Sections:
 - **`[entry.<name>]`** — one build entry per table: `path` (default
   `<root>/<name>.vl`) and `target` (default `node`). A package with
   entries builds each for its own platform; reachability (§11.2) is
-  what lets one source tree serve several.
+  what lets one source tree serve several. `[package] default-entry`
+  names the entry `vilan run` executes when several are runnable.
 - **`[library]`** — a dependency-only package: `name`, `description`,
   `root`, `dependencies`, and **`[library.layer.<name>]`** overlays
   (`root`, `platform = ["…"]`) for per-platform sources.
 - **`[project]`** — a workspace: `packages = ["member", …]` (paths);
   building the project builds every member against its own manifest.
+  `default-entry` names the member `vilan run` executes when several
+  are runnable.
   Its own `dependencies` are declared once for the members to share: a
   member writes `dep = { project = true }` to take that declaration
   (paths in it resolve against the **project root**). Inheritance is
   per dependency and opt-in — nothing is inherited implicitly — and
   `project = true` combines with no other key.
-- **`[build]`** — codegen options: `preset` (`"debug"` | `"release"`)
-  and the per-feature overrides `indent`, `spaces`, `debug-names`.
-  Build options never change program semantics (§7.6), only the
-  emitted text.
+- **`[build]`** — `run`, plus codegen options: `preset` (`"debug"` |
+  `"release"`) and the per-feature overrides `indent`, `spaces`,
+  `debug-names`. Build options never change program semantics (§7.6),
+  only the emitted text. `run` is a command line — or a list of them —
+  executed through the host shell **before** each build (each `--watch`
+  round included), in the manifest's directory, in order; a non-zero
+  exit fails the build. `vilan check` builds nothing and runs none.
 - **`[macro]`** — the compile-time interpreter budget: `fuel` (steps
   per macro/const run) and `depth` (nested expansion), §9.3/§10.4.
 
@@ -85,6 +91,7 @@ The manifest declares what a directory builds. Sections:
 Each entry emits `dist/<name>.js` for its platform (browser entries
 first, so a server that ships bundles finds them fresh), plus
 `dist/<name>.css` when const evaluation emitted style assets (§9.2).
-`vilan run` builds all entries and starts the one `@process` entry;
+`vilan run` builds all entries and starts one `@process` entry — the
+only one, the designated `default-entry`, or the one `--entry` names;
 `vilan check` checks every entry, always. The emitted text beyond
 §7.6's guarantees is implementation-defined.

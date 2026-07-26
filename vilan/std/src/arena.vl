@@ -1,4 +1,5 @@
 import pkg::option::Option::{ None, Some, self };
+import pkg::random::range;
 
 // `std::arena` — a generational arena: stable, deletion-safe identities for
 // values of any type `T`, with no per-type bookkeeping.
@@ -12,32 +13,59 @@ import pkg::option::Option::{ None, Some, self };
 // the new occupant.
 
 /// A first-class key into an `Arena<T>`: the slot index plus the generation it
-/// was issued at. Copied freely; storable anywhere a plain value is.
+/// was issued at. Copied freely; storable anywhere a plain value is — and, being
+/// two plain integers, sendable: `[derive(Wire)]` makes a handle a **name that
+/// crosses the wire** (`claims-and-epochs.md` §6), so a server-side arena's
+/// handles are the stable entity references clients quote back. `T` is phantom
+/// here — it types the arena the handle belongs to, and never appears in the
+/// payload, which is exactly `{ index, generation }`.
+[derive(Wire)]
 struct Handle<T> {
 	index: i32,
 	generation: i32,
 }
 
 /// One arena slot: a generation counter (bumped on removal so stale handles go
-/// `None`) and the stored value. Occupancy is tracked by the generation alone —
-/// a live handle's generation only ever matches an occupied slot, since removal
-/// bumps it — so a freed slot simply keeps its last value until the slot is
-/// reused and overwritten.
+/// `None`, and started at the arena's `brand`) and the stored value. Occupancy
+/// is tracked by the generation alone — a live handle's generation only ever
+/// matches an occupied slot, since removal bumps it — so a freed slot simply
+/// keeps its last value until the slot is reused and overwritten.
 struct Slot<T> {
 	generation: i32,
 	value: T,
 }
 
 /// A generational arena over `T`. `free` holds emptied indices, reused on the
-/// next insert.
+/// next insert. `brand` is where this arena's generation counters START: `0` for
+/// a plain arena, a random value for a `branded()` one (see `branded`).
 struct Arena<T> {
 	slots: List<Slot<T>>,
 	free: List<i32>,
+	brand: i32,
 }
 
 impl Arena<type T> {
 	fun new(): Arena<T> {
-		Arena { slots = List::new(), free = List::new() }
+		Arena { slots = List::new(), free = List::new(), brand = 0 }
+	}
+
+	/// An arena whose handles are **branded**: its generation counters start at
+	/// a random value instead of `0`, so a handle issued by one branded arena
+	/// resolves to `None` in every other arena rather than silently naming that
+	/// arena's slot of the same index.
+	///
+	/// Reach for it when handles cross a trust boundary — the cross-tenant case
+	/// of `claims-and-epochs.md` §6. The blessed default is still a **per-session
+	/// arena**: scope the arena to the session and a handle names nothing outside
+	/// it by construction. Branding is the belt to those suspenders, for when one
+	/// arena is shared and its handles must not be interchangeable.
+	///
+	/// It is a confusion guard, not an authorization check: the brand travels
+	/// inside the handles it issues, so a client holding one valid handle can
+	/// derive it. Authorize the session first; then look the handle up in that
+	/// session's arena.
+	fun branded(): Arena<T> {
+		Arena { slots = List::new(), free = List::new(), brand = range(1, 1073741823) }
 	}
 
 	/// Store `value`, returning a handle to it. Reuses a freed slot when one is
@@ -50,15 +78,18 @@ impl Arena<type T> {
 			},
 			None => {
 				let index = self.slots.len();
-				self.slots.push(Slot { generation = 0, value = value });
-				Handle { index = index, generation = 0 }
+				self.slots.push(Slot { generation = self.brand, value = value });
+				Handle { index = index, generation = self.brand }
 			},
 		}
 	}
 
 	/// Whether `handle` still refers to a live value: in range and the slot's
 	/// generation matches. (Removal bumps the generation, so a matching
-	/// generation is exactly an occupied slot.)
+	/// generation is exactly an occupied slot.) This one comparison carries the
+	/// brand too: a `branded()` arena's counters start from its brand, so a
+	/// foreign handle's generation cannot match — a mismatch is `None`/`false`,
+	/// never a panic.
 	fun contains(self, handle: Handle<T>): bool {
 		handle.index < self.slots.len() && self.slots[handle.index].generation == handle.generation
 	}

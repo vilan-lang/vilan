@@ -875,3 +875,70 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
+
+/// E16's residual: the overlay names the file each diagnostic BELONGS to. A
+/// broken `pkg::common` module reaches the browser as `common.vl:<line>:<col>`
+/// — the entry (`client.vl`) heads the overlay, but the location line points at
+/// the module, and the line/column are resolved against the module's own text.
+/// (Before this, every diagnostic was located as if its span indexed the entry:
+/// wrong file, wrong position.)
+#[test]
+fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
+    let dir = temp_project("overlay_module");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n",
+    );
+    write(&dir, "src/common.vl", &common_source("BANNER_ONE"));
+    write(&dir, "src/client.vl", &shared_client_source("x1"));
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = Duration::from_secs(20);
+        let port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), deadline),
+            "round 1 should have written dist/client.js"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut sse = SseClient::connect(port);
+        // Break the MODULE, on its own second line, leaving the entry intact.
+        write(
+            &dir,
+            "src/common.vl",
+            "fun banner(): str {\n\tmissing_name()\n}\n",
+        );
+        let error_event = sse.expect_event("error", deadline);
+        assert!(
+            error_event.contains("common.vl:2:"),
+            "the overlay should locate the diagnostic in the module: {error_event}"
+        );
+        assert!(
+            !error_event.contains("client.vl:2:"),
+            "the entry must not be credited with the module's diagnostic: {error_event}"
+        );
+        // The leg's entry still heads the overlay — it names which build failed.
+        assert!(
+            error_event.contains("client.vl — 1 error"),
+            "the overlay header should still name the failing leg: {error_event}"
+        );
+    }));
+
+    let _ = watcher.kill();
+    let _ = watcher.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.unwrap();
+}

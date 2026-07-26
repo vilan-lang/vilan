@@ -82,3 +82,46 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
         script.display()
     );
 }
+
+/// A9: the `[build] run` hooks belong to the *round*, not to the session — a
+/// watch that rebuilds re-runs them, so a Tailwind bridge regenerates its CSS on
+/// every edit rather than once at startup. The hook appends a line per round, so
+/// the count is the observation.
+#[test]
+fn build_hooks_run_once_per_watch_round() {
+    let dir = temp_package("hooks");
+    std::fs::write(
+        dir.join("vilan.toml"),
+        "[package]\nname = \"app\"\n\n[build]\nrun = [\"echo round >> rounds.txt\"]\n",
+    )
+    .unwrap();
+    let rounds = dir.join("rounds.txt");
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", dir.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the watcher");
+
+    let lines = || {
+        std::fs::read_to_string(&rounds)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    wait_for("the first round's hook", || lines() >= 1);
+
+    // A source edit starts a second round, which must run the hook again.
+    std::fs::write(
+        dir.join("src/main.vl"),
+        "import std::print;\n\nfun main() {\n\tprint(\"round two\");\n}\n",
+    )
+    .unwrap();
+    wait_for("the second round's hook", || lines() >= 2);
+
+    let _ = Command::new("kill")
+        .args(["-INT", &watcher.id().to_string()])
+        .status();
+    let _ = watcher.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
