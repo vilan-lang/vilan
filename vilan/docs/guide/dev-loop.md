@@ -2,15 +2,20 @@
 
 You built an app in the [walkthrough](walkthrough.md). This chapter is about
 *iterating* on it — the edit-save-see loop. `vilan run --watch` on a
-full-stack workspace closes that loop with **hot module replacement (HMR)**:
+full-stack project closes that loop with **hot module replacement (HMR)**:
 save a source file and the running browser app updates in place, reactive
 state intact, without a full page reload.
+
+Nothing here needs the walkthrough app specifically. Any project with a
+browser leg will do, and `vilan init my-app --template fullstack` writes
+one ([Start a project](../tour/hello-vilan.md#start-a-project)). From the
+project directory:
 
 ```sh
 vilan run --watch .
 ```
 
-On a workspace with a browser leg this prints one extra line at startup:
+A project with a browser leg prints one extra line at startup:
 
 ```text
 hmr: dev channel on 127.0.0.1:35917
@@ -32,7 +37,7 @@ verdict exact.
 | **Client code** | The browser bundle changes → a **swap**: the new bundle is evaluated in place, module state carried across (below). No reload. |
 | **A stylesheet only** | Just the CSS sidecar changed → the stylesheet is **hot-swapped**, no reload, no swap — the page doesn't even flicker. |
 | **Server code** | The server bundle changed → the **Node process restarts**. The browser stays connected; its live rpc mirror reconnects on its own (the same backoff that survives a server crash) and resyncs from the server's current values. |
-| **Shared code** (a `common` library both legs use) | Both bundles change → the server restarts **and** the browser swaps. The fresh client dials the new contract, so a changed rpc shape never leaves a stale client talking to a new server. |
+| **Shared code** (a module both entries reach, or a `common` library both legs use) | Both bundles change → the server restarts **and** the browser swaps. The fresh client dials the new contract, so a changed rpc shape never leaves a stale client talking to a new server. |
 | **A file with a mistake** | The compile error shows in the terminal *and* as an in-page **overlay** — the real file, line, and message — while the running app keeps its last good build. Fix it and the next good save clears the overlay and swaps normally. |
 
 A server-only edit pushes **nothing** to the browser — the client is
@@ -80,7 +85,7 @@ fun main() {
 What resets is state minted **inside functions during mount** — an ephemeral
 signal created in a component, the focused element, scroll position,
 half-typed text not yet pushed. Fine-grained reactivity gives these no stable
-identity to reattach to, so v1 lets them go. A plain browser refresh is the
+identity to reattach to, so a swap lets them go. A plain browser refresh is the
 always-available complete reset.
 
 **The initializer-edit rule.** Editing a binding's *initializer* without
@@ -112,6 +117,11 @@ something minted inside a function, reach for the manual channel —
   in the page's heap, so reloading throws all of it away.
 
 ## Picking which server to run
+
+You only need this section if you use the
+[workspace shape](../tour/platforms.md#full-stack-packages) — a
+`[project]` of several packages. The default one-package app has a single
+node entry, so `run` just runs it.
 
 `run` (and `run --watch`) executes one Node leg. A workspace with a single
 `node` package needs no help — that one runs. A workspace with **two or more**

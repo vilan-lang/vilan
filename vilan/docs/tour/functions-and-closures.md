@@ -26,7 +26,7 @@ fun main() {
 ```
 
 Notice there is no `return` on the last line. A bare expression at the
-end of a block is the block's value. You'll see this everywhere in vilan.
+end of a block is the block's value. You'll see this everywhere in Vilan.
 `if`, `match`, and plain blocks all work the same way.
 
 Generic functions take type parameters. Bounds say what the body is
@@ -39,7 +39,7 @@ fun largest<T: PartialOrd>(a: T, b: T): T { … }
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes
-`x => x * 2`, vilan writes `|x| x * 2`. Parameter types are usually
+`x => x * 2`, Vilan writes `|x| x * 2`. Parameter types are usually
 inferred from where the closure is used. Annotate them when they aren't:
 
 ```vilan
@@ -61,7 +61,7 @@ Closure **types** are written `|T| U`. A closure with no parameters is
 parameter types, in `let` annotations, and as struct fields.
 
 Closures capture their surroundings **by value** at the moment they are
-created. vilan copies, remember. When a closure needs to share mutable
+created. Vilan copies, remember. When a closure needs to share mutable
 state with its creator, they hold a `Shared` cell together. The
 [memory model](memory-model.md) explains that pattern.
 
@@ -85,7 +85,7 @@ fun main() {
 }
 ```
 
-This works for plain vilan functions. It does not work for generic
+This works for plain Vilan functions. It does not work for generic
 functions, methods, `async` functions, or externs. For those, write the
 small wrapping closure — the compiler will tell you when you hit one.
 
@@ -96,21 +96,24 @@ async work.
 
 A closure type can carry an `async` marker: `async |T| U`. Calls through
 a value of that type are awaited automatically, the same way direct
-calls to async functions are (see [Async](async.md)). The marker is
-allowed in exactly two places: parameter types and `let` annotations.
+calls to async functions are (see [Async](async.md)). Write it anywhere
+a closure type is declared — a parameter, a `let` annotation, a struct
+field, a return type:
 
 ```vilan,fragment
-struct Draft<T> {
-	commit: |T| Option<str>,          // struct fields store the plain type
+fun draft<T>(initial: T, commit: async |T| Option<str>): Draft<T>   // a parameter
+
+struct Poller {
+	tick: async || i32,               // a struct field
 }
-…
-let commit: async |T| Option<str> = self.commit;   // re-mark at a let
-let outcome = commit(value);                        // this call awaits
+
+let commit: async |T| Option<str> = stored;   // a let annotation
+let outcome = commit(value);                  // …and this call awaits
 ```
 
-That "store plain, re-mark at a `let`" dance is the standard pattern for
-async callbacks kept in struct fields, because the marker doesn't exist
-on field types yet.
+An unannotated `let` needs no marker at all: a binding that holds an
+async closure adopts its asyncness. [Async](async.md#async-closures)
+covers the same seams from the async side.
 
 There is one more rule, and it works in your favor. Passing an async
 closure where a plain closure is expected is an error if the plain type
@@ -151,5 +154,4 @@ owners, and ownership still flows to the right place.
 ## Traps
 
 - Chained element access on a call result (`read()[i]`) can lose the
-  element type. Bind, then index. (Tuple `.0`/`.1` access isn't
-  implemented at all yet — destructure tuples instead.)
+  element type. Bind, then index.

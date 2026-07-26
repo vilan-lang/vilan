@@ -1,8 +1,35 @@
-# Hello vilan
+# Hello Vilan
 
-vilan compiles to JavaScript. Your programs run on node (or deno, or bun)
+Vilan compiles to JavaScript. Your programs run on node (or deno, or bun)
 and in the browser. One tool, the `vilan` binary, does everything:
 scaffold, build, run, check, format, test.
+
+## Install the toolchain
+
+You need two things: [node](https://nodejs.org) (to *run* what you build)
+and the `vilan` binary itself. On Linux and macOS:
+
+```sh
+curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
+```
+
+Either way `vilan` (and `vilan-lsp`, the language server) lands in
+`~/.vilan/bin` — `%USERPROFILE%\.vilan\bin` on Windows. The unix script
+prints the PATH line to add; the PowerShell one edits your user PATH
+itself, so open a new terminal afterwards. `vilan --version` confirms it
+worked, and `vilan upgrade` updates it later.
+
+Homebrew (`brew install vilan-lang/vilan/vilan`) and building from source
+are the other two routes; the
+[repository README](https://github.com/vilan-lang/vilan#getting-started)
+has both. Every command in this book assumes only that `vilan` is on your
+PATH.
 
 ## A first program
 
@@ -149,9 +176,10 @@ own `shapes = { path = "…" }` simply uses that one — there is no
 shadowing rule to remember, because inheritance only happens where you
 ask for it.
 
-By default the source root is the package directory and the entry file is
-`main.vl`. You can point elsewhere with `root = "src"` and
-`entry = "app.vl"` if you prefer.
+By default a package's sources live in `src/` and the entry file is
+`src/main.vl` — that is where `vilan build` looks when the manifest says
+nothing. Point it elsewhere with `root = "."` (sources beside the
+manifest) or `entry = "app.vl"`.
 
 ## Imports
 
@@ -160,7 +188,7 @@ import std::print;                          // one item
 import std::reactive::{ Signal, combine };  // several at once
 import std::option::Option::{ self, Some, None };  // a type plus its variants
 import pkg::routes::{ Route, parse };       // another file in YOUR package
-import common::{ Task, KoltClient };        // a dependency, by its name
+import common::{ Note, NotesClient };       // a dependency, by its name
 ```
 
 There are three places an import can come from:

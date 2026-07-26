@@ -8,7 +8,7 @@ sits on top is [Services & RPC](services.md).
 
 ## SQLite: `std::db`
 
-vilan ships with an embedded SQLite binding (node's built-in SQLite
+Vilan ships with an embedded SQLite binding (node's built-in SQLite
 underneath). There is no ORM and no query builder. You write SQL, with
 `?` placeholders for values:
 
@@ -137,7 +137,7 @@ long-lived *client* process (a probe holding a socket, say) has to keep
 
 ## Putting it together
 
-The boot sequence of a kolt-shaped server, in order:
+The boot sequence of a full-stack server, in order:
 
 1. `Database::open`, then `exec` the schema
    (`CREATE TABLE IF NOT EXISTS …`).

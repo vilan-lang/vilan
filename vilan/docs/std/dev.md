@@ -1,7 +1,7 @@
 # Dev / HMR — reference
 
 `std::dev` is the app-facing surface of **hot module replacement** — the
-live-update loop `vilan run --watch` runs for a full-stack app (see
+live-update loop `vilan run --watch` runs for a full-stack project (see
 [The dev loop](../guide/dev-loop.md) for the whole picture). Browser-only,
 and every hook here is a **no-op outside a hot reload**: importing it costs
 nothing in a production build, so you can leave the calls in place.

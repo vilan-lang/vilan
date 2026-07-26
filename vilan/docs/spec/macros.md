@@ -28,7 +28,7 @@ macro fun derive_display(item: Item): Source
 
 ## 10.2 The macro environment
 
-A macro's body is ordinary vilan, but it compiles against
+A macro's body is ordinary Vilan, but it compiles against
 **`macro_std`** — the compile-time standard library (`source`, the
 `meta` item types, collections, strings) — and only that: a macro's
 imports are its own, and it cannot reference the surrounding program's

@@ -5,7 +5,7 @@
 # The tour
 
 - [Coming from JavaScript](tour/coming-from-javascript.md)
-- [Hello vilan](tour/hello-vilan.md)
+- [Hello Vilan](tour/hello-vilan.md)
 - [Values and types](tour/values-and-types.md)
 - [Functions & closures](tour/functions-and-closures.md)
 - [Data and traits](tour/data-and-traits.md)

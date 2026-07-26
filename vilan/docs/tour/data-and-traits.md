@@ -98,7 +98,7 @@ fun main() {
 
 The `&mut self` on `bump` matters: it means "mutate the actual receiver,
 not a copy". Plain `self` receives a copy, like every other value in
-vilan. The [memory model](memory-model.md) chapter makes this precise.
+Vilan. The [memory model](memory-model.md) chapter makes this precise.
 
 ## Generics and bounds
 
@@ -193,6 +193,7 @@ write the boilerplate:
 | `PartialEq` | structural `==` |
 | `Debug` | `.debug()` — a developer-facing rendering |
 | `Default` | `Default::default()` built from the fields' defaults |
+| `Hashable` | usability as a `Map` key or `Set` member (`std::hash`) |
 | `Json` | JSON encode/decode (`std::json`) |
 | `Wire` | serialization for rpc payloads (`std::wire`) |
 

@@ -1,6 +1,6 @@
 # Spec §1 — Introduction & conformance
 
-This is the vilan language specification: the normative definition of what
+This is the Vilan language specification: the normative definition of what
 programs mean and which programs are rejected. The [tour](../tour/) teaches;
 this defines. Where the two disagree, this document wins.
 
@@ -28,7 +28,7 @@ operator traits, `PartialEq`/`PartialOrd`, `Context`, `Task`, `Promise`,
 
 ## 1.2 Program processing phases
 
-A vilan program is processed in phases; each phase's errors preclude the
+A Vilan program is processed in phases; each phase's errors preclude the
 next. A **conforming program** passes all of them.
 
 1. **Lexing** (§2) — source text to tokens.

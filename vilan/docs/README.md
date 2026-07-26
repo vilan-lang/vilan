@@ -1,16 +1,20 @@
-# The vilan documentation
+# The Vilan documentation
 
-How to use the vilan language, its standard library, and the frameworks
+How to use the Vilan language, its standard library, and the frameworks
 built on top of it. If you're wondering where something lives: this book
-is about *using* vilan. Design history and rationale live in
-`vilan/proposal/`.
+is about *using* Vilan. Design history and rationale live in the
+repository's [`vilan/proposal/`](https://github.com/vilan-lang/vilan/tree/main/vilan/proposal/).
+
+**Brand new?** [Hello Vilan](tour/hello-vilan.md) installs the toolchain and
+gets a program running in a couple of minutes. Everything in this book
+assumes only that the `vilan` command is on your PATH.
 
 ## Parts
 
 - **[Tour](tour/)** — the language itself, taught informally. Start with
   [Coming from JavaScript](tour/coming-from-javascript.md) if that's your
   background, then read in order. Come back any time you need a syntax
-  reminder.
+  reminder. Nothing in the tour assumes you know the other parts.
 - **[Guides](guide/)** — the frameworks, task by task: reactive state,
   building UI, styling, routing, talking to a server. Each guide reads
   front to back and links into the reference for exact signatures.
@@ -21,13 +25,17 @@ is about *using* vilan. Design history and rationale live in
   teaches; the spec defines; where they disagree, the spec wins.
 - **[Appendix](appendix/)** — the [error index](appendix/errors.md) ("you saw this message, go here"), the [gotchas checklist](appendix/gotchas.md), and the [glossary](appendix/glossary.md).
 
-## Reading this as a website
+## Where this book lives
 
-The book renders with [mdBook](https://rust-lang.github.io/mdBook/):
-`mdbook serve vilan/docs` gives a local live-reloading site with search
-and a sidebar (`cargo install mdbook` once). Pushes to `main` publish it
-to GitHub Pages automatically. Everything also reads fine as plain files
-— the site adds navigation, it doesn't replace the markdown.
+The published copy is at <https://vilan-lang.github.io/vilan/> — search
+and a sidebar included, always built from the latest `main`. That is the
+copy to link to and the one most readers want.
+
+The source is markdown in the
+[repository](https://github.com/vilan-lang/vilan) under `vilan/docs/`, so
+everything also reads fine as plain files. If you have the repository
+checked out, `cargo install mdbook` once and then `mdbook serve
+vilan/docs` gives you the same site locally with live reload.
 
 ## Conventions
 
@@ -46,8 +54,8 @@ to GitHub Pages automatically. Everything also reads fine as plain files
 ### Tour
 | Chapter | Covers |
 |---|---|
-| [Coming from JavaScript](tour/coming-from-javascript.md) | the three big shifts, a JS→vilan phrasebook |
-| [Hello vilan](tour/hello-vilan.md) | the CLI, `vilan.toml`, packages & workspaces, imports |
+| [Coming from JavaScript](tour/coming-from-javascript.md) | the three big shifts, a JS→Vilan phrasebook |
+| [Hello Vilan](tour/hello-vilan.md) | installing, the CLI, `vilan.toml`, packages & workspaces, imports |
 | [Values & types](tour/values-and-types.md) | bindings, primitives & numeric widths, strings & interpolation, tuples, collections |
 | [Functions & closures](tour/functions-and-closures.md) | `fun`, closure types, named-fn coercion, async closures and their seams, context clauses |
 | [Data & traits](tour/data-and-traits.md) | structs, enums, `impl`, generics & bounds, traits, derives |
@@ -67,7 +75,9 @@ to GitHub Pages automatically. Everything also reads fine as plain files
 | [Routing](guide/routing.md) | enum routes, `parse`/`href`, `link`, `swap`, navigation |
 | [Services & RPC](guide/services.md) | `[service]`/`[rpc]`/`[expose]`, Wire, mirrors, reconnection, the server side |
 | [Persistence & the server](guide/persistence.md) | `std::db` (SQLite), the http server, files, the process |
+| [Server-side rendering](guide/ssr.md) | render-and-replace, one component on both legs, the HTML shell |
 | [A full-stack walkthrough](guide/walkthrough.md) | the Notes app end to end — every layer meeting, quoted from a real, tested example |
+| [The dev loop](guide/dev-loop.md) | `run --watch`, hot module replacement, what carries across a swap |
 
 ### std reference
 | Page | Modules |
@@ -85,8 +95,9 @@ to GitHub Pages automatically. Everything also reads fine as plain files
 | [style](std/style.md) | the full `std::style` API |
 | [rpc](std/rpc.md) | `std::rpc` — transports, clients, frames |
 | [browser](std/browser.md) | `std::dom`, `std::ui`, `std::router`, `std::storage` |
+| [dev / HMR](std/dev.md) | `std::dev` — `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, process, rpc_server |
-| [misc](std/misc.md) | io, promise, context, crypto, jwt, asset |
+| [misc](std/misc.md) | io, task, promise, context, crypto, jwt, asset |
 
 ### Specification
 | Chapter | Defines |

@@ -1,6 +1,6 @@
 # Services & RPC
 
-This is the chapter where vilan's full-stack story comes together. The
+This is the chapter where Vilan's full-stack story comes together. The
 short version: you write one ordinary struct on the server, mark a few
 things on it, and you get a typed client, live data sync, and reconnect
 handling without writing any protocol code.
@@ -120,7 +120,7 @@ the full shape.
 ## What can cross the wire: `Wire`
 
 Everything that travels — rpc parameters, return types, mirrored
-payloads — must be serializable, which vilan calls **Wire**. The scalars
+payloads — must be serializable, which Vilan calls **Wire**. The scalars
 are Wire (`bool`, the integers including `i53`, floats, `str`). `List`
 and `Option` of Wire types are Wire. And your own types opt in with a
 derive:
@@ -207,9 +207,9 @@ push, or the user pressing the button again.
 
 ## Authentication
 
-The straightforward shape, proven in the kolt pilot: a `login` rpc
-returns a token, later rpcs take the token as their first parameter, and
-the server validates it per call.
+The straightforward shape, and the one the walkthrough app uses: a
+`login` rpc returns a token, later rpcs take the token as their first
+parameter, and the server validates it per call.
 
 ```vilan,fragment
 [rpc]

@@ -1,6 +1,6 @@
 # Macros & const
 
-vilan has two tools that run at compile time. `const` computes *values*
+Vilan has two tools that run at compile time. `const` computes *values*
 ahead of time. Macros generate *code*. In both cases the emitted
 JavaScript carries only the results, never the computation.
 
@@ -98,7 +98,7 @@ fun main() {
 
 How to read that:
 
-- `macro fun` declares the macro. Its body is ordinary vilan, but it
+- `macro fun` declares the macro. Its body is ordinary Vilan, but it
   compiles against `macro_std` — a small compile-time standard library
   with `source`, the `meta` types (`Item`, `StructItem`, …), and the
   basics. Its imports are its own; it can't reach into your program.

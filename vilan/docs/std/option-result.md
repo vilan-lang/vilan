@@ -1,6 +1,6 @@
 # Option & Result — reference
 
-`Option<T>` is how vilan says "maybe a value" (there is no `null`), and
+`Option<T>` is how Vilan says "maybe a value" (there is no `null`), and
 `Result<T, E>` is how it says "this can fail" (there are no exceptions).
 Both are plain enums with a large helper-method surface, listed here. For
 how they replace `null` checks and `try`/`catch` in practice — including

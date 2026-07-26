@@ -8,13 +8,17 @@ The finished app lives in the repo at
 [`vilan/examples/walkthrough/`](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/walkthrough/), about 500
 lines in **one package**. Every snippet below is quoted from those files,
 and the test suite builds the app on every run, so this chapter can't
-quietly rot. To run it:
+quietly rot. To run it, clone the repository and start it:
 
 ```sh
-cd vilan/examples/walkthrough
+git clone https://github.com/vilan-lang/vilan
+cd vilan/vilan/examples/walkthrough
 vilan run .             # builds both entries, starts the server
                         # → http://localhost:4600
 ```
+
+(You can also read straight through without running anything — every
+snippet below is reproduced in full.)
 
 Open two browser windows side by side. Sign in, add a note in one window,
 and watch it appear in the other. Open a note and type — the other window
@@ -299,7 +303,7 @@ there is nothing left for one to do.
 
 | In this app | Taught in |
 |---|---|
-| the package, its two entries | [Hello vilan](../tour/hello-vilan.md), [Platforms](../tour/platforms.md) |
+| the package, its two entries | [Hello Vilan](../tour/hello-vilan.md), [Platforms](../tour/platforms.md) |
 | `Note`, derives, the enums | [Data & traits](../tour/data-and-traits.md) |
 | signals, effects, drafts | [Reactive state](reactive.md) |
 | views, `bind_each`, `when`, `show` | [Building UI](ui.md) |

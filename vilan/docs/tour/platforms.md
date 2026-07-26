@@ -9,6 +9,17 @@ can actually do. Call a server function from code a browser build can
 reach, and you get a clear compile error naming the call chain — not a
 runtime crash. That's the whole idea of this chapter.
 
+## The std layers
+
+- **Base** — platform-neutral, available everywhere: collections,
+  `Option`/`Result`, strings, numbers, `reactive`, `shared`, `time`,
+  json/wire/binary, the rpc client machinery, `style`, `fetch`,
+  `crypto`, and friends.
+- **Browser layer** — `std::dom`, `std::ui`, `std::router`,
+  `std::storage`. Browser builds only.
+- **Process layer** (node/deno/bun) — `std::db`, `std::http`, `std::fs`,
+  `std::process`, `std::rpc_server`. Server builds only.
+
 > **Going deeper.** The check is on *reachable code*, not on imports. A
 > file may import `std::fs` and compile for the browser, as long as no
 > code the browser entry can reach actually calls into it. The compiler
@@ -21,28 +32,6 @@ runtime crash. That's the whole idea of this chapter.
 > it — a server-only global in a shared file costs the browser build
 > nothing. `const` initializers run at build time and ship as plain
 > values, so they never color anything.
-> Where a team wants an explicit boundary, `[platform("browser")]` on a
-> function declares the platforms it promises to run on — the compiler
-> checks the promise on every compile (entry or not, whatever the build
-> target), and a violation lands at the fence with its chain instead of
-> at some distant entry in a dependent build. Patterns use the manifest
-> layers' vocabulary: `"node"`, `"browser"`, families like
-> `"@process"`, or several at once for code that must stay neutral.
-> The editor shows the same information as you write: violations appear
-> as live diagnostics at the offending call, and hovering a function
-> shows its inferred requirement and how it got it — e.g. ``requires the
-> `process` layer of `std` (via `save → write_file (std::fs)`)``.
-
-## The std layers
-
-- **Base** — platform-neutral, available everywhere: collections,
-  `Option`/`Result`, strings, numbers, `reactive`, `shared`, `time`,
-  json/wire/binary, the rpc client machinery, `style`, `fetch`,
-  `crypto`, and friends.
-- **Browser layer** — `std::dom`, `std::ui`, `std::router`,
-  `std::storage`. Browser builds only.
-- **Process layer** (node/deno/bun) — `std::db`, `std::http`, `std::fs`,
-  `std::process`, `std::rpc_server`. Server builds only.
 
 ## Full-stack packages
 
@@ -96,6 +85,19 @@ app/
 compiler checks each against its own platform, including that `common`
 stays platform-neutral. Either shape, the service lives next to its
 resources (see [Services](../guide/services.md)).
+
+> **Going deeper.** Where a team wants an explicit boundary,
+> `[platform("browser")]` on a function declares the platforms it
+> promises to run on — the compiler checks the promise on every compile
+> (entry or not, whatever the build target), and a violation lands at the
+> fence with its chain instead of at some distant entry in a dependent
+> build. Patterns use the manifest layers' vocabulary: `"node"`,
+> `"browser"`, families like `"@process"`, or several at once for code
+> that must stay neutral. The editor shows the same information as you
+> write: violations appear as live diagnostics at the offending call, and
+> hovering a function shows its inferred requirement and how it got it —
+> e.g. ``requires the `process` layer of `std` (via `save → write_file
+> (std::fs)`)``.
 
 ## Externs — talking to the host
 

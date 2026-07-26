@@ -81,8 +81,8 @@ fun main() {
 }
 ```
 
-(Bind the tuple before taking elements — chained access on a call result,
-`both.get().1`, doesn't type yet; see the gotchas appendix.)
+(Destructuring names the parts, which reads better than positions;
+`both.get().1` also works.)
 
 ## Subscription, Disposable
 

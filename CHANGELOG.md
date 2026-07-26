@@ -1,6 +1,6 @@
 # Changelog
 
-vilan is a fast-moving alpha. Minor versions (`0.X`) may change the
+Vilan is a fast-moving alpha. Minor versions (`0.X`) may change the
 language, the standard library, and the wire protocol without a
 deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.github.io/vilan/) always

@@ -75,7 +75,7 @@ the owner is rebound, resized, moved, or dropped; a [claim](#claim) is valid
 only while it has not. [The memory model](../spec/memory.md).
 
 **extern** — a declaration binding a host (JavaScript) function, object,
-or property so vilan code can call it. [Platforms](../tour/platforms.md).
+or property so Vilan code can call it. [Platforms](../tour/platforms.md).
 
 **frame** — one encoded message on the wire. You only meet it when
 building custom transports. [rpc reference](../std/rpc.md).
@@ -103,6 +103,11 @@ receives a live copy of. The server writes; every client updates.
 own specialized code, so generic dispatch has no runtime cost.
 [Data and traits](../tour/data-and-traits.md).
 
+**nursery** — the structured way to spawn: `nursery(body)` joins every
+task spawned in the body's dynamic extent before returning the body's
+value, applies the first-observed error rule, and owns the cancellation
+signal std IO listens on. [Async](../tour/async.md).
+
 **owner** — the object that collects subscriptions and disposes them
 when its subtree dies. Created by the framework at
 [boundaries](#boundary); you rarely touch one directly.
@@ -129,7 +134,7 @@ and is destroyed deterministically at scope end — a `Database`, an
 `OwnedNursery`. [Resources](../tour/resources.md).
 
 **safe integer** — an integer JavaScript's 64-bit floats represent
-exactly: anything within ±2^53. vilan's `i53`/`u53` are named for this
+exactly: anything within ±2^53. Vilan's `i53`/`u53` are named for this
 window. [Values and types](../tour/values-and-types.md).
 
 **service** — a server struct whose `[rpc]` methods clients call and
@@ -146,11 +151,6 @@ Gives you a `Task<T>`. [Async](../tour/async.md).
 same-task. A task's failure is absorbed at the spawn — a later `await`
 receives it; an unobserved failure is reported, not crashed on.
 [Async](../tour/async.md).
-
-**nursery** — the structured way to spawn: `nursery(body)` joins every
-task spawned in the body's dynamic extent before returning the body's
-value, applies the first-observed error rule, and owns the cancellation
-signal std IO listens on. [Async](../tour/async.md).
 
 **subscription** — one live "call me on change" registration on a
 signal. Effects manage theirs through [owners](#owner); manual `sub`

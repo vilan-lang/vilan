@@ -2,7 +2,7 @@
 
 A **context** is a dynamically-scoped value: established for the dynamic
 extent of a body, readable from anything that runs within that extent,
-invisible outside it. Contexts are vilan's answer to ambient parameters
+invisible outside it. Contexts are Vilan's answer to ambient parameters
 — the current reactive owner, the current turn, the enclosing nursery —
 without global mutable state and without threading a parameter by hand
 through every signature.
@@ -135,7 +135,7 @@ fun main() {
 This is the stability rule §7.5 relies on: ambient values do not shift
 across suspensions or across deferred invocation, because the closure's
 channel was fixed when it was made. (Contrast dynamic-binding systems
-where the *call site's* environment decides; in vilan only `run`'s
+where the *call site's* environment decides; in Vilan only `run`'s
 extent and creation sites decide.)
 
 ## 8.5 Injected closures: the `context` clause

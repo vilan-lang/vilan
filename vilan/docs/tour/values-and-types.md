@@ -19,7 +19,7 @@ fun main() {
 }
 ```
 
-One thing to know up front: everything in vilan is a **value**. Assigning
+One thing to know up front: everything in Vilan is a **value**. Assigning
 a value to a new binding gives you a copy, not a second name for the same
 thing. If that sounds strange coming from JavaScript, start with
 [Coming from JavaScript](coming-from-javascript.md), then read
@@ -35,10 +35,10 @@ thing. If that sounds strange coming from JavaScript, start with
 - Floats: `f64` (a bare `2.5`, or the `f` suffix) and `f32` (`2.5f32`).
 - `BigInt` — arbitrary precision, with the `n` suffix (`7n`).
 
-Why `i53` and not `i64`? Because vilan runs on JavaScript, and JavaScript
+Why `i53` and not `i64`? Because Vilan runs on JavaScript, and JavaScript
 numbers are 64-bit floats. Every integer up to ±2^53 is exact in a float.
 Beyond that, precision silently disappears. Rather than offer an `i64`
-that quietly isn't one, vilan names the type for what it actually
+that quietly isn't one, Vilan names the type for what it actually
 delivers. If you need more than 53 bits, use `BigInt`.
 
 The compiler checks every literal against its type's range, so an
@@ -77,7 +77,7 @@ and the mix won't compile.
 
 ## Strings and interpolation
 
-`"…"` is a plain string, and vilan does **not** interpret `{}` inside it.
+`"…"` is a plain string, and Vilan does **not** interpret `{}` inside it.
 To interpolate, prefix the string with `i`:
 
 ```vilan
@@ -191,4 +191,4 @@ compiler makes you handle the `None` case before you can use the value.
 This is one of the big shifts from JavaScript, and
 [Control flow](control-flow.md) shows how natural it becomes. (`null`
 technically exists at the host boundary, for externs that can return JS
-null, but ordinary vilan code never sees it.)
+null, but ordinary Vilan code never sees it.)

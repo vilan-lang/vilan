@@ -1,6 +1,6 @@
 # Reactive state
 
-`std::reactive` is vilan's state layer. If you've used signals in Solid or
+`std::reactive` is Vilan's state layer. If you've used signals in Solid or
 Preact, you'll be at home immediately. If you're coming from React, think
 of a signal as a piece of state that components subscribe to directly —
 there is no re-render, no dependency array, no memoization dance. When a
@@ -42,7 +42,7 @@ signal.set(value: T)                   // write + notify subscribers
 signal.set_with(transform: sync |T| T) // read-modify-write in one step
 ```
 
-Signals hold **values**. vilan copies, so `get` hands you a copy, and the
+Signals hold **values**. Vilan copies, so `get` hands you a copy, and the
 only way to change what subscribers see is `set` or `set_with`. To update
 a list inside a signal, transform it:
 
@@ -124,7 +124,7 @@ Two ways to run code on change. **Use `effect` by default.**
 Every effect is a subscription, and subscriptions must die when the
 thing that created them goes away — otherwise a page you navigated off
 keeps reacting forever. That's a memory leak in any reactive system.
-vilan's answer is **owners**, and the good news is that in normal app
+Vilan's answer is **owners**, and the good news is that in normal app
 code you never manage them: the UI layer creates owners exactly where
 subtrees can die (a mounted root, a list row, a conditional block), and
 every `effect` you create automatically registers with the nearest one.
@@ -170,7 +170,7 @@ before your first line of UI code ran.
 ## Turns: when changes become visible
 
 If an event handler sets five signals, you want watchers to see the
-final state once, not five intermediate states. vilan batches writes
+final state once, not five intermediate states. Vilan batches writes
 into **turns**. Inside a turn, `set` just records. When the turn
 settles, each affected watcher runs once with the final values:
 

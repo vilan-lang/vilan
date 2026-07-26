@@ -112,7 +112,7 @@ fun parse(path: str): Route {
 
 ## Option and Result
 
-vilan has no `null` and no exceptions. Instead:
+Vilan has no `null` and no exceptions. Instead:
 
 - A value that might be absent is an `Option<T>` — either `Some(value)`
   or `None`.
@@ -157,7 +157,7 @@ This is what `try`/`catch` becomes: failures travel up through return
 types, visibly, and the caller decides what to do.
 
 `!` returns the failure **as-is**, so the value's error type must already
-be the function's — vilan doesn't convert it behind your back. When the
+be the function's — Vilan doesn't convert it behind your back. When the
 types differ, convert at the value, before the `!`: `.map_err(…)` changes
 a `Result`'s error, and `.ok_or(err)` turns an `Option`'s `None` into an
 `Err` you supply.

@@ -76,7 +76,7 @@ is the answer where the range itself is the problem.
 
 ## 7.3 The async model
 
-vilan is **await-by-default**. Asyncness is a property of *functions*,
+Vilan is **await-by-default**. Asyncness is a property of *functions*,
 inferred, and never written in return types:
 
 1. A function is **async** iff its body contains a suspension point: a
@@ -163,7 +163,7 @@ into `map` adapts both), and never crosses these boundaries:
 - a `sync` parameter (error, including transitively — the diagnostic
   names the call that made the closure async);
 - a host (`external`) function's value-returning closure parameter —
-  host code cannot await a vilan closure;
+  host code cannot await a Vilan closure;
 - a trait/generic-dispatched call — there is no statically-known callee
   to instantiate (bind the receiver concretely, or declare the trait
   parameter `async`);
@@ -229,7 +229,7 @@ selects an adapted instance per §7.4.
 
 - a body throw wins (it always happens before the join);
 - otherwise the earliest-settled task failure wins, re-raised from the
-  `nursery` call; a failure that is a vilan panic carries the spawn's
+  `nursery` call; a failure that is a Vilan panic carries the spawn's
   origin (the spawning function's name) in its message.
 
 On the first failure the nursery cancels (below). Every other

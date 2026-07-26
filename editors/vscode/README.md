@@ -71,7 +71,7 @@ install directory you did not add — point **`vilan.server.path`** at it
 (absolute, or a name to resolve on `PATH`).
 
 The server carries the `std` sources inside itself, so definitions into `std`
-resolve on a machine with nothing else installed. Inside a vilan checkout it
+resolve on a machine with nothing else installed. Inside a Vilan checkout it
 uses that working tree instead; **`vilan.stdPath`** overrides both.
 
 ## Settings
@@ -99,7 +99,7 @@ organizing is a fixed point, so having both on is harmless.
 Pruning is conservative: it never runs while the file has errors, never removes
 a re-export, and keeps any import that derive-generated code references.
 
-## Learning vilan
+## Learning Vilan
 
 - [The book](https://vilan-lang.github.io/vilan/) — guide, tour, and the
   language specification.
@@ -133,6 +133,6 @@ brand master `assets/branding/dark_icon.svg` — regenerate it with
 
 MIT or Apache-2.0, at your option — see
 [LICENSE.md](https://github.com/vilan-lang/vilan/blob/main/editors/vscode/LICENSE.md).
-The vilan
+The Vilan
 logo and icon are covered by [their own license](https://github.com/vilan-lang/vilan/blob/main/assets/branding/LICENSE)
 instead.

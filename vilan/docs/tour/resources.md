@@ -2,7 +2,7 @@
 
 > Normative rules: spec [§6.8 Resources and destruction](../spec/memory.md).
 
-Almost everything in vilan is a value: it copies, and the copy is yours (the
+Almost everything in Vilan is a value: it copies, and the copy is yours (the
 [memory model](memory-model.md) chapter). A few things can't work that way.
 A database handle that copied would close twice. A task owner that copied
 would cancel the wrong tasks. These are **resources**: values with a single

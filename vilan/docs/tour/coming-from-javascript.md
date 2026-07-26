@@ -1,6 +1,6 @@
 # Coming from JavaScript
 
-vilan compiles to JavaScript and runs on node and in the browser. If you
+Vilan compiles to JavaScript and runs on node and in the browser. If you
 know JS or TypeScript, most of the syntax will feel familiar. A handful of
 ideas are genuinely different, though. This page is the five-minute
 orientation. Each topic links to the chapter that teaches it properly.
@@ -11,7 +11,7 @@ orientation. Each topic links to the chapter that teaches it properly.
 
 In JavaScript, objects and arrays are passed around by reference. Two
 variables can point at the same object, and a change through one is
-visible through the other. In vilan, assigning or passing a value gives
+visible through the other. In Vilan, assigning or passing a value gives
 the receiver its own copy. Nothing is shared unless you ask for sharing
 explicitly.
 
@@ -51,7 +51,7 @@ for the explicit keywords when you *don't* want to wait. The
 
 ## A quick phrasebook
 
-| You write in JS/TS              | You write in vilan                              |
+| You write in JS/TS              | You write in Vilan                              |
 | ------------------------------- | ----------------------------------------------- |
 | `function f(x) { … }`           | `fun f(x: i32): i32 { … }`                      |
 | `const x = …` / `let x = …`     | `let x = …` / `mut x = …`                       |
@@ -87,7 +87,7 @@ library is small and imported explicitly, so files start with a few
 
 ## Where to go next
 
-Read [Hello vilan](hello-vilan.md) to get a program running, then follow
+Read [Hello Vilan](hello-vilan.md) to get a program running, then follow
 the tour in order. When you start building UI or talking to a server, the
 [guides](../guide/) take over. And whenever something surprises you, check
 the [gotchas page](../appendix/gotchas.md) — if it surprised us first, it

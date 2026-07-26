@@ -6,7 +6,7 @@ crawler sees a blank page. Server-side rendering fixes both by doing the first
 render on the server: the page arrives already painted, and the client takes over
 from there.
 
-vilan's model is **render, then replace**. There is no hydration — the client
+Vilan's model is **render, then replace**. There is no hydration — the client
 does not adopt the server's DOM. It renders the same view fresh and swaps it in.
 
 1. **Render.** The server calls your own view-building code against the process
@@ -67,7 +67,7 @@ fun app(): View {
 
 fun main() {
 	let client_js = fs::read_file_to_str("dist/client.js");
-	let shell = fs::read_file_to_str("server/src/app.html");
+	let shell = fs::read_file_to_str("src/app.html");
 	Server::builder()
 		.port(8791)
 		.on_request(|request| {
@@ -134,27 +134,38 @@ hostile string is inert markup, not injected HTML.
 
 ## The double-fetch, honestly
 
-v1 embeds no initial state. A data-backed app still fetches its data over rpc on
-boot exactly as a client-only app does — so the data is fetched once for the
-server render and again on the client. A change between the two shows as a content
-update when the client replaces (the honest behavior, not a mismatch error).
+Server-side rendering embeds no initial state today. A data-backed app
+still fetches its data over rpc on boot exactly as a client-only app does —
+so the data is fetched once for the server render and again on the client. A
+change between the two shows as a content update when the client replaces
+(the honest behavior, not a mismatch error).
 
 Serializing the initial store into the page and adopting it client-side — so the
-first client fetch is skipped — is a planned next slice (`proposal/ssr.md` §6c),
-held back because it introduces a cross-process state contract v1 does not need.
-The end state beyond that is resumability (A7b): the server serializes the
-reactive graph and handlers so the client executes *nothing* at boot. Render and
-replace is the fallback that remains under both.
+first client fetch is skipped — is planned but not built, held back because it
+introduces a cross-process state contract this version does not need. Further
+out is *resumability*: the server serializes the reactive graph and the handlers
+too, so the client executes nothing at boot. Render-and-replace is the fallback
+that remains under both.
 
 ## Try it
 
-`examples/ssr` is the whole loop in one package with two entries — `src/app.vl`
-(the shared `app()`), `src/client.vl` (browser), and `src/server.vl` (node):
+The repository carries the whole loop as a runnable example:
+[`vilan/examples/ssr/`](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/ssr/)
+— one package with two entries, `src/app.vl` (the shared `app()`),
+`src/client.vl` (browser), and `src/server.vl` (node). Clone it and run:
 
 ```sh
-vilan run examples/ssr
+git clone https://github.com/vilan-lang/vilan
+cd vilan
+vilan run vilan/examples/ssr
 # open http://localhost:8791/ — view source shows the rendered markup
 ```
 
 View the page source and you will see the list already in the HTML, before any
 script runs. Load it in a browser and the client boots and replaces it in place.
+
+To build the same thing from nothing instead, `vilan init my-app --template
+fullstack` gives you the one-package/two-entries scaffold this page assumes
+(see [Start a project](../tour/hello-vilan.md#start-a-project)); add the
+shared `app()` module, `render` on the server leg, and the `<!--ssr-->` marker
+in the shell, as above.

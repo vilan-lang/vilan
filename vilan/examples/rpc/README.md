@@ -271,7 +271,7 @@ channel), off the application, which now just calls `server.expose(counter)`.
 One adjacent item remains, noted for honesty: **`param: SomeTrait` is not a generic bound**
 (you write the explicit `<S: Source<T>>`, so the proposal's `fun stringify(value: ToJson)`
 sketch is aspirational syntax). The capability table also still stores `str`, since it holds
-heterogeneous sources and vilan has no trait objects.
+heterogeneous sources and Vilan has no trait objects.
 
 ## What this validates for the plan
 

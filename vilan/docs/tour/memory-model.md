@@ -2,7 +2,7 @@
 
 > Normative rules: spec [§6 The memory model](../spec/memory.md).
 
-This is the chapter where vilan differs most from JavaScript, so it goes
+This is the chapter where Vilan differs most from JavaScript, so it goes
 slowly. The one-sentence version: **values are copied, and sharing is
 something you ask for explicitly.**
 
@@ -11,7 +11,7 @@ a function means the function can mutate your data. Storing one in two
 places means a change shows up in both. That's convenient right up until
 it isn't, and then it's a bug hunt.
 
-vilan flips the default. Everything copies. Then it gives you four tools,
+Vilan flips the default. Everything copies. Then it gives you four tools,
 each for one kind of sharing, so that when data *is* shared, the code
 says so. Here's the decision tree you'll internalize quickly:
 
@@ -103,7 +103,7 @@ moment.** A view can be a parameter or a short-lived local. It cannot be
 stored in a struct field, put in a list, returned into long-lived state,
 or held across an `await`. Lend, use, done. That confinement is what
 makes views safe without a whole lifetime system — if you've heard Rust
-horror stories, this is the part vilan deliberately keeps small.
+horror stories, this is the part Vilan deliberately keeps small.
 
 Views also make loops that mutate in place. A plain `for x in list`
 copies each element; `for e in &mut list` gives you writable views

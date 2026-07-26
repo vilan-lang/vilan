@@ -1,11 +1,11 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/branding/dark_logo_beside_text.svg">
-    <img src="assets/branding/light_logo_beside_text.svg" alt="vilan" width="520">
+    <img src="assets/branding/light_logo_beside_text.svg" alt="Vilan" width="520">
   </picture>
 </p>
 
-vilan is a language for building full-stack web apps. It compiles to
+Vilan is a language for building full-stack web apps. It compiles to
 JavaScript and runs on node and in the browser, but it is not JavaScript:
 values are copied instead of shared, there is no `null` and no exceptions,
 `await` is implicit, and the compiler checks the things you usually find
@@ -178,7 +178,7 @@ crates/
   vilan-lsp/       the language server
 editors/vscode/    the VS Code extension (grammar + LSP client)
 vilan/
-  std/             the standard library, written in vilan
+  std/             the standard library, written in Vilan
   docs/            the book: tour, guides, reference, spec (mdBook)
   examples/        runnable examples, incl. the walkthrough app
   test/            the codegen corpus (byte-identical golden files)
@@ -207,11 +207,11 @@ Licensed under either of
 
 at your option.
 
-The vilan logo, wordmark, and the other brand assets under
+The Vilan logo, wordmark, and the other brand assets under
 [assets/branding/](assets/branding/) are excluded from the above and are
 covered by [their own license](assets/branding/LICENSE) instead.
 
 Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in vilan by you, as defined in the Apache-2.0
+submitted for inclusion in Vilan by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms
 or conditions.

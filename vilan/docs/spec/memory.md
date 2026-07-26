@@ -314,7 +314,7 @@ changes no ownership and is policed by rule 4.
   `Set` and every external generic (`Shared`, `Task`, `Promise`, `Context`)
   reject resource type arguments in v1 — their internals are host code the
   move checker cannot see. `Option` is the sanctioned container (it is a
-  vilan enum, checkable under R11).
+  Vilan enum, checkable under R11).
 - **R11 — generics must be move-clean per instantiation.** Instantiating a
   type parameter with a resource type re-checks the instantiated body under
   the affine rules (T := the resource): every T-typed value is used at most

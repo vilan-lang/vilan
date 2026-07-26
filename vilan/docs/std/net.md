@@ -43,7 +43,7 @@ Streaming a body chunk by chunk: `response.body_stream().reader()` +
 transport uses this.
 
 Note `fetch` is base-layer: it works in the browser *and* on node. For
-talking to your own vilan service, prefer the generated rpc client over
+talking to your own Vilan service, prefer the generated rpc client over
 hand-rolled fetch calls.
 
 ## std::ws

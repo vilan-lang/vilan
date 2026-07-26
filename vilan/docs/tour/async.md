@@ -3,7 +3,7 @@
 > Normative rules: spec [§7 Execution & async](../spec/execution.md).
 
 If you know async/await in JavaScript, here is the whole model in one
-line: vilan keeps the machinery and deletes the keywords. Calling an
+line: Vilan keeps the machinery and deletes the keywords. Calling an
 async function just gives you the value. You don't write `await`, you
 don't mark functions `async`, and you never see `Promise<T>` in a return
 type. The compiler figures out which functions suspend and awaits the
@@ -53,7 +53,7 @@ fun main() {
 }
 ```
 
-So in JS you mark the async case and waiting is explicit. In vilan you
+So in JS you mark the async case and waiting is explicit. In Vilan you
 mark the *concurrent* case and waiting is the default. Fire-and-forget
 is just spawning and dropping the task: `let _done = async
 save(entry);`. To wait on many at once, `Task::settle_all(tasks)` from

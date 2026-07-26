@@ -1,6 +1,6 @@
 # vilan
 
-The [vilan](https://github.com/vilan-lang/vilan) toolchain, installed by npm.
+The [Vilan](https://github.com/vilan-lang/vilan) toolchain, installed by npm.
 
 ```sh
 npm install -g @vilan-lang/vilan
@@ -20,7 +20,7 @@ tour, the language guide, the standard library reference and the specification.
 
 ## What this package is
 
-vilan is a compiler written in Rust that emits JavaScript, so this package
+Vilan is a compiler written in Rust that emits JavaScript, so this package
 delivers a native binary, not a JS implementation. It carries no code of its
 own beyond two `bin` stubs; the binaries live in five per-platform packages
 (`@vilan-lang/linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`,

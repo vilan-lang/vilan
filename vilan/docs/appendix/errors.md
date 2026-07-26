@@ -13,13 +13,13 @@ topic rather than by message.)
 The name isn't visible here. Usually a missing `import` — remember that
 everything, even `print`, is imported explicitly. If you did import it,
 check for a typo or a shadowing local.
-→ [Hello vilan](../tour/hello-vilan.md), [spec §4](../spec/names.md)
+→ [Hello Vilan](../tour/hello-vilan.md), [spec §4](../spec/names.md)
 
 **"`std` is a namespace, not a value — import the module first …"**
 You wrote a qualified path like `std::math::min(1, 2)` inline. That
 spelling isn't supported. Import the module, then qualify through its
 name: `import std::math;` and `math::min(1, 2)`.
-→ [Hello vilan](../tour/hello-vilan.md)
+→ [Hello Vilan](../tour/hello-vilan.md)
 
 **"`…` requires the `…` layer of `std` and cannot run on `…`"**
 Code reachable from this build's entry calls into a module the platform
@@ -42,7 +42,7 @@ the two fixes.
 The path names a module file that doesn't exist. `pkg::routes` means
 "`routes.vl` in this package's source root" — check the file name and
 the package you're in.
-→ [Hello vilan](../tour/hello-vilan.md)
+→ [Hello Vilan](../tour/hello-vilan.md)
 
 **"module '…' resolved to '…' on disk, but it is imported as '…'"**
 Your filesystem ignores case (NTFS, and macOS by default) and answered
@@ -108,7 +108,7 @@ no implicit conversions. An unsuffixed literal adapts to its peer
 (`stamp < 3` is fine for an `i53` stamp); two differently-typed
 *variables* need a suffix or an `as_*` conversion. Related:
 **"`bool` has no ordering"** (compare with `==`/`!=`) and
-**"`&&` takes `bool` operands"** (vilan has no truthiness).
+**"`&&` takes `bool` operands"** (Vilan has no truthiness).
 → [Values and types](../tour/values-and-types.md)
 
 **"type '…' does not implement the `…` operator; add `impl … with …` providing `…`"**
@@ -200,14 +200,14 @@ or, if you really need two owners, restructure with `Option` + `take`.
 
 **"cannot move a resource field out of a live aggregate — … no partial moves …"**
 `let x = s.db`, or passing / returning `s.db` by value, would move a
-resource out of a struct that is still alive — v1 has no partial moves.
+resource out of a struct that is still alive — there are no partial moves.
 Loan the field (`&s.db`, `&mut s.db`, `s.db.method(…)`), or make the field
 an `Option<…>` and `take()` it out.
 → [Resources](../tour/resources.md)
 
 **"`…` is moved on one path through this branch but not another — …"**
 An `if`/`match` moves the binding on some paths and not others, so its
-end-of-scope ownership isn't static (v1 has no runtime drop flags). Move it
+end-of-scope ownership isn't static (there are no runtime drop flags). Move it
 on *every* path, or on none — or hold it in an `Option` and `take()` on the
 path that consumes it. A diverging leg (one that `ret`s or `jump`s out) is
 exempt: it never reaches the merge.
@@ -269,7 +269,7 @@ instead.
 
 **"`…` cannot hold the resource `…` — a native container's internals are host code …"**
 `List`, `Map`, `Set`, and the external generics (`Shared`, `Task`,
-`Promise`, `Context`) can't hold a resource in v1 — the move checker
+`Promise`, `Context`) can't hold a resource — the move checker
 can't see inside host storage. `Option` is the sanctioned resource
 container; or keep the resource in a struct field.
 → [Resources](../tour/resources.md)
@@ -290,7 +290,7 @@ uses the cooperative `Disposable` protocol, not `Drop`.)
 
 **"`drop` for `…` is async — teardown must be synchronous …"**
 A `drop` body may not be `async`, nor await (call an async function): a
-destructor runs synchronously in v1. Cancel owned tasks through an
+destructor runs synchronously. Cancel owned tasks through an
 `OwnedNursery` — whose own `drop` cancels them — rather than awaiting them.
 Awaited teardown is a future design.
 → [Resources](../tour/resources.md)

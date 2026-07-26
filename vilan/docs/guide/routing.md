@@ -1,7 +1,7 @@
 # Routing
 
 Routers you've used probably match URL pattern strings: `"/w/:id/task/:tid"`.
-vilan's router doesn't. **Routes are enums.** You describe your app's pages
+Vilan's router doesn't. **Routes are enums.** You describe your app's pages
 as an enum, write one function that parses a path into it and one that
 prints it back, and the type system takes it from there. Every link targets
 a page that exists. Every page receives exactly the parameters it declares.

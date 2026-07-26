@@ -1,7 +1,8 @@
 # Misc — reference
 
 The small modules that don't need a page of their own: `std::io`,
-`std::promise`, `std::context`, `std::crypto`, `std::jwt`, `std::asset`.
+`std::task`, `std::promise`, `std::context`, `std::crypto`, `std::jwt`,
+`std::asset`.
 
 ## std::io
 
@@ -126,8 +127,9 @@ fun equals_constant_time(a: Bytes, b: Bytes): bool   // timing-safe compare
 ```
 
 WebCrypto-backed (async where the host is). For password hashing on the
-server, bind the host's sync primitives as externs (the kolt pilot uses
-node's `pbkdf2Sync`) — candidates for std promotion.
+server, bind the host's sync primitives as externs (the walkthrough
+example binds node's `pbkdf2Sync` this way) — candidates for std
+promotion.
 
 ## std::jwt
 

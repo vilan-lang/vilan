@@ -4,7 +4,7 @@
 with its result: the emitted program carries the value as a literal,
 never the computation. Const evaluation and macro expansion (§10) run
 in the same fueled compile-time interpreter; they are the two phases
-that execute vilan code at build time.
+that execute Vilan code at build time.
 
 ## 9.1 The `const` expression
 

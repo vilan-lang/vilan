@@ -2,7 +2,7 @@
 
 `std::ui` is a declarative view layer with no virtual DOM. A `View`
 describes a DOM element. Methods chain to build it. Where React re-runs
-components and diffs the result, vilan binds individual DOM properties to
+components and diffs the result, Vilan binds individual DOM properties to
 signals — when a signal changes, exactly that text node or attribute
 updates and nothing else runs.
 
@@ -220,16 +220,17 @@ many plain function calls sit in between:
 
 Navigate away, and the page's owner is disposed — every binding the page
 created dies with it. Delete row 2, and only row 2's bindings die. This
-is why there is no unsubscribe code anywhere in a vilan app: the tree of
+is why there is no unsubscribe code anywhere in a Vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
 them where subtrees end.
 
 ## Server-side rendering
 
-The same component code runs on the server. On `@process` (a node build)
-`std::ui` builds an HTML **string** instead of live DOM, and `render(view)`
-serializes it — first paint and SEO, before any JavaScript (A7, `proposal/ssr.md`).
-A route handler calls your own `app()` and splices the markup into its HTML shell.
+The same component code runs on the server. On a node build `std::ui`
+builds an HTML **string** instead of live DOM, and `render(view)`
+serializes it — first paint and SEO, before any JavaScript. A route
+handler calls your own `app()` and splices the markup into its HTML
+shell. The [server-side rendering guide](ssr.md) walks the whole loop.
 
 ```vilan
 import std::ui::{ view, View, render };
