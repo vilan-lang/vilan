@@ -58,7 +58,7 @@ fun main() {
 	};
 	serve_service(4000, notes.dispatcher().into_protocol(json_codec()), |request| {
 		Response::builder().body("app shell here").build()
-	}, || print("listening on :4000"));
+	}, |server| print(i"listening on {server.url()}"));
 }
 ```
 
@@ -301,7 +301,7 @@ serve_service(
 	port,
 	service.dispatcher().into_protocol(json_codec()),
 	|request| …,       // http fallback: serve assets + the app shell
-	|| …,              // on_ready
+	|server| …,        // on_ready — `server.port()` is the bound port
 )
 ```
 

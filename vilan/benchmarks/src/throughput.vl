@@ -76,7 +76,7 @@ fun run(finished: || void) {
 			|id, end| {},
 			|id| {},
 			|request| Response::builder().code(404).body("benchmark").build(),
-			|| {
+			|server| {
 				let binary_elapsed = drive(HttpTransport { url = "http://localhost:48233/rpc" }, binary_codec(), http_calls);
 				let binary_average_us = round(binary_elapsed * 1000.0 / http_calls);
 				print(i"http binary: {http_calls} calls in {round(binary_elapsed)} ms -> {rate(http_calls, binary_elapsed)} calls/sec ({binary_average_us} us avg)");
@@ -86,7 +86,7 @@ fun run(finished: || void) {
 					|id, end| {},
 					|id| {},
 					|request| Response::builder().code(404).body("benchmark").build(),
-					|| {
+					|server| {
 						let socket: SocketDuplex = match connect_socket("ws://localhost:48234") {
 							Ok(let opened) => opened,
 							Err(let reason) => panic(reason),

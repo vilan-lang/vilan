@@ -94,6 +94,33 @@ fun main() {
 Concatenation is `+`. The full method list (split, trim, contains, and so
 on) is in the [strings reference](../std/strings.md).
 
+For text that spans lines, `"""…"""` is a **raw** multiline string:
+nothing follows the opening delimiter on its line, the closing delimiter
+sits alone on its line, and the whitespace before it is the indentation
+stripped from every line — so the literal can sit at the indentation of
+the code around it. Prefix it with `i` to get holes as well:
+
+```vilan
+import std::print;
+
+fun main() {
+	let name = "John";
+	print("""
+		raw: \n stays two characters, {braces} are literal
+		""");
+	print(i"""
+		Hello, {name}!
+		    This line keeps its extra indentation.
+		Braces are written \{like this\}.
+		""");
+}
+```
+
+The trimming is decided before the holes are: a line that opens with a
+hole is indented like any other line. Inside `i"""…"""` exactly two
+escapes exist — `\{` and `\}` — and everything else is raw, just as in
+the plain form.
+
 ## Tuples
 
 `(a, b)` groups a few values without declaring a struct. Take them

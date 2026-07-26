@@ -58,6 +58,7 @@ impl ServerBuilder {
 }
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
+	fun port(self): i32    // the bound port (see below)
 	fun url(self): str
 }
 
@@ -85,6 +86,24 @@ impl ResponseStream {
 }
 ```
 
+`ServerBuilder::port(0)` asks the OS for a free port instead of guessing
+one — and the `Server` handed to `on_start` carries the port it actually
+bound, so `port()` and `url()` are right in either case:
+
+```vilan,norun
+import std::print;
+import std::http::{ Response, Server };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.on_request(|request| Response::builder().body("hi").build())
+		.on_start(|server| print(i"listening on {server.url()} (port {server.port()})"))
+		.build()
+		.start();
+}
+```
+
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and
 writes chunks over time (SSE's shape — a suspending `on_open` runs as
@@ -100,7 +119,7 @@ fun serve_service(
 	port: i32,
 	protocol: RpcProtocol,             // service.dispatcher().into_protocol(codec)
 	fallback: |Request| Response,      // plain-http requests
-	on_ready: || void,
+	on_ready: |Server| void,           // `server.port()` is the port actually bound
 )
 
 fun serve_connected(port, protocol, on_connection, fallback, on_ready)

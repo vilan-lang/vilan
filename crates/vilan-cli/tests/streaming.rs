@@ -7,23 +7,9 @@
 //! surface directly.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-/// Bind an ephemeral port, then release it — a free port for the program under
-/// test (a small TOCTOU window, standard for this kind of test; the pattern
-/// `ssr_fullstack.rs` already uses). Fixed literals collide between runs and, on
-/// Windows, sit inside ranges Hyper-V/WSL reserve outright
-/// (windows-support.md §4).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
 
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_stream_{tag}_{}", std::process::id()));
@@ -85,7 +71,6 @@ fn a_streaming_response_delivers_chunks_until_close() {
         "vilan.toml",
         "[package]\nname = \"app\"\ntarget = \"node\"\n",
     );
-    let port = free_port().to_string();
     write(
         &dir,
         "src/main.vl",
@@ -97,8 +82,9 @@ import std::fetch::fetch;
 import std::bytes::new_text_decoder;
 
 fun main() {
+	// Port 0: the OS picks a free port and the ready callback reports it.
 	Server::builder()
-		.port(45213)
+		.port(0)
 		.on_request(|request| {
 			if request.path().starts_with("/stream") {
 				Response::builder()
@@ -117,14 +103,14 @@ fun main() {
 			}
 		})
 		.on_start(|server| {
-			run_client();
+			run_client(server.port());
 		})
 		.build()
 		.start();
 }
 
-fun run_client() {
-	let response = fetch("http://localhost:45213/stream");
+fun run_client(port: i32) {
+	let response = fetch(i"http://localhost:{port}/stream");
 	let reader = response.body_stream().reader();
 	let decoder = new_text_decoder();
 	mut received = "";
@@ -138,8 +124,7 @@ fun run_client() {
 	print(received);
 	exit(0);
 }
-"#
-        .replace("45213", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(45));
     let one = stdout.find("one").expect("first chunk missing");

@@ -10,25 +10,10 @@
 //! processes come and go.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-
-/// Bind an ephemeral port, then release it — a free port for the server the
-/// program under test starts (a small TOCTOU window, standard for this kind of
-/// test; the pattern `ssr_fullstack.rs` already uses). The port is substituted
-/// into the `.vl` source, both at the `serve_*` call and in the client's URL.
-/// Fixed literals collide between runs and, on Windows, sit inside ranges
-/// Hyper-V/WSL reserve outright (windows-support.md §4).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
 
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
@@ -157,8 +142,9 @@ impl StreamingServer {
         StreamingServer { child, lines }
     }
 
-    /// Blocks until a stdout line containing `needle` arrives.
-    fn await_line(&self, needle: &str, timeout: Duration) {
+    /// Blocks until a stdout line containing `needle` arrives, and returns it —
+    /// the ready line carries the port the server bound (it asked for 0).
+    fn await_line(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -167,7 +153,7 @@ impl StreamingServer {
                 "timed out waiting for `{needle}` from the server"
             );
             match self.lines.recv_timeout(remaining) {
-                Ok(line) if line.contains(needle) => return,
+                Ok(line) if line.contains(needle) => return line,
                 Ok(_other) => {}
                 Err(_) => panic!("server stdout ended or timed out before `{needle}`"),
             }
@@ -185,7 +171,6 @@ impl Drop for StreamingServer {
 #[test]
 fn rpc_round_trips_over_real_http() {
     let dir = temp_project("round_trip");
-    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -218,13 +203,15 @@ impl Counter {
 
 fun main() {
 	let counter = Counter { count = Shared::new(0) };
-	serve_rpc(45177, counter.dispatcher().into_protocol(json_codec()), |server| {
-		run_client();
+	// Port 0: the OS picks a free port and `server.url()` is the one it
+	// bound — no probe, no TOCTOU window, nothing to substitute.
+	serve_rpc(0, counter.dispatcher().into_protocol(json_codec()), |server| {
+		run_client(server.url());
 	});
 }
 
-fun run_client() {
-	let client = Client { transport = HttpTransport { url = "http://localhost:45177/" }, codec = json_codec() };
+fun run_client(url: str) {
+	let client = Client { transport = HttpTransport { url = url }, codec = json_codec() };
 	match client.verify() {
 		Ok(let same) => print(i"verify = {same}"),
 		Err(let error) => print(i"verify err {error.to_json()}"),
@@ -239,8 +226,7 @@ fun run_client() {
 	}
 	exit(0);
 }
-"#
-        .replace("45177", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     assert!(
@@ -261,7 +247,6 @@ fn realtime_sync_reaches_every_session_over_sse() {
     // reactive channels, and one session's RPC mutation is observed by BOTH —
     // multi-session sync over a real wire.
     let dir = temp_project("realtime");
-    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -318,16 +303,18 @@ impl Board {
 
 fun main() {
 	let board = Board { count = Signal::new(0) };
+	// Port 0: the OS picks a free port, and the ready callback's server
+	// reports the one it bound.
 	serve_connected(
-		9273,
+		0,
 		board.dispatcher().into_protocol(json_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
 		},
 		|id| {},
 		|request| Response::builder().code(404).body("nope").build(),
-		|| {
-			run_clients();
+		|server| {
+			run_clients(i"http://localhost:{server.port()}");
 		},
 	);
 }
@@ -348,8 +335,7 @@ fun watch(name: str, base: str): Client<HttpTransport> {
 	client
 }
 
-fun run_clients() {
-	let base = "http://localhost:9273";
+fun run_clients(base: str) {
 	let alice = watch("alice", base);
 	let bob = watch("bob", base);
 	sleep(300);   // let both Subscribe frames land
@@ -360,8 +346,7 @@ fun run_clients() {
 	sleep(300);   // let the SSE deliveries land
 	exit(0);
 }
-"#
-        .replace("9273", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -387,9 +372,6 @@ fn a_closed_connection_tears_its_session_down_and_spares_the_rest() {
     // and disposing it must not disturb another session subscribed to the SAME
     // signal, which still sees a later mutation.
     let server_dir = temp_project("close_server");
-    // One port for the three projects: the server's, and the URL both client
-    // processes dial.
-    let port = free_port().to_string();
     write(
         &server_dir,
         "vilan.toml",
@@ -450,8 +432,10 @@ fun drop_session(target: i32) {
 
 fun main() {
 	let board = Board { count = Signal::new(0) };
+	// Port 0, announced: the client processes are written once this line
+	// arrives, so they dial the port the OS actually handed out.
 	serve_connected(
-		47161,
+		0,
 		board.dispatcher().into_protocol(json_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
@@ -461,12 +445,20 @@ fun main() {
 			print(i"closed {id}");
 		},
 		|request| Response::builder().code(404).body("nope").build(),
-		|| print("ready"),
+		|server| print(i"ready {server.port()}"),
 	);
 }
-"#
-        .replace("47161", &port),
+"#,
     );
+
+    // The server is started FIRST: its ready line names the port the clients dial.
+    let server = StreamingServer::spawn(&server_dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .to_string();
 
     // The client processes speak the §4.1 foundation directly (`call`), since
     // the generated `Client` lives in the server's package.
@@ -527,9 +519,6 @@ fun main() {{
         ),
     );
 
-    let server = StreamingServer::spawn(&server_dir);
-    server.await_line("ready", Duration::from_secs(60));
-
     // Session 0 subscribes, then its process exits — the socket close must
     // reach the app as a disconnect.
     let doomed_out = vilan_run_with_timeout(&doomed_dir, Duration::from_secs(60));
@@ -563,7 +552,6 @@ fn realtime_sync_over_a_true_websocket() {
     // promise — this is the SSE realtime test with `connect_split` swapped for
     // `connect_socket`, nothing else.
     let dir = temp_project("websocket");
-    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -622,27 +610,28 @@ fun main() {
 	print(i"accept ok = {accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}");
 
 	let board = Board { count = Signal::new(0) };
+	// Port 0: both the http and the ws URL are built from the bound port.
 	serve_connected(
-		9291,
+		0,
 		board.dispatcher().into_protocol(json_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
 		},
 		|id| print(i"closed {id}"),
 		|request| Response::builder().code(404).body("nope").build(),
-		|| {
-			run_clients();
+		|server| {
+			run_clients(server.port());
 		},
 	);
 }
 
-fun watch(name: str, base: str): Client<HttpTransport> {
-	let socket: SocketDuplex = match connect_socket("ws://localhost:9291") {
+fun watch(name: str, port: i32): Client<HttpTransport> {
+	let socket: SocketDuplex = match connect_socket(i"ws://localhost:{port}") {
 		Ok(let opened) => opened,
 		Err(let reason) => panic(reason),
 	};
 	let reactive = ReactiveClient::new(bridge(socket), json_codec());
-	let client = Client { transport = HttpTransport { url = i"{base}/rpc" }, codec = json_codec() };
+	let client = Client { transport = HttpTransport { url = i"http://localhost:{port}/rpc" }, codec = json_codec() };
 	match client.attach(socket.connection.read()) {
 		Ok(let channel) => {
 			let mirror: RemoteSource<i32> = reactive.source(channel);
@@ -655,10 +644,9 @@ fun watch(name: str, base: str): Client<HttpTransport> {
 	client
 }
 
-fun run_clients() {
-	let base = "http://localhost:9291";
-	let alice = watch("alice", base);
-	let bob = watch("bob", base);
+fun run_clients(port: i32) {
+	let alice = watch("alice", port);
+	let bob = watch("bob", port);
 	sleep(300);
 	match alice.add(7) {
 		Ok(let n) => print(i"alice add -> {n}"),
@@ -667,8 +655,7 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#
-        .replace("9291", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -693,7 +680,6 @@ fn rpc_and_realtime_multiplex_over_one_socket() {
     // exercising the correlation ids) and the reactive updates ALL ride each
     // client's one WebSocket; no HTTP requests after the upgrade.
     let dir = temp_project("multiplex");
-    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -748,23 +734,23 @@ impl Board {
 fun main() {
 	let board = Board { count = Signal::new(0) };
 	serve_connected(
-		9293,
+		0,
 		board.dispatcher().into_protocol(json_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
 		},
 		|id| {},
 		|request| Response::builder().code(404).body("nope").build(),
-		|| {
-			run_clients();
+		|server| {
+			run_clients(server.port());
 		},
 	);
 }
 
 // EVERYTHING rides the one socket: RPC via the transport() view, updates via
 // the duplex — no HTTP requests at all after the upgrade.
-fun watch(name: str): Client<SocketTransport> {
-	let socket: SocketDuplex = match connect_socket("ws://localhost:9293") {
+fun watch(name: str, port: i32): Client<SocketTransport> {
+	let socket: SocketDuplex = match connect_socket(i"ws://localhost:{port}") {
 		Ok(let opened) => opened,
 		Err(let reason) => panic(reason),
 	};
@@ -782,9 +768,9 @@ fun watch(name: str): Client<SocketTransport> {
 	client
 }
 
-fun run_clients() {
-	let alice = watch("alice");
-	let bob = watch("bob");
+fun run_clients(port: i32) {
+	let alice = watch("alice", port);
+	let bob = watch("bob", port);
 	sleep(300);
 	match alice.verify() {
 		Ok(let same) => print(i"verify over socket = {same}"),
@@ -802,8 +788,7 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#
-        .replace("9293", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [
@@ -835,7 +820,6 @@ fn the_binary_codec_rides_the_socket_end_to_end() {
     // lanes answering in kind on the server. Same scenario as the text
     // multiplex test: interleaved adds from two clients, fan-out to both.
     let dir = temp_project("binary-socket");
-    let port = free_port().to_string();
     write(
         &dir,
         "vilan.toml",
@@ -891,21 +875,21 @@ impl Board {
 fun main() {
 	let board = Board { count = Signal::new(0) };
 	serve_connected(
-		9294,
+		0,
 		board.dispatcher().into_protocol(binary_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, binary_codec())));
 		},
 		|id| {},
 		|request| Response::builder().code(404).body("nope").build(),
-		|| {
-			run_clients();
+		|server| {
+			run_clients(server.port());
 		},
 	);
 }
 
-fun watch(name: str): Client<SocketTransport> {
-	let socket: SocketDuplex = match connect_socket("ws://localhost:9294") {
+fun watch(name: str, port: i32): Client<SocketTransport> {
+	let socket: SocketDuplex = match connect_socket(i"ws://localhost:{port}") {
 		Ok(let opened) => opened,
 		Err(let reason) => panic(reason),
 	};
@@ -923,9 +907,9 @@ fun watch(name: str): Client<SocketTransport> {
 	client
 }
 
-fun run_clients() {
-	let alice = watch("alice");
-	let bob = watch("bob");
+fun run_clients(port: i32) {
+	let alice = watch("alice", port);
+	let bob = watch("bob", port);
 	sleep(300);
 	match alice.verify() {
 		Ok(let same) => print(i"verify over binary socket = {same}"),
@@ -942,8 +926,7 @@ fun run_clients() {
 	sleep(300);
 	exit(0);
 }
-"#
-        .replace("9294", &port),
+"#,
     );
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
     for expected in [

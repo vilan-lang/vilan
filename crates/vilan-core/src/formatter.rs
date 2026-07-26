@@ -1695,10 +1695,30 @@ impl<'src> Printer<'src> {
         if self.source.get(range.start..range.start + 2) != Some("i\"") {
             return None;
         }
-        // The lexer reports an i-string's span ending *at* its closing quote
-        // rather than after it, so the recovered slice would drop the quote (and
-        // swallow the rest of the file into one string). Include it when present.
-        let end = if self.source.as_bytes().get(range.end) == Some(&b'"') {
+        // A concatenation's span ends at the last token IT consumed — which, when
+        // the literal ends with a hole, is the hole's `}` and not the literal's
+        // closing delimiter (the wrapper `)` belongs to the group the parser
+        // dissolves). So the span's end may fall SHORT, and the real close has to
+        // be recovered from the source.
+        //
+        // Only ever EXTEND, never shorten. This function is consulted for every
+        // expression node, and a node whose span merely STARTS at an i-string is
+        // not necessarily the literal: `i"…" + "t"`, `i"…".len()` and every other
+        // left-headed compound share that start. Shortening one to the literal
+        // drops the rest of the expression's tokens, the safety net sees a token
+        // stream that no longer matches, and `format` returns the whole FILE's
+        // original bytes — a silent whole-file bail that `--check` calls clean.
+        // Taking the larger end keeps the property the single-quoted arms always
+        // had: the slice is the whole expression's source, uncanonicalized but
+        // token-complete.
+        let end = if self.source.get(range.start..range.start + 4) == Some("i\"\"\"") {
+            // The triple-quoted body is raw and runs to the first `"""` (backlog
+            // H7 — the same scan the lexer makes).
+            let body_start = range.start + 4;
+            let close = body_start + self.source.get(body_start..)?.find("\"\"\"")? + 3;
+            close.max(range.end)
+        } else if self.source.as_bytes().get(range.end) == Some(&b'"') {
+            // The single-quoted form is short by exactly its closing quote.
             range.end + 1
         } else {
             range.end
@@ -2413,6 +2433,64 @@ mod reformats {
         assert_formats(
             "fun f(){let x=i\"a \\{b\\} c\";x}\n",
             "fun f() {\n\tlet x = i\"a \\{b\\} c\";\n\tx\n}\n",
+        );
+    }
+
+    #[test]
+    fn interpolated_triple_quoted_string_is_reprinted_verbatim() {
+        // H7. The inner whitespace is semantic (the closing delimiter's
+        // indentation is the trim prefix), so the literal reprints verbatim like
+        // its plain twin — while the code around it still canonicalizes.
+        assert_formats(
+            "fun f(self){let x=i\"\"\"\n\t\thi {self.name}\n\t\t\"\"\";x}\n",
+            "fun f(self) {\n\tlet x = i\"\"\"\n\t\thi {self.name}\n\t\t\"\"\";\n\tx\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_interpolated_triple_quoted_string_ending_in_a_hole_keeps_its_closing_delimiter() {
+        // THE span case: a concatenation's span ends at the last token it
+        // consumed, so a literal ending with a hole reports a span stopping at
+        // the hole's `}`. Recovering the slice from that span alone truncates the
+        // literal — the reprint then fails to lex and the formatter bails.
+        assert_formats(
+            "fun f(){let x=i\"\"\"\n\t\tvalue: {n}\n\t\t\"\"\";x}\n",
+            "fun f() {\n\tlet x = i\"\"\"\n\t\tvalue: {n}\n\t\t\"\"\";\n\tx\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_interpolated_triple_quoted_string_leading_a_compound_is_not_a_bail() {
+        // THE truncation case (the slice-6 review's block): `interpolated_source`
+        // is consulted for every expression node, and a COMPOUND whose span
+        // merely starts at the literal — a concatenation, a method call — is not
+        // the literal. Recovering "the first `\"\"\"` after the start" as the
+        // slice's end truncated the compound to the literal alone, the safety
+        // net saw dropped tokens, and the WHOLE FILE silently kept its original
+        // bytes with `--check` reporting clean. The recovered end may only ever
+        // EXTEND the span (the ends-in-a-hole case), never shorten it.
+        assert_formats(
+            "fun f(){let x=i\"\"\"\n\t\thi\n\t\t\"\"\" + \"t\";x}\n",
+            "fun f() {\n\tlet x = i\"\"\"\n\t\thi\n\t\t\"\"\" + \"t\";\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun f(){let x=i\"\"\"\n\t\thi\n\t\t\"\"\".len();x}\n",
+            "fun f() {\n\tlet x = i\"\"\"\n\t\thi\n\t\t\"\"\".len();\n\tx\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_interpolated_string_in_trailing_position_still_formats() {
+        // Controls for the truncation case: trailing position never had the
+        // problem (the compound's start is not the literal's), and the
+        // single-quoted form's arm never shortened. Both must stay formatting.
+        assert_formats(
+            "fun f(){let x=\"x\" + i\"\"\"\n\t\thi\n\t\t\"\"\";x}\n",
+            "fun f() {\n\tlet x = \"x\" + i\"\"\"\n\t\thi\n\t\t\"\"\";\n\tx\n}\n",
+        );
+        assert_formats(
+            "fun f(){let x=i\"a{n}\" + \"t\";x}\n",
+            "fun f() {\n\tlet x = i\"a{n}\" + \"t\";\n\tx\n}\n",
         );
     }
 
@@ -3229,6 +3307,18 @@ mod newlines {
         // A triple-quoted body reprints verbatim (its whitespace is semantic),
         // so it is a third verbatim path; its VALUE already strips CR.
         let canonical = "fun main() {\n\tlet t = \"\"\"\n\ta\n\tb\n\t\"\"\";\n}\n";
+        let formatted = format(&crlf(canonical));
+        assert!(!formatted.contains('\r'), "{formatted:?}");
+        assert_eq!(formatted, canonical);
+    }
+
+    #[test]
+    fn a_crlf_interpolated_triple_quoted_string_reprints_without_carriage_returns() {
+        // H7's literal joins the two verbatim paths above: it is recovered from
+        // source like an i-string AND carries semantic inner whitespace like a
+        // triple-quoted one.
+        let canonical =
+            "fun main() {\n\tlet w = \"w\";\n\tlet t = i\"\"\"\n\ta {w}\n\tb\n\t\"\"\";\n}\n";
         let formatted = format(&crlf(canonical));
         assert!(!formatted.contains('\r'), "{formatted:?}");
         assert_eq!(formatted, canonical);

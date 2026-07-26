@@ -31,6 +31,6 @@ async fun main() {
 			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
 			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
 		}
-	}, || print("todo server: http://localhost:59386/ — open it in two tabs"));
+	}, |server| print(i"todo server: {server.url()} — open it in two tabs"));
 }
 

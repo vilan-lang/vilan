@@ -1,0 +1,78 @@
+import std::display::{ Display, format };
+import std::print;
+
+// `i"""` is H4's raw multi-line string with H7's holes. Two rules, in this
+// order: the trimming is applied to the literal's RAW text (holes and `\{`/`\}`
+// count as ordinary characters of it, so a hole never disturbs its line's
+// indent accounting), and the fragmenting happens on the trimmed text. Exactly
+// two escapes exist — `\{` and `\}` for a literal brace; everything else is
+// raw, so `\n` is still a backslash and an `n`. The payoff is macro authoring:
+// generated source is written as it will appear.
+
+macro fun derive_label(item: Item): Source {
+	import macro_std::source;
+	import macro_std::meta::{ Item, Source, StructItem };
+	import macro_std::option::Option::{ self, Some, None };
+
+	let target = match item.as_struct() {
+		Some(let found) => found,
+		None => StructItem { name = "?", fields = [] },
+	};
+	// The whole impl as a template: braces of the GENERATED code are escaped,
+	// braces of the holes are not, and the indentation is the closing
+	// delimiter's — not this file's.
+	source(i"""
+		impl {target.name} with Display \{
+			fun to_string(self): str \{
+				"{target.name}"
+			\}
+		\}
+		""")
+}
+
+[derive_label]
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun main() {
+	let who = "world";
+
+	// The motivating shape: a hole mid-line, a hole at line start, a blank
+	// line, and a line indented past the prefix keeping its extra indentation.
+	let text = i"""
+		hello {who}
+		{who} leads
+
+		    indented {who} deeper
+		""";
+	print(text);
+
+	// Raw but for the two brace escapes.
+	let raw = i"""
+		literal \{braces\}, no \n escape, path C:\dir {who}
+		""";
+	print(raw);
+
+	// The body runs to the first `"""`, so quotes inside are content.
+	let quoted = i"""
+		say "" and "{who}"
+		""";
+	print(quoted);
+
+	// A hole is lexed as code: a `{` inside a string in it is not a hole.
+	let nested = i"""
+		{"{not a hole}" + who}
+		""";
+	print(nested);
+
+	// An empty literal is the empty string, and the result is an ordinary
+	// `str` — it concatenates like any other.
+	let empty = i"""
+		""";
+	print(i"[{empty}]" + "!");
+
+	print(format(Point { x = 1, y = 2 }));
+}
+main();

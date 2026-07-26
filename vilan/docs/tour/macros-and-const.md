@@ -76,13 +76,14 @@ macro fun derive_display(item: Item): Source {
 		}
 		arms = arms + i"\"{field.name}=\" + format(self.{field.name})";
 	}
-	source(i"impl {target.name} with Display \{
-	fun to_string(self): str \{
-		import std::display::format;
-		{arms}
-	\}
-\}
-")
+	source(i"""
+		impl {target.name} with Display \{
+			fun to_string(self): str \{
+				import std::display::format;
+				{arms}
+			\}
+		\}
+		""")
 }
 
 [derive_display]
@@ -104,8 +105,12 @@ How to read that:
   basics. Its imports are its own; it can't reach into your program.
 - The macro receives the annotated item as data. `item.as_struct()`
   gives the struct's name and fields.
-- It returns `Source`: text, usually built with interpolation. Literal
-  braces in generated code are escaped as `\{` and `\}`.
+- It returns `Source`: text, usually built with interpolation. The
+  `i"""…"""` form is the one to reach for — the template is written as
+  the generated code will read, indented with the macro around it (the
+  closing delimiter's indentation is stripped from every line). Literal
+  braces in generated code are escaped as `\{` and `\}`; the holes'
+  braces are not.
 - The returned source is spliced in *before* type checking, so generated
   code is checked exactly like code you wrote by hand.
 

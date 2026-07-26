@@ -825,19 +825,6 @@ fn compile_and_run(source: &str) -> Result<String, Vec<String>> {
     }
 }
 
-/// Bind an ephemeral port, then release it — a free port for a program that
-/// serves one (a small TOCTOU window, standard for this kind of test; the
-/// pattern `ssr_fullstack.rs` already uses). Fixed literals both collide
-/// between runs and, on Windows, land in ranges Hyper-V/WSL reserve outright
-/// (windows-support.md §4).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
-
 #[track_caller]
 fn assert_compiles_and_runs(source: &str, expected_stdout: &str) {
     match compile_and_run(source) {
@@ -5384,12 +5371,11 @@ fn client_connect_enforces_the_contract_and_wires_mirrors() {
     // (serve_service), and wires one RemoteSource mirror per [expose]d field
     // in declaration order — both mirrors deliver.
     //
-    // The two ports are ephemeral, not literals: 48411/48412 collided in the
-    // v0.12.0 release gate (EADDRINUSE on a re-run), and on Windows the
-    // 45000-48500 band sits inside the ranges Hyper-V/WSL reserve outright
-    // (windows-support.md §4).
-    let board_port = free_port().to_string();
-    let other_port = free_port().to_string();
+    // Both servers bind port 0 and the ready callbacks report what they got
+    // (backlog E19): literals collided in the v0.12.0 release gate
+    // (EADDRINUSE on a re-run), on Windows the 45000-48500 band sits inside
+    // the ranges Hyper-V/WSL reserve outright (windows-support.md §4), and a
+    // probe-then-substitute port keeps a TOCTOU window the OS can close for us.
     assert_compiles_and_runs(
         &r#"
 import std::print;
@@ -5436,24 +5422,24 @@ import std::print;
         fun main() {
         	let board = Board { count = Signal::new(0), label = Signal::new(""), total = Shared::new(0) };
         	serve_service(
-        		48411,
+        		0,
         		board.dispatcher().into_protocol(json_codec()),
         		|request| Response::builder().code(404).body("probe").build(),
-        		|| {
+        		|board_server| {
         			let other = Other { value = Shared::new(0) };
         			serve_service(
-        				48412,
+        				0,
         				other.dispatcher().into_protocol(json_codec()),
         				|request| Response::builder().code(404).body("probe").build(),
-        				|| drive(),
+        				|other_server| drive(board_server.port(), other_server.port()),
         			);
         		},
         	);
         }
         
-        fun drive() {
+        fun drive(board_port: i32, other_port: i32) {
         	// One call: socket + contract enforcement + attach + mirrors.
-        	match Client::connect("ws://localhost:48411", json_codec()) {
+        	match Client::connect(i"ws://localhost:{board_port}", json_codec()) {
         		Ok(let client) => {
         			// Typed mirrors: values arrive decoded at each field's type.
         			let counting = client.count.sub(|n| {
@@ -5470,7 +5456,7 @@ import std::print;
         			}
         			sleep(300);
         			// Drift: a Board client pointed at Other's server refuses cleanly.
-        			match Client::connect("ws://localhost:48412", json_codec()) {
+        			match Client::connect(i"ws://localhost:{other_port}", json_codec()) {
         				Ok(let wrong) => print("drift NOT caught"),
         				Err(let error) => print(i"drift: {error.to_json()}"),
         			}
@@ -5484,9 +5470,7 @@ import std::print;
         	}
         }
 
-        "#
-        .replace("48411", &board_port)
-        .replace("48412", &other_port),
+        "#,
         "count = 0\ncount = 7\nlabel = sum 7\nadd -> 7\ndrift: {\"Contract\":\"the server reports a different service surface\"}\n",
     );
 }
@@ -11891,6 +11875,229 @@ fn a_macro_emits_source_from_a_triple_quoted_string() {
         main();
         "#,
         "42\n",
+    );
+}
+
+// --- H7: interpolated triple-quoted strings -----------------------------------
+// `i"""` … `"""` is H4's literal with holes. Two rules, in this order:
+//
+// 1. TRIMMING FIRST, on the literal's raw text — the same rule and the same code
+//    as a plain `"""` (util::multiline_layout), with holes and `\{` / `\}`
+//    counting as ordinary characters of that text. So a hole never disturbs its
+//    line's indent accounting: the closing delimiter's indentation is stripped
+//    from the start of every content line whether that line opens with text, an
+//    escape, or a hole.
+// 2. FRAGMENTING SECOND, on the trimmed text. Exactly two escapes exist: `\{` and
+//    `\}` for a literal brace. Everything else is raw — a backslash before any
+//    other character is a literal backslash and that character, with no `\n` /
+//    `\t` processing, exactly as in a plain `"""`.
+
+#[test]
+fn an_interpolated_triple_quoted_string_trims_and_interpolates() {
+    // Holes at line start, mid-line, and adjacent to text; a blank line; a line
+    // indented past the prefix keeps its extra indentation.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let who = "world";
+            let text = i"""
+                hello {who}
+                {who} leads
+
+                    indented {who} deeper
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "hello world\nworld leads\n\n    indented world deeper\n",
+    );
+}
+
+#[test]
+fn an_interpolated_triple_quoted_string_escapes_only_braces() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = "X";
+            let text = i"""
+                literal \{braces\} and a hole {x}
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "literal {braces} and a hole X\n",
+    );
+}
+
+#[test]
+fn a_backslash_in_an_interpolated_triple_quoted_string_is_literal() {
+    // NOTHING else is an escape: `\n` is a backslash and an `n`, `\\` is two
+    // backslashes, and a `\` before the end of a line is a backslash — the same
+    // near-rawness as the plain form.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = "X";
+            let text = i"""
+                path C:\dir\next {x}
+                twice \\ and trailing \
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "path C:\\dir\\next X\ntwice \\\\ and trailing \\\n",
+    );
+}
+
+#[test]
+fn an_interpolated_triple_quoted_hole_may_hold_a_string_with_braces() {
+    // The hole is lexed as code, so a `{` inside a plain string in it is content,
+    // not a nested hole.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = "X";
+            let text = i"""
+                {"{not a hole}" + x}
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "{not a hole}X\n",
+    );
+}
+
+#[test]
+fn an_empty_interpolated_triple_quoted_string_is_empty() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let text = i"""
+                """;
+            print(text);
+            print("after");
+        }
+        main();
+        "#,
+        "\nafter\n",
+    );
+}
+
+#[test]
+fn adjacent_quotes_inside_an_interpolated_triple_quoted_string_are_content() {
+    // The body is raw and runs to the first `"""`, so `""` and a lone `"` are
+    // ordinary characters — including right before a hole.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = "X";
+            let text = i"""
+                say "" and "{x}"
+                """;
+            print(text);
+        }
+        main();
+        "#,
+        "say \"\" and \"X\"\n",
+    );
+}
+
+#[test]
+fn content_after_the_opening_quotes_of_an_interpolated_string_is_an_error() {
+    // A malformed shape degrades to its plain twin, so the diagnostic is H4's —
+    // spanned on the raw text, which sits one byte further in for the `i` form.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = i"""oops
+                """;
+        }
+        main();
+        "#,
+        "oops",
+        "nothing may follow the opening",
+    );
+}
+
+#[test]
+fn insufficient_indentation_in_an_interpolated_string_names_the_line() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = i"""
+                properly_indented
+              shallow
+                """;
+        }
+        main();
+        "#,
+        "              shallow",
+        "line 2 of the triple-quoted string is not indented",
+    );
+}
+
+#[test]
+fn an_unescaped_closing_brace_names_the_escape_that_was_meant() {
+    // `\}` is one of the two escapes that exist, which is only meaningful if an
+    // unescaped `}` is not already a literal one — and the shape it catches is a
+    // hole whose `}` was forgotten. The message states the rule and the
+    // sanctioned spelling rather than "found '}' expected a token".
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let x = i"""
+                a bare } here
+                """;
+        }
+        main();
+        "#,
+        "}",
+        r"written `\}`",
+    );
+}
+
+#[test]
+fn a_macro_emits_source_from_an_interpolated_triple_quoted_string() {
+    // THE payoff: a macro's generated source is a template with holes, written
+    // as it will appear — no concatenation ceremony, no `\n` bookkeeping.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        macro fun gen(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [] },
+            };
+            source(i"""
+                fun describe_{target.name}(): str \{
+                    "{target.name}"
+                \}
+                """)
+        }
+
+        [gen]
+        struct Marker {}
+
+        fun main() {
+            print(describe_Marker());
+        }
+        main();
+        "#,
+        "Marker\n",
     );
 }
 
@@ -25593,6 +25800,28 @@ fn a_backslash_before_a_crlf_line_break_in_an_interpolated_string_emits_lf() {
     // into the value. The same program, two encodings, one bundle.
     let javascript = assert_crlf_twin_emits_identically("fun main(): str {\n    i\"a\\\nb\"\n}\n");
     assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn an_interpolated_triple_quoted_string_from_crlf_source_emits_lf() {
+    // H7's literal fragments per LINE, so every line terminator sits at a
+    // fragment boundary — the shape most exposed to a split CRLF pair.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    let who = \"w\";\n    i\"\"\"\n    a {who}\n    b\n    \"\"\"\n}\n",
+    );
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+}
+
+#[test]
+fn a_backslash_before_a_crlf_line_break_in_an_interpolated_triple_quoted_string_emits_lf() {
+    // The H7 twin of the case above, and the one the trimming complicates: a
+    // trailing `\` on the LAST content line has no terminator to take (the
+    // trimming removed it), while one on an interior line takes the whole pair.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    i\"\"\"\n    a\\\n    b\\\n    \"\"\"\n}\n",
+    );
+    assert!(!javascript.contains(r"\r"), "{javascript}");
+    assert!(javascript.contains(r#""a\\\nb\\""#), "{javascript}");
 }
 
 #[test]

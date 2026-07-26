@@ -25,6 +25,39 @@
     "strings": {
       "patterns": [
         {
+          "comment": "Interpolated triple-quoted string `i\"\"\"...{expr}...\"\"\"` (H7) — the triple-quoted form with holes: RAW but for the two brace escapes `\\{` and `\\}`. First of all the string rules: the triple rule below does not match at the `i`, and the `i\"` rule would end at the very next quote (the second of the three).",
+          "name": "string.quoted.triple.vilan",
+          "begin": "\\b(i)(\"\"\")",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.vilan" },
+            "2": { "name": "punctuation.definition.string.begin.vilan" }
+          },
+          "end": "(\"\"\")",
+          "endCaptures": {
+            "1": { "name": "punctuation.definition.string.end.vilan" }
+          },
+          "patterns": [
+            {
+              "comment": "Exactly two escapes exist here; a backslash before anything else is a literal backslash.",
+              "name": "constant.character.escape.vilan",
+              "match": "\\\\[{}]"
+            },
+            {
+              "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"\"\"`, so a hole can never swallow the closing delimiter — an unclosed `{` while typing corrupts at most the rest of the literal. A lone `\"` is ordinary content here, so — unlike the single-quoted form — the hole does not stop at one.",
+              "name": "meta.template.expression.vilan",
+              "begin": "\\{",
+              "end": "\\}|(?=\"\"\")",
+              "beginCaptures": {
+                "0": { "name": "punctuation.definition.template-expression.begin.vilan" }
+              },
+              "endCaptures": {
+                "0": { "name": "punctuation.definition.template-expression.end.vilan" }
+              },
+              "patterns": [{ "include": "$self" }]
+            }
+          ]
+        },
+        {
           "comment": "Triple-quoted string `\"\"\"...\"\"\"` — RAW and multi-line: no escapes, no interpolation; content runs to the first `\"\"\"`. Must be tried before the plain rule, or `\"\"\"` reads as an empty string plus a quote.",
           "name": "string.quoted.triple.vilan",
           "begin": "(\"\"\")",

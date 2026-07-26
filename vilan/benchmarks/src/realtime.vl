@@ -100,7 +100,7 @@ fun run(finished: || void) {
 		},
 		|id| {},
 		|request| Response::builder().code(404).body("benchmark").build(),
-		|| {
+		|server| {
 			drive(finished);
 		},
 	);

@@ -11884,9 +11884,12 @@ impl<'src> Analyzer<'src> {
             Node::MultilineString(x) => match crate::util::trim_multiline_string(x) {
                 Ok(_) => Some(Expr::MultilineString(x)),
                 Err((message, range)) => {
-                    // The range is relative to the raw inner text, which starts
-                    // 3 bytes into the literal (after the opening delimiter).
-                    let base = node.1.start + 3;
+                    // The range is relative to the raw inner text, which ends 3
+                    // bytes before the literal does (the closing delimiter).
+                    // Measuring back from the END rather than forward from the
+                    // start keeps this right for BOTH openers: `"""` and the
+                    // `i"""` whose malformed shape degraded to this node.
+                    let base = node.1.end.saturating_sub(3 + x.len());
                     self.diagnostics.push(Error {
                         note: None,
                         span: (base + range.start..base + range.end).into(),

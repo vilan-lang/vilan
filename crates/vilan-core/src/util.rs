@@ -172,8 +172,22 @@ impl Drop for RecursionGuard {
     }
 }
 
-/// Trims a triple-quoted string literal's raw inner text — everything between
-/// the `"""` delimiters — to its content (backlog H4; Swift's multiline rule):
+/// The validated shape of a triple-quoted literal's raw inner text: the byte
+/// range of its content lines within `raw`, and the indentation prefix every one
+/// of them starts with. See [`multiline_layout`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultilineLayout<'src> {
+    /// The content lines, `first newline + 1 .. last newline` — empty when the
+    /// literal has no content lines at all.
+    pub content: std::ops::Range<usize>,
+    /// The whitespace preceding the closing `"""`, stripped from every content
+    /// line.
+    pub prefix: &'src str,
+}
+
+/// Validates a triple-quoted string literal's raw inner text — everything between
+/// the `"""` delimiters — and returns its layout (backlog H4; Swift's multiline
+/// rule):
 ///
 /// - The opening `"""` is followed by a newline (after optional whitespace):
 ///   content starts on the next line.
@@ -183,14 +197,19 @@ impl Drop for RecursionGuard {
 ///   a tab never satisfies a space prefix) — unless it is whitespace-only, in
 ///   which case it may be shorter and becomes empty.
 /// - The newlines adjoining the delimiters belong to the syntax, not the
-///   string. The body is RAW: no escape processing at all (the appeal is
-///   pasting code verbatim), so `\n` is a backslash and an `n`.
+///   string.
 ///
-/// A `\r` before any line-ending `\n` is dropped (CRLF tolerance).
+/// This is the ONE implementation of the multiline shape rule: the plain form
+/// trims through [`trim_multiline_string`], and the interpolated form
+/// (`i"""…"""`, backlog H7) fragments through the same layout in the lexer, so
+/// the two can never drift. Holes are ordinary characters here — the rule is
+/// defined on the literal's RAW text, before any fragmentation.
 ///
 /// An error carries the offending byte range RELATIVE TO `raw`, so the caller
 /// can span the diagnostic at the exact offender rather than the whole literal.
-pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Range<usize>)> {
+pub fn multiline_layout(
+    raw: &str,
+) -> Result<MultilineLayout<'_>, (String, std::ops::Range<usize>)> {
     let Some(first_newline) = raw.find('\n') else {
         return Err((
             "a triple-quoted string spans lines: the opening \"\"\" must be followed by a newline"
@@ -220,20 +239,20 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
     }
     if first_newline == last_newline {
         // `"""` directly followed by the closing line: zero content lines.
-        return Ok(String::new());
+        return Ok(MultilineLayout {
+            content: first_newline..first_newline,
+            prefix,
+        });
     }
-    let body = &raw[first_newline + 1..last_newline];
-    let mut content_lines = Vec::new();
-    let mut line_start = first_newline + 1;
+    let content = first_newline + 1..last_newline;
+    let body = &raw[content.clone()];
+    let mut line_start = content.start;
     for (index, line) in body.split('\n').enumerate() {
         let raw_line_length = line.len();
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(prefix) {
-            content_lines.push(rest);
-        } else if line.chars().all(|c| c == ' ' || c == '\t') {
-            // A whitespace-only line may fall short of the prefix.
-            content_lines.push("");
-        } else {
+        if !line.starts_with(prefix) && !line.chars().all(|c| c == ' ' || c == '\t') {
+            // A whitespace-only line may fall short of the prefix; anything else
+            // must carry it.
             return Err((
                 format!(
                     "line {} of the triple-quoted string is not indented to its closing \"\"\" \
@@ -245,6 +264,28 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
         }
         line_start += raw_line_length + 1;
     }
+    Ok(MultilineLayout { content, prefix })
+}
+
+/// Trims a triple-quoted string literal's raw inner text to its value: the
+/// content lines of [`multiline_layout`] with the indentation prefix stripped,
+/// joined by `\n`. The body is RAW — no escape processing at all (the appeal is
+/// pasting code verbatim), so `\n` is a backslash and an `n` — and a `\r` before
+/// any line-ending `\n` is dropped (CRLF tolerance).
+pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Range<usize>)> {
+    let layout = multiline_layout(raw)?;
+    if layout.content.is_empty() {
+        return Ok(String::new());
+    }
+    let content_lines = raw[layout.content]
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            // Validated above: a line either carries the prefix or is
+            // whitespace-only (and then contributes nothing).
+            line.strip_prefix(layout.prefix).unwrap_or("")
+        })
+        .collect::<Vec<_>>();
     Ok(content_lines.join("\n"))
 }
 

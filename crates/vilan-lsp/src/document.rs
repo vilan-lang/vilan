@@ -4923,6 +4923,36 @@ pub(crate) mod tests {
         );
     }
 
+    // An i-string being typed is the shape that reaches the server most often:
+    // the opening `i"""` exists before its closing delimiter does. The lexer
+    // hands the rest of the file to the unterminated literal, so the ITEMS ABOVE
+    // are what survives — analysis must still terminate, report the error, and
+    // tokenize (H7).
+    #[test]
+    fn an_unterminated_interpolated_triple_quoted_string_still_analyzes() {
+        let document = analyze_text(
+            "fun above(): i32 {\n\t42\n}\n\nfun typing() {\n\tlet text = i\"\"\"\n\thalf written\n",
+        );
+        assert!(
+            document.program.is_some(),
+            "the salvaged tree must still analyze to a program",
+        );
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the unterminated literal must be reported",
+        );
+        assert!(
+            !document.semantic_tokens().is_empty(),
+            "the salvaged declarations must still tokenize",
+        );
+        let names: Vec<String> = document
+            .document_symbols()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        assert!(names.contains(&"above".to_string()), "{names:?}");
+    }
+
     // Document symbols list every salvaged item — the outline survives a mid-file
     // error (an in-body error recovers, so the tail items are here too).
     #[test]

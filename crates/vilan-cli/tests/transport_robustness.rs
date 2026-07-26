@@ -34,9 +34,15 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 }
 
 /// Bind an ephemeral port, then release it — a free port for the server (a small
-/// TOCTOU window, standard for this kind of test; the pattern `ssr_fullstack.rs`
-/// already uses). Fixed literals are unbindable outright inside Windows'
+/// TOCTOU window). Fixed literals are unbindable outright inside Windows'
 /// Hyper-V/WSL reserved ranges (windows-support.md §4).
+///
+/// The one probe backlog E19's port-0 rework deliberately LEFT: this test kills
+/// the server mid-call and starts a SECOND server process that the client must
+/// reconnect to, so the port has to be the same across two independent binds —
+/// which a port-0 bind cannot promise. Phase 1 could announce its port for phase
+/// 3 to reuse, but that only moves the window (the port is released by the kill),
+/// so it buys nothing the probe does not already have.
 #[cfg(unix)]
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -162,7 +168,7 @@ async fun main() {
 	let board = StatusBoard { status = Signal::new(initial) };
 	serve_service(9297, board.dispatcher().into_protocol(json_codec()), |request| {
 		Response::builder().code(404).body("nope").build()
-	}, || print(i"listening {initial}"));
+	}, |server| print(i"listening {initial}"));
 }
 "#;
 

@@ -24,10 +24,16 @@ use crate::token::Token;
 /// One error is recorded per un-lexable character. The chumsky lexer coalesces a
 /// run of consecutive un-lexable characters into a single diagnostic — a
 /// difference in error *count*, not in the token stream, deferred to S4.
+///
+/// `rule` upgrades the generic "found X expected a token" to a curated statement
+/// of the language rule the character broke (diagnostics-standard.md B6 — the
+/// prohibition explains itself and names the sanctioned spelling). The parser
+/// renders it as [`crate::parsing::ParseErrorReason::Rule`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexError {
     pub position: usize,
     pub character: char,
+    pub rule: Option<&'static str>,
 }
 
 /// Lex `source` into its token stream (with spans) and any lexing errors. The
@@ -145,7 +151,11 @@ impl<'src> Lexer<'src> {
         let start = self.position;
         let first = self.bytes[start];
         if first == b'i' && self.bytes.get(start + 1) == Some(&b'"') {
-            self.lex_interpolated();
+            if self.bytes[start + 1..].starts_with(b"\"\"\"") {
+                self.lex_interpolated_multiline();
+            } else {
+                self.lex_interpolated();
+            }
         } else if first == b'"' {
             match self.read_string(start) {
                 Some((token, end)) => self.push(token, start, end),
@@ -182,6 +192,7 @@ impl<'src> Lexer<'src> {
         self.errors.push(LexError {
             position: self.position,
             character,
+            rule: None,
         });
         self.position += character.len_utf8();
     }
@@ -420,12 +431,15 @@ impl<'src> Lexer<'src> {
                         let mut end = self.position + 1 + escaped.len_utf8();
                         // A CRLF is ONE line terminator (windows-support.md §2), so
                         // an escape whose escaped character is the CR must take the
-                        // whole pair. This is the only scanner that ends a fragment
-                        // on a character COUNT rather than a delimiter, so it is the
-                        // only one that could split a pair across two `String`
-                        // tokens — where the per-token normalization that builds the
-                        // value can no longer see it, and the CR would survive into
-                        // a value its LF twin does not have. (A plain `"…"` is one
+                        // whole pair. This is one of exactly TWO scanners that end a
+                        // fragment on a character COUNT rather than a delimiter (the
+                        // other is `lex_multiline_escape`, the i-triple form's twin
+                        // of this branch), so these two are the only places a pair
+                        // could split across two `String` tokens — where the
+                        // per-token normalization that builds the value can no
+                        // longer see it, and the CR would survive into a value its
+                        // LF twin does not have. A third count-based scanner must
+                        // take the pair the same way. (A plain `"…"` is one
                         // contiguous token, so it cannot split.)
                         if escaped == '\r' && self.bytes.get(end) == Some(&b'\n') {
                             end += 1;
@@ -465,11 +479,19 @@ impl<'src> Lexer<'src> {
             self.errors.push(LexError {
                 position: istring_start,
                 character: 'i',
+                rule: None,
             });
             return;
         };
 
-        let whole = span(istring_start, close + 1);
+        self.emit_interpolated(parts, span(istring_start, close + 1));
+        self.position = close + 1;
+    }
+
+    /// Push the token sequence for an interpolated string's `parts`: the outer
+    /// parens, the seed `""`, and a `+` before every part — all carrying `whole`,
+    /// the literal's own span.
+    fn emit_interpolated(&mut self, parts: Vec<IStringPart<'src>>, whole: Span) {
         self.tokens.push((Token::Ctrl('('), whole));
         self.tokens.push((Token::String(""), whole));
         for part in parts {
@@ -480,7 +502,201 @@ impl<'src> Lexer<'src> {
             }
         }
         self.tokens.push((Token::Ctrl(')'), whole));
-        self.position = close + 1;
+    }
+
+    /// Desugar `i"""…"""` (backlog H7) into the same parenthesised concatenation
+    /// `lex_interpolated` produces. `position` is the leading `i`.
+    ///
+    /// Two rules meet here, in this order:
+    ///
+    /// 1. **Trimming happens first, on the raw text.** The literal's inner text is
+    ///    laid out by [`crate::util::multiline_layout`] — the same rule, the same
+    ///    code, as a plain `"""` — with holes and `\{` / `\}` counting as ordinary
+    ///    characters of that text. So a hole never disturbs its line's indent
+    ///    accounting: the closing delimiter's indentation is stripped from the
+    ///    start of every content line whether that line goes on to open with a
+    ///    hole, with text, or with an escape. (A hole may span lines; its
+    ///    continuation lines carry the prefix like any other, and stripping is a
+    ///    no-op inside the hole, where whitespace is trivia.) A literal whose
+    ///    shape breaks the rule degrades to its plain twin so the analyzer reports
+    ///    the precise error.
+    /// 2. **Fragmenting happens second, on the trimmed text.** Exactly two escapes
+    ///    exist: `\{` and `\}` for a literal brace. Everything else is raw — a
+    ///    backslash before any other character is a literal backslash and that
+    ///    character, exactly as in a plain `"""`, with no `\n` / `\t` processing.
+    ///
+    /// Rule 2 is delivered by the fragments themselves: a literal fragment is a
+    /// slice of the source, and `transformer::unescape_string` reads it at code
+    /// generation, so a fragment must never CONTAIN a backslash. Every backslash
+    /// is emitted as [`RAW_BACKSLASH`] instead, which unescapes back to one.
+    fn lex_interpolated_multiline(&mut self) {
+        let istring_start = self.position;
+        let content_start = istring_start + 4; // `i` and the opening `"""`
+        let Some(closing) = self.source[content_start..].find("\"\"\"") else {
+            // Unterminated. There is no resynchronisation point inside an
+            // unclosed multi-line literal (its body may hold anything), so the
+            // rest of the input belongs to the string: record the error and stop.
+            // The parser still gets every token lexed before it.
+            self.errors.push(LexError {
+                position: istring_start,
+                character: 'i',
+                rule: None,
+            });
+            self.position = self.bytes.len();
+            return;
+        };
+        let raw_end = content_start + closing;
+        let raw = &self.source[content_start..raw_end];
+        let whole = span(istring_start, raw_end + 3);
+
+        let layout = match crate::util::multiline_layout(raw) {
+            Ok(layout) => layout,
+            Err(_) => {
+                // A malformed shape degrades to its plain twin: the identical
+                // `"""…"""` text as a multiline-string token, whose already
+                // shipped validation in the analyzer reports the exact offender.
+                // The token keeps the WHOLE literal's span (the `i` included), so
+                // the formatter still recovers it verbatim and the analyzer's
+                // error base — measured back from the span's end — still lands on
+                // the raw text.
+                self.tokens.push((Token::MultilineString(raw), whole));
+                self.position = raw_end + 3;
+                return;
+            }
+        };
+
+        let content_start_offset = content_start + layout.content.start;
+        let mut content_end = content_start + layout.content.end;
+        // The last content line's trailing `\r` belongs to the line terminator the
+        // trimming removes (`trim_multiline_string` strips it per line). Dropping
+        // it here keeps a CRLF file's value byte-identical to its LF twin — the
+        // rest of the pairs stay inside a fragment, where `unescape_string`
+        // normalizes them.
+        if self.source[content_start_offset..content_end].ends_with('\r') {
+            content_end -= 1;
+        }
+
+        let mut parts: Vec<IStringPart<'src>> = Vec::new();
+        let mut at_line_start = true;
+        self.position = content_start_offset;
+        while self.position < content_end {
+            if at_line_start {
+                at_line_start = false;
+                self.skip_multiline_indentation(layout.prefix, content_end);
+                continue;
+            }
+            match self.bytes[self.position] {
+                b'{' => parts.push(IStringPart::Hole(self.lex_hole())),
+                // A bare `}` is malformed, exactly as in `i"…"`: `\}` is one of the
+                // two escapes that exist, which is only meaningful if an unescaped
+                // `}` is not already a literal one — and the shape it catches is a
+                // hole whose `}` was forgotten. Unlike `i"…"` the literal is not
+                // abandoned (a multi-line body swallows far too much source for
+                // that): the offender is reported and read as text.
+                b'}' => {
+                    self.errors.push(LexError {
+                        position: self.position,
+                        character: '}',
+                        rule: Some(UNESCAPED_BRACE),
+                    });
+                    parts.push(IStringPart::Text(
+                        &self.source[self.position..self.position + 1],
+                    ));
+                    self.position += 1;
+                }
+                b'\\' => self.lex_multiline_escape(&mut parts, content_end, &mut at_line_start),
+                _ => {
+                    let text_start = self.position;
+                    while self.position < content_end {
+                        let byte = self.bytes[self.position];
+                        if matches!(byte, b'{' | b'}' | b'\\') {
+                            break;
+                        }
+                        let character = self.source[self.position..]
+                            .chars()
+                            .next()
+                            .expect("byte present implies a character");
+                        self.position += character.len_utf8();
+                        if byte == b'\n' {
+                            // The fragment ends WITH its line terminator (a `\r\n`
+                            // pair stays contiguous inside it); the next line's
+                            // indentation is skipped, not emitted.
+                            at_line_start = true;
+                            break;
+                        }
+                    }
+                    parts.push(IStringPart::Text(&self.source[text_start..self.position]));
+                }
+            }
+        }
+
+        self.emit_interpolated(parts, whole);
+        self.position = raw_end + 3;
+    }
+
+    /// At the start of a content line: step over the indentation prefix
+    /// [`crate::util::multiline_layout`] validated. A whitespace-only line may
+    /// fall short of the prefix — it contributes nothing, so the whole of it goes.
+    fn skip_multiline_indentation(&mut self, prefix: &str, content_end: usize) {
+        let rest = &self.source[self.position..content_end];
+        if rest.starts_with(prefix) {
+            self.position += prefix.len();
+        } else {
+            self.position = match rest.find('\n') {
+                Some(offset) => self.position + offset,
+                None => content_end,
+            };
+        }
+    }
+
+    /// One `\`-led sequence in an `i"""…"""` body. `\{` / `\}` collapse to the
+    /// brace; every other backslash is literal, and so is the character after it.
+    fn lex_multiline_escape(
+        &mut self,
+        parts: &mut Vec<IStringPart<'src>>,
+        content_end: usize,
+        at_line_start: &mut bool,
+    ) {
+        let escaped = self.source[self.position + 1..content_end].chars().next();
+        match escaped {
+            Some('{') | Some('}') => {
+                parts.push(IStringPart::Text(
+                    &self.source[self.position + 1..self.position + 2],
+                ));
+                self.position += 2;
+            }
+            // A lone backslash at the very end of the content (the line terminator
+            // the trimming removed is not its to escape).
+            None => {
+                parts.push(IStringPart::Text(RAW_BACKSLASH));
+                self.position += 1;
+            }
+            Some(character) => {
+                parts.push(IStringPart::Text(RAW_BACKSLASH));
+                let mut end = self.position + 1 + character.len_utf8();
+                // A CRLF is ONE line terminator (windows-support.md §2): an escape
+                // whose escaped character is the CR must take the whole pair, or
+                // the pair splits across two fragments — where the per-fragment
+                // normalization that builds the value can no longer see it, and
+                // the CR survives into a value its LF twin does not have. This is
+                // the second of exactly two count-based fragment scanners (the
+                // other is `lex_interpolated`'s escape branch — the single-quoted
+                // twin of this one); both must take the pair, and so must any
+                // third that ever joins them.
+                if character == '\r' && end < content_end && self.bytes[end] == b'\n' {
+                    end += 1;
+                }
+                if character == '\\' {
+                    parts.push(IStringPart::Text(RAW_BACKSLASH));
+                } else {
+                    parts.push(IStringPart::Text(&self.source[self.position + 1..end]));
+                }
+                if self.source[self.position + 1..end].ends_with('\n') {
+                    *at_line_start = true;
+                }
+                self.position = end;
+            }
+        }
     }
 
     /// Lex one interpolation hole `{…}` into its parenthesised token list. The
@@ -545,6 +761,19 @@ enum IStringPart<'src> {
     Text(&'src str),
     Hole(Vec<Spanned<Token<'src>>>),
 }
+
+/// The rule an unescaped `}` in an interpolated string breaks. Curated
+/// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned
+/// spelling of a literal one is named.
+const UNESCAPED_BRACE: &str = "a literal `}` inside an interpolated string is written `\\}` — an unescaped \
+     brace belongs to a `{expr}` hole";
+
+/// One literal backslash, as an `i"""…"""` fragment must spell it. A fragment is
+/// read back by `transformer::unescape_string`, so a backslash that must survive
+/// as itself cannot be a slice of the source — it is this two-character escape
+/// instead. (`&'static str` coerces to any `&'src str`, exactly as the seed `""`
+/// fragment does.)
+const RAW_BACKSLASH: &str = "\\\\";
 
 #[cfg(test)]
 mod tests {
@@ -951,6 +1180,165 @@ mod tests {
         );
     }
 
+    // --- Interpolated triple-quoted strings (backlog H7) ---------------------
+
+    #[test]
+    fn an_interpolated_triple_quoted_string_fragments_the_trimmed_text() {
+        // Trimming first, on the RAW text: the opening line's newline and the
+        // closing line's indentation are gone, and every content line loses the
+        // prefix — whether it opens with text or with a hole. Fragmenting second:
+        // a fragment ends WITH its line terminator, so the next line's prefix can
+        // be skipped rather than emitted.
+        assert_eq!(
+            lex("i\"\"\"\n\ta {x}\n\t{y} b\n\t\"\"\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a "),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("x"),
+                Token::Ctrl(')'),
+                Token::Op("+"),
+                Token::String("\n"),
+                Token::Op("+"),
+                Token::Ctrl('('),
+                Token::Ident("y"),
+                Token::Ctrl(')'),
+                Token::Op("+"),
+                Token::String(" b"),
+                Token::Ctrl(')'),
+            ]
+        );
+        // Zero content lines is the empty string, exactly as `"""` is.
+        assert_eq!(
+            lex("i\"\"\"\n\t\"\"\""),
+            vec![Token::Ctrl('('), Token::String(""), Token::Ctrl(')')]
+        );
+    }
+
+    #[test]
+    fn an_interpolated_triple_quoted_string_has_only_the_two_brace_escapes() {
+        // `\{` / `\}` collapse to the brace. Every other backslash is literal —
+        // and so is the character after it — so the fragment cannot be a slice of
+        // the source (`unescape_string` reads it back): it is `RAW_BACKSLASH`.
+        assert_eq!(
+            lex("i\"\"\"\n\t\\{a\\} \\n\n\t\"\"\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("{"),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("}"),
+                Token::Op("+"),
+                Token::String(" "),
+                Token::Op("+"),
+                Token::String("\\\\"),
+                Token::Op("+"),
+                Token::String("n"),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escaped_crlf_stays_in_one_interpolated_triple_quoted_fragment() {
+        // The same character-COUNT hazard as the single-quoted form: a `\` before
+        // a CRLF must take the whole pair, or the terminator splits across two
+        // fragments and the CR survives into a value its LF twin does not have.
+        assert_eq!(
+            lex("i\"\"\"\r\n\ta\\\r\n\tb\r\n\t\"\"\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("\\\\"),
+                Token::Op("+"),
+                Token::String("\r\n"),
+                Token::Op("+"),
+                Token::String("b"),
+                Token::Ctrl(')'),
+            ]
+        );
+        // The LAST content line's `\r` belongs to the terminator the trimming
+        // removes, so a trailing `\` there stays a lone backslash — the LF twin's
+        // shape exactly.
+        assert_eq!(
+            lex("i\"\"\"\r\n\ta\\\r\n\t\"\"\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("\\\\"),
+                Token::Ctrl(')'),
+            ]
+        );
+        assert_eq!(
+            lex("i\"\"\"\n\ta\\\n\t\"\"\""),
+            vec![
+                Token::Ctrl('('),
+                Token::String(""),
+                Token::Op("+"),
+                Token::String("a"),
+                Token::Op("+"),
+                Token::String("\\\\"),
+                Token::Ctrl(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_interpolated_triple_quoted_string_degrades_to_its_plain_twin() {
+        // The shape rule is one implementation (`util::multiline_layout`), and so
+        // is its diagnostic: a literal that breaks the rule becomes the very
+        // `"""…"""` token its text would lex as without the `i`, and the
+        // analyzer's shipped validation reports the exact offender. The span
+        // still covers the WHOLE literal, the `i` included.
+        assert_eq!(
+            lex_spanned("i\"\"\"oops\n\"\"\""),
+            vec![(Token::MultilineString("oops\n"), 0, 12)]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_interpolated_triple_quoted_string_records_one_error() {
+        // Mid-edit in an editor. There is no resynchronisation point inside an
+        // unclosed multi-line literal, so the rest of the input belongs to the
+        // string: the tokens before it survive, one error is recorded, and the
+        // scan terminates (a lexer that failed to advance would hang the server).
+        let (tokens, errors) = tokenize("fun f() {\n\tlet x = i\"\"\"\n\tmid edit\n");
+        let bare: Vec<Token> = tokens.into_iter().map(|(token, _)| token).collect();
+        assert_eq!(
+            bare,
+            vec![
+                Token::Fun,
+                Token::Ident("f"),
+                Token::Ctrl('('),
+                Token::Ctrl(')'),
+                Token::Ctrl('{'),
+                Token::Let,
+                Token::Ident("x"),
+                Token::Op("="),
+            ]
+        );
+        assert_eq!(
+            errors,
+            vec![LexError {
+                position: 19,
+                character: 'i',
+                rule: None,
+            }]
+        );
+    }
+
     // --- Illegal characters (the error value shape is S1's own choice) -------
 
     #[test]
@@ -965,6 +1353,7 @@ mod tests {
             vec![LexError {
                 position: 1,
                 character: '@',
+                rule: None,
             }]
         );
     }
@@ -978,6 +1367,7 @@ mod tests {
             vec![LexError {
                 position: 1,
                 character: '€',
+                rule: None,
             }]
         );
     }

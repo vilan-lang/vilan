@@ -6,23 +6,9 @@
 //! up as the watchdog killing a hung run.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-/// Bind an ephemeral port, then release it — a free port for the program under
-/// test (a small TOCTOU window, standard for this kind of test; the pattern
-/// `ssr_fullstack.rs` already uses). Fixed literals collide between runs and, on
-/// Windows, sit inside ranges Hyper-V/WSL reserve outright
-/// (windows-support.md §4).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
-}
 
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
@@ -88,7 +74,6 @@ fn cancel_aborts_an_in_flight_fetch() {
         "vilan.toml",
         "[package]\nname = \"app\"\ntarget = \"node\"\n",
     );
-    let port = free_port().to_string();
     write(
         &dir,
         "src/main.vl",
@@ -100,8 +85,9 @@ import std::fetch::fetch;
 import std::http::{ Server, Response };
 
 fun main() {
+	// Port 0: the OS picks a free port and the ready callback reports it.
 	Server::builder()
-		.port(45211)
+		.port(0)
 		.on_request(|request| {
 			// Never answers within the test window: only an in-flight abort
 			// lets the client finish.
@@ -109,21 +95,21 @@ fun main() {
 			Response::builder().body("too late").build()
 		})
 		.on_start(|server| {
-			run_client();
+			run_client(server.port());
 		})
 		.build()
 		.start();
 }
 
-fun fetch_hanging(): i32 {
-	let response = fetch("http://localhost:45211/hang");
+fun fetch_hanging(port: i32): i32 {
+	let response = fetch(i"http://localhost:{port}/hang");
 	print("unreachable-response");
 	response.status()
 }
 
-fun run_client() {
+fun run_client(port: i32) {
 	nursery(|n| {
-		let _ = async fetch_hanging();
+		let _ = async fetch_hanging(port);
 		sleep(150);   // let the request get in flight
 		n.cancel();   // aborts it via the ambient signal
 		0
@@ -131,8 +117,7 @@ fun run_client() {
 	print("aborted-fast");
 	exit(0);
 }
-"#
-        .replace("45211", &port),
+"#,
     );
     let started = Instant::now();
     let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(45));

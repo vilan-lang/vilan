@@ -24,10 +24,10 @@
 //!   new binary makes the old std dead, and re-materializing one is free and
 //!   offline. A git entry is neither: its key is its content, so it is never
 //!   *stale*, and re-fetching one needs the network — an age sweep would delete
-//!   exactly the entry that makes the promise below true. Cleanup is therefore
-//!   limited to this process's own staging directory. (A staging directory left
-//!   behind by a *crashed* run is not swept yet; its natural home is the
-//!   upgrade-time sweep that already prunes the std cache.)
+//!   exactly the entry that makes the promise below true. The one thing that
+//!   IS swept by age is the opposite of a cache entry: a `.staging-…` directory
+//!   a crashed run left behind, which is an incomplete fetch nobody can read
+//!   ([`sweep_stale_staging`], on the way in as a writer).
 //!
 //! **Offline with a warm cache works, and nothing ever fetches passively.** A
 //! key that is present is used with no network call at all; a key that is
@@ -240,6 +240,7 @@ pub fn materialize(
             config.cache_root.display()
         )
     })?;
+    sweep_stale_staging(&config.cache_root, STALE_STAGING);
     let staging = config.cache_root.join(format!(
         ".staging-{}-{}",
         cache_key(source),
@@ -265,6 +266,50 @@ pub fn materialize(
                 "cannot move the fetched checkout into place at {}: {error}",
                 entry.display()
             )))
+        }
+    }
+}
+
+/// How long a `.staging-…` directory must have gone untouched before another
+/// run reads it as a crashed run's leftover rather than a live fetch. HOURS,
+/// not minutes: cloning a large repository over a slow link takes minutes, and
+/// deleting a live staging directory would break the fetch that owns it (the
+/// name carries the owner's process id, but a pid is not a liveness test — it
+/// is reused, and it means nothing across machines sharing a home directory).
+/// Six hours is far past any fetch and far short of "leftovers accumulate".
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Remove `.staging-…` directories older than `older_than` — a crashed fetch's
+/// leftovers (`distribution.md` §7's S4 residual). Best-effort and
+/// opportunistic: it runs on the way INTO the cache as a *writer*, the one
+/// moment a process is already paying for the directory, and every failure is
+/// ignored — hygiene must never fail a build. A warm-cache hit returns long
+/// before this, so the fast path stays free of it.
+///
+/// Deleting a staging directory is safe in a way that deleting a cache entry is
+/// not (see the module note on age-pruning): a staging directory is by
+/// definition an incomplete fetch that no one can be reading — only whole,
+/// verified checkouts are ever renamed under a key.
+fn sweep_stale_staging(cache_root: &Path, older_than: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(".staging-") {
+            continue;
+        }
+        // A modification time in the FUTURE (a clock skew, a copied tree) reads
+        // as an error from `duration_since` and therefore as "not stale" — the
+        // conservative direction.
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= older_than);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -695,5 +740,50 @@ mod tests {
         // No `fatal:`/`error:` line at all: the last thing it said.
         assert_eq!(digest(b"something odd\nlast word\n"), "last word");
         assert_eq!(digest(b""), "(no output)");
+    }
+
+    /// A cache root holding one warm entry and one staging directory, both just
+    /// created (so their age is ~0 and the threshold decides everything).
+    fn planted_cache(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("vilan_git_staging_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".staging-deadbeef-1234/src")).unwrap();
+        std::fs::write(root.join(".staging-deadbeef-1234/src/lib.vl"), "// half\n").unwrap();
+        std::fs::create_dir_all(root.join("deadbeef/src")).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_stale_staging_directory_is_swept_and_a_cache_entry_is_not() {
+        // The S4 residual (`distribution.md` §7): a crashed fetch's leftovers
+        // are removed by the next run that writes to the cache. The threshold
+        // is a parameter so the pin can state the age instead of forging an
+        // mtime — zero means "everything is old enough".
+        let root = planted_cache("stale");
+        sweep_stale_staging(&root, std::time::Duration::ZERO);
+        assert!(
+            !root.join(".staging-deadbeef-1234").exists(),
+            "the crashed run's staging directory survived the sweep"
+        );
+        assert!(
+            root.join("deadbeef").is_dir(),
+            "the sweep must never touch a cache ENTRY — re-fetching one needs \
+             the network, which is what a warm cache exists to avoid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fresh_staging_directory_survives_the_sweep() {
+        // The reason the threshold is hours: a staging directory that a
+        // CONCURRENT fetch is still filling must be left alone.
+        let root = planted_cache("fresh");
+        sweep_stale_staging(&root, STALE_STAGING);
+        assert!(
+            root.join(".staging-deadbeef-1234/src/lib.vl").is_file(),
+            "a live fetch's staging directory was deleted under it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

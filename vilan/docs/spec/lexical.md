@@ -122,6 +122,43 @@ An interpolated string may also span lines — the multi-line
 literal fragments follow the same line-terminator rule: one `\n` per
 source line break.
 
+#### Interpolated multiline strings
+
+```text
+INTERPOLATED_MULTILINE = 'i' , '"""' , raw_text , '"""' ;
+```
+
+`i"""…"""` is the multiline string with holes. Two rules apply, in this
+order:
+
+1. **Trimming, on the literal's raw text.** The layout rule of a plain
+   `"""` applies unchanged and applies *first*: nothing may follow the
+   opening delimiter on its line, the closing delimiter sits alone on its
+   line, and the whitespace preceding it is the indentation prefix
+   stripped from the start of every content line. Holes and `\{` / `\}`
+   count as ordinary characters of that text, so a hole never disturbs its
+   line's indent accounting: a line opening with a hole is indented like
+   any other, and a hole in the middle of a line has no effect on it. A
+   hole may span lines; its continuation lines carry the prefix like every
+   other line, and stripping is a no-op inside the hole, where whitespace
+   is trivia.
+2. **Fragmenting, on the trimmed text.** Exactly two escapes exist: `\{`
+   and `\}`, each a literal brace. Nothing else is an escape — a backslash
+   before any other character is a literal backslash and that character,
+   the same near-rawness as a plain `"""` (`\n` is a backslash and an
+   `n`). An unescaped `}` outside a hole is an error, as it is in `i"…"`.
+
+The body is raw and runs to the first `"""`, so a single `"` and a `""`
+pair are ordinary content. As with the single-quoted form, the value is a
+`str` and a source line break contributes one `\n`.
+
+```vilan,fragment
+let report = i"""
+    {name} scored {score}.
+    Braces are written \{like this\}.
+    """
+```
+
 *Implementation note: because a hole is re-lexed as ordinary tokens, a
 string literal inside a hole cannot use `\"` escapes — nested quoting
 inside holes is currently a parse error. Bind the value to a local first.*

@@ -19,10 +19,24 @@ impl NodeServer {
 	[extern(method)]
 	external fun listen(self, port: i32, on_ready: || void);
 
+	/// The bound address, once listening — where a port-0 bind's ACTUAL port
+	/// comes from. A TCP server (the only kind this module starts) always
+	/// answers with an address object.
+	[extern(method, "address")]
+	external fun address(self): NodeAddress;
+
 	/// Subscribe to the server's `upgrade` event — a WebSocket handshake
 	/// arrives as `(request, raw socket, head)` instead of a normal request.
 	[extern(method, "on")]
 	external fun on_upgrade(self, event: str, handler: |NodeRequest, NodeSocket, Bytes| void);
+}
+
+/// The `AddressInfo` a listening server reports (`{ address, family, port }`).
+external struct NodeAddress;
+
+impl NodeAddress {
+	[extern(get, "port")]
+	external fun port(self): i32;
 }
 
 external struct NodeRequest;
@@ -229,6 +243,10 @@ impl ResponseBuilder {
 // --- Server ---
 
 struct Server {
+	/// The port to listen on before `start`, and the port actually BOUND from
+	/// `on_start` onward: binding port 0 lets the OS pick a free one, and the
+	/// server handed to `on_start` carries the number it picked (so `url()` and
+	/// `port()` are right in both cases).
 	port: i32,
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
@@ -250,6 +268,13 @@ struct ServerBuilder {
 impl Server {
 	fun builder(): ServerBuilder {
 		ServerBuilder { port = 3000, request_handler = |request| Response::builder().code(404).body("Not Found").build(), on_start = |server| {}, on_stop = |server| {}, upgrade_handler = None }
+	}
+
+	/// The port this server listens on: the requested one before `start`, the
+	/// bound one from `on_start` onward. Bind `0` and read it here to take a
+	/// port the OS knows is free instead of guessing one.
+	fun port(self): i32 {
+		self.port
 	}
 
 	fun url(self): str {
@@ -292,9 +317,19 @@ impl Server {
 			None => {},
 		}
 		node_server.listen(port, || {
-			on_start(server);
+			// The server handed to `on_start` carries the port it actually
+			// bound, which is the whole point of being allowed to request 0.
+			mut started = server;
+			started.port = bound_port(node_server);
+			on_start(started);
 		});
 	}
+}
+
+/// The port `node_server` actually bound, read off its `address()` — which is
+/// how a `port(0)` request becomes a number the app (and its clients) can use.
+fun bound_port(node_server: NodeServer): i32 {
+	node_server.address().port()
 }
 
 impl ServerBuilder {

@@ -215,9 +215,14 @@ pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
         .iter()
         .map(|error| ParseError {
             span: (error.position..error.position + error.character.len_utf8()).into(),
-            reason: ParseErrorReason::Expected {
-                found: Found::Character(error.character),
-                expected: vec!["a token".to_string()],
+            // A lexer error that knows WHICH rule the character broke states it;
+            // the rest render as the generic "found X expected a token".
+            reason: match error.rule {
+                Some(rule) => ParseErrorReason::Rule(rule),
+                None => ParseErrorReason::Expected {
+                    found: Found::Character(error.character),
+                    expected: vec!["a token".to_string()],
+                },
             },
             context: Vec::new(),
             hint: None,

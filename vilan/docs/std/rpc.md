@@ -94,7 +94,7 @@ fun serve_service(
 	port: i32,
 	protocol: RpcProtocol,
 	fallback: |Request| Response,   // plain-http requests: assets + app shell
-	on_ready: || void,
+	on_ready: |Server| void,        // `server.port()` is the port actually bound
 )
 ```
 

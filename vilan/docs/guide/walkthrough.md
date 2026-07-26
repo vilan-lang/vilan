@@ -177,7 +177,7 @@ async fun main() {
 			"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
 			_ => Response::builder().set_header("Content-Type", "text/html").body(app_html).build(),
 		}
-	}, || print("notes server listening on http://localhost:4600"));
+	}, |server| print(i"notes server listening on {server.url()}"));
 }
 ```
 
