@@ -217,7 +217,8 @@ during S1–S5, or lands in both frontends with the differential as the referee
 > generic combinators collapse lexer and parser monomorphizations into one
 > symbol each; the clean datum is `token.rs` self-cost 9.22% (parser-side
 > wrap+compare) vs `lexer.rs` 0.03%. S1 re-baselines on
-> `vilan build examples/todo/client` (5.21B Ir on the profiling profile).
+> `vilan build examples/todo/client` (5.21B Ir on the profiling profile;
+> the path is historical — todo became a single package in the D7 cleanup).
 
 ## 4. Risks, named
 

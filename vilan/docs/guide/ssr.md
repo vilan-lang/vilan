@@ -24,9 +24,11 @@ does not adopt the server's DOM. It renders the same view fresh and swaps it in.
 ## One component, both legs
 
 The whole trick is a shared `fun app(): View`. It imports `std::ui`, which
-resolves *per platform*: the browser layer (live DOM) in the client build, the
-process layer (an HTML string tree) in the server build — the same source, no
-annotation. Put it in a `common` library both packages depend on.
+resolves *per entry*: the browser layer (live DOM) in the client leg, the
+process layer (an HTML string tree) in the server leg — the same source, no
+annotation. Put it in a module beside the two entry files (one package, two
+entries — the [full-stack shape](../tour/platforms.md)); in a workspace, put it
+in a `common` library both packages depend on instead.
 
 ```vilan
 import std::ui::{ view, View, render };
@@ -146,8 +148,8 @@ replace is the fallback that remains under both.
 
 ## Try it
 
-`examples/ssr` is the whole loop in three small packages — `common` (the shared
-`app()`), `client` (browser), and `server` (node):
+`examples/ssr` is the whole loop in one package with two entries — `src/app.vl`
+(the shared `app()`), `src/client.vl` (browser), and `src/server.vl` (node):
 
 ```sh
 vilan run examples/ssr

@@ -1,6 +1,8 @@
+# The shared member: a `[library]`, not a package. A library has no host
+# `target` — it serves every target, being compiled into each consumer. This one
+# is all base layer (core std only), so it compiles into both the Node server and
+# the browser client. A platform-specific module would live in a
+# `[library.target.<t>]` overlay and only be available to a dependent building
+# for that target.
 [library]
 name = "common"
-# A library has no host `target` — it serves every target. This one is all base
-# layer (core std only), so it compiles into both the Node server and the browser
-# client. A platform-specific module would live in a `[library.target.<t>]` overlay
-# and only be available to a dependent building for that target.

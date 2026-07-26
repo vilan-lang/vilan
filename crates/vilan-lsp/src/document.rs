@@ -4321,15 +4321,27 @@ pub(crate) mod tests {
 
     #[test]
     fn todo_example_analyzes_without_diagnostics() {
-        // The realtime workspace: both entries import the shared `common`
-        // library (`[derive(Wire)]` + a generated `[service(TodoClient)]`), and
-        // the non-entry files (a package module, a `[library]` module — neither
-        // has a `main`) must analyze via project context, not be rejected the
-        // way a bare `vilan check <file>` would.
-        assert_example_analyzes_clean("../../vilan/examples/todo/server/src/main.vl");
-        assert_example_analyzes_clean("../../vilan/examples/todo/client/src/main.vl");
-        assert_example_analyzes_clean("../../vilan/examples/todo/client/src/todos.vl");
-        assert_example_analyzes_clean("../../vilan/examples/todo/common/src/lib.vl");
+        // The realtime app: ONE package with two entries (`[entry.client]` /
+        // `[entry.server]`), sharing `[derive(Wire)] Todo` and a generated
+        // `[service(TodoClient)]`. Both entries and the non-entry package
+        // modules (which have no `main`) must analyze via project context, not
+        // be rejected the way a bare `vilan check <file>` would — and each entry
+        // must resolve against its OWN target, so the browser entry sees the
+        // generated stub while the server-colored bodies beside it stay put.
+        assert_example_analyzes_clean("../../vilan/examples/todo/src/server.vl");
+        assert_example_analyzes_clean("../../vilan/examples/todo/src/client.vl");
+        assert_example_analyzes_clean("../../vilan/examples/todo/src/todos.vl");
+        assert_example_analyzes_clean("../../vilan/examples/todo/src/todo.vl");
+    }
+
+    #[test]
+    fn workspace_library_module_analyzes_without_diagnostics() {
+        // The other half of the shape, kept pinned now that the full-stack
+        // examples are single-package: a `[library]` member's module inside a
+        // `[project]` workspace, with no `main` of its own, reached through the
+        // workspace root's project context.
+        assert_example_analyzes_clean("../../vilan/examples/fullstack/common/src/lib.vl");
+        assert_example_analyzes_clean("../../vilan/examples/fullstack/server/src/main.vl");
     }
 
     #[test]

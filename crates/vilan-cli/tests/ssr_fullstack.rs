@@ -1,5 +1,6 @@
 //! The full-stack SSR proof (proposal/ssr.md §1, §4 S2): the `examples/ssr`
-//! workspace, built and run end to end. Two phases over one build:
+//! project (one package, two entries), built and run end to end. Two phases
+//! over one build:
 //!
 //! 1. **Server render.** `node dist/server.js` serves the page; a GET asserts the
 //!    served HTML carries the RENDERED content — the signal-fed list items, the
@@ -39,7 +40,7 @@ fn temp_project(tag: &str) -> PathBuf {
     dir
 }
 
-/// The in-repo `examples/ssr` workspace (this crate is `crates/vilan-cli`).
+/// The in-repo `examples/ssr` project (this crate is `crates/vilan-cli`).
 fn example_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vilan/examples/ssr")
@@ -252,7 +253,7 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
     // A free port injected into the server source (both the `.port(..)` and the
     // cosmetic banner) so the test is hermetic and parallel-safe.
     let port = free_port();
-    let server_source = dir.join("server/src/main.vl");
+    let server_source = dir.join("src/server.vl");
     let patched = std::fs::read_to_string(&server_source)
         .unwrap()
         .replace("8791", &port.to_string());
@@ -262,7 +263,7 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
     build(&dir);
 
     // The server runs from the project root (it reads `dist/client.js` and
-    // `server/src/app.html` by relative path).
+    // `src/app.html` by relative path).
     let mut server = Command::new("node")
         .arg("dist/server.js")
         .current_dir(&dir)

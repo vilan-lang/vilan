@@ -1,11 +1,22 @@
-# The realtime full-stack to-do app (proposal/transport-rpc.md, phase 6): a
-# browser `client`, a Node `server`, and a shared `common` library holding the
-# wire type and the `[service(TodoClient)]` service the two sides meet at. The
-# list lives on the server (persisted to `todos.json`); every connected session
-# observes it over SSE (`std::rpc`'s SplitDuplex), so an edit in one tab appears
-# in all of them.
+# The realtime full-stack to-do app (proposal/transport-rpc.md, phase 6): ONE
+# package, two entries. The browser client and the Node server build from the
+# same source tree — `src/todo.vl` holds the `[derive(Wire)]` payload and
+# `src/store.vl` the `[service(TodoClient)]` the two sides meet at. Platform
+# coloring is what makes that safe: the client entry imports the GENERATED
+# `TodoClient` from `src/store.vl` and never reaches the server-only bodies
+# beside it, so no `common` library and no path dependency are needed.
 #
-#   vilan build .   compiles each app into `dist/` (`client.js` / `server.js`)
-#   vilan run .     builds both and starts the Node server
-[project]
-packages = ["common", "client", "server"]
+# The list lives on the server (persisted to `todos.json`); every connected
+# session observes it over SSE (`std::rpc`'s SplitDuplex), so an edit in one tab
+# appears in all of them.
+#
+#   vilan build .   compiles both entries into `dist/` (`client.js` / `server.js`)
+#   vilan run .     builds both and starts the Node server → http://localhost:59386
+[package]
+name = "todo"
+
+[entry.client]
+target = "browser"
+
+[entry.server]
+# target defaults to node; path defaults to server.vl under src/

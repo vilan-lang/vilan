@@ -1,0 +1,9 @@
+# The raw-DOM browser example: `std::dom` with no framework on top. A single
+# `browser`-target package, so a plain `vilan build .` emits `client.js` next to
+# `index.html` — no `--target` flag needed. Sources sit at the package root, so
+# `root` is `.`.
+[package]
+name = "browser_demo"
+root = "."
+entry = "client.vl"
+target = "browser"

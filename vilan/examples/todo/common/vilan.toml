@@ -1,4 +1,0 @@
-[library]
-name = "common"
-# All base layer (core std only — `std::rpc` and `std::reactive` are platform-
-# neutral), so it compiles into both the Node server and the browser client.

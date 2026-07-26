@@ -20,7 +20,7 @@ async fun main() {
 	// time (proposal/ui-styling.md) — served like the bundle it belongs to.
 	let client_css = fs::read_file_to_str("dist/client.css");
 
-	let app_html = fs::read_file_to_str("server/src/app.html");
+	let app_html = fs::read_file_to_str("src/app.html");
 
 	// Reload, seed ids, subscribe persistence — the store's own lifecycle.
 	let store = boot();

@@ -8,12 +8,12 @@ import std::fs;
 import std::http::{ Request, Response, Server };
 import std::print;
 import std::ui::render;
-import common::app;
+import pkg::app::app;
 
 async fun main() {
 	// Read once at boot; the server runs from the project root (`vilan run .`).
 	let client_js = fs::read_file_to_str("dist/client.js");
-	let shell = fs::read_file_to_str("server/src/app.html");
+	let shell = fs::read_file_to_str("src/app.html");
 
 	Server::builder().port(8791).on_request(|request| {
 		match request.path() {

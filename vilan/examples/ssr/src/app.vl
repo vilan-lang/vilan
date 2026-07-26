@@ -1,9 +1,11 @@
-// `common` — the shared component: ONE `fun app(): View` that both legs build
-// (proposal/ssr.md §1, §3). The client mounts it into live DOM; the server
-// renders it to an HTML string. Its data is self-contained (signals seeded in
-// code), so the two legs produce the same markup by construction — and a button
-// drives a live signal so the client can prove its bindings fire after the
-// replace.
+// The shared component: ONE `fun app(): View` that both entries build
+// (proposal/ssr.md §1, §3). It sits in the same source tree as `client.vl` and
+// `server.vl`, and `import std::ui` resolves per entry — the browser layer in
+// the client leg, the process layer in the server leg. The client mounts it
+// into live DOM; the server renders it to an HTML string. Its data is
+// self-contained (signals seeded in code), so the two legs produce the same
+// markup by construction — and a button drives a live signal so the client can
+// prove its bindings fire after the replace.
 //
 // Build pure, bind reactive (proposal/ssr.md §5): the bindings below all READ
 // ONCE on the server (the value at render time is the value served) and stay live

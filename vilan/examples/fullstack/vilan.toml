@@ -1,8 +1,12 @@
-# A full-stack project as a multi-package workspace. Each member has its own
-# `vilan.toml` and target; `common` (a pure `target = "none"` library) is shared
-# by both apps via `import common::greeting`.
+# A full-stack project as a multi-package WORKSPACE — the example that teaches
+# this shape. The default full-stack shape is one package with two entries
+# (see `../walkthrough`, `../todo`, `../ssr`); a `[project]` workspace is the
+# form for larger codebases whose parts want their own manifests and dependency
+# sets. Each member here has its own `vilan.toml` and target; `common` (a
+# `[library]`, compiled into each consumer) is shared by both apps via
+# `import common::greeting`.
 #
-#   vilan build .   compiles each app for its target into `dist/`
+#   vilan build .   compiles each member for its target into `dist/`
 #                   (`dist/server.js` for Node, `dist/client.js` for the browser)
 #   vilan run .     builds both and starts the Node server, which serves the
 #                   client bundle (the workspace's single `node` member is run)

@@ -1,3 +1,6 @@
+# The Node member of the workspace, and the one `vilan run .` starts. It depends
+# on the same `common` library the browser member does; each member declares the
+# dependency for itself.
 [package]
 name = "server"
 target = "node"

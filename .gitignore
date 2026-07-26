@@ -3,8 +3,12 @@
 .claude
 *.out
 
-# Build artifacts emitted by the examples (`vilan build` writes `dist/`).
+# Build artifacts emitted by the examples. Examples check in NO emitted output:
+# multi-entry projects write `dist/`, single-entry ones write the bundle (and its
+# stylesheet) beside the source.
 vilan/examples/**/dist/
+vilan/examples/**/*.js
+vilan/examples/**/*.css
 
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
 vilan/benchmarks/src/main.js

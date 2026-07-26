@@ -1,18 +1,25 @@
-# Full-stack example
+# Full-stack example — the workspace shape
 
-A Node server and a browser client, **both written in Vilan**, that share a
-package. The project is a **multi-package workspace** — its root `vilan.toml`
-lists three members, each with its own `vilan.toml` and target:
+**This is the workspace teacher.** A client + server app normally fits in
+**one package with two entries** — that is the default shape, and
+[`../walkthrough/`](../walkthrough/), [`../todo/`](../todo/) and
+[`../ssr/`](../ssr/) all use it. This example deliberately keeps the other
+form: a **`[project]` workspace** of separately-manifested members, which is
+what you reach for once a codebase is large enough that its parts want their
+own dependency sets, or once a shared library is published on its own.
+
+The app itself is kept trivial so the *shape* is the lesson. Its root
+`vilan.toml` lists three members, each with its own `vilan.toml` and target:
 
 ```toml
 [project]
 packages = ["common", "client", "server"]
 ```
 
-- `common/` — `[package] target = "none"`, a pure library (core std only). Both
-  apps `import common::greeting`; as a `none` package it compiles into either
-  bundle, and the platform gate rejects it if it ever reaches for a Node- or
-  browser-only module.
+- `common/` — a `[library]`. A library has no host `target`: it is compiled
+  into each consumer, so this one (all core std) lands in both bundles. Both
+  apps `import common::greeting`, and the platform gate rejects the library if
+  it ever reaches for a Node- or browser-only module.
 - `server/` — `[package] target = "node"`, depending on `common` via a `path`
   dependency. It reads the compiled client bundle once at startup and serves the
   HTML shell on every path, the bundle at `/client.js`, and a small API at

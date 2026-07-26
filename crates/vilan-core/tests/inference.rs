@@ -11845,7 +11845,7 @@ fn a_second_push_conflicting_with_the_first_is_an_error() {
 
 #[test]
 fn an_empty_literal_pushed_two_incompatible_types_is_an_error() {
-    // The motivating repro (examples/playground).
+    // The motivating repro (the former `examples/playground`, pruned in D7).
     assert_fails_spanning(
         r#"
         fun main() {

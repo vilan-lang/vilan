@@ -1,5 +1,10 @@
+# The smallest real package: one `node` entry, one sibling module, one test
+# file. Sources sit at the package root rather than the default `src/`, so
+# `root` is `.` — `main.vl` and its `pkg::square` sibling resolve next to this
+# manifest.
+#
+#   vilan run .     build + run `main.vl`
+#   vilan test .    run every `*_test.vl` in the package
 [package]
 name = "math"
-# Sources sit at the package root rather than the default `src/`, so `root` is
-# `.` — `main.vl` and its `pkg::square` sibling resolve next to this manifest.
 root = "."

@@ -84,7 +84,10 @@ Nothing else fetches: the editor uses the cache when it's there and
 never reaches the network.
 
 A workspace groups several packages so they build together with one
-`vilan build .` at the root:
+`vilan build .` at the root. You need it less often than you might
+expect — a client + server app is *one* package with two entries (see
+[below](#the-shape-of-a-full-stack-app)) — so reach for a workspace when
+members genuinely want their own manifests and dependency sets:
 
 ```toml
 [project]
@@ -163,8 +166,12 @@ app/
     …             everything else, shared by whichever entry reaches it
 ```
 
-Larger apps split into a `[project]` workspace of packages and libraries,
-as above. Either way, the compiler knows which standard-library modules
+Start here. This is the shape the examples use — the
+[walkthrough app](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/walkthrough/),
+the [to-do app](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/todo/),
+and the [SSR example](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/ssr/)
+are all one package with two entries. Larger apps split into a `[project]`
+workspace of packages and libraries, as above. Either way, the compiler knows which standard-library modules
 exist on which platform: if code the browser entry can *reach* calls into
 `std::db` (a server thing), you get a clear compile error naming the call
 chain — importing the module is fine, reaching it is what's checked. The

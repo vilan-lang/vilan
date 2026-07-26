@@ -1,11 +1,11 @@
-// The service — living in the SERVER package, where its resources are
-// (proposal/platform-coloring.md §4.1). The `[service(TodoClient)]` macro
-// still generates both sides from this one struct: the dispatcher and these
-// bodies compile only where they're reachable (the server), while the browser
-// build, importing `server::store::TodoClient`, takes just the generated stub
-// and the contract hash — so this module may use `std::fs` directly, and the
-// whole boot/persist lifecycle is the store's own business instead of wiring
-// injected from `main`.
+// The service — living next to its resources (proposal/platform-coloring.md
+// §4.1). The `[service(TodoClient)]` macro generates both sides from this one
+// struct: the dispatcher and these bodies compile only where they're reachable
+// (the server entry), while the browser entry, importing `pkg::store::TodoClient`,
+// takes just the generated stub and the contract hash — so this module may use
+// `std::fs` directly even though it sits in the same source tree as the client,
+// and the whole boot/persist lifecycle is the store's own business instead of
+// wiring injected from `main`.
 
 import std::reactive::Signal;
 import std::shared::Shared;
@@ -13,7 +13,7 @@ import std::json::json_codec;
 import std::wire::{ encode, decode, Frame };
 import std::result::Result::{ self, Ok, Err };
 import std::fs;
-import common::Todo;
+import pkg::todo::Todo;
 
 // Where the list lives between runs — reloaded on boot, rewritten on change.
 let storage = "todos.json";

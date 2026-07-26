@@ -5,7 +5,7 @@
 // so when the data matches the swap is imperceptible.
 
 import std::ui::mount_root;
-import common::app;
+import pkg::app::app;
 
 fun main() {
 	let _root = mount_root("app", || app());

@@ -1,0 +1,13 @@
+// The shared vocabulary of the to-do app: just the wire type.
+// `[derive(Wire)]` gives `Todo` its codec and proves every field is wire-safe.
+// Both entries import it from here — one package, so there is no library to
+// declare. The service itself lives with its resources in `store.vl` (platform
+// coloring lets the browser entry import its generated client from there
+// without reaching the server-only bodies).
+
+[derive(Wire, PartialEq)]
+struct Todo {
+	id: i32,
+	label: str,
+	done: bool,
+}

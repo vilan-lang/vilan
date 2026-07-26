@@ -1,3 +1,6 @@
+# The browser member of the workspace. It takes `common` by an explicit `path`
+# dependency — the price of the workspace shape, and the reason a two-entry
+# single package is the default when both legs are one app.
 [package]
 name = "client"
 target = "browser"

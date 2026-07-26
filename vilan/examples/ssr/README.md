@@ -1,18 +1,37 @@
 # Server-side rendering (render and replace)
 
-The A7 SSR model in three small packages (proposal/ssr.md, and the
-[SSR guide](../../docs/guide/ssr.md)):
+The A7 SSR model (`proposal/ssr.md`, and the
+[SSR guide](../../docs/guide/ssr.md)) in **one package with two entries** — the
+default full-stack shape:
 
-- **`common`** — a `[library]` holding the one `fun app(): View` both legs build.
-  It imports `std::ui`, which resolves per platform: the browser layer (live DOM)
-  in the client build, the process layer (an HTML string) in the server build —
-  the same source, no annotation.
-- **`client`** — the browser package. `main` is `mount_root("app", || app())`;
-  on boot `mount` clears the container and mounts the live UI, *replacing* the
-  server-rendered nodes.
-- **`server`** — the node package. It renders `app()` to markup with `render`,
-  splices it into `server/src/app.html` at the `<!--ssr-->` marker, and serves the
-  page plus `dist/client.js`.
+```
+ssr/
+  vilan.toml     [entry.client] target = "browser"; [entry.server]
+  src/
+    app.vl       the ONE `fun app(): View` both entries build
+    client.vl    the browser entry — mount_root("app", || app())
+    server.vl    the node entry — render(app()) spliced into the shell
+    app.html     the shell, with the `<!--ssr-->` marker
+```
+
+## What it demonstrates
+
+- **One component, two rendered forms.** `src/app.vl` imports `std::ui`, which
+  resolves per *entry*: the browser layer (live DOM) in the client leg, the
+  process layer (an HTML string) in the server leg. Same source, no annotation,
+  no conditional compilation. That per-entry shadow is the whole SSR mechanism
+  (`proposal/ssr.md` §0).
+- **Render, then replace.** The server renders `app()` to markup per request and
+  splices it into `src/app.html` at the `<!--ssr-->` marker. On boot the client
+  builds the same view live and `mount_root` *clears* the container before
+  appending it. No hydration — no node adoption, no mismatch errors, no second
+  set of rules.
+- **Build pure, bind reactive** (`proposal/ssr.md` §5). Every binding here reads
+  once on the server (the value at render time is the value served) and stays
+  live on the client: a signal-fed list, an escaped heading, a `when` branch,
+  and a button whose click writes a signal bound to its own text.
+
+## Run
 
 ```sh
 vilan run .
@@ -21,9 +40,10 @@ vilan run .
 
 View the page source: the task list and heading are already in the HTML, before
 any script runs — first paint and SEO. Load it in a browser and the client boots
-and replaces the server markup in place. No hydration: the client renders fresh
-and swaps.
+and replaces the server markup in place.
 
-The data here is seeded in code, so both legs produce the same markup and the swap
-is imperceptible. A real app fetches over rpc; see the guide's note on the
+The data here is seeded in code, so both legs produce the same markup and the
+swap is imperceptible. A real app fetches over rpc; see the guide's note on the
 double-fetch v1 accepts.
+
+`dist/` is generated and not checked in.

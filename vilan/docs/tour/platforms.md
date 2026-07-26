@@ -47,7 +47,8 @@ runtime crash. That's the whole idea of this chapter.
 ## Full-stack packages
 
 A client + server app fits in **one package** with two entries — each
-`[entry.<name>]` names an entry file and the platform it builds for:
+`[entry.<name>]` names an entry file and the platform it builds for.
+This is the default shape; reach past it only when you have a reason:
 
 ```toml
 [package]
@@ -78,9 +79,10 @@ the sorting: the same `store.vl` may use `std::fs` freely, because only
 the server entry reaches into it — if client code ever calls that far,
 the build fails with the call chain.
 
-Larger apps can still split into a workspace of packages — a shared
-`[library]` for payload types, a browser package, a server package —
-and each member may declare its own entries:
+The advanced form, for larger apps, is a workspace of packages — a
+shared `[library]` for payload types, a browser package, a server
+package — where each member has its own manifest and dependency set, and
+may declare its own entries:
 
 ```
 app/

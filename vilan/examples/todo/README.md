@@ -6,21 +6,36 @@ every connected tab kept in sync in realtime. Open the page twice; add a todo in
 one tab and watch it appear in the other. Restart the server; the list is still
 there.
 
-```
-vilan run vilan/examples/todo     # build both bundles + start the server
+```sh
+cd vilan/examples/todo
+vilan run .                       # build both entries + start the server
 # → http://localhost:59386/  (open it in two tabs)
 ```
 
 ## The shape
 
+**One package, two entries** — the default full-stack shape (see
+[Platforms](../../docs/tour/platforms.md)):
+
 ```
-common/   the shared vocabulary — compiled into BOTH bundles
-  Todo                 [derive(Wire)]: the codec + the proof it's wire-safe
-  TodoStore            [service(TodoClient)]: state + [rpc] methods
-  TodoClient           GENERATED: the typed stub the browser calls
-server/   node — owns the one TodoStore, persists it, serves everything
-client/   browser — renders signals; never touches the data directly
+todo/
+  vilan.toml     [entry.client] target = "browser"; [entry.server]
+  src/
+    todo.vl      Todo — [derive(Wire)]: the codec + the proof it's wire-safe
+    store.vl     TodoStore — [service(TodoClient)]: state + [rpc] methods
+                 TodoClient — GENERATED: the typed stub the browser calls
+    server.vl    the node entry — owns the store, persists it, serves everything
+    client.vl    the browser entry — connect, mirror, mount
+    todos.vl     the UI — renders signals; never touches the data directly
+    app.html     the shell
 ```
+
+`store.vl` reads and writes `todos.json` with `std::fs` while sitting in the
+same directory as the browser entry. That is safe because the check is on
+*reachable* code: the client entry only ever touches the generated
+`TodoClient`, so the server-only bodies never enter its build. Splitting the
+tree into packages to keep them apart would be doing by hand what the compiler
+already does.
 
 One struct is the whole contract. `[service(TodoClient)]` generates the server's
 `dispatcher()` and the client's `TodoClient<T: Transport>` sibling (each call

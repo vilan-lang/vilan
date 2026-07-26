@@ -1,8 +1,6 @@
 // todos.vl — the fuller picture on the explicit-dependency core: derived signals
 // (`derive`), a two-input dependency (`combine`), a reactive keyed list, and
 // conditional rendering. The dependency graph is literally the combinator tree.
-//
-// NOTE: this is an API design proposal — not implemented yet.
 
 import std::ui::{ view, View };
 import std::reactive::{ Signal, combine };

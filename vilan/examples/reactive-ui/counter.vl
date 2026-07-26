@@ -31,8 +31,7 @@ fun counter(): View {
 		.styled(card)
 		.child(view("h2").text("Counter"))
 		// `bind_text` binds to a `Source<str>`; derive one from `count`. The
-		// i-string renders the number directly (host coercion) — see the README
-		// note on calling a generic like `format` inside a binding closure.
+		// i-string renders the number directly (host coercion).
 		.child(view("p").bind_text(count.map(|n| i"Count: {n}")))
 		.child(view("button").text("−").on("click", || count.set_with(|n| n - 1)))
 		.child(view("button").text("+").on("click", || count.set_with(|n| n + 1)))
