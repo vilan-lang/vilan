@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::analyzer::{Expr, GenericDispatch, Program};
+use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
@@ -94,10 +94,8 @@ pub fn infer(program: &mut Program) {
             break adaptation;
         }
     };
-    for (span, msg, note) in adaptation.diagnostics {
-        program
-            .diagnostics
-            .push(crate::error::Error { note, span, msg });
+    for (error, source) in adaptation.diagnostics {
+        program.push_diagnostic(error, source);
     }
     program.adapted_instances = adaptation.instances;
 
@@ -141,7 +139,7 @@ pub fn infer(program: &mut Program) {
     // cannot await it, is refused. (A PLAIN value-returning parameter now
     // ADAPTS instead of erroring — the worklist above; void-returning
     // parameters stay legal as spawn semantics.)
-    let mut divergences: Vec<(crate::span::Span, String)> = Vec::new();
+    let mut divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let no_flags: HashMap<Id, bool> = HashMap::new();
     for function_call in program.function_calls.values() {
         let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
@@ -180,11 +178,7 @@ pub fn infer(program: &mut Program) {
             if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
                 continue;
             }
-            let span = program
-                .span_map
-                .get(parameter)
-                .map(|span| **span)
-                .unwrap_or(crate::span::Span { start: 0, end: 0 });
+            let (span, source) = anchor_of(program, *parameter);
             // A `sync`-marked parameter is a deliberate contract
             // (async-polymorphism.md A.2) — refused, with the contract's
             // steer. A PLAIN value-returning parameter ADAPTS (the instance
@@ -193,11 +187,15 @@ pub fn infer(program: &mut Program) {
                 continue;
             }
             divergences.push((
-                span,
-                format!(
-                    "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
-                    parameter_record.name
-                ),
+                crate::error::Error {
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
+                        parameter_record.name
+                    ),
+                },
+                source,
             ));
         }
     }
@@ -237,17 +235,17 @@ pub fn infer(program: &mut Program) {
             if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
                 continue;
             }
-            let span = program
-                .span_map
-                .get(argument)
-                .map(|span| **span)
-                .unwrap_or(crate::span::Span { start: 0, end: 0 });
+            let (span, source) = anchor_of(program, *argument);
             divergences.push((
-                span,
-                format!(
-                    "`{}` is a host (`external`) function — it cannot await a vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
-                    external.name
-                ),
+                crate::error::Error {
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{}` is a host (`external`) function — it cannot await a Vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
+                        external.name
+                    ),
+                },
+                source,
             ));
         }
     }
@@ -278,7 +276,7 @@ pub fn infer(program: &mut Program) {
             _ => {}
         }
     }
-    let mut field_divergences: Vec<(crate::span::Span, String)> = Vec::new();
+    let mut field_divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
     for (struct_id, field_index, value_id) in field_stores {
         if program.async_fields.contains(&(struct_id, field_index)) {
             continue;
@@ -303,17 +301,17 @@ pub fn infer(program: &mut Program) {
         if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
             continue;
         }
-        let span = program
-            .span_map
-            .get(&value_id)
-            .map(|span| **span)
-            .unwrap_or(crate::span::Span { start: 0, end: 0 });
+        let (span, source) = anchor_of(program, value_id);
         field_divergences.push((
-            span,
-            format!(
-                "field `{}` of `{}` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
-                field.name, struct_.name
-            ),
+            crate::error::Error {
+                note: None,
+                span,
+                msg: format!(
+                    "field `{}` of `{}` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                    field.name, struct_.name
+                ),
+            },
+            source,
         ));
     }
     divergences.extend(field_divergences);
@@ -345,26 +343,22 @@ pub fn infer(program: &mut Program) {
         if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *value_id) {
             continue;
         }
-        let span = program
-            .span_map
-            .get(value_id)
-            .map(|span| **span)
-            .unwrap_or(crate::span::Span { start: 0, end: 0 });
+        let (span, source) = anchor_of(program, *value_id);
         divergences.push((
-            span,
-            format!(
-                "`{}` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
-                function.name
-            ),
+            crate::error::Error {
+                note: None,
+                span,
+                msg: format!(
+                    "`{}` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                    function.name
+                ),
+            },
+            source,
         ));
     }
 
-    for (span, msg) in divergences {
-        program.diagnostics.push(crate::error::Error {
-            note: None,
-            span,
-            msg,
-        });
+    for (error, source) in divergences {
+        program.push_diagnostic(error, source);
     }
 
     // --- Module-level initializers cannot await (backlog §J.3): they run at
@@ -382,7 +376,7 @@ pub fn infer(program: &mut Program) {
     let running_bindings = crate::platform_color::entry_function(program)
         .map(|entry| crate::platform_color::reachable_bindings(program, &graph, entry));
     let initializer_adaptive = adaptive_params_of(program);
-    let mut initializer_awaits: Vec<(crate::span::Span, String)> = Vec::new();
+    let mut initializer_awaits: Vec<(crate::error::Error, SourceId)> = Vec::new();
     for binding in program.module_level_bindings() {
         if running_bindings
             .as_ref()
@@ -459,11 +453,7 @@ pub fn infer(program: &mut Program) {
                 .get(&binding)
                 .map(|variable| variable.name)
                 .unwrap_or("_");
-            let span = program
-                .span_map
-                .get(&call.call_id)
-                .map(|span| **span)
-                .unwrap_or(crate::span::Span { start: 0, end: 0 });
+            let (span, source) = anchor_of(program, call.call_id);
             // A nameless target is an awaiting closure applied directly (an
             // adopted value, or a lowered `run` body) — phrase it as what it
             // is rather than backticking a description.
@@ -472,21 +462,21 @@ pub fn infer(program: &mut Program) {
                 None => "runs a closure that awaits".to_string(),
             };
             initializer_awaits.push((
-                span,
-                format!(
-                    "the initializer of `{binding_name}` {culprit} — a module-level \
-                     binding cannot await (module initialization is synchronous); wrap \
-                     the work in a function and call it from `main`"
-                ),
+                crate::error::Error {
+                    note: None,
+                    span,
+                    msg: format!(
+                        "the initializer of `{binding_name}` {culprit} — a module-level \
+                         binding cannot await (module initialization is synchronous); wrap \
+                         the work in a function and call it from `main`"
+                    ),
+                },
+                source,
             ));
         }
     }
-    for (span, msg) in initializer_awaits {
-        program.diagnostics.push(crate::error::Error {
-            note: None,
-            span,
-            msg,
-        });
+    for (error, source) in initializer_awaits {
+        program.push_diagnostic(error, source);
     }
 
     program.async_functions = async_set;
@@ -722,7 +712,10 @@ fn members_named(program: &Program, member: &str) -> Vec<Id> {
 /// diagnostics it found (transitive `sync` violations, dispatch refusals).
 struct Adaptation {
     instances: HashMap<(Id, Vec<Id>), crate::analyzer::AdaptedInstance>,
-    diagnostics: Vec<(crate::span::Span, String, Option<crate::error::Note>)>,
+    /// Each diagnostic with the file its span indexes into (backlog E16) —
+    /// this pass runs over the whole program, so the file comes from the
+    /// diagnostic's anchor entity, not from "the file being walked".
+    diagnostics: Vec<(crate::error::Error, SourceId)>,
 }
 
 /// One instance's identity: the function and WHICH of its closure parameters
@@ -897,7 +890,7 @@ fn compute_adaptation(
     // --- Final pass: with every flag stable, collect each instance's
     // emission decisions and the context-dependent diagnostics.
     let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::new();
-    let mut diagnostics: Vec<(crate::span::Span, String, Option<crate::error::Note>)> = Vec::new();
+    let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let mut reported: HashSet<(Id, Id)> = HashSet::new();
     let keys: Vec<InstanceKey> = instance_async.keys().cloned().collect();
     for key in keys {
@@ -1115,6 +1108,17 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     )
 }
 
+/// The span of an entity WITH the file that span indexes into (backlog E16).
+/// The two always come from the SAME entity, so a diagnostic this
+/// whole-program pass raises renders in — and is published to — the file it is
+/// about, not the entry it was reached from.
+fn anchor_of(program: &Program, id: Id) -> (crate::span::Span, SourceId) {
+    (
+        span_of(program, id),
+        program.source_of(id).unwrap_or(SourceId(0)),
+    )
+}
+
 /// The span of an entity, or an empty fallback.
 fn span_of(program: &Program, id: Id) -> crate::span::Span {
     program
@@ -1138,7 +1142,7 @@ fn sync_violations_at(
     call_id: Id,
     origin: Option<Id>,
     reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::span::Span, String, Option<crate::error::Note>)>,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
     let Some(function) = program.functions.get(&callee) else {
         return;
@@ -1180,12 +1184,16 @@ fn sync_violations_at(
             msg: format!("forwarded into the `sync` parameter `{parameter_name}` here"),
             source: program.source_of(call_id),
         });
+        let (span, source) = anchor_of(program, primary);
         diagnostics.push((
-            span_of(program, primary),
-            format!(
-                "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`) — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
-            ),
-            note,
+            crate::error::Error {
+                note,
+                span,
+                msg: format!(
+                    "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`) — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
+                ),
+            },
+            source,
         ));
     }
 }
@@ -1204,7 +1212,7 @@ fn extern_violations_at(
     call_id: Id,
     origin: Option<Id>,
     reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::span::Span, String, Option<crate::error::Note>)>,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
     let Some(external) = program.external_functions.get(&callee) else {
         return;
@@ -1244,13 +1252,17 @@ fn extern_violations_at(
             msg: format!("forwarded to the host function `{}` here", external.name),
             source: program.source_of(call_id),
         });
+        let (span, source) = anchor_of(program, primary);
         diagnostics.push((
-            span_of(program, primary),
-            format!(
-                "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a vilan closure — only synchronous closures can cross",
-                external.name
-            ),
-            note,
+            crate::error::Error {
+                note,
+                span,
+                msg: format!(
+                    "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure — only synchronous closures can cross",
+                    external.name
+                ),
+            },
+            source,
         ));
     }
 }
@@ -1268,7 +1280,7 @@ fn dispatch_refusals_at(
     bits: &[Id],
     call_id: Id,
     reported: &mut HashSet<(Id, Id)>,
-    diagnostics: &mut Vec<(crate::span::Span, String, Option<crate::error::Note>)>,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
@@ -1301,10 +1313,14 @@ fn dispatch_refusals_at(
         if !reported.insert((call_id, Id(position as u32))) {
             continue;
         }
+        let (span, source) = anchor_of(program, call_id);
         diagnostics.push((
-            span_of(program, call_id),
-            "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation) — bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
-            None,
+            crate::error::Error {
+                note: None,
+                span,
+                msg: "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation) — bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
+            },
+            source,
         ));
     }
 }

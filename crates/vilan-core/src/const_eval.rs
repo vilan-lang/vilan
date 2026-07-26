@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::analyzer::{Expr, Program};
+use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget};
 use crate::error::Error;
 use crate::id::Id;
@@ -20,7 +20,13 @@ use crate::transformer;
 pub fn evaluate(
     program: &Program,
     options: &BuildOptions,
-) -> (HashMap<Id, ConstValue>, Vec<(String, String)>, Vec<Error>) {
+) -> (
+    HashMap<Id, ConstValue>,
+    Vec<(String, String)>,
+    // Each failure with the file its span indexes into (backlog E16): the pass
+    // walks the whole program, so a `const` in a module reports in that module.
+    Vec<(Error, SourceId)>,
+) {
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to build const mini-programs) assume
     // a clean program, exactly as `transform` itself does.
@@ -74,7 +80,7 @@ struct State<'p, 'src> {
     assets: Vec<(String, String)>,
     failed: HashSet<Id>,
     in_progress: HashSet<Id>,
-    errors: Vec<Error>,
+    errors: Vec<(Error, SourceId)>,
 }
 
 /// How a const expression's free variable is (or isn't) compile-time-known.
@@ -97,11 +103,14 @@ impl<'p, 'src> State<'p, 'src> {
             return false;
         }
         if !self.in_progress.insert(expr_id) {
-            self.errors.push(Error {
-                note: None,
-                span: self.span_of(expr_id),
-                msg: "`const` expressions form a dependency cycle".to_string(),
-            });
+            self.errors.push((
+                Error {
+                    note: None,
+                    span: self.span_of(expr_id),
+                    msg: "`const` expressions form a dependency cycle".to_string(),
+                },
+                self.source_of(expr_id),
+            ));
             self.failed.insert(expr_id);
             return false;
         }
@@ -127,14 +136,17 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
                 Known::Runtime(name) => {
-                    self.errors.push(Error {
-                        note: None,
-                        span: self.span_of(reference_id),
-                        msg: format!(
-                            "`{name}` is a runtime value; a `const` expression reads only \
-                             compile-time-known bindings"
-                        ),
-                    });
+                    self.errors.push((
+                        Error {
+                            note: None,
+                            span: self.span_of(reference_id),
+                            msg: format!(
+                                "`{name}` is a runtime value; a `const` expression reads only \
+                                 compile-time-known bindings"
+                            ),
+                        },
+                        self.source_of(reference_id),
+                    ));
                     ok = false;
                 }
             }
@@ -167,14 +179,17 @@ impl<'p, 'src> State<'p, 'src> {
                         }
                     }
                     Known::Runtime(name) => {
-                        self.errors.push(Error {
-                            note: None,
-                            span: self.span_of(expr_id),
-                            msg: format!(
-                                "this `const` expression reaches `{name}`, whose value is not \
-                                 compile-time-known"
-                            ),
-                        });
+                        self.errors.push((
+                            Error {
+                                note: None,
+                                span: self.span_of(expr_id),
+                                msg: format!(
+                                    "this `const` expression reaches `{name}`, whose value is not \
+                                     compile-time-known"
+                                ),
+                            },
+                            self.source_of(expr_id),
+                        ));
                         ok = false;
                     }
                 }
@@ -193,11 +208,14 @@ impl<'p, 'src> State<'p, 'src> {
                     true
                 }
                 Err(failure) => {
-                    self.errors.push(Error {
-                        note: None,
-                        span: self.span_of(expr_id),
-                        msg: format!("const evaluation failed: {}", failure.message),
-                    });
+                    self.errors.push((
+                        Error {
+                            note: None,
+                            span: self.span_of(expr_id),
+                            msg: format!("const evaluation failed: {}", failure.message),
+                        },
+                        self.source_of(expr_id),
+                    ));
                     false
                 }
             };
@@ -298,15 +316,24 @@ impl<'p, 'src> State<'p, 'src> {
                     .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
                     .unwrap_or_else(|| "this call".to_string())
             };
-            self.errors.push(Error {
-                note: None,
-                span: self.span_of(site),
-                msg: format!(
-                    "{name} is compile-time-only — evaluate this call inside a `const` \
-                     expression"
-                ),
-            });
+            self.errors.push((
+                Error {
+                    note: None,
+                    span: self.span_of(site),
+                    msg: format!(
+                        "{name} is compile-time-only — evaluate this call inside a `const` \
+                         expression"
+                    ),
+                },
+                self.source_of(site),
+            ));
         }
+    }
+
+    /// The file an anchor entity's span indexes into — the file its diagnostic
+    /// renders in (backlog E16); a synthetic entity falls back to the entry.
+    fn source_of(&self, id: Id) -> SourceId {
+        self.program.source_of(id).unwrap_or(SourceId(0))
     }
 
     /// Whether an entity sits inside any `const` expression's span (same

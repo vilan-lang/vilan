@@ -11,5 +11,5 @@ import std::ui::{ View, view };
 fun counter(): View {
 	let count = Signal::new(0);
 
-	view("section").child(view("h1").text("hello from vilan")).child(view("p").bind_text(count.map(|n| i"clicked {n} times"))).child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
+	view("section").child(view("h1").text("hello from Vilan")).child(view("p").bind_text(count.map(|n| i"clicked {n} times"))).child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
 }

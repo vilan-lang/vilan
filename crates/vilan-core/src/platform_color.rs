@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-use crate::analyzer::{GenericDispatch, Program};
+use crate::analyzer::{GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
 use crate::id::Id;
@@ -65,7 +65,11 @@ pub fn check(program: &mut Program, platform: Platform) {
         traversal.walk(entry, &SubstitutionContext::new(), None);
         diagnostics.extend(traversal.diagnostics);
     }
-    program.diagnostics.extend(diagnostics);
+    // Each violation goes in with the file its anchor span indexes into — the
+    // chain crosses files, so the anchor is regularly in a module (backlog E16).
+    for (error, source) in diagnostics {
+        program.push_diagnostic(error, source);
+    }
 }
 
 /// The concrete host platforms the checker enumerates for a fence pattern —
@@ -92,7 +96,7 @@ fn known_hosts() -> [Platform; 4] {
 /// a dependent build. A fence on a generic function walks unbound
 /// (dispatches consider every candidate): it promises for every possible
 /// instantiation.
-fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Error> {
+fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> {
     let mut diagnostics = Vec::new();
     for (id, function) in &program.functions {
         if function.platform_fence.is_empty() {
@@ -107,15 +111,19 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<Error> {
         let mut checked_platforms: Vec<Platform> = Vec::new();
         for (pattern_text, pattern_span) in &function.platform_fence {
             let Some(patterns) = crate::target::PlatformPattern::parse(pattern_text) else {
-                diagnostics.push(Error {
-                    note: None,
-                    span: *pattern_span,
-                    msg: format!(
-                        "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
-                         (expected `node`/`deno`/`bun`/`browser`, or a family like \
-                         `@process`)"
-                    ),
-                });
+                // The pattern is written in the fenced function's own file.
+                diagnostics.push((
+                    Error {
+                        note: None,
+                        span: *pattern_span,
+                        msg: format!(
+                            "unknown platform pattern `{pattern_text}` in `[platform(…)]` \
+                             (expected `node`/`deno`/`bun`/`browser`, or a family like \
+                             `@process`)"
+                        ),
+                    },
+                    program.source_of(*id).unwrap_or(SourceId(0)),
+                ));
                 continue;
             };
             for pattern in patterns {
@@ -158,6 +166,16 @@ pub(crate) fn reachable_bindings(program: &Program, graph: &CallGraph, entry: Id
 /// A per-call type binding: the analyzer's constraint id → bound type id.
 type SubstitutionContext = HashMap<TypeId, TypeId>;
 
+/// How the walk arrived at a frame: the call site's span, the file that span
+/// indexes into, and whether the site is user code (only user-code sites are
+/// eligible anchors).
+#[derive(Clone, Copy)]
+struct Arrival {
+    span: Span,
+    source: SourceId,
+    user_code: bool,
+}
+
 /// The contextual DFS shared by admission (`platform` set: check + prune +
 /// chain diagnostics) and binding reachability (`platform` empty: collect).
 struct Traversal<'a, 'src> {
@@ -168,8 +186,12 @@ struct Traversal<'a, 'src> {
     /// resolved bindings — so the same generic function re-walks under a
     /// different `T` but recursion still terminates.
     visited: HashSet<(Id, Vec<(u32, u32)>)>,
-    trail: Vec<(Id, Option<(Span, bool)>)>,
-    diagnostics: Vec<Error>,
+    /// The walk stack: each frame's node with how it was ARRIVED at — the call
+    /// site's span, the file that span indexes into, and whether it is user
+    /// code. The file rides along with the span so a violation renders where it
+    /// is anchored (backlog E16).
+    trail: Vec<(Id, Option<Arrival>)>,
+    diagnostics: Vec<(Error, SourceId)>,
     module_bindings: HashSet<Id>,
     reached_bindings: HashSet<Id>,
     origin: Origin,
@@ -190,12 +212,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
         }
     }
 
-    fn walk(
-        &mut self,
-        node: Id,
-        substitution: &SubstitutionContext,
-        arrived_by: Option<(Span, bool)>,
-    ) {
+    fn walk(&mut self, node: Id, substitution: &SubstitutionContext, arrived_by: Option<Arrival>) {
         let mut key: Vec<(u32, u32)> = substitution
             .iter()
             .map(|(constraint, bound)| (constraint.0, self.resolve_type_id(*bound, substitution).0))
@@ -309,9 +326,13 @@ impl<'a, 'src> Traversal<'a, 'src> {
         self.trail.pop();
     }
 
-    fn arrival(&self, site: Id) -> Option<(Span, bool)> {
+    fn arrival(&self, site: Id) -> Option<Arrival> {
         let span = self.program.span_map.get(&site).map(|span| **span)?;
-        Some((span, is_user_code(self.program, site)))
+        Some(Arrival {
+            span,
+            source: self.program.source_of(site).unwrap_or(SourceId(0)),
+            user_code: is_user_code(self.program, site),
+        })
     }
 
     /// The bindings a call hands its callee — the transformer's
@@ -582,11 +603,11 @@ fn is_user_code(program: &Program, id: Id) -> bool {
 fn violation(
     program: &Program,
     platform: Platform,
-    trail: &[(Id, Option<(Span, bool)>)],
+    trail: &[(Id, Option<Arrival>)],
     node: Id,
     requirement: Requirement,
     origin: &Origin,
-) -> Error {
+) -> (Error, SourceId) {
     let chain = trail
         .iter()
         .map(|(id, _)| frame_label(program, *id))
@@ -594,30 +615,40 @@ fn violation(
         .join(" → ");
     // Anchor at the deepest user-code call site on the path; a violation with
     // no user frame at all (unlikely) falls back to the entry's span.
+    // The anchor's FILE travels with it: the deepest user-code call site is
+    // regularly in a module, and the diagnostic renders there (backlog E16).
     let anchor = trail
         .iter()
         .rev()
-        .find_map(|(_, arrived)| arrived.and_then(|(span, user)| user.then_some(span)))
-        .or_else(|| program.span_map.get(&node).map(|span| **span))
-        .unwrap_or(Span { start: 0, end: 0 });
+        .find_map(|(_, arrived)| {
+            arrived.and_then(|arrival| arrival.user_code.then_some((arrival.span, arrival.source)))
+        })
+        .or_else(|| {
+            let span = **program.span_map.get(&node)?;
+            Some((span, program.source_of(node).unwrap_or(SourceId(0))))
+        })
+        .unwrap_or((Span { start: 0, end: 0 }, SourceId(0)));
     let from = match origin {
         Origin::Entry => "reachable from the entry".to_string(),
         Origin::Fence { function, fence } => {
             format!("reachable from `{function}`, fenced `[platform({fence})]`")
         }
     };
-    Error {
-        note: None,
-        span: anchor,
-        msg: format!(
-            "`{}` requires {} and cannot run on `{}`\n  {}: {}",
-            name_of(program, node),
-            requirement.label,
-            platform.name(),
-            from,
-            chain
-        ),
-    }
+    (
+        Error {
+            note: None,
+            span: anchor.0,
+            msg: format!(
+                "`{}` requires {} and cannot run on `{}`\n  {}: {}",
+                name_of(program, node),
+                requirement.label,
+                platform.name(),
+                from,
+                chain
+            ),
+        },
+        anchor.1,
+    )
 }
 
 fn name_of(program: &Program, id: Id) -> String {

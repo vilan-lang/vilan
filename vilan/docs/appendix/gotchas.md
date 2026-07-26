@@ -8,9 +8,6 @@ organized by message instead of by topic.
 
 ## Language
 
-- **Chained element access on a call result loses the element type.**
-  `shared.read()[i]` → bind, then index: `let list = shared.read();
-  list[i]`.
 - **`match` can't be an operator operand.**
   `(match x { … }) + 1` → bind the match to a local first.
 - **A bare integer literal adapts to its peer; two typed variables

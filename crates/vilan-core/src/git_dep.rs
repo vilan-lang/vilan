@@ -439,7 +439,7 @@ fn verify_library(staging: &Path, source: &GitSource) -> Result<(), String> {
     let Ok(contents) = crate::util::read_source(&manifest_path) else {
         return Err(format!(
             "the checkout of {} has no `vilan.toml` at its root — a git dependency is a \
-             vilan `[library]` package, and its manifest is what says so",
+             Vilan `[library]` package, and its manifest is what says so",
             source.describe()
         ));
     };

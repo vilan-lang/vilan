@@ -327,7 +327,7 @@ async closure that reaches `…`") points at the call that made the
 closure async and notes where it was forwarded.
 → [Async](../tour/async.md), [Reactivity](../guide/reactive.md)
 
-**"`…` is a host (`external`) function — it cannot await a vilan closure …"**
+**"`…` is a host (`external`) function — it cannot await a Vilan closure …"**
 Host code can't await your callback, so an `external` function's
 value-returning closure parameters only accept synchronous closures
 (void-returning ones spawn, as everywhere). A parameter *declared*

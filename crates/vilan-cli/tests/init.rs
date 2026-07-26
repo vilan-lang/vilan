@@ -221,7 +221,7 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
             );
             // The shared module is what both legs reach; the client carries it.
             assert!(
-                bundle.contains("hello from vilan"),
+                bundle.contains("hello from Vilan"),
                 "the client bundle should carry the shared greeting"
             );
         }));
@@ -427,7 +427,7 @@ fn the_current_directory_is_scaffolded_unless_it_is_already_a_project() {
     let again = vilan(&project, &["init", "--template", "node"]);
     assert!(!again.status.success(), "a second init is refused");
     assert!(
-        combined(&again).contains("already a vilan project"),
+        combined(&again).contains("already a Vilan project"),
         "{}",
         combined(&again)
     );
@@ -451,7 +451,7 @@ fn naming_the_current_directory_is_the_same_as_naming_nothing() {
     let again = vilan(&project, &["init", ".", "--template", "node"]);
     assert!(!again.status.success(), "a second init is refused");
     assert!(
-        combined(&again).contains("already a vilan project"),
+        combined(&again).contains("already a Vilan project"),
         "{}",
         combined(&again)
     );

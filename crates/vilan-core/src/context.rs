@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::analyzer::{Expr, Program};
+use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
 use crate::error::Error;
 use crate::id::Id;
@@ -54,7 +54,9 @@ pub fn thread_contexts(program: &mut Program) {
         match analyze(program, &graph, get_fn, get_safe_fn, run_fn, new_fn) {
             Ok(plan) => plan,
             Err(errors) => {
-                program.diagnostics.extend(errors);
+                for (error, source) in errors {
+                    program.push_diagnostic(error, source);
+                }
                 return;
             }
         }
@@ -171,6 +173,20 @@ fn local_target(program: &Program, entity_id: Id) -> Option<Id> {
     }
 }
 
+/// A diagnostic anchored at an entity: the message at that entity's span, with
+/// the file the span indexes into (backlog E16). This pass walks the whole
+/// program, so the file comes from the anchor — never from "the entry".
+fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
+    (
+        Error {
+            note: None,
+            span: span_of(program, anchor),
+            msg,
+        },
+        program.source_of(anchor).unwrap_or(SourceId(0)),
+    )
+}
+
 fn span_of(program: &Program, id: Id) -> crate::span::Span {
     program
         .span_map
@@ -196,7 +212,7 @@ fn analyze(
     get_safe_fn: Option<Id>,
     run_fn: Id,
     new_fn: Id,
-) -> Result<Plan, Vec<Error>> {
+) -> Result<Plan, Vec<(Error, SourceId)>> {
     let mut errors = Vec::new();
 
     // The entry `main` is special: the transformer inlines its body as the
@@ -239,11 +255,11 @@ fn analyze(
             let context = receiver.and_then(|receiver| local_target(program, receiver));
             let (Some(context), Some(&owner)) = (context, owner_of.get(&call_id)) else {
                 let method = if safe { "get_safe" } else { "get" };
-                errors.push(Error {
-                    note: None,
-                    span: span_of(program, call_id),
-                    msg: format!("`{method}` must be called on a context bound to a name"),
-                });
+                errors.push(anchored(
+                    program,
+                    call_id,
+                    format!("`{method}` must be called on a context bound to a name"),
+                ));
                 continue;
             };
             contexts.insert(context);
@@ -279,20 +295,17 @@ fn analyze(
             let (Some(context), Some(value_id), Some(closure_entity)) =
                 (context, value_id, closure_entity)
             else {
-                errors.push(Error {
-                    note: None,
-                    span: span_of(program, call_id),
-                    msg: "`run` must be called on a named context with a closure literal body"
+                errors.push(anchored(
+                    program,
+                    call_id,
+                    "`run` must be called on a named context with a closure literal body"
                         .to_string(),
-                });
+                ));
                 continue;
             };
             if closure_id.is_none() && !injected_body {
-                errors.push(Error { note: None,
-                    span: span_of(program, call_id),
-                    msg: "`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context"
-                        .to_string(),
-                });
+                errors.push(anchored(program, call_id, "`run` must be called on a named context with a closure literal body, or a closure value whose type is `context`-annotated with exactly this context"
+                        .to_string()));
                 continue;
             }
             contexts.insert(context);
@@ -530,13 +543,12 @@ fn analyze(
                 if is_context {
                     contexts.insert(context);
                 } else {
-                    errors.push(Error {
-                        note: None,
-                        span: span_of(program, parameter),
-                        msg:
-                            "this parameter's `context` clause names a value that is not a context"
-                                .to_string(),
-                    });
+                    errors.push(anchored(
+                        program,
+                        parameter,
+                        "this parameter's `context` clause names a value that is not a context"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -570,11 +582,8 @@ fn analyze(
                     allowed_forwards.insert(initial);
                 }
                 _ => {
-                    errors.push(Error { note: None,
-                        span: span_of(program, initial),
-                        msg: "a `context`-typed binding takes a closure literal, or a value with the same `context` clause"
-                            .to_string(),
-                    });
+                    errors.push(anchored(program, initial, "a `context`-typed binding takes a closure literal, or a value with the same `context` clause"
+                            .to_string()));
                 }
             }
         }
@@ -621,11 +630,8 @@ fn analyze(
                         allowed_forwards.insert(*argument);
                     }
                     _ => {
-                        errors.push(Error { note: None,
-                            span: span_of(program, *argument),
-                            msg: "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
-                                .to_string(),
-                        });
+                        errors.push(anchored(program, *argument, "a `context`-typed parameter takes a closure literal, a value with the same `context` clause, or a local closure binding (which adopts the clause)"
+                                .to_string()));
                     }
                 }
             }
@@ -670,11 +676,8 @@ fn analyze(
             {
                 continue;
             }
-            errors.push(Error { note: None,
-                span: span_of(program, entity),
-                msg: "an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`"
-                    .to_string(),
-            });
+            errors.push(anchored(program, entity, "an injected (`context`-typed) closure can only be called, forwarded to a parameter with the same `context` clause, or passed to `run`"
+                    .to_string()));
         }
     }
     plan.contexts = {
@@ -886,26 +889,20 @@ fn analyze(
             .filter(|get| get.context == context && !get.safe)
         {
             if !bound.contains(&get.owner.id()) {
-                errors.push(Error { note: None,
-                    span: span_of(program, get.call_id),
-                    msg: format!(
+                errors.push(anchored(program, get.call_id, format!(
                         "context `{}` is read here, but this code can be reached without an enclosing `run`",
                         context_name(program, context)
-                    ),
-                });
+                    )));
             }
         }
         // Calling an injected closure IS a read: its deferred argument comes
         // from the caller, so an unbound caller has nothing to supply.
         for (owner, call_id) in injected_calls.get(&context).into_iter().flatten() {
             if !bound.contains(&owner.id()) {
-                errors.push(Error { note: None,
-                    span: span_of(program, *call_id),
-                    msg: format!(
+                errors.push(anchored(program, *call_id, format!(
                         "an injected closure is called here, but this code can be reached without an enclosing `run` for context `{}`",
                         context_name(program, context)
-                    ),
-                });
+                    )));
             }
         }
 
@@ -924,10 +921,10 @@ fn analyze(
         for (&entity_id, expr) in &program.entity_map {
             if let Expr::Local(target) = expr {
                 if needs_functions.contains(target) && !call_subjects.contains(&entity_id) {
-                    errors.push(Error {
-                        note: None,
-                        span: span_of(program, entity_id),
-                        msg: format!(
+                    errors.push(anchored(
+                        program,
+                        entity_id,
+                        format!(
                             "`{}` reads context `{}`, so it can't be used as a value",
                             program
                                 .functions
@@ -936,7 +933,7 @@ fn analyze(
                                 .unwrap_or("function"),
                             context_name(program, context)
                         ),
-                    });
+                    ));
                 }
             }
         }
@@ -1162,11 +1159,16 @@ fn analyze(
                 plan.some_variant = Some(some_variant);
                 plan.none_variant = Some(none_variant);
             }
-            _ => errors.push(Error {
-                note: None,
-                span: crate::span::Span { start: 0, end: 0 },
-                msg: "`get_safe` needs `std::option::Option` loaded".to_string(),
-            }),
+            // No anchor entity: a missing std module is the toolchain's
+            // problem, reported against the entry.
+            _ => errors.push((
+                Error {
+                    note: None,
+                    span: crate::span::Span { start: 0, end: 0 },
+                    msg: "`get_safe` needs `std::option::Option` loaded".to_string(),
+                },
+                SourceId(0),
+            )),
         }
     }
 

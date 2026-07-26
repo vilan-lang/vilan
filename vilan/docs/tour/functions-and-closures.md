@@ -151,7 +151,3 @@ owners, and ownership still flows to the right place.
 > context can't be passed around as a plain value, because the context
 > channel would be severed. Both produce clear errors when you hit them.
 
-## Traps
-
-- Chained element access on a call result (`read()[i]`) can lose the
-  element type. Bind, then index.

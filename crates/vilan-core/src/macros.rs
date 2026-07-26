@@ -1067,7 +1067,7 @@ impl Expander<'_, '_> {
             Err(message) => self.diagnostics.push(Error {
                 note: None,
                 span: (0..0).into(),
-                msg: format!("the built-in derive generators produced invalid vilan ({message})"),
+                msg: format!("the built-in derive generators produced invalid Vilan ({message})"),
             }),
         }
     }
@@ -1301,7 +1301,7 @@ impl Expander<'_, '_> {
                         note: None,
                         span: site,
                         msg: format!(
-                            "{label} generated invalid vilan ({message}) — the \
+                            "{label} generated invalid Vilan ({message}) — the \
                              output was: {}",
                             preview(&wrapped)
                         ),
@@ -1350,7 +1350,7 @@ impl Expander<'_, '_> {
                         note: None,
                         span: site,
                         msg: format!(
-                            "{label} generated invalid vilan ({message}) — the \
+                            "{label} generated invalid Vilan ({message}) — the \
                              output was: {}",
                             preview(stamped.as_deref().unwrap_or(raw))
                         ),

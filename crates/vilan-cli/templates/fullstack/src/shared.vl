@@ -3,5 +3,5 @@
 // sides must agree on (payload types, routes, greetings) here.
 
 fun greeting(): str {
-	"hello from vilan"
+	"hello from Vilan"
 }

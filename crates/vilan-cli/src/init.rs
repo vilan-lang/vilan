@@ -339,7 +339,7 @@ fn refusal(directory: &Path, elsewhere: bool, template: Template) -> Option<Stri
     }
     if !elsewhere && directory.join("vilan.toml").is_file() {
         return Some(format!(
-            "{} is already a vilan project (it has a `vilan.toml`) — \
+            "{} is already a Vilan project (it has a `vilan.toml`) — \
              run `vilan init <name>` to scaffold a new one beside it",
             directory.display()
         ));

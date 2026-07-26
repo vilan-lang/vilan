@@ -1160,6 +1160,11 @@ pub struct Analyzer<'src> {
     /// Non-fatal diagnostics (e.g. an unused `[must_use]` result). Rendered as
     /// warnings; they do not block codegen.
     warnings: Vec<Error>,
+    /// The file each warning belongs to, parallel to `warnings` — the warnings'
+    /// half of the diagnostic attribution channel (backlog E16). Warnings are
+    /// raised by whole-program sweeps that run outside any per-file walk, so
+    /// each is attributed from its anchor entity rather than from the marks.
+    warning_sources: Vec<SourceId>,
     entity_id: u32,
     enums: IndexMap<Id, Enum<'src>>,
     expr_id_to_expr_map: HashMap<Id, Expr<'src>>,
@@ -1721,6 +1726,7 @@ impl<'src> Analyzer<'src> {
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
             warnings: Vec::new(),
+            warning_sources: Vec::new(),
             entity_id: 0,
             enums: IndexMap::new(),
             expr_id_to_expr_map: HashMap::new(),
@@ -11130,6 +11136,11 @@ impl<'src> Analyzer<'src> {
                     span: **self.span_map.get(&statement_id).unwrap_or(&&EMPTY_SPAN),
                     msg: "unused result of a `[must_use]` call: bind it (e.g. `owner.take(…)`), or `let _ = …` to discard.".to_string(),
                 });
+                // This sweep runs over the whole program, outside any per-file
+                // walk, so the warning's file comes from its anchor statement —
+                // the span belongs to that file, and that is where it renders.
+                let source = self.source_of_id(statement_id).unwrap_or(SourceId(0));
+                self.warning_sources.push(source);
             }
         }
     }
@@ -21476,6 +21487,9 @@ pub struct Program<'src> {
     pub diagnostic_sources: Vec<SourceId>,
     /// Non-fatal diagnostics (unused `[must_use]` results) — rendered as warnings.
     pub warnings: Vec<Error>,
+    /// The source file each warning (by index) belongs to — read through
+    /// [`Program::warning_source`].
+    pub warning_sources: Vec<SourceId>,
     pub enums: IndexMap<Id, Enum<'src>>,
     pub entity_map: HashMap<Id, Expr<'src>>,
     pub entity_scope_map: HashMap<Id, Id>,
@@ -21756,6 +21770,38 @@ impl<'src> Program<'src> {
     /// The filesystem path of a source file.
     pub fn source_path(&self, source: SourceId) -> Option<&Path> {
         self.sources.get(source.0 as usize).map(PathBuf::as_path)
+    }
+
+    /// The file a diagnostic (by index into `diagnostics`) belongs to — the ONE
+    /// attribution channel every consumer reads: the language server publishes
+    /// against it, the CLI renders against it (backlog E16). An index past
+    /// `diagnostic_sources`' end is the entry, which is what a pass that pushed
+    /// without attributing gets.
+    pub fn diagnostic_source(&self, index: usize) -> SourceId {
+        self.diagnostic_sources
+            .get(index)
+            .copied()
+            .unwrap_or(SourceId(0))
+    }
+
+    /// The file a warning (by index into `warnings`) belongs to — the warnings'
+    /// half of the same channel.
+    pub fn warning_source(&self, index: usize) -> SourceId {
+        self.warning_sources
+            .get(index)
+            .copied()
+            .unwrap_or(SourceId(0))
+    }
+
+    /// Pushes a post-`analyze()` diagnostic together with the file its span
+    /// indexes into. Keeps the two vectors parallel by padding any earlier
+    /// unattributed push to the entry first — otherwise an attributed source
+    /// would land on someone else's index.
+    pub fn push_diagnostic(&mut self, error: Error, source: SourceId) {
+        self.diagnostic_sources
+            .resize(self.diagnostics.len(), SourceId(0));
+        self.diagnostics.push(error);
+        self.diagnostic_sources.push(source);
     }
 
     /// The program's call graph, built on first use and kept.
@@ -25015,6 +25061,7 @@ pub fn analyze<'src>(
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
         warnings: analyzer.warnings,
+        warning_sources: analyzer.warning_sources,
         enums: analyzer.enums,
         entity_map: analyzer.expr_id_to_expr_map,
         entity_scope_map: analyzer.expr_id_to_scope_id_map,
@@ -25111,21 +25158,32 @@ pub fn analyze<'src>(
 /// body. The methods were keyed on the std `Drop` entity when collected, so a
 /// user-defined `trait Drop` never reaches here.
 pub fn check_async_drops(program: &mut Program) {
-    let violations: Vec<(Span, String)> = program
+    // The span is the drop method's, so the file is the method's too — this
+    // runs over the whole program, not inside a file walk (backlog E16).
+    let violations: Vec<(Span, SourceId, String)> = program
         .drop_method_checks
         .iter()
         .filter(|(function_id, _, _)| program.async_functions.contains(function_id))
-        .map(|(_, span, subject)| (*span, subject.clone()))
+        .map(|(function_id, span, subject)| {
+            (
+                *span,
+                program.source_of(*function_id).unwrap_or(SourceId(0)),
+                subject.clone(),
+            )
+        })
         .collect();
-    for (span, subject) in violations {
-        program.diagnostics.push(Error {
-            note: None,
-            span,
-            msg: format!(
-                "`drop` for `{subject}` is async — teardown must be synchronous; cancel \
-                 owned tasks via an `OwnedNursery`. Awaited teardown is a future design"
-            ),
-        });
+    for (span, source, subject) in violations {
+        program.push_diagnostic(
+            Error {
+                note: None,
+                span,
+                msg: format!(
+                    "`drop` for `{subject}` is async — teardown must be synchronous; cancel \
+                     owned tasks via an `OwnedNursery`. Awaited teardown is a future design"
+                ),
+            },
+            source,
+        );
     }
 }
 
@@ -25137,23 +25195,32 @@ pub fn check_async_drops(program: &mut Program) {
 /// gave a hidden context parameter). Keyed on the std `Drop` entity via
 /// `drop_method_checks`, so a user's own `trait Drop` never reaches here.
 pub fn check_context_drops(program: &mut Program) {
-    let violations: Vec<(Span, String)> = program
+    let violations: Vec<(Span, SourceId, String)> = program
         .drop_method_checks
         .iter()
         .filter(|(function_id, _, _)| program.context_dependent_functions.contains(function_id))
-        .map(|(_, span, subject)| (*span, subject.clone()))
+        .map(|(function_id, span, subject)| {
+            (
+                *span,
+                program.source_of(*function_id).unwrap_or(SourceId(0)),
+                subject.clone(),
+            )
+        })
         .collect();
-    for (span, subject) in violations {
-        program.diagnostics.push(Error {
-            note: None,
-            span,
-            msg: format!(
-                "`drop` for `{subject}` requires an ambient context — teardown must be \
-                 context-free; a `drop` body cannot require an ambient context (its call \
-                 sites are scope exits, which do not thread contexts). Hand turn-joining \
-                 work to an owner inside the turn"
-            ),
-        });
+    for (span, source, subject) in violations {
+        program.push_diagnostic(
+            Error {
+                note: None,
+                span,
+                msg: format!(
+                    "`drop` for `{subject}` requires an ambient context — teardown must be \
+                     context-free; a `drop` body cannot require an ambient context (its call \
+                     sites are scope exits, which do not thread contexts). Hand turn-joining \
+                     work to an owner inside the turn"
+                ),
+            },
+            source,
+        );
     }
 }
 

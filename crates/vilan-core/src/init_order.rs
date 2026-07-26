@@ -126,17 +126,11 @@ pub fn check_cycles(program: &mut Program) {
     // same one moments later, and building it twice cost ~3% of a clean compile
     // (`b33-emission-order.md` §4).
     let found = cycle_diagnostics(program, program.call_graph());
-    // `diagnostic_sources` runs parallel to `diagnostics` and tells the editor
-    // which file to publish each one in, so a cross-module cycle squiggles in
-    // the module it is about. The guard above means both vectors are empty
-    // here; the length check keeps that assumption honest rather than silently
-    // misattributing diagnostics if it ever stops holding.
-    let attributed = program.diagnostics.len() == program.diagnostic_sources.len();
+    // Each diagnostic goes in with the file its span indexes into, so a
+    // cross-module cycle squiggles — and renders — in the module it is about
+    // (`Program::push_diagnostic` keeps the two vectors parallel).
     for (error, source) in found {
-        program.diagnostics.push(error);
-        if attributed {
-            program.diagnostic_sources.push(source);
-        }
+        program.push_diagnostic(error, source);
     }
 }
 

@@ -223,6 +223,5 @@ Normative rejection cases (each is a compile error):
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call;
 `effect`'s unannotated closure parameter can type against the impl's
-abstract `T` (B23); chained element access on a call result can lose the
-element type. Each has a pinned test; the workaround is an annotation or
-a binding.*
+abstract `T` (B23). Each has a pinned test; the workaround is an
+annotation or a binding.*

@@ -30,7 +30,7 @@ use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Range, Url,
 };
 
-use crate::document::Document;
+use crate::document::{Document, PublishedDiagnostic};
 use crate::line_index::LineIndex;
 
 /// The bookkeeping for everything published so far: each owner's last
@@ -170,6 +170,37 @@ impl PublishState {
     }
 }
 
+/// Attaches a diagnostic's C3 note as LSP related information (backlog E17) —
+/// a location plus a message, which is exactly what a declaration note is.
+/// `home` is the file the diagnostic itself was published to, with its index:
+/// a note with no file of its own lives there (the entry, or the module the
+/// diagnostic was attributed to). A note in another file is read fresh, like
+/// the diagnostic's own file is. An unreadable note file drops the related
+/// information only — never the diagnostic.
+fn attach_note(
+    converted: &mut Diagnostic,
+    item: &PublishedDiagnostic,
+    home: &Url,
+    home_index: &LineIndex,
+) {
+    let Some((note_span, note_msg, note_path)) = &item.note else {
+        return;
+    };
+    let located = match note_path {
+        None => Some((home.clone(), home_index.range(note_span))),
+        Some(path) => vilan_core::util::read_source(path)
+            .ok()
+            .map(|text| LineIndex::new(&text).range(note_span))
+            .and_then(|range| Url::from_file_path(path).ok().map(|target| (target, range))),
+    };
+    if let Some((target, range)) = located {
+        converted.related_information = Some(vec![DiagnosticRelatedInformation {
+            location: Location { uri: target, range },
+            message: note_msg.clone(),
+        }]);
+    }
+}
+
 /// One analyzed document's diagnostics as per-target groups: the entry's own
 /// (always present, even when empty, so the owner's URI is always brought
 /// current) plus each imported file's, with spans converted through a fresh
@@ -196,25 +227,7 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                 let mut converted = diagnostic(document.line_index.range(&item.span));
                 // A secondary note becomes related information — "first
                 // call here"-style anchors.
-                if let Some((note_span, note_msg, note_path)) = &item.note {
-                    // A cross-source note points into ITS file, with a
-                    // fresh index for that file's positions.
-                    let located = match note_path {
-                        None => Some((owner.clone(), document.line_index.range(note_span))),
-                        Some(path) => vilan_core::util::read_source(path)
-                            .ok()
-                            .map(|text| LineIndex::new(&text).range(note_span))
-                            .and_then(|range| {
-                                Url::from_file_path(path).ok().map(|target| (target, range))
-                            }),
-                    };
-                    if let Some((target, range)) = located {
-                        converted.related_information = Some(vec![DiagnosticRelatedInformation {
-                            location: Location { uri: target, range },
-                            message: note_msg.clone(),
-                        }]);
-                    }
-                }
+                attach_note(&mut converted, &item, owner, &document.line_index);
                 entry_group.push(converted);
             }
             Some(path) => {
@@ -233,7 +246,12 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
                     .clone();
                 match (index, Url::from_file_path(path)) {
                     (Some(index), Ok(target)) => {
-                        let converted = diagnostic(index.range(&item.span));
+                        let mut converted = diagnostic(index.range(&item.span));
+                        // The note travels with the diagnostic here too
+                        // (backlog E17): this branch used to publish
+                        // module-attributed diagnostics stripped of their
+                        // second location.
+                        attach_note(&mut converted, &item, &target, &index);
                         match extra_groups
                             .iter_mut()
                             .find(|(existing, _)| *existing == target)
@@ -296,6 +314,67 @@ mod tests {
         let mut visible = editor.clone();
         visible.retain(|_, group| !group.is_empty());
         visible
+    }
+
+    // A module-attributed diagnostic reaches the editor WITH its note (backlog
+    // E17): the note is a second location plus a message, which is exactly LSP
+    // related information. The publisher's module branch used to build the
+    // diagnostic without one, so `Z` is declared here` — and every other C3
+    // note on a non-entry file — was invisible in the editor.
+    #[test]
+    fn a_module_attributed_diagnostic_publishes_its_note_as_related_information() {
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::alpha::{ A };\nimport pkg::zeta::{ Z };\n\
+                 fun main() { print(A); print(Z); }\n",
+            ),
+            (
+                "alpha.vl",
+                "import pkg::zeta::{ Z };\nlet A: i32 = Z + 1;\n",
+            ),
+            (
+                "zeta.vl",
+                "import pkg::alpha::{ A };\nlet Z: i32 = A + 2;\n",
+            ),
+        ]);
+        let mut state = PublishState::new();
+        let (main_uri, main_document) = open(&dir, "main.vl");
+        let published = state.plan_publish(&main_uri, &main_document);
+        let group = published
+            .iter()
+            .find(|(target, _)| target.path().ends_with("alpha.vl"))
+            .map(|(_, group)| group)
+            .expect("the cycle publishes at alpha.vl, where the read closes it");
+        let diagnostic = group
+            .iter()
+            .find(|item| item.message.contains("initialization cycle"))
+            .expect("the cycle diagnostic is published");
+        let related = diagnostic
+            .related_information
+            .as_ref()
+            .expect("the note travels with the diagnostic")
+            .first()
+            .expect("one note, one related-information entry");
+        assert!(
+            related.message.contains("`Z` is declared here"),
+            "{}",
+            related.message
+        );
+        assert!(
+            related.location.uri.path().ends_with("zeta.vl"),
+            "the note's location is in ITS file: {}",
+            related.location.uri
+        );
+        assert_eq!(
+            (
+                related.location.range.start.line,
+                related.location.range.start.character
+            ),
+            (1, 0),
+            "`let Z` starts line 2 of zeta.vl"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A BOM'd module on disk publishes its diagnostic at the right COLUMN

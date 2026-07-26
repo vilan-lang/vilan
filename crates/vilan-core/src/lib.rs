@@ -307,7 +307,9 @@ pub fn analyze_source(
             const_eval::evaluate(&program, &options::BuildOptions::default());
         program.const_results = const_results;
         program.const_assets = const_assets;
-        program.diagnostics.extend(const_errors);
+        for (error, source) in const_errors {
+            program.push_diagnostic(error, source);
+        }
         // A dependency cycle among module-level initializers has no valid
         // declaration order (b33-emission-order.md §3), so it is an error
         // rather than a load-time `ReferenceError`. Runs last: the relation is

@@ -651,6 +651,10 @@ pub struct Document {
     pub diagnostic_sources: Vec<SourceId>,
     /// Non-fatal diagnostics (`[must_use]` drops) — published at Warning severity.
     pub warnings: Vec<Error>,
+    /// The file each warning belongs to, parallel to `warnings` — the same
+    /// attribution channel the errors use (backlog E16), so a `[must_use]`
+    /// warning in an imported module squiggles in that module.
+    pub warning_sources: Vec<SourceId>,
     /// The buffer text as of the last edit — kept so a dependent re-analysis
     /// (another open file changed) can re-run this document without the editor
     /// resending its content.
@@ -825,6 +829,10 @@ impl Document {
             .as_ref()
             .map(|program| program.warnings.clone())
             .unwrap_or_default();
+        let warning_sources = program
+            .as_ref()
+            .map(|program| program.warning_sources.clone())
+            .unwrap_or_default();
         let platform_requirements = program
             .as_ref()
             .map(vilan_core::platform_color::requirements)
@@ -851,6 +859,7 @@ impl Document {
             diagnostics,
             diagnostic_sources,
             warnings,
+            warning_sources,
             text: text.to_string(),
             text_hash,
             entity_spans,
@@ -865,6 +874,18 @@ impl Document {
     /// that map to no file — they attach to the entry at offset 0, labeled.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
         let mut published = Vec::new();
+        // The C3 note as the publisher wants it: its span, its message, and the
+        // file it lives in when it has one of its own (`None` = the
+        // diagnostic's own file, whichever that is — backlog E17).
+        let note_of = |error: &Error| {
+            error.note.as_ref().map(|note| {
+                let note_path = note
+                    .source
+                    .and_then(|source| self.program.as_ref()?.source_path(source))
+                    .map(Path::to_path_buf);
+                (note.span, note.msg.clone(), note_path)
+            })
+        };
         for (index, error) in self.diagnostics.iter().enumerate() {
             let source = self
                 .diagnostic_sources
@@ -877,13 +898,7 @@ impl Document {
                     span: error.span,
                     message: error.msg.clone(),
                     warning: false,
-                    note: error.note.as_ref().map(|note| {
-                        let note_path = note
-                            .source
-                            .and_then(|source| self.program.as_ref()?.source_path(source))
-                            .map(Path::to_path_buf);
-                        (note.span, note.msg.clone(), note_path)
-                    }),
+                    note: note_of(error),
                 });
             } else if source == DERIVED_SOURCE {
                 published.push(PublishedDiagnostic {
@@ -900,12 +915,17 @@ impl Document {
                     .and_then(|program| program.source_path(source))
                     .map(Path::to_path_buf);
                 match path {
+                    // The note rides along with the diagnostic wherever it is
+                    // published (backlog E17): a declaration note is exactly
+                    // what LSP related information is for, and dropping it in
+                    // this branch cost every module-attributed diagnostic its
+                    // second location.
                     Some(path) => published.push(PublishedDiagnostic {
                         path: Some(path),
                         span: error.span,
                         message: error.msg.clone(),
                         warning: false,
-                        note: None,
+                        note: note_of(error),
                     }),
                     // An unknown source (shouldn't happen): keep the error
                     // visible on the entry rather than dropping it.
@@ -919,14 +939,46 @@ impl Document {
                 }
             }
         }
-        for warning in &self.warnings {
-            published.push(PublishedDiagnostic {
-                path: None,
-                span: warning.span,
-                message: warning.msg.clone(),
-                warning: true,
-                note: None,
+        for (index, warning) in self.warnings.iter().enumerate() {
+            // A warning is attributed like an error: a module's warning
+            // squiggles in the module, not at that offset in this document.
+            let source = self
+                .warning_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0));
+            let path = (source != SourceId(0)).then(|| {
+                self.program
+                    .as_ref()
+                    .and_then(|program| program.source_path(source))
+                    .map(Path::to_path_buf)
             });
+            match path {
+                // This document's own.
+                None => published.push(PublishedDiagnostic {
+                    path: None,
+                    span: warning.span,
+                    message: warning.msg.clone(),
+                    warning: true,
+                    note: note_of(warning),
+                }),
+                Some(Some(path)) => published.push(PublishedDiagnostic {
+                    path: Some(path),
+                    span: warning.span,
+                    message: warning.msg.clone(),
+                    warning: true,
+                    note: note_of(warning),
+                }),
+                // A source with no file (generated code): keep it visible on
+                // the entry rather than at that offset in the wrong text.
+                Some(None) => published.push(PublishedDiagnostic {
+                    path: None,
+                    span: Span::from(0..0),
+                    message: warning.msg.clone(),
+                    warning: true,
+                    note: None,
+                }),
+            }
         }
         // The manifest channel (F5 S5): ONE diagnostic, on `vilan.toml` itself
         // — which is where the mistake is, and where the planner already knows
@@ -2702,14 +2754,28 @@ pub(crate) mod tests {
             read..read + 1,
             "spanned at the read, in alpha.vl's own text"
         );
-        // The diagnostic's note ("`Z` is declared here") is dropped here, not
-        // by the check: `published_diagnostics` carries notes only on the
-        // ENTRY-attributed branch above. That predates this diagnostic (it is
-        // where every module-attributed diagnostic loses its note) and is
-        // pinned as the current truth rather than quietly worked around.
+        // The C3 note survives the module-attributed branch too (backlog E17):
+        // it used to be dropped there, so every module-attributed diagnostic
+        // reached the editor without its second location. `Z` is declared in
+        // `zeta.vl`, so the note carries that file — the note's own source, not
+        // the diagnostic's.
+        let (note_span, note_message, note_path) = item
+            .note
+            .as_ref()
+            .expect("the C3 declaration note survives a module-attributed publish");
         assert!(
-            item.note.is_none(),
-            "a module-attributed diagnostic publishes without its note today"
+            note_message.contains("`Z` is declared here"),
+            "{note_message}"
+        );
+        let note_path = note_path.as_ref().expect("the note names its own file");
+        assert!(note_path.ends_with("zeta.vl"), "{note_path:?}");
+        let declaration = std::fs::read_to_string(note_path).expect("read zeta.vl");
+        assert_eq!(
+            note_span.into_range().start,
+            declaration
+                .find("let Z: i32 = A + 2")
+                .expect("Z's declaration"),
+            "the note is spanned in zeta.vl's own text"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

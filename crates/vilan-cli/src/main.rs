@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -15,7 +15,7 @@ mod paint;
 mod upgrade;
 
 use job::ManagedChild;
-use vilan_core::analyzer::{analyze, check_library_contract};
+use vilan_core::analyzer::{Program, SourceId, analyze, check_library_contract};
 use vilan_core::async_infer;
 use vilan_core::call_graph::CallGraph;
 use vilan_core::context;
@@ -1874,10 +1874,11 @@ fn compile_to_js(
     // diagnostics in a single fast-and-rich pass.
     let cached = vilan_core::parse_clean_cached(&src);
 
-    // Analyzer and codegen diagnostics, collected as `(span, message)` for
-    // ariadne; note-carrying ones render separately (they still count against a
-    // clean build via `noted_errors`).
-    let mut analyzer_errors: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    // Analyzer and codegen diagnostics, collected as `(source, span, message)`
+    // for ariadne — the source being the file the span indexes into, so each one
+    // renders in its own file (backlog E16). Note-carrying ones render
+    // separately (they still count against a clean build via `noted_errors`).
+    let mut analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)> = Vec::new();
     let mut noted_errors = 0usize;
     // The same diagnostics, captured as structured items for the HMR overlay
     // (only assembled into text when `overlay` is `Some`). Populated alongside
@@ -1911,11 +1912,18 @@ fn compile_to_js(
     };
     // The source text the chosen root's spans index into: the cached `'static`
     // text on a hit (byte-identical to `src` — the cache is content-keyed),
-    // otherwise `src` itself. Every diagnostic renders against it.
+    // otherwise `src` itself. The ENTRY's diagnostics render against it.
     let source_ref: &str = match &cached {
         Some((_, text)) => text,
         None => src.as_str(),
     };
+    // The text each diagnostic renders against — the file its span indexes
+    // into, not the entry's (backlog E16). The entry is seeded from the text
+    // just chosen; every other source is read back through the same
+    // `read_source` the module loader used, so the offsets line up. One map,
+    // shared by the plain path, the note path and the warnings.
+    let mut diagnostic_files: HashMap<SourceId, (String, String)> = HashMap::new();
+    diagnostic_files.insert(SourceId(0), (filename.clone(), source_ref.to_string()));
 
     if let Some(root) = root {
         if emit_debug {
@@ -1950,7 +1958,9 @@ fn compile_to_js(
         );
         program.const_results = const_results;
         program.const_assets = const_assets;
-        program.diagnostics.extend(const_errors);
+        for (error, source) in const_errors {
+            program.push_diagnostic(error, source);
+        }
 
         // A dependency cycle among module-level initializers has no valid
         // declaration order (b33-emission-order.md §3), so it is an error
@@ -1958,7 +1968,9 @@ fn compile_to_js(
         // only meaningful for a program that analyzed cleanly.
         vilan_core::init_order::check_cycles(&mut program);
 
-        for error in &program.diagnostics {
+        for (index, error) in program.diagnostics.iter().enumerate() {
+            let source = program.diagnostic_source(index);
+            load_diagnostic_file(&mut diagnostic_files, &program, source);
             // Capture every diagnostic for the overlay (message + note verbatim);
             // the terminal rendering below is unchanged.
             overlay_diagnostics.push(hmr::OverlayDiagnostic {
@@ -1972,32 +1984,30 @@ fn compile_to_js(
             match &error.note {
                 Some(note) => {
                     // A cross-source note reads its file so the sub-label can
-                    // render in it (the trait's declaration in std, say).
-                    let note_file = note
-                        .source
-                        .and_then(|source| {
-                            let path = program.source_path(source)?;
-                            let text = vilan_core::util::read_source(path).ok()?;
-                            Some((path.display().to_string(), text))
-                        })
-                        // The note's file may BE the entry — same-file
-                        // rendering needs no second source.
-                        .filter(|(name, _)| *name != filename);
-                    report_error_with_note(&filename, source_ref, error, note_file);
+                    // render in it (the trait's declaration in std, say). `None`,
+                    // or the primary's own source, means the same file — which
+                    // needs no second source.
+                    let note_source = note.source.filter(|note_source| *note_source != source);
+                    if let Some(note_source) = note_source {
+                        load_diagnostic_file(&mut diagnostic_files, &program, note_source);
+                    }
+                    let (name, text) = diagnostic_file(&diagnostic_files, source);
+                    let note_file = note_source
+                        .map(|note_source| diagnostic_file(&diagnostic_files, note_source));
+                    report_error_with_note(name, text, error, note_file);
                     noted_errors += 1;
                 }
-                None => analyzer_errors.push((error.span.into_range(), error.msg.clone())),
+                None => analyzer_errors.push((source, error.span.into_range(), error.msg.clone())),
             }
         }
         // Warnings are non-fatal: render them, but they do not enter `errs`,
-        // so they don't block codegen.
-        for warning in &program.warnings {
-            report_warning(
-                &filename,
-                source_ref,
-                warning.span.into_range(),
-                &warning.msg,
-            );
+        // so they don't block codegen. They carry their own source too — an
+        // unused `[must_use]` result in a module renders in that module.
+        for (index, warning) in program.warnings.iter().enumerate() {
+            let source = program.warning_source(index);
+            load_diagnostic_file(&mut diagnostic_files, &program, source);
+            let (name, text) = diagnostic_file(&diagnostic_files, source);
+            report_warning(name, text, warning.span.into_range(), &warning.msg);
         }
 
         if emit_debug {
@@ -2030,7 +2040,9 @@ fn compile_to_js(
                         message: error.msg.clone(),
                         note: error.note.as_ref().map(|note| note.msg.clone()),
                     });
-                    analyzer_errors.push((error.span.into_range(), error.msg));
+                    // A codegen failure carries no source of its own (it is a
+                    // compiler bug, not a located user error): the entry.
+                    analyzer_errors.push((SourceId(0), error.span.into_range(), error.msg));
                 }
             }
         }
@@ -2059,7 +2071,9 @@ fn compile_to_js(
             );
         }
     }
-    report(&filename, source_ref, analyzer_errors, parse_errors);
+    // The entry's parse errors belong to the entry; the analyzer's carry their
+    // own source.
+    report(&diagnostic_files, analyzer_errors, parse_errors);
 
     match output {
         Some(compiled) if clean => Ok(compiled),
@@ -2156,34 +2170,95 @@ fn diagnostic_config() -> ariadne::Config {
         .with_color(paint::stderr_enabled())
 }
 
+/// Reads the file a diagnostic renders against into `files`, once per source.
+/// The entry is pre-seeded by the caller; a module (or a std/library file) is
+/// read back through the same `read_source` the module loader used, so the
+/// spans address the same bytes. A source with no path (generated code) or an
+/// unreadable file records its label with EMPTY text: the message still
+/// renders, with no snippet — see [`snippet`].
+fn load_diagnostic_file(
+    files: &mut HashMap<SourceId, (String, String)>,
+    program: &Program,
+    source: SourceId,
+) {
+    if files.contains_key(&source) {
+        return;
+    }
+    let entry = match program.source_path(source) {
+        Some(path) => {
+            let name = path.display().to_string();
+            let text = vilan_core::util::read_source(path).unwrap_or_default();
+            (name, text)
+        }
+        None => ("<generated>".to_string(), String::new()),
+    };
+    files.insert(source, entry);
+}
+
+/// The (label, text) a diagnostic renders against. Every source a diagnostic
+/// named has been loaded by then; the fallback keeps an unknown one visible
+/// (message, no snippet) rather than rendering it against innocent text.
+fn diagnostic_file(files: &HashMap<SourceId, (String, String)>, source: SourceId) -> (&str, &str) {
+    files
+        .get(&source)
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .unwrap_or(("<unknown>", ""))
+}
+
+/// The text a label may be drawn from: the file's own text when the span
+/// actually indexes it at character boundaries, otherwise nothing.
+///
+/// ariadne slices the source by the label's byte range and **panics** on a
+/// mid-codepoint index ("byte index N is not a char boundary"), which takes the
+/// compiler thread down with it (backlog E16). Attribution is what makes spans
+/// fit — this is the net under it: a span that does not index this text is a
+/// bug, and the honest degrade is the message without a snippet, never a
+/// clamped label pointing at innocent code.
+fn snippet<'a>(text: &'a str, span: &std::ops::Range<usize>) -> &'a str {
+    let indexes_this_text = span.start <= span.end
+        && span.end <= text.len()
+        && text.is_char_boundary(span.start)
+        && text.is_char_boundary(span.end);
+    if indexes_this_text { text } else { "" }
+}
+
 /// Renders parser diagnostics (via the handwritten frontend's `render`) and
 /// analyzer/codegen diagnostics with ariadne. Analyzer diagnostics arrive
-/// pre-rendered as `(span, message)`; parse errors carry the structured
+/// pre-rendered as `(source, span, message)` — each renders against the file
+/// its span indexes into, and is labeled with that file (backlog E16); parse
+/// errors are the entry's own and carry the structured
 /// found/expected/context/hint the renderer assembles.
 fn report(
-    filename: &str,
-    src: &str,
-    analyzer_errors: Vec<(std::ops::Range<usize>, String)>,
+    files: &HashMap<SourceId, (String, String)>,
+    analyzer_errors: Vec<(SourceId, std::ops::Range<usize>, String)>,
     parse_errors: Vec<vilan_core::parsing::ParseError>,
 ) {
-    let diagnostics = analyzer_errors.into_iter().chain(
-        parse_errors
-            .into_iter()
-            .map(|error| (error.span.into_range(), vilan_core::parsing::render(&error))),
-    );
-    for (span, message) in diagnostics {
+    let diagnostics = analyzer_errors
+        .into_iter()
+        .chain(parse_errors.into_iter().map(|error| {
+            (
+                SourceId(0),
+                error.span.into_range(),
+                vilan_core::parsing::render(&error),
+            )
+        }));
+    for (source, span, message) in diagnostics {
+        let (filename, text) = diagnostic_file(files, source);
         Report::build(ReportKind::Error, (filename.to_string(), span.clone()))
             .with_config(diagnostic_config())
             .with_message(&message)
             .with_label(
-                Label::new((filename.to_string(), span))
+                Label::new((filename.to_string(), span.clone()))
                     .with_message(&message)
                     .with_color(Color::Red),
             )
             .finish()
             // stderr, like the warnings (ratified call (f)): a diagnostic must
             // never land in `build --stdout`'s JavaScript.
-            .eprint(sources([(filename.to_string(), src.to_string())]))
+            .eprint(sources([(
+                filename.to_string(),
+                snippet(text, &span).to_string(),
+            )]))
             .unwrap()
     }
 }
@@ -2193,37 +2268,50 @@ fn report(
 /// note as a second label at its own location ("first call here", "generated
 /// by this attribute").
 fn report_error_with_note(
+    // The primary span's own file (name, contents) — a module's error renders
+    // in the module (backlog E16).
     filename: &str,
     src: &str,
     error: &vilan_core::Error,
     // The note's own file when it lives elsewhere (name, contents) —
     // cross-source notes point into std or an imported module.
-    note_file: Option<(String, String)>,
+    note_file: Option<(&str, &str)>,
 ) {
     let Some(note) = &error.note else {
         return;
     };
+    let primary_span = error.span.into_range();
+    let note_span = note.span.into_range();
     let note_filename = note_file
-        .as_ref()
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| name.to_string())
         .unwrap_or_else(|| filename.to_string());
-    let mut files = vec![(filename.to_string(), src.to_string())];
-    if let Some((name, text)) = note_file {
-        files.push((name, text));
+    let mut files = vec![(
+        filename.to_string(),
+        snippet(src, &primary_span).to_string(),
+    )];
+    match note_file {
+        Some((name, text)) => files.push((name.to_string(), snippet(text, &note_span).to_string())),
+        // Same file as the primary: the note's span must index the text the
+        // primary already brought.
+        None => {
+            if snippet(src, &note_span).is_empty() {
+                files[0].1 = String::new();
+            }
+        }
     }
     Report::build(
         ReportKind::Error,
-        (filename.to_string(), error.span.into_range()),
+        (filename.to_string(), primary_span.clone()),
     )
     .with_config(diagnostic_config())
     .with_message(error.msg.clone())
     .with_label(
-        Label::new((filename.to_string(), error.span.into_range()))
+        Label::new((filename.to_string(), primary_span))
             .with_message(error.msg.clone())
             .with_color(Color::Red),
     )
     .with_label(
-        Label::new((note_filename, note.span.into_range()))
+        Label::new((note_filename, note_span))
             .with_message(note.msg.clone())
             .with_color(Color::Yellow),
     )
@@ -2234,20 +2322,23 @@ fn report_error_with_note(
 }
 
 /// Renders a single analyzer warning (e.g. an unused `[must_use]` result) — like
-/// `report`, but `ReportKind::Warning` and non-fatal.
+/// `report`, but `ReportKind::Warning` and non-fatal. Carries its own file too.
 fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, message: &str) {
     Report::build(ReportKind::Warning, (filename.to_string(), span.clone()))
         .with_config(diagnostic_config())
         .with_message(message)
         .with_label(
-            Label::new((filename.to_string(), span))
+            Label::new((filename.to_string(), span.clone()))
                 .with_message(message)
                 .with_color(Color::Yellow),
         )
         .finish()
         // stderr, so it doesn't corrupt `build --stdout` JS — the call the
         // errors now match too.
-        .eprint(sources([(filename.to_string(), src.to_string())]))
+        .eprint(sources([(
+            filename.to_string(),
+            snippet(src, &span).to_string(),
+        )]))
         .unwrap();
 }
 
@@ -2322,5 +2413,29 @@ mod tests {
         // Idempotent: the loop-exit call runs after the round already removed it.
         remove_watch_script();
         assert!(!script.exists());
+    }
+
+    // The net under the attribution (backlog E16). ariadne slices the source by
+    // the label's byte range and PANICS on a mid-codepoint index, killing the
+    // compiler thread; a span that does not index the text it was handed loses
+    // its snippet instead — the message still prints, with its file.
+    #[test]
+    fn a_span_that_indexes_the_text_keeps_its_snippet() {
+        let text = "let x = 1;\n";
+        assert_eq!(snippet(text, &(4..5)), text);
+        // The boundaries themselves index it: an empty span at the end is fine.
+        assert_eq!(snippet(text, &(text.len()..text.len())), text);
+    }
+
+    #[test]
+    fn a_span_that_does_not_index_the_text_loses_its_snippet() {
+        // Mid-codepoint — the fatal case: `é` occupies bytes 4..6.
+        let multibyte = "let é = 1;\n";
+        assert!(!multibyte.is_char_boundary(5));
+        assert_eq!(snippet(multibyte, &(5..7)), "");
+        // Past the end — a span from a longer file.
+        assert_eq!(snippet(multibyte, &(400..420)), "");
+        // Inverted — never produced, never sliced either.
+        assert_eq!(snippet(multibyte, &(6..4)), "");
     }
 }

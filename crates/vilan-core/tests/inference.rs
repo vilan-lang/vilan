@@ -7555,7 +7555,7 @@ fn a_macro_generating_invalid_vilan_errors_at_the_site() {
         main();
         "#,
         "broken",
-        "generated invalid vilan",
+        "generated invalid Vilan",
     );
 }
 
@@ -7877,7 +7877,7 @@ fn an_expression_macro_must_generate_one_expression() {
         main();
         "#,
         "two_statements",
-        "generated invalid vilan",
+        "generated invalid Vilan",
     );
 }
 
@@ -8203,7 +8203,7 @@ fun main() {
 main();
         "#,
         r#"macro { source("+++ nope") }"#,
-        "generated invalid vilan",
+        "generated invalid Vilan",
     );
 }
 
@@ -19289,7 +19289,7 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
             });
         }
         "#,
-        "`host_transform` is a host (`external`) function — it cannot await a vilan closure",
+        "`host_transform` is a host (`external`) function — it cannot await a Vilan closure",
     );
 }
 
@@ -20112,7 +20112,7 @@ fn an_async_parameter_cannot_launder_into_a_host_callback() {
             let _ = outer(|n| n + 1);
         }
         "#,
-        "cannot await a vilan closure",
+        "cannot await a Vilan closure",
     );
 }
 
@@ -26736,4 +26736,216 @@ fn the_call_graph_is_built_once_and_stays_current() {
         .expect("spawn worker")
         .join()
         .expect("worker panicked");
+}
+
+// --- Chained element access on a call result (backlog D6, finding 1) ---------
+//
+// `spec/types.md`, `tour/functions-and-closures.md` and `appendix/gotchas.md`
+// all carried a tracked gap: "chained element access on a call result loses the
+// element type — bind, then index". The spec's entry claimed "each has a pinned
+// test", and for this one no such test existed. All six shapes the D6 audit
+// probed compile AND run today, so these pins are what let the claim be deleted
+// from the three pages: the trap is dead, and it stays dead by test.
+
+#[test]
+fn indexing_a_call_result_keeps_the_element_type() {
+    // The gotchas page's own example: `shared.read()[i]`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        import std::shared::Shared;
+        fun main() {
+            mut backing: List<i32> = List::new();
+            backing.push(1);
+            backing.push(2);
+            let shared = Shared::new(backing);
+            print(shared.read()[1]);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_field_read_through_an_indexed_call_result_keeps_the_element_type() {
+    // `rows()[0].name` — the element is a struct, and its field must resolve.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        struct Row { name: str }
+        fun rows(): List<Row> {
+            mut out: List<Row> = List::new();
+            out.push(Row { name = "ada" });
+            out
+        }
+        fun main() {
+            print(rows()[0].name);
+        }
+        "#,
+        "ada\n",
+    );
+}
+
+#[test]
+fn a_method_call_on_an_indexed_element_keeps_the_element_type() {
+    // `words[1].len()` — the element type must survive to dispatch a method.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        fun main() {
+            mut words: List<str> = List::new();
+            words.push("a");
+            words.push("bcd");
+            print(words[1].len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn indexing_a_generic_methods_result_keeps_the_element_type() {
+    // `h.all()[1]` — the element type arrives through the impl's binder.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        struct Holder<T> { items: List<T> }
+        impl Holder<type T> {
+            fun all(self): List<T> {
+                self.items
+            }
+        }
+        fun main() {
+            mut items: List<i32> = List::new();
+            items.push(7);
+            items.push(8);
+            let holder = Holder { items = items };
+            print(holder.all()[1]);
+        }
+        "#,
+        "8\n",
+    );
+}
+
+#[test]
+fn indexing_a_map_value_keeps_the_element_type() {
+    // A `List` stored as a `Map` value, indexed after the `Option` unwraps.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        import std::map::Map;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut lists: Map<str, List<i32>> = Map::new();
+            mut values: List<i32> = List::new();
+            values.push(5);
+            lists.insert("k", values);
+            match lists.get("k") {
+                Some(let l) => {
+                    print(l[0]);
+                },
+                None => {},
+            }
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn indexing_an_indexed_call_result_keeps_the_element_type() {
+    // The nested form — `grid()[0][1]`: the inner index must produce a `List`
+    // the outer one can index again.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::list::List;
+        fun grid(): List<List<i32>> {
+            mut out: List<List<i32>> = List::new();
+            mut inner: List<i32> = List::new();
+            inner.push(10);
+            inner.push(11);
+            out.push(inner);
+            out
+        }
+        fun main() {
+            print(grid()[0][1]);
+        }
+        "#,
+        "11\n",
+    );
+}
+
+// --- Post-`analyze()` diagnostics carry their file (backlog E16) -------------
+//
+// The passes that run after `analyze()` walk the WHOLE program, so there is no
+// "file being walked" to attribute their diagnostics to — before this they all
+// defaulted to the entry, which made the editor squiggle the wrong file and the
+// CLI render the wrong text. Each now attributes from the anchor entity whose
+// span it reports. (`const`, platform coloring and the `[must_use]` warnings are
+// pinned end-to-end in `vilan-cli/tests/diagnostics.rs`, where the rendering is
+// observable; these are the two that only the attribution channel shows.)
+
+#[test]
+fn an_async_divergence_in_a_module_is_attributed_to_the_module() {
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import std::print;\nimport pkg::alpha::go;\nfun main() { print(go()); }\n",
+            ),
+            (
+                "alpha.vl",
+                "import std::time::sleep;\n\
+                 external fun host_transform(f: |i32| i32): i32;\n\
+                 fun go(): i32 {\n\thost_transform(|n| {\n\t\tsleep(1);\n\t\tn\n\t})\n}\n",
+            ),
+        ],
+        "main.vl",
+    );
+    let (message, _span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("cannot await a Vilan closure"))
+        .expect("the host-boundary divergence is reported");
+    assert_eq!(
+        file.as_deref(),
+        Some("alpha.vl"),
+        "the divergence belongs to the module holding the call: {message}"
+    );
+}
+
+#[test]
+fn an_async_drop_in_a_module_is_attributed_to_the_module() {
+    let outcome = analyze_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::alpha::make;\nfun main() { let held = make(); }\n",
+            ),
+            (
+                "alpha.vl",
+                "import std::drop::Drop;\n\
+                 resource struct Res { x: i32 }\n\
+                 impl Res with Drop {\n\tasync fun drop(&mut self) {}\n}\n\
+                 fun make(): Res { Res { x = 1 } }\n",
+            ),
+        ],
+        "main.vl",
+    );
+    let (message, _span, file) = outcome
+        .diagnostics
+        .iter()
+        .find(|(message, _, _)| message.contains("teardown must be synchronous"))
+        .expect("the async-drop rejection is reported");
+    assert_eq!(
+        file.as_deref(),
+        Some("alpha.vl"),
+        "the rejection belongs to the module holding the `drop` body: {message}"
+    );
 }
