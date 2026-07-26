@@ -1,0 +1,3 @@
+# `vilan build .` writes both entries' bundles (and any style sidecar) into
+# `dist/`. Generated output is not checked in.
+dist/

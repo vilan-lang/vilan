@@ -1,0 +1,10 @@
+// The entry. `fun main` runs on start — there is no `main()` call at the
+// bottom of the file. Everything from the standard library is imported
+// explicitly, `print` included.
+
+import std::print;
+import pkg::greeting::greeting;
+
+fun main() {
+	print(greeting("world"));
+}

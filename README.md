@@ -148,6 +148,15 @@ and run it:
 vilan run hello.vl
 ```
 
+For a whole project rather than a file, `vilan init` scaffolds one that
+already compiles — a manifest, sources, and a `.gitignore`:
+
+```sh
+vilan init my-app --template fullstack   # or node, or browser
+cd my-app
+vilan run .
+```
+
 For a full-stack project, `vilan run --watch .` is the whole dev loop —
 rebuild, hot-swap the browser, restart the server — described in
 [the dev-loop guide](vilan/docs/guide/dev-loop.md).
@@ -165,7 +174,7 @@ ends with the full-stack walkthrough:
 ```
 crates/
   vilan-core/      the compiler: lexer → parser → analyzer → transformer
-  vilan-cli/       the `vilan` binary (build / check / run / fmt / test)
+  vilan-cli/       the `vilan` binary (init / build / check / run / fmt / test)
   vilan-lsp/       the language server
 editors/vscode/    the VS Code extension (grammar + LSP client)
 vilan/

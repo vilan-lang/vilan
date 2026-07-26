@@ -9,6 +9,7 @@ use std::{
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
 mod hmr;
+mod init;
 mod job;
 mod paint;
 mod upgrade;
@@ -36,6 +37,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold a ready-to-run project: a manifest, sources that compile, and a
+    /// `.gitignore`. Creates no repository — `git init` stays yours.
+    Init {
+        /// The directory to create (it must not exist, or must be empty).
+        /// Omitted: scaffold into the current directory, which must not already
+        /// hold a `vilan.toml`.
+        name: Option<String>,
+        /// Which scaffold to write: `node` (a package that runs on node),
+        /// `browser` (a reactive browser app), or `fullstack` (one package,
+        /// two entries — a browser client and a node server). Omitted: choose
+        /// at a prompt; without a terminal that is an error, never a hang.
+        #[arg(long)]
+        template: Option<String>,
+    },
     /// Compile to JavaScript, writing `<file>.js`. With no path, compiles the
     /// project entry from the nearest `vilan.toml`.
     Build {
@@ -200,6 +215,7 @@ fn run_cli() -> ExitCode {
             run_or_watch(roots, move || test(path.clone()))
         }
         Command::Fmt { paths, check } => fmt(&paths, check),
+        Command::Init { name, template } => init::init(name, template),
         Command::Upgrade { check } => upgrade::upgrade(check),
     }
 }

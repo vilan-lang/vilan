@@ -1,0 +1,10 @@
+// `vilan test .` runs every `*_test.vl` file in the package. A test is a
+// program: it passes by exiting 0, and a failed `assert` panics.
+
+import std::assert;
+import pkg::greeting::greeting;
+
+fun main() {
+	assert(greeting("world") == "hello, world", "greeting names its argument");
+	assert(greeting("") == "hello, ", "an empty name still greets");
+}

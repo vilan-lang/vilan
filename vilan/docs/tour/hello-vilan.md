@@ -1,8 +1,8 @@
 # Hello vilan
 
 vilan compiles to JavaScript. Your programs run on node (or deno, or bun)
-and in the browser. One tool, the `vilan` binary, does everything: build,
-run, check, format, test.
+and in the browser. One tool, the `vilan` binary, does everything:
+scaffold, build, run, check, format, test.
 
 ## A first program
 
@@ -30,10 +30,45 @@ is imported explicitly — even `print`. Your files will start with a few
 `import` lines, just like ES modules. Second, indentation is tabs by
 convention, and `vilan fmt` will format files for you.
 
+## Start a project
+
+A single file is fine for a first look. For anything you will come back
+to, scaffold a project: `vilan init` writes a manifest, sources that
+already compile, and a `.gitignore`.
+
+```sh
+vilan init my-app                       # pick a template at the prompt
+vilan init my-app --template fullstack  # or say which one outright
+cd my-app
+vilan run .
+```
+
+Three templates, for the three shapes that exist:
+
+| `--template` | What you get |
+|---|---|
+| `node` | the smallest real package: an entry, a module beside it, a `*_test.vl` |
+| `browser` | a reactive browser app — `index.html` beside the emitted bundle |
+| `fullstack` | one package, two entries: a browser client and a node server ([below](#the-shape-of-a-full-stack-app)) |
+
+`fullstack` is the default — a bare Enter at the prompt takes it — because
+it is the shape the examples and the walkthrough teach. Pass `--template`
+and there is no prompt at all, which is what a script wants (without a
+terminal to prompt on, `vilan init` says so and stops rather than
+hanging).
+
+With no name, `vilan init` scaffolds into the current directory, as long
+as that directory is not already a project. Nothing is ever overwritten,
+either way. The `[package] name` comes from the directory's name, with
+anything a name cannot carry folded to `_` (`my-app` → `my_app`). No
+repository is created: you get a `.gitignore`, and `git init` stays
+yours.
+
 ## The CLI
 
 | Command | What it does |
 |---|---|
+| `vilan init [name]` | scaffold a project; `--template` picks `node`, `browser`, or `fullstack` |
 | `vilan build [path]` | compile to `<file>.js` (no path: use the nearest `vilan.toml`) |
 | `vilan check [path]` | type-check and report problems, write nothing |
 | `vilan run [path] [args…]` | build and run; extra args reach `process::args()` |
@@ -166,7 +201,8 @@ app/
     …             everything else, shared by whichever entry reaches it
 ```
 
-Start here. This is the shape the examples use — the
+Start here — `vilan init my-app --template fullstack` writes exactly this
+layout, ready to run. It is the shape the examples use too: the
 [walkthrough app](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/walkthrough/),
 the [to-do app](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/todo/),
 and the [SSR example](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/ssr/)

@@ -1,0 +1,12 @@
+// The entry. A component is an ordinary function returning a `View`, so an app
+// is just composition: build the view and mount it into a node from
+// `index.html`.
+
+import std::ui::mount_root;
+import pkg::counter::counter;
+
+fun main() {
+	// The returned root owns everything the component binds; holding it (or, as
+	// here, letting it live for the page's lifetime) keeps the UI alive.
+	let _root = mount_root("app", || counter());
+}

@@ -1,0 +1,4 @@
+# `vilan build .` writes the bundle (and any `const` style sidecar) beside the
+# entry it came from. Generated output is not checked in.
+*.js
+*.css

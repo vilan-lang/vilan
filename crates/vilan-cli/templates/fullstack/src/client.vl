@@ -1,0 +1,18 @@
+// The browser entry (`[entry.client]`, target `browser`). It builds a view and
+// mounts it into the `<div id="app">` of `src/app.html`, which the server
+// serves. Nothing here reaches a node-only module, so it compiles for the
+// browser.
+//
+// `count.map(..)` derives a reactive source and `bind_text` keeps the text in
+// step with it; the i-string renders the number by host coercion.
+
+import std::reactive::Signal;
+import std::ui::{ mount_root, view };
+import pkg::shared::greeting;
+
+fun main() {
+	let _root = mount_root("app", || {
+		let count = Signal::new(0);
+		view("main").child(view("h1").text(greeting())).child(view("p").bind_text(count.map(|n| i"clicked {n} times"))).child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
+	});
+}

@@ -1,0 +1,22 @@
+// The node entry (`[entry.server]`; `target` defaults to node). It serves the
+// HTML shell and the client bundle the build wrote into `dist/`. Add routes
+// here — this side may use `std::fs`, `std::db`, and the rest of the process
+// layer, which the client entry cannot reach.
+
+import std::fs;
+import std::http::{ Request, Response, Server };
+import std::print;
+import pkg::shared::greeting;
+
+async fun main() {
+	// Read once at boot; the server runs from the project root (`vilan run .`).
+	let client_js = fs::read_file_to_str("dist/client.js");
+	let shell = fs::read_file_to_str("src/app.html");
+
+	Server::builder().port(8080).on_request(|request| {
+		match request.path() {
+			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+			_ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
+		}
+	}).on_start(|server| print(greeting() + " — http://localhost:8080/")).build().start();
+}

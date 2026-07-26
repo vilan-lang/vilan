@@ -1,0 +1,7 @@
+// A module BOTH entries reach, as `pkg::shared`. It is shared because they
+// both import it — one source tree, nothing to declare. Keep the code the two
+// sides must agree on (payload types, routes, greetings) here.
+
+fun greeting(): str {
+	"hello from vilan"
+}

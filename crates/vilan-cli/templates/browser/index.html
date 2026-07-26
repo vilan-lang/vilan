@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{{name}}</title>
+		<style>
+			body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; }
+		</style>
+	</head>
+	<body>
+		<!-- `mount_root("app", ..)` looks this node up by id and mounts into it. -->
+		<div id="app"></div>
+		<!-- `vilan build .` emits app.js beside this file: an ES module that
+		     uses DOM globals, with no Node host imports. -->
+		<script type="module" src="app.js"></script>
+	</body>
+</html>

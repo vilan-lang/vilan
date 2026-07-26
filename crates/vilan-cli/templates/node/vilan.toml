@@ -1,0 +1,10 @@
+# The smallest real package: one `node` entry, one sibling module, one test
+# file. `root = "."` keeps the sources beside this manifest (the default root
+# is `src/`), which is also where `vilan test .` looks for `*_test.vl`.
+#
+#   vilan run .     build + run `main.vl`
+#   vilan test .    run every `*_test.vl` in the package
+#   vilan build .   write `main.js` beside `main.vl`
+[package]
+name = "{{name}}"
+root = "."

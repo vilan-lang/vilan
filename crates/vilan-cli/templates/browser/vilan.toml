@@ -1,0 +1,14 @@
+# A browser app on `std::reactive` + `std::ui`. The package's `target` is
+# `browser`, so a plain `vilan build .` emits `app.js` beside `index.html` —
+# no `--target` flag. Sources sit beside this manifest, so `root` is `.`.
+#
+#   vilan build .   compile `app.vl` -> `app.js`
+#   vilan check .   type-check without writing anything
+#
+# Then open `index.html`. Serve the directory over HTTP (any static server) if
+# your browser refuses ES modules on `file://`.
+[package]
+name = "{{name}}"
+root = "."
+entry = "app.vl"
+target = "browser"

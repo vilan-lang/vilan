@@ -1,0 +1,5 @@
+# `vilan build .` writes the emitted JavaScript beside the source it came
+# from, and `vilan run .` refreshes any style sidecar the same way. Generated
+# output is not checked in.
+*.js
+*.css

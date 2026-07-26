@@ -1,0 +1,20 @@
+# ONE package, two entries — the shape a client + server app wants. Both legs
+# build from the same `src/` tree: `src/client.vl` compiles for the browser,
+# `src/server.vl` for node, and every module they both reach (`src/shared.vl`
+# here) is shared by construction — no second package, no path dependency.
+# Platform coloring keeps that honest: if code the client can *reach* calls a
+# server-only module, the build fails with the call chain.
+#
+#   vilan build .           compile both entries into `dist/`
+#   vilan run .             build both, then start the server
+#                           -> http://localhost:8080
+#   vilan run --watch .     the dev loop: rebuild, hot-swap the browser,
+#                           restart the server
+[package]
+name = "{{name}}"
+
+[entry.client]
+target = "browser"
+
+[entry.server]
+# target defaults to node; path defaults to server.vl under src/

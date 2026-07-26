@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{{name}}</title>
+		<style>
+			body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; }
+		</style>
+	</head>
+	<body>
+		<!-- `mount_root("app", ..)` in src/client.vl mounts into this node. -->
+		<div id="app"></div>
+		<!-- The server serves the built client bundle at this path. -->
+		<script type="module" src="/client.js"></script>
+	</body>
+</html>
