@@ -33,14 +33,14 @@
 		const PLAIN_STRING = {
 			className: "string",
 			begin: '"',
-			end: '"',
+			end: /"|$/,
 			contains: [{ begin: "\\\\." }],
 		};
 		// i"…{hole}…" — the holes carry expressions; render them as substitutions.
 		const INTERPOLATED = {
 			className: "string",
 			begin: 'i"',
-			end: '"',
+			end: /"|$/,
 			contains: [
 				{ begin: "\\\\." },
 				{ className: "subst", begin: "\\{", end: "\\}" },

@@ -19,11 +19,13 @@ import std::option::Option::{ self, Some, None };
 
 fun main() {
 	let db = Database::open("app.db");
-	db.exec("CREATE TABLE IF NOT EXISTS task (
+	db.exec("""
+	CREATE TABLE IF NOT EXISTS task (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		created_at INTEGER NOT NULL
-	)");
+	)
+	""");
 
 	let id = db.prepare("INSERT INTO task (name, created_at) VALUES (?, ?)")
 		.run(["write docs", 1720656000000i53]);

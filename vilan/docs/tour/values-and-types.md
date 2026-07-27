@@ -121,6 +121,21 @@ hole is indented like any other line. Inside `i"""…"""` exactly two
 escapes exist — `\{` and `\}` — and everything else is raw, just as in
 the plain form.
 
+The triple-quoted forms are the *only* ones that span lines. A `"…"` or
+`i"…"` must close on the line it opens; a raw line break inside one is an
+error that names both fixes — `"""…"""` for multi-line text, `\n` for a
+single break:
+
+```vilan,fragment
+let wrong = "first line
+second line";                          // error: a string cannot span lines
+let short = "first line\nsecond line"; // one break: write it `\n`
+```
+
+That is a small restriction with a large payoff: a closing quote you
+forget is reported on its own line, instead of the string running on to
+the next `"` somewhere below and burying the real mistake.
+
 ## Tuples
 
 `(a, b)` groups a few values without declaring a struct. Take them

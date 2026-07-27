@@ -158,11 +158,20 @@ impl<'src> Lexer<'src> {
             }
         } else if first == b'"' {
             match self.read_string(start) {
-                Some((token, end)) => self.push(token, start, end),
-                // An unterminated string: skip the opening quote and retry, exactly
-                // as chumsky's skip-then-retry recovery does (`"unterminated` lexes
+                StringScan::Complete(token, end) => self.push(token, start, end),
+                StringScan::LineBreak { content, at } => {
+                    self.report_line_break_in_string(start, '"');
+                    // Salvage (frontend.md §3): what was scanned before the break
+                    // becomes the literal's token and lexing resumes AT the break,
+                    // so the statement still parses and everything below it lexes
+                    // normally. The error above keeps the program failing.
+                    self.push(Token::String(content), start, at);
+                }
+                // An unterminated string at end of input — no line break to
+                // anchor at: skip the opening quote and retry, exactly as
+                // chumsky's skip-then-retry recovery does (`"unterminated` lexes
                 // the tail as identifiers).
-                None => self.skip_illegal(),
+                StringScan::Unterminated => self.skip_illegal(),
             }
         } else if first.is_ascii_digit() {
             let (token, end) = self.read_number(start);
@@ -183,6 +192,22 @@ impl<'src> Lexer<'src> {
     fn push(&mut self, token: Token<'src>, start: usize, end: usize) {
         self.tokens.push((token, span(start, end)));
         self.position = end;
+    }
+
+    /// Record the [`LINE_BREAK_IN_STRING`] ban against the literal's OPENING
+    /// character — the `"` of a `"…"`, the `i` of an `i"…"`. The break itself is
+    /// the more precise offset but the worse span: it renders as a caret past the
+    /// last visible character of the line (and on a CRLF file it lands on an
+    /// invisible `\r`), while the opening quote is a character the reader can see
+    /// and says WHICH of the line's literals failed to close (diagnostics-standard
+    /// A1 — the narrowest span that *identifies* the problem). The message names
+    /// the line break, so nothing is lost.
+    fn report_line_break_in_string(&mut self, position: usize, character: char) {
+        self.errors.push(LexError {
+            position,
+            character,
+            rule: Some(LINE_BREAK_IN_STRING),
+        });
     }
 
     /// Record an un-lexable character and step over it (one whole char), leaving the
@@ -355,29 +380,52 @@ impl<'src> Lexer<'src> {
         (Token::Op(&self.source[start..end]), end)
     }
 
-    /// A string literal. `start` is `"`. Returns the token and its end, or `None`
-    /// if the string is unterminated. A triple-quoted `"""…"""` is tried first (it
-    /// is raw and runs to the first `"""`); otherwise a `"…"` string whose body is
-    /// kept raw (escapes are interpreted at code generation).
-    fn read_string(&self, start: usize) -> Option<(Token<'src>, usize)> {
+    /// A string literal. `start` is `"`. A triple-quoted `"""…"""` is tried first
+    /// (it is raw and runs to the first `"""`); otherwise a `"…"` string whose body
+    /// is kept raw (escapes are interpreted at code generation) and which must close
+    /// on its own line — a raw line break inside it is [`LINE_BREAK_IN_STRING`].
+    fn read_string(&self, start: usize) -> StringScan<'src> {
         if self.bytes[start..].starts_with(b"\"\"\"") {
             let content_start = start + 3;
-            let closing = self.source[content_start..].find("\"\"\"")?;
+            let Some(closing) = self.source[content_start..].find("\"\"\"") else {
+                return StringScan::Unterminated;
+            };
             let content_end = content_start + closing;
             let content = &self.source[content_start..content_end];
-            return Some((Token::MultilineString(content), content_end + 3));
+            return StringScan::Complete(Token::MultilineString(content), content_end + 3);
         }
 
         let content_start = start + 1;
         let mut position = content_start;
         loop {
             match self.bytes.get(position) {
-                None => return None,
+                None => return StringScan::Unterminated,
                 Some(b'"') => break,
+                // The ban: a `"…"` never spans lines, so the break ends the scan
+                // whether the author meant a multi-line literal or simply forgot
+                // the closing quote — the two are indistinguishable here, and one
+                // honest message covers both.
+                Some(b'\n') | Some(b'\r') => {
+                    return StringScan::LineBreak {
+                        content: &self.source[content_start..position],
+                        at: position,
+                    };
+                }
                 Some(b'\\') => {
                     // A backslash escapes the next character (so `\"` does not close
                     // the string). The escaped character may be multi-byte.
-                    let escaped = self.source[position + 1..].chars().next()?;
+                    let Some(escaped) = self.source[position + 1..].chars().next() else {
+                        return StringScan::Unterminated;
+                    };
+                    // …but nothing escapes a line break: the literal has to close on
+                    // this line either way. The salvaged body stops BEFORE the `\`,
+                    // so no dangling backslash reaches `unescape_string`.
+                    if escaped == '\n' || escaped == '\r' {
+                        return StringScan::LineBreak {
+                            content: &self.source[content_start..position],
+                            at: position + 1,
+                        };
+                    }
                     position += 1 + escaped.len_utf8();
                 }
                 Some(_) => {
@@ -390,7 +438,7 @@ impl<'src> Lexer<'src> {
             }
         }
         let content = &self.source[content_start..position];
-        Some((Token::String(content), position + 1))
+        StringScan::Complete(Token::String(content), position + 1)
     }
 
     // --- Interpolated strings ------------------------------------------------
@@ -408,10 +456,13 @@ impl<'src> Lexer<'src> {
         // Scan the body into parts first: the wrapper tokens need the closing
         // quote's position, which is only known once the body is consumed.
         let mut parts: Vec<IStringPart<'src>> = Vec::new();
-        let close = loop {
+        let end = loop {
             match self.bytes.get(self.position) {
-                None => break None, // unterminated
-                Some(b'"') => break Some(self.position),
+                None => break IStringEnd::Unterminated,
+                Some(b'"') => break IStringEnd::Close(self.position),
+                // The ban, exactly as in the plain form: an `i"…"` never spans
+                // lines ([`LINE_BREAK_IN_STRING`]).
+                Some(b'\n') | Some(b'\r') => break IStringEnd::LineBreak(self.position),
                 Some(b'{') => parts.push(IStringPart::Hole(self.lex_hole())),
                 Some(b'\\') => match self.bytes.get(self.position + 1) {
                     // `\{` / `\}` collapse to the brace itself (the slice is the
@@ -421,44 +472,42 @@ impl<'src> Lexer<'src> {
                         parts.push(IStringPart::Text(brace));
                         self.position += 2;
                     }
+                    // Nothing escapes a line break — the literal has to close on
+                    // this line either way. The `\` itself is dropped with the rest
+                    // of the unclosed body.
+                    Some(b'\n') | Some(b'\r') => {
+                        break IStringEnd::LineBreak(self.position + 1);
+                    }
                     // Any other escape is kept raw as a `\X` fragment (interpreted
-                    // at code generation, like a plain string).
+                    // at code generation, like a plain string). This branch ends a
+                    // fragment on a character COUNT rather than a delimiter, which
+                    // is how a CRLF pair could once split across two `String`
+                    // tokens — where the per-token normalization that builds the
+                    // value can no longer see it (windows-support.md §2). The ban
+                    // above now makes a line terminator unreachable here, so the
+                    // count is safe; `lex_multiline_escape` is the one count-based
+                    // scanner that still has to take the pair itself.
                     Some(_) => {
                         let escaped = self.source[self.position + 1..]
                             .chars()
                             .next()
                             .expect("byte present implies a character");
-                        let mut end = self.position + 1 + escaped.len_utf8();
-                        // A CRLF is ONE line terminator (windows-support.md §2), so
-                        // an escape whose escaped character is the CR must take the
-                        // whole pair. This is one of exactly TWO scanners that end a
-                        // fragment on a character COUNT rather than a delimiter (the
-                        // other is `lex_multiline_escape`, the i-triple form's twin
-                        // of this branch), so these two are the only places a pair
-                        // could split across two `String` tokens — where the
-                        // per-token normalization that builds the value can no
-                        // longer see it, and the CR would survive into a value its
-                        // LF twin does not have. A third count-based scanner must
-                        // take the pair the same way. (A plain `"…"` is one
-                        // contiguous token, so it cannot split.)
-                        if escaped == '\r' && self.bytes.get(end) == Some(&b'\n') {
-                            end += 1;
-                        }
+                        let end = self.position + 1 + escaped.len_utf8();
                         parts.push(IStringPart::Text(&self.source[self.position..end]));
                         self.position = end;
                     }
-                    None => break None,
+                    None => break IStringEnd::Unterminated,
                 },
                 // A bare, unmatched `}` makes the i-string malformed (a clean source
                 // never reaches here); record it and stop the body scan.
                 Some(b'}') => {
                     self.skip_illegal();
-                    break None;
+                    break IStringEnd::Unterminated;
                 }
                 Some(_) => {
                     let text_start = self.position;
                     while let Some(&byte) = self.bytes.get(self.position) {
-                        if matches!(byte, b'{' | b'}' | b'"' | b'\\') {
+                        if matches!(byte, b'{' | b'}' | b'"' | b'\\' | b'\n' | b'\r') {
                             break;
                         }
                         let character = self.source[self.position..]
@@ -472,20 +521,29 @@ impl<'src> Lexer<'src> {
             }
         };
 
-        let Some(close) = close else {
-            // Unterminated: best-effort. A clean source never gets here; chumsky
-            // discards its whole output in this case (a recovery pathology recorded
-            // for S4). We keep what we scanned and record the error.
-            self.errors.push(LexError {
-                position: istring_start,
-                character: 'i',
-                rule: None,
-            });
-            return;
-        };
-
-        self.emit_interpolated(parts, span(istring_start, close + 1));
-        self.position = close + 1;
+        match end {
+            IStringEnd::Close(close) => {
+                self.emit_interpolated(parts, span(istring_start, close + 1));
+                self.position = close + 1;
+            }
+            IStringEnd::LineBreak(at) => {
+                self.report_line_break_in_string(istring_start, 'i');
+                // Salvage, exactly as the plain form: the fragments scanned so far
+                // become the concatenation and lexing resumes AT the break.
+                self.emit_interpolated(parts, span(istring_start, at));
+                self.position = at;
+            }
+            IStringEnd::Unterminated => {
+                // Best-effort. A clean source never gets here; chumsky discards its
+                // whole output in this case (a recovery pathology recorded for S4).
+                // We keep what we scanned and record the error.
+                self.errors.push(LexError {
+                    position: istring_start,
+                    character: 'i',
+                    rule: None,
+                });
+            }
+        }
     }
 
     /// Push the token sequence for an interpolated string's `parts`: the outer
@@ -679,10 +737,11 @@ impl<'src> Lexer<'src> {
                 // the pair splits across two fragments — where the per-fragment
                 // normalization that builds the value can no longer see it, and
                 // the CR survives into a value its LF twin does not have. This is
-                // the second of exactly two count-based fragment scanners (the
-                // other is `lex_interpolated`'s escape branch — the single-quoted
-                // twin of this one); both must take the pair, and so must any
-                // third that ever joins them.
+                // now the ONLY count-based fragment scanner that can meet a line
+                // terminator at all: its single-quoted twin (`lex_interpolated`'s
+                // escape branch) cannot, because `\` before a line break is the
+                // [`LINE_BREAK_IN_STRING`] ban there. Any further count-based
+                // scanner in a MULTI-LINE literal must take the pair the same way.
                 if character == '\r' && end < content_end && self.bytes[end] == b'\n' {
                     end += 1;
                 }
@@ -738,9 +797,16 @@ impl<'src> Lexer<'src> {
         let start = self.position;
         let first = self.bytes[start];
         let (token, end) = if first == b'"' {
-            // An unterminated string inside a hole cannot be recovered locally; the
-            // hole is malformed. A clean source never gets here.
-            self.read_string(start)?
+            match self.read_string(start) {
+                StringScan::Complete(token, end) => (token, end),
+                // A string inside a hole that does not close — at end of input or
+                // at a line break — cannot be recovered locally; the hole is
+                // malformed. A clean source never gets here. The line-break case
+                // reports nothing of its own: the enclosing i-string's body holds
+                // the same break, so it states the rule once
+                // (diagnostics-standard B5, one diagnostic per root cause).
+                StringScan::LineBreak { .. } | StringScan::Unterminated => return None,
+            }
         } else if first.is_ascii_digit() {
             self.read_number(start)
         } else if is_ident_start(first) {
@@ -762,11 +828,42 @@ enum IStringPart<'src> {
     Hole(Vec<Spanned<Token<'src>>>),
 }
 
+/// The outcome of scanning a `"…"` literal ([`Lexer::read_string`]).
+enum StringScan<'src> {
+    /// A closed literal: its token and the offset just past the closing quote.
+    Complete(Token<'src>, usize),
+    /// A raw line break inside the body — the [`LINE_BREAK_IN_STRING`] ban.
+    /// `content` is the raw body scanned before the break (the salvaged token's
+    /// text) and `at` is the break's offset, which is where lexing resumes.
+    LineBreak { content: &'src str, at: usize },
+    /// End of input with no closing quote and no line break to anchor at.
+    Unterminated,
+}
+
+/// How an `i"…"` body's scan ended ([`Lexer::lex_interpolated`]) — the i-string
+/// twin of [`StringScan`]. The fragments live in the caller's `parts`, so only the
+/// offsets travel: the closing quote's, or the line break's.
+enum IStringEnd {
+    Close(usize),
+    LineBreak(usize),
+    Unterminated,
+}
+
 /// The rule an unescaped `}` in an interpolated string breaks. Curated
 /// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned
 /// spelling of a literal one is named.
 const UNESCAPED_BRACE: &str = "a literal `}` inside an interpolated string is written `\\}` — an unescaped \
      brace belongs to a `{expr}` hole";
+
+/// The rule a raw line break inside a `"…"` or `i"…"` breaks. Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names both
+/// sanctioned spellings. One message covers the two shapes that reach it — a
+/// deliberate multi-line literal and a closing quote the author forgot — because
+/// the lexer cannot tell them apart, and "close it" is the fix for one while the
+/// triple-quoted forms are the fix for the other.
+const LINE_BREAK_IN_STRING: &str = "a string cannot span lines unless it is triple-quoted — close it before the line break; \
+     multi-line text goes in `\"\"\"…\"\"\"` (`i\"\"\"…\"\"\"` when interpolating), and a single \
+     line break is written `\\n`";
 
 /// One literal backslash, as an `i"""…"""` fragment must spell it. A fragment is
 /// read back by `transformer::unescape_string`, so a backslash that must survive
@@ -1015,18 +1112,130 @@ mod tests {
             lex(r#""with \"escaped\" quotes""#),
             vec![Token::String(r#"with \"escaped\" quotes"#)]
         );
-        // A `"…"` string may span lines.
-        assert_eq!(lex("\"a\nb\""), vec![Token::String("a\nb")]);
-        // …including with CRLF endings, which the token keeps RAW like every
-        // other body character. The `\r\n`-is-one-line-terminator rule
-        // (windows-support.md §2, spec §2) applies where the literal's VALUE is
-        // built — `transformer::unescape_string` — not here, so that spans keep
-        // addressing the file exactly as it sits on disk.
-        assert_eq!(lex("\"a\r\nb\""), vec![Token::String("a\r\nb")]);
-        // A triple-quoted string runs to the first `"""` and may hold a lone `"`.
+        // A triple-quoted string runs to the first `"""` and may hold a lone `"`
+        // — and it is the ONLY form that spans lines (see the line-break pins
+        // below, which is where a multi-line `"…"` now goes).
         assert_eq!(
             lex(r#""""with " inner""""#),
             vec![Token::MultilineString(r#"with " inner"#)]
+        );
+        assert_eq!(
+            lex("\"\"\"a\r\nb\"\"\""),
+            vec![Token::MultilineString("a\r\nb")]
+        );
+    }
+
+    // --- The single-line rule for `"…"` and `i"…"` ---------------------------
+    //
+    // A raw line break inside a single-quoted literal is a compile error
+    // ([`LINE_BREAK_IN_STRING`]). These pins carry three properties each: the
+    // error is recorded against the literal's OPENING character, the scanned
+    // prefix is salvaged as the literal's token, and lexing RESUMES at the break
+    // so everything below it still lexes (the frontend.md §3 salvage discipline).
+
+    /// Tokens and errors together, for a source the lexer is expected to reject.
+    fn lex_rejecting(source: &str) -> (Vec<Token<'_>>, Vec<LexError>) {
+        let (tokens, errors) = tokenize(source);
+        assert!(!errors.is_empty(), "expected a lex error for {source:?}");
+        (
+            tokens.into_iter().map(|(token, _span)| token).collect(),
+            errors,
+        )
+    }
+
+    /// The one error [`LINE_BREAK_IN_STRING`] records, at `position`.
+    fn line_break_error(position: usize, character: char) -> Vec<LexError> {
+        vec![LexError {
+            position,
+            character,
+            rule: Some(LINE_BREAK_IN_STRING),
+        }]
+    }
+
+    #[test]
+    fn a_line_break_ends_a_plain_string() {
+        // `let a = "x` / newline / `y` — indistinguishable from a deliberate
+        // multi-line literal, and reported the same way. The salvaged token is
+        // the body up to the break; `b` on the next line lexes on, which is what
+        // "the rest of the file still parses" means.
+        let (tokens, errors) = lex_rejecting("\"a\nb");
+        assert_eq!(errors, line_break_error(0, '"'));
+        assert_eq!(tokens, vec![Token::String("a"), Token::Ident("b")]);
+    }
+
+    #[test]
+    fn a_crlf_line_break_ends_a_plain_string() {
+        // The CRLF twin: the pair is one line terminator, and the CR alone is
+        // enough to end the literal, so the error offset does not move.
+        let (tokens, errors) = lex_rejecting("\"a\r\nb");
+        assert_eq!(errors, line_break_error(0, '"'));
+        assert_eq!(tokens, vec![Token::String("a"), Token::Ident("b")]);
+    }
+
+    #[test]
+    fn a_lone_carriage_return_ends_a_plain_string() {
+        // Classic-Mac endings are not blessed as line terminators
+        // (windows-support.md §2) but a lone `\r` still ENDS a single-quoted
+        // literal: whatever the file's convention, the quote is not on this line.
+        let (tokens, errors) = lex_rejecting("\"a\rb");
+        assert_eq!(errors, line_break_error(0, '"'));
+        assert_eq!(tokens, vec![Token::String("a"), Token::Ident("b")]);
+    }
+
+    #[test]
+    fn a_backslash_cannot_escape_a_line_break_in_a_plain_string() {
+        // Nothing escapes a line terminator — the literal has to close on its
+        // line either way. The `\` goes with the unclosed body, so the salvaged
+        // token never ends in a dangling backslash (`unescape_string` would read
+        // past it).
+        for source in ["\"a\\\nb", "\"a\\\r\nb", "\"a\\\rb"] {
+            let (tokens, errors) = lex_rejecting(source);
+            assert_eq!(errors, line_break_error(0, '"'), "{source:?}");
+            assert_eq!(
+                tokens,
+                vec![Token::String("a"), Token::Ident("b")],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unterminated_plain_string_at_end_of_input_keeps_skip_then_retry() {
+        // No line break to anchor at (the file simply stops): the opening quote
+        // is skipped and the tail retried, chumsky's shipped recovery. The
+        // generic "found '\"' expected a token" stands — the curated rule would
+        // be a guess about a file with no next line.
+        let (tokens, errors) = lex_rejecting("\"abc");
+        assert_eq!(
+            errors,
+            vec![LexError {
+                position: 0,
+                character: '"',
+                rule: None,
+            }]
+        );
+        assert_eq!(tokens, vec![Token::Ident("abc")]);
+    }
+
+    #[test]
+    fn a_line_break_in_a_string_does_not_stop_the_lexer() {
+        // Mid-edit shape: the statement below the broken literal lexes normally,
+        // so the LSP keeps working under the error.
+        let (tokens, errors) = lex_rejecting("let a = \"oops;\nlet b = 1;\n");
+        assert_eq!(errors, line_break_error(8, '"'));
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Let,
+                Token::Ident("a"),
+                Token::Op("="),
+                Token::String("oops;"),
+                Token::Let,
+                Token::Ident("b"),
+                Token::Op("="),
+                Token::Number("1", None, None),
+                Token::Ctrl(';'),
+            ]
         );
     }
 
@@ -1072,54 +1281,64 @@ mod tests {
     }
 
     #[test]
-    fn an_escaped_crlf_stays_in_one_interpolated_fragment() {
-        // The fragment scanner ends an escape on a character COUNT, so `\` before
-        // a CRLF would otherwise end the fragment BETWEEN the CR and the LF —
-        // splitting one line terminator across two `String` tokens, where the
-        // per-token normalization that builds the value can no longer see the
-        // pair (windows-support.md §2). The pair must ride in one fragment.
-        assert_eq!(
-            lex("i\"a\\\r\nb\""),
-            vec![
-                Token::Ctrl('('),
-                Token::String(""),
-                Token::Op("+"),
-                Token::String("a"),
-                Token::Op("+"),
-                Token::String("\\\r\n"),
-                Token::Op("+"),
-                Token::String("b"),
-                Token::Ctrl(')'),
-            ]
-        );
-        // A LONE `\r` after the backslash is not a line terminator, so the escape
-        // takes exactly the CR — one character, as before.
-        assert_eq!(
-            lex("i\"a\\\rb\""),
-            vec![
-                Token::Ctrl('('),
-                Token::String(""),
-                Token::Op("+"),
-                Token::String("a"),
-                Token::Op("+"),
-                Token::String("\\\r"),
-                Token::Op("+"),
-                Token::String("b"),
-                Token::Ctrl(')'),
-            ]
-        );
-        // An UNESCAPED CRLF needs nothing: the text run is delimiter-driven, so
-        // the pair is already contiguous inside one fragment.
-        assert_eq!(
-            lex("i\"a\r\nb\""),
-            vec![
-                Token::Ctrl('('),
-                Token::String(""),
-                Token::Op("+"),
-                Token::String("a\r\nb"),
-                Token::Ctrl(')'),
-            ]
-        );
+    fn a_line_break_ends_an_interpolated_string() {
+        // The i-string half of the single-line rule. The fragments scanned so far
+        // become the concatenation (`""` seed included), the error sits on the
+        // literal's `i`, and lexing resumes at the break.
+        for source in ["i\"a\nb", "i\"a\r\nb", "i\"a\rb"] {
+            let (tokens, errors) = lex_rejecting(source);
+            assert_eq!(errors, line_break_error(0, 'i'), "{source:?}");
+            assert_eq!(
+                tokens,
+                vec![
+                    Token::Ctrl('('),
+                    Token::String(""),
+                    Token::Op("+"),
+                    Token::String("a"),
+                    Token::Ctrl(')'),
+                    Token::Ident("b"),
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backslash_cannot_escape_a_line_break_in_an_interpolated_string() {
+        // The escape branch ends a fragment on a character COUNT, so `\` before a
+        // CRLF used to end the fragment BETWEEN the CR and the LF — one line
+        // terminator split across two `String` tokens, where the per-token
+        // normalization that builds the value could no longer see the pair
+        // (windows-support.md §2). The ban removes the shape entirely: a `\`
+        // before a line break is now the error, and the `\` is dropped with the
+        // rest of the unclosed body. That is why the branch needs no pair
+        // handling and `lex_multiline_escape` is the only count-based scanner
+        // that still does.
+        for source in ["i\"a\\\nb", "i\"a\\\r\nb", "i\"a\\\rb"] {
+            let (tokens, errors) = lex_rejecting(source);
+            assert_eq!(errors, line_break_error(0, 'i'), "{source:?}");
+            assert_eq!(
+                tokens,
+                vec![
+                    Token::Ctrl('('),
+                    Token::String(""),
+                    Token::Op("+"),
+                    Token::String("a"),
+                    Token::Ctrl(')'),
+                    Token::Ident("b"),
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_break_inside_a_hole_reports_the_rule_once() {
+        // A `"…"` inside a hole meets the break first, but says nothing: the
+        // enclosing i-string's body holds the same break and states the rule
+        // (diagnostics-standard B5 — one diagnostic per root cause).
+        let (_tokens, errors) = lex_rejecting("i\"a{f(\"x\ny\")}b\"");
+        assert_eq!(errors, line_break_error(0, 'i'));
     }
 
     #[test]

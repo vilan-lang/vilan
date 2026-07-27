@@ -456,6 +456,16 @@ condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
 
+**"a string cannot span lines unless it is triple-quoted …"**
+A `"…"` or `i"…"` ran into a line break before its closing quote. Either
+the quote is missing — that is the common case, and the error is reported
+on the string's own line rather than wherever the next `"` happens to be
+— or the text really is multi-line, in which case write it `"""…"""`
+(`i"""…"""` with holes). A single line break inside a one-line string is
+`\n`. Nothing escapes a line break: a trailing `\` does not continue the
+literal onto the next line.
+→ [Values and types](../tour/values-and-types.md), [spec §2.3](../spec/lexical.md)
+
 **"`Name` is a type, not a value"** (also *"a trait / a type parameter /
 a module, not a value"*)
 A type, trait, type parameter, or module name was used where a value is

@@ -77,7 +77,7 @@
             "1": { "name": "storage.type.string.vilan" },
             "2": { "name": "punctuation.definition.string.begin.vilan" }
           },
-          "end": "(\")",
+          "end": "(\")|$",
           "endCaptures": {
             "1": { "name": "punctuation.definition.string.end.vilan" }
           },
@@ -90,7 +90,7 @@
               "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"`, so a hole can never swallow the string's closing quote — an unclosed `{` while typing corrupts at most its own line. The trade: a string literal NESTED in a hole ends the hole early; rare, and the damage stays local.",
               "name": "meta.template.expression.vilan",
               "begin": "\\{",
-              "end": "\\}|(?=\")",
+              "end": "\\}|(?=\")|$",
               "beginCaptures": {
                 "0": { "name": "punctuation.definition.template-expression.begin.vilan" }
               },
@@ -108,7 +108,7 @@
           "beginCaptures": {
             "1": { "name": "punctuation.definition.string.begin.vilan" }
           },
-          "end": "(\")",
+          "end": "(\")|$",
           "endCaptures": {
             "1": { "name": "punctuation.definition.string.end.vilan" }
           },

@@ -1,5 +1,5 @@
-import std::print;
 import std::display::{ Display, format };
+import std::print;
 
 // The macro engine, Phase 1 (macro-engine.md §2): a user-land derive. The
 // macro compiles hermetically against macro_std, runs in the expansion
@@ -29,13 +29,14 @@ macro fun derive_display(item: Item): Source {
 		}
 		arms = arms + i"\"{field.name}=\" + format(self.{field.name})";
 	}
-	source(i"impl {target.name} with Display \{
-	fun to_string(self): str \{
-		import std::display::format;
-		{arms}
+	source(i"""
+	impl {target.name} with Display \{
+		fun to_string(self): str \{
+			import std::display::format;
+			{arms}
+		\}
 	\}
-\}
-")
+	""")
 }
 
 [derive_display]

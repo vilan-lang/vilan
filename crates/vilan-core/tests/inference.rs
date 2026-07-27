@@ -25649,27 +25649,73 @@ fn assert_crlf_twin_emits_identically(source: &str) -> String {
     lf
 }
 
+/// The one message a raw line break inside `"…"` / `i"…"` produces.
+const LINE_BREAK_IN_STRING: &str = "a string cannot span lines unless it is triple-quoted";
+
+// The single-quoted forms no longer span lines at all (the H7 disallow-revisit).
+// The pins that used to prove their CRLF normalization now prove the ban, and the
+// CRLF byte-identity property lives on in the triple-quoted pins below, which are
+// the forms that carry multi-line text.
+
 #[test]
-fn a_multi_line_plain_string_from_crlf_source_emits_lf() {
-    // THE miscompile this slice exists to kill: a plain `"…"` spanning lines
-    // kept the `\r` in its VALUE, so a Windows checkout printed different text.
-    let javascript = assert_crlf_twin_emits_identically(
-        "fun main(): str {\n    let text = \"alpha\nbeta\";\n    text\n}\n",
-    );
-    assert!(javascript.contains(r#""alpha\nbeta""#), "{javascript}");
-    assert!(!javascript.contains(r"\r"), "{javascript}");
+fn a_multi_line_plain_string_is_rejected() {
+    // What the pin used to say: a plain `"…"` spanning lines normalized its
+    // `\r\n` to `\n`. It is now an error in both encodings, so the miscompile
+    // class it guarded cannot arise.
+    let source = "fun main(): str {\n    let text = \"alpha\nbeta\";\n    text\n}\n";
+    assert_fails_with(source, LINE_BREAK_IN_STRING);
+    assert_fails_with(&crlf(source), LINE_BREAK_IN_STRING);
 }
 
 #[test]
-fn a_multi_line_interpolated_string_from_crlf_source_emits_lf() {
-    // The load-bearing form: multi-line `i"…"` is how a macro authors the source
-    // it returns (corpus `macro-derive.vl`), so it gets the same normalization.
-    let javascript = assert_crlf_twin_emits_identically(
-        "fun main(): str {\n    let who = \"world\";\n    i\"hello {who}\nagain\"\n}\n",
-    );
-    assert!(javascript.contains(r#""hello ""#), "{javascript}");
-    assert!(javascript.contains(r#""\nagain""#), "{javascript}");
-    assert!(!javascript.contains(r"\r"), "{javascript}");
+fn a_multi_line_interpolated_string_is_rejected() {
+    // The form that WAS load-bearing: multi-line `i"…"` is how a macro used to
+    // author the source it returns (corpus `macro-derive.vl`, migrated to
+    // `i"""` with this change).
+    let source = "fun main(): str {\n    let who = \"world\";\n    i\"hello {who}\nagain\"\n}\n";
+    assert_fails_with(source, LINE_BREAK_IN_STRING);
+    assert_fails_with(&crlf(source), LINE_BREAK_IN_STRING);
+}
+
+#[test]
+fn an_unterminated_string_is_reported_on_its_own_line() {
+    // The reason for the ban. Before it, the literal ran on to the NEXT `"`
+    // anywhere below — here `"world"`, five lines down — and whatever the
+    // compiler said, it said somewhere else entirely. The span is now the
+    // opening quote of the offending literal, which is the source's FIRST `"`.
+    let source = "\
+fun greet(name: str): str {
+    let prefix = \"hello, ;
+    prefix + name
+}
+
+fun main(): str {
+    greet(\"world\")
+}
+";
+    assert_fails_spanning(source, "\"", LINE_BREAK_IN_STRING);
+}
+
+#[test]
+fn code_below_a_line_break_error_still_analyzes() {
+    // The salvage half (frontend.md §3): the lexer resumes AT the break, so the
+    // statements under the broken literal are still lexed, parsed and CHECKED —
+    // the type error below it is reported, which it could not be if the literal
+    // had swallowed the rest of the file. This is what keeps the LSP useful
+    // mid-edit.
+    let source = "\
+fun broken(): str {
+    let prefix = \"hello, ;
+    prefix
+}
+
+fun later(): i32 {
+    let n: i32 = \"not a number\";
+    n
+}
+";
+    assert_fails_with(source, LINE_BREAK_IN_STRING);
+    assert_fails_with(source, "Expected i32, but got str instead.");
 }
 
 #[test]
@@ -25701,8 +25747,10 @@ fn a_mixed_crlf_program_emits_byte_identical_javascript() {
         }
 
         fun main() {
-            let note = Note { title = "one", body = "first line
-second line" };
+            let note = Note { title = "one", body = """
+                first line
+                second line
+                """ };
             print(greeting(note.title));
             print(note.body);
         }
@@ -25727,10 +25775,11 @@ fn emitted_javascript_from_crlf_source_has_no_carriage_return_through_a_macro() 
 
             mut body = "";
             for name in arguments.values {
-                body = body + i"fun {name}(): i32 \{
-    7
-\}
-";
+                body = body + i"""
+                fun {name}(): i32 \{
+                    7
+                \}
+                """;
             }
             source(body)
         }
@@ -25764,10 +25813,11 @@ fn a_macro_observing_a_multi_line_argument_sees_lf_from_crlf_source() {
             import macro_std::meta::{ Arguments, Source };
 
             let text = arguments.values[0];
-            source(i"fun width(): i32 \{
-    {text.len()}
-\}
-")
+            source(i"""
+            fun width(): i32 \{
+                {text.len()}
+            \}
+            """)
         }
 
         macro measure(1 +
@@ -25783,23 +25833,29 @@ fn a_macro_observing_a_multi_line_argument_sees_lf_from_crlf_source() {
 }
 
 #[test]
-fn a_lone_carriage_return_in_a_string_literal_is_preserved() {
-    // Classic-Mac endings are deliberately NOT blessed (windows-support.md §2):
-    // a `\r` with no following `\n` stays a character of the value. Pinned so
-    // the non-blessing is a decision rather than an oversight.
-    let javascript = compile("fun main(): str {\n    \"a\rb\"\n}\n").expect("compiles");
-    assert!(javascript.contains(r#""a\rb""#), "{javascript}");
+fn a_lone_carriage_return_ends_a_string_literal() {
+    // Classic-Mac endings are still NOT blessed as line terminators
+    // (windows-support.md §2 — `normalize_newlines` leaves a lone `\r` alone),
+    // but a lone `\r` DOES end a single-quoted literal: whatever the file's
+    // convention, the closing quote is not on this line. The pin that used to
+    // assert `"a\rb"` compiles to a value with a CR now asserts the ban.
+    assert_fails_with("fun main(): str {\n    \"a\rb\"\n}\n", LINE_BREAK_IN_STRING);
 }
 
 #[test]
-fn a_backslash_before_a_crlf_line_break_in_an_interpolated_string_emits_lf() {
+fn a_backslash_before_a_line_break_in_an_interpolated_string_is_rejected() {
     // The i-string fragment scanner ends an escape on a character COUNT, so a
     // `\` immediately before a line break used to end its fragment BETWEEN the
     // CR and the LF — one line terminator split across two `String` tokens,
     // where per-token normalization can no longer see the pair, and the CR rode
-    // into the value. The same program, two encodings, one bundle.
-    let javascript = assert_crlf_twin_emits_identically("fun main(): str {\n    i\"a\\\nb\"\n}\n");
-    assert!(!javascript.contains(r"\r"), "{javascript}");
+    // into the value. The ban removes the shape: nothing escapes a line break,
+    // so the split can no longer happen in a single-quoted literal at all.
+    for source in [
+        "fun main(): str {\n    i\"a\\\nb\"\n}\n",
+        "fun main(): str {\n    i\"a\\\r\nb\"\n}\n",
+    ] {
+        assert_fails_with(source, LINE_BREAK_IN_STRING);
+    }
 }
 
 #[test]
@@ -25825,35 +25881,50 @@ fn a_backslash_before_a_crlf_line_break_in_an_interpolated_triple_quoted_string_
 }
 
 #[test]
-fn a_backslash_before_a_crlf_line_break_in_a_plain_string_emits_lf() {
-    // The plain `"…"` twin of the case above. It needs no lexer change — the
-    // whole body is ONE contiguous token, so the pair can never split — but it
-    // is the reason the fix belongs in the i-string scanner alone, so it is
-    // pinned rather than assumed.
-    let javascript = assert_crlf_twin_emits_identically("fun main(): str {\n    \"a\\\nb\"\n}\n");
-    assert!(!javascript.contains(r"\r"), "{javascript}");
-}
-
-#[test]
-fn an_escape_immediately_before_a_crlf_line_break_composes() {
-    // The multi-escape edge: a real escape adjacent to the line break, so the
-    // fragment boundary lands right at the CR from the other side. `\\` then a
-    // break, and `\n` then a break.
-    for body in [
-        "fun main(): str {\n    i\"a\\\\\nb\"\n}\n",
-        "fun main(): str {\n    i\"a\\n\nb\"\n}\n",
+fn a_backslash_before_a_line_break_in_a_plain_string_is_rejected() {
+    // The plain `"…"` twin of the case above. Its body was ONE contiguous token,
+    // so the CRLF pair could never split there — but a `\` before a line break
+    // is the same ban in both forms, so the rule needs no per-form exception.
+    for source in [
+        "fun main(): str {\n    \"a\\\nb\"\n}\n",
+        "fun main(): str {\n    \"a\\\r\nb\"\n}\n",
     ] {
-        let javascript = assert_crlf_twin_emits_identically(body);
-        assert!(!javascript.contains(r"\r"), "{body}\n{javascript}");
+        assert_fails_with(source, LINE_BREAK_IN_STRING);
     }
 }
 
 #[test]
-fn a_backslash_before_a_crlf_break_after_a_hole_emits_lf() {
-    // …and with a hole before it, so the fragment the escape starts is not the
-    // first one in the i-string.
-    let javascript = assert_crlf_twin_emits_identically(
+fn an_escape_immediately_before_a_line_break_is_still_the_ban() {
+    // The multi-escape edge: a real escape adjacent to the line break, so the
+    // fragment boundary lands right at the CR from the other side. `\\` then a
+    // break, and `\n` then a break — the break rules in both cases.
+    for source in [
+        "fun main(): str {\n    i\"a\\\\\nb\"\n}\n",
+        "fun main(): str {\n    i\"a\\n\nb\"\n}\n",
+    ] {
+        assert_fails_with(source, LINE_BREAK_IN_STRING);
+    }
+}
+
+#[test]
+fn a_line_break_after_a_hole_is_the_ban() {
+    // …and with a hole before it, so the break is not in the i-string's first
+    // fragment. The salvage keeps the hole's tokens, so nothing downstream
+    // panics on a half-scanned concatenation.
+    assert_fails_with(
         "fun main(): str {\n    let n = \"x\";\n    i\"a{n}\\\nb\"\n}\n",
+        LINE_BREAK_IN_STRING,
+    );
+}
+
+#[test]
+fn a_backslash_before_a_crlf_break_after_a_hole_in_a_triple_quoted_string_emits_lf() {
+    // The surviving CRLF-pair case: `lex_multiline_escape` is now the ONLY
+    // count-based fragment scanner that can meet a line terminator, so this is
+    // the pin that keeps its pair handling honest. A hole precedes the escape,
+    // so the fragment it starts is not the literal's first.
+    let javascript = assert_crlf_twin_emits_identically(
+        "fun main(): str {\n    let n = \"x\";\n    i\"\"\"\n    a{n}\\\n    b\n    \"\"\"\n}\n",
     );
     assert!(!javascript.contains(r"\r"), "{javascript}");
 }

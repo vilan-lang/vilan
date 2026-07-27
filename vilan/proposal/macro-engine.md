@@ -64,9 +64,11 @@ macro fun derive_display(item: Item): Source {
 	for field in target.fields {
 		arms.push(i"\"{field.name}=\" + format(self.{field.name})");
 	}
-	source(i"impl {target.name} with Display \{
-		fun to_string(self): str \{ {arms.join(" + \", \" + ")} \}
-	\}")
+	source(i"""
+		impl {target.name} with Display \{
+			fun to_string(self): str \{ {arms.join(" + \", \" + ")} \}
+		\}
+		""")
 }
 ```
 ```vilan

@@ -84,7 +84,8 @@ not `0xFF` with suffix `f`.
 
 ```text
 STRING           = '"' , { string_char } , '"' ;
-string_char      = "\" any_char | any_char_except_quote_backslash ;
+string_char      = "\" any_char_except_line_terminator
+                 | any_char_except_quote_backslash_or_line_terminator ;
 MULTILINE_STRING = '"""' , raw_text , '"""' ;
 ```
 
@@ -95,10 +96,17 @@ string is **raw** (a backslash is a backslash) and runs to the first
 `"""`; the whitespace prefix of the line containing the closing delimiter
 is stripped from every line of the content.
 
-Both forms may span lines, and in both a source line break contributes a
-single `\n` to the value per the line-terminator rule above. An escaped
-`\r` is unaffected: it is written into the literal, not read off the end
-of a line.
+A single-quoted string **must close on the line it opens**. A raw line
+break inside `"…"` is an error, and so is a backslash immediately before
+one — nothing escapes a line terminator, because the literal has to close
+on its line either way. Multi-line text is written `"""…"""`; a single
+line break inside a one-line string is written `\n`. (The rule buys error
+locality: a forgotten closing quote is reported at its own line instead of
+running on to the next `"` anywhere below it.)
+
+In a multiline string a source line break contributes a single `\n` to the
+value per the line-terminator rule above. An escaped `\r` is unaffected:
+it is written into the literal, not read off the end of a line.
 
 ### Interpolated strings
 
@@ -117,10 +125,10 @@ and parsed as a single parenthesized expression. The result of the whole
 form is `str`; each part must therefore be valid as a `+` operand with
 `str` (§5's operator dispatch).
 
-An interpolated string may also span lines — the multi-line
-`source(i"…")` form is how a macro writes the code it returns — and its
-literal fragments follow the same line-terminator rule: one `\n` per
-source line break.
+`i"…"` obeys the single-line rule of its plain twin: a raw line break in
+its body — or a backslash before one — is the same error. Interpolated
+multi-line text is `i"""…"""`, which is how a macro writes the code it
+returns.
 
 #### Interpolated multiline strings
 
@@ -149,8 +157,9 @@ order:
    `n`). An unescaped `}` outside a hole is an error, as it is in `i"…"`.
 
 The body is raw and runs to the first `"""`, so a single `"` and a `""`
-pair are ordinary content. As with the single-quoted form, the value is a
-`str` and a source line break contributes one `\n`.
+pair are ordinary content. The value is a `str`, and — this being one of
+the two forms that may span lines — a source line break in it contributes
+one `\n`.
 
 ```vilan,fragment
 let report = i"""

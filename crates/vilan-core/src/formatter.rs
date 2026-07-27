@@ -3273,10 +3273,11 @@ mod newlines {
     #[test]
     fn a_crlf_multi_line_string_does_not_bail_the_safety_net() {
         // The net compares the input's token stream against the reprint's. A
-        // plain multi-line string's token carries its RAW body, so without
-        // normalizing the input the two sides would disagree on `\r\n` vs `\n`
-        // and the formatter would bail — leaving CRLF on disk forever.
-        let canonical = "fun main() {\n\tlet text = \"alpha\nbeta\";\n}\n";
+        // multi-line string's token carries its RAW body, so without normalizing
+        // the input the two sides would disagree on `\r\n` vs `\n` and the
+        // formatter would bail — leaving CRLF on disk forever. (The literal is
+        // triple-quoted: a `"…"` no longer spans lines at all.)
+        let canonical = "fun main() {\n\tlet text = \"\"\"\n\talpha\n\tbeta\n\t\"\"\";\n}\n";
         assert_eq!(format(&crlf(canonical)), canonical);
     }
 
@@ -3284,10 +3285,27 @@ mod newlines {
     fn a_crlf_interpolated_string_reprints_without_carriage_returns() {
         // An i-string is recovered VERBATIM from source, so its slice is the
         // path a `\r` would ride into formatted output.
-        let canonical = "fun main() {\n\tlet who = \"w\";\n\tlet t = i\"hi {who}\nbye\";\n}\n";
+        let canonical = "fun main() {\n\tlet who = \"w\";\n\tlet t = i\"\"\"\n\thi {who}\n\tbye\n\t\"\"\";\n}\n";
         let formatted = format(&crlf(canonical));
         assert!(!formatted.contains('\r'), "{formatted:?}");
         assert_eq!(formatted, canonical);
+    }
+
+    #[test]
+    fn a_line_break_in_a_single_quoted_string_bails_the_formatter() {
+        // A now-illegal literal must never reach the printer: the reprint would
+        // silently ADD the closing quote the author left off, rewriting the
+        // program. `code_tokens` declines on any lexer error, so `format` takes
+        // the ordinary bail path and returns the input's bytes untouched —
+        // including its line endings, which is why the CRLF twin is checked too.
+        for source in [
+            "fun main() {\n\tlet text = \"alpha\nbeta\";\n}\n",
+            "fun main() {\n\tlet text = i\"alpha\nbeta\";\n}\n",
+        ] {
+            assert_eq!(format(source), source, "{source:?}");
+            let windows = crlf(source);
+            assert_eq!(format(&windows), windows, "{source:?}");
+        }
     }
 
     #[test]

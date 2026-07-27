@@ -99,7 +99,7 @@ fn a_bom_prefixed_crlf_file_compiles_like_its_plain_twin() {
     // The two Windows-editor defaults together: BOM *and* CRLF. The emitted
     // bundle must be byte-identical to the plain LF file's.
     let dir = temp_project("bom_crlf");
-    let source = "import std::print;\n\nfun main() {\n\tlet text = \"alpha\nbeta\";\n\tprint(text);\n}\n\nmain();\n";
+    let source = "import std::print;\n\nfun main() {\n\tlet text = \"\"\"\n\talpha\n\tbeta\n\t\"\"\";\n\tprint(text);\n}\n\nmain();\n";
     write_bytes(&dir, "plain.vl", source.as_bytes());
     write_bytes(&dir, "windows.vl", &[BOM, &crlf(source)].concat());
 
@@ -123,7 +123,7 @@ fn a_crlf_file_runs_with_lf_string_values() {
     // The miscompile, observed at RUNTIME rather than in the bundle text: the
     // program prints two lines, not one line ending in a stray carriage return.
     let dir = temp_project("crlf_run");
-    let source = "import std::print;\n\nfun main() {\n\tprint(\"alpha\nbeta\");\n}\n\nmain();\n";
+    let source = "import std::print;\n\nfun main() {\n\tprint(\"\"\"\n\talpha\n\tbeta\n\t\"\"\");\n}\n\nmain();\n";
     write_bytes(&dir, "main.vl", &crlf(source));
 
     let output = vilan(&dir, &["run", "main.vl"]);
@@ -142,8 +142,7 @@ fn fmt_converts_a_crlf_file_to_lf_exactly_once() {
     // reformat. Two files that differ ONLY in line endings must end up identical
     // on disk, and the second run must report nothing left to do.
     let dir = temp_project("fmt_crlf");
-    let source =
-        "import std::print;\n\nfun main() {\n\tlet text = \"alpha\nbeta\";\n\tprint(text);\n}\n";
+    let source = "import std::print;\n\nfun main() {\n\tlet text = \"\"\"\n\talpha\n\tbeta\n\t\"\"\";\n\tprint(text);\n}\n";
     write_bytes(&dir, "canonical.vl", source.as_bytes());
     write_bytes(&dir, "windows.vl", &crlf(source));
 
@@ -186,7 +185,7 @@ fn a_crlf_module_import_compiles_like_its_lf_twin() {
     let dir = temp_project("crlf_module");
     let entry =
         "import pkg::helper::shout;\nimport std::print;\n\nfun main() {\n\tprint(shout());\n}\n";
-    let helper = "fun shout(): str {\n\t\"first\nsecond\"\n}\n";
+    let helper = "fun shout(): str {\n\t\"\"\"\n\tfirst\n\tsecond\n\t\"\"\"\n}\n";
     write_bytes(&dir, "main.vl", entry.as_bytes());
 
     write_bytes(&dir, "helper.vl", helper.as_bytes());
