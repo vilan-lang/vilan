@@ -1,6 +1,6 @@
 # The Vilan Organization's stance on AI
 
-_This document was written exclusively by @ReedSyllas without assistance from AI tooling._
+_This document was written exclusively by [Reed Syllas](https://github.com/ReedSyllas) without assistance from AI tooling._
 
 In the modern age, AI-assisted programming has become quite common. With it, two opposing sides have formed: those who love it and those who hate it. I'm not going to engage with the topic as a whole, but I will set guidelines for the Vilan project.
 
