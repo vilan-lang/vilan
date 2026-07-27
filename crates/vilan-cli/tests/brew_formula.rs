@@ -311,7 +311,7 @@ fn the_generator_covers_every_unix_target_the_release_matrix_builds() {
 #[test]
 fn the_formula_carries_the_projects_identity() {
     let homepage = string_setting("homepage");
-    assert_eq!(homepage, "https://vilan-lang.github.io/vilan/");
+    assert_eq!(homepage, "https://vilan-lang.org/docs/");
     let npm = std::fs::read_to_string(repo_root().join("npm/meta/package.json"))
         .expect("read the npm meta manifest");
     assert!(

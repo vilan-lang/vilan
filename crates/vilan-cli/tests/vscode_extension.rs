@@ -188,7 +188,7 @@ fn the_description_matches_what_the_extension_does_today() {
 fn the_listing_links_point_at_the_project() {
     assert_eq!(
         manifest_field("homepage"),
-        "https://vilan-lang.github.io/vilan/",
+        "https://vilan-lang.org/docs/",
         "the listing's homepage is the book"
     );
     assert_eq!(

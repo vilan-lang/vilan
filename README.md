@@ -165,7 +165,7 @@ From there, read the book. It starts with
 [Coming from JavaScript](vilan/docs/tour/coming-from-javascript.md) and
 ends with the full-stack walkthrough:
 
-- **Rendered** (search + sidebar): https://vilan-lang.github.io/vilan/ —
+- **Rendered** (search + sidebar): https://vilan-lang.org/docs/ —
   or locally, `cargo install mdbook && mdbook serve vilan/docs`.
 - **As files**: start at [vilan/docs/README.md](vilan/docs/README.md).
 

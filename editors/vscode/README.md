@@ -1,6 +1,6 @@
 # Vilan for VS Code
 
-[Vilan](https://vilan-lang.github.io/vilan/) is a language for building
+[Vilan](https://vilan-lang.org/docs/) is a language for building
 full-stack web apps. It compiles to JavaScript and runs on node and in the
 browser, but it is not JavaScript: values are copied instead of shared, there
 is no `null` and no exceptions, `await` is implicit, and the compiler checks
@@ -101,9 +101,9 @@ a re-export, and keeps any import that derive-generated code references.
 
 ## Learning Vilan
 
-- [The book](https://vilan-lang.github.io/vilan/) — guide, tour, and the
+- [The book](https://vilan-lang.org/docs/) — guide, tour, and the
   language specification.
-- [Coming from JavaScript](https://vilan-lang.github.io/vilan/tour/coming-from-javascript.html)
+- [Coming from JavaScript](https://vilan-lang.org/docs/tour/coming-from-javascript.html)
   — the differences that will bite first.
 - [The repository](https://github.com/vilan-lang/vilan) — including a working
   full-stack example app.

@@ -3,7 +3,7 @@
 # release workflow. Edit the script, never this file.
 class Vilan < Formula
   desc "Language toolchain for vilan: the compiler and the language server"
-  homepage "https://vilan-lang.github.io/vilan/"
+  homepage "https://vilan-lang.org/docs/"
   version "0.14.0"
   license any_of: ["MIT", "Apache-2.0"]
 

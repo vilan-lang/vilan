@@ -15,7 +15,7 @@ That gives you two commands:
   [VS Code extension](https://github.com/vilan-lang/vilan/tree/main/editors/vscode)
   starts for you.
 
-**The book (start here): <https://vilan-lang.github.io/vilan/>** — the guided
+**The book (start here): <https://vilan-lang.org/docs/>** — the guided
 tour, the language guide, the standard library reference and the specification.
 
 ## What this package is

@@ -81,7 +81,7 @@ const OWNER_STRING_ALLOWLIST: &[(&str, &str)] = &[
 
 /// The repository moved from the maintainer's personal account to the
 /// `vilan-lang` org, and the book with it — it now publishes at
-/// `vilan-lang.github.io/vilan` (F9, `vilan/proposal/org-migration.md`).
+/// `vilan-lang.org/docs` (F9, `vilan/proposal/org-migration.md`).
 /// The invariant behind this gate: **the old GitHub repository name is never
 /// reused.** A transfer leaves permanent redirects for git operations *and*
 /// `releases/download/…` URLs, which is the only thing keeping every
@@ -121,7 +121,7 @@ fn no_tracked_file_contains_a_pre_migration_owner_string() {
     assert!(
         offenders.is_empty(),
         "pre-migration owner strings in tracked files (the project lives at \
-         vilan-lang/vilan and the book at vilan-lang.github.io/vilan):\n{}",
+         vilan-lang/vilan and the book at vilan-lang.org/docs):\n{}",
         offenders.join("\n")
     );
 }

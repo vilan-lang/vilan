@@ -90,7 +90,7 @@ main() {
             ;;
     esac
     say ""
-    say "get started: https://vilan-lang.github.io/vilan/"
+    say "get started: https://vilan-lang.org/docs/"
 }
 
 main

@@ -133,7 +133,7 @@ function Main {
         Say "verify with: vilan --version"
     }
     Say ""
-    Say "get started: https://vilan-lang.github.io/vilan/"
+    Say "get started: https://vilan-lang.org/docs/"
 }
 
 Main

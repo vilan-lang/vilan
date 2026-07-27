@@ -27,7 +27,7 @@ assumes only that the `vilan` command is on your PATH.
 
 ## Where this book lives
 
-The published copy is at <https://vilan-lang.github.io/vilan/> — search
+The published copy is at <https://vilan-lang.org/docs/> — search
 and a sidebar included, always built from the latest `main`. That is the
 copy to link to and the one most readers want.
 
