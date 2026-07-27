@@ -964,11 +964,13 @@ fn a_broken_inherited_declaration_names_the_projects_manifest() {
     let output = vilan(&["build", dir.join("app").to_str().unwrap()]);
     assert!(!output.status.success(), "expected a resolution failure");
     let text = combined(&output);
+    // Through the same canonical seam the product uses: `enclosing_project`
+    // canonicalizes, so on windows the message carries the long spelling
+    // (`runneradmin`) where the raw temp path says `RUNNER~1` — the windows CI
+    // leg caught the raw-spelling version of this assertion.
+    let project_manifest = vilan_core::util::canonical_path(&dir).join("vilan.toml");
     assert!(
-        text.contains(&format!(
-            "inherited from {}",
-            dir.join("vilan.toml").display()
-        )),
+        text.contains(&format!("inherited from {}", project_manifest.display())),
         "{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
