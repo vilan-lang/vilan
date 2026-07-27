@@ -417,7 +417,7 @@ fn success_banner(colored: bool, installed: &str, destination: &str) -> String {
     // collector re-emitted next.
     let mark = UPGRADE_LOGO
         .lines()
-        .map(|line| paint::wrap(colored, Style::LAVENDER, line).into_owned())
+        .map(|line| paint::wrap(colored, Style::BLUSH, line).into_owned())
         .collect::<Vec<_>>()
         .join("\n");
     let line = format!("installed {installed} to {destination}");
@@ -1004,11 +1004,11 @@ mod tests {
         );
         assert!(plain.contains(UPGRADE_LOGO), "the art is missing:\n{plain}");
 
-        // Colored: the brand lavender opens the art, the caption keeps its own
+        // Colored: the brand blush opens the art, the caption keeps its own
         // green, and the whole thing closes on a reset.
         assert!(
-            colored.contains("\x1b[38;2;212;205;255m"),
-            "no lavender: {colored:?}"
+            colored.contains("\x1b[38;2;249;223;231m"),
+            "no blush: {colored:?}"
         );
         assert!(colored.contains("\x1b[32m"), "the caption lost green");
         assert!(colored.ends_with("\x1b[0m"), "unterminated: {colored:?}");

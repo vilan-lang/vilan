@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/dark_logo_beside_text.svg">
-    <img src="assets/branding/light_logo_beside_text.svg" alt="Vilan" width="520">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/light_lockup.png">
+    <img src="assets/branding/dark_lockup.png" alt="Vilan" width="360">
   </picture>
 </p>
 

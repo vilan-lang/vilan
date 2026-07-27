@@ -12,6 +12,8 @@ tracks the latest state.
 **Breaking: single-quoted strings no longer span lines.** A raw line break inside `"…"` or `i"…"` is now a compile error, and so is a backslash before one — nothing escapes a line terminator. Multi-line text goes in the triple-quoted forms, `"""…"""` and `i"""…"""` (new in this release); a single line break inside a one-line string is written `\n`. The payoff is error locality: a string whose closing quote you forgot used to run on to the next `"` anywhere below it, so the compiler complained somewhere else entirely — often many lines away, about something unrelated. It is now reported on the literal's own line, pointing at the opening quote, and the rest of the file still compiles and still serves hovers and completions in the editor. The editor's syntax highlighting agrees: a broken string paints at most its own line. To migrate: a multi-line `"…"` becomes `"""…"""` (an `i"…"` becomes `i"""…"""` — the triple forms are raw and strip the closing delimiter's indentation), or collapse onto one line with `\n`.
 
 **Breaking: `serve_service` and `serve_connected` hand their ready callback the `Server`.** `on_ready` is now `|Server| void`, matching `serve_rpc` — which is what makes `serve_service(0, …)` usable: the server you're handed knows the port it actually bound (`server.port()`, new this release).
+
+**Vilan has a new look.** The palette moved from indigo-and-lavender to blush on near-black (`#F9DFE7` on `#120004`), and every rendering of the brand moved with it: the repository header, the VS Code extension's icon and listing banner, the CLI's post-upgrade mark, and the website. The mark itself is unchanged.
 -->
 
 ## v0.15.0 — 2026-07-25

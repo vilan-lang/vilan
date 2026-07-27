@@ -125,9 +125,9 @@ with the extension loaded, and open a `.vl` file to activate it. Point
 `vilan.server.path` at your `target/release/vilan-lsp` to test against a local
 build of the server.
 
-`icon.png` is a derived asset, not a source: it is rendered at 256×256 from the
-brand master `assets/branding/dark_icon.svg` — regenerate it with
-`python3 scripts/icon_png.py` after any change to the mark.
+`icon.png` is a derived asset, not a source: it is a vendored copy of the brand
+pipeline's `baked/icon_256.png` — the private `vilan-lang/branding` repository
+bakes it from the flat mark; re-vendor after any change to the mark.
 
 ## License
 

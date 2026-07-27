@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Generate the terminal (half-block) rendering of the vilan mark.
 
-Reads the brand master `assets/branding/dark_logo_flat.svg` (pure straight-edge
-polygons) and rasterizes it onto a character grid, two vertical subcells per
-row, emitted as ` ▀▄█` — glyphs present even in CP437 legacy Windows consoles.
-Terminal cells are treated as 1:2 (width:height), so subcells are square and
-the mark keeps its true aspect ratio.
+Reads the brand master `assets/branding/light_logo_flat.svg` (pure
+straight-edge polygons, vendored from the private `vilan-lang/branding`
+repository) and rasterizes it onto a character grid, two vertical subcells
+per row, emitted as ` ▀▄█` — glyphs present even in CP437 legacy Windows
+consoles. Terminal cells are treated as 1:2 (width:height), so subcells are
+square and the mark keeps its true aspect ratio.
 
     python3 scripts/ascii_logo.py            # print the art
     python3 scripts/ascii_logo.py --rust     # print the Rust const for the CLI
@@ -15,8 +16,7 @@ The `--rust` output is the source of truth for `UPGRADE_LOGO` in
 or the parameters below change. Defaults (44 columns, threshold 0.35) were
 chosen by eye: 44 fits an 80-column terminal with room for a caption, and
 0.35 keeps the thin stroke tips connected. Below ~32 columns the full mark
-stops reading — don't shrink it, that is what the simplified icon SVGs are
-for.
+stops reading — don't shrink it.
 """
 
 import argparse
@@ -24,7 +24,7 @@ import pathlib
 import re
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-SVG = REPO / "assets" / "branding" / "dark_logo_flat.svg"
+SVG = REPO / "assets" / "branding" / "light_logo_flat.svg"
 
 
 def load_polygons():

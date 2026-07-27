@@ -11,7 +11,7 @@
 //! per stream, and hand back the input unchanged on the plain path.
 //!
 //! A [`Style`] is just an SGR *parameter body*, so the palette is not limited to
-//! the classic 3-bit codes: [`Style::LAVENDER`] carries the brand color as a
+//! the classic 3-bit codes: [`Style::BLUSH`] carries the brand color as a
 //! 24-bit `38;2;r;g;b` body through the same constant, the same [`wrap`], and
 //! the same gate. Status lines stay on the classic codes (they must read on
 //! whatever palette the user has themed); the one truecolor style exists because
@@ -51,9 +51,10 @@ impl Style {
     pub const BOLD_RED: Style = Style("1;31");
     pub const BOLD_GREEN: Style = Style("1;32");
     pub const BOLD_YELLOW: Style = Style("1;33");
-    /// The brand lavender `#D4CDFF` as a 24-bit foreground — the one style that
-    /// names an exact color rather than a palette slot, for the mark itself.
-    pub const LAVENDER: Style = Style("38;2;212;205;255");
+    /// The brand's primary light `#F9DFE7` as a 24-bit foreground — the one
+    /// style that names an exact color rather than a palette slot, for the
+    /// mark itself.
+    pub const BLUSH: Style = Style("38;2;249;223;231");
 }
 
 /// Wraps `text` in `style`'s SGR codes when `enabled`; otherwise hands it back
@@ -224,16 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn the_brand_lavender_rides_the_same_style_encoding_as_the_classic_codes() {
-        // `#D4CDFF` → the 24-bit foreground body `38;2;212;205;255`. Nothing
+    fn the_brand_blush_rides_the_same_style_encoding_as_the_classic_codes() {
+        // `#F9DFE7` → the 24-bit foreground body `38;2;249;223;231`. Nothing
         // about `wrap` knows this is a truecolor style: a `Style` is its SGR
         // parameter body, so there is no parallel color path to keep in sync.
         assert_eq!(
-            wrap(true, Style::LAVENDER, "▀██▀"),
-            "\x1b[38;2;212;205;255m▀██▀\x1b[0m"
+            wrap(true, Style::BLUSH, "▀██▀"),
+            "\x1b[38;2;249;223;231m▀██▀\x1b[0m"
         );
         // ...and it obeys the one gate like every other style.
-        let plain = wrap(false, Style::LAVENDER, "▀██▀");
+        let plain = wrap(false, Style::BLUSH, "▀██▀");
         assert_eq!(plain, "▀██▀");
         assert!(matches!(plain, Cow::Borrowed(_)));
     }

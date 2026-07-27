@@ -88,8 +88,9 @@ fn the_extension_version_is_the_toolchain_version() {
 }
 
 /// The icon the manifest names, as bytes. PNG only: the marketplace does not
-/// accept SVG, which is why `editors/vscode/icon.png` is rendered from the
-/// brand master at all (`python3 scripts/icon_png.py`).
+/// accept SVG, which is why `editors/vscode/icon.png` is a vendored copy of
+/// the brand pipeline's `baked/icon_256.png` (the private `vilan-lang/branding`
+/// repository bakes it from the flat mark).
 fn icon() -> Vec<u8> {
     let name = manifest_field("icon");
     assert!(!name.is_empty() && name != "undefined", "no `icon` field");
@@ -129,9 +130,9 @@ fn the_icon_is_square_and_at_least_the_marketplace_minimum() {
 /// Colour type 2 is truecolour *without* an alpha channel. It matters: gallery
 /// pages render the icon on a white card and the editor's Extensions view
 /// renders it on the user's theme, so a transparent icon can only read against
-/// one of the two. Ours is opaque, on the palette's deep indigo — the same
-/// ground as `galleryBanner`, and the pairing the branding README specifies for
-/// the dark (pale-lavender) mark.
+/// one of the two. Ours is opaque, on the palette's primary-dark ground — the
+/// same ground as `galleryBanner`, and the pairing the branding README
+/// specifies for the light (blush) mark.
 #[test]
 fn the_icon_is_opaque_so_it_reads_on_a_light_gallery_and_a_dark_one() {
     let (_, _, colour_type) = image_header();
@@ -146,8 +147,8 @@ fn the_icon_is_opaque_so_it_reads_on_a_light_gallery_and_a_dark_one() {
 fn the_gallery_banner_is_the_brands_dark_ground() {
     assert_eq!(
         manifest_field("galleryBanner.color"),
-        "#110C31",
-        "the listing's banner is the palette's deep indigo (assets/branding/README.md)"
+        "#120004",
+        "the listing's banner is the palette's primary dark (assets/branding/README.md)"
     );
     assert_eq!(
         manifest_field("galleryBanner.theme"),
