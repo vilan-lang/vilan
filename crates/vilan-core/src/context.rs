@@ -177,13 +177,13 @@ fn local_target(program: &Program, entity_id: Id) -> Option<Id> {
 /// the file the span indexes into (backlog E16). This pass walks the whole
 /// program, so the file comes from the anchor — never from "the entry".
 fn anchored(program: &Program, anchor: Id, msg: String) -> (Error, SourceId) {
-    (
+    program.anchored(
         Error {
             note: None,
             span: span_of(program, anchor),
             msg,
         },
-        program.source_of(anchor).unwrap_or(SourceId(0)),
+        anchor,
     )
 }
 

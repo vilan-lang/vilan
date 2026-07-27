@@ -115,6 +115,73 @@ fn a_wrong_case_import_does_not_resolve_on_a_case_sensitive_filesystem() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// --- Exact-case ENTRY resolution (windows-support.md §12's residual) ---
+
+#[test]
+fn an_exact_case_entry_builds_with_no_diagnostics() {
+    // The entry file gets the same rule as a module: `vilan build Main.vl` on
+    // NTFS opens `main.vl` and succeeds, and the identical command fails on
+    // Linux. This is the happy path — command line, `[package] entry`, and an
+    // `[entry.<name>] path`, all spelled exactly — which must stay silent on
+    // every platform.
+    //
+    // As with the module arm, the MISMATCH cannot be exercised end to end on a
+    // case-sensitive filesystem (the wrong spelling never opens, so the failure
+    // is the ordinary read error); the windows-latest CI leg is that e2e, and
+    // the checker itself is pinned in `main.rs`'s `tests`.
+    let root = temp_root("entry-case");
+    write_package(
+        &root,
+        &[(
+            "main.vl",
+            "import std::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n",
+        )],
+    );
+
+    // 1. The path named on the command line.
+    let output = vilan(&root, &["run", "main.vl"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("hi"), "{text}");
+    assert!(
+        !text.contains("exact case"),
+        "an exact-case entry must not trip the check: {text}"
+    );
+
+    // 2. `[package] entry`, resolved against the package root.
+    std::fs::write(
+        root.join("vilan.toml"),
+        "[package]\nname = \"paths\"\nroot = \".\"\nentry = \"main.vl\"\n",
+    )
+    .unwrap();
+    let output = vilan(&root, &["build"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("exact case"), "{text}");
+
+    // 3. An `[entry.<name>] path` through a subdirectory — the shape whose
+    //    DIRECTORY component the checker also covers.
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    std::fs::write(
+        root.join("web/client.vl"),
+        "fun main() {\n\tlet ready = true;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vilan.toml"),
+        "[package]\nname = \"paths\"\nroot = \".\"\n\n\
+         [entry.app]\npath = \"main.vl\"\n\n\
+         [entry.client]\npath = \"web/client.vl\"\ntarget = \"browser\"\n",
+    )
+    .unwrap();
+    let output = vilan(&root, &["build"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("exact case"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- Paths that a lossy `String` round-trip would destroy ---
 
 /// A directory name that is valid on the filesystem but NOT valid UTF-8 — the

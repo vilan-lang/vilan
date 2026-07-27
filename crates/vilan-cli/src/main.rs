@@ -1067,6 +1067,31 @@ fn pkg_root_of(entry: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// Checks the ENTRY file's on-disk spelling, the way module resolution checks a
+/// module's (`windows-support.md` §5, ratified call (c); §12 recorded the entry
+/// as the gap that scoping left open). `vilan build Main.vl` on NTFS opens
+/// `main.vl` and builds; the same command on Linux does not — a program that
+/// builds on one machine and not another, which is what the check exists to
+/// stop, and nothing about it is specific to an `import`.
+///
+/// The split is the same one `case_exact_mismatch` takes for a module: the
+/// package root, and the components the build configuration joined onto it — so
+/// an `[entry.<name>] path = "web/client.vl"` has its DIRECTORY checked too.
+/// When the two do not nest (a bare `vilan build Main.vl` has `pkg_root = "."`,
+/// which `strip_prefix` cannot cancel) the entry's own parent is the root and
+/// its file name the single component. Directories ABOVE the package root are
+/// deliberately not checked: they are how this machine was invoked, not part of
+/// the program.
+fn entry_case_mismatch(entry: &Path, pkg_root: &Path) -> Option<(String, String)> {
+    if let Ok(relative) = entry.strip_prefix(pkg_root) {
+        if !relative.as_os_str().is_empty() {
+            return vilan_core::util::case_exact_mismatch(pkg_root, relative);
+        }
+    }
+    let name = entry.file_name()?;
+    vilan_core::util::case_exact_mismatch(&pkg_root_of(entry), Path::new(name))
+}
+
 /// Formats every `.vl` file under `paths` (a file, a directory walked
 /// recursively, or the working directory when empty). In `--check` mode it only
 /// reports files that would change; otherwise it rewrites them in place. The
@@ -2058,6 +2083,22 @@ fn compile_to_js(
             return Err(ExitCode::FAILURE);
         }
     };
+    // Exact case for the entry, checked here because this is the ONE seam every
+    // entry compile passes through (`build`, `run`, `check`, `test`, each watch
+    // round) — whether the path came from the command line, `[package] entry`,
+    // or an `[entry.<name>] path`. It has no source span (nothing in the program
+    // names it), so it reports like the read failure above rather than through
+    // the diagnostic channel.
+    if let Some((requested, on_disk)) = entry_case_mismatch(file, pkg_root) {
+        eprintln!(
+            "{} entry {} resolved to `{on_disk}` on disk, but it is named `{requested}` — \
+             vilan matches source files by exact case, so this builds only where the \
+             filesystem ignores case; rename one to match the other",
+            paint::error_prefix(),
+            file.display()
+        );
+        return Err(ExitCode::FAILURE);
+    }
     let filename = file.to_string_lossy().into_owned();
     let std = match std_dir(file) {
         Ok(directory) => vilan_core::manifest::resolve_std(&directory),
@@ -2250,8 +2291,18 @@ fn compile_to_js(
                         error.msg.clone(),
                         error.note.as_ref().map(|note| note.msg.clone()),
                     ));
-                    // A codegen failure carries no source of its own (it is a
-                    // compiler bug, not a located user error): the entry.
+                    // The entry, and not as a fallback (E16's leftover, resolved
+                    // by looking): `transform` has exactly ONE failure —
+                    // `transform_entry_ast`'s missing `main`
+                    // (`transformer.rs`) — and it is STRUCTURAL. Its subject is
+                    // the ABSENCE of a definition, so there is no span to take a
+                    // source from (it carries `0..0` for that reason), and the
+                    // entity whose absence it reports is the entry's `main`. The
+                    // span-source rule the post-analyze passes follow needs a
+                    // span that indexes a file; this one indexes nothing, and
+                    // the entry is where the missing definition was looked for.
+                    // A future transformer error WITH a real span must attribute
+                    // through `program.source_of(..)` like everything else.
                     analyzer_errors.push((SourceId(0), error.span.into_range(), error.msg));
                 }
             }
@@ -2556,6 +2607,105 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- The entry file's exact case (windows-support.md §5 / §12) ----------
+    //
+    // Pinned at the checker, not end to end: on a case-SENSITIVE filesystem a
+    // wrong-case entry never opens, so `compile_to_js` fails at the read long
+    // before the check runs (the same reason the module arm is CI's to prove —
+    // see `module_paths.rs`). The windows-latest CI leg is the mismatch-arm
+    // e2e; the happy path is pinned there on every platform.
+
+    /// A fresh, empty scratch directory for one entry-case test.
+    fn entry_scratch(tag: &str) -> PathBuf {
+        let directory = env::temp_dir().join(format!(
+            "vilan-entry-case-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create the scratch directory");
+        directory
+    }
+
+    #[test]
+    fn an_exact_case_entry_is_no_mismatch() {
+        let root = entry_scratch("exact");
+        fs::write(root.join("main.vl"), "").expect("write main.vl");
+        assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
+        // The false-positive guard, and the one arm a case-SENSITIVE
+        // filesystem can hold: with both spellings on disk, the requested one
+        // matches exactly and the near-miss sibling is not reported.
+        fs::write(root.join("Main.vl"), "").expect("write Main.vl");
+        assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
+        assert_eq!(entry_case_mismatch(&root.join("Main.vl"), &root), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_wrong_case_entry_names_both_spellings() {
+        // `[package] entry = "Main.vl"` against a `main.vl` on disk — what NTFS
+        // resolves happily and Linux refuses.
+        let root = entry_scratch("wrong");
+        fs::write(root.join("main.vl"), "").expect("write main.vl");
+        assert_eq!(
+            entry_case_mismatch(&root.join("Main.vl"), &root),
+            Some(("Main.vl".to_string(), "main.vl".to_string()))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_entry_path_has_its_directory_checked_too() {
+        // `[entry.<name>] path = "Web/client.vl"`: the directory component is
+        // part of the manifest's spelling, so it counts exactly as a module
+        // directory's does.
+        let root = entry_scratch("nested");
+        fs::create_dir_all(root.join("web")).expect("create web/");
+        fs::write(root.join("web").join("client.vl"), "").expect("write client.vl");
+        assert_eq!(
+            entry_case_mismatch(&root.join("Web").join("client.vl"), &root),
+            Some(("Web".to_string(), "web".to_string()))
+        );
+        // …and the file under a correctly-spelled directory.
+        assert_eq!(
+            entry_case_mismatch(&root.join("web").join("Client.vl"), &root),
+            Some(("Client.vl".to_string(), "client.vl".to_string()))
+        );
+        // The exact spelling of both is silent.
+        assert_eq!(
+            entry_case_mismatch(&root.join("web").join("client.vl"), &root),
+            None
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_filename_entry_is_checked_against_the_working_directory() {
+        // `vilan build Main.vl` — `pkg_root_of` gives `.`, which `strip_prefix`
+        // cannot cancel, so the fallback arm is what has to answer. Exercised by
+        // building the same shape with an absolute root that the entry does NOT
+        // nest under, which takes the identical branch without moving the
+        // process's working directory (tests share one).
+        let root = entry_scratch("bare");
+        fs::write(root.join("main.vl"), "").expect("write main.vl");
+        let elsewhere = root.join("not-the-parent");
+        assert_eq!(
+            entry_case_mismatch(&root.join("Main.vl"), &elsewhere),
+            Some(("Main.vl".to_string(), "main.vl".to_string()))
+        );
+        assert_eq!(entry_case_mismatch(&root.join("main.vl"), &elsewhere), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_absent_entry_is_not_a_case_mismatch() {
+        // A missing entry is the read's failure to report, not this check's —
+        // and `compile_to_js` never reaches the check in that case anyway.
+        let root = entry_scratch("absent");
+        assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     // --- A15's follow-up: the manifest-designated default `run` entry -------
 

@@ -452,3 +452,45 @@ fn a_macro_registration_diagnostic_renders_in_the_file_that_defines_the_macro() 
         "and renders in the file that defines the macro: {stderr}"
     );
 }
+
+#[test]
+fn the_codegen_failure_renders_in_the_entry_that_lacks_main() {
+    // `transform`'s ONE failure — a program with no `main` — and E16's recorded
+    // leftover. It is structural: its subject is the ABSENCE of a definition, so
+    // it carries no span into any file (`0..0`), and attributing it to the entry
+    // is not a fallback — the entry's global scope is where `main` was looked
+    // for. The module here is the discriminator: a diagnostic that took the last
+    // loaded source, or the module the program spends its text on, would name
+    // `alpha.vl`.
+    let dir = temp_files(
+        "codegen_no_main",
+        &[
+            ("vilan.toml", MANIFEST),
+            (
+                "src/main.vl",
+                "import pkg::alpha::value;\n\nfun helper(): str {\n\tvalue()\n}\n",
+            ),
+            ("src/alpha.vl", "fun value(): str {\n\t\"ok\"\n}\n"),
+        ],
+    );
+    let (output, stderr) = build_stderr(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the build fails, without panicking: {stderr}"
+    );
+    assert!(
+        stderr.contains("Cannot execute program without a main function"),
+        "the codegen failure is reported: {stderr}"
+    );
+    assert!(
+        renders_in(&stderr, "main.vl", "import pkg::alpha::value;"),
+        "and renders in the ENTRY, quoting its first line: {stderr}"
+    );
+    assert!(
+        !stderr.contains("alpha.vl"),
+        "never in the module it happened to load: {stderr}"
+    );
+}

@@ -254,7 +254,7 @@ fn cycle_error(
     let noted = chain.get(1).copied().unwrap_or(chain[0]);
     let anchor_span = span_of(program, anchor);
     let noted_span = span_of(program, noted);
-    let already_shown = program.source_of(noted) == program.source_of(anchor)
+    let already_shown = program.note_source_of(noted) == program.note_source_of(anchor)
         && noted_span.start <= anchor_span.start
         && anchor_span.end <= noted_span.end;
     let note = (!already_shown).then(|| Note {
@@ -263,16 +263,16 @@ fn cycle_error(
         // The contract on `Note::source`: name the file only when it differs
         // from the primary span's.
         source: program
-            .source_of(noted)
-            .filter(|source| Some(*source) != program.source_of(anchor)),
+            .note_source_of(noted)
+            .filter(|source| Some(*source) != program.note_source_of(anchor)),
     });
-    (
+    program.anchored(
         Error {
             span: anchor_span,
             msg: message,
             note,
         },
-        program.source_of(anchor).unwrap_or(SourceId(0)),
+        anchor,
     )
 }
 

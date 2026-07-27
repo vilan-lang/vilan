@@ -178,7 +178,6 @@ pub fn infer(program: &mut Program) {
             if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
                 continue;
             }
-            let (span, source) = anchor_of(program, *parameter);
             // A `sync`-marked parameter is a deliberate contract
             // (async-polymorphism.md A.2) — refused, with the contract's
             // steer. A PLAIN value-returning parameter ADAPTS (the instance
@@ -186,16 +185,14 @@ pub fn infer(program: &mut Program) {
             if !program.sync_values.contains(parameter) {
                 continue;
             }
-            divergences.push((
-                crate::error::Error {
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
-                        parameter_record.name
-                    ),
-                },
-                source,
+            divergences.push(anchored(
+                program,
+                *parameter,
+                format!(
+                    "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
+                    parameter_record.name
+                ),
+                None,
             ));
         }
     }
@@ -235,17 +232,14 @@ pub fn infer(program: &mut Program) {
             if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
                 continue;
             }
-            let (span, source) = anchor_of(program, *argument);
-            divergences.push((
-                crate::error::Error {
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`{}` is a host (`external`) function — it cannot await a Vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
-                        external.name
-                    ),
-                },
-                source,
+            divergences.push(anchored(
+                program,
+                *argument,
+                format!(
+                    "`{}` is a host (`external`) function — it cannot await a Vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
+                    external.name
+                ),
+                None,
             ));
         }
     }
@@ -301,17 +295,14 @@ pub fn infer(program: &mut Program) {
         if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
             continue;
         }
-        let (span, source) = anchor_of(program, value_id);
-        field_divergences.push((
-            crate::error::Error {
-                note: None,
-                span,
-                msg: format!(
-                    "field `{}` of `{}` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
-                    field.name, struct_.name
-                ),
-            },
-            source,
+        field_divergences.push(anchored(
+            program,
+            value_id,
+            format!(
+                "field `{}` of `{}` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                field.name, struct_.name
+            ),
+            None,
         ));
     }
     divergences.extend(field_divergences);
@@ -343,17 +334,14 @@ pub fn infer(program: &mut Program) {
         if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *value_id) {
             continue;
         }
-        let (span, source) = anchor_of(program, *value_id);
-        divergences.push((
-            crate::error::Error {
-                note: None,
-                span,
-                msg: format!(
-                    "`{}` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
-                    function.name
-                ),
-            },
-            source,
+        divergences.push(anchored(
+            program,
+            *value_id,
+            format!(
+                "`{}` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                function.name
+            ),
+            None,
         ));
     }
 
@@ -453,7 +441,6 @@ pub fn infer(program: &mut Program) {
                 .get(&binding)
                 .map(|variable| variable.name)
                 .unwrap_or("_");
-            let (span, source) = anchor_of(program, call.call_id);
             // A nameless target is an awaiting closure applied directly (an
             // adopted value, or a lowered `run` body) — phrase it as what it
             // is rather than backticking a description.
@@ -461,17 +448,15 @@ pub fn infer(program: &mut Program) {
                 Some(name) => format!("calls `{name}`, which is async"),
                 None => "runs a closure that awaits".to_string(),
             };
-            initializer_awaits.push((
-                crate::error::Error {
-                    note: None,
-                    span,
-                    msg: format!(
-                        "the initializer of `{binding_name}` {culprit} — a module-level \
-                         binding cannot await (module initialization is synchronous); wrap \
-                         the work in a function and call it from `main`"
-                    ),
-                },
-                source,
+            initializer_awaits.push(anchored(
+                program,
+                call.call_id,
+                format!(
+                    "the initializer of `{binding_name}` {culprit} — a module-level \
+                     binding cannot await (module initialization is synchronous); wrap \
+                     the work in a function and call it from `main`"
+                ),
+                None,
             ));
         }
     }
@@ -1108,14 +1093,25 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     )
 }
 
-/// The span of an entity WITH the file that span indexes into (backlog E16).
-/// The two always come from the SAME entity, so a diagnostic this
-/// whole-program pass raises renders in — and is published to — the file it is
-/// about, not the entry it was reached from.
-fn anchor_of(program: &Program, id: Id) -> (crate::span::Span, SourceId) {
-    (
-        span_of(program, id),
-        program.source_of(id).unwrap_or(SourceId(0)),
+/// A diagnostic anchored at an entity: reported at that entity's span, in the
+/// file that span indexes into (backlog E16). Span and file always come from
+/// the SAME entity, so a diagnostic this whole-program pass raises renders in —
+/// and is published to — the file it is about, not the entry it was reached
+/// from; and generated code re-anchors at the attribute that generated it
+/// (`Program::anchored`), which is the only location a reader can act on.
+fn anchored(
+    program: &Program,
+    id: Id,
+    msg: String,
+    note: Option<crate::error::Note>,
+) -> (crate::error::Error, SourceId) {
+    program.anchored(
+        crate::error::Error {
+            note,
+            span: span_of(program, id),
+            msg,
+        },
+        id,
     )
 }
 
@@ -1182,18 +1178,15 @@ fn sync_violations_at(
         let note = (primary != call_id).then(|| crate::error::Note {
             span: span_of(program, call_id),
             msg: format!("forwarded into the `sync` parameter `{parameter_name}` here"),
-            source: program.source_of(call_id),
+            source: program.note_source_of(call_id),
         });
-        let (span, source) = anchor_of(program, primary);
-        diagnostics.push((
-            crate::error::Error {
-                note,
-                span,
-                msg: format!(
-                    "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`) — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
-                ),
-            },
-            source,
+        diagnostics.push(anchored(
+            program,
+            primary,
+            format!(
+                "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`) — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
+            ),
+            note,
         ));
     }
 }
@@ -1250,19 +1243,16 @@ fn extern_violations_at(
         let note = (primary != call_id).then(|| crate::error::Note {
             span: span_of(program, call_id),
             msg: format!("forwarded to the host function `{}` here", external.name),
-            source: program.source_of(call_id),
+            source: program.note_source_of(call_id),
         });
-        let (span, source) = anchor_of(program, primary);
-        diagnostics.push((
-            crate::error::Error {
-                note,
-                span,
-                msg: format!(
-                    "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure — only synchronous closures can cross",
-                    external.name
-                ),
-            },
-            source,
+        diagnostics.push(anchored(
+            program,
+            primary,
+            format!(
+                "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure — only synchronous closures can cross",
+                external.name
+            ),
+            note,
         ));
     }
 }
@@ -1313,14 +1303,11 @@ fn dispatch_refusals_at(
         if !reported.insert((call_id, Id(position as u32))) {
             continue;
         }
-        let (span, source) = anchor_of(program, call_id);
-        diagnostics.push((
-            crate::error::Error {
-                note: None,
-                span,
-                msg: "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation) — bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
-            },
-            source,
+        diagnostics.push(anchored(
+            program,
+            call_id,
+            "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation) — bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
+            None,
         ));
     }
 }

@@ -122,7 +122,7 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> 
                              `@process`)"
                         ),
                     },
-                    program.source_of(*id).unwrap_or(SourceId(0)),
+                    program.diagnostic_source_of(*id),
                 ));
                 continue;
             };
@@ -330,7 +330,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
         let span = self.program.span_map.get(&site).map(|span| **span)?;
         Some(Arrival {
             span,
-            source: self.program.source_of(site).unwrap_or(SourceId(0)),
+            source: self.program.diagnostic_source_of(site),
             user_code: is_user_code(self.program, site),
         })
     }
@@ -625,7 +625,7 @@ fn violation(
         })
         .or_else(|| {
             let span = **program.span_map.get(&node)?;
-            Some((span, program.source_of(node).unwrap_or(SourceId(0))))
+            Some((span, program.diagnostic_source_of(node)))
         })
         .unwrap_or((Span { start: 0, end: 0 }, SourceId(0)));
     let from = match origin {

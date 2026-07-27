@@ -331,9 +331,10 @@ impl<'p, 'src> State<'p, 'src> {
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic
-    /// renders in (backlog E16); a synthetic entity falls back to the entry.
+    /// renders in (backlog E16); a synthetic entity falls back to the entry, and
+    /// generated code to the file that wrote the attribute.
     fn source_of(&self, id: Id) -> SourceId {
-        self.program.source_of(id).unwrap_or(SourceId(0))
+        self.program.diagnostic_source_of(id)
     }
 
     /// Whether an entity sits inside any `const` expression's span (same

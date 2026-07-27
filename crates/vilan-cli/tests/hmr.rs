@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -377,8 +379,7 @@ fn the_dev_channel_drives_the_watch_round() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
@@ -479,8 +480,7 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
@@ -582,8 +582,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
         server_after
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
 
     // The cache-hit A/B (review finding, 2026-07-21): after a round that went
     // THROUGH the caches (round 2 skipped the server; the client compiled via
@@ -807,8 +806,7 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
@@ -870,8 +868,7 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
@@ -937,8 +934,7 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }

@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -412,8 +414,7 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
         );
     }));
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
     if outcome.is_ok() {
         let _ = std::fs::remove_dir_all(&dir);
     }

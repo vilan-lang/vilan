@@ -139,6 +139,65 @@ pub fn canonical_path(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// Verifies that every component of `relative` names an on-disk entry under
+/// `root` **byte-for-byte**, and reports the first that does not as
+/// `(requested, on-disk)`.
+///
+/// A case-insensitive filesystem (NTFS, and APFS by default) answers
+/// `Path::exists` for `foo.vl` when the file on disk is `Foo.vl`, so `import
+/// foo` resolves there and the same program fails on Linux — a program that
+/// builds on one machine and not another, which is exactly what the
+/// platform-independence invariant forbids (`windows-support.md` §5, ratified
+/// call (c)). Enforcing exact case is the general fix; this is the check.
+///
+/// It lives here rather than beside the module loader because nothing about it
+/// is specific to an `import`: the CLI runs the same check on the ENTRY file's
+/// spelling (`main.rs::entry_case_mismatch` — `windows-support.md` §12's
+/// residual), where the "requested" name comes from the command line or a
+/// manifest instead of an import statement.
+///
+/// `None` when the names agree, or when a directory cannot be read — an
+/// unreadable directory is a different failure, not this check's to report.
+///
+/// The `read_dir` is deliberately **not cached, and must not be**: a memoized
+/// directory listing goes stale the moment a file is renamed, and a long-lived
+/// process (`run --watch`, the language server) would then invent a case
+/// mismatch for a file that is now spelled correctly — inventing a diagnostic
+/// is far worse than the cost. Measured on `examples/walkthrough`: 179 calls
+/// per build, each one `read_dir` of a ~50-entry directory, median build 1986 ms
+/// with the check against 1980 ms without — inside the run-to-run noise.
+pub fn case_exact_mismatch(root: &Path, relative: &Path) -> Option<(String, String)> {
+    let mut directory = root.to_path_buf();
+    for component in relative.components() {
+        let requested = component.as_os_str();
+        let entries = std::fs::read_dir(&directory).ok()?;
+        let mut on_disk: Option<std::ffi::OsString> = None;
+        let mut exact = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == requested {
+                exact = true;
+                break;
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&requested.to_string_lossy())
+            {
+                on_disk = Some(name);
+            }
+        }
+        if !exact {
+            let on_disk = on_disk?;
+            return Some((
+                requested.to_string_lossy().into_owned(),
+                on_disk.to_string_lossy().into_owned(),
+            ));
+        }
+        directory.push(requested);
+    }
+    None
+}
+
 thread_local! {
     static RECURSION_DEPTH: Cell<usize> = const { Cell::new(0) };
 }

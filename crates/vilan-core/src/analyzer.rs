@@ -7972,7 +7972,7 @@ impl<'src> Analyzer<'src> {
         expansion_scope_id: Id,
         module_scope_id: Id,
     ) {
-        let mut move_name = |analyzer: &mut Self, name: &'src str| {
+        let move_name = |analyzer: &mut Self, name: &'src str| {
             let Some(id) = analyzer
                 .scopes
                 .get(&expansion_scope_id)
@@ -18880,22 +18880,21 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Failed;
                 }
             };
-        let struct_ = match self.structs.get(&struct_id) {
-            Some(struct_) => struct_,
-            None => {
-                let span = self
-                    .span_map
-                    .get(&constraint.initializer_id)
-                    .map(|span| **span)
-                    .unwrap_or(constraint.fields_span);
-                self.diagnostics.push(Error {
-                    note: None,
-                    span,
-                    msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
-                });
-                return Resolution::Failed;
-            }
-        };
+        // Existence check only — the struct itself is re-fetched below, after
+        // `record_reference`'s `&mut self` borrow.
+        if !self.structs.contains_key(&struct_id) {
+            let span = self
+                .span_map
+                .get(&constraint.initializer_id)
+                .map(|span| **span)
+                .unwrap_or(constraint.fields_span);
+            self.diagnostics.push(Error {
+                note: None,
+                span,
+                msg: format!("cannot initialize a non-struct: {}", constraint.struct_name),
+            });
+            return Resolution::Failed;
+        }
         // Record the literal's NAME as a reference (the literal starts with
         // it, so the name span is the initializer's head) — semantic tokens
         // and go-to-definition on `Point { .. }`'s name ride this.
@@ -21618,6 +21617,13 @@ pub struct Program<'src> {
     // Computed once here because the coloring walk asks per reachable node.
     pub canonical_sources: Vec<PathBuf>,
     pub source_ranges: Vec<SourceRange>,
+    /// Where each run of GENERATED entities came from: the entity-id range, the
+    /// span of the attribute that generated it, and the file that attribute is
+    /// written in. `source_ranges` files those entities under [`DERIVED_SOURCE`]
+    /// — a sentinel with no path — so this is the only way back to a real file,
+    /// and every whole-program pass reaches it through
+    /// [`Program::diagnostic_source_of`].
+    pub derived_origins: Vec<(std::ops::Range<u32>, Span, SourceId)>,
     // Library layer roots with their platform patterns (plus base roots with
     // empty patterns, marking library territory) — the seeds and the
     // user-code test for platform coloring (`platform_color`). Roots are
@@ -21780,6 +21786,73 @@ impl<'src> Program<'src> {
             .iter()
             .find(|range| id.0 >= range.start && id.0 < range.end)
             .map(|range| range.source)
+    }
+
+    /// The attribute a GENERATED entity was expanded from: its span, in the
+    /// file that WROTE it. `None` for ordinary code.
+    fn derived_origin(&self, id: Id) -> Option<(Span, SourceId)> {
+        if self.source_of(id) != Some(DERIVED_SOURCE) {
+            return None;
+        }
+        self.derived_origins
+            .iter()
+            .find(|(range, _, _)| range.contains(&id.0))
+            .map(|(_, span, source)| (*span, *source))
+    }
+
+    /// Anchors a diagnostic that a whole-program pass raises ABOUT entity
+    /// `anchor` — the pairing every post-`analyze()` pass must produce, because
+    /// those passes have no file walk to inherit an attribution mark from
+    /// (backlog E16).
+    ///
+    /// Ordinary code: the entity's own file (a synthetic entity, belonging to no
+    /// walk, falls back to the entry).
+    ///
+    /// GENERATED code: `source_of` answers [`DERIVED_SOURCE`], a sentinel with
+    /// no path — the diagnostic would render as `<generated>` against empty
+    /// text, reaching the user with no location at all and the editor with
+    /// nowhere to publish it. Worse, its span indexes generated text that no
+    /// file holds, so merely NAMING the deriving file would draw the label over
+    /// whatever that file happens to have at those offsets — the exact harm E16
+    /// exists to stop. So the whole diagnostic is re-anchored at the attribute
+    /// that generated the code: the origin's span, in the origin's file, with
+    /// the provenance said in the message. That is deliberately identical to the
+    /// analyzer's in-walk `redirect_derived_range`, so generated code reports the
+    /// same way whichever pass noticed the problem.
+    pub fn anchored(&self, mut error: Error, anchor: Id) -> (Error, SourceId) {
+        match self.derived_origin(anchor) {
+            Some((origin_span, origin_source)) => {
+                error.msg = format!("in code generated by this attribute: {}", error.msg);
+                error.span = origin_span;
+                // A note points into generated text too, and its own file is
+                // then meaningless; the attribute says everything there is.
+                error.note = None;
+                (error, origin_source)
+            }
+            None => {
+                let source = self.source_of(anchor).unwrap_or(SourceId(0));
+                (error, source)
+            }
+        }
+    }
+
+    /// The file a diagnostic about `anchor` belongs to — [`Program::anchored`]'s
+    /// source half, for a caller that only needs to place an already-built
+    /// diagnostic (and whose span is not generated).
+    pub fn diagnostic_source_of(&self, anchor: Id) -> SourceId {
+        self.derived_origin(anchor)
+            .map(|(_, source)| source)
+            .unwrap_or_else(|| self.source_of(anchor).unwrap_or(SourceId(0)))
+    }
+
+    /// [`Program::diagnostic_source_of`] in its `Option` form, for a secondary
+    /// NOTE's source — where `None` keeps its own meaning ("the diagnostic's own
+    /// file") instead of collapsing to the entry.
+    pub fn note_source_of(&self, anchor: Id) -> Option<SourceId> {
+        match self.source_of(anchor)? {
+            DERIVED_SOURCE => self.derived_origin(anchor).map(|(_, source)| source),
+            source => Some(source),
+        }
     }
 
     /// The filesystem path of a source file.
@@ -22915,59 +22988,6 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
     }
 }
 
-/// Verifies that every component of `relative` names an on-disk entry under
-/// `root` **byte-for-byte**, and reports the first that does not as
-/// `(requested, on-disk)`.
-///
-/// A case-insensitive filesystem (NTFS, and APFS by default) answers
-/// `Path::exists` for `foo.vl` when the file on disk is `Foo.vl`, so `import
-/// foo` resolves there and the same program fails on Linux — a program that
-/// builds on one machine and not another, which is exactly what the
-/// platform-independence invariant forbids (`windows-support.md` §5, ratified
-/// call (c)). Enforcing exact case is the general fix; this is the check.
-///
-/// `None` when the names agree, or when a directory cannot be read — an
-/// unreadable directory is a different failure, not this check's to report.
-///
-/// The `read_dir` is deliberately **not cached, and must not be**: a memoized
-/// directory listing goes stale the moment a file is renamed, and a long-lived
-/// process (`run --watch`, the language server) would then invent a case
-/// mismatch for a file that is now spelled correctly — inventing a diagnostic
-/// is far worse than the cost. Measured on `examples/walkthrough`: 179 calls
-/// per build, each one `read_dir` of a ~50-entry directory, median build 1986 ms
-/// with the check against 1980 ms without — inside the run-to-run noise.
-fn case_exact_mismatch(root: &Path, relative: &Path) -> Option<(String, String)> {
-    let mut directory = root.to_path_buf();
-    for component in relative.components() {
-        let requested = component.as_os_str();
-        let entries = std::fs::read_dir(&directory).ok()?;
-        let mut on_disk: Option<std::ffi::OsString> = None;
-        let mut exact = false;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name == requested {
-                exact = true;
-                break;
-            }
-            if name
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&requested.to_string_lossy())
-            {
-                on_disk = Some(name);
-            }
-        }
-        if !exact {
-            let on_disk = on_disk?;
-            return Some((
-                requested.to_string_lossy().into_owned(),
-                on_disk.to_string_lossy().into_owned(),
-            ));
-        }
-        directory.push(requested);
-    }
-    None
-}
-
 /// Collects package modules referenced via `<root>::<module>::..` in a node list's
 /// top-level `import`/`use`/`export import` statements — each with the **span** of
 /// its module segment, so the loader can pull them in transitively and report a
@@ -23744,7 +23764,7 @@ pub fn analyze<'src>(
             // reaches its module through this loop, and it runs once per module
             // actually LOADED, never on a resolution probe.
             if let Some((requested, on_disk)) =
-                case_exact_mismatch(&resolution.root, &resolution.relative)
+                crate::util::case_exact_mismatch(&resolution.root, &resolution.relative)
             {
                 analyzer.diagnostics.push(Error {
                     note: None,
@@ -25133,6 +25153,7 @@ pub fn analyze<'src>(
         sources,
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
+        derived_origins: std::mem::take(&mut analyzer.derived_origins),
         layer_platforms,
         diagnostic_sources,
         member_name_spans: analyzer.member_name_spans,
@@ -25174,31 +25195,28 @@ pub fn analyze<'src>(
 /// user-defined `trait Drop` never reaches here.
 pub fn check_async_drops(program: &mut Program) {
     // The span is the drop method's, so the file is the method's too — this
-    // runs over the whole program, not inside a file walk (backlog E16).
-    let violations: Vec<(Span, SourceId, String)> = program
+    // runs over the whole program, not inside a file walk (backlog E16), and a
+    // `drop` a macro generated re-anchors at its attribute.
+    let violations: Vec<(Error, SourceId)> = program
         .drop_method_checks
         .iter()
         .filter(|(function_id, _, _)| program.async_functions.contains(function_id))
         .map(|(function_id, span, subject)| {
-            (
-                *span,
-                program.source_of(*function_id).unwrap_or(SourceId(0)),
-                subject.clone(),
+            program.anchored(
+                Error {
+                    note: None,
+                    span: *span,
+                    msg: format!(
+                        "`drop` for `{subject}` is async — teardown must be synchronous; cancel \
+                         owned tasks via an `OwnedNursery`. Awaited teardown is a future design"
+                    ),
+                },
+                *function_id,
             )
         })
         .collect();
-    for (span, source, subject) in violations {
-        program.push_diagnostic(
-            Error {
-                note: None,
-                span,
-                msg: format!(
-                    "`drop` for `{subject}` is async — teardown must be synchronous; cancel \
-                     owned tasks via an `OwnedNursery`. Awaited teardown is a future design"
-                ),
-            },
-            source,
-        );
+    for (error, source) in violations {
+        program.push_diagnostic(error, source);
     }
 }
 
@@ -25210,32 +25228,28 @@ pub fn check_async_drops(program: &mut Program) {
 /// gave a hidden context parameter). Keyed on the std `Drop` entity via
 /// `drop_method_checks`, so a user's own `trait Drop` never reaches here.
 pub fn check_context_drops(program: &mut Program) {
-    let violations: Vec<(Span, SourceId, String)> = program
+    let violations: Vec<(Error, SourceId)> = program
         .drop_method_checks
         .iter()
         .filter(|(function_id, _, _)| program.context_dependent_functions.contains(function_id))
         .map(|(function_id, span, subject)| {
-            (
-                *span,
-                program.source_of(*function_id).unwrap_or(SourceId(0)),
-                subject.clone(),
+            program.anchored(
+                Error {
+                    note: None,
+                    span: *span,
+                    msg: format!(
+                        "`drop` for `{subject}` requires an ambient context — teardown must be \
+                         context-free; a `drop` body cannot require an ambient context (its call \
+                         sites are scope exits, which do not thread contexts). Hand turn-joining \
+                         work to an owner inside the turn"
+                    ),
+                },
+                *function_id,
             )
         })
         .collect();
-    for (span, source, subject) in violations {
-        program.push_diagnostic(
-            Error {
-                note: None,
-                span,
-                msg: format!(
-                    "`drop` for `{subject}` requires an ambient context — teardown must be \
-                     context-free; a `drop` body cannot require an ambient context (its call \
-                     sites are scope exits, which do not thread contexts). Hand turn-joining \
-                     work to an owner inside the turn"
-                ),
-            },
-            source,
-        );
+    for (error, source) in violations {
+        program.push_diagnostic(error, source);
     }
 }
 
@@ -25244,7 +25258,8 @@ mod path_tests {
     //! Path and filesystem semantics for module loading (`windows-support.md`
     //! §5): exact-case resolution and the open-document overlay's key.
 
-    use super::{case_exact_mismatch, document_overlay_get, set_document_overlay};
+    use super::{document_overlay_get, set_document_overlay};
+    use crate::util::case_exact_mismatch;
     use std::path::{Path, PathBuf};
 
     /// A fresh, empty scratch directory for one test.

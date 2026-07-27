@@ -9,6 +9,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -200,8 +202,7 @@ fn watch_round_refreshes_the_sidecar() {
     std::fs::write(&entry, quick_exit_program("v2")).unwrap();
     let round_two = wait_for_contents(&css, ".v2{color:red}\n", deadline);
 
-    let _ = watcher.kill();
-    let _ = watcher.wait();
+    support::kill_watcher(&mut watcher);
 
     round_one.expect("round 1 should have written the v1 sidecar");
     round_two
