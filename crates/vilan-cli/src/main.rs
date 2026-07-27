@@ -2688,12 +2688,29 @@ mod tests {
         let root = entry_scratch("exact");
         fs::write(root.join("main.vl"), "").expect("write main.vl");
         assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
-        // The false-positive guard, and the one arm a case-SENSITIVE
-        // filesystem can hold: with both spellings on disk, the requested one
-        // matches exactly and the near-miss sibling is not reported.
+        // The false-positive guard, and an arm only a case-SENSITIVE
+        // filesystem can hold: with both spellings genuinely on disk, the
+        // requested one matches exactly and the near-miss sibling is not
+        // reported. On a case-insensitive filesystem the second write lands in
+        // the FIRST file (one directory entry — the windows CI leg proved it:
+        // the checker then correctly reports the requested spelling against
+        // the surviving entry), so the arm is gated on a runtime probe of what
+        // this filesystem actually did, not on a platform guess.
         fs::write(root.join("Main.vl"), "").expect("write Main.vl");
-        assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
-        assert_eq!(entry_case_mismatch(&root.join("Main.vl"), &root), None);
+        let distinct = fs::read_dir(&root)
+            .expect("read the scratch dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("main.vl")
+            })
+            .count();
+        if distinct == 2 {
+            assert_eq!(entry_case_mismatch(&root.join("main.vl"), &root), None);
+            assert_eq!(entry_case_mismatch(&root.join("Main.vl"), &root), None);
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

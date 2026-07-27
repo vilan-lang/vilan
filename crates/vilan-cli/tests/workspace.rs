@@ -688,11 +688,20 @@ fn a_build_hook_runs_before_the_build_that_consumes_it() {
     // entry imports. If hooks ran after the build (or not at all), the compile
     // would fail on the missing module.
     let dir = temp_project("hook_before");
+    // The hook runs through the PLATFORM shell (the A9 design), so the fixture's
+    // command is per-platform: `printf` does not exist in cmd. cmd's `echo`
+    // emits a trailing space + CRLF — both trivia to the compiler, so the
+    // generated module still parses (the windows CI leg caught the original
+    // printf-only fixture).
+    let hook = if cfg!(windows) {
+        "run = \"echo fun generated(): i32 { 41 }> src/generated.vl\"\n"
+    } else {
+        "run = \"printf 'fun generated(): i32 { 41 }\\n' > src/generated.vl\"\n"
+    };
     write(
         &dir,
         "vilan.toml",
-        "[package]\nname = \"app\"\n\n[build]\n\
-         run = \"printf 'fun generated(): i32 { 41 }\\n' > src/generated.vl\"\n",
+        &format!("[package]\nname = \"app\"\n\n[build]\n{hook}"),
     );
     write(
         &dir,
@@ -752,7 +761,11 @@ fn hooks_run_in_declaration_order_from_the_manifests_directory() {
     let output = vilan(&["build", dir.to_str().unwrap()]);
     assert!(output.status.success(), "{}", combined(&output));
     let order = std::fs::read_to_string(dir.join("order.txt")).expect("the hooks wrote it");
-    assert_eq!(order, "one\ntwo\n");
+    // Normalized per line: cmd's `echo` writes a trailing space + CRLF where
+    // sh writes a bare LF — the ORDER is the assertion, not the shell's
+    // whitespace dialect (the windows CI leg caught the exact-bytes version).
+    let lines: Vec<&str> = order.lines().map(str::trim_end).collect();
+    assert_eq!(lines, ["one", "two"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
