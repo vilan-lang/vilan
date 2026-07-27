@@ -1379,19 +1379,27 @@ fn resolve_project(path: Option<PathBuf>) -> Result<Project, String> {
 /// Reads, parses, validates, and reports warnings for the `vilan.toml` in
 /// `directory`.
 fn read_manifest(directory: &Path) -> Result<Manifest, String> {
-    let manifest_path = directory.join("vilan.toml");
-    let contents = fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-    let (manifest, warnings) = Manifest::parse(&contents)
-        .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+    let (manifest, warnings) = read_manifest_quietly(directory)?;
     for warning in &warnings {
         eprintln!(
             "{} {} in {}",
             paint::warning_prefix(),
             warning,
-            manifest_path.display()
+            directory.join("vilan.toml").display()
         );
     }
+    Ok(manifest)
+}
+
+/// The same read without the warning report, for a caller that runs **per
+/// file** — `vilan test` reads its package's manifest once per test, and one
+/// unknown key should not print once per test.
+fn read_manifest_quietly(directory: &Path) -> Result<(Manifest, Vec<String>), String> {
+    let manifest_path = directory.join("vilan.toml");
+    let contents = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    let (manifest, warnings) = Manifest::parse(&contents)
+        .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
     let errors = manifest.validate();
     if !errors.is_empty() {
         return Err(format!(
@@ -1400,7 +1408,7 @@ fn read_manifest(directory: &Path) -> Result<Manifest, String> {
             errors.join("\n  - ")
         ));
     }
-    Ok(manifest)
+    Ok((manifest, warnings))
 }
 
 /// Builds a [`Unit`] from a package manifest in `directory`.
@@ -1936,16 +1944,63 @@ fn test(path: Option<PathBuf>) -> ExitCode {
     }
 }
 
+/// How one `*_test.vl` compiles: the package source root its `pkg::` imports
+/// resolve against, the dependency workspace, and the package's build options.
+///
+/// A test file is a file **of its package** (the Go-style, alongside-the-source
+/// model), so it compiles the way that package compiles: the same manifest
+/// discovery from the test's own location, the same `root`, the same
+/// dependencies (distribution.md §7's S4 residual — until now `vilan test`
+/// compiled against `Workspace::default()`, so a test could import neither a
+/// `pkg::` sibling through a declared `root` nor any dependency at all).
+///
+/// Two boundaries, stated: git dependencies resolve under the **fetching**
+/// policy, because running the tests is a build the user asked for — the same
+/// policy `build`, `run`, and `check` use. And a test compiles for **`node`**
+/// whatever the package's `target` says, because `vilan test` executes the
+/// emitted JS with `node`; a browser package's tests are node programs that may
+/// import its neutral modules.
+///
+/// A file with no manifest above it keeps its old context exactly: its own
+/// directory as the package root, no dependencies, default options. So does a
+/// test sitting at a `[project]` root, which has no sources of its own.
+fn test_context(file: &Path) -> Result<(PathBuf, Workspace, BuildOptions), String> {
+    let bare = || {
+        (
+            pkg_root_of(file),
+            Workspace::default(),
+            BuildOptions::default(),
+        )
+    };
+    let Some(directory) = file.parent().and_then(find_project_root) else {
+        return Ok(bare());
+    };
+    let (manifest, _warnings) = read_manifest_quietly(&directory)?;
+    let root = match (&manifest.package, &manifest.library) {
+        (Some(package), _) => package.root(),
+        (None, Some(library)) => library.base_root(),
+        // A `[project]` root: no package owns this file.
+        (None, None) => return Ok(bare()),
+    };
+    let options = manifest
+        .build_options()
+        .map_err(|error| format!("invalid {}/vilan.toml: {error}", directory.display()))?;
+    let workspace = vilan_core::manifest::resolve_workspace(&directory, &git_deps())
+        .map_err(|error| error.to_string())?;
+    Ok((directory.join(root), workspace, options))
+}
+
 /// Compiles and executes one test. `Ok` if it exits 0; otherwise `Err(detail)`
 /// with the captured runtime output (empty for a compile error, which
 /// `compile_to_js` has already reported to stderr).
 fn run_test(file: &Path) -> Result<(), String> {
+    let (pkg_root, workspace, options) = test_context(file)?;
     let (javascript, _assets, _sources) = compile_to_js(
         file,
-        &pkg_root_of(file),
+        &pkg_root,
         Platform::default(),
-        &BuildOptions::default(),
-        &Workspace::default(),
+        &options,
+        &workspace,
         false,
         None,
     )

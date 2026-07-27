@@ -221,7 +221,7 @@ pub fn materialize(
         return Ok(entry);
     }
     if config.policy == GitPolicy::CacheOnly {
-        return Err(WorkspaceError::Unfetched(format!(
+        return Err(WorkspaceError::unfetched(format!(
             "{} is not in the local cache, and this command does not fetch — \
              run `vilan build` (or `vilan check`) once to fetch it",
             source.describe()
@@ -251,7 +251,7 @@ pub fn materialize(
     let _ = std::fs::remove_dir_all(&staging);
     if let Err(error) = fetch(source, &staging).and_then(|()| verify_library(&staging, source)) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(WorkspaceError::Broken(error));
+        return Err(WorkspaceError::broken(error));
     }
     match std::fs::rename(&staging, &entry) {
         Ok(()) => Ok(entry),
@@ -262,7 +262,7 @@ pub fn materialize(
                 // winner's checkout is the same content by construction.
                 return Ok(entry);
             }
-            Err(WorkspaceError::Broken(format!(
+            Err(WorkspaceError::broken(format!(
                 "cannot move the fetched checkout into place at {}: {error}",
                 entry.display()
             )))

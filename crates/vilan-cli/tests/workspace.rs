@@ -3,7 +3,10 @@
 //! proposal/platform-coloring.md §4.2): building a workspace emits one bundle
 //! per host member / per entry, the platform-compatibility rule and dependency
 //! cycles are rejected, and the retired `[server]`/`[client]` form fails with
-//! its migration hint.
+//! its migration hint. It also carries B33's cross-package pin
+//! (proposal/b33-emission-order.md §1): the canonical initialization order
+//! across packages needs a workspace to be observable at all, so it lives here
+//! rather than beside the single-file corpus pin.
 //!
 //! Each test writes a throwaway project tree and drives the built `vilan` binary.
 
@@ -777,4 +780,348 @@ fn no_hooks_is_no_change_and_check_never_runs_them() {
     assert!(output.status.success(), "{}", combined(&output));
     assert!(!checked.join("ran-during-check").exists());
     let _ = std::fs::remove_dir_all(&checked);
+}
+
+// ── `vilan test` compiles a test as a file OF its package
+// (proposal/distribution.md §7's S4 residual: it compiled against an empty
+// workspace, so a `*_test.vl` could import neither a sibling through the
+// manifest's `root` nor any dependency) ──
+
+/// The `*_test.vl` body for a one-assertion test.
+fn test_source(imports: &str, condition: &str, label: &str) -> String {
+    format!(
+        "import std::assert;\n{imports}\n\nfun main() {{\n\tassert({condition}, \"{label}\");\n}}\n"
+    )
+}
+
+#[test]
+fn a_test_resolves_pkg_siblings_through_the_manifests_root() {
+    // The test file sits beside the manifest while the sources live under the
+    // declared `root` — so `pkg::` can only resolve if the test is compiled
+    // with the PACKAGE's root, not with its own directory.
+    let dir = temp_project("test_sibling");
+    write(&dir, "vilan.toml", "[package]\nname = \"app\"\n");
+    write(&dir, "src/main.vl", "fun main() {}\n");
+    write(&dir, "src/thing.vl", "fun value(): i32 { 9 }\n");
+    write(
+        &dir,
+        "outer_test.vl",
+        &test_source(
+            "import pkg::thing::value;",
+            "value() == 9",
+            "the sibling resolves",
+        ),
+    );
+
+    let output = vilan(&["test", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("1 passed, 0 failed"),
+        "{}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_test_resolves_a_path_dependency() {
+    let dir = temp_project("test_pathdep");
+    write(&dir, "shapes/vilan.toml", "[library]\nname = \"shapes\"\n");
+    write(&dir, "shapes/src/lib.vl", "fun area(): i32 { 7 }\n");
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+         shapes = { path = \"../shapes\" }\n",
+    );
+    write(&dir, "app/src/main.vl", "fun main() {}\n");
+    write(
+        &dir,
+        "app/src/dep_test.vl",
+        &test_source(
+            "import shapes::area;",
+            "area() == 7",
+            "the dependency resolves",
+        ),
+    );
+
+    let output = vilan(&["test", dir.join("app/src").to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("1 passed, 0 failed"),
+        "{}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_librarys_own_test_resolves_its_siblings_and_dependencies() {
+    // A `[library]` is never a build unit, so nothing else in the CLI resolves
+    // a workspace for one — but its tests are compiled from inside it, and they
+    // are entitled to the same package it declares.
+    let dir = temp_project("test_library");
+    write(&dir, "shapes/vilan.toml", "[library]\nname = \"shapes\"\n");
+    write(&dir, "shapes/src/lib.vl", "fun area(): i32 { 7 }\n");
+    write(
+        &dir,
+        "lib2/vilan.toml",
+        "[library]\nname = \"lib2\"\n\n[library.dependencies]\n\
+         shapes = { path = \"../shapes\" }\n",
+    );
+    write(
+        &dir,
+        "lib2/src/lib.vl",
+        "fun twice(n: i32): i32 { n * 2 }\n",
+    );
+    write(
+        &dir,
+        "lib2/src/util.vl",
+        "fun triple(n: i32): i32 { n * 3 }\n",
+    );
+    write(
+        &dir,
+        "lib2/src/util_test.vl",
+        &test_source(
+            "import pkg::util::triple;\nimport shapes::area;",
+            "triple(2) == 6 && area() == 7",
+            "the library's sibling and dependency both resolve",
+        ),
+    );
+
+    let output = vilan(&["test", dir.join("lib2/src").to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("1 passed, 0 failed"),
+        "{}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_test_with_no_manifest_keeps_its_old_context() {
+    // The control: a lone `*_test.vl` under no package still compiles and runs,
+    // rooted at its own directory — the behavior every existing `std::assert`
+    // test relies on.
+    let dir = temp_project("test_bare");
+    write(
+        &dir,
+        "lonely_test.vl",
+        &test_source("", "1 + 1 == 2", "arithmetic still works"),
+    );
+
+    let output = vilan(&["test", dir.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("1 passed, 0 failed"),
+        "{}",
+        combined(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── a broken INHERITED declaration names the manifest that wrote it
+// (proposal/distribution.md §7's S5 residual) ──
+
+#[test]
+fn a_broken_inherited_declaration_names_the_projects_manifest() {
+    // The member opted in and did nothing else wrong; the path that does not
+    // resolve is written in the project root's `[project.dependencies]`. The
+    // CLI has to say so, or the user opens the wrong file.
+    let dir = temp_project("inherit_broken");
+    write(
+        &dir,
+        "vilan.toml",
+        "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+         shapes = { path = \"nowhere\" }\n",
+    );
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\n[package.dependencies]\n\
+         shapes = { project = true }\n",
+    );
+    write(
+        &dir,
+        "app/src/main.vl",
+        "import shapes::area;\nfun main() {}\n",
+    );
+
+    let output = vilan(&["build", dir.join("app").to_str().unwrap()]);
+    assert!(!output.status.success(), "expected a resolution failure");
+    let text = combined(&output);
+    assert!(
+        text.contains(&format!(
+            "inherited from {}",
+            dir.join("vilan.toml").display()
+        )),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_broken_member_declaration_names_no_one_else() {
+    // The control: the member wrote the failing declaration itself, so the
+    // message stays exactly as it was.
+    let dir = temp_project("member_broken");
+    write(&dir, "vilan.toml", "[project]\npackages = [\"app\"]\n");
+    write(
+        &dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\n[package.dependencies]\n\
+         shapes = { path = \"../nowhere\" }\n",
+    );
+    write(
+        &dir,
+        "app/src/main.vl",
+        "import shapes::area;\nfun main() {}\n",
+    );
+
+    let output = vilan(&["build", dir.join("app").to_str().unwrap()]);
+    assert!(!output.status.success(), "expected a resolution failure");
+    let text = combined(&output);
+    assert!(text.contains("dependency `shapes`"), "{text}");
+    assert!(!text.contains("inherited from"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── cross-package initialization order (B33; proposal/b33-emission-order.md §1)
+//
+// The canonical fallback order was pinned within a single package by the corpus
+// (`emitted_js_is_independent_of_import_order`), and probed but never pinned
+// ACROSS packages — b33-emission-order.md's shipped-status residual, which needs
+// exactly the workspace fixture this file already knows how to build.
+
+/// A workspace whose module-level bindings exercise every tier of the canonical
+/// order at once, with nothing depending on anything else — so the emitted
+/// sequence is the canonical fallback and not a dependency topo-sort.
+///
+/// The dependency graph is deliberately NOT alphabetical: `app` declares both
+/// `alpha` and `zed`, and `alpha` itself depends on `zed`, so the post-order DFS
+/// gives `zed` package index 0 and `alpha` index 1 — the reverse of the
+/// manifest's (BTreeMap, i.e. alphabetical) listing. A fixture where the two
+/// agree would pass under either rule and pin neither.
+fn write_ordered_workspace(dir: &Path, entry: &str) {
+    write(dir, "zed/vilan.toml", "[library]\nname = \"zed\"\n");
+    write(dir, "zed/src/lib.vl", "let Z_ROOT: i32 = 1;\n");
+    // Two bindings in one file: declaration order within a module.
+    write(
+        dir,
+        "zed/src/zmod.vl",
+        "let Z_ONE: i32 = 2;\n\nlet Z_TWO: i32 = 3;\n",
+    );
+    write(
+        dir,
+        "alpha/vilan.toml",
+        "[library]\nname = \"alpha\"\n\n[library.dependencies]\nzed = { path = \"../zed\" }\n",
+    );
+    write(dir, "alpha/src/lib.vl", "let A_ROOT: i32 = 4;\n");
+    write(dir, "alpha/src/amod.vl", "let A_MOD: i32 = 5;\n");
+    write(
+        dir,
+        "app/vilan.toml",
+        "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+         alpha = { path = \"../alpha\" }\nzed = { path = \"../zed\" }\n",
+    );
+    // The entry package's own modules, named so that name order (`beta` before
+    // `gamma`) is what decides — not the order the entry imports them.
+    write(dir, "app/src/beta.vl", "let OWN_B: i32 = 6;\n");
+    write(dir, "app/src/gamma.vl", "let OWN_G: i32 = 7;\n");
+    write(dir, "app/src/main.vl", entry);
+}
+
+/// The entry file, parameterized by the order its imports are written in. The
+/// body reads every binding (through an interpolated string), so none of them is
+/// tree-shaken and all of them must be emitted.
+fn ordered_entry(imports: &[&str]) -> String {
+    format!(
+        "{}\n\nlet ENTRY: i32 = 8;\n\nfun main() {{\n\t\
+         print(i\"{{PI}} {{A_ROOT}} {{A_MOD}} {{Z_ROOT}} {{Z_ONE}} {{Z_TWO}} \
+         {{OWN_B}} {{OWN_G}} {{ENTRY}}\")\n}}\n",
+        imports.join("\n")
+    )
+}
+
+/// The imports of [`ordered_entry`], in one spelling.
+fn ordered_imports() -> Vec<&'static str> {
+    vec![
+        "import std::print;",
+        "import std::math::PI;",
+        "import alpha::A_ROOT;",
+        "import alpha::amod::A_MOD;",
+        "import zed::Z_ROOT;",
+        "import zed::zmod::Z_ONE;",
+        "import zed::zmod::Z_TWO;",
+        "import pkg::beta::OWN_B;",
+        "import pkg::gamma::OWN_G;",
+    ]
+}
+
+/// The names of the `const` declarations in an emitted bundle, in emission
+/// order.
+fn emitted_constant_names(javascript: &str) -> Vec<String> {
+    javascript
+        .lines()
+        .filter_map(|line| line.strip_prefix("const "))
+        .filter_map(|rest| rest.split(' ').next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn cross_package_initialization_follows_the_canonical_tier_order() {
+    // Spec §7.1's canonical order, across every tier at once: std modules, then
+    // each dependency package's modules in dependency-graph post-order, then the
+    // entry package's own modules by name, then the dependency packages' ROOT
+    // modules (`lib.vl`) in that same package order, then the entry file —
+    // declaration order within each file.
+    let dir = temp_project("init_order");
+    write_ordered_workspace(&dir, &ordered_entry(&ordered_imports()));
+    let output = vilan(&["build", "--stdout", dir.join("app").to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let javascript = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        emitted_constant_names(&javascript),
+        vec![
+            "PI",     // std module (tier 0)
+            "Z_ONE",  // dependency package 0 (`zed`), declaration order …
+            "Z_TWO",  // … within its module
+            "A_MOD",  // dependency package 1 (`alpha`) — post-order, not `a` < `z`
+            "OWN_B",  // the entry package's own modules, by module name …
+            "OWN_G",  // … `beta` before `gamma`
+            "Z_ROOT", // the dependency ROOT modules, in the same package order …
+            "A_ROOT", // … `zed` (0) before `alpha` (1)
+            "ENTRY",  // the entry file, last
+        ],
+        "{javascript}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_package_emission_is_byte_identical_under_import_permutation() {
+    // The point of the canonical order: the emitted bundle is a function of
+    // which modules are reachable, never of how the entry spells its imports —
+    // across packages, which is where the naive orders (id, name) diverge.
+    let straight = temp_project("init_order_a");
+    write_ordered_workspace(&straight, &ordered_entry(&ordered_imports()));
+    let output = vilan(&["build", "--stdout", straight.join("app").to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let first = output.stdout.clone();
+    let _ = std::fs::remove_dir_all(&straight);
+
+    let mut permuted = ordered_imports();
+    permuted.reverse();
+    let shuffled = temp_project("init_order_b");
+    write_ordered_workspace(&shuffled, &ordered_entry(&permuted));
+    let output = vilan(&["build", "--stdout", shuffled.join("app").to_str().unwrap()]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&output.stdout),
+        "reordering the entry's imports changed the emitted bundle"
+    );
+    let _ = std::fs::remove_dir_all(&shuffled);
 }

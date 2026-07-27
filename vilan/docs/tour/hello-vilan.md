@@ -107,6 +107,11 @@ whenever a source file changes. `--platform browser` builds for the
 browser instead of node (`--target` also works). `--stdout` prints the JS
 instead of writing a file.
 
+A `*_test.vl` lives beside the code it tests and compiles as a file *of*
+its package: it imports `pkg::` siblings and the package's dependencies
+exactly the way the rest of the package does. Tests run on node, whatever
+the package's `target` says.
+
 ## Projects: `vilan.toml`
 
 A single `.vl` file is fine for experiments. Real projects get a folder

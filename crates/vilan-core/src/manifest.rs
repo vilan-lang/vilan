@@ -737,43 +737,94 @@ fn validate_dependencies(
     }
 }
 
-/// Why [`resolve_workspace`] failed. The two kinds are carried structurally
-/// rather than sniffed out of a message because their **severity differs where
-/// they are reported**: something broken is an error wherever it appears, while
-/// an unfetched git dependency means every manifest is correct and a single
-/// `vilan build` fixes it — a warning in the editor, which never fetches
-/// (proposal `distribution.md` §5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceError {
+/// Why a [`resolve_workspace`] failure is the user's problem — or isn't. The
+/// two kinds are carried structurally rather than sniffed out of a message
+/// because their **severity differs where they are reported**: something broken
+/// is an error wherever it appears, while an unfetched git dependency means
+/// every manifest is correct and a single `vilan build` fixes it — a warning in
+/// the editor, which never fetches (proposal `distribution.md` §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceErrorKind {
     /// A manifest is invalid, a dependency does not resolve, the graph has a
     /// cycle, a fetch failed — something the user must fix.
-    Broken(String),
+    Broken,
     /// A declared git dependency is not in the cache and this caller's policy
     /// is cache-only, so nothing fetched it. Nothing is *wrong*.
-    Unfetched(String),
+    Unfetched,
+}
+
+/// Why [`resolve_workspace`] failed: the kind (above), the message, and — when
+/// it is not simply the manifest resolution started from — **the manifest that
+/// wrote the offending declaration**.
+///
+/// That last part exists for inheritance (`dep = { project = true }`): the
+/// member opts in, but the declaration lives in the project root's
+/// `[project.dependencies]`, so a broken one is only fixable there. Without the
+/// path the editor squiggles the member's `vilan.toml`, which is correct, while
+/// the file that needs the edit says nothing (proposal `distribution.md` §7's
+/// S5 residual).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceError {
+    kind: WorkspaceErrorKind,
+    message: String,
+    declared_in: Option<PathBuf>,
 }
 
 impl WorkspaceError {
-    /// The message, without the kind.
-    pub fn message(&self) -> &str {
-        match self {
-            WorkspaceError::Broken(message) | WorkspaceError::Unfetched(message) => message,
+    /// Something the user must fix.
+    pub fn broken(message: impl Into<String>) -> WorkspaceError {
+        WorkspaceError {
+            kind: WorkspaceErrorKind::Broken,
+            message: message.into(),
+            declared_in: None,
         }
     }
 
-    /// Whether the only thing standing in the way is an unfetched git
-    /// dependency (see [`WorkspaceError::Unfetched`]).
-    pub fn is_unfetched(&self) -> bool {
-        matches!(self, WorkspaceError::Unfetched(_))
+    /// A git dependency this caller's policy would not fetch.
+    pub fn unfetched(message: impl Into<String>) -> WorkspaceError {
+        WorkspaceError {
+            kind: WorkspaceErrorKind::Unfetched,
+            message: message.into(),
+            declared_in: None,
+        }
     }
 
-    /// The same kind with its message rewritten — a caller adding context
-    /// (`git dependency `x`: …`) must not flatten the kind away, which is the
-    /// whole reason the kind is carried.
+    /// The message, without the kind.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Whether the only thing standing in the way is an unfetched git
+    /// dependency — the kind [`WorkspaceError::unfetched`] builds.
+    pub fn is_unfetched(&self) -> bool {
+        self.kind == WorkspaceErrorKind::Unfetched
+    }
+
+    /// The `vilan.toml` holding the declaration at fault, when that is not the
+    /// manifest resolution started from — the address a diagnostic belongs on.
+    pub fn declared_in(&self) -> Option<&Path> {
+        self.declared_in.as_deref()
+    }
+
+    /// The same failure, attributed to the manifest that declared it. The
+    /// **first** attribution wins: the innermost frame is the one that knows
+    /// whose declaration it was resolving, so an outer frame must not restamp
+    /// an error that already found its home.
+    pub fn declared_in_manifest(mut self, manifest: &Path) -> WorkspaceError {
+        if self.declared_in.is_none() {
+            self.declared_in = Some(manifest.to_path_buf());
+        }
+        self
+    }
+
+    /// The same kind and address with the message rewritten — a caller adding
+    /// context (`git dependency `x`: …`) must not flatten either away, which is
+    /// the whole reason they are carried.
     pub fn map_message(self, rewrite: impl FnOnce(String) -> String) -> WorkspaceError {
-        match self {
-            WorkspaceError::Broken(message) => WorkspaceError::Broken(rewrite(message)),
-            WorkspaceError::Unfetched(message) => WorkspaceError::Unfetched(rewrite(message)),
+        WorkspaceError {
+            kind: self.kind,
+            message: rewrite(self.message),
+            declared_in: self.declared_in,
         }
     }
 }
@@ -786,7 +837,7 @@ impl std::fmt::Display for WorkspaceError {
 
 impl From<String> for WorkspaceError {
     fn from(message: String) -> Self {
-        WorkspaceError::Broken(message)
+        WorkspaceError::broken(message)
     }
 }
 
@@ -794,9 +845,14 @@ impl From<String> for WorkspaceError {
 /// (P2): every reachable `path` and `git` dependency, transitively, with cycle
 /// detection. Each `PackageSpec` records its declared `target`, but the graph
 /// itself is target-independent — the target-compatibility *diagnostic* is the
-/// analyzer's, reported at the import (P3). A directory whose manifest declares no
-/// `[package]` (and a bare file, which has no manifest) yields an empty workspace.
-/// Shared by the CLI and the language server so both resolve imports identically.
+/// analyzer's, reported at the import (P3). Shared by the CLI and the language
+/// server so both resolve imports identically.
+///
+/// The rooted manifest may be a `[package]` (an app) **or a `[library]`**: a
+/// library's own `[library.dependencies]` are the edges of anything compiled
+/// from inside it — its `*_test.vl` files, and the file an editor has open.
+/// Everything else — a `[project]` root, which has no sources of its own, and a
+/// bare file, which has no manifest — yields an empty workspace.
 ///
 /// `git` decides what a git dependency may do here — fetch on a cache miss (a
 /// build) or read a warm cache only (the editor; see [`GitDeps`]). It is an
@@ -812,17 +868,21 @@ pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace,
             depth: section.depth.unwrap_or(defaults.depth),
         })
         .unwrap_or(defaults);
-    let Some(package) = manifest.package else {
-        return Ok(Workspace {
-            macro_limits,
-            ..Workspace::default()
-        });
+    let declared = match (&manifest.package, &manifest.library) {
+        (Some(package), _) => &package.dependencies,
+        (None, Some(library)) => &library.dependencies,
+        (None, None) => {
+            return Ok(Workspace {
+                macro_limits,
+                ..Workspace::default()
+            });
+        }
     };
     let mut packages = Vec::new();
     let mut index_by_path = HashMap::new();
     let mut visiting = HashSet::new();
     let entry_dependencies = resolve_dependency_edges(
-        &package.dependencies,
+        declared,
         package_dir,
         &mut packages,
         &mut index_by_path,
@@ -953,17 +1013,23 @@ fn load_manifest(directory: &Path) -> Result<Manifest, String> {
 /// workspace that is merely broken.
 fn enclosing_project(
     package_dir: &Path,
-) -> Result<Option<(PathBuf, BTreeMap<String, Dependency>)>, String> {
+) -> Result<Option<(PathBuf, BTreeMap<String, Dependency>)>, WorkspaceError> {
     let start = crate::util::canonical_path(package_dir);
     for directory in start.ancestors() {
         let manifest_path = directory.join("vilan.toml");
         if !manifest_path.is_file() {
             continue;
         }
-        let contents = std::fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-        let (manifest, _warnings) = Manifest::parse(&contents)
-            .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+        // Every failure here is a failure of the manifest being read, which is
+        // never the one resolution started from — so each is addressed to it.
+        let contents = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            WorkspaceError::broken(format!("cannot read {}: {error}", manifest_path.display()))
+                .declared_in_manifest(&manifest_path)
+        })?;
+        let (manifest, _warnings) = Manifest::parse(&contents).map_err(|error| {
+            WorkspaceError::broken(format!("invalid {}: {error}", manifest_path.display()))
+                .declared_in_manifest(&manifest_path)
+        })?;
         if manifest.project.is_none() {
             continue;
         }
@@ -971,11 +1037,12 @@ fn enclosing_project(
         // held to the same standard as any manifest resolution reads.
         let errors = manifest.validate();
         if !errors.is_empty() {
-            return Err(format!(
+            return Err(WorkspaceError::broken(format!(
                 "invalid {}:\n  - {}",
                 manifest_path.display(),
                 errors.join("\n  - ")
-            ));
+            ))
+            .declared_in_manifest(&manifest_path));
         }
         let project = manifest.project.expect("checked just above");
         return Ok(Some((directory.to_path_buf(), project.dependencies)));
@@ -1025,14 +1092,18 @@ fn resolve_dependency_edges(
         // with it the directory the declaration's `path` is relative to. A path
         // written in `[project.dependencies]` is written from the project root,
         // which is the whole point of declaring it in one place.
-        let (declaration, declaration_dir) = match dependency.source() {
+        let (declaration, declaration_dir, inherited_from) = match dependency.source() {
             Ok(DependencySource::Inherited) => {
                 if !project_searched {
                     project = enclosing_project(base_dir)?;
                     project_searched = true;
                 }
+                // The two failures below are the MEMBER's: it wrote `project =
+                // true` where there is no project, or for a name the project
+                // does not declare. They stay addressed to the member manifest,
+                // which is where the opt-in that has to change lives.
                 let Some((project_dir, declared)) = &project else {
-                    return Err(WorkspaceError::Broken(format!(
+                    return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but `{}` is not \
                          inside a workspace — inheritance reads the `[project.dependencies]` \
                          of the nearest ancestor `vilan.toml` that declares a `[project]`",
@@ -1040,16 +1111,36 @@ fn resolve_dependency_edges(
                     )));
                 };
                 let Some(inherited) = declared.get(import_name) else {
-                    return Err(WorkspaceError::Broken(format!(
+                    return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but {} declares \
                          no `{import_name}` — {}",
                         project_dir.join("vilan.toml").display(),
                         declared_names(declared)
                     )));
                 };
-                (inherited.clone(), project_dir.clone())
+                (
+                    inherited.clone(),
+                    project_dir.clone(),
+                    Some(project_dir.join("vilan.toml")),
+                )
             }
-            _ => (dependency.clone(), base_dir.to_path_buf()),
+            _ => (dependency.clone(), base_dir.to_path_buf(), None),
+        };
+        // Everything from here on resolves *the declaration*, so a failure
+        // belongs to the manifest that wrote it — the project root for an
+        // inherited dependency, and (already, by omission) this package's own
+        // manifest otherwise. Both halves in one place so the diagnostic's
+        // address and its wording can never drift apart.
+        let attribute = |error: WorkspaceError| match &inherited_from {
+            None => error,
+            Some(manifest) => error
+                .map_message(|message| {
+                    format!(
+                        "{message} — `{import_name}` is inherited from {}",
+                        manifest.display()
+                    )
+                })
+                .declared_in_manifest(manifest),
         };
         // `validate` has already rejected registry dependencies, malformed
         // git ones, and an inheriting `[project.dependencies]` entry, so only
@@ -1058,8 +1149,9 @@ fn resolve_dependency_edges(
             Ok(DependencySource::Path(relative)) => declaration_dir.join(relative),
             Ok(DependencySource::Git(source)) => {
                 crate::git_dep::materialize(&source, git, import_name).map_err(|error| {
-                    error
-                        .map_message(|message| format!("git dependency `{import_name}`: {message}"))
+                    attribute(error.map_message(|message| {
+                        format!("git dependency `{import_name}`: {message}")
+                    }))
                 })?
             }
             Ok(DependencySource::Inherited) | Ok(DependencySource::Registry) | Err(_) => continue,
@@ -1075,13 +1167,16 @@ fn resolve_dependency_edges(
             continue;
         }
         if !visiting.insert(canonical.clone()) {
-            return Err(WorkspaceError::Broken(format!(
+            return Err(attribute(WorkspaceError::broken(format!(
                 "dependency cycle through `{}`",
                 dependency_dir.display()
-            )));
+            ))));
         }
-        let manifest = load_manifest(&dependency_dir)
-            .map_err(|error| format!("dependency `{import_name}`: {error}"))?;
+        let manifest = load_manifest(&dependency_dir).map_err(|error| {
+            attribute(WorkspaceError::broken(format!(
+                "dependency `{import_name}`: {error}"
+            )))
+        })?;
         // A dependency is a `[library]` (layered, contract-checked, with a
         // `lib.vl` surface) — or, since platform coloring, a `[package]` (an
         // app): its `src/` modules import by path, its items color
@@ -1092,10 +1187,10 @@ fn resolve_dependency_edges(
             (Some(_), _) => (Some(manifest.library.unwrap()), None),
             (None, Some(package)) => (None, Some(package.dependencies.clone())),
             (None, None) => {
-                return Err(WorkspaceError::Broken(format!(
+                return Err(attribute(WorkspaceError::broken(format!(
                     "dependency `{import_name}` at `{}` is not a `[library]` or `[package]`",
                     dependency_dir.display()
-                )));
+                ))));
             }
         };
         // Resolve the library's own dependencies first, so they take lower indices
@@ -2057,6 +2152,131 @@ mod tests {
         assert!(
             message.contains("`[project.dependencies]` declares `geometry`"),
             "{message}"
+        );
+        // The member wrote the opt-in, so the member is where it is fixed.
+        assert_eq!(error.declared_in(), None, "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_broken_inherited_declaration_is_addressed_to_the_project() {
+        // distribution.md §7's S5 residual: the member's manifest is correct —
+        // it opted in — so the failure has to carry the manifest that WROTE the
+        // declaration, or every surface reports a file with nothing to fix.
+        let root = workspace_tree(
+            "inherit-broken",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { path = \"nowhere\" }\n",
+                ),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("the inherited path does not resolve");
+        assert_eq!(
+            error.declared_in(),
+            Some(
+                crate::util::canonical_path(&root)
+                    .join("vilan.toml")
+                    .as_path()
+            ),
+            "{}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("is inherited from"),
+            "{}",
+            error.message()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_broken_own_declaration_is_addressed_nowhere_but_here() {
+        // The control for the rule above: a package that declares its own
+        // dependency owns the mistake, so nothing is re-addressed and the
+        // message gains no inheritance clause.
+        let root = workspace_tree(
+            "inherit-broken-own",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     shapes = { path = \"shapes\" }\n",
+                ),
+                ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+                ("shapes/src/lib.vl", ""),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     shapes = { path = \"../nowhere\" }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("the member's own path does not resolve");
+        assert_eq!(error.declared_in(), None, "{}", error.message());
+        assert!(
+            !error.message().contains("is inherited from"),
+            "{}",
+            error.message()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deeper_declaration_keeps_its_own_address_under_an_inherited_one() {
+        // The ordering-sensitive case: `app` INHERITS `middle`, and `middle`
+        // declares a broken dependency of its own. The inner frame is the one
+        // that knows whose declaration failed, so the outer inherited frame
+        // must not restamp it onto the project root.
+        let root = workspace_tree(
+            "inherit-deeper",
+            &[
+                (
+                    "vilan.toml",
+                    "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                     middle = { path = \"middle\" }\n",
+                ),
+                (
+                    "middle/vilan.toml",
+                    "[library]\nname = \"middle\"\n[library.dependencies]\n\
+                     shapes = { path = \"../nowhere\" }\n",
+                ),
+                ("middle/src/lib.vl", ""),
+                (
+                    "app/vilan.toml",
+                    "[package]\nname = \"app\"\n[package.dependencies]\n\
+                     middle = { project = true }\n",
+                ),
+                ("app/src/main.vl", ""),
+            ],
+        );
+        let error = resolve_workspace(
+            &root.join("app"),
+            &GitDeps::cache_only(root.join("unused-git-cache")),
+        )
+        .expect_err("middle's own dependency does not resolve");
+        assert_eq!(error.declared_in(), None, "{}", error.message());
+        assert!(
+            !error.message().contains("is inherited from"),
+            "{}",
+            error.message()
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -558,3 +558,43 @@ fn a_branch_pin_is_refused_by_the_manifest_before_any_fetch() {
     );
     assert!(fixture.cache_entries().is_empty());
 }
+
+#[test]
+fn a_test_file_resolves_a_git_dependency_by_fetching_it() {
+    // `vilan test` resolves the same workspace the package build does
+    // (distribution.md §7's S4 residual), and it does so under the FETCHING
+    // policy: running the tests is a build the user asked for, so a cold cache
+    // is filled rather than reported. The proof is the cache entry appearing
+    // from a `test` run alone.
+    let fixture = Fixture::new("test_cmd");
+    let files = library_files("hello from v1");
+    let url = repository(
+        &fixture.root.join("repos/shapes"),
+        &as_pairs(&files),
+        Some("v1.0.0"),
+    );
+    let app = fixture.root.join("app");
+    application(&app, &format!("{{ git = \"{url}\", tag = \"v1.0.0\" }}"));
+    write(
+        &app,
+        "src/greeting_test.vl",
+        "import std::assert;\nimport shapes::greeting;\n\nfun main() {\n\t\
+         assert(greeting() == \"hello from v1\", \"the git dependency resolves\");\n}\n",
+    );
+
+    assert!(
+        fixture.cache_entries().is_empty(),
+        "the cache starts cold: {:?}",
+        fixture.cache_entries()
+    );
+    let output = fixture.vilan(&["test", app.join("src").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("1 passed, 0 failed"), "{text}");
+    assert_eq!(
+        fixture.cache_entries().len(),
+        1,
+        "the test run fetched it: {:?}",
+        fixture.cache_entries()
+    );
+}

@@ -65,8 +65,10 @@ struct ManifestProblem {
 /// A `[package]` roots `pkg::` at its source `root`, analyzes its files against
 /// its platform (the package `target`, or per-entry targets under the
 /// `[entry.<name>]` form), and resolves its dependency workspace (so
-/// cross-package imports type-check). Anything unreadable / unrecognized
-/// yields [`ProjectContext::none`].
+/// cross-package imports type-check). A `[library]` roots `pkg::` at the layer
+/// the file lives in and resolves its dependencies the same way, with no
+/// platform — see the branch itself for the two limits that carries. Anything
+/// unreadable / unrecognized yields [`ProjectContext::none`].
 fn resolve_project_context(entry_path: &Path) -> ProjectContext {
     let mut directory = entry_path.parent();
     let (manifest_path, root) = loop {
@@ -119,33 +121,7 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
                     .then(|| entry.resolved_target().unwrap_or_default())
             })
         };
-        // The editor's git-dependency policy: **the cache, never the network**
-        // (proposal/distribution.md §5). Analysis runs on every keystroke and
-        // must never block on a repository — nor fetch behind the user's back —
-        // so a dependency that no build has fetched yet is simply not in the
-        // workspace, and its imports stay unresolved until `vilan build` (or
-        // `vilan check`) fetches it. That degradation is the one this call has
-        // always had for an unresolvable manifest.
-        let git =
-            vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
-        // The resolution failure is no longer swallowed (F5 S5): the workspace
-        // still degrades to none — imports into a dependency stay unresolved
-        // either way — but the REASON is published on the manifest, so the wall
-        // of "cannot find module" errors has something to point at. A git
-        // dependency the editor hasn't been allowed to fetch is a warning: that
-        // manifest is correct, and `vilan build` is the whole fix.
-        let (workspace, manifest_problem) =
-            match vilan_core::manifest::resolve_workspace(root, &git) {
-                Ok(workspace) => (workspace, None),
-                Err(error) => (
-                    BuildWorkspace::default(),
-                    Some(ManifestProblem {
-                        path: manifest_path.clone(),
-                        warning: error.is_unfetched(),
-                        message: error.message().to_string(),
-                    }),
-                ),
-            };
+        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
         return ProjectContext {
             platform,
             pkg_root: Some(pkg_root),
@@ -154,8 +130,91 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         };
     }
 
+    // A `[library]`: its own modules and its own dependencies, which is what a
+    // file inside it imports. Two limits are deliberate, and both are the
+    // platform-model era's recorded deferral rather than an oversight:
+    //
+    //   - **No platform.** A library declares no `target`; it is compiled once
+    //     per platform its layers serve, and the contract checker (`vilan check
+    //     <library>`, `check_library_contract`) is what verifies that. The
+    //     editor analyzes one buffer, so it keeps the no-project behavior —
+    //     infer from the file's own imports — instead of inventing a target and
+    //     reporting coloring violations the library never committed to.
+    //   - **One root, the file's own layer.** `pkg::` resolution for the
+    //     ENTRY's package searches a single directory (only a *dependency* gets
+    //     the layered `search_roots`), so a file is rooted at the layer it
+    //     lives in — its base layer, or the platform layer containing it. A
+    //     module therefore reaches its own layer's siblings and not the other
+    //     layers'. Reaching both needs the entry package to carry a layered
+    //     spec, which is the deferral above; rooting at the file's own layer is
+    //     the subset that never resolves less than the no-project fallback did.
+    //
+    // `std` costs nothing extra: `analyze` recognizes any of std's own layer
+    // roots as "compiling std", after which the full layered search applies.
+    if manifest.library.is_some() {
+        let spec = vilan_core::manifest::resolve_library(root);
+        // The deepest layer containing the file — layer roots may nest, and the
+        // innermost one is the file's own.
+        let pkg_root = spec
+            .layers
+            .iter()
+            .filter(|layer| is_within(&layer.root, entry_path))
+            .max_by_key(|layer| layer.root.as_os_str().len())
+            .map(|layer| layer.root.clone())
+            .unwrap_or(spec.base_root);
+        let (workspace, manifest_problem) = resolve_dependencies(root, &manifest_path);
+        return ProjectContext {
+            platform: None,
+            pkg_root: Some(pkg_root),
+            workspace,
+            manifest_problem,
+        };
+    }
+
     // A `[project]` workspace root has no buildable package of its own.
     ProjectContext::none()
+}
+
+/// The dependency workspace for the package rooted at `root`, with the reason
+/// it did not resolve, if it did not.
+///
+/// The editor's git-dependency policy: **the cache, never the network**
+/// (proposal/distribution.md §5). Analysis runs on every keystroke and must
+/// never block on a repository — nor fetch behind the user's back — so a
+/// dependency that no build has fetched yet is simply not in the workspace, and
+/// its imports stay unresolved until `vilan build` (or `vilan check`) fetches
+/// it.
+///
+/// The failure is not swallowed (F5 S5): the workspace still degrades to none —
+/// imports into a dependency stay unresolved either way — but the REASON is
+/// published on the manifest, so the wall of "cannot find module" errors has
+/// something to point at. A git dependency the editor hasn't been allowed to
+/// fetch is a warning: that manifest is correct, and `vilan build` is the whole
+/// fix.
+fn resolve_dependencies(
+    root: &Path,
+    manifest_path: &Path,
+) -> (BuildWorkspace, Option<ManifestProblem>) {
+    let git = vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
+    match vilan_core::manifest::resolve_workspace(root, &git) {
+        Ok(workspace) => (workspace, None),
+        Err(error) => (
+            BuildWorkspace::default(),
+            Some(ManifestProblem {
+                // The manifest that WROTE the broken declaration, which for an
+                // inherited dependency is the project root, not this file's own
+                // `vilan.toml` (distribution.md §7's S5 residual). Squiggling
+                // the member is technically true and practically useless: the
+                // edit happens elsewhere.
+                path: error
+                    .declared_in()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| manifest_path.to_path_buf()),
+                warning: error.is_unfetched(),
+                message: error.message().to_string(),
+            }),
+        ),
+    }
 }
 
 /// Whether two paths name the same file. Both sides go through the one
@@ -3113,6 +3172,228 @@ pub(crate) mod tests {
                 .iter()
                 .map(|item| item.message.clone())
                 .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_project_declaration_publishes_on_the_projects_manifest() {
+        // distribution.md §7's S5 residual: the member's `vilan.toml` is
+        // CORRECT — it opted in and nothing more — so squiggling it points the
+        // user at a file with nothing to fix. The declaration lives in the
+        // project root, and that is where the diagnostic goes.
+        let (dir, document) = analyze_workspace(&[
+            ("app/src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { project = true }\n",
+            ),
+            (
+                "vilan.toml",
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { path = \"nowhere\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the resolution failure is published");
+        let path = item.path.clone().expect("addressed to a manifest");
+        assert_eq!(
+            path,
+            vilan_core::util::canonical_path(&dir).join("vilan.toml"),
+            "the project's manifest, not the member's"
+        );
+        assert!(!item.warning, "an unresolvable dependency is an error");
+        // The wording carries the same fact, for the CLI and for a reader who
+        // sees the message without its address.
+        assert!(
+            item.message.contains("is inherited from"),
+            "{}",
+            item.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_member_declaration_still_publishes_on_the_member() {
+        // The control: a member that declares its own dependency owns the
+        // mistake, so the address is unchanged by the inheritance rule above.
+        let (dir, document) = analyze_workspace(&[
+            ("app/src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { path = \"../nowhere\" }\n",
+            ),
+            ("vilan.toml", "[project]\npackages = [\"app\"]\n"),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the resolution failure is published");
+        let path = item.path.clone().expect("addressed to a manifest");
+        assert_eq!(
+            path,
+            dir.join("app").join("vilan.toml"),
+            "the member's own manifest"
+        );
+        assert!(
+            !item.message.contains("is inherited from"),
+            "{}",
+            item.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invalid_project_declaration_publishes_on_the_projects_manifest() {
+        // The other broken-declaration shape: a spelling `validate` rejects
+        // (both `tag` and `rev`). It fails before any path is resolved — a
+        // different code path (`enclosing_project`) that must reach the same
+        // address.
+        let (dir, document) = analyze_workspace(&[
+            ("app/src/main.vl", "import shapes::area;\n\nfun main() {}\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n[package.dependencies]\n\
+                 shapes = { project = true }\n",
+            ),
+            (
+                "vilan.toml",
+                "[project]\npackages = [\"app\"]\n[project.dependencies]\n\
+                 shapes = { git = \"https://example.invalid/org/shapes\", \
+                 tag = \"v1\", rev = \"0123456\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the invalid manifest is published");
+        let path = item.path.clone().expect("addressed to a manifest");
+        assert_eq!(
+            path,
+            vilan_core::util::canonical_path(&dir).join("vilan.toml"),
+            "the project's manifest, not the member's"
+        );
+        assert!(!item.warning, "an invalid manifest is an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── a `[library]`-rooted document resolves its own package (the S5 report's
+    // noted pre-existing gap: a file whose nearest manifest is a `[library]`
+    // got NO project at all, so its own `pkg::` modules read as unresolved) ──
+
+    #[test]
+    fn a_library_module_resolves_its_pkg_siblings() {
+        // The library's own layer is the `pkg::` root, so a sibling module is a
+        // module — not "cannot find". The document is a NESTED module
+        // (`src/deep/lib.vl`, i.e. `pkg::deep`), which is exactly the shape the
+        // no-project fallback got wrong: it rooted `pkg::` at the file's own
+        // directory, so `pkg::util` looked for `src/deep/util.vl`.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "src/deep/lib.vl",
+                "import pkg::util::triple;\n\nfun twice(n: i32): i32 { triple(n) }\n",
+            ),
+            ("src/util.vl", "fun triple(n: i32): i32 { n * 3 }\n"),
+            ("vilan.toml", "[library]\nname = \"shapes\"\n"),
+        ]);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| item.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_module_resolves_its_own_dependency() {
+        // `[library.dependencies]` are the edges of anything compiled inside
+        // the library — `resolve_workspace` used to return an empty workspace
+        // for any manifest without a `[package]`.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "lib2/src/lib.vl",
+                "import shapes::area;\n\nfun doubled(): i32 { area() * 2 }\n",
+            ),
+            (
+                "lib2/vilan.toml",
+                "[library]\nname = \"lib2\"\n[library.dependencies]\n\
+                 shapes = { path = \"../shapes\" }\n",
+            ),
+            ("shapes/vilan.toml", "[library]\nname = \"shapes\"\n"),
+            ("shapes/src/lib.vl", "fun area(): i32 { 7 }\n"),
+        ]);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| item.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_modules_manifest_failures_reach_the_editor_too() {
+        // The `vilan.toml` channel now covers libraries: a library whose own
+        // dependency does not resolve says so, on its own manifest.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "src/lib.vl",
+                "import shapes::area;\n\nfun a(): i32 { area() }\n",
+            ),
+            (
+                "vilan.toml",
+                "[library]\nname = \"lib2\"\n[library.dependencies]\n\
+                 shapes = { path = \"../nowhere\" }\n",
+            ),
+        ]);
+        let item = manifest_diagnostic(&document).expect("the resolution failure is published");
+        assert!(!item.warning, "an unresolvable dependency is an error");
+        assert!(
+            item.message.contains("dependency `shapes`"),
+            "{}",
+            item.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_layered_library_module_is_rooted_at_its_own_layer() {
+        // The boundary, pinned as current truth: `pkg::` for the entry's OWN
+        // package searches one root, so a file under a platform layer is rooted
+        // THERE — same-layer siblings resolve, base-layer modules do not.
+        // Reaching both needs the entry package to carry a layered spec (the
+        // platform-model era's deferral); rooting at the file's own layer is
+        // the subset that never resolves less than the fallback it replaces.
+        let (dir, document) = analyze_workspace(&[
+            (
+                "src/browser/widget.vl",
+                "import pkg::paint::tint;\nimport pkg::shared::base_value;\n\n\
+                 fun render(): i32 { tint() + base_value() }\n",
+            ),
+            ("src/browser/paint.vl", "fun tint(): i32 { 2 }\n"),
+            ("src/shared.vl", "fun base_value(): i32 { 1 }\n"),
+            (
+                "vilan.toml",
+                "[library]\nname = \"widgets\"\n[library.layer.browser]\n\
+                 platform = [\"@browser\"]\n",
+            ),
+        ]);
+        let messages: Vec<String> = document
+            .published_diagnostics()
+            .iter()
+            .map(|item| item.message.clone())
+            .collect();
+        assert!(
+            !messages.iter().any(|message| message.contains("tint")),
+            "the same-layer sibling must resolve: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("base_value")),
+            "the base-layer module is out of reach today: {messages:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
