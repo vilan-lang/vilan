@@ -861,15 +861,56 @@ impl Document {
         // a full analysis inside the analysis — run the whole thing on a
         // dedicated big-stack thread, like the CLI's compiler thread. Callers
         // stay synchronous (the LSP already wraps this in spawn_blocking).
+        //
+        // The thread body is panic-fenced (B40): the core pipeline carries its
+        // own fence, but the stages around it (workspace/manifest discovery,
+        // index building) do not, and an unwinding analysis used to re-raise
+        // through the join — out of whichever handler called it, aborting the
+        // whole server. It degrades to an internal-error document instead.
         let text = text.to_string();
+        let outer_text = text.clone();
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn(move || Self::analyze_on_this_thread(&text, &std_dir, &entry_path))
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
+                }))
+                .unwrap_or_else(|_| Self::internal_error(&text))
+            })
             .expect("spawn analysis thread")
             .join()
-            .expect("analysis thread panicked")
+            // Unreachable while the thread body catches unwinds (an abort
+            // never returns here); kept graceful all the same.
+            .unwrap_or_else(|_| Self::internal_error(&outer_text))
+    }
+
+    /// The degraded document a panicked analysis lands on: no program, the
+    /// live text faithfully recorded (so position mapping and re-analysis on
+    /// the next edit behave), and one honest diagnostic.
+    fn internal_error(text: &str) -> Self {
+        let line_index = Arc::new(LineIndex::new(text));
+        Document {
+            analyzed_index: Arc::clone(&line_index),
+            line_index,
+            program: None,
+            const_results: Default::default(),
+            diagnostics: vec![Error {
+                note: None,
+                span: vilan_core::span::Span::new((), 0..0),
+                msg: "internal error: the compiler panicked analyzing this file (this is a bug — the details are on stderr)"
+                    .to_string(),
+            }],
+            diagnostic_sources: vec![SourceId(0)],
+            warnings: Vec::new(),
+            warning_sources: Vec::new(),
+            text: text.to_string(),
+            text_hash: hash_text(text),
+            entity_spans: Vec::new(),
+            platform_requirements: HashMap::new(),
+            manifest_problem: None,
+        }
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {

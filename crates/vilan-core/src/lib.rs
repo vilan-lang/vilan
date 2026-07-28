@@ -195,6 +195,36 @@ pub fn analyze_source(
     platform: Option<Platform>,
     workspace: &Workspace,
 ) -> (Option<Program<'static>>, Vec<Error>) {
+    // One outer fence covers the stages the analysis fence below does not —
+    // lexing/parsing and the lift rewrite. A panic there used to unwind into
+    // the caller: in the editor that meant through `Document::analyze`'s
+    // thread join and out of a request handler, aborting the whole language
+    // server (B40). It degrades to "no program" plus an honest diagnostic
+    // instead; the panic hook (or default hook) has already written the
+    // payload and location to stderr.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        analyze_source_unfenced(source, std, pkg_root, entry_path, platform, workspace)
+    }))
+    .unwrap_or_else(|_| {
+        (
+            None,
+            vec![Error {
+                note: None,
+                span: crate::span::Span::new((), 0..0),
+                msg: "internal error: the compiler panicked analyzing this file (this is a bug — the details are on stderr)".to_string(),
+            }],
+        )
+    })
+}
+
+fn analyze_source_unfenced(
+    source: &'static str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Option<Platform>,
+    workspace: &Workspace,
+) -> (Option<Program<'static>>, Vec<Error>) {
     // The handwritten frontend lexes and parses in a single fast-and-rich pass,
     // always returning a tree — clean, or recovered from syntax errors — together
     // with every diagnostic (lexer and parser, span-ordered). Analysis below runs

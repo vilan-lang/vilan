@@ -22181,7 +22181,9 @@ static DOCUMENT_OVERLAY: std::sync::OnceLock<
 pub fn set_document_overlay(path: &Path, text: Option<String>) {
     let overlay = DOCUMENT_OVERLAY.get_or_init(Default::default);
     let key = crate::util::canonical_path(path);
-    let mut overlay = overlay.lock().unwrap();
+    let mut overlay = overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match text {
         Some(text) => {
             overlay.insert(key, text);
@@ -22194,7 +22196,9 @@ pub fn set_document_overlay(path: &Path, text: Option<String>) {
 
 fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
-    let overlay = overlay.lock().unwrap();
+    let overlay = overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     overlay.get(&crate::util::canonical_path(path)).cloned()
 }
 
@@ -22230,7 +22234,11 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     };
     // A previously-recovered broken module is served from its own cache first,
     // so it is rich-parsed (and its source leaked) once per distinct content.
-    if let Some(loaded) = error_cache.lock().unwrap().get(&key) {
+    if let Some(loaded) = error_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
         return Some(*loaded);
     }
 
@@ -22302,7 +22310,10 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
         text: source,
         parse_errors,
     };
-    error_cache.lock().unwrap().insert(key, loaded);
+    error_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, loaded);
     Some(loaded)
 }
 

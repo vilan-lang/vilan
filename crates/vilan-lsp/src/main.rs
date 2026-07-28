@@ -370,6 +370,28 @@ fn content_modified() -> JsonRpcError {
     }
 }
 
+/// The refusal a PANICKED edit-producing handler answers with (B40). Rename
+/// and formatting return edits; their empty answer reads as "nothing to do",
+/// which a failure is not — so they refuse, in the inline no-toast spelling
+/// `still_analyzing` documents.
+fn handler_panicked() -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::ServerError(-32803),
+        message: "the request failed inside the language server — this is a vilan-lsp bug".into(),
+        data: None,
+    }
+}
+
+/// The human part of a panic payload (`panic!` carries a `&str` or `String`;
+/// anything else renders opaquely).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 /// Whether `uri` names a `vilan.toml`. The extension registers manifests with
 /// the server by PATH (any language id), so this is the routing question every
 /// document notification asks first.
@@ -1100,7 +1122,10 @@ async fn publish_document(
         let Some(document) = documents.get(uri) else {
             return;
         };
-        publish_state.lock().unwrap().plan_publish(uri, &document)
+        publish_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan_publish(uri, &document)
     };
     for (target, group) in actions {
         client.publish_diagnostics(target, group, None).await;
@@ -1196,6 +1221,41 @@ fn pause_action(
 }
 
 impl Backend {
+    /// Runs a request handler's synchronous body under a panic fence (B40).
+    /// A panic in a handler used to unwind through the async runtime and
+    /// abort the whole server — exit 101, and after five crashes in three
+    /// minutes the client stops restarting it, so one bad request locked the
+    /// user out of every LSP feature. Here it degrades to `fallback`, loudly:
+    /// the default panic hook has already put the payload and location on
+    /// stderr (the extension's output channel), and an ERROR log names the
+    /// handler. Every query handler's body is `.await`-free — pure work over
+    /// a snapshot guard — which is what lets one synchronous seam cover them
+    /// all (a DashMap guard just drops on unwind; the two `std::sync` locks
+    /// are poison-tolerant so a caught panic cannot convert into a
+    /// panic-on-every-later-request loop).
+    fn fenced<R>(&self, request: &'static str, fallback: R, work: impl FnOnce() -> R) -> R {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            panic_fence_tests::maybe_inject(request);
+            work()
+        }));
+        match caught {
+            Ok(answer) => answer,
+            Err(payload) => {
+                let text = format!(
+                    "the {request} handler panicked: {} — answered with its fallback (this is a vilan-lsp bug; details on stderr)",
+                    panic_message(payload.as_ref())
+                );
+                eprintln!("vilan-lsp: {text}");
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    client.log_message(MessageType::ERROR, text).await;
+                });
+                fallback
+            }
+        }
+    }
+
     /// Schedule a debounced re-analysis. A burst of edits collapses to a single
     /// analysis once typing pauses, and an edit that leaves the buffer unchanged
     /// is skipped entirely.
@@ -1282,82 +1342,88 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Seed the feature settings from the client's `initializationOptions`
-        // (the extension sends the `vilan` config object); later changes arrive
-        // via `did_change_configuration`.
-        if let Some(options) = &params.initialization_options {
-            *self.config.write().unwrap() = Config::from_settings(options);
-        }
-        // Snippet completions (tab-stop placeholders) need the client to opt in
-        // via `completionItem.snippetSupport`; without it, a call-shaped
-        // completion degrades to plain text. This is fixed for the session.
-        let snippet_support = params
-            .capabilities
-            .text_document
-            .as_ref()
-            .and_then(|text_document| text_document.completion.as_ref())
-            .and_then(|completion| completion.completion_item.as_ref())
-            .and_then(|completion_item| completion_item.snippet_support)
-            .unwrap_or(false);
-        self.snippet_support
-            .store(snippet_support, Ordering::Relaxed);
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                        ..Default::default()
-                    },
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                references_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                document_formatting_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions {
-                    // `.` and `:` (the second `:` of `::`) re-trigger completion so
-                    // member/path candidates appear without a manual invoke.
-                    trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
-                    ..Default::default()
-                }),
-                inlay_hint_provider: Some(OneOf::Left(true)),
-                // E2: precision highlighting from the analyzed program. The
-                // legend is index-aligned with `document::TokenKind`.
-                semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensOptions(
-                        SemanticTokensOptions {
-                            legend: SemanticTokensLegend {
-                                token_types: crate::document::TOKEN_TYPES
-                                    .iter()
-                                    .map(|name| SemanticTokenType::new(name))
-                                    .collect(),
-                                token_modifiers: crate::document::TOKEN_MODIFIERS
-                                    .iter()
-                                    .map(|name| SemanticTokenModifier::new(name))
-                                    .collect(),
-                            },
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                            range: None,
+        self.fenced("initialize", Err(JsonRpcError::internal_error()), || {
+            // Seed the feature settings from the client's `initializationOptions`
+            // (the extension sends the `vilan` config object); later changes arrive
+            // via `did_change_configuration`.
+            if let Some(options) = &params.initialization_options {
+                *self
+                    .config
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Config::from_settings(options);
+            }
+            // Snippet completions (tab-stop placeholders) need the client to opt in
+            // via `completionItem.snippetSupport`; without it, a call-shaped
+            // completion degrades to plain text. This is fixed for the session.
+            let snippet_support = params
+                .capabilities
+                .text_document
+                .as_ref()
+                .and_then(|text_document| text_document.completion.as_ref())
+                .and_then(|completion| completion.completion_item.as_ref())
+                .and_then(|completion_item| completion_item.snippet_support)
+                .unwrap_or(false);
+            self.snippet_support
+                .store(snippet_support, Ordering::Relaxed);
+            Ok(InitializeResult {
+                capabilities: ServerCapabilities {
+                    text_document_sync: Some(TextDocumentSyncCapability::Options(
+                        TextDocumentSyncOptions {
+                            open_close: Some(true),
+                            change: Some(TextDocumentSyncKind::FULL),
+                            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                             ..Default::default()
                         },
-                    ),
-                ),
-                // WO-2: the "Organize Imports" source action (sort + prune).
-                code_action_provider: Some(CodeActionProviderCapability::Options(
-                    CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                    )),
+                    hover_provider: Some(HoverProviderCapability::Simple(true)),
+                    definition_provider: Some(OneOf::Left(true)),
+                    references_provider: Some(OneOf::Left(true)),
+                    rename_provider: Some(OneOf::Left(true)),
+                    document_symbol_provider: Some(OneOf::Left(true)),
+                    document_formatting_provider: Some(OneOf::Left(true)),
+                    completion_provider: Some(CompletionOptions {
+                        // `.` and `:` (the second `:` of `::`) re-trigger completion so
+                        // member/path candidates appear without a manual invoke.
+                        trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
                         ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            },
-            server_info: Some(ServerInfo {
-                name: "vilan-lsp".to_string(),
-                version: None,
-            }),
+                    }),
+                    inlay_hint_provider: Some(OneOf::Left(true)),
+                    // E2: precision highlighting from the analyzed program. The
+                    // legend is index-aligned with `document::TokenKind`.
+                    semantic_tokens_provider: Some(
+                        SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                legend: SemanticTokensLegend {
+                                    token_types: crate::document::TOKEN_TYPES
+                                        .iter()
+                                        .map(|name| SemanticTokenType::new(name))
+                                        .collect(),
+                                    token_modifiers: crate::document::TOKEN_MODIFIERS
+                                        .iter()
+                                        .map(|name| SemanticTokenModifier::new(name))
+                                        .collect(),
+                                },
+                                full: Some(SemanticTokensFullOptions::Bool(true)),
+                                range: None,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    // WO-2: the "Organize Imports" source action (sort + prune).
+                    code_action_provider: Some(CodeActionProviderCapability::Options(
+                        CodeActionOptions {
+                            code_action_kinds: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+                server_info: Some(ServerInfo {
+                    name: "vilan-lsp".to_string(),
+                    version: None,
+                }),
+            })
         })
     }
 
@@ -1374,7 +1440,11 @@ impl LanguageServer for Backend {
         // — the language client also emits a bare `{ settings: null }` on any
         // config change, which must NOT reset our settings to their defaults.
         if params.settings.get("vilan").is_some() {
-            *self.config.write().unwrap() = Config::from_settings(&params.settings);
+            *self
+                .config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Config::from_settings(&params.settings);
         }
     }
 
@@ -1388,51 +1458,66 @@ impl LanguageServer for Backend {
         // — still finds it. (The debounced change path runs off the async thread,
         // but there a previous analysis is always already in place.)
         let uri = params.text_document.uri;
-        // A manifest is not a vilan source file: it feeds completion and
-        // nothing else. It is deliberately NOT registered as a document
-        // overlay either — project resolution reads `vilan.toml` from disk, so
-        // an unsaved manifest edit takes effect on save (which re-analyzes
-        // every open document through `did_save`).
-        if is_manifest(&uri) {
-            self.manifests
-                .insert(uri, ManifestDocument::new(params.text_document.text));
-            return;
+        // The synchronous prefix fences (B40); the trailing publish is pure
+        // message sending. A panicked open publishes nothing — the map entry
+        // it failed to make is what "open" means everywhere else.
+        let publish = self.fenced("didOpen", false, || {
+            // A manifest is not a vilan source file: it feeds completion and
+            // nothing else. It is deliberately NOT registered as a document
+            // overlay either — project resolution reads `vilan.toml` from disk, so
+            // an unsaved manifest edit takes effect on save (which re-analyzes
+            // every open document through `did_save`).
+            if is_manifest(&uri) {
+                self.manifests.insert(
+                    uri.clone(),
+                    ManifestDocument::new(params.text_document.text),
+                );
+                return false;
+            }
+            let path = uri.to_file_path().unwrap_or_default();
+            // Register the buffer so OTHER documents' analyses load this one's
+            // live content instead of the file on disk (backlog E6).
+            vilan_core::analyzer::set_document_overlay(
+                &path,
+                Some(params.text_document.text.clone()),
+            );
+            let std_dir = discover_std_dir(&path);
+            let document = Document::analyze(&params.text_document.text, &std_dir, &path);
+            // The ONLY place a document enters the map. Every later analysis lands
+            // by merge onto what is here (`land`), which is what lets a result
+            // arriving after `did_close` be dropped instead of resurrecting the
+            // file: a missing entry can only mean "closed", never "not opened yet".
+            self.documents.insert(uri.clone(), document);
+            true
+        });
+        if publish {
+            publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
         }
-        let path = uri.to_file_path().unwrap_or_default();
-        // Register the buffer so OTHER documents' analyses load this one's
-        // live content instead of the file on disk (backlog E6).
-        vilan_core::analyzer::set_document_overlay(&path, Some(params.text_document.text.clone()));
-        let std_dir = discover_std_dir(&path);
-        let document = Document::analyze(&params.text_document.text, &std_dir, &path);
-        // The ONLY place a document enters the map. Every later analysis lands
-        // by merge onto what is here (`land`), which is what lets a result
-        // arriving after `did_close` be dropped instead of resurrecting the
-        // file: a missing entry can only mean "closed", never "not opened yet".
-        self.documents.insert(uri.clone(), document);
-        publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.pop() {
-            let uri = params.text_document.uri;
-            if is_manifest(&uri) {
-                self.manifests
-                    .insert(uri, ManifestDocument::new(change.text));
-                return;
+        self.fenced("did_change", (), || {
+            if let Some(change) = params.content_changes.pop() {
+                let uri = params.text_document.uri;
+                if is_manifest(&uri) {
+                    self.manifests
+                        .insert(uri, ManifestDocument::new(change.text));
+                    return;
+                }
+                // Apply the new text to the open document immediately so a completion
+                // request arriving before the debounced re-analysis still sees the
+                // just-typed character (e.g. the `.` that selects member completion).
+                if let Some(mut document) = self.documents.get_mut(&uri) {
+                    document.set_text(&change.text);
+                }
+                // The overlay updates immediately (pre-debounce), so any analysis
+                // that runs meanwhile — a dependent's, this one's — sees the edit.
+                if let Ok(path) = uri.to_file_path() {
+                    vilan_core::analyzer::set_document_overlay(&path, Some(change.text.clone()));
+                }
+                self.on_change(uri, change.text);
             }
-            // Apply the new text to the open document immediately so a completion
-            // request arriving before the debounced re-analysis still sees the
-            // just-typed character (e.g. the `.` that selects member completion).
-            if let Some(mut document) = self.documents.get_mut(&uri) {
-                document.set_text(&change.text);
-            }
-            // The overlay updates immediately (pre-debounce), so any analysis
-            // that runs meanwhile — a dependent's, this one's — sees the edit.
-            if let Ok(path) = uri.to_file_path() {
-                vilan_core::analyzer::set_document_overlay(&path, Some(change.text.clone()));
-            }
-            self.on_change(uri, change.text);
-        }
+        })
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -1482,7 +1567,11 @@ impl LanguageServer for Backend {
         // Clear this document's diagnostics AND the ones it published onto
         // other files — each target republishes as the remaining owners'
         // merged view (empty where this was the only contributor).
-        let actions = self.publish_state.lock().unwrap().plan_close(&uri);
+        let actions = self
+            .publish_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan_close(&uri);
         for (target, group) in actions {
             self.client.publish_diagnostics(target, group, None).await;
         }
@@ -1491,260 +1580,295 @@ impl LanguageServer for Backend {
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        // `vilan.inlayHints.enabled` gates the provider server-side.
-        if !self.config.read().unwrap().inlay_hints_enabled {
-            return Ok(None);
-        }
-        let uri = params.text_document.uri;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let range = params.range;
-        let hints = document
-            .inlay_hints()
-            .into_iter()
-            .filter_map(|(offset, label)| {
-                // The anchor is a program offset, so it converts through the
-                // ANALYZED index (S1). Through the live one, an insertion above
-                // slid every hint below it — and the viewport filter on the next
-                // line then dropped the ones that slid out of range entirely.
-                //
-                // The filter itself compares this analyzed-space position to
-                // `params.range`, which is live-space — under FULL sync there
-                // is no mapping between the two, so this is as good as it gets
-                // (backlog 39c): exact for same-line edits, off by the inserted
-                // or deleted lines near the viewport edge for the ~200 ms until
-                // the refresh lands.
-                let position = document.analyzed_position(offset);
-                (position >= range.start && position <= range.end).then(|| InlayHint {
-                    position,
-                    label: InlayHintLabel::String(label),
-                    kind: Some(InlayHintKind::TYPE),
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: Some(false),
-                    padding_right: Some(false),
-                    data: None,
+        self.fenced("inlay_hint", Ok(None), || {
+            // `vilan.inlayHints.enabled` gates the provider server-side.
+            if !self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .inlay_hints_enabled
+            {
+                return Ok(None);
+            }
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let range = params.range;
+            let hints = document
+                .inlay_hints()
+                .into_iter()
+                .filter_map(|(offset, label)| {
+                    // The anchor is a program offset, so it converts through the
+                    // ANALYZED index (S1). Through the live one, an insertion above
+                    // slid every hint below it — and the viewport filter on the next
+                    // line then dropped the ones that slid out of range entirely.
+                    //
+                    // The filter itself compares this analyzed-space position to
+                    // `params.range`, which is live-space — under FULL sync there
+                    // is no mapping between the two, so this is as good as it gets
+                    // (backlog 39c): exact for same-line edits, off by the inserted
+                    // or deleted lines near the viewport edge for the ~200 ms until
+                    // the refresh lands.
+                    let position = document.analyzed_position(offset);
+                    (position >= range.start && position <= range.end).then(|| InlayHint {
+                        position,
+                        label: InlayHintLabel::String(label),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(false),
+                        padding_right: Some(false),
+                        data: None,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        Ok(Some(hints))
+                .collect::<Vec<_>>();
+            Ok(Some(hints))
+        })
     }
 
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        // `vilan.semanticTokens.enabled` gates the provider server-side; when off,
-        // the editor falls back to its TextMate grammar.
-        if !self.config.read().unwrap().semantic_tokens_enabled {
-            return Ok(None);
-        }
-        let uri = params.text_document.uri;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let data = encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
-        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data,
-        })))
+        self.fenced("semantic_tokens_full", Ok(None), || {
+            // `vilan.semanticTokens.enabled` gates the provider server-side; when off,
+            // the editor falls back to its TextMate grammar.
+            if !self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .semantic_tokens_enabled
+            {
+                return Ok(None);
+            }
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let data =
+                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            })))
+        })
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        // Program-space lookup: the position converts through the ANALYZED
-        // index, so it names the same character the analysis saw there (S1).
-        let offset = document.analyzed_offset(position);
-        Ok(document.hover(offset).map(|label| Hover {
-            contents: HoverContents::Scalar(MarkedString::String(label)),
-            range: None,
-        }))
+        self.fenced("hover", Ok(None), || {
+            let uri = params.text_document_position_params.text_document.uri;
+            let position = params.text_document_position_params.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            // Program-space lookup: the position converts through the ANALYZED
+            // index, so it names the same character the analysis saw there (S1).
+            let offset = document.analyzed_offset(position);
+            Ok(document.hover(offset).map(|label| Hover {
+                contents: HoverContents::Scalar(MarkedString::String(label)),
+                range: None,
+            }))
+        })
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        if is_manifest(&uri) {
-            let Some(manifest) = self.manifests.get(&uri) else {
+        self.fenced("completion", Ok(None), || {
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            if is_manifest(&uri) {
+                let Some(manifest) = self.manifests.get(&uri) else {
+                    return Ok(None);
+                };
+                let offset = manifest.line_index.offset(position);
+                let items = manifest_completion::completions(&manifest.text, offset)
+                    .into_iter()
+                    .map(|item| to_manifest_item(item, &manifest.line_index))
+                    .collect();
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+            let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            let offset = manifest.line_index.offset(position);
-            let items = manifest_completion::completions(&manifest.text, offset)
+            let offset = document.line_index.offset(position);
+            let mode = self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completion_function_call;
+            let snippet_support = self.snippet_support.load(Ordering::Relaxed);
+            let items = document
+                .completion(offset)
                 .into_iter()
-                .map(|item| to_manifest_item(item, &manifest.line_index))
+                .map(|completion| to_completion_item(completion, mode, snippet_support))
                 .collect();
-            return Ok(Some(CompletionResponse::Array(items)));
-        }
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let offset = document.line_index.offset(position);
-        let mode = self.config.read().unwrap().completion_function_call;
-        let snippet_support = self.snippet_support.load(Ordering::Relaxed);
-        let items = document
-            .completion(offset)
-            .into_iter()
-            .map(|completion| to_completion_item(completion, mode, snippet_support))
-            .collect();
-        Ok(Some(CompletionResponse::Array(items)))
+            Ok(Some(CompletionResponse::Array(items)))
+        })
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let offset = document.analyzed_offset(position);
-        let Some((source, span)) = document.definition(offset) else {
-            return Ok(None);
-        };
-        Ok(self
-            .location_for(&document, &uri, source, span)
-            .map(GotoDefinitionResponse::Scalar))
+        self.fenced("goto_definition", Ok(None), || {
+            let uri = params.text_document_position_params.text_document.uri;
+            let position = params.text_document_position_params.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = document.analyzed_offset(position);
+            let Some((source, span)) = document.definition(offset) else {
+                return Ok(None);
+            };
+            Ok(self
+                .location_for(&document, &uri, source, span)
+                .map(GotoDefinitionResponse::Scalar))
+        })
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let offset = document.analyzed_offset(position);
-        let locations = document
-            .references(offset)
-            .into_iter()
-            .filter_map(|(source, span)| self.location_for(&document, &uri, source, span))
-            .collect();
-        Ok(Some(locations))
+        self.fenced("references", Ok(None), || {
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = document.analyzed_offset(position);
+            let locations = document
+                .references(offset)
+                .into_iter()
+                .filter_map(|(source, span)| self.location_for(&document, &uri, source, span))
+                .collect();
+            Ok(Some(locations))
+        })
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        let new_name = params.new_name;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        // S3: a rename is edits computed from program data. Applying them to a
-        // buffer that has moved on corrupts it, so refuse while the snapshots
-        // diverge instead of guessing. At human timescales this is invisible —
-        // a rename happens at rest, after the debounce has landed.
-        if document.is_stale() {
-            return Err(still_analyzing());
-        }
-        let offset = document.analyzed_offset(position);
-        let occurrences = document.references(offset);
-        if occurrences.is_empty() {
-            return Ok(None);
-        }
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-        for (source, span) in occurrences {
-            if let Some(location) = self.location_for(&document, &uri, source, span) {
-                changes.entry(location.uri).or_default().push(TextEdit {
-                    range: location.range,
-                    new_text: new_name.clone(),
-                });
+        self.fenced("rename", Err(handler_panicked()), || {
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            let new_name = params.new_name;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            // S3: a rename is edits computed from program data. Applying them to a
+            // buffer that has moved on corrupts it, so refuse while the snapshots
+            // diverge instead of guessing. At human timescales this is invisible —
+            // a rename happens at rest, after the debounce has landed.
+            if document.is_stale() {
+                return Err(still_analyzing());
             }
-        }
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }))
+            let offset = document.analyzed_offset(position);
+            let occurrences = document.references(offset);
+            if occurrences.is_empty() {
+                return Ok(None);
+            }
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            for (source, span) in occurrences {
+                if let Some(location) = self.location_for(&document, &uri, source, span) {
+                    changes.entry(location.uri).or_default().push(TextEdit {
+                        range: location.range,
+                        new_text: new_name.clone(),
+                    });
+                }
+            }
+            Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }))
+        })
     }
 
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        let uri = params.text_document.uri;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let symbols = document
-            .document_symbols()
-            .into_iter()
-            .map(|symbol| to_lsp_symbol(symbol, document.analyzed_index()))
-            .collect::<Vec<_>>();
-        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+        self.fenced("document_symbol", Ok(None), || {
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let symbols = document
+                .document_symbols()
+                .into_iter()
+                .map(|symbol| to_lsp_symbol(symbol, document.analyzed_index()))
+                .collect::<Vec<_>>();
+            Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+        })
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        let uri = params.text_document.uri;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        let source = document.line_index.text();
-        let formatted = vilan_core::formatter::format(source);
-        // `format` returns the input unchanged when the file is already canonical
-        // or hits a construct it can't print (it never produces non-round-tripping
-        // output) — either way there is nothing to edit.
-        if formatted == source {
-            return Ok(None);
-        }
-        // Replace the whole document in one edit, from the start to the end
-        // position the line index reports for the final byte.
-        let end = document.line_index.position(source.len());
-        Ok(Some(vec![TextEdit {
-            range: Range::new(Position::new(0, 0), end),
-            new_text: formatted,
-        }]))
+        self.fenced("formatting", Err(handler_panicked()), || {
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let source = document.line_index.text();
+            let formatted = vilan_core::formatter::format(source);
+            // `format` returns the input unchanged when the file is already canonical
+            // or hits a construct it can't print (it never produces non-round-tripping
+            // output) — either way there is nothing to edit.
+            if formatted == source {
+                return Ok(None);
+            }
+            // Replace the whole document in one edit, from the start to the end
+            // position the line index reports for the final byte.
+            let end = document.line_index.position(source.len());
+            Ok(Some(vec![TextEdit {
+                range: Range::new(Position::new(0, 0), end),
+                new_text: formatted,
+            }]))
+        })
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        // The only source action we offer is Organize Imports; skip the work
-        // entirely when the client asked for a different kind (e.g. quickfix).
-        if !organize_imports_requested(&params.context.only) {
-            return Ok(None);
-        }
-        let uri = params.text_document.uri;
-        let Some(document) = self.documents.get(&uri) else {
-            return Ok(None);
-        };
-        // S3, as for rename: the action returns text edits, and its prune half
-        // is computed from program data. Refuse while the snapshots diverge
-        // rather than hand back a half-informed edit set — with the SILENT
-        // spelling: code actions fire automatically (menu population, the
-        // on-save hooks), so this refusal must not toast.
-        if document.is_stale() {
-            return Err(content_modified());
-        }
-        let edits = document.organize_import_edits();
-        // No edits = already organized (or nothing to do): offer no action, so
-        // `codeActionsOnSave` is a clean no-op.
-        if edits.is_empty() {
-            return Ok(None);
-        }
-        let text_edits: Vec<TextEdit> = edits
-            .into_iter()
-            .map(|(span, new_text)| TextEdit {
-                // Live-space: these spans come from the formatter's own parse
-                // of the live text, not from the program (S2). The staleness
-                // refusal above means the two texts are equal here anyway.
-                range: document.line_index.range(&span),
-                new_text,
-            })
-            .collect();
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-        changes.insert(uri, text_edits);
-        let action = CodeAction {
-            title: "Organize Imports".to_string(),
-            kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
+        self.fenced("code_action", Ok(None), || {
+            // The only source action we offer is Organize Imports; skip the work
+            // entirely when the client asked for a different kind (e.g. quickfix).
+            if !organize_imports_requested(&params.context.only) {
+                return Ok(None);
+            }
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            // S3, as for rename: the action returns text edits, and its prune half
+            // is computed from program data. Refuse while the snapshots diverge
+            // rather than hand back a half-informed edit set — with the SILENT
+            // spelling: code actions fire automatically (menu population, the
+            // on-save hooks), so this refusal must not toast.
+            if document.is_stale() {
+                return Err(content_modified());
+            }
+            let edits = document.organize_import_edits();
+            // No edits = already organized (or nothing to do): offer no action, so
+            // `codeActionsOnSave` is a clean no-op.
+            if edits.is_empty() {
+                return Ok(None);
+            }
+            let text_edits: Vec<TextEdit> = edits
+                .into_iter()
+                .map(|(span, new_text)| TextEdit {
+                    // Live-space: these spans come from the formatter's own parse
+                    // of the live text, not from the program (S2). The staleness
+                    // refusal above means the two texts are equal here anyway.
+                    range: document.line_index.range(&span),
+                    new_text,
+                })
+                .collect();
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            changes.insert(uri, text_edits);
+            let action = CodeAction {
+                title: "Organize Imports".to_string(),
+                kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        Ok(Some(vec![CodeActionOrCommand::CodeAction(action)]))
+            };
+            Ok(Some(vec![CodeActionOrCommand::CodeAction(action)]))
+        })
     }
 }
 
@@ -1766,13 +1890,100 @@ fn organize_imports_requested(only: &Option<Vec<CodeActionKind>>) -> bool {
     })
 }
 
+/// B40: request handlers are panic-fenced. A panic used to unwind through
+/// the async runtime and abort the whole server — exit 101, five crashes in
+/// three minutes and the client stops restarting it. These prove the fence
+/// (a panicked handler answers its fallback) and, as important, that the
+/// server KEEPS answering afterwards — a poisoned lock would turn the first
+/// caught panic into a panic on every later request.
+#[cfg(test)]
+mod panic_fence_tests {
+    use super::snapshot_consistency_tests::{SOURCE, backend, open_with_live_edit, rename_params};
+    use super::*;
+
+    thread_local! {
+        /// The handler whose next fenced body panics (consumed on fire).
+        /// Thread-local: `#[tokio::test]`'s current-thread runtime polls the
+        /// handler future on the test's own thread, so an armed injection
+        /// cannot leak into a concurrently running test's handler calls.
+        static INJECT: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Called by `Backend::fenced` at the top of every fenced body.
+    pub(crate) fn maybe_inject(request: &'static str) {
+        INJECT.with(|slot| {
+            if slot.get() == Some(request) {
+                slot.set(None);
+                panic!("test-injected {request} panic");
+            }
+        });
+    }
+
+    fn arm(request: &'static str) {
+        INJECT.with(|slot| slot.set(Some(request)));
+    }
+
+    fn hover_params(uri: &Url, position: Position) -> HoverParams {
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    // Read-only queries degrade to their empty answer; the next request runs
+    // the normal path — the server, its document map, and its locks all
+    // survive the caught panic.
+    #[tokio::test]
+    async fn a_panicked_query_answers_empty_and_the_server_keeps_serving() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+        // Line 1, inside `value` — a position that hovers in the normal path.
+        let position = Position::new(1, 6);
+        arm("hover");
+        let fenced = backend.hover(hover_params(&uri, position)).await;
+        assert_eq!(fenced.expect("the fallback, not an error"), None);
+        let after = backend.hover(hover_params(&uri, position)).await;
+        assert!(
+            after.expect("a normal answer").is_some(),
+            "the request after a caught panic must run the normal path"
+        );
+    }
+
+    // Edit-producing requests refuse instead: a rename answering `None`
+    // would read as "nothing to rename", which a failure is not.
+    #[tokio::test]
+    async fn a_panicked_rename_refuses_and_the_server_keeps_serving() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+        let position = Position::new(1, 6);
+        arm("rename");
+        let refused = backend
+            .rename(rename_params(&uri, position))
+            .await
+            .expect_err("a panicked rename must refuse, not answer");
+        assert_eq!(refused.code, ErrorCode::ServerError(-32803));
+        assert!(refused.message.contains("vilan-lsp bug"), "{refused:?}");
+        let after = backend.rename(rename_params(&uri, position)).await;
+        assert!(
+            after.expect("a normal answer").is_some(),
+            "the rename after a caught panic must run the normal path"
+        );
+    }
+}
+
 #[cfg(test)]
 mod snapshot_consistency_tests {
     use super::*;
     use crate::document::tests::std_root;
     use tower_lsp::ClientSocket;
 
-    const SOURCE: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
+    pub(crate) const SOURCE: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
     /// The same program with one character inserted on line 0, so every later
     /// byte shifts: what the buffer looks like mid-keystroke.
     const EDITED: &str = "fun  main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
@@ -1788,7 +1999,7 @@ mod snapshot_consistency_tests {
     /// A real `Backend` (the socket is returned so the client half stays
     /// alive). Only handlers that never talk to the client are driven through
     /// it — the ones this file guards.
-    fn backend() -> (LspService<Backend>, ClientSocket) {
+    pub(crate) fn backend() -> (LspService<Backend>, ClientSocket) {
         LspService::new(|client| Backend {
             client,
             documents: Arc::new(DashMap::new()),
@@ -1803,7 +2014,7 @@ mod snapshot_consistency_tests {
 
     /// An open document at [`uri`], analyzed from `SOURCE`, with `live` applied
     /// as an un-analyzed edit.
-    fn open_with_live_edit(backend: &Backend, live: &str) -> Url {
+    pub(crate) fn open_with_live_edit(backend: &Backend, live: &str) -> Url {
         let uri = uri();
         backend.documents.insert(uri.clone(), document(SOURCE));
         backend
@@ -1814,7 +2025,7 @@ mod snapshot_consistency_tests {
         uri
     }
 
-    fn rename_params(uri: &Url, position: Position) -> RenameParams {
+    pub(crate) fn rename_params(uri: &Url, position: Position) -> RenameParams {
         RenameParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
