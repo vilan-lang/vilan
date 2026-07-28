@@ -698,6 +698,24 @@ fn in_import_path(text: &str, offset: usize) -> bool {
     keyword == "import" || keyword == "use"
 }
 
+/// Clamp a rendered hover preview to its display budget, cutting at a char
+/// boundary. The budget is in BYTES, and byte 160 of a value carrying
+/// multi-byte text — an em-dash in a style constant's CSS, an arrow in a
+/// label — is not necessarily a boundary; `String::truncate` PANICS off one,
+/// and a hover must never take the server down (it did: page.vl's `stack`).
+fn clamp_preview(mut rendered: String) -> String {
+    const BUDGET: usize = 160;
+    if rendered.len() > BUDGET {
+        let mut cut = BUDGET;
+        while !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        rendered.truncate(cut);
+        rendered.push('…');
+    }
+    rendered
+}
+
 /// One open file, held as TWO snapshots (`lsp-snapshot-consistency.md`):
 ///
 /// - the **live** snapshot — [`text`](Document::text) and
@@ -1465,7 +1483,7 @@ impl Document {
 
     /// A constant's evaluated value for hover (`= 42`), when `id` is (or
     /// names) a binding whose initializer is a `const` expression the
-    /// evaluation resolved. Rendered compactly and truncated — hover is a
+    /// evaluation resolved. Rendered compactly and clamped — hover is a
     /// glance, not a dump.
     fn const_value_label(&self, program: &Program, id: Id) -> Option<String> {
         use vilan_core::analyzer::Expr;
@@ -1539,11 +1557,7 @@ impl Document {
         }
         let mut rendered = String::new();
         render(value, &mut rendered);
-        if rendered.len() > 160 {
-            rendered.truncate(160);
-            rendered.push('…');
-        }
-        Some(rendered)
+        Some(clamp_preview(rendered))
     }
 
     fn hover_label(&self, program: &Program, id: Id) -> Option<String> {
@@ -4298,6 +4312,68 @@ pub(crate) mod tests {
         )
         .expect("hover on the constant");
         assert!(hover.contains("= 64"), "{hover}");
+    }
+
+    // The crash shape (page.vl's `stack`, 2026-07-28): a const whose rendered
+    // value is long multi-byte text, so byte 160 of the preview lands inside
+    // an em-dash. The clamp used to be a bare `String::truncate(160)`, which
+    // PANICS off a char boundary — and a hover panic took the whole server
+    // down (five crashes and the client stops restarting it). The pin is the
+    // absence of that panic, plus the visible contract: clamped with an
+    // ellipsis.
+    #[test]
+    fn hover_clamps_a_long_multibyte_constant_without_panicking() {
+        let source = format!(
+            "import std::print;\n\nlet BANNER = const \"ab{}\";\n\nfun main() {{\n\tprint(BAN|NER);\n}}\n",
+            "—".repeat(70),
+        );
+        let hover = hover_at_cursor(&source).expect("hover on the constant");
+        assert!(hover.contains('…'), "the preview is clamped: {hover}");
+    }
+
+    // --- clamp_preview: the hover budget cuts at char boundaries ------------
+
+    // Byte 160 inside a 3-byte character: back up to the boundary below.
+    // Boundaries here are 2 + 3k, so the cut lands at 158 (2 ASCII + 52 whole
+    // em-dashes) — never mid-character, never a panic.
+    #[test]
+    fn the_preview_clamp_backs_off_a_three_byte_straddle() {
+        let text = format!("ab{}", "—".repeat(60));
+        assert!(!text.is_char_boundary(160), "the fixture must straddle");
+        let clamped = super::clamp_preview(text.clone());
+        let kept = clamped.strip_suffix('…').expect("clamped");
+        assert_eq!(kept.len(), 158, "2 ASCII + 52 whole em-dashes");
+        assert_eq!(kept, &text[..158]);
+    }
+
+    // The same for a 4-byte (astral) character: boundaries 2 + 4k, cut at 158
+    // (2 ASCII + 39 whole emoji).
+    #[test]
+    fn the_preview_clamp_backs_off_a_four_byte_straddle() {
+        let text = format!("ab{}", "😀".repeat(50));
+        assert!(!text.is_char_boundary(160), "the fixture must straddle");
+        let clamped = super::clamp_preview(text.clone());
+        let kept = clamped.strip_suffix('…').expect("clamped");
+        assert_eq!(kept.len(), 158, "2 ASCII + 39 whole emoji");
+        assert_eq!(kept, &text[..158]);
+    }
+
+    // When byte 160 IS a boundary, the clamp cuts exactly there…
+    #[test]
+    fn the_preview_clamp_cuts_exactly_on_a_boundary() {
+        let text = "a".repeat(200);
+        let clamped = super::clamp_preview(text.clone());
+        let kept = clamped.strip_suffix('…').expect("clamped");
+        assert_eq!(kept.len(), 160);
+        assert_eq!(kept, &text[..160]);
+    }
+
+    // …and a preview inside the budget passes through untouched — multi-byte
+    // text included, no ellipsis.
+    #[test]
+    fn a_preview_inside_the_budget_is_untouched() {
+        let text = "short — with a dash".to_string();
+        assert_eq!(super::clamp_preview(text.clone()), text);
     }
 
     // E9: a parameter's `context` clause renders in the hovered signature.
