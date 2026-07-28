@@ -7,7 +7,7 @@ import {
     commands,
     CodeAction,
     CodeActionKind,
-    OutputChannel,
+    LogOutputChannel,
     ExtensionContext,
     Range,
     TextDocument,
@@ -22,7 +22,7 @@ import {
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
-let outputChannel: OutputChannel | undefined;
+let outputChannel: LogOutputChannel | undefined;
 
 /// Windows executables carry a `.exe` suffix and nothing else does, so every use
 /// below collapses to exactly the pre-Windows expression on Linux and macOS
@@ -190,7 +190,7 @@ async function organizeImportsEdits(document: TextDocument): Promise<TextEdit[]>
 }
 
 export function activate(context: ExtensionContext): void {
-    outputChannel = window.createOutputChannel('Vilan Language Server');
+    outputChannel = window.createOutputChannel('Vilan Language Server', { log: true });
     context.subscriptions.push(outputChannel);
 
     void startClient(context);

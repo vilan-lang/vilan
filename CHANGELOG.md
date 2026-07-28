@@ -21,6 +21,8 @@ tracks the latest state.
 
 **`vilan fmt` stopped skipping files with redundant parentheses.** A parenthesized group that the language did not strictly need — `let b = (1 + 2);`, `ret (x);`, `f((1 + 2))`, `(300).as_u8()`, and above all `const (chain + reveal)` — used to make the formatter give up on the **entire file** and return it byte for byte, with `fmt --check` then reporting that file as already clean. Those files now format, and the parentheses are kept exactly where you wrote them: the formatter preserves a group you wrote rather than judging it redundant, because a redundant group is usually there for clarity. A style module written as `let heading = const (style()…margin(space(0)) + reveal);` was exactly this case, so it is also what kept the new chain splitting from reaching real files.
 
+**The VS Code extension requires VS Code 1.91 or newer.** The extension's language-client library moved to its current major (v10, clearing npm audit's outstanding advisories), and that library's floor is the extension's floor. The server's output channel became a log channel on the way: the Vilan Language Server output now carries timestamps and a per-level filter.
+
 **Vilan has a new look.** The palette moved from indigo-and-lavender to blush on near-black (`#F9DFE7` on `#120004`), and every rendering of the brand moved with it: the repository header, the VS Code extension's icon and listing banner, the CLI's post-upgrade mark, and the website. The mark itself is unchanged.
 -->
 
