@@ -507,6 +507,7 @@ pub fn organize_import_runs(
         cursor: 0,
         source,
         bailed: false,
+        split_statement_chain: false,
     };
     Some(printer.organize_runs(&items, keep))
 }
@@ -547,6 +548,7 @@ pub fn format(original: &str) -> String {
         cursor: 0,
         source,
         bailed: false,
+        split_statement_chain: false,
     };
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
@@ -564,6 +566,27 @@ pub fn format(original: &str) -> String {
     }
 }
 
+/// The column budget for a statement line. A statement whose inline rendering
+/// is *wider* than this — and whose expression carries a postfix chain of at
+/// least two `.name(…)` call links — re-renders with one link per line; at
+/// exactly the budget it stays inline. Deliberately not a knob: the formatter
+/// has one canonical output, and a width knob would fork every file's shape.
+const LINE_BUDGET: usize = 100;
+
+/// The columns a tab occupies when measuring a line. Vilan indents with tabs,
+/// so the measurement has to agree with what an editor shows.
+const TAB_COLUMNS: usize = 4;
+
+/// The display width of printed text, counting a tab as [`TAB_COLUMNS`] columns
+/// and every other character as one. (A tab only ever reaches this from inside a
+/// string literal or a verbatim slice — the printer's own indentation is
+/// measured from the indent level, not from the text.)
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| if character == '\t' { TAB_COLUMNS } else { 1 })
+        .sum()
+}
+
 struct Printer<'src> {
     out: String,
     indent: usize,
@@ -571,6 +594,14 @@ struct Printer<'src> {
     cursor: usize,
     source: &'src str,
     bailed: bool,
+    /// Armed for the re-render of one statement whose inline form overflowed
+    /// [`LINE_BUDGET`]: the postfix chain printed in that statement's own value
+    /// position breaks across lines. `print_expr` *takes* it on entry, so it
+    /// reaches a chain only through the forms that re-arm it explicitly — the
+    /// prefix and binary-left positions whose rendering keeps the chain on the
+    /// statement's own line. Everything else (a call argument, a list element, a
+    /// closure body) drops it, which is what keeps a nested chain inline (v1).
+    split_statement_chain: bool,
 }
 
 impl<'src> Printer<'src> {
@@ -700,9 +731,25 @@ impl<'src> Printer<'src> {
                 self.blank_line();
             }
             self.line();
+            // Print the statement inline, then re-print it with the chain split
+            // armed if that rendering overflowed the line budget. The terminator
+            // is part of what is measured (and glues to the last link in the
+            // split form); a trailing same-line comment is not — it is not the
+            // statement's code, and letting comment text drive the layout would
+            // make the shape depend on prose.
+            let statement_start = self.out.len();
+            let comment_cursor = self.cursor;
+            let terminated = Self::needs_semicolon(&item.0);
             self.print_item(item);
-            if Self::needs_semicolon(&item.0) {
+            if terminated {
                 self.out.push(';');
+            }
+            if self.begin_split_reprint(statement_start, comment_cursor) {
+                self.print_item(item);
+                self.split_statement_chain = false;
+                if terminated {
+                    self.out.push(';');
+                }
             }
             self.flush_trailing_comment(range.end);
             prev_end = range.end;
@@ -1535,7 +1582,15 @@ impl<'src> Printer<'src> {
                 self.blank_line();
             }
             self.line();
+            // A block's tail expression is a statement position too (it is the
+            // block's value), so it takes the same width rule.
+            let statement_start = self.out.len();
+            let comment_cursor = self.cursor;
             self.print_expr(tail);
+            if self.begin_split_reprint(statement_start, comment_cursor) {
+                self.print_expr(tail);
+                self.split_statement_chain = false;
+            }
             self.flush_trailing_comment(tail_range.end);
             prev_end = tail_range.end;
         }
@@ -1658,6 +1713,155 @@ impl<'src> Printer<'src> {
         }
     }
 
+    // --- Width-aware method-chain splitting ---------------------------------
+    //
+    // The formatter's only width-driven decision. A statement is printed inline
+    // first; if that rendering overflows [`LINE_BUDGET`] the output rolls back
+    // and the statement re-prints with `split_statement_chain` armed, which
+    // breaks the postfix chain in the statement's own value position across
+    // lines. Measuring the real rendering — rather than predicting its width —
+    // is what keeps the rule honest: the two forms are the same print, and the
+    // choice between them is purely the measured width.
+    //
+    // v1 is statement level only: a chain nested in a call argument, a list
+    // element, a closure body or a `match` arm stays inline, because
+    // `print_expr` drops the arming flag on entry and only the prefix and
+    // binary-left arms hand it on. Generalizing it recursively (breaking a
+    // chain wherever it overflows, wrapping long argument lists) is the
+    // deliberate non-goal — it needs a width model for nested contexts, not
+    // just for a statement's own line.
+
+    /// Whether the statement printed inline from output offset `start`
+    /// overflows the line budget. A rendering that already spans several lines
+    /// (a block, a `match`, a closure with a block body) never re-splits: the
+    /// width rule reads a single-line rendering only, so that the measured
+    /// width and the line it describes are the same thing.
+    fn over_line_budget(&self, start: usize) -> bool {
+        let rendered = &self.out[start..];
+        !rendered.contains('\n')
+            && self.indent * TAB_COLUMNS + display_width(rendered) > LINE_BUDGET
+    }
+
+    /// Rolls the output and the comment cursor back to the start of the
+    /// statement just printed inline and arms the chain split, so the caller
+    /// can print the same statement again in split form. Returns `false` —
+    /// changing nothing — when the statement fits the budget.
+    fn begin_split_reprint(&mut self, statement_start: usize, comment_cursor: usize) -> bool {
+        if !self.over_line_budget(statement_start) {
+            return false;
+        }
+        self.out.truncate(statement_start);
+        self.cursor = comment_cursor;
+        self.split_statement_chain = true;
+        true
+    }
+
+    /// Starts a continuation line one indentation level past the statement's
+    /// own — where a chain's `.name(…)` links and a binary continuation go.
+    fn continuation_line(&mut self) {
+        self.indent += 1;
+        self.line();
+        self.indent -= 1;
+    }
+
+    /// The postfix spine of `expr`: its innermost subject, then every postfix
+    /// applied to it in application order (innermost first). A `Call` is *not*
+    /// a spine step — `style()` is a chain's subject, not a link — and neither
+    /// is a `?.` lift chain, which absorbs what follows it.
+    fn postfix_spine<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+    ) -> (&'ast Spanned<Node<'src>>, Vec<&'ast Spanned<Node<'src>>>) {
+        let mut spine = Vec::new();
+        let mut subject = expr;
+        loop {
+            let inner = match &subject.0 {
+                Node::MemberAccessor(inner, _)
+                | Node::Index(inner, _)
+                | Node::TryAssert(inner)
+                | Node::Lifted(inner) => inner,
+                _ => break,
+            };
+            spine.push(subject);
+            subject = inner;
+        }
+        spine.reverse();
+        (subject, spine)
+    }
+
+    /// Whether a spine step is a `.name(…)` call link — the unit the split form
+    /// gives its own line. Every other postfix (`.field`, `[i]`, `?`, `!`) glues
+    /// to the segment printed before it.
+    fn is_call_link(node: &Node<'src>) -> bool {
+        matches!(node, Node::MemberAccessor(_, member) if matches!(member.0, Node::Call(_, _, _)))
+    }
+
+    /// Whether `expr` is a postfix chain the split form breaks: two or more
+    /// `.name(…)` call links. One link is not a chain — breaking it would buy a
+    /// line and no clarity.
+    fn is_breakable_chain(expr: &Spanned<Node<'src>>) -> bool {
+        let (_, spine) = Self::postfix_spine(expr);
+        spine
+            .iter()
+            .filter(|node| Self::is_call_link(&node.0))
+            .count()
+            >= 2
+    }
+
+    /// Prints a postfix chain in split form: the subject stays on the
+    /// statement's line, and every `.name(…)` link starts a fresh line one
+    /// indentation level in, carrying whatever non-call postfixes follow it
+    /// (`a.b(x).c` keeps `.c` on `.b(x)`'s line). The statement's terminator is
+    /// the caller's, so it glues to the last link. Only ever called for a chain
+    /// [`Self::is_breakable_chain`] accepted, so the spine holds at least the
+    /// two call links.
+    fn print_split_chain(&mut self, expr: &Spanned<Node<'src>>) {
+        let (subject, spine) = Self::postfix_spine(expr);
+        // The subject prints exactly as the innermost postfix would print it
+        // inline — a `.member`/`[index]` subject through the lift-wrapping rule,
+        // a `?`/`!` subject through the plain operand rule.
+        match &spine[0].0 {
+            Node::MemberAccessor(_, _) | Node::Index(_, _) => self.print_postfix_subject(subject),
+            _ => self.print_operand(subject, 100),
+        }
+        for step in spine {
+            if Self::is_call_link(&step.0) {
+                self.continuation_line();
+            }
+            self.print_postfix_suffix(step);
+        }
+    }
+
+    /// Prints just the postfix a spine step applies — its subject is already
+    /// printed. Mirrors the four postfix arms of `print_expr`.
+    fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
+        match &step.0 {
+            Node::MemberAccessor(_, member) => {
+                self.out.push('.');
+                self.print_expr(member);
+            }
+            Node::Index(_, index) => {
+                self.out.push('[');
+                self.print_expr(index);
+                self.out.push(']');
+            }
+            Node::TryAssert(_) => self.out.push('!'),
+            Node::Lifted(_) => self.out.push('?'),
+            // `postfix_spine` yields only the four forms above.
+            _ => self.bailed = true,
+        }
+    }
+
+    /// Prints `expr` as an operand (see [`Self::print_operand`]), handing an
+    /// armed chain split down to it only when the operand needs no parentheses
+    /// of its own — splitting inside parentheses would strand the closing paren
+    /// on a continuation line. This is the single way the split reaches past a
+    /// statement's prefix (`let x = const …`, `ret …`, `await …`) and into the
+    /// left operand of a binary.
+    fn print_split_operand(&mut self, expr: &Spanned<Node<'src>>, minimum: u8, split: bool) {
+        self.split_statement_chain = split && Self::expression_precedence(&expr.0) >= minimum;
+        self.print_operand(expr, minimum);
+    }
+
     /// Prints a comma-separated list of macro arguments, each reprinted VERBATIM
     /// from its source span. A macro's arguments are syntax (the parser keeps only
     /// their spans, not a tree), so — like an interpolated string — they are
@@ -1728,8 +1932,18 @@ impl<'src> Printer<'src> {
 
     /// Prints any expression. Sets `bailed` for forms not yet handled.
     fn print_expr(&mut self, expr: &Spanned<Node<'src>>) {
+        // Take the pending statement-level chain split here, so that every form
+        // *drops* it by default and only the arms below re-arm it explicitly
+        // (via `print_split_operand`) for the operand that continues the
+        // statement's own line. Forgetting one of those can only lose a split,
+        // never produce one where v1 says there should be none.
+        let split = std::mem::take(&mut self.split_statement_chain);
         if let Some(interpolated) = self.interpolated_source(expr) {
             self.out.push_str(interpolated);
+            return;
+        }
+        if split && Self::is_breakable_chain(expr) {
+            self.print_split_chain(expr);
             return;
         }
         match &expr.0 {
@@ -1819,8 +2033,19 @@ impl<'src> Printer<'src> {
             }
             Node::Binary(operator, left, right) => {
                 let precedence = Self::binary_precedence(*operator);
-                self.print_operand(left, precedence);
-                self.out.push(' ');
+                let left_start = self.out.len();
+                self.print_split_operand(left, precedence, split);
+                // A statement-level split that broke the left operand's chain
+                // across lines continues here: the operator and the right
+                // operand take their own line at the links' indentation
+                // (`…margin(space(0))` ⏎ `+ reveal`). The split is the only
+                // thing that can have introduced a break — a statement whose
+                // inline rendering already spanned lines never splits.
+                if split && self.out[left_start..].contains('\n') {
+                    self.continuation_line();
+                } else {
+                    self.out.push(' ');
+                }
                 self.out.push_str(binary_operator_symbol(*operator));
                 self.out.push(' ');
                 self.print_operand(right, precedence + 1);
@@ -1834,7 +2059,7 @@ impl<'src> Printer<'src> {
             // unwrapped.
             Node::Unary(operator, operand) => {
                 self.out.push(*operator);
-                self.print_operand(operand, 10);
+                self.print_split_operand(operand, 10, split);
             }
             Node::TryAssert(subject) => {
                 self.print_operand(subject, 100);
@@ -1872,26 +2097,26 @@ impl<'src> Printer<'src> {
                 if *mutable {
                     self.out.push_str("mut ");
                 }
-                self.print_operand(operand, 10);
+                self.print_split_operand(operand, 10, split);
             }
             Node::Dereference(operand) => {
                 self.out.push('*');
-                self.print_operand(operand, 10);
+                self.print_split_operand(operand, 10, split);
             }
             Node::Await(operand) => {
                 self.out.push_str("await ");
-                self.print_operand(operand, 10);
+                self.print_split_operand(operand, 10, split);
             }
             Node::Async(operand) => {
                 self.out.push_str("async ");
-                self.print_expr(operand);
+                self.print_split_operand(operand, 0, split);
             }
             // Weak precedence: `const` captures everything to its right, so
             // the inner expression never needs wrapping; as an OPERAND the
             // whole `const ..` is parenthesized (precedence 0 above).
             Node::Const(inner) => {
                 self.out.push_str("const ");
-                self.print_expr(inner);
+                self.print_split_operand(inner, 0, split);
             }
             Node::Let(name, declared_type, value, mutable) => {
                 self.out.push_str(if *mutable { "mut " } else { "let " });
@@ -1902,7 +2127,7 @@ impl<'src> Printer<'src> {
                 }
                 if let Some(value) = value {
                     self.out.push_str(" = ");
-                    self.print_expr(value);
+                    self.print_split_operand(value, 0, split);
                 }
             }
             // `let (a, b) = …` / `mut [x, y] = …` — a destructuring binding. As
@@ -1917,7 +2142,7 @@ impl<'src> Printer<'src> {
                 }
                 if let Some(value) = value {
                     self.out.push_str(" = ");
-                    self.print_expr(value);
+                    self.print_split_operand(value, 0, split);
                 }
             }
             Node::Assign(target, operator, value) => {
@@ -1927,7 +2152,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(binary_operator_symbol(*operator));
                 }
                 self.out.push_str("= ");
-                self.print_expr(value);
+                self.print_split_operand(value, 0, split);
             }
             Node::If(branch) => self.print_if_branch(branch),
             Node::Match(subject, legs) => {
@@ -1984,7 +2209,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str("ret");
                 if let Some(value) = value {
                     self.out.push(' ');
-                    self.print_expr(value);
+                    self.print_split_operand(value, 0, split);
                 }
             }
             Node::Jump(target) => {
@@ -2616,7 +2841,7 @@ mod bailing_constructs {
 
     /// The formatter's notion of "the same code": the lexer's tokens with spans
     /// stripped and insignificant trailing commas normalized away.
-    fn code_tokens(text: &str) -> Vec<Token<'_>> {
+    pub(super) fn code_tokens(text: &str) -> Vec<Token<'_>> {
         let (tokens, errors) = tokenize(text);
         assert!(
             errors.is_empty(),
@@ -2625,7 +2850,10 @@ mod bailing_constructs {
         normalize(tokens.into_iter().map(|(token, _)| token).collect())
     }
 
-    fn assert_construct(source: &str, expected: &str) {
+    /// The whole formatter contract for one source, asserted loudly. Shared with
+    /// the chain-splitting pins: a split rendering has to satisfy exactly the
+    /// same contract as any other reprint.
+    pub(super) fn assert_construct(source: &str, expected: &str) {
         let formatted = format(source);
         // (a) The output carries the SAME tokens as the source — the safety
         // net's criterion, asserted here rather than trusted silently.
@@ -2883,6 +3111,370 @@ mod bailing_constructs {
         assert_construct(
             "[derive(Json, Debug)]\nstruct Packet {\n\tkind: u8,\n}\n",
             "[derive(Json, Debug)]\nstruct Packet {\n\tkind: u8,\n}\n",
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_splitting {
+    //! The formatter's one width-aware decision: a statement whose inline
+    //! rendering is wider than [`LINE_BUDGET`] columns (a tab counting as
+    //! [`TAB_COLUMNS`]) and whose expression carries a postfix chain of two or
+    //! more `.name(…)` call links re-renders with the subject on the statement's
+    //! line and every link on its own, one indentation level in. Everything else
+    //! about the reprint is unchanged, so each pin runs the full formatter
+    //! contract (same tokens out, no silent bail, canonical, idempotent).
+    use super::bailing_constructs::assert_construct;
+    use super::{LINE_BUDGET, display_width, format};
+
+    /// The width the formatter measures for one rendered line.
+    fn columns(line: &str) -> usize {
+        display_width(line)
+    }
+
+    /// Asserts a fixture line really is over the budget, so that a pin about a
+    /// statement *not* splitting proves a rule rather than a short line.
+    fn assert_over_budget(line: &str) {
+        assert!(
+            columns(line) > LINE_BUDGET,
+            "fixture is only {} columns, so it proves nothing about the budget: {line:?}",
+            columns(line)
+        );
+    }
+
+    // --- The shape (S1/S2) ---------------------------------------------------
+
+    /// The motivating line, from the website's `page.vl`: a style-builder chain
+    /// the formatter used to collapse onto one 101-column line.
+    #[test]
+    fn an_over_width_chain_splits_one_link_per_line() {
+        let source = "let stack = const style().display(Display::Flex)\
+                      .flex_direction(FlexDirection::Column).gap(space(4));\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let stack = const style()\n\
+             \t.display(Display::Flex)\n\
+             \t.flex_direction(FlexDirection::Column)\n\
+             \t.gap(space(4));\n",
+        );
+    }
+
+    /// The boundary, arithmetically: `let padded = s.aa("…").bb(2);` is 28
+    /// columns of code around the padding string (13 for `let padded = `, 6 for
+    /// `s.aa("`, 9 for `").bb(2);`), so 72 padding characters make exactly the
+    /// 100-column budget and 73 make 101. At the budget the statement stays
+    /// inline; one column over, it splits.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("let padded = s.aa(\"{}\").bb(2);\n", "P".repeat(72));
+        let over_budget = format!("let padded = s.aa(\"{}\").bb(2);\n", "P".repeat(73));
+        assert_eq!(columns(at_budget.trim_end()), LINE_BUDGET);
+        assert_eq!(columns(over_budget.trim_end()), LINE_BUDGET + 1);
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("let padded = s\n\t.aa(\"{}\")\n\t.bb(2);\n", "P".repeat(73)),
+        );
+    }
+
+    /// The width is the statement's own line, so its leading indentation counts
+    /// (a tab as four columns) and the links land one level past *that* — the
+    /// same chain splits inside a block that would have fit at the top level.
+    #[test]
+    fn indentation_counts_toward_the_budget_and_the_links_indent_past_it() {
+        // 97 columns at the top level, 101 inside one block (one tab = four).
+        let statement = format!("let padded = s.aa(\"{}\").bb(2);", "P".repeat(69));
+        assert_eq!(columns(&statement), LINE_BUDGET - 3);
+        assert_construct(
+            &format!("fun main() {{\n\t{statement}\n}}\n"),
+            &format!(
+                "fun main() {{\n\tlet padded = s\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n}}\n",
+                "P".repeat(69)
+            ),
+        );
+    }
+
+    /// A block's tail expression is a statement position too — this is the shape
+    /// `std::process::rpc_server`'s `serve_rpc` reflowed into.
+    #[test]
+    fn a_block_tail_expression_splits() {
+        let tail = "Server::builder().port(port).on_request(|request| handle(protocol, request))\
+                    .on_start(on_ready).build().start()";
+        assert_over_budget(&format!("\t{tail}"));
+        assert_construct(
+            &format!("fun serve(port: i32) {{\n\t{tail}\n}}\n"),
+            "fun serve(port: i32) {\n\
+             \tServer::builder()\n\
+             \t\t.port(port)\n\
+             \t\t.on_request(|request| handle(protocol, request))\n\
+             \t\t.on_start(on_ready)\n\
+             \t\t.build()\n\
+             \t\t.start()\n\
+             }\n",
+        );
+    }
+
+    /// Every statement-value position reaches the chain through its prefix — an
+    /// assignment's right-hand side, a `ret` value, an `await` operand — not
+    /// just a `let` initializer. Each fixture is one column over the budget
+    /// (`\ttotal = s.aa("…").bb(2);` is 27 columns around the padding, `\tret
+    /// s.aa("…").bb(2)` is 22, `\tlet awaited = await s.aa("…").bb(2);` is 39).
+    #[test]
+    fn an_assignment_a_return_and_an_await_all_split() {
+        let assignment = format!(
+            "fun main() {{\n\ttotal = s.aa(\"{}\").bb(2);\n}}\n",
+            "P".repeat(74)
+        );
+        let returned = format!(
+            "fun give(): i32 {{\n\tret s.aa(\"{}\").bb(2)\n}}\n",
+            "P".repeat(79)
+        );
+        let awaited = format!(
+            "fun main() {{\n\tlet awaited = await s.aa(\"{}\").bb(2);\n}}\n",
+            "P".repeat(62)
+        );
+        assert_construct(
+            &assignment,
+            &format!(
+                "fun main() {{\n\ttotal = s\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n}}\n",
+                "P".repeat(74)
+            ),
+        );
+        assert_construct(
+            &returned,
+            &format!(
+                "fun give(): i32 {{\n\tret s\n\t\t.aa(\"{}\")\n\t\t.bb(2)\n}}\n",
+                "P".repeat(79)
+            ),
+        );
+        assert_construct(
+            &awaited,
+            &format!(
+                "fun main() {{\n\tlet awaited = await s\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n}}\n",
+                "P".repeat(62)
+            ),
+        );
+    }
+
+    // --- What does *not* split ------------------------------------------------
+
+    /// The collapse is preserved: a chain the author split by hand that fits the
+    /// budget still comes back as one line. The choice is purely width-driven.
+    #[test]
+    fn an_under_width_hand_split_chain_collapses() {
+        assert_construct(
+            "fun main() {\n\tlet short = one()\n\t\t.two(2)\n\t\t.three(3);\n}\n",
+            "fun main() {\n\tlet short = one().two(2).three(3);\n}\n",
+        );
+    }
+
+    /// v1 is statement level: a chain nested in a call argument stays inline
+    /// however wide the statement gets. (Breaking it needs a width model for
+    /// nested contexts — the recorded non-goal.)
+    #[test]
+    fn a_chain_nested_in_an_argument_stays_inline() {
+        let source = "let nested = outer(subject.first(1).second(2).third(3).fourth(4)\
+                      .fifth(5).sixth(666666666666666666));\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(source, source);
+    }
+
+    /// One `.name(…)` link is not a chain — breaking it would buy a line and no
+    /// clarity — and a long call that is not a chain at all never splits
+    /// (argument wrapping is out of scope).
+    #[test]
+    fn a_single_link_and_a_plain_long_call_stay_inline() {
+        let single_link = "let value = subject\
+                           .only_one_link_here_but_a_very_long_one_indeed_truly_yes_it_is_here\
+                           (1234567890123);\n";
+        let plain_call = "let value = plain_function_call_with_no_chain_at_all(argument_one, \
+                          argument_two, argument_three_xyz);\n";
+        assert_over_budget(single_link.trim_end());
+        assert_over_budget(plain_call.trim_end());
+        assert_construct(single_link, single_link);
+        assert_construct(plain_call, plain_call);
+    }
+
+    /// The width rule reads a single-line rendering only: a statement that
+    /// already spans lines (here a closure with a block body) is left alone, so
+    /// the measured width always describes the line it is about.
+    #[test]
+    fn a_statement_that_already_spans_lines_is_not_split() {
+        let source = "fun main() {\n\
+                      \tlet built = registry.on(\"alpha\", |event| {\n\
+                      \t\thandle(event);\n\
+                      \t}).on(\"beta\", |event| handle_the_other_one_with_a_long_name(event));\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A `?.` lift chain absorbs everything that follows it into one node, so it
+    /// has no postfix spine to break: it stays inline (a v1 gap, recorded here so
+    /// the behavior is a decision rather than an accident).
+    #[test]
+    fn a_lift_chain_stays_inline() {
+        let source = "let lifted = alpha?.beta(1).gamma(2)\
+                      .delta(\"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\");\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(source, source);
+    }
+
+    // --- Glue and continuations (S3/S4) --------------------------------------
+
+    /// A non-call postfix — a plain member, an index, a `!` — glues to the
+    /// segment printed before it rather than taking a line of its own.
+    #[test]
+    fn non_call_postfixes_glue_to_the_preceding_segment() {
+        let member = format!(
+            "let glued = alpha.beta(1).gamma.delta(\"{}\");\n",
+            "G".repeat(60)
+        );
+        let indexed = format!(
+            "let glued = alpha.beta(1)[0].gamma(2).delta(\"{}\");\n",
+            "G".repeat(53)
+        );
+        let asserted = format!(
+            "let glued = alpha.beta(1)!.gamma(2)!.delta(\"{}\");\n",
+            "G".repeat(54)
+        );
+        assert_over_budget(member.trim_end());
+        assert_over_budget(indexed.trim_end());
+        assert_over_budget(asserted.trim_end());
+        assert_construct(
+            &member,
+            &format!(
+                "let glued = alpha\n\t.beta(1).gamma\n\t.delta(\"{}\");\n",
+                "G".repeat(60)
+            ),
+        );
+        assert_construct(
+            &indexed,
+            &format!(
+                "let glued = alpha\n\t.beta(1)[0]\n\t.gamma(2)\n\t.delta(\"{}\");\n",
+                "G".repeat(53)
+            ),
+        );
+        assert_construct(
+            &asserted,
+            &format!(
+                "let glued = alpha\n\t.beta(1)!\n\t.gamma(2)!\n\t.delta(\"{}\");\n",
+                "G".repeat(54)
+            ),
+        );
+    }
+
+    /// The website's `heading` shape: the chain is the left operand of a `+`, so
+    /// the operator and its right operand continue on their own line at the
+    /// links' indentation, with the terminator glued after.
+    #[test]
+    fn a_chain_operand_of_a_binary_puts_the_continuation_on_its_own_line() {
+        let source = "let heading = const style().raw(\"font-family\", display_face)\
+                      .font_size(Length::px(32.0)).raw(\"line-height\", \"48px\")\
+                      .font_weight(600).margin(space(0)) + reveal;\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let heading = const style()\n\
+             \t.raw(\"font-family\", display_face)\n\
+             \t.font_size(Length::px(32.0))\n\
+             \t.raw(\"line-height\", \"48px\")\n\
+             \t.font_weight(600)\n\
+             \t.margin(space(0))\n\
+             \t+ reveal;\n",
+        );
+    }
+
+    /// The same statement as the website actually writes it, with the redundant
+    /// parentheses `const (…)` around the sum.
+    ///
+    /// IGNORED — and not by this change: the formatter bails on *any* redundant
+    /// parenthesization in a value position (`let b = (1 + 2);` bails today
+    /// too). The parser dissolves a `(expr)` group, keeping the inner
+    /// expression's own span, so the tree does not record that the parentheses
+    /// were written; the printer reconstructs only the ones precedence demands,
+    /// the re-lex safety net sees a token stream missing two tokens, and
+    /// `format` returns the whole file's original bytes. Un-ignore this when the
+    /// formatter's parse records paren groups.
+    #[test]
+    #[ignore = "pre-existing: a redundant paren group in a value position bails the whole file"]
+    fn a_parenthesized_chain_operand_keeps_its_parentheses() {
+        assert_construct(
+            "let heading = const (style().raw(\"font-family\", display_face)\
+             .font_size(Length::px(32.0)).raw(\"line-height\", \"48px\")\
+             .font_weight(600).margin(space(0)) + reveal);\n",
+            "let heading = const (style()\n\
+             \t.raw(\"font-family\", display_face)\n\
+             \t.font_size(Length::px(32.0))\n\
+             \t.raw(\"line-height\", \"48px\")\n\
+             \t.font_weight(600)\n\
+             \t.margin(space(0))\n\
+             \t+ reveal);\n",
+        );
+    }
+
+    // --- Comments and idempotency (S6/S7) ------------------------------------
+
+    /// E13's zero-bail law under the split: a comment written between two links
+    /// is never dropped. The attachment machinery has no place *between* links —
+    /// comments are flushed at statement boundaries, not inside an expression —
+    /// so it lands on its own line below the statement, exactly as it already
+    /// did under the collapse, and the paragraph-gap rule reads the chain lines
+    /// it skipped over as a gap and keeps a blank line after it. Pinned as the
+    /// actual behavior (split and collapsed both), not as an ideal: placing a
+    /// comment *between* links needs comment attachment inside expressions.
+    #[test]
+    fn a_mid_chain_comment_moves_below_the_statement() {
+        assert_construct(
+            "fun main() {\n\tlet short = one()\n\t\t// a note\n\t\t.two(2)\n\t\t.three(3);\n\tdone()\n}\n",
+            "fun main() {\n\tlet short = one().two(2).three(3);\n\t// a note\n\n\tdone()\n}\n",
+        );
+        let long = format!(
+            "fun main() {{\n\tlet padded = s\n\t\t// a note\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n\tdone()\n}}\n",
+            "P".repeat(69)
+        );
+        assert_construct(
+            &long,
+            &format!(
+                "fun main() {{\n\tlet padded = s\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n\t// a note\n\n\tdone()\n}}\n",
+                "P".repeat(69)
+            ),
+        );
+    }
+
+    /// Formatting is a fixed point over a file that mixes both forms: the split
+    /// chains stay split, the inline ones stay inline, and nothing drifts on a
+    /// second pass.
+    #[test]
+    fn a_file_mixing_split_and_inline_chains_is_a_fixed_point() {
+        let source = "let stack = const style().display(Display::Flex)\
+                      .flex_direction(FlexDirection::Column).gap(space(4));\n\
+                      \n\
+                      let small = style().gap(space(4));\n\
+                      \n\
+                      fun main() {\n\
+                      \tlet nested = outer(subject.first(1).second(2).third(3).fourth(4)\
+                      .fifth(5).sixth(666666666666666666));\n\
+                      \tregistry.on(\"alpha\", handle_alpha).on(\"beta\", handle_beta)\
+                      .on(\"gamma\", handle_gamma).build_this()\n\
+                      }\n";
+        let once = format(source);
+        assert_eq!(format(&once), once, "formatting is not a fixed point");
+        assert!(
+            once.contains("let stack = const style()\n\t.display(Display::Flex)\n"),
+            "the wide chain did not split:\n{once}"
+        );
+        assert!(
+            once.contains("let small = style().gap(space(4));\n"),
+            "the narrow chain did not stay inline:\n{once}"
+        );
+        assert!(
+            once.contains(".fifth(5).sixth(666666666666666666));\n"),
+            "the nested chain did not stay inline:\n{once}"
+        );
+        assert!(
+            once.contains("\tregistry\n\t\t.on(\"alpha\", handle_alpha)\n"),
+            "the wide tail chain did not split:\n{once}"
         );
     }
 }

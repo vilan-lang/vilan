@@ -138,7 +138,11 @@ macro fun PartialEq(item: Item): Source {
 		if comparison == "" {
 			comparison = "true";
 		}
-		let eq = fun_of("eq").parameter("self").parameter(i"other: {target.name}").returns("bool").expr(comparison);
+		let eq = fun_of("eq")
+			.parameter("self")
+			.parameter(i"other: {target.name}")
+			.returns("bool")
+			.expr(comparison);
 		ret source("import std::compare::PartialEq;\n" + impl_of(target.name).implements("PartialEq").method(eq).render());
 	}
 	if item.as_enum() is Some(let target) {
@@ -166,7 +170,11 @@ macro fun PartialEq(item: Item): Source {
 			}
 		}
 		arms = arms.arm("_", "false");
-		let eq = fun_of("eq").parameter("self").parameter(i"other: {target.name}").returns("bool").expr(arms.render());
+		let eq = fun_of("eq")
+			.parameter("self")
+			.parameter(i"other: {target.name}")
+			.returns("bool")
+			.expr(arms.render());
 		ret source("import std::compare::PartialEq;\n" + impl_of(target.name).implements("PartialEq").method(eq).render());
 	}
 	// Anything else (a bodyless external struct): nothing, like the Rust

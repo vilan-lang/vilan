@@ -60,7 +60,12 @@ fun rpc_response(protocol: RpcProtocol, request: Request): Response {
 /// Serve one RPC protocol on `port`: every request is dispatched through it. The
 /// client side is `std::rpc`'s `HttpTransport { url = "http://host:port/" }`.
 fun serve_rpc(port: i32, protocol: RpcProtocol, on_ready: |Server| void) {
-	Server::builder().port(port).on_request(|request| rpc_response(protocol, request)).on_start(on_ready).build().start()
+	Server::builder()
+		.port(port)
+		.on_request(|request| rpc_response(protocol, request))
+		.on_start(on_ready)
+		.build()
+		.start()
 }
 
 /// The `Client::connect` server (§4.2): `serve_connected` with the runtime's

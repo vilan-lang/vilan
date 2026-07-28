@@ -740,8 +740,13 @@ macro fun struct_json_impls(target: StructItem): str {
 	// `from_json_value` checks each field is present (naming a missing one) and
 	// threads a leaf failure with `!`.
 	let result_type = i"Result<{target.name}, str>";
-	let from_json = fun_of("from_json").parameter("text: str").returns(result_type).expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
-	mut from_json_value = fun_of("from_json_value").parameter("value: JsonValue").returns(result_type);
+	let from_json = fun_of("from_json")
+		.parameter("text: str")
+		.returns(result_type)
+		.expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
+	mut from_json_value = fun_of("from_json_value")
+		.parameter("value: JsonValue")
+		.returns(result_type);
 	// The output uses fully-qualified `Result::Ok`/`Result::Err` so it does not
 	// depend on the deriving file importing the variants (`Result` the type is
 	// reachable wherever the derive is; its variants may not be in scope).
@@ -755,20 +760,32 @@ macro fun struct_json_impls(target: StructItem): str {
 		literal = literal.field(field.name, i"{field.type_.render()}::from_json_value(value.field({label}))!");
 	}
 	from_json_value = from_json_value.expr(i"Result::Ok({literal.render()})");
-	impl_of(target.name).implements("Json").method(to_json).render() + impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
+	impl_of(target.name)
+		.implements("Json")
+		.method(to_json)
+		.render()
+		+ impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
 }
 
 macro fun struct_wire_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of, init_of, quote };
 
-	mut describe = fun_of("describe").generics("<S: Serialize>").parameter("self").parameter("serializer: S").line(i"serializer.begin_struct({target.fields.len()});");
+	mut describe = fun_of("describe")
+		.generics("<S: Serialize>")
+		.parameter("self")
+		.parameter("serializer: S")
+		.line(i"serializer.begin_struct({target.fields.len()});");
 	for field in target.fields {
 		let label = quote(field.name);
 		describe = describe.line(i"serializer.field({label});");
 		describe = describe.line(i"self.{field.name}.describe(serializer);");
 	}
 	describe = describe.line("serializer.end_struct();");
-	mut rebuild = fun_of("rebuild").generics("<D: Deserialize>").parameter("deserializer: D").returns(target.name).line("deserializer.begin_struct();");
+	mut rebuild = fun_of("rebuild")
+		.generics("<D: Deserialize>")
+		.parameter("deserializer: D")
+		.returns(target.name)
+		.line("deserializer.begin_struct();");
 	mut literal = init_of(target.name);
 	for field in target.fields {
 		let label = quote(field.name);
@@ -838,9 +855,19 @@ macro fun enum_json_impls(target: EnumItem): str {
 	from_arms = from_arms.arm("_", i"Result::Err(\"unknown variant in JSON for enum {target.name}\")");
 	let result_type = i"Result<{target.name}, str>";
 	let to_json = fun_of("to_json").parameter("self").returns("str").expr(to_arms.render());
-	let from_json = fun_of("from_json").parameter("text: str").returns(result_type).expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
-	let from_json_value = fun_of("from_json_value").parameter("value: JsonValue").returns(result_type).expr(from_arms.render());
-	impl_of(target.name).implements("Json").method(to_json).render() + impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
+	let from_json = fun_of("from_json")
+		.parameter("text: str")
+		.returns(result_type)
+		.expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
+	let from_json_value = fun_of("from_json_value")
+		.parameter("value: JsonValue")
+		.returns(result_type)
+		.expr(from_arms.render());
+	impl_of(target.name)
+		.implements("Json")
+		.method(to_json)
+		.render()
+		+ impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
 }
 
 macro fun enum_wire_impls(target: EnumItem): str {
@@ -919,8 +946,17 @@ macro fun enum_wire_impls(target: EnumItem): str {
 		}
 	}
 	rebuild_arms = rebuild_arms.arm_block("_", fallback);
-	let describe = fun_of("describe").generics("<S: Serialize>").parameter("self").parameter("serializer: S").expr(describe_arms.render());
-	let rebuild = fun_of("rebuild").generics("<D: Deserialize>").parameter("deserializer: D").returns(target.name).line("let tag = deserializer.variant_tag();").expr(rebuild_arms.render());
+	let describe = fun_of("describe")
+		.generics("<S: Serialize>")
+		.parameter("self")
+		.parameter("serializer: S")
+		.expr(describe_arms.render());
+	let rebuild = fun_of("rebuild")
+		.generics("<D: Deserialize>")
+		.parameter("deserializer: D")
+		.returns(target.name)
+		.line("let tag = deserializer.variant_tag();")
+		.expr(rebuild_arms.render());
 	impl_of(target.name).implements("Wire").method(describe).method(rebuild).render()
 }
 

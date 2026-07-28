@@ -13,6 +13,9 @@ import pkg::shared::greeting;
 fun main() {
 	let _root = mount_root("app", || {
 		let count = Signal::new(0);
-		view("main").child(view("h1").text(greeting())).child(view("p").bind_text(count.map(|n| i"clicked {n} times"))).child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
+		view("main")
+			.child(view("h1").text(greeting()))
+			.child(view("p").bind_text(count.map(|n| i"clicked {n} times")))
+			.child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
 	});
 }
