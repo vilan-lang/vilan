@@ -1482,7 +1482,10 @@ macro fun service(item: Item): Source {
 	}
 	let exposure_list = join(exposures, ", ");
 	let attach_reply = match_of("session_of(connection)")
-		.arm_block("Option::Some(let session)", [i"let channels: List<i32> = [{exposure_list}];", "reply(channels)"])
+		.arm_block("Option::Some(let session)", [
+			i"let channels: List<i32> = [{exposure_list}];",
+			"reply(channels)",
+		])
 		.arm("Option::None", "RpcOutcome::Failure(RpcError::Remote(" + quote("unknown connection") + "))")
 		.render();
 	mut attach_statements: List<str> = [];
