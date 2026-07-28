@@ -16,7 +16,7 @@ import pkg::asset::emit;
 import pkg::io::panic;
 import pkg::map::Map;
 import pkg::operators::Add;
-import pkg::option::Option::{ self, Some, None };
+import pkg::option::Option::{ None, Some, self };
 import pkg::range::Range;
 
 // --- values -------------------------------------------------------------------

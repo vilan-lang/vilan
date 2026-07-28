@@ -3,7 +3,7 @@
 // what JWTs and URL-safe tokens expect.
 
 import pkg::bytes::Bytes;
-import pkg::option::Option::{ self, Some, None };
+import pkg::option::Option::{ None, Some, self };
 import pkg::range::Range;
 
 let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -18,8 +18,7 @@ fun encode_url(bytes: Bytes): str {
 	for group in Range::new(0, total / 3) {
 		let base = group * 3;
 		let chunk = (bytes.get(base) << 16) | (bytes.get(base + 1) << 8) | bytes.get(base + 2);
-		out = out + char_at((chunk >> 18) & 63) + char_at((chunk >> 12) & 63)
-			+ char_at((chunk >> 6) & 63) + char_at(chunk & 63);
+		out = out + char_at((chunk >> 18) & 63) + char_at((chunk >> 12) & 63) + char_at((chunk >> 6) & 63) + char_at(chunk & 63);
 	}
 	let rest = total % 3;
 	if rest == 1 {

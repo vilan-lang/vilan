@@ -8,10 +8,10 @@
 // types are wire-able: a timestamp is plain data (one i53), so it can ride
 // rpc payloads and mirrors.
 
+import pkg::compare::{ Ordering, PartialEq, PartialOrd };
 import pkg::operators::{ Add, Sub };
-import pkg::compare::{ PartialEq, PartialOrd, Ordering };
-import pkg::option::Option::{ self, Some, None };
-import pkg::task::{ ambient_signal, CancelSignal };
+import pkg::option::Option::{ None, Some, self };
+import pkg::task::{ CancelSignal, ambient_signal };
 
 // --- The clock ---------------------------------------------------------------
 
@@ -113,8 +113,16 @@ impl Duration {
 	/// A coarse human rendering: the two largest non-zero units — "2h 3m",
 	/// "5m 30s", "980ms", "0ms" — with a leading "-" for a negative span.
 	fun describe(self): str {
-		let sign = if self.millis < 0i53 { "-" } else { "" };
-		let magnitude = if self.millis < 0i53 { 0i53 - self.millis } else { self.millis };
+		let sign = if self.millis < 0i53 {
+			"-"
+		} else {
+			""
+		};
+		let magnitude = if self.millis < 0i53 {
+			0i53 - self.millis
+		} else {
+			self.millis
+		};
 		let parts = split_units(magnitude);
 		sign + parts
 	}

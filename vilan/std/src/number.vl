@@ -1,8 +1,8 @@
+import pkg::compare::{ Eq, Ord, Ordering, PartialEq, PartialOrd };
 import pkg::default::Default;
-import pkg::compare::{ PartialEq, Eq, PartialOrd, Ord, Ordering };
-import pkg::option::Option::{ self, Some, None };
 import pkg::math::PI;
-import pkg::operators::{ Add, Sub, Mul, Div, Shl, Shr, BitAnd, BitOr, BitXor };
+import pkg::operators::{ Add, BitAnd, BitOr, BitXor, Div, Mul, Shl, Shr, Sub };
+import pkg::option::Option::{ None, Some, self };
 
 external struct u32;
 
