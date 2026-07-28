@@ -46,10 +46,21 @@ struct View {
 }
 
 /// A fresh element of the given tag (`view("div")`, `view("button")`, …).
+/// An `svg` root is seeded with its `xmlns` attribute, mirroring the browser
+/// twin's `createElementNS` routing: the serialized markup then parses into
+/// SVG-namespace nodes wherever it lands (descendants inherit the namespace,
+/// so only the root needs it). A component setting `xmlns` itself simply
+/// replaces the seed (`set_attribute` is set-or-replace by name). KEEP the
+/// SVG tag story IN STEP with the browser twin's `is_svg_tag` allowlist
+/// (browser/ui.vl) — the layer system shares no file between them.
 fun view(tag: str): View {
+	let attributes: Shared<List<Attribute>> = Shared::new([]);
+	if tag == "svg" {
+		set_attribute(attributes, "xmlns", "http://www.w3.org/2000/svg");
+	}
 	View {
 		tag,
-		attributes = Shared::new([]),
+		attributes,
 		children = Shared::new([]),
 		text = Shared::new(""),
 	}

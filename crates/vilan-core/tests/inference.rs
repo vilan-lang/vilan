@@ -25943,6 +25943,57 @@ fn ssr_renders_static_view_with_ordered_attributes_and_nesting() {
 }
 
 #[test]
+fn ssr_svg_root_carries_its_namespace() {
+    // B37: the process twin seeds `xmlns` on an `svg` root (descendants
+    // inherit), before the component's own attributes; a component setting
+    // `xmlns` itself replaces the seed in place.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("svg")
+                .attr("viewBox", "0 0 24 24")
+                .child(view("path").attr("d", "M5 12h14"))));
+            print(render(view("svg").attr("xmlns", "urn:custom")));
+        }
+        "#,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path d=\"M5 12h14\"></path></svg>\n<svg xmlns=\"urn:custom\"></svg>\n",
+    );
+}
+
+#[test]
+fn browser_view_routes_svg_tags_through_create_element_ns() {
+    // B37's browser half, pinned at the codegen level: an svg-family tag
+    // creates through `createElementNS` (an HTML-namespace `<svg>` renders
+    // nothing), a plain tag through `createElement`, and the ambiguous tags
+    // (`a`, `title`, `style`, `script`) stay HTML.
+    let js = compile_browser(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
+            let _link = view("div").child(view("a").attr("href", "/"));
+        }
+        main();
+        "#,
+    )
+    .expect("a clean browser compile");
+    assert!(
+        js.contains("document.createElementNS"),
+        "svg tags must route through createElementNS:\n{js}"
+    );
+    assert!(
+        js.contains("\"http://www.w3.org/2000/svg\""),
+        "the SVG namespace constant must be emitted:\n{js}"
+    );
+    assert!(
+        js.contains("document.createElement"),
+        "plain tags still route through createElement:\n{js}"
+    );
+}
+
+#[test]
 fn ssr_bind_text_embeds_current_signal_value() {
     // Read-once: `bind_text` takes `signal.get()` at render time — no subscription.
     assert_compiles_and_runs(

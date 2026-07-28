@@ -9,15 +9,19 @@
 //!   `render(app())` is the string.
 //!
 //! THE CANONICAL FORM. The DOM records the properties the browser ui writes —
-//! `className`, `hidden`, `value` — separately from `setAttribute`. Left alone,
-//! that property-vs-attribute divide would false-diff against the process ui,
-//! which keeps ONE ordered attribute list. So the stub folds those properties
-//! INTO an ordered `[name, value]` list at write time (className→`class`,
-//! `hidden`→a `hidden` attribute, `value`→a `value` attribute), and serializes
+//! `hidden`, `value` — separately from `setAttribute` (`class` used to be the
+//! third; since B37 the ui writes it as an attribute, because SVG's `className`
+//! is readonly). Left alone, that property-vs-attribute divide would false-diff
+//! against the process ui, which keeps ONE ordered attribute list. So the stub
+//! folds those properties INTO an ordered `[name, value]` list at write time
+//! (`hidden`→a `hidden` attribute, `value`→a `value` attribute), and serializes
 //! with the exact escaping and void-element rules the process `render` uses. The
 //! canonical form is therefore that serialization; with the mapping applied on
 //! the browser side, structural equality is byte equality — the two trees agree
-//! on tags, attributes (and their insertion order), text, and nesting.
+//! on tags, attributes (and their insertion order), text, and nesting. The SVG
+//! namespace folds the same way (B37): `createElementNS` on an `svg` root
+//! records the `xmlns` attribute the process twin seeds, so the namespace
+//! decision is part of the byte equality too.
 //!
 //! Not exercised by THIS differential (all covered by the inference snapshot
 //! pins instead): `on_event` — present in both layers, but a handler that touches
@@ -87,6 +91,10 @@ fun app(): View {
 		}))
 		.child(view("input").attr("type", "text").bind_value(query))
 		.child(view("button").text("save").on("click", || query.set("x")))
+		.child(view("svg")
+			.class("icon")
+			.attr("viewBox", "0 0 24 24")
+			.child(view("path").attr("d", "M5 12h14")))
 }
 "#;
 
@@ -114,14 +122,20 @@ const HARNESS: &str = r#"const VOID = new Set(["area","base","br","col","embed",
 const escapeText = s => s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
 const escapeAttr = s => s.replaceAll("&","&amp;").replaceAll('"',"&quot;");
 
+const SVG_NS = "http://www.w3.org/2000/svg";
 class StubElement {
-    constructor(tag) {
+    constructor(tag, namespace) {
         this.tagName = tag;
+        this.namespaceURI = namespace || "http://www.w3.org/1999/xhtml";
         this.children = [];
         this.parent = null;
         this.listeners = {};
         this.text = "";
         this.attributes = [];
+        // A real createElementNS records no xmlns ATTRIBUTE; the canonical
+        // form folds the namespace into the one the process twin seeds on the
+        // svg root, so the namespace decision lands in the byte comparison.
+        if (namespace === SVG_NS && tag === "svg") this.attributes.push(["xmlns", namespace]);
         this.style = { setProperty: (n, v) => this._upsertStyle(n, v) };
     }
     _upsert(name, value) {
@@ -164,6 +178,7 @@ function serialize(el) {
 const root = new StubElement("app-root");
 global.document = {
     createElement: (tag) => new StubElement(tag),
+    createElementNS: (ns, tag) => new StubElement(tag, ns),
     getElementById: (id) => (id === "app" ? root : null),
     querySelector: () => null, querySelectorAll: () => [],
 };
@@ -171,6 +186,18 @@ global.window = { addEventListener: () => {} };
 global.location = { pathname: "/" };
 
 require("./client.js");
+
+// The cause pin for B37: the svg subtree must be built in the SVG namespace —
+// an HTML-namespace <svg> serializes identically and renders nothing.
+const find = (el, tag) => el.tagName === tag ? el : el.children.map(c => find(c, tag)).find(Boolean);
+const svg = find(root, "svg");
+const path = find(root, "path");
+if (!svg || svg.namespaceURI !== SVG_NS || !path || path.namespaceURI !== SVG_NS) {
+    console.error("svg subtree is not SVG-namespaced: "
+        + (svg ? svg.namespaceURI : "<no svg>") + " / " + (path ? path.namespaceURI : "<no path>"));
+    process.exit(1);
+}
+
 console.log(serialize(root.children[0]));
 "#;
 
@@ -254,7 +281,10 @@ fn ssr_process_render_matches_browser_dom_tree() {
     assert!(
         server_markup.contains("<main class=\"app\" id=\"root\">")
             && server_markup.contains("<li>second &amp; third</li>")
-            && server_markup.contains("<aside hidden=\"\">"),
+            && server_markup.contains("<aside hidden=\"\">")
+            && server_markup.contains(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M5 12h14\"></path></svg>"
+            ),
         "rendered markup is missing expected structure: {server_markup}"
     );
 

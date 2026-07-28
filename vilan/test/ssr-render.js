@@ -11,7 +11,11 @@ function new2() {
 	return [ __shared_new([  ]) ];
 }
 function view(tag) {
-	return [ tag, __shared_new([  ]), __shared_new([  ]), __shared_new("") ];
+	const attributes = __shared_new([  ]);
+	if (tag === "svg") {
+		set_attribute(attributes, "xmlns", "http://www.w3.org/2000/svg");
+	}
+	return [ tag, attributes, __shared_new([  ]), __shared_new("") ];
 }
 function set_attribute(attributes, name, value) {
 	let updated = [  ];
@@ -169,3 +173,4 @@ const page = $c([ 1 ]);
 console.log(render(app(title, todos, page)));
 console.log(render(text(view("p"), "<script>alert(\"&\")</script>")));
 console.log(render(attr(attr(view("img"), "src", "/logo.png"), "alt", "a & b")));
+console.log(render(child(attr(view("svg"), "viewBox", "0 0 24 24"), attr(view("path"), "d", "M5 12h14"))));

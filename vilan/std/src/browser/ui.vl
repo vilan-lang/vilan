@@ -20,7 +20,7 @@
 //
 // Only available when building for the browser (`vilan build --target browser`).
 
-import pkg::dom::{ Element, Event, get_element_by_id, create_element };
+import pkg::dom::{ Element, Event, get_element_by_id, create_element, create_element_ns };
 import pkg::reactive::{ Signal, Owner, Disposable, reconcile, RowStep, owner_scope, get_owner, run_with_owner, comp, turn_scope, turn, FlushPolicy, Draft };
 import pkg::shared::Shared;
 import pkg::style::Style;
@@ -35,8 +35,63 @@ struct View {
 }
 
 /// A fresh element of the given tag (`view("div")`, `view("button")`, …).
+/// SVG tag names (exact case — `clipPath`, not `clippath`) create in the SVG
+/// namespace, so an inline `view("svg")` tree actually renders; everything
+/// else is an HTML element. Tags that exist in BOTH vocabularies (`a`,
+/// `title`, `style`, `script`) resolve to HTML — inline SVG rarely wants
+/// them, and a link around an icon is the HTML `a`.
 fun view(tag: str): View {
-	View { element = create_element(tag) }
+	if is_svg_tag(tag) {
+		View { element = create_element_ns("http://www.w3.org/2000/svg", tag) }
+	} else {
+		View { element = create_element(tag) }
+	}
+}
+
+/// The SVG vocabulary `view` routes through `createElementNS` — the drawing
+/// and paint-server elements, exact-case (the camelCase names cannot be
+/// created by `createElement` at all: it lowercases). Deliberately excludes
+/// the HTML-ambiguous tags (`a`, `title`, `style`, `script`).
+/// KEEP IN STEP with the process twin's copy (process/ui.vl) — the layer
+/// system shares no file between them, and SSR must serialize exactly the
+/// set the browser namespaces.
+fun is_svg_tag(tag: str): bool {
+	match tag {
+		"svg" => true,
+		"path" => true,
+		"circle" => true,
+		"ellipse" => true,
+		"rect" => true,
+		"line" => true,
+		"polyline" => true,
+		"polygon" => true,
+		"g" => true,
+		"defs" => true,
+		"use" => true,
+		"symbol" => true,
+		"marker" => true,
+		"pattern" => true,
+		"mask" => true,
+		"clipPath" => true,
+		"linearGradient" => true,
+		"radialGradient" => true,
+		"stop" => true,
+		"text" => true,
+		"tspan" => true,
+		"textPath" => true,
+		"filter" => true,
+		"foreignObject" => true,
+		"feGaussianBlur" => true,
+		"feColorMatrix" => true,
+		"feOffset" => true,
+		"feMerge" => true,
+		"feMergeNode" => true,
+		"feFlood" => true,
+		"feComposite" => true,
+		"feBlend" => true,
+		"feDropShadow" => true,
+		_ => false,
+	}
 }
 
 impl View {
@@ -46,9 +101,12 @@ impl View {
 		self
 	}
 
-	/// Static CSS class.
+	/// Static CSS class. Set as the `class` ATTRIBUTE, not the `className`
+	/// property: identical on HTML elements, and the only form that works on
+	/// SVG (whose `className` is a readonly `SVGAnimatedString` — assigning
+	/// it throws in module code).
 	fun class(self, name: str): View {
-		self.element.set_class(name);
+		self.element.set_attribute("class", name);
 		self
 	}
 
@@ -56,7 +114,7 @@ impl View {
 	/// is runtime-legal — the rules were emitted when the style was
 	/// constructed, inside its `const` expression.
 	fun styled(self, style: Style): View {
-		self.element.set_class(style.class_list());
+		self.element.set_attribute("class", style.class_list());
 		self
 	}
 
@@ -123,7 +181,7 @@ impl View {
 	fun bind_class(self, source: Signal<str>): View {
 		let element = self.element;
 		source.effect(|value| {
-			element.set_class(value);
+			element.set_attribute("class", value);
 		});
 		self
 	}

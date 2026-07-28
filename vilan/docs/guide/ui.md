@@ -274,6 +274,10 @@ directly: `get_element_by_id`, `query_selector`,
 
 - `show` keeps bindings live while hidden — they keep firing. If the
   hidden content is expensive, use `when`.
+- Inline SVG works — `view("svg").attr("viewBox", …).child(view("path")…)`
+  creates real SVG-namespace elements, and the server render carries the
+  `xmlns` — but `show` drives the HTML-only `hidden` property, which SVG
+  ignores: toggle an SVG subtree with `when` (or a class) instead.
 - `bind_value` fights remote updates (every keystroke overwrites). For
   server-backed fields, use `bind_draft`.
 - The `owner_scope` compile error means you built UI outside every

@@ -17,6 +17,13 @@ external fun get_element_by_id(id: str): Element;
 [extern("document.createElement")]
 external fun create_element(tag: str): Element;
 
+/// `document.createElementNS(namespace, tag)` — a fresh element in an explicit
+/// namespace. SVG elements must be created this way: `createElement` produces
+/// an HTML-namespace node whatever the tag says, and an HTML-namespace `<svg>`
+/// renders nothing. `std::ui::view` routes SVG tag names here by itself.
+[extern("document.createElementNS")]
+external fun create_element_ns(namespace: str, tag: str): Element;
+
 /// `document.querySelector(selector)` — the first element matching a CSS selector
 /// (e.g. `"#name"`, `".item"`, `"input[name=email]"`).
 [extern("document.querySelector")]

@@ -12,6 +12,7 @@ Opaque handles over real DOM objects.
 external struct Element;
 fun get_element_by_id(id: str): Element
 fun create_element(tag: str): Element
+fun create_element_ns(namespace: str, tag: str): Element   // createElementNS
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
 
@@ -57,6 +58,14 @@ fun mount_root(id: str, body: (|| View) context owner_scope): Owner
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
 owner (most apps let it live forever). `mount` is the attach half alone —
 use only when you already hold a boundary.
+
+`view` knows the SVG vocabulary: an SVG tag name (`svg`, `path`, `rect`,
+`clipPath`, … — exact case) creates its element in the SVG namespace, so
+inline icons and diagrams render; on the server the `svg` root serializes
+with its `xmlns`. Tags that exist in both vocabularies (`a`, `title`,
+`style`, `script`) resolve to HTML. `class`/`styled` set the `class`
+attribute (not the `className` property), so styling works on SVG nodes
+too.
 
 ### View methods
 
