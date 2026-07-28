@@ -224,10 +224,14 @@ fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnost
         };
         match &item.path {
             None => {
-                let mut converted = diagnostic(document.line_index.range(&item.span));
+                // The ANALYZED index: these are program spans, so they index
+                // the text the analysis consumed (`document.rs`'s two-snapshot
+                // law). Publishing runs right after an analysis lands, so the
+                // two indices normally agree — the law is uniform anyway.
+                let mut converted = diagnostic(document.analyzed_range(&item.span));
                 // A secondary note becomes related information — "first
                 // call here"-style anchors.
-                attach_note(&mut converted, &item, owner, &document.line_index);
+                attach_note(&mut converted, &item, owner, document.analyzed_index());
                 entry_group.push(converted);
             }
             Some(path) => {

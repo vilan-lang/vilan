@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use tower_lsp::jsonrpc::{Error as JsonRpcError, ErrorCode};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result};
 use vilan_core::Span;
@@ -234,6 +235,55 @@ fn call_insertion(
     Some((snippet, InsertTextFormat::SNIPPET))
 }
 
+/// Delta-encode classified spans (E2) into the LSP semantic-token wire form:
+/// five integers per token — line delta, character delta, length, type,
+/// modifiers — each relative to the token before it.
+///
+/// `index` must be the ANALYZED snapshot's line index: the spans are program
+/// spans, so that is the text they index (S1). Positions AND `length` are in
+/// UTF-16 code units, which is the unit the protocol specifies and the one the
+/// line index already produces; the byte width this used to send overshot on
+/// every line carrying an accent or an emoji, dragging a token's highlight over
+/// its neighbours.
+fn encode_semantic_tokens(
+    tokens: &[(Span, crate::document::TokenKind, u32)],
+    index: &LineIndex,
+) -> Vec<SemanticToken> {
+    let mut data: Vec<SemanticToken> = Vec::with_capacity(tokens.len());
+    let mut previous_line = 0u32;
+    let mut previous_start = 0u32;
+    for (span, kind, modifiers) in tokens {
+        let range = index.range(span);
+        // A token spanning lines has no wire form at all (one line delta, one
+        // width). The classifier only ever produces name-sized spans, so this
+        // is unreachable — dropped rather than encoded at a bogus width, and
+        // never a panic. Saturating deltas below are the same totality: the
+        // tokens are sorted (pinned in `document.rs`), and a language server
+        // must not abort if that ever stops being true.
+        if range.end.line != range.start.line {
+            continue;
+        }
+        let line = range.start.line;
+        let start = range.start.character;
+        let delta_line = line.saturating_sub(previous_line);
+        let delta_start = if delta_line == 0 {
+            start.saturating_sub(previous_start)
+        } else {
+            start
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: range.end.character.saturating_sub(start),
+            token_type: *kind as u32,
+            token_modifiers_bitset: *modifiers,
+        });
+        previous_line = line;
+        previous_start = start;
+    }
+    data
+}
+
 /// Convert a Vilan outline node to an LSP `DocumentSymbol`.
 #[allow(deprecated)]
 fn to_lsp_symbol(symbol: Symbol, line_index: &LineIndex) -> DocumentSymbol {
@@ -280,6 +330,43 @@ impl ManifestDocument {
             line_index: LineIndex::new(&text),
             text,
         }
+    }
+}
+
+/// The refusal a program-space *mutating* request answers while the live buffer
+/// has advanced past the analyzed snapshot (S3): its edits would be computed
+/// against one text and applied to another. Two spellings, chosen by how the
+/// client surfaces them:
+///
+/// - [`still_analyzing`] — `-32803`, the protocol's `RequestFailed`, spelled
+///   through `ServerError` because that one really is absent from tower-lsp
+///   0.20's `ErrorCode`. For requests the user invoked EXPLICITLY (rename):
+///   `vscode-languageclient` rethrows it without a toast (`rename.js` passes
+///   `showNotification: false`) and the rename widget shows this message
+///   inline — the user learns why nothing happened.
+/// - [`content_modified`] — the named `ContentModified` variant, the code LSP
+///   defines for "the content changed under this request". For requests that
+///   fire AUTOMATICALLY (code actions: menu population, `organizeImports.onSave`,
+///   `codeActionsOnSave`): the client swallows it silently and uses the default
+///   empty answer (`handleFailedRequest`), so a save mid-typing is a clean
+///   no-op. Any other code on this path raises an error toast — with
+///   `showNotification` defaulted true, "Request textDocument/codeAction
+///   failed." would pop on every save inside the debounce window.
+fn still_analyzing() -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::ServerError(-32803),
+        message: "still analyzing this file — retry in a moment".into(),
+        data: None,
+    }
+}
+
+/// See [`still_analyzing`]: the silent spelling, for refusals of automatic
+/// requests. The message rides along for wire logs; clients don't show it.
+fn content_modified() -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::ContentModified,
+        message: "still analyzing this file — retry in a moment".into(),
+        data: None,
     }
 }
 
@@ -767,28 +854,233 @@ mod code_action_tests {
     }
 }
 
-/// Analyze `text` as the document at `uri`, store the result, and publish its
-/// diagnostics (grouped per file — backlog E1). The analysis is CPU-bound, so
-/// it runs on a blocking thread to keep the async runtime responsive.
+#[cfg(test)]
+mod semantic_token_encoding_tests {
+    use super::encode_semantic_tokens;
+    use crate::document::TokenKind;
+    use crate::line_index::LineIndex;
+    use vilan_core::Span;
+
+    /// One classified span, as `Document::semantic_tokens` hands them over.
+    fn token(range: std::ops::Range<usize>) -> (Span, TokenKind, u32) {
+        (Span::from(range), TokenKind::Variable, 0)
+    }
+
+    // S6 / skew pin 5: positions AND deltas are UTF-16 code units. The line
+    // here carries a 3-byte em-dash and a 4-byte astral emoji before the second
+    // identifier, so the byte distance between the two tokens (24) and the
+    // UTF-16 distance (20) disagree — a delta in bytes would drop the second
+    // token four columns to the right of the word it highlights.
+    #[test]
+    fn token_deltas_are_utf16_units_not_byte_distances() {
+        let text = "let title = \"— 😀\"; let value = 2;\n";
+        let index = LineIndex::new(text);
+        let title = text.find("title").expect("the first identifier");
+        let value = text.find("value").expect("the second identifier");
+        assert_eq!(value - title, 24, "the byte distance");
+        let data = encode_semantic_tokens(
+            &[
+                token(title..title + "title".len()),
+                token(value..value + "value".len()),
+            ],
+            &index,
+        );
+        assert_eq!((data[0].delta_line, data[0].delta_start), (0, 4));
+        assert_eq!(
+            (data[1].delta_line, data[1].delta_start),
+            (0, 20),
+            "…is 20 UTF-16 units: the em-dash counts 1 and the emoji 2",
+        );
+    }
+
+    // S6, the `length` half. The classifier only ever hands over identifier
+    // spans and identifiers are ASCII (`lexing.rs::is_identifier_start`), so
+    // bytes and UTF-16 units agree for every token it can produce TODAY: this
+    // pin is the guard for the day one of them covers text that isn't (a
+    // string-interpolation hole, a comment, a wider identifier alphabet). A
+    // byte length stretches the highlight over whatever follows the token.
+    #[test]
+    fn a_token_length_counts_utf16_units_not_bytes() {
+        let text = "// — 😀\n";
+        let index = LineIndex::new(text);
+        let span = Span::from(3..text.find('\n').expect("a line end"));
+        assert_eq!(span.into_range().len(), 8, "`— 😀` is eight bytes");
+        let data = encode_semantic_tokens(&[(span, TokenKind::Variable, 0)], &index);
+        assert_eq!(
+            (data[0].delta_start, data[0].length),
+            (3, 4),
+            "…and four UTF-16 units (1 + 1 + 2)",
+        );
+    }
+
+    // Pin 6: the delta rules themselves — a same-line token is relative to the
+    // previous token's start, a token on a later line restarts from the line's
+    // own column 0 (absolute), and the type/modifier bits ride through.
+    #[test]
+    fn deltas_are_relative_within_a_line_and_absolute_across_lines() {
+        let text = "alpha beta\ngamma\n";
+        let index = LineIndex::new(text);
+        let data = encode_semantic_tokens(
+            &[
+                (Span::from(0..5), TokenKind::Variable, 0),
+                (Span::from(6..10), TokenKind::Function, 1),
+                (Span::from(11..16), TokenKind::Struct, 0),
+            ],
+            &index,
+        );
+        let shape: Vec<(u32, u32, u32, u32, u32)> = data
+            .iter()
+            .map(|item| {
+                (
+                    item.delta_line,
+                    item.delta_start,
+                    item.length,
+                    item.token_type,
+                    item.token_modifiers_bitset,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, 0, 5, TokenKind::Variable as u32, 0),
+                (0, 6, 4, TokenKind::Function as u32, 1),
+                // Absolute, not `0 - 6`.
+                (1, 0, 5, TokenKind::Struct as u32, 0),
+            ],
+        );
+    }
+
+    // A span that straddles a line boundary has no wire form (the encoding
+    // carries one line delta and one width). It is dropped rather than sent at
+    // a bogus width — and never panics, which is what an underflowing delta
+    // would have done. Reachable only through a stale-index conversion, which
+    // S1 now prevents; the guard stays because a language server must not abort.
+    #[test]
+    fn a_cross_line_span_is_dropped_and_its_neighbours_still_encode() {
+        let text = "alpha\nbeta\n";
+        let index = LineIndex::new(text);
+        let data = encode_semantic_tokens(
+            &[
+                (Span::from(0..5), TokenKind::Variable, 0),
+                // `alpha\nb` — straddles the newline.
+                (Span::from(0..7), TokenKind::Variable, 0),
+                (Span::from(6..10), TokenKind::Variable, 0),
+            ],
+            &index,
+        );
+        assert_eq!(data.len(), 2, "the straddling span is dropped");
+        assert_eq!((data[1].delta_line, data[1].delta_start), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::{PauseAction, Refresh, pause_action, refresh_plan};
+
+    // S5: a sweep that landed at least one analysis asks for BOTH providers,
+    // once — the analyzed snapshot moved underneath answers the client is
+    // already showing.
+    #[test]
+    fn a_landed_sweep_plans_one_refresh_pair() {
+        assert_eq!(
+            refresh_plan(true),
+            &[Refresh::SemanticTokens, Refresh::InlayHints],
+        );
+    }
+
+    // …and a sweep that landed nothing plans nothing: the answers out there
+    // were computed against a snapshot that is still current, so a refresh
+    // would only make the client re-ask for identical data.
+    #[test]
+    fn a_sweep_that_landed_nothing_plans_no_refresh() {
+        assert!(refresh_plan(false).is_empty());
+    }
+
+    // The two ways a pause lands nothing. A newer edit supersedes this one (its
+    // own pause will do the work), and a buffer byte-identical to the analyzed
+    // text has nothing to analyze — notably the case where the user typed and
+    // then undid it, which is also why staleness is text equality rather than a
+    // flag (`Document::is_stale`).
+    #[test]
+    fn a_superseded_or_unchanged_pause_neither_analyzes_nor_refreshes() {
+        assert_eq!(
+            pause_action(Some(7), 6, Some(1), 2),
+            PauseAction::Superseded,
+        );
+        assert_eq!(pause_action(None, 6, Some(1), 2), PauseAction::Superseded);
+        assert_eq!(pause_action(Some(6), 6, Some(9), 9), PauseAction::Unchanged);
+        assert_eq!(pause_action(Some(6), 6, Some(1), 2), PauseAction::Analyze);
+        // A document with no analysis yet (never possible today — `did_open`
+        // analyzes inline — but the skip must not swallow the work if it ever is).
+        assert_eq!(pause_action(Some(6), 6, None, 2), PauseAction::Analyze);
+    }
+}
+
+/// Analyze `text` as the document at `uri`, land the result on the open
+/// document, and publish its diagnostics (grouped per file — backlog E1). The
+/// analysis is CPU-bound, so it runs on a blocking thread to keep the async
+/// runtime responsive. Returns whether the analysis landed (see [`land`]).
 async fn analyze_and_publish(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
     uri: Url,
     text: String,
-) {
+) -> bool {
     let path = uri.to_file_path().unwrap_or_default();
     let std_dir = discover_std_dir(&path);
-    let document = match tokio::task::spawn_blocking(move || {
+    let analysis = match tokio::task::spawn_blocking(move || {
         Document::analyze(&text, &std_dir, &path)
     })
     .await
     {
-        Ok(document) => document,
-        Err(_) => return,
+        Ok(analysis) => analysis,
+        Err(_) => return false,
     };
-    documents.insert(uri.clone(), document);
+    if !land(documents, &uri, analysis) {
+        return false;
+    }
     publish_document(documents, client, publish_state, &uri).await;
+    true
+}
+
+/// Land a completed analysis on the open document at `uri`
+/// (`Document::adopt_analysis`). Returns whether it landed.
+///
+/// A result is dropped, not landed, in two cases:
+///
+/// - **The document is gone.** It was closed while the analysis ran; inserting
+///   the result would resurrect a closed buffer — its diagnostics would
+///   reappear with no document behind them and nothing left to clear them.
+///   Only `did_open` ever puts a document INTO the map, so a missing entry can
+///   only mean "closed".
+/// - **The buffer moved on.** The analysis is of a text that is no longer the
+///   live one. Two analyses of one document can be in flight at once (the
+///   debounce generation is checked only before an analysis *starts*), and
+///   they can finish in either order — adopting an older result on top of a
+///   newer one would regress the analyzed snapshot and leave the document
+///   stuck stale, with nothing scheduled to heal it until the next keystroke.
+///   Dropping is always safe here: a live text this analysis doesn't match
+///   implies a later `did_change` whose own debounced task (or an
+///   already-landed fresher analysis) covers the buffer.
+///
+/// So the analyzed snapshot only ever advances to *the* live text, never
+/// sideways to a different stale one. `adopt_analysis` keeps its own
+/// keep-the-live-side guard all the same — two independent layers: this one
+/// never regresses the snapshot, that one never loses typed text.
+///
+/// Synchronous by construction: the map guard is taken and dropped here, never
+/// held across the caller's `await`.
+fn land(documents: &DashMap<Url, Document>, uri: &Url, analysis: Document) -> bool {
+    let Some(mut document) = documents.get_mut(uri) else {
+        return false;
+    };
+    if document.text != analysis.text {
+        return false;
+    }
+    document.adopt_analysis(analysis);
+    true
 }
 
 /// Publish the stored document's diagnostics: the planner computes every
@@ -818,20 +1110,88 @@ async fn publish_document(
 /// Re-analyze every OTHER open document: an edit (or save) of one file changes
 /// what its dependents see, so their diagnostics must be recomputed — the
 /// stale-diagnostics half of backlog E1. Their buffers didn't change, so this
-/// bypasses the unchanged-text short-circuit deliberately.
+/// bypasses the unchanged-text short-circuit deliberately. Returns whether any
+/// of them landed an analysis.
 async fn reanalyze_dependents(
     documents: &DashMap<Url, Document>,
     client: &Client,
     publish_state: &std::sync::Mutex<PublishState>,
     changed: &Url,
-) {
+) -> bool {
     let others: Vec<(Url, String)> = documents
         .iter()
         .filter(|entry| entry.key() != changed)
         .map(|entry| (entry.key().clone(), entry.value().text.clone()))
         .collect();
+    let mut landed = false;
     for (uri, text) in others {
-        analyze_and_publish(documents, client, publish_state, uri, text).await;
+        landed |= analyze_and_publish(documents, client, publish_state, uri, text).await;
+    }
+    landed
+}
+
+/// One thing the server asks the client to re-request after a sweep of
+/// analyses lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refresh {
+    SemanticTokens,
+    InlayHints,
+}
+
+/// What a completed sweep owes the client, as data — the publish planner's
+/// pattern (backlog E6): the decision is computed here and unit-tested, and
+/// [`send_refreshes`] merely transmits it.
+///
+/// A sweep that landed at least one analysis has moved the analyzed snapshot
+/// underneath answers the client is already showing, so both providers are
+/// asked for once — per sweep, not per document. A sweep that landed nothing
+/// (superseded, closed, or the buffer was byte-identical to what we last
+/// analyzed) owes nothing: the answers out there were computed against a
+/// snapshot that is still current.
+fn refresh_plan(landed: bool) -> &'static [Refresh] {
+    if landed {
+        &[Refresh::SemanticTokens, Refresh::InlayHints]
+    } else {
+        &[]
+    }
+}
+
+/// Send a [`refresh_plan`]. Errors are ignored: a client that doesn't support
+/// refresh answers with one, and that is a no-op, not a failure.
+async fn send_refreshes(client: &Client, plan: &[Refresh]) {
+    for refresh in plan {
+        let _ = match refresh {
+            Refresh::SemanticTokens => client.semantic_tokens_refresh().await,
+            Refresh::InlayHints => client.inlay_hint_refresh().await,
+        };
+    }
+}
+
+/// What a debounced pause does when it wakes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PauseAction {
+    /// A newer edit (or a close) arrived while we slept — that one will run.
+    Superseded,
+    /// The buffer is byte-for-byte what we last analyzed. Nothing to analyze,
+    /// and nothing to refresh: every answer already out there is still right.
+    Unchanged,
+    /// Re-analyze and sweep the dependents.
+    Analyze,
+}
+
+/// The pause decision, separated from its effects so both skips are testable.
+fn pause_action(
+    pending_generation: Option<u64>,
+    this_generation: u64,
+    analyzed_hash: Option<u64>,
+    buffer_hash: u64,
+) -> PauseAction {
+    if pending_generation != Some(this_generation) {
+        PauseAction::Superseded
+    } else if analyzed_hash == Some(buffer_hash) {
+        PauseAction::Unchanged
+    } else {
+        PauseAction::Analyze
     }
 }
 
@@ -851,18 +1211,28 @@ impl Backend {
         let client = self.client.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-            // A newer edit (or a close) superseded this one.
-            if pending.get(&uri).map(|current| *current) != Some(generation) {
-                return;
+            // Read both facts synchronously (no map guard may cross an await),
+            // then decide.
+            let current_generation = pending.get(&uri).map(|current| *current);
+            let analyzed_hash = documents.get(&uri).map(|document| document.text_hash);
+            match pause_action(
+                current_generation,
+                generation,
+                analyzed_hash,
+                hash_text(&text),
+            ) {
+                PauseAction::Superseded | PauseAction::Unchanged => return,
+                PauseAction::Analyze => {}
             }
-            // The buffer is byte-for-byte what we last analyzed — nothing to do.
-            if documents.get(&uri).map(|document| document.text_hash) == Some(hash_text(&text)) {
-                return;
-            }
-            analyze_and_publish(&documents, &client, &publish_state, uri.clone(), text).await;
+            let landed =
+                analyze_and_publish(&documents, &client, &publish_state, uri.clone(), text).await;
             // The edit may change what other open files see (they import this
             // one, or a file it re-exports) — bring their diagnostics up to date.
-            reanalyze_dependents(&documents, &client, &publish_state, &uri).await;
+            let dependents_landed =
+                reanalyze_dependents(&documents, &client, &publish_state, &uri).await;
+            // The analyzed snapshot moved under the client's highlighting and
+            // hints; ask for them again (S5). Every guard is long dropped here.
+            send_refreshes(&client, refresh_plan(landed || dependents_landed)).await;
         });
     }
 
@@ -894,7 +1264,8 @@ impl Backend {
         if source == SourceId(0) {
             return Some(Location {
                 uri: doc_uri.clone(),
-                range: document.line_index.range(&span),
+                // A program span indexes the ANALYZED text (S1).
+                range: document.analyzed_range(&span),
             });
         }
         let program = document.program.as_ref()?;
@@ -1033,6 +1404,10 @@ impl LanguageServer for Backend {
         vilan_core::analyzer::set_document_overlay(&path, Some(params.text_document.text.clone()));
         let std_dir = discover_std_dir(&path);
         let document = Document::analyze(&params.text_document.text, &std_dir, &path);
+        // The ONLY place a document enters the map. Every later analysis lands
+        // by merge onto what is here (`land`), which is what lets a result
+        // arriving after `did_close` be dropped instead of resurrecting the
+        // file: a missing entry can only mean "closed", never "not opened yet".
         self.documents.insert(uri.clone(), document);
         publish_document(&self.documents, &self.client, &self.publish_state, &uri).await;
     }
@@ -1064,12 +1439,15 @@ impl LanguageServer for Backend {
         // A save changes what OTHER documents' analyses read from disk (module
         // loading is disk-backed), so re-analyze every open document.
         let saved = params.text_document.uri;
+        // `.map` consumes the map guard inside the closure, so nothing is held
+        // across the awaits below (which take the same key for writing).
+        let mut landed = false;
         if let Some((uri, text)) = self
             .documents
             .get(&saved)
             .map(|document| (saved.clone(), document.text.clone()))
         {
-            analyze_and_publish(
+            landed = analyze_and_publish(
                 &self.documents,
                 &self.client,
                 &self.publish_state,
@@ -1078,7 +1456,10 @@ impl LanguageServer for Backend {
             )
             .await;
         }
-        reanalyze_dependents(&self.documents, &self.client, &self.publish_state, &saved).await;
+        landed |=
+            reanalyze_dependents(&self.documents, &self.client, &self.publish_state, &saved).await;
+        // Same sweep rule as a typing pause (S5).
+        send_refreshes(&self.client, refresh_plan(landed)).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1123,8 +1504,18 @@ impl LanguageServer for Backend {
             .inlay_hints()
             .into_iter()
             .filter_map(|(offset, label)| {
-                let span = vilan_core::Span::from(offset..offset);
-                let position = document.line_index.range(&span).start;
+                // The anchor is a program offset, so it converts through the
+                // ANALYZED index (S1). Through the live one, an insertion above
+                // slid every hint below it — and the viewport filter on the next
+                // line then dropped the ones that slid out of range entirely.
+                //
+                // The filter itself compares this analyzed-space position to
+                // `params.range`, which is live-space — under FULL sync there
+                // is no mapping between the two, so this is as good as it gets
+                // (backlog 39c): exact for same-line edits, off by the inserted
+                // or deleted lines near the viewport edge for the ~200 ms until
+                // the refresh lands.
+                let position = document.analyzed_position(offset);
                 (position >= range.start && position <= range.end).then(|| InlayHint {
                     position,
                     label: InlayHintLabel::String(label),
@@ -1153,33 +1544,7 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
-        // Delta-encode (line delta, char delta, length, type, modifiers) in
-        // position order; identifiers never span lines, so the length is the
-        // span's width.
-        let mut data: Vec<SemanticToken> = Vec::new();
-        let mut previous_line = 0u32;
-        let mut previous_start = 0u32;
-        for (span, kind, modifiers) in document.semantic_tokens() {
-            let range = document.line_index.range(&span);
-            let line = range.start.line;
-            let start = range.start.character;
-            let length = span.into_range().len() as u32;
-            let delta_line = line - previous_line;
-            let delta_start = if delta_line == 0 {
-                start - previous_start
-            } else {
-                start
-            };
-            data.push(SemanticToken {
-                delta_line,
-                delta_start,
-                length,
-                token_type: kind as u32,
-                token_modifiers_bitset: modifiers,
-            });
-            previous_line = line;
-            previous_start = start;
-        }
+        let data = encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
             result_id: None,
             data,
@@ -1192,7 +1557,9 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
-        let offset = document.line_index.offset(position);
+        // Program-space lookup: the position converts through the ANALYZED
+        // index, so it names the same character the analysis saw there (S1).
+        let offset = document.analyzed_offset(position);
         Ok(document.hover(offset).map(|label| Hover {
             contents: HoverContents::Scalar(MarkedString::String(label)),
             range: None,
@@ -1236,7 +1603,7 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
-        let offset = document.line_index.offset(position);
+        let offset = document.analyzed_offset(position);
         let Some((source, span)) = document.definition(offset) else {
             return Ok(None);
         };
@@ -1251,7 +1618,7 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
-        let offset = document.line_index.offset(position);
+        let offset = document.analyzed_offset(position);
         let locations = document
             .references(offset)
             .into_iter()
@@ -1267,7 +1634,14 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
-        let offset = document.line_index.offset(position);
+        // S3: a rename is edits computed from program data. Applying them to a
+        // buffer that has moved on corrupts it, so refuse while the snapshots
+        // diverge instead of guessing. At human timescales this is invisible —
+        // a rename happens at rest, after the debounce has landed.
+        if document.is_stale() {
+            return Err(still_analyzing());
+        }
+        let offset = document.analyzed_offset(position);
         let occurrences = document.references(offset);
         if occurrences.is_empty() {
             return Ok(None);
@@ -1298,7 +1672,7 @@ impl LanguageServer for Backend {
         let symbols = document
             .document_symbols()
             .into_iter()
-            .map(|symbol| to_lsp_symbol(symbol, &document.line_index))
+            .map(|symbol| to_lsp_symbol(symbol, document.analyzed_index()))
             .collect::<Vec<_>>();
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
@@ -1335,6 +1709,14 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
+        // S3, as for rename: the action returns text edits, and its prune half
+        // is computed from program data. Refuse while the snapshots diverge
+        // rather than hand back a half-informed edit set — with the SILENT
+        // spelling: code actions fire automatically (menu population, the
+        // on-save hooks), so this refusal must not toast.
+        if document.is_stale() {
+            return Err(content_modified());
+        }
         let edits = document.organize_import_edits();
         // No edits = already organized (or nothing to do): offer no action, so
         // `codeActionsOnSave` is a clean no-op.
@@ -1344,6 +1726,9 @@ impl LanguageServer for Backend {
         let text_edits: Vec<TextEdit> = edits
             .into_iter()
             .map(|(span, new_text)| TextEdit {
+                // Live-space: these spans come from the formatter's own parse
+                // of the live text, not from the program (S2). The staleness
+                // refusal above means the two texts are equal here anyway.
                 range: document.line_index.range(&span),
                 new_text,
             })
@@ -1379,6 +1764,488 @@ fn organize_imports_requested(only: &Option<Vec<CodeActionKind>>) -> bool {
                 .strip_prefix(requested.as_str())
                 .is_some_and(|rest| rest.starts_with('.'))
     })
+}
+
+#[cfg(test)]
+mod snapshot_consistency_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+    use tower_lsp::ClientSocket;
+
+    const SOURCE: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
+    /// The same program with one character inserted on line 0, so every later
+    /// byte shifts: what the buffer looks like mid-keystroke.
+    const EDITED: &str = "fun  main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
+
+    fn document(text: &str) -> Document {
+        Document::analyze(text, &std_root(), Path::new("snapshot.vl"))
+    }
+
+    fn uri() -> Url {
+        Url::parse("file:///snapshot/main.vl").expect("a url")
+    }
+
+    /// A real `Backend` (the socket is returned so the client half stays
+    /// alive). Only handlers that never talk to the client are driven through
+    /// it — the ones this file guards.
+    fn backend() -> (LspService<Backend>, ClientSocket) {
+        LspService::new(|client| Backend {
+            client,
+            documents: Arc::new(DashMap::new()),
+            manifests: Arc::new(DashMap::new()),
+            publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
+            pending: Arc::new(DashMap::new()),
+            line_indices: Arc::new(DashMap::new()),
+            config: Arc::new(std::sync::RwLock::new(Config::default())),
+            snippet_support: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// An open document at [`uri`], analyzed from `SOURCE`, with `live` applied
+    /// as an un-analyzed edit.
+    fn open_with_live_edit(backend: &Backend, live: &str) -> Url {
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SOURCE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("just inserted")
+            .set_text(live);
+        uri
+    }
+
+    fn rename_params(uri: &Url, position: Position) -> RenameParams {
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            new_name: "renamed".to_string(),
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    fn code_action_params(uri: &Url) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::default(),
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    // S3, handler 1 of 2: rename returns text edits computed from program
+    // spans. Applying them to a buffer that has moved on lands them at the
+    // wrong offsets — the one failure mode that corrupts a file rather than
+    // merely looking wrong — so it refuses while the snapshots diverge.
+    #[tokio::test]
+    async fn rename_refuses_while_the_buffer_is_ahead_of_the_analysis() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, EDITED);
+        let position = Position::new(1, 6); // inside `value`
+        let error = backend
+            .rename(rename_params(&uri, position))
+            .await
+            .expect_err("a stale rename refuses");
+        assert_eq!(error.code, ErrorCode::ServerError(-32803));
+        assert!(
+            error.message.contains("still analyzing"),
+            "{}",
+            error.message
+        );
+    }
+
+    // …and it answers normally once the buffer and the analysis agree again —
+    // the non-vacuity half, so the refusal can't be a permanent refusal.
+    #[tokio::test]
+    async fn rename_answers_once_the_snapshots_agree() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+        let edit = backend
+            .rename(rename_params(&uri, Position::new(1, 6)))
+            .await
+            .expect("a fresh rename answers")
+            .expect("`value` is renameable");
+        let changes = edit.changes.expect("one file's edits");
+        assert_eq!(
+            changes[&uri].len(),
+            2,
+            "the declaration and its use are renamed",
+        );
+    }
+
+    // S3, handler 2 of 2: Organize Imports also returns text edits, and its
+    // prune half reads program data. Its refusal is the SILENT spelling —
+    // `ContentModified`, which `vscode-languageclient` swallows into the
+    // default empty answer — because code actions fire automatically (menu
+    // population, the on-save hooks): `RequestFailed` here would pop an error
+    // toast on every save inside the debounce window.
+    #[tokio::test]
+    async fn organize_imports_refuses_while_the_buffer_is_ahead_of_the_analysis() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, EDITED);
+        let error = backend
+            .code_action(code_action_params(&uri))
+            .await
+            .expect_err("a stale organize refuses");
+        assert_eq!(error.code, ErrorCode::ContentModified);
+        assert!(
+            error.message.contains("still analyzing"),
+            "{}",
+            error.message
+        );
+    }
+
+    // A code-action request for a kind we don't offer is answered before the
+    // staleness gate: refusing there would make every unrelated quickfix
+    // request fail mid-typing.
+    #[tokio::test]
+    async fn a_stale_document_still_answers_an_unrelated_code_action_kind() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, EDITED);
+        let mut params = code_action_params(&uri);
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        assert!(
+            backend
+                .code_action(params)
+                .await
+                .expect("not a refusal")
+                .is_none(),
+        );
+    }
+
+    // S1/S3: read-only queries never refuse — they answer
+    // correctly-for-the-snapshot. Semantic tokens over a stale buffer come back
+    // byte-identical to the pre-edit answer, which is what stops the
+    // highlighting from breaking up while the analysis catches up.
+    #[tokio::test]
+    async fn semantic_tokens_answer_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SOURCE));
+        let params = SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let baseline = backend
+            .semantic_tokens_full(params.clone())
+            .await
+            .expect("tokens");
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(EDITED);
+        let mid_edit = backend
+            .semantic_tokens_full(params)
+            .await
+            .expect("tokens while typing");
+        assert_eq!(
+            format!("{baseline:?}"),
+            format!("{mid_edit:?}"),
+            "the answer holds still until the analysis lands",
+        );
+        let SemanticTokensResult::Tokens(tokens) = baseline.expect("some") else {
+            panic!("the full provider returns tokens");
+        };
+        assert!(!tokens.data.is_empty(), "the fixture must produce tokens");
+    }
+
+    // S1: inlay hints, same property — and the viewport filter is what made
+    // them vanish rather than merely shift, so the request asks for the whole
+    // file's range exactly as the editor does.
+    #[tokio::test]
+    async fn inlay_hints_answer_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(SOURCE));
+        let params = InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(0, 0), Position::new(100, 0)),
+            work_done_progress_params: Default::default(),
+        };
+        let baseline = backend.inlay_hint(params.clone()).await.expect("hints");
+        assert!(
+            baseline.as_ref().is_some_and(|hints| !hints.is_empty()),
+            "the fixture must produce hints",
+        );
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(EDITED);
+        let mid_edit = backend
+            .inlay_hint(params)
+            .await
+            .expect("hints while typing");
+        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    // --- Handler wiring: the S1 index switch, pinned per handler ------------
+    //
+    // Case 9 pins the inbound mechanism on `Document`; these pin that each
+    // HANDLER actually routes through it — reverting any one handler line back
+    // to the live index fails its pin. The fixture prepends a line, which
+    // changes the LINE every analyzed byte offset converts to through the live
+    // index; and the two locals carry different types (`i32` vs `str`), so a
+    // wrongly-wired inbound lookup that slides from `other` onto `value`
+    // cannot answer an accidentally-identical hover.
+
+    /// `WIRING_SOURCE` with a comment line prepended: every analyzed offset's
+    /// live-index conversion moves down a line (or, near the top, onto the
+    /// comment's bytes).
+    const WIRING_SOURCE: &str = "fun main() {\n\tlet value = 1;\n\tlet other = \"text\";\n}\n";
+    const WIRING_EDITED_HEAD: &str = "// a new first line\n";
+
+    /// Apply the prepend to the open document at `uri` as an un-analyzed edit —
+    /// with the guard that the edit really skews the inbound conversion at
+    /// `position` (otherwise the equality assertions above it prove nothing).
+    fn apply_wiring_edit(backend: &Backend, uri: &Url, position: Position) {
+        let mut edited = String::from(WIRING_EDITED_HEAD);
+        edited.push_str(WIRING_SOURCE);
+        backend
+            .documents
+            .get_mut(uri)
+            .expect("open")
+            .set_text(&edited);
+        let document = backend.documents.get(uri).expect("open");
+        assert_ne!(
+            document.analyzed_offset(position),
+            document.line_index.offset(position),
+            "the fixture must skew the inbound conversion at {position:?}",
+        );
+    }
+
+    /// The `other` declaration in [`WIRING_SOURCE`]: line 2, inside the name.
+    fn other_decl() -> Position {
+        Position::new(2, 6)
+    }
+
+    #[tokio::test]
+    async fn hover_answers_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(WIRING_SOURCE));
+        let params = |uri: &Url| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: other_decl(),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let baseline = backend.hover(params(&uri)).await.expect("hover");
+        assert!(baseline.is_some(), "the fixture must hover");
+        apply_wiring_edit(backend, &uri, other_decl());
+        let mid_edit = backend.hover(params(&uri)).await.expect("hover mid-edit");
+        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    #[tokio::test]
+    async fn goto_definition_answers_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(WIRING_SOURCE));
+        let params = |uri: &Url| GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: other_decl(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let baseline = backend.goto_definition(params(&uri)).await.expect("def");
+        assert!(baseline.is_some(), "the fixture must resolve a definition");
+        apply_wiring_edit(backend, &uri, other_decl());
+        let mid_edit = backend
+            .goto_definition(params(&uri))
+            .await
+            .expect("def mid-edit");
+        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    #[tokio::test]
+    async fn references_answer_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(WIRING_SOURCE));
+        let params = |uri: &Url| ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: other_decl(),
+            },
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let baseline = backend.references(params(&uri)).await.expect("refs");
+        assert!(
+            baseline.as_ref().is_some_and(|refs| !refs.is_empty()),
+            "the fixture must find references",
+        );
+        apply_wiring_edit(backend, &uri, other_decl());
+        let mid_edit = backend
+            .references(params(&uri))
+            .await
+            .expect("refs mid-edit");
+        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    #[tokio::test]
+    async fn document_symbols_answer_the_analyzed_snapshot_while_typing() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(WIRING_SOURCE));
+        let params = |uri: &Url| DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let baseline = backend
+            .document_symbol(params(&uri))
+            .await
+            .expect("symbols");
+        assert!(baseline.is_some(), "the fixture must outline");
+        apply_wiring_edit(backend, &uri, other_decl());
+        // The outbound guard: the outline's spans really do convert differently
+        // through the two indices after the edit (the prepend moves the
+        // function's END line, so the full range differs even though its start
+        // does not).
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            let full = document.document_symbols()[0].full;
+            assert_ne!(
+                document.analyzed_range(&full),
+                document.line_index.range(&full),
+                "the fixture must skew the outbound conversion",
+            );
+        }
+        let mid_edit = backend
+            .document_symbol(params(&uri))
+            .await
+            .expect("symbols mid-edit");
+        assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    // S4, pin 12: an analysis that finishes AFTER the document was closed is
+    // dropped. Re-inserting it would resurrect a closed buffer — diagnostics
+    // reappearing with no document behind them and nothing left to clear them,
+    // since `did_close` has already run its clear.
+    #[test]
+    fn an_analysis_that_finishes_after_a_close_is_dropped() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        assert!(
+            !land(&documents, &uri(), document(SOURCE)),
+            "nothing to land onto",
+        );
+        assert!(
+            documents.is_empty(),
+            "the closed document is not resurrected"
+        );
+    }
+
+    // …while an analysis OF the live text lands: the freshest possible answer,
+    // adopted.
+    #[test]
+    fn an_analysis_of_the_live_text_lands() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        documents.get_mut(&uri).expect("open").set_text(EDITED);
+        assert!(land(&documents, &uri, document(EDITED)));
+        let document = documents.get(&uri).expect("still open");
+        assert_eq!(document.analyzed_text(), EDITED, "the analysis is adopted");
+        assert!(!document.is_stale());
+    }
+
+    // S4's ordering half: two analyses of one document can be in flight at once
+    // (the debounce generation is only checked before an analysis STARTS), and
+    // the OLDER one can finish second. Landing it would regress the analyzed
+    // snapshot underneath the newer one and leave the document stuck stale —
+    // answers in last-keystroke-but-one coordinates and every rename refused —
+    // with nothing scheduled to heal it until the next keystroke. So a result
+    // for a text that is no longer the live one is dropped: whatever made the
+    // live text move on has its own debounced task (or already landed).
+    #[test]
+    fn a_stale_analysis_finishing_out_of_order_is_dropped() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        // The user types EDITED; its analysis (the newer one) lands first…
+        documents.get_mut(&uri).expect("open").set_text(EDITED);
+        assert!(land(&documents, &uri, document(EDITED)));
+        // …and the analysis of the ORIGINAL text (started earlier, finished
+        // later) arrives afterwards.
+        assert!(
+            !land(&documents, &uri, document(SOURCE)),
+            "an out-of-order result is dropped",
+        );
+        let document = documents.get(&uri).expect("still open");
+        assert_eq!(
+            document.analyzed_text(),
+            EDITED,
+            "the newer snapshot is not regressed",
+        );
+        assert!(
+            !document.is_stale(),
+            "the document does not get stuck refusing renames",
+        );
+    }
+
+    // The mid-burst variant of the same rule: the buffer has already moved past
+    // the text this analysis consumed, so it is dropped even though it is newer
+    // than the ADOPTED snapshot — the keystroke that moved the buffer has its
+    // own debounced task, and adopting here would still leave the document
+    // stale. The analyzed snapshot only ever advances to the live text.
+    #[test]
+    fn an_analysis_the_buffer_has_moved_past_is_dropped() {
+        let documents: DashMap<Url, Document> = DashMap::new();
+        let uri = uri();
+        documents.insert(uri.clone(), document(SOURCE));
+        documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text("fun main() {\n\tlet value = 2;\n}\n");
+        assert!(
+            !land(&documents, &uri, document(EDITED)),
+            "EDITED is not the live text",
+        );
+        let document = documents.get(&uri).expect("still open");
+        assert_eq!(
+            document.text, "fun main() {\n\tlet value = 2;\n}\n",
+            "the live edit is kept",
+        );
+        assert_eq!(
+            document.analyzed_text(),
+            SOURCE,
+            "the snapshot stays consistent at the last adopted analysis",
+        );
+    }
 }
 
 #[tokio::main]

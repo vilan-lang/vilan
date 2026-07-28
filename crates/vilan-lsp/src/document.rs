@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Implementation, Parameter, SourceId};
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
@@ -696,8 +698,31 @@ fn in_import_path(text: &str, offset: usize) -> bool {
     keyword == "import" || keyword == "use"
 }
 
+/// One open file, held as TWO snapshots (`lsp-snapshot-consistency.md`):
+///
+/// - the **live** snapshot — [`text`](Document::text) and
+///   [`line_index`](Document::line_index) — advanced synchronously by
+///   [`set_text`](Document::set_text) on every edit, so live-text operations
+///   (completion's context scan, whole-document formatting) see the character
+///   that was just typed;
+/// - the **analyzed** snapshot — the `program`, every product derived from it,
+///   and `analyzed_index` (the line index OF the text the analysis consumed) —
+///   advanced only when an analysis lands ([`adopt_analysis`](Document::adopt_analysis)).
+///
+/// Every program span and offset lives in the analyzed snapshot's coordinate
+/// space, so it must be converted through `analyzed_index` — see
+/// [`analyzed_range`](Document::analyzed_range). Converting a stale program's
+/// byte offsets through the *live* index is what made highlighting and inlay
+/// hints slide around while typing: same bytes, different text.
 pub struct Document {
-    pub line_index: LineIndex,
+    /// The LIVE line index: the text as of the last edit. Shared as an `Arc`
+    /// with `analyzed_index` while the two snapshots agree, which is the
+    /// steady state — an edit replaces this one alone.
+    pub line_index: Arc<LineIndex>,
+    /// The ANALYZED line index: the text the current `program` was built from.
+    /// A `LineIndex` owns its text, so this IS the analyzed-text record — there
+    /// is no second `String` to keep in step.
+    analyzed_index: Arc<LineIndex>,
     pub program: Option<Program<'static>>,
     /// Evaluated `const` results (E9: hover shows a constant's VALUE). The
     /// evaluation is fuel-capped and skips itself on any diagnostic, so a
@@ -714,9 +739,9 @@ pub struct Document {
     /// attribution channel the errors use (backlog E16), so a `[must_use]`
     /// warning in an imported module squiggles in that module.
     pub warning_sources: Vec<SourceId>,
-    /// The buffer text as of the last edit — kept so a dependent re-analysis
-    /// (another open file changed) can re-run this document without the editor
-    /// resending its content.
+    /// The LIVE buffer text, as of the last edit — kept so a dependent
+    /// re-analysis (another open file changed) can re-run this document without
+    /// the editor resending its content.
     pub text: String,
     /// A hash of the source text this document was analyzed from, so an edit that
     /// leaves the buffer unchanged can skip re-analysis.
@@ -830,7 +855,10 @@ impl Document {
     }
 
     fn analyze_on_this_thread(text: &str, std_dir: &Path, entry_path: &Path) -> Self {
-        let line_index = LineIndex::new(text);
+        // A fresh analysis has one snapshot: its text IS both the live and the
+        // analyzed one, so both indices share a single `Arc`. They part company
+        // only when an edit lands (`set_text`).
+        let line_index = Arc::new(LineIndex::new(text));
         let text_hash = hash_text(text);
         // The program borrows its source for `'static`, so leak a copy (the
         // editor re-analyzes on change; see the known leak tradeoff).
@@ -912,6 +940,7 @@ impl Document {
             .unwrap_or_default();
 
         Document {
+            analyzed_index: Arc::clone(&line_index),
             line_index,
             program,
             const_results,
@@ -1059,14 +1088,107 @@ impl Document {
         published
     }
 
-    /// Updates the document's text (its line index) without re-analyzing — applied
-    /// on every edit so position-based queries (notably completion's context scan)
-    /// see the just-typed character immediately, while the heavier re-analysis
-    /// stays debounced. `text_hash` is deliberately left at the last *analyzed*
-    /// text so the pending re-analysis still fires.
+    /// Advances the LIVE snapshot — the text and its line index — without
+    /// re-analyzing. Applied on every edit so live-text queries (notably
+    /// completion's context scan) see the just-typed character immediately,
+    /// while the heavier re-analysis stays debounced. The analyzed snapshot
+    /// (`program`, `analyzed_index`, `text_hash`) is deliberately untouched:
+    /// program answers stay exactly right for the text they were computed
+    /// from, and the pending re-analysis still fires.
     pub fn set_text(&mut self, text: &str) {
-        self.line_index = LineIndex::new(text);
+        self.line_index = Arc::new(LineIndex::new(text));
         self.text = text.to_string();
+    }
+
+    /// The line index of the text the current analysis consumed: the coordinate
+    /// space every program span and offset lives in.
+    pub fn analyzed_index(&self) -> &LineIndex {
+        &self.analyzed_index
+    }
+
+    /// The text the current analysis consumed.
+    pub fn analyzed_text(&self) -> &str {
+        self.analyzed_index.text()
+    }
+
+    /// The LSP range for a program span — the outbound program-space
+    /// conversion (semantic tokens, inlay hints, definition/reference/symbol
+    /// locations). Correct for the analyzed text, and therefore visually
+    /// correct in the editor everywhere except the lines being actively edited;
+    /// converting the same bytes through the live index is correct for
+    /// *neither* text.
+    pub fn analyzed_range(&self, span: &Span) -> Range {
+        self.analyzed_index.range(span)
+    }
+
+    /// The LSP position for a program byte offset (an inlay hint's anchor).
+    pub fn analyzed_position(&self, offset: usize) -> Position {
+        self.analyzed_index.position(offset)
+    }
+
+    /// The program byte offset for an LSP position — the inbound program-space
+    /// conversion, feeding `entity_at` and the queries built on it (hover,
+    /// definition, references, rename).
+    pub fn analyzed_offset(&self, position: Position) -> usize {
+        self.analyzed_index.offset(position)
+    }
+
+    /// Whether the live buffer has advanced past the analyzed text — i.e. an
+    /// analysis is pending and program answers describe an older text.
+    ///
+    /// Deliberately a text comparison rather than a flag set by `set_text`: an
+    /// edit that returns the buffer to the analyzed text takes the debounce's
+    /// unchanged-text short-circuit, so no analysis ever lands to clear a flag
+    /// and it would stick "stale" forever. Text equality heals itself.
+    pub fn is_stale(&self) -> bool {
+        self.text != self.analyzed_text()
+    }
+
+    /// Land a completed analysis of this document (`analysis` is a fresh
+    /// [`Document::analyze`] result for the same file).
+    ///
+    /// Every field is classified. The **analysis side** — `program` and
+    /// everything derived from it, `analyzed_index`, `text_hash`, the
+    /// diagnostics and their attribution, the const results, entity spans,
+    /// platform requirements, the manifest problem — is adopted wholesale. The
+    /// **live side** — `text` and `line_index` — is kept whenever the buffer
+    /// advanced while the analysis ran, so a merge can never undo typing (this
+    /// replaced a whole-`Document` overwrite, which lost every character typed
+    /// during the 80–190 ms analysis). When the two texts are equal the live
+    /// side is adopted too, which puts both indices back on one shared `Arc`.
+    pub fn adopt_analysis(&mut self, analysis: Document) {
+        let Document {
+            line_index: analyzed_live_index,
+            analyzed_index,
+            program,
+            const_results,
+            diagnostics,
+            diagnostic_sources,
+            warnings,
+            warning_sources,
+            text: analyzed_text,
+            text_hash,
+            entity_spans,
+            platform_requirements,
+            manifest_problem,
+        } = analysis;
+        // The analysis side, in full.
+        self.analyzed_index = analyzed_index;
+        self.program = program;
+        self.const_results = const_results;
+        self.diagnostics = diagnostics;
+        self.diagnostic_sources = diagnostic_sources;
+        self.warnings = warnings;
+        self.warning_sources = warning_sources;
+        self.text_hash = text_hash;
+        self.entity_spans = entity_spans;
+        self.platform_requirements = platform_requirements;
+        self.manifest_problem = manifest_problem;
+        // The live side, only when the buffer has not moved on.
+        if self.text == analyzed_text {
+            self.text = analyzed_text;
+            self.line_index = analyzed_live_index;
+        }
     }
 
     /// The innermost entry-file entity whose span contains `offset`.
@@ -1173,7 +1295,12 @@ impl Document {
     /// classifies the token whose span contains the cursor — only a keyword
     /// token yields a hover, so a string literal like `"fun"` never does.
     fn keyword_hover(&self, offset: usize) -> Option<String> {
-        let (tokens, _errors) = tokenize(&self.text);
+        // The ANALYZED text: `offset` arrived through `analyzed_offset`, so
+        // every lookup hover makes must index the same snapshot. (Lexing is
+        // independent of analysis SUCCEEDING, so a keyword still hovers on a
+        // document that doesn't compile — that was the point of doing this
+        // before the `program` check.)
+        let (tokens, _errors) = tokenize(self.analyzed_text());
         let (token, _span) = tokens.iter().find(|(_, span)| {
             let range = span.into_range();
             range.start <= offset && offset < range.end
@@ -1246,14 +1373,15 @@ impl Document {
     /// The contiguous `//` block directly above a declaration's name line —
     /// its doc comment, with the comment markers stripped. Attribute lines
     /// (`[must_use]`, `[platform(…)]`) between the block and the name are
-    /// skipped. The entry file reads from the open buffer; other sources
-    /// read from disk on demand (hover-time, cheap).
+    /// skipped. The entry file reads the ANALYZED text (`name_span` is a
+    /// program span, so it slices the text the analysis consumed); other
+    /// sources read from disk on demand (hover-time, cheap).
     fn doc_comment_of(&self, program: &Program, declaration_id: Id) -> Option<String> {
         let source = program.source_of(declaration_id)?;
         let name_span = self.definition_name_span(program, declaration_id)?;
         let owned;
         let text: &str = if source == SourceId(0) {
-            &self.text
+            self.analyzed_text()
         } else {
             let path = program.source_path(source)?;
             // BOM-stripped so `name_span` (from the analyzer's read) slices
@@ -1774,6 +1902,10 @@ impl Document {
     /// the formatter — they are surface, not usage), and an import a macro
     /// expansion references is kept (see `unused_import_leaf_spans`).
     pub fn organize_import_edits(&self) -> Vec<(Span, String)> {
+        // The LIVE text: the returned spans come from the formatter's own parse
+        // of this string, so they are live-space and the handler converts them
+        // through the live index. (The handler also refuses outright while the
+        // snapshots diverge — S3 — so in practice the two texts are equal here.)
         let source = self.text.as_str();
         // Prune only against a fresh, diagnostic-free analysis of THIS buffer: a
         // stale or broken document (a mid-edit unresolved name might be about to
@@ -1781,7 +1913,7 @@ impl Document {
         let prunable_program = self
             .program
             .as_ref()
-            .filter(|_| self.diagnostics.is_empty() && self.text_hash == hash_text(source));
+            .filter(|_| self.diagnostics.is_empty() && !self.is_stale());
         let edits = match prunable_program {
             Some(program) => {
                 let keep = |leaf_span: Span| self.import_leaf_is_used(program, leaf_span);
@@ -4703,12 +4835,12 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let document = Document::analyze(&text, &std_root(), &path);
         for symbol in document.document_symbols() {
-            let _ = document.line_index.range(&symbol.full);
-            let _ = document.line_index.range(&symbol.selection);
+            let _ = document.analyzed_range(&symbol.full);
+            let _ = document.analyzed_range(&symbol.selection);
         }
         for (start, end, _) in &document.entity_spans {
-            let _ = document.line_index.position(*start);
-            let _ = document.line_index.position(*end);
+            let _ = document.analyzed_position(*start);
+            let _ = document.analyzed_position(*end);
         }
     }
 
@@ -5399,6 +5531,237 @@ pub(crate) mod tests {
                 "a non-clean source must format to itself (the handler then emits no edit)",
             );
         }
+    }
+
+    // --- Snapshot consistency (lsp-snapshot-consistency.md) ----------------
+    //
+    // The two-snapshot law: an edit advances the LIVE snapshot alone, so every
+    // answer computed from the program stays in the ANALYZED snapshot's
+    // coordinates until an analysis lands. Each pin below asserts BOTH halves —
+    // the analyzed conversion is unmoved, and the live conversion (what the
+    // handlers used to call) really does move. Without the second half a pin
+    // could pass on a fixture that never skewed at all.
+
+    /// A three-line program with one token per line and an un-annotated `let`
+    /// (so it carries an inlay hint too).
+    const SKEW_SOURCE: &str = "fun main() {\n\tlet value = 1;\n\tlet other = value;\n}\n";
+
+    /// Every semantic token's range in a given index, in token order.
+    fn token_ranges(document: &Document, index: &LineIndex) -> Vec<Range> {
+        document
+            .semantic_tokens()
+            .iter()
+            .map(|(span, _, _)| index.range(span))
+            .collect()
+    }
+
+    // Skew pin 1: one character inserted on an early line. Every token below it
+    // keeps its ANALYZED coordinates — line/column are stable under edits on
+    // other lines, so the highlighting the client is showing stays exactly
+    // where the words still are. Through the live index the same bytes land a
+    // column early, which is the highlighting-breaks-while-typing bug.
+    #[test]
+    fn semantic_token_positions_hold_still_when_an_early_line_grows() {
+        let mut document = analyze_text(SKEW_SOURCE);
+        let before = token_ranges(&document, document.analyzed_index());
+        assert!(!before.is_empty(), "the fixture must produce tokens");
+        // One character on line 0 (`fun  main`), so every later byte shifts by 1.
+        document.set_text(&SKEW_SOURCE.replace("fun main", "fun  main"));
+        assert!(document.is_stale(), "the buffer has advanced");
+        assert_eq!(
+            token_ranges(&document, document.analyzed_index()),
+            before,
+            "program spans convert through the ANALYZED index",
+        );
+        assert_ne!(
+            token_ranges(&document, &document.line_index),
+            before,
+            "the fixture must actually skew through the live index",
+        );
+    }
+
+    // Skew pin 2: the same for inlay hints, whose anchors are program offsets
+    // too. A slid hint is worse than a wrong one — the viewport filter in the
+    // handler drops it once it slides out of the requested range.
+    #[test]
+    fn inlay_hint_positions_hold_still_when_an_early_line_grows() {
+        let mut document = analyze_text(SKEW_SOURCE);
+        let hints = document.inlay_hints();
+        assert!(!hints.is_empty(), "the fixture must produce a hint");
+        let before: Vec<Position> = hints
+            .iter()
+            .map(|(offset, _)| document.analyzed_position(*offset))
+            .collect();
+        document.set_text(&SKEW_SOURCE.replace("fun main", "fun  main"));
+        let after: Vec<Position> = document
+            .inlay_hints()
+            .iter()
+            .map(|(offset, _)| document.analyzed_position(*offset))
+            .collect();
+        assert_eq!(after, before, "hint anchors hold their analyzed positions");
+        let through_live: Vec<Position> = document
+            .inlay_hints()
+            .iter()
+            .map(|(offset, _)| document.line_index.position(*offset))
+            .collect();
+        assert_ne!(through_live, before, "the fixture must actually skew");
+    }
+
+    // Skew pin 3: a NEWLINE inserted above — the edit that moves every token to
+    // a different LINE through the live index, not merely a different column.
+    #[test]
+    fn token_positions_hold_still_when_a_newline_is_inserted() {
+        let mut document = analyze_text(SKEW_SOURCE);
+        let before = token_ranges(&document, document.analyzed_index());
+        document.set_text(&format!("// a new first line\n{SKEW_SOURCE}"));
+        assert_eq!(
+            token_ranges(&document, document.analyzed_index()),
+            before,
+            "an inserted line does not move the analyzed coordinates",
+        );
+        let through_live = token_ranges(&document, &document.line_index);
+        assert_ne!(through_live, before, "the fixture must actually skew");
+        assert!(
+            through_live
+                .iter()
+                .any(|range| range.start.line != range.end.line),
+            "through the live index the same bytes can even straddle a line \
+             boundary — a shape the wire format has no encoding for: {through_live:?}",
+        );
+    }
+
+    // Skew pin 4: a SHRINKING edit that leaves a token's old offset past the
+    // new end of the buffer. The live index clamps such an offset to the text
+    // length, so every token below the cut used to pile up on the last
+    // character; the analyzed index still holds the real text they index.
+    #[test]
+    fn a_shrinking_edit_does_not_clamp_tokens_to_the_new_end() {
+        let mut document = analyze_text(SKEW_SOURCE);
+        let before = token_ranges(&document, document.analyzed_index());
+        assert!(before.len() >= 2, "need tokens on more than one line");
+        // Cut the file down to two lines — shorter than the last token's offset.
+        document.set_text("fun main() {\n}\n");
+        assert_eq!(
+            token_ranges(&document, document.analyzed_index()),
+            before,
+            "no clamping, no panic: the analyzed text is still there",
+        );
+        let through_live = token_ranges(&document, &document.line_index);
+        let last = through_live.last().copied().expect("a token");
+        let piled_up = through_live
+            .iter()
+            .filter(|range| range.start == last.start)
+            .count();
+        assert!(
+            piled_up > 1,
+            "the fixture must make the live index pile tokens on one spot: {through_live:?}",
+        );
+    }
+
+    // Inbound pin (9): a position → program offset lookup goes through the
+    // ANALYZED index, so a hover over a word the analysis saw still resolves
+    // after an unrelated edit above it. Through the live index the same
+    // position names a different byte and the hover misses (or, worse, hits the
+    // neighbouring entity).
+    #[test]
+    fn a_program_lookup_after_an_early_edit_resolves_through_the_analyzed_index() {
+        let mut document = analyze_text(SKEW_SOURCE);
+        // The `value` USE on line 2 (`let other = value;`).
+        let use_offset = offset_at(SKEW_SOURCE, "= value;", 2);
+        let position = document.analyzed_position(use_offset);
+        let expected = document.hover(use_offset).expect("`value` hovers");
+        document.set_text(&SKEW_SOURCE.replace("fun main", "fun  main"));
+        assert_eq!(
+            document.hover(document.analyzed_offset(position)),
+            Some(expected),
+            "the analyzed index maps the position back to the same entity",
+        );
+        assert_ne!(
+            document.analyzed_offset(position),
+            document.line_index.offset(position),
+            "the fixture must actually skew the inbound conversion",
+        );
+    }
+
+    // Merge pin (7): an analysis landing on a buffer that moved on adopts every
+    // analysis-side field and keeps BOTH live-side ones. Clobbering the whole
+    // document — what `documents.insert` used to do — threw away every
+    // character typed during the 80–190 ms analysis.
+    #[test]
+    fn landing_an_analysis_keeps_a_live_edit_and_adopts_the_program() {
+        let first = "fun main() {\n\tlet value = 1;\n}\n";
+        let second = "fun main() {\n\tlet value = 1;\n\tlet other = 2;\n}\n";
+        let mut document = analyze_text(first);
+        // The analysis of `second` starts…
+        let analysis = analyze_text(second);
+        // …and while it runs the user types a third revision.
+        let live = "fun main() {\n\tlet value = 1;\n\tlet other = 2;\n\tlet third = 3;\n}\n";
+        document.set_text(live);
+        let analyzed_tokens = analysis.semantic_tokens();
+        document.adopt_analysis(analysis);
+
+        // Live side: kept, both halves.
+        assert_eq!(document.text, live, "typing is never undone by a merge");
+        assert_eq!(
+            document.line_index.text(),
+            live,
+            "the live index tracks the live text",
+        );
+        // Analysis side: adopted, and the analyzed index is the one the spans
+        // index (it holds `second`, not the live text).
+        assert_eq!(document.analyzed_text(), second);
+        assert_eq!(document.text_hash, hash_text(second));
+        assert_eq!(document.semantic_tokens(), analyzed_tokens);
+        // …and program spans convert through the ADOPTED index — the analyzed
+        // conversion answers in `second`'s coordinates, not the live text's.
+        let (first_span, _, _) = document.semantic_tokens()[0];
+        assert_eq!(
+            document.analyzed_range(&first_span),
+            LineIndex::new(second).range(&first_span),
+            "the adopted analyzed index is the one conversions use",
+        );
+        assert_eq!(
+            document.inlay_hints().len(),
+            2,
+            "the newly analyzed `other` hint is adopted",
+        );
+        assert!(document.is_stale(), "the buffer is ahead of the analysis");
+        // …and the live text is what completion's context scan reads.
+        assert_eq!(document.line_index.text(), live);
+    }
+
+    // Merge pin (8): when the buffer did NOT move, everything is adopted and
+    // the document is not stale — the steady state after a typing pause.
+    #[test]
+    fn landing_an_analysis_on_unchanged_text_adopts_everything() {
+        let first = "fun main() {\n\tlet value = 1;\n}\n";
+        let second = "fun main() {\n\tlet value = 1;\n\tlet other = 2;\n}\n";
+        let mut document = analyze_text(first);
+        document.set_text(second);
+        document.adopt_analysis(analyze_text(second));
+        assert!(!document.is_stale());
+        assert_eq!(document.text, second);
+        assert_eq!(document.analyzed_text(), second);
+        assert_eq!(document.line_index.text(), document.analyzed_text());
+        assert_eq!(document.inlay_hints().len(), 2);
+    }
+
+    // `is_stale` is TEXT equality, never a flag set by `set_text`: an edit that
+    // returns the buffer to the analyzed text takes the debounce's
+    // unchanged-text short-circuit, so no analysis would ever land to clear a
+    // flag — a mutating request would refuse for the rest of the session.
+    #[test]
+    fn a_buffer_edited_back_to_the_analyzed_text_is_not_stale() {
+        let source = "fun main() {\n\tlet value = 1;\n}\n";
+        let mut document = analyze_text(source);
+        assert!(!document.is_stale());
+        document.set_text("fun main() {\n\tlet value = 12;\n}\n");
+        assert!(document.is_stale(), "mid-edit");
+        document.set_text(source);
+        assert!(
+            !document.is_stale(),
+            "reverting heals without needing an analysis to land",
+        );
     }
 }
 
