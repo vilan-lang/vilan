@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::id::Id;
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
@@ -1037,6 +1037,15 @@ pub struct Scope<'src> {
     /// so markers live here regardless of item collisions. Feeds editor
     /// navigation and macro-name imports; expansion scoping stays syntactic.
     pub macro_name_to_id: IndexMap<&'src str, Id>,
+    /// Value bindings in declaration order, each visible from the byte offset
+    /// where its declaring construct ends (proposal/local-shadowing.md §2): a
+    /// later same-name binding shadows the earlier one from its own visibility
+    /// point onward, and an initializer never sees the binding it declares.
+    /// Populated only in non-module scopes — module-level bindings stay
+    /// order-independent (B33). `name_to_id_map` still records the last
+    /// declaration, so map consumers (completions, emission order, the
+    /// parent-scope memo) are untouched.
+    pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
 }
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, plus each
@@ -7927,6 +7936,26 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_else(|| panic!("failed to get scope for id: {}", scope_id.0))
     }
 
+    /// Registers a value binding into a scope: the `name_to_id_map` entry (the
+    /// last declaration wins there, for map consumers) plus — in non-module
+    /// scopes — the positional entry that makes the binding visible only from
+    /// `visible_from` onward, so a later same-name `let` shadows an earlier one
+    /// and an initializer never sees the binding it declares
+    /// (proposal/local-shadowing.md §2). Module-level bindings stay
+    /// order-independent (B33), so module scopes record no positional entry.
+    fn declare_scope_value(&mut self, scope_id: Id, name: &'src str, id: Id, visible_from: usize) {
+        let positional = !self.module_scope_ids.contains(&scope_id);
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.insert(name, id);
+        if positional {
+            scope
+                .local_value_declarations
+                .entry(name)
+                .or_default()
+                .push((visible_from, id));
+        }
+    }
+
     fn get_scope_id_for_entity(&mut self, entity_id: Id) -> Id {
         self.expr_id_to_scope_id_map
             .get(&entity_id)
@@ -7941,6 +7970,7 @@ impl<'src> Analyzer<'src> {
             parent_id,
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
+            local_value_declarations: IndexMap::new(),
         }
     }
 
@@ -8024,6 +8054,7 @@ impl<'src> Analyzer<'src> {
             parent_id,
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
+            local_value_declarations: IndexMap::new(),
         };
         self.scopes.insert(id, scope);
         self.scopes.get_mut(&id).unwrap()
@@ -8194,33 +8225,46 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
     /// → `Some(true)`, `&` → `Some(false)`, an owned value → `None`. Follows
-    /// copies between locals (`let w = v`).
+    /// copies between locals (`let w = v`) iteratively with a seen-set: a
+    /// module-level `let a = b; let b = a;` makes the copy chain a CYCLE, and
+    /// an unguarded recursion here overflowed the stack (B34) before the
+    /// initialization-order check could reject the program.
     fn view_binding_mutability(&self, binding_id: Id) -> Option<bool> {
-        // A `for e in &mut list` binding, or a `Some(let v)` capture over a
-        // wrapped-view call, has no initial; its writability is the view's.
-        if let Some(&mutable) = self.for_each_views.get(&binding_id) {
-            return Some(mutable);
-        }
-        if let Some(&(mutable, _scalar)) = self.wrapped_view_captures.get(&binding_id) {
-            return Some(mutable);
-        }
-        let initial = self.variables.get(&binding_id)?.initial?;
-        match self.expr_id_to_expr_map.get(&initial)? {
-            Expr::Reference(_, mutable) => Some(*mutable),
-            Expr::Local(source_id) => self.view_binding_mutability(*source_id),
-            // `let v = obj.slot()` borrows a view; its writability is the borrows
-            // function's return convention (`&mut` vs `&`).
-            Expr::Call(call_id) => {
-                let function_call = self.function_calls.get(call_id)?;
-                match self.expr_id_to_expr_map.get(&function_call.subject_id)? {
-                    Expr::Local(function_id) => {
-                        let function = self.functions.get(function_id)?;
-                        (!function.borrows.is_empty()).then_some(function.returns_mut_view)
-                    }
-                    _ => None,
-                }
+        let mut current = binding_id;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current) {
+                // A copy cycle never reaches a view; the bindings are broken
+                // in a way later checks (B33's initialization cycle, the
+                // unresolved-type residual) report.
+                return None;
             }
-            _ => None,
+            // A `for e in &mut list` binding, or a `Some(let v)` capture over a
+            // wrapped-view call, has no initial; its writability is the view's.
+            if let Some(&mutable) = self.for_each_views.get(&current) {
+                return Some(mutable);
+            }
+            if let Some(&(mutable, _scalar)) = self.wrapped_view_captures.get(&current) {
+                return Some(mutable);
+            }
+            let initial = self.variables.get(&current)?.initial?;
+            match self.expr_id_to_expr_map.get(&initial)? {
+                Expr::Reference(_, mutable) => return Some(*mutable),
+                Expr::Local(source_id) => current = *source_id,
+                // `let v = obj.slot()` borrows a view; its writability is the borrows
+                // function's return convention (`&mut` vs `&`).
+                Expr::Call(call_id) => {
+                    let function_call = self.function_calls.get(call_id)?;
+                    return match self.expr_id_to_expr_map.get(&function_call.subject_id)? {
+                        Expr::Local(function_id) => {
+                            let function = self.functions.get(function_id)?;
+                            (!function.borrows.is_empty()).then_some(function.returns_mut_view)
+                        }
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -11435,6 +11479,74 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Resolves a value-name USE at a byte offset, honoring positional
+    /// visibility (proposal/local-shadowing.md): in each scope, if the name has
+    /// positional entries, the nearest one at-or-before the use wins; entries
+    /// that are all later mean the scope does not bind the name *yet*, so the
+    /// walk continues outward (the enclosing binding is the visible one until
+    /// the shadow point). Names without positional entries — items, `use`
+    /// aliases, the parent-scope memo, and everything in a module scope —
+    /// resolve from `name_to_id_map` exactly as before. Parent-scope hits are
+    /// cached into the originating scope like `try_get_expr_id_by_name`'s: a
+    /// scope's text sits between the same pair of parent declarations, so a
+    /// parent answer is uniform across every use inside the scope.
+    fn resolve_value_name_at(
+        &mut self,
+        name: &'src str,
+        scope_id: Id,
+        use_offset: usize,
+    ) -> Option<Id> {
+        let scope = self.scopes.get(&scope_id)?;
+        let parent_id = scope.parent_id;
+        if let Some(entries) = scope.local_value_declarations.get(name) {
+            if let Some((_, id)) = entries
+                .iter()
+                .rev()
+                .find(|(visible_from, _)| *visible_from <= use_offset)
+            {
+                return Some(*id);
+            }
+            // Declared here, but only later: resolve outward without caching —
+            // this scope's map slot belongs to its own (later) declaration.
+            return parent_id.and_then(|parent_scope_id| {
+                self.resolve_value_name_at(name, parent_scope_id, use_offset)
+            });
+        }
+        if let Some(id) = scope.name_to_id_map.get(name) {
+            return Some(*id);
+        }
+        let resolved = parent_id.and_then(|parent_scope_id| {
+            self.resolve_value_name_at(name, parent_scope_id, use_offset)
+        })?;
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.insert(name, resolved);
+        Some(resolved)
+    }
+
+    /// The nearest declaration of `name` that a use at `use_offset` cannot see
+    /// *yet* — a positional entry later in the use's scope chain. Feeds the
+    /// declared-later note on the `cannot find` diagnostic.
+    fn later_local_declaration(&self, name: &str, scope_id: Id, use_offset: usize) -> Option<Id> {
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = self.scopes.get(&id)?;
+            if let Some((_, later_id)) =
+                scope
+                    .local_value_declarations
+                    .get(name)
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(visible_from, _)| *visible_from > use_offset)
+                    })
+            {
+                return Some(*later_id);
+            }
+            current = scope.parent_id;
+        }
+        None
+    }
+
     /// Resolves a name to its declaring entity by walking the scope chain,
     /// returning `None` if it is not in scope (callers turn that into a
     /// user-facing diagnostic). Resolved names are cached into the originating
@@ -12153,9 +12265,9 @@ impl<'src> Analyzer<'src> {
                         .insert(variable_id, body_scope_id);
                     self.span_map.insert(variable_id, &node.1);
                     self.reference_count.entry(variable_id).or_insert(0);
-                    self.mut_scope_for_scope_id(body_scope_id)
-                        .name_to_id_map
-                        .insert(variable, variable_id);
+                    // Visible from its name in the header on — i.e. throughout
+                    // the body, and shadowable by a `let` inside it.
+                    self.declare_scope_value(body_scope_id, variable, variable_id, name_span.end);
                     // `for e in &mut list` / `&list` — the iterable is a view, so
                     // each binding is a view of the element (write-through), not a
                     // copy. The element type still resolves below (a view is
@@ -12184,7 +12296,8 @@ impl<'src> Analyzer<'src> {
             // `build`. The expression itself types as `bool`.
             Node::Is(subject, pattern) => {
                 let subject_id = self.walk_expr_node(subject, scope_id);
-                let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, true);
+                let walk_pattern =
+                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, true, pattern.1.end);
                 self.constraints.push(Constraint::Is(PreppedIs {
                     id,
                     subject_id,
@@ -12804,9 +12917,11 @@ impl<'src> Analyzer<'src> {
                 let name_span = name.1;
                 let name = name.0;
                 // `_` eats the value: the binding is never referenceable.
+                // Visible from the END of the whole statement, so the
+                // initializer reads an enclosing (or shadowed) binding, never
+                // the one being declared.
                 if name != "_" {
-                    let scope = self.mut_scope_for_scope_id(scope_id);
-                    scope.name_to_id_map.insert(name, id);
+                    self.declare_scope_value(scope_id, name, id, node.1.end);
                 }
                 self.reference_count.entry(id).or_insert(0);
                 let initial = value.as_ref().map(|value| {
@@ -12912,7 +13027,10 @@ impl<'src> Analyzer<'src> {
                 let value_id = value
                     .as_ref()
                     .map(|value| self.walk_expr_node(value, scope_id));
-                let walk_pattern = self.walk_pattern(&pattern.0, &pattern.1, scope_id, false);
+                // Binders become visible after the whole statement, like a
+                // plain `let` — the initializer never sees them.
+                let walk_pattern =
+                    self.walk_pattern(&pattern.0, &pattern.1, scope_id, false, node.1.end);
                 if *mutable {
                     self.set_pattern_bindings_mutable(&walk_pattern);
                 }
@@ -13135,7 +13253,13 @@ impl<'src> Analyzer<'src> {
                     let walked_patterns = patterns
                         .iter()
                         .map(|pattern| {
-                            self.walk_pattern(&pattern.0, &pattern.1, leg_scope_id, true)
+                            self.walk_pattern(
+                                &pattern.0,
+                                &pattern.1,
+                                leg_scope_id,
+                                true,
+                                pattern.1.end,
+                            )
                         })
                         .collect();
                     let guard_id = guard
@@ -13640,9 +13764,10 @@ impl<'src> Analyzer<'src> {
             _ => "_",
         };
         // `_` eats the argument: it stays positional but is never referenceable.
+        // Visible from its own declaration on — i.e. throughout the body, and
+        // shadowable by a `let` inside it.
         if name != "_" {
-            let scope = self.mut_scope_for_scope_id(body_scope_id);
-            scope.name_to_id_map.insert(name, parameter_id);
+            self.declare_scope_value(body_scope_id, name, parameter_id, span.end);
         }
         self.parameters.insert(
             parameter_id,
@@ -13664,7 +13789,7 @@ impl<'src> Analyzer<'src> {
         // *reference* to the parameter (an `Expr::Local`), since the parameter
         // entity itself is a declaration that emits no value.
         if !matches!(pattern, Pattern::Binding(..)) {
-            let walked = self.walk_pattern(pattern, span, body_scope_id, false);
+            let walked = self.walk_pattern(pattern, span, body_scope_id, false, span.end);
             let reference_id = self.new_entity_id();
             self.expr_id_to_expr_map
                 .insert(reference_id, Expr::Local(parameter_id));
@@ -13697,6 +13822,11 @@ impl<'src> Analyzer<'src> {
         // `match` bindings spell `let`/`mut` before each capture; binder elements
         // (a `let`/parameter tuple) don't. Drives the name-span keyword strip.
         keyword_prefixed: bool,
+        // Where the captures become visible (proposal/local-shadowing.md §2):
+        // the end of the declaring construct — the whole statement for a
+        // destructuring `let` (so its initializer never sees its own binders),
+        // the pattern for a `match` leg or `is`.
+        visible_from: usize,
     ) -> WalkPattern<'src> {
         match pattern {
             Pattern::Wildcard => WalkPattern::Wildcard,
@@ -13730,8 +13860,7 @@ impl<'src> Analyzer<'src> {
                 self.reference_count.entry(capture_id).or_insert(0);
                 // `_` eats the value: it matches but is never referenceable.
                 if name != "_" {
-                    let scope = self.mut_scope_for_scope_id(scope_id);
-                    scope.name_to_id_map.insert(name, capture_id);
+                    self.declare_scope_value(scope_id, name, capture_id, visible_from);
                 }
                 WalkPattern::Binding(capture_id)
             }
@@ -13748,6 +13877,7 @@ impl<'src> Analyzer<'src> {
                                 &sub_pattern.1,
                                 scope_id,
                                 keyword_prefixed,
+                                visible_from,
                             )
                         })
                         .collect()
@@ -13763,6 +13893,7 @@ impl<'src> Analyzer<'src> {
                             &sub_pattern.1,
                             scope_id,
                             keyword_prefixed,
+                            visible_from,
                         )
                     })
                     .collect(),
@@ -13777,6 +13908,7 @@ impl<'src> Analyzer<'src> {
                             &sub_pattern.1,
                             scope_id,
                             keyword_prefixed,
+                            visible_from,
                         )
                     })
                     .collect(),
@@ -19482,7 +19614,14 @@ impl<'src> Analyzer<'src> {
 
         for (id, name) in self.prepped_locals.clone() {
             let scope_id = self.get_scope_id_for_entity(id);
-            match self.try_get_expr_id_by_name(name, scope_id) {
+            // A use resolves at its own byte offset (positional visibility,
+            // proposal/local-shadowing.md); a spanless synthesized use sees
+            // the whole scope, as every use did before shadowing.
+            let use_offset = match self.span_map.get(&id) {
+                Some(span) if span.end > span.start => span.start,
+                _ => usize::MAX,
+            };
+            match self.resolve_value_name_at(name, scope_id, use_offset) {
                 Some(subject_id) => {
                     if let Some(message) = self.bare_name_not_a_value(subject_id, name) {
                         let diagnostics_before = self.diagnostics.len();
@@ -19504,8 +19643,42 @@ impl<'src> Analyzer<'src> {
                 None => {
                     let diagnostics_before = self.diagnostics.len();
                     let steer = self.import_steer(name).unwrap_or_default();
+                    // A use before the name's only declaration gets pointed at
+                    // it: the visibility rule is new information.
+                    let note = self.later_local_declaration(name, scope_id, use_offset).map(
+                        |later_id| {
+                            // The use sitting inside the declaring statement is
+                            // the self-referential initializer (`let x = x;`);
+                            // anywhere else it is a plain use-before-declaration.
+                            let own_initializer = self
+                                .span_map
+                                .get(&later_id)
+                                .is_some_and(|span| span.into_range().contains(&use_offset));
+                            Note {
+                                span: self
+                                    .variables
+                                    .get(&later_id)
+                                    .map(|variable| variable.name_span)
+                                    .unwrap_or_else(|| {
+                                        **self.span_map.get(&later_id).unwrap_or(&&EMPTY_SPAN)
+                                    }),
+                                msg: if own_initializer {
+                                    format!(
+                                        "'{}' is the binding being declared — an initializer cannot read its own binding",
+                                        name
+                                    )
+                                } else {
+                                    format!(
+                                        "'{}' is declared here, later in the scope — a local binding is visible only after its declaration",
+                                        name
+                                    )
+                                },
+                                source: self.source_of_id(later_id),
+                            }
+                        },
+                    );
                     self.diagnostics.push(Error {
-                        note: None,
+                        note,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!("cannot find '{}' in this scope{}", name, steer),
                     });

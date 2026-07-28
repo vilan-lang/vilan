@@ -664,6 +664,47 @@ fn assert_fails_noting(source: &str, message_part: &str, note_spanning: &str, no
     );
 }
 
+/// `assert_fails_noting`, but the note spans the Nth occurrence (0-based) of
+/// `note_spanning` — for notes that point at a declaration the diagnosed use
+/// necessarily precedes (use-before-declaration's declared-later note).
+#[track_caller]
+fn assert_fails_noting_nth(
+    source: &str,
+    message_part: &str,
+    note_spanning: &str,
+    occurrence: usize,
+    note_part: &str,
+) {
+    let mut start = 0;
+    let mut at = None;
+    for _ in 0..=occurrence {
+        at = source[start..]
+            .find(note_spanning)
+            .map(|found| start + found);
+        match at {
+            Some(position) => start = position + 1,
+            None => panic!("occurrence {occurrence} of {note_spanning:?} not found"),
+        }
+    }
+    let expected_start = at.unwrap();
+    let expected = expected_start..expected_start + note_spanning.len();
+    let diagnostics = failure_diagnostics_with_notes(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains(message_part))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "no diagnostic contains {message_part:?}; got: {diagnostics:#?}"
+    );
+    assert!(
+        matching.iter().any(|(_, _, note)| note
+            .as_ref()
+            .is_some_and(|(msg, range, _)| msg.contains(note_part) && *range == expected)),
+        "no {message_part:?} diagnostic notes {note_part:?} at {expected:?} (occurrence {occurrence} of {note_spanning:?}); got: {matching:#?}"
+    );
+}
+
 /// `assert_fails_spanning`, but targeting the Nth occurrence (0-based) of
 /// `spanning` — for snippets that necessarily appear earlier in another
 /// role (an attribute name also being the macro definition's, a use after
@@ -22290,6 +22331,271 @@ fn edge_shadowing_rebinds_a_fresh_owner() {
         fun main() { f(); }
         "#,
     );
+}
+
+// --- Local shadowing & self-referential initializers -------------------------
+// B34 + proposal/local-shadowing.md: a local binding is visible from the end
+// of its declaring construct; a later same-name declaration shadows from its
+// own point on. `let x = x;` used to send the analyzer into a stack-overflow
+// abort; same-scope rebinding used to bind EVERY use to the last declaration
+// (the emitted JS threw a TDZ ReferenceError at runtime).
+
+#[test]
+fn a_self_referential_local_initializer_is_a_clean_error() {
+    // The initializer sits inside the declaring statement, so it never sees
+    // the binding being declared; with no enclosing `x` that is a plain
+    // cannot-find, noted at the declaration.
+    assert_fails_noting(
+        "fun main() { let x = x; }",
+        "cannot find 'x' in this scope",
+        "x",
+        "an initializer cannot read its own binding",
+    );
+}
+
+#[test]
+fn a_self_referential_local_initializer_is_spanned_at_the_read() {
+    assert_fails_spanning_nth(
+        "fun main() { let x = x; }",
+        "x",
+        1,
+        "cannot find 'x' in this scope",
+    );
+}
+
+#[test]
+fn a_self_referential_local_with_a_following_mutation_is_a_clean_error() {
+    // The assignment routes `check_readonly_mutation` → `readonly_root` into
+    // the copy-chain walk one pass earlier than the view checks — a distinct
+    // crash entry before the guard.
+    assert_fails_with(
+        "fun main() { mut x = x; x = 1; }",
+        "cannot find 'x' in this scope",
+    );
+}
+
+#[test]
+fn a_module_level_bare_self_reference_does_not_overflow_the_analyzer() {
+    // `let a = a;` at module level stays representable (module bindings are
+    // order-independent); the copy-chain cycle guard keeps analysis alive and
+    // the ungrounded binding reports. Upgrading this to B33's
+    // initialization-cycle message is a recorded polish
+    // (proposal/local-shadowing.md §6).
+    assert_fails_with(
+        "let a = a;
+        fun main() {}",
+        "type of variable 'a' could not be resolved",
+    );
+}
+
+#[test]
+fn a_module_level_bare_copy_cycle_does_not_overflow_the_analyzer() {
+    // `let a = b; let b = a;` — the two-member `Expr::Local` cycle recursed
+    // `view_binding_mutability` unboundedly before the seen-set.
+    assert_fails_with(
+        "let a = b;
+        let b = a;
+        fun main() {}",
+        "could not be resolved",
+    );
+}
+
+#[test]
+fn a_same_scope_rebinding_binds_each_use_positionally() {
+    // Both prints used to bind the SECOND `d` (resolution ran against the
+    // final scope map), so the emitted JS read `d` before its declaration —
+    // a TDZ ReferenceError at runtime from a cleanly-compiling program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let d = 1;
+            print(d);
+            let d = 2;
+            print(d);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn a_shadowing_initializer_reads_the_prior_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = 1;
+            let x = x + 1;
+            print(x);
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_block_shadow_ends_with_its_block() {
+    // Rust's rule: before the inner `let`, the outer binding is the visible
+    // one; after the block, it is again.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let x = 1;
+            {
+                print(x);
+                let x = 2;
+                print(x);
+            }
+            print(x);
+        }
+        "#,
+        "1\n2\n1\n",
+    );
+}
+
+#[test]
+fn a_let_shadows_a_parameter_from_its_point_on() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun f(x: i32): i32 {
+            let y = x;
+            let x = 10;
+            x + y
+        }
+        fun main() { print(f(3)); }
+        "#,
+        "13\n",
+    );
+}
+
+#[test]
+fn a_destructure_initializer_never_sees_its_own_binders() {
+    // The binder pattern precedes the initializer textually; visibility is
+    // the END of the whole statement, so `(b, a)` reads the prior pair.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let (a, b) = (1, 2);
+            let (a, b) = (b, a);
+            print(a);
+            print(b);
+        }
+        "#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn a_for_item_is_shadowable_inside_its_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            for x in [1, 2] {
+                let x = x * 10;
+                print(x);
+            }
+        }
+        "#,
+        "10\n20\n",
+    );
+}
+
+#[test]
+fn a_match_capture_is_shadowable_inside_its_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            match Some(1) {
+                Some(let v) => {
+                    let v = v + 1;
+                    print(v);
+                }
+                None => {}
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_use_before_the_declaration_is_an_error_pointing_at_it() {
+    let source = r#"
+        import std::print;
+        fun main() {
+            print(x);
+            let x = 1;
+        }
+        "#;
+    assert_fails_spanning(source, "x", "cannot find 'x' in this scope");
+    assert_fails_noting_nth(
+        source,
+        "cannot find 'x' in this scope",
+        "x",
+        1,
+        "a local binding is visible only after its declaration",
+    );
+}
+
+#[test]
+fn a_closure_cannot_capture_a_binding_declared_after_it() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let f = |n: i32| x + n;
+            let x = 1;
+            let _ = f(1);
+            let _ = x;
+        }
+        "#,
+        "cannot find 'x' in this scope",
+    );
+}
+
+#[test]
+fn a_module_binding_may_still_be_read_before_its_declaration() {
+    // Module-level bindings stay order-independent (B33 orders emission);
+    // positional visibility is a LOCAL rule only.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        let early = late + 1;
+        let late = 1;
+        fun main() { print(early); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_view_copy_across_a_shadow_keeps_its_viewness() {
+    // `let v = v;` with a prior view `v` is a legal view copy between two
+    // DISTINCT bindings — the exact shape that was a self-cycle before.
+    assert_compiles(
+        r#"
+        fun main() {
+            mut c = 1;
+            let v = &c;
+            let v = v;
+            let _ = v;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn an_unterminated_string_at_end_of_input_stays_a_clean_diagnostic() {
+    // The lexer's end-of-input salvage skips the quote, so `let prefix =
+    // "prefix` tokenizes as `let prefix = prefix` — the live editor-typing
+    // path into the self-referential shape (B34).
+    assert_fails("fun main() { let prefix = \"prefix");
 }
 
 #[test]
