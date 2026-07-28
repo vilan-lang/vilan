@@ -1218,6 +1218,19 @@ impl Document {
             .map(|(_, _, id)| *id)
     }
 
+    /// Whether `offset` falls inside a lexed token of the analyzed text —
+    /// false in trivia: comments, whitespace, blank lines. Containment
+    /// lookups (`entity_at`) are only meaningful for offsets that touch
+    /// actual code; a comment inside a function body is *contained* by the
+    /// function's span but is not the function.
+    fn offset_touches_a_token(&self, offset: usize) -> bool {
+        let (tokens, _errors) = tokenize(self.analyzed_text());
+        tokens.iter().any(|(_, span)| {
+            let range = span.into_range();
+            range.start <= offset && offset < range.end
+        })
+    }
+
     /// The hover for the entity under `offset` (E9): a fenced full
     /// declaration when the entity names one (function signature — with
     /// inferred `async` prepended — or a struct/enum block), the
@@ -1240,6 +1253,12 @@ impl Document {
                 }
             }
             return Some(label);
+        }
+        // Everything below answers by span CONTAINMENT, and an entity's span
+        // contains its trivia — a comment or blank line inside a function body
+        // would hover as the enclosing function. Only code hovers.
+        if !self.offset_touches_a_token(offset) {
+            return None;
         }
         let id = self.entity_at(offset)?;
         // A function (or requirement-carrying binding): the full signature.
@@ -4312,6 +4331,45 @@ pub(crate) mod tests {
         )
         .expect("hover on the constant");
         assert!(hover.contains("= 64"), "{hover}");
+    }
+
+    // --- trivia does not hover (found probing the 2026-07-28 report) --------
+    //
+    // Hover's containment fallback (`entity_at`) answers for any offset inside
+    // an entity's span — and a function's span contains its whole body, trivia
+    // included, so a comment or a blank line inside it hovered as
+    // `fun main()`. Trivia is not code: those offsets answer nothing. Offsets
+    // ON tokens keep containment (the closing brace still names its function).
+
+    #[test]
+    fn a_comment_inside_a_body_does_not_hover_as_the_function() {
+        assert_eq!(
+            hover_at_cursor("fun main() {\n\t// a lo|ne note\n\tlet _x = 1;\n}\n"),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_body_does_not_hover() {
+        assert_eq!(hover_at_cursor("fun main() {\n\tlet _x = 1;\n|\n}\n"), None,);
+    }
+
+    #[test]
+    fn a_top_level_comment_does_not_hover() {
+        assert_eq!(
+            hover_at_cursor(
+                "// a to|p-level note\nlet size = 1;\nfun main() {\n\tlet _s = size;\n}\n"
+            ),
+            None,
+        );
+    }
+
+    // The boundary of the gate: a real token inside the body still resolves by
+    // containment — trivia was the wart, not containment itself.
+    #[test]
+    fn a_body_brace_still_hovers_the_enclosing_function() {
+        let hover = hover_at_cursor("fun main() {\n\tlet _x = 1;\n|}\n").expect("the brace hovers");
+        assert!(hover.contains("fun main()"), "{hover}");
     }
 
     // The crash shape (page.vl's `stack`, 2026-07-28): a const whose rendered
