@@ -514,8 +514,17 @@ pub fn organize_import_runs(
 
 /// Parses `source` into its top-level item list, or `None` if it doesn't parse
 /// perfectly cleanly — the formatter reprints only sources it fully understands.
+///
+/// The formatter parses in GROUP-PRESERVING mode
+/// ([`crate::parsing::parse_preserving_groups`]): every `(…)` is recorded as a
+/// [`Node::LiftGroup`] rather than dissolving into its inner expression. A
+/// reprint has to reproduce the source's token stream, and a group the tree does
+/// not record is one the printer cannot put back — the safety net would then see
+/// two missing tokens and silently bail the whole file. Recording them makes
+/// user-written parentheses PRESERVED: the formatter reprints the group it was
+/// given and never adjudicates whether it was redundant.
 fn parse(source: &str) -> Option<NodeList<'_>> {
-    let (tree, errors) = crate::parsing::parse(source);
+    let (tree, errors) = crate::parsing::parse_preserving_groups(source);
     tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
 }
 
@@ -2081,10 +2090,17 @@ impl<'src> Printer<'src> {
                 self.print_operand(subject, 100);
                 self.out.push('?');
             }
-            // A recorded region-delimiting paren group: the parens are
-            // semantic (they bound the lift), so they always reprint.
+            // A recorded paren group — the parentheses were written, so they
+            // reprint as written. (The formatter parses in group-preserving
+            // mode, so this covers every `(…)`, not only the region-delimiting
+            // ones the compiler's parse records.) An armed statement split is
+            // handed to the interior: the group is the source's own, so the
+            // chain inside it breaks and the closing paren glues after the last
+            // line — unlike a paren the PRINTER adds, which
+            // `print_split_operand` refuses to split inside.
             Node::LiftGroup(inner) => {
                 self.out.push('(');
+                self.split_statement_chain = split;
                 self.print_expr(inner);
                 self.out.push(')');
             }
@@ -3116,6 +3132,194 @@ mod bailing_constructs {
 }
 
 #[cfg(test)]
+mod paren_groups {
+    //! **User-written parentheses are preserved.** A `(…)` group the user wrote
+    //! reprints as a group — the formatter does not adjudicate whether it was
+    //! redundant, because a redundant group is usually deliberate clarity
+    //! (`const (chain + reveal)`).
+    //!
+    //! Until the formatter's parse recorded groups, every one of these shapes
+    //! bailed the WHOLE FILE: the parser dissolved `(expr)` to its inner
+    //! expression, the printer put back only the parentheses precedence
+    //! demanded, and the re-lex safety net — seeing an output two tokens short —
+    //! returned the file's original bytes (which `fmt --check` then called
+    //! clean). The formatter now parses in group-preserving mode
+    //! (`parsing::parse_preserving_groups`), so the group is a node and reprints
+    //! as written.
+    //!
+    //! Each pin runs the full formatter contract through `assert_construct`:
+    //! same tokens out, no silent bail, canonical, idempotent, round-tripping.
+    use super::bailing_constructs::assert_construct;
+    use super::format;
+
+    // --- The shapes that used to bail ---------------------------------------
+
+    /// `let b = (1 + 2);` — a redundant group around a binary in a `let` value.
+    #[test]
+    fn a_redundant_group_in_a_let_value() {
+        assert_construct(
+            "fun f() {\n\tlet b = (1 + 2);\n}\n",
+            "fun f() {\n\tlet b = (1 + 2);\n}\n",
+        );
+    }
+
+    /// `let b = (x);` — a group around a BARE NAME. The atom case is the one
+    /// precedence can never reconstruct (an atom is precedence 100, so no
+    /// operand minimum ever wraps it), which is why it bailed.
+    #[test]
+    fn a_redundant_group_around_a_bare_name() {
+        assert_construct(
+            "fun f() {\n\tlet b = (x);\n}\n",
+            "fun f() {\n\tlet b = (x);\n}\n",
+        );
+    }
+
+    /// `(300).as_u8()` — the same atom case in method-subject position, the
+    /// shape that kept `numeric-types.vl` in the corpus bail ledger through
+    /// E13. The corpus sites were canonicalized away then; the shape is legal
+    /// vilan and now formats.
+    #[test]
+    fn a_redundant_group_around_a_number_literal_subject() {
+        assert_construct(
+            "fun f() {\n\tlet b = (300).as_u8();\n}\n",
+            "fun f() {\n\tlet b = (300).as_u8();\n}\n",
+        );
+    }
+
+    /// `ret (1 + 2);` — the group survives an early return.
+    #[test]
+    fn a_redundant_group_in_a_return() {
+        assert_construct(
+            "fun f() {\n\tret (1 + 2);\n}\n",
+            "fun f() {\n\tret (1 + 2);\n}\n",
+        );
+    }
+
+    /// `f((1 + 2))` — a group as a call argument, where the call's own
+    /// parentheses sit right beside the group's.
+    #[test]
+    fn a_redundant_group_as_a_call_argument() {
+        assert_construct(
+            "fun f() {\n\tg((1 + 2))\n}\n",
+            "fun f() {\n\tg((1 + 2))\n}\n",
+        );
+    }
+
+    /// `const (a.b(1) + c)` — the website's shape. `const` captures everything
+    /// to its right, so the group is pure clarity; it is kept.
+    #[test]
+    fn a_redundant_group_after_const() {
+        assert_construct(
+            "fun f() {\n\tlet b = const (a.b(1) + c);\n}\n",
+            "fun f() {\n\tlet b = const (a.b(1) + c);\n}\n",
+        );
+    }
+
+    /// Nested redundant groups are preserved as written — one node per pair of
+    /// parentheses, so `((x))` neither collapses to `(x)` nor to `x`.
+    #[test]
+    fn nested_redundant_groups_are_preserved_as_written() {
+        assert_construct(
+            "fun f() {\n\tlet b = ((x));\n}\n",
+            "fun f() {\n\tlet b = ((x));\n}\n",
+        );
+        assert_construct(
+            "fun f() {\n\tlet b = (((1 + 2)));\n}\n",
+            "fun f() {\n\tlet b = (((1 + 2)));\n}\n",
+        );
+    }
+
+    // --- Parentheses the printer would have added anyway ---------------------
+
+    /// A group precedence REQUIRES is printed exactly once. The printer's own
+    /// wrapping (`print_operand`'s minimum) sees a recorded group as an atom
+    /// (precedence 100) and so never wraps it a second time — no `((a + b))`.
+    #[test]
+    fn a_precedence_required_group_is_not_doubled() {
+        for (source, expected) in [
+            // A binary operand of a tighter binary.
+            ("(a + b) * c", "(a + b) * c"),
+            // A binary operand of a prefix operator.
+            ("-(2 + 3)", "-(2 + 3)"),
+            ("&(a + b)", "&(a + b)"),
+            // A member/index result being CALLED — `(self.fn)()` is a
+            // field-closure call, `self.fn()` a method call.
+            ("(self.fn)()", "(self.fn)()"),
+            // A `?.` chain as a postfix subject: without the parens the chain
+            // absorbs the `.z`.
+            ("(x?.y).z", "(x?.y).z"),
+        ] {
+            assert_construct(
+                &format!("fun f(self) {{\n\t{source}\n}}\n"),
+                &format!("fun f(self) {{\n\t{expected}\n}}\n"),
+            );
+        }
+    }
+
+    /// The printer still ADDS the parentheses a reparse needs when the source
+    /// did not write them — group preservation adds parentheses, it never
+    /// removes the reconstruction. (`a + b` written without parens under a
+    /// tighter operator can only arise from a source that had them, so the
+    /// contrast pinned here is the unparenthesized form staying bare.)
+    #[test]
+    fn minimal_parentheses_are_still_minimal_without_a_group() {
+        assert_construct("fun f() {\n\ta + b * c\n}\n", "fun f() {\n\ta + b * c\n}\n");
+        assert_construct("fun f() {\n\tx.y.z\n}\n", "fun f() {\n\tx.y.z\n}\n");
+    }
+
+    // --- Idempotency over a paren-heavy fixture ------------------------------
+
+    /// A file whose every statement carries parentheses of some kind — kept,
+    /// required, nested, synthetic (`i"…"` expands to a parenthesized
+    /// concatenation), and split across lines — is a fixed point, and its
+    /// messy spelling canonicalizes to it.
+    #[test]
+    fn a_paren_heavy_file_is_a_fixed_point() {
+        let canonical = "let plain = (1 + 2);\n\
+                         let bare = (x);\n\
+                         let nested = ((x));\n\
+                         let required = (a + b) * c;\n\
+                         let prefixed = -(2 + 3);\n\
+                         let called = (registry.handler)(1);\n\
+                         let text = (i\"hi {name}!\");\n\
+                         \n\
+                         fun f() {\n\
+                         \tg((1 + 2));\n\
+                         \tlet wide = const (style()\n\
+                         \t\t.display(Display::Flex)\n\
+                         \t\t.flex_direction(FlexDirection::Column)\n\
+                         \t\t.gap(space(4))\n\
+                         \t\t+ reveal);\n\
+                         \tret (1 + 2);\n\
+                         }\n";
+        assert_eq!(
+            format(canonical),
+            canonical,
+            "the paren-heavy fixture is not a fixed point"
+        );
+        let messy = "let plain=(1+2);\n\
+                     let bare=(x);\n\
+                     let nested=((x));\n\
+                     let required=(a+b)*c;\n\
+                     let prefixed= -(2+3);\n\
+                     let called=(registry.handler)(1);\n\
+                     let text=(i\"hi {name}!\");\n\
+                     \n\
+                     fun f(){\n\
+                     g((1+2));\n\
+                     let wide=const (style().display(Display::Flex)\
+                     .flex_direction(FlexDirection::Column).gap(space(4))+reveal);\n\
+                     ret (1+2);\n\
+                     }\n";
+        assert_eq!(
+            format(messy),
+            canonical,
+            "the messy spelling did not canonicalize"
+        );
+    }
+}
+
+#[cfg(test)]
 mod chain_splitting {
     //! The formatter's one width-aware decision: a statement whose inline
     //! rendering is wider than [`LINE_BUDGET`] columns (a tab counting as
@@ -3386,18 +3590,10 @@ mod chain_splitting {
     }
 
     /// The same statement as the website actually writes it, with the redundant
-    /// parentheses `const (…)` around the sum.
-    ///
-    /// IGNORED — and not by this change: the formatter bails on *any* redundant
-    /// parenthesization in a value position (`let b = (1 + 2);` bails today
-    /// too). The parser dissolves a `(expr)` group, keeping the inner
-    /// expression's own span, so the tree does not record that the parentheses
-    /// were written; the printer reconstructs only the ones precedence demands,
-    /// the re-lex safety net sees a token stream missing two tokens, and
-    /// `format` returns the whole file's original bytes. Un-ignore this when the
-    /// formatter's parse records paren groups.
+    /// parentheses `const (…)` around the sum. The group is the source's own, so
+    /// the split happens INSIDE it and the closing paren glues after the
+    /// continuation — the parentheses are preserved, not adjudicated.
     #[test]
-    #[ignore = "pre-existing: a redundant paren group in a value position bails the whole file"]
     fn a_parenthesized_chain_operand_keeps_its_parentheses() {
         assert_construct(
             "let heading = const (style().raw(\"font-family\", display_face)\

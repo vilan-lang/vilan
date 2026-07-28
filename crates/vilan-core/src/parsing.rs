@@ -191,9 +191,34 @@ pub fn render(error: &ParseError) -> String {
 /// slices are `&'src str` copied out of the tokens), exactly like the chumsky
 /// parser; the intermediate token vector does not outlive this call.
 pub fn parse(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+    parse_with(source, false)
+}
+
+/// [`parse`], but every parenthesized expression is RECORDED as a
+/// [`Node::LiftGroup`] node instead of dissolving into its inner expression.
+///
+/// This is the **formatter's** parse mode and nothing else's: `vilan fmt`
+/// reprints from the tree, so a group the tree does not record is a group the
+/// reprint cannot reproduce — the re-lex safety net then sees an output missing
+/// two tokens and the whole file silently bails (`let b = (1 + 2);` did exactly
+/// that). User-written parentheses are preserved rather than adjudicated, so
+/// recording every group is precisely what the formatter needs.
+///
+/// The main pipeline (analyzer, macro expansion, emission, the CLI, the language
+/// server's analysis) keeps calling [`parse`] and keeps seeing the dissolved
+/// tree, so nothing downstream changes. That separation is what the corpus
+/// byte-gate and `tests/parse_differential.rs` guard.
+pub fn parse_preserving_groups(source: &str) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
+    parse_with(source, true)
+}
+
+fn parse_with(
+    source: &str,
+    preserve_paren_groups: bool,
+) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
     let (tokens, lex_errors) = lexing::tokenize(source);
 
-    let mut parser = Parser::new(&tokens, source.len());
+    let mut parser = Parser::new(&tokens, source.len(), preserve_paren_groups);
     let root = parser.parse_program();
     if parser.position != tokens.len() {
         // The top-level `statement*` stopped before consuming everything — an
@@ -259,6 +284,11 @@ struct Parser<'a, 'src> {
     /// The live production-context stack (`in type`, `in function parameters`),
     /// snapshotted when a new farthest failure is recorded.
     context_stack: Vec<&'static str>,
+    /// Record EVERY parenthesized expression as a [`Node::LiftGroup`] rather than
+    /// dissolving the ones that carry no lift mark — the formatter's parse mode
+    /// (see [`parse_preserving_groups`]). Read at exactly one site,
+    /// [`Parser::parse_paren_atom`]; false everywhere the compiler proper parses.
+    preserve_paren_groups: bool,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -369,7 +399,7 @@ fn is_known_attribute_marker(name: &str) -> bool {
 }
 
 impl<'a, 'src> Parser<'a, 'src> {
-    fn new(tokens: &'a [Spanned<Token<'src>>], eoi: usize) -> Self {
+    fn new(tokens: &'a [Spanned<Token<'src>>], eoi: usize, preserve_paren_groups: bool) -> Self {
         Parser {
             tokens,
             position: 0,
@@ -377,6 +407,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             errors: Vec::new(),
             farthest_failure: None,
             context_stack: Vec::new(),
+            preserve_paren_groups,
         }
     }
 
@@ -1634,6 +1665,11 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `(a, b, …)` (a tuple, ≥2 elements) or `(expr)` (a group that dissolves to its
     /// inner expression — keeping the inner's own span — unless it contains a
     /// bare-`?` mark, when it becomes a region-delimiting `LiftGroup`).
+    ///
+    /// Under [`Parser::preserve_paren_groups`] — the formatter's parse mode — every
+    /// group is recorded as a `LiftGroup` instead, so a reprint can put the
+    /// parentheses back exactly where they were written. This is the one site the
+    /// flag is read.
     fn parse_paren_atom(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
@@ -1652,7 +1688,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 Some((Node::Tuple(items), parser.span_from(start)))
             } else {
                 parser.expect_ctrl(')')?;
-                if first.0.contains_lift_mark() {
+                if parser.preserve_paren_groups || first.0.contains_lift_mark() {
                     Some((Node::LiftGroup(Box::new(first)), parser.span_from(start)))
                 } else {
                     // A group dissolves to its inner expression, keeping the inner's
@@ -3357,9 +3393,18 @@ mod tests {
     /// Parse `source` as a bare expression, asserting a clean full-consumption
     /// parse. Spans are at their natural source offsets (no wrapper).
     fn expr(source: &str) -> Spanned<Node<'_>> {
+        expr_in_mode(source, false)
+    }
+
+    /// [`expr`], parsed in the formatter's group-preserving mode.
+    fn expr_preserving_groups(source: &str) -> Spanned<Node<'_>> {
+        expr_in_mode(source, true)
+    }
+
+    fn expr_in_mode(source: &str, preserve_paren_groups: bool) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len());
+        let mut parser = Parser::new(&tokens, source.len(), preserve_paren_groups);
         let node = parser.parse_expression().expect("expression did not parse");
         assert_eq!(
             parser.position,
@@ -3373,7 +3418,7 @@ mod tests {
     fn condition(source: &str) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len());
+        let mut parser = Parser::new(&tokens, source.len(), false);
         let node = parser.parse_condition().expect("condition did not parse");
         assert_eq!(
             parser.position,
@@ -3387,7 +3432,7 @@ mod tests {
     fn type_(source: &str) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len());
+        let mut parser = Parser::new(&tokens, source.len(), false);
         let node = parser.parse_type().expect("type did not parse");
         assert_eq!(
             parser.position,
@@ -3560,6 +3605,65 @@ mod tests {
         assert!(matches!(expr("(a)").0, Node::Accessor("a")));
     }
 
+    // --- The formatter's group-preserving mode -------------------------------
+
+    /// The COMPILER's parse is unchanged by the formatter-only flag: a group
+    /// carrying no lift mark still dissolves to its inner expression, keeping
+    /// the inner's own span. This is the seam the "main pipeline untouched"
+    /// constraint lives at — every pipeline entry (`lib.rs`, the CLI, the module
+    /// loader, macro expansion, the language server's analysis) calls `parse`,
+    /// and only `formatter::parse` calls `parse_preserving_groups`.
+    #[test]
+    fn the_default_mode_still_dissolves_a_mark_free_group() {
+        assert!(matches!(expr("(a)").0, Node::Accessor("a")));
+        assert!(matches!(
+            expr("(1 + 2)").0,
+            Node::Binary(BinaryOp::Add, _, _)
+        ));
+        // Dissolving keeps the INNER expression's own span — the parens
+        // contribute nothing, so `1 + 2` spans 1..6 of `(1 + 2)`, not 0..7.
+        assert_eq!(expr("(1 + 2)").1.into_range(), 1..6);
+        // A nested group dissolves at every level.
+        assert!(matches!(expr("((a))").0, Node::Accessor("a")));
+    }
+
+    /// Group-preserving mode records every group — including the ones the
+    /// default mode dissolves — and the recorded node spans the parentheses.
+    #[test]
+    fn group_preserving_mode_records_every_paren_group() {
+        let group = expr_preserving_groups("(1 + 2)");
+        assert!(matches!(group.0, Node::LiftGroup(_)));
+        assert_eq!(group.1.into_range(), 0..7);
+        assert!(matches!(
+            expr_preserving_groups("(a)").0,
+            Node::LiftGroup(_)
+        ));
+        // Nested groups nest, one node per pair of parentheses.
+        match &expr_preserving_groups("((a))").0 {
+            Node::LiftGroup(inner) => assert!(matches!(inner.0, Node::LiftGroup(_))),
+            other => panic!("expected a nested LiftGroup, got {other:?}"),
+        }
+        // A mark-carrying group is recorded exactly as it already was.
+        assert!(matches!(
+            expr_preserving_groups("(a?)").0,
+            Node::LiftGroup(_)
+        ));
+    }
+
+    /// Only the GROUP form is affected: a tuple stays a tuple, and a
+    /// parenthesized expression list elsewhere (call arguments) is untouched —
+    /// the flag is read at one site, the group branch of the paren atom.
+    #[test]
+    fn group_preserving_mode_leaves_tuples_and_arguments_alone() {
+        assert!(matches!(expr_preserving_groups("(a, b)").0, Node::Tuple(_)));
+        match &expr_preserving_groups("f(a)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(arguments.0[0].0, Node::Accessor("a")));
+            }
+            other => panic!("expected a Call, got {other:?}"),
+        }
+    }
+
     #[test]
     fn direct_call_folds_onto_a_method_result() {
         // `self.hook.read()(a)` — the trailing `(a)` is a DirectCall on the member
@@ -3627,7 +3731,7 @@ mod tests {
         // is `default<Id>()` above.
         let (tokens, errors) = lexing::tokenize("foo<T>");
         assert!(errors.is_empty());
-        let mut parser = Parser::new(&tokens, "foo<T>".len());
+        let mut parser = Parser::new(&tokens, "foo<T>".len(), false);
         let node = parser.parse_expression().expect("prefix parses");
         assert!(matches!(node.0, Node::Binary(BinaryOp::Lt, _, _)));
     }

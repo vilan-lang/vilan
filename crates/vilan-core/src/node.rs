@@ -271,10 +271,17 @@ pub enum Node<'src> {
     // region rewrite at the analyzer's entry, which linearizes every marked
     // slot-root expression into a `LiftRegion`; the walk never sees it.
     Lifted(Box<Spanned<Self>>),
-    // A parenthesized expression that contains a `Lifted` mark. Parens delimit
-    // a lift region (§6.2), so the parser records them in exactly this case
-    // (a paren without a mark dissolves as always); the region rewrite seals
-    // the inner expression as its own region root and the wrapper vanishes.
+    // A RECORDED parenthesized expression — the parens were written, and the
+    // node says so. The compiler's parse records exactly one case: a group
+    // containing a `Lifted` mark, because parens delimit a lift region (§6.2);
+    // a paren without a mark dissolves as always. The region rewrite then seals
+    // the inner expression as its own region root and the wrapper vanishes, and
+    // anything that does see one treats it as transparent (the analyzer's walk
+    // forwards straight to the inner expression).
+    //
+    // The FORMATTER's parse (`parsing::parse_preserving_groups`) records every
+    // group instead, so `vilan fmt` can reprint the parentheses a user wrote
+    // rather than bailing on the file. That mode never reaches the analyzer.
     LiftGroup(Box<Spanned<Self>>),
     // A sealed lift region (rewrite output): the ordered evaluation steps and
     // the residual body skeleton. A step is (expression, is_split): an `Eval`

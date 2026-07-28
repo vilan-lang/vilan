@@ -397,26 +397,25 @@ fn current_bail_set() -> Vec<String> {
     bails
 }
 
-/// The corpus files `vilan fmt` still silently no-ops on. E13 closed nine of the
-/// ten H6 S0 bailers by adding the missing printer arms (destructuring, fixed
-/// arrays, macro forms, unary minus, and the lift-chain postfix subject); this is
-/// what remains.
+/// The corpus files `vilan fmt` silently no-ops on — the ledger is EMPTY and the
+/// assertion below keeps it that way.
 ///
-/// `numeric-types.vl` is a DESIGN GAP, not a missing arm: it writes redundant
-/// parentheses around a number literal in method-subject position —
-/// `(300).as_u8()`. The parser dissolves parentheses around an atom (they add no
-/// structure), so the tree is `MemberAccessor(Number(300), …)` — identical to
-/// `300.as_u8()`. The printer canonicalizes it to `300.as_u8()` (correct — both
-/// spellings compile to the same JS), but the safety net compares the OUTPUT's
-/// tokens to the SOURCE's, sees the dropped parens, and refuses the reprint. The
-/// net cannot allow paren-normalization (parens are usually semantic) and the AST
-/// E13 closed 2026-07-22: every corpus file formats. The residual DESIGN gap
-/// stays recorded (backlog E13 closure note): a redundant paren around a BARE
-/// ATOM — `(300).as_u8()` — is dissolved by the parser and unrecorded in the
-/// AST, so the printer can neither preserve nor safely drop it; such a file
-/// bails safely (`fmt` no-ops). The corpus's four such sites were canonicalized
-/// (emission byte-identical, probe-proven); a future fix is an AST-aware net or
-/// parser-recorded parens.
+/// E13 closed nine of the ten H6 S0 bailers on 2026-07-22 by adding the missing
+/// printer arms (destructuring, fixed arrays, macro forms, unary minus, and the
+/// lift-chain postfix subject). The tenth, `numeric-types.vl`, was a DESIGN gap
+/// rather than a missing arm: a redundant paren group in a value position —
+/// `(300).as_u8()`, `let b = (1 + 2);` — was dissolved by the parser and so
+/// unrecorded in the AST, the printer put back only the parens precedence
+/// demanded, and the net (which compares the OUTPUT's tokens to the SOURCE's)
+/// refused the reprint and returned the whole file's original bytes. E13
+/// canonicalized the corpus's four such sites away (emission byte-identical,
+/// probe-proven) and recorded the gap.
+///
+/// That gap is now CLOSED at the root the note predicted: the formatter parses
+/// in group-preserving mode (`parsing::parse_preserving_groups`), which records
+/// every `(…)` as a node, so a user-written group reprints as written. The
+/// corpus carries no such shape today (it was canonicalized), so this gate does
+/// not exercise the fix — `formatter::paren_groups` pins it per shape.
 #[test]
 fn formatter_never_silently_bails_over_the_corpus() {
     let bails = current_bail_set();
