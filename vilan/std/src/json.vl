@@ -764,7 +764,11 @@ macro fun struct_json_impls(target: StructItem): str {
 		.implements("Json")
 		.method(to_json)
 		.render()
-		+ impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
+		+ impl_of(target.name)
+			.implements("FromJson")
+			.method(from_json)
+			.method(from_json_value)
+			.render()
 }
 
 macro fun struct_wire_impls(target: StructItem): str {
@@ -867,7 +871,11 @@ macro fun enum_json_impls(target: EnumItem): str {
 		.implements("Json")
 		.method(to_json)
 		.render()
-		+ impl_of(target.name).implements("FromJson").method(from_json).method(from_json_value).render()
+		+ impl_of(target.name)
+			.implements("FromJson")
+			.method(from_json)
+			.method(from_json_value)
+			.render()
 }
 
 macro fun enum_wire_impls(target: EnumItem): str {

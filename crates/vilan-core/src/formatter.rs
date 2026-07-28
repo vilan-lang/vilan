@@ -611,10 +611,11 @@ enum Split {
     Off,
     /// A STATEMENT's own line overflowed. The statement's value position may
     /// break — a postfix chain into one link per line, a list literal into one
-    /// element per line — reached through the prefix and binary-left positions
-    /// that keep the value on the statement's own line. It deliberately does
-    /// not descend into a call's arguments: a chain nested in an argument of a
-    /// statement that is not itself a chain stays inline (v1's boundary).
+    /// element per line — reached through the prefix and binary operand
+    /// positions that keep the value on the statement's own line. It
+    /// deliberately does not descend into a call's arguments: a chain nested in
+    /// an argument of a statement that is not itself a chain stays inline (v1's
+    /// boundary).
     Statement,
     /// A line *inside* a split rendering overflowed — a chain link's line, a
     /// list element's line. Everything `Statement` allows, plus the descent
@@ -1762,6 +1763,13 @@ impl<'src> Printer<'src> {
     // (`.child(<tree>)`) or its list (`footer_column("title", [<elements>])`).
     // A split list measures each element's line the same way. Any depth.
     //
+    // A binary's operands are both entry points, and the LEFT wins: it prints
+    // first, and if it broke, the operator and the right operand take a fresh
+    // continuation line. The right operand is then measured on whatever line it
+    // landed on — the statement's own when the left stayed inline
+    // (`const (art_blob + style()` ⏎ `.raw(…)`), the continuation line when the
+    // left broke — and rolls back into a split of its own if that line is over.
+    //
     // What still does not break: an EARLIER argument that is the over-budget
     // cause (R5 — last-argument layout is the universal builder convention;
     // breaking an earlier one needs argument-list layout design), a `?.` lift
@@ -1780,6 +1788,19 @@ impl<'src> Printer<'src> {
             && self.indent * TAB_COLUMNS + display_width(rendered) > LINE_BUDGET
     }
 
+    /// Whether the line the printer is on right now — everything emitted since
+    /// the last newline, that line's own indentation included — overflows the
+    /// budget. [`Self::over_line_budget`] is given the offset just past a line's
+    /// indentation and adds the *current* level back; this one reads the
+    /// indentation from the text instead, so it also measures a line the printer
+    /// opened at another level (a binary's continuation line). Used only where a
+    /// split is already armed, which is what guarantees the line is a single
+    /// line: an arming site never measures a rendering that spans lines.
+    fn current_line_over_budget(&self) -> bool {
+        let line_start = self.out.rfind('\n').map_or(0, |newline| newline + 1);
+        display_width(&self.out[line_start..]) > LINE_BUDGET
+    }
+
     /// Rolls the output and the comment cursor back to the start of the
     /// statement just printed inline and arms the statement-level split, so the
     /// caller can print the same statement again in split form. Returns `false`
@@ -1792,14 +1813,6 @@ impl<'src> Printer<'src> {
         self.cursor = comment_cursor;
         self.split = Split::Statement;
         true
-    }
-
-    /// Starts a continuation line one indentation level past the statement's
-    /// own — where a binary continuation of a split chain goes.
-    fn continuation_line(&mut self) {
-        self.indent += 1;
-        self.line();
-        self.indent -= 1;
     }
 
     /// The postfix spine of `expr`: its innermost subject, then every postfix
@@ -1967,6 +1980,39 @@ impl<'src> Printer<'src> {
             Split::Off
         };
         self.print_operand(expr, minimum);
+    }
+
+    /// Prints the RIGHT operand of a binary expression, and — when the line it
+    /// landed on then overflows the budget — rolls it back and reprints it with
+    /// the split armed, so a breakable chain to the right of an operator breaks
+    /// exactly as one to the left already does (`const (art_blob + style()` ⏎
+    /// `.raw("left", "30%")` ⏎ …).
+    ///
+    /// This is the statement rule applied one operand in: print inline, measure
+    /// the real line, reprint with the flag — never a prediction of what would
+    /// fit, and never an AST test for what could break, so a reprint that finds
+    /// nothing to split reproduces the inline bytes exactly. The left operand
+    /// keeps winning when both could break, because it prints first and a left
+    /// that broke puts this operand on a fresh continuation line, which is then
+    /// measured on its own.
+    ///
+    /// What is measured is the line through this operand: whatever glues after
+    /// it — the statement's terminator, the closing paren of an enclosing group
+    /// — belongs to a construct that has not printed yet and is the caller's,
+    /// exactly as for a chain link.
+    fn print_split_right(&mut self, right: &Spanned<Node<'src>>, minimum: u8, split: Split) {
+        if split == Split::Off {
+            self.print_operand(right, minimum);
+            return;
+        }
+        let right_start = self.out.len();
+        let comment_cursor = self.cursor;
+        self.print_operand(right, minimum);
+        if self.current_line_over_budget() {
+            self.out.truncate(right_start);
+            self.cursor = comment_cursor;
+            self.print_split_operand(right, minimum, split);
+        }
     }
 
     /// Prints a comma-separated list of macro arguments, each reprinted VERBATIM
@@ -2163,20 +2209,26 @@ impl<'src> Printer<'src> {
                 let precedence = Self::binary_precedence(*operator);
                 let left_start = self.out.len();
                 self.print_split_operand(left, precedence, split);
-                // A split that broke the left operand's chain across lines
-                // continues here: the operator and the right operand take their
-                // own line at the links' indentation (`…margin(space(0))` ⏎
-                // `+ reveal`). The split is the only thing that can have
-                // introduced a break — a line whose inline rendering already
-                // spanned lines never splits.
-                if split != Split::Off && self.out[left_start..].contains('\n') {
-                    self.continuation_line();
+                // A split that broke the left operand across lines continues
+                // here: the operator and the right operand take their own line
+                // at the links' indentation (`…margin(space(0))` ⏎ `+ reveal`).
+                // The split is the only thing that can have introduced a break —
+                // a line whose inline rendering already spanned lines never
+                // splits. The indent stays raised for the right operand, so a
+                // break of its OWN lands one level past that continuation line.
+                let continued = split != Split::Off && self.out[left_start..].contains('\n');
+                if continued {
+                    self.indent += 1;
+                    self.line();
                 } else {
                     self.out.push(' ');
                 }
                 self.out.push_str(binary_operator_symbol(*operator));
                 self.out.push(' ');
-                self.print_operand(right, precedence + 1);
+                self.print_split_right(right, precedence + 1, split);
+                if continued {
+                    self.indent -= 1;
+                }
             }
             // A prefix operator (`-x`, `!x`, `&x`, `*x`, `await x`) binds tighter
             // than every binary operator (the parser recurses on the unary chain
@@ -4140,6 +4192,290 @@ mod nested_layout {
         assert!(
             once.contains("\t\t.child(view(\"p\")\n\t\t\t.styled(art_caption)\n"),
             "the sibling link did not split:\n{once}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod binary_operand_layout {
+    //! Both operands of a binary are layout sites, and the LEFT wins. The left
+    //! prints first; if it broke, the operator and the right operand take a
+    //! fresh continuation line. The right operand is then measured on whatever
+    //! line it landed on — the statement's own when the left stayed inline
+    //! (`const (art_blob + style()` ⏎ `.raw(…)`, the website's dominant shape),
+    //! that continuation line when the left broke — and rolls back into a split
+    //! of its own when that line is over budget, its links one level past the
+    //! line it is on.
+    //!
+    //! The left-operand rule itself is v1's and is pinned in
+    //! [`super::chain_splitting`]:
+    //! `a_chain_operand_of_a_binary_puts_the_continuation_on_its_own_line` (the
+    //! bare form) and `a_parenthesized_chain_operand_keeps_its_parentheses` (the
+    //! recorded-group form). Neither changes here.
+    //!
+    //! Entry is width only, in both directions, at either arming. Each pin runs
+    //! the whole formatter contract through `assert_construct` (same tokens out,
+    //! no silent bail, canonical form in one pass, idempotent).
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    // --- B1: the right operand is the breakable chain ------------------------
+
+    /// The motivating line, from the website's `art.vl` — 19 of that module's
+    /// 21 over-long lines are this shape. Everything through the operator and
+    /// the chain's subject stays on the statement's line, the links break one
+    /// level in, and the group's `)` and the terminator glue after the last one.
+    #[test]
+    fn a_chain_as_the_right_operand_splits_after_the_operator() {
+        let source = "let dg_blob_top = const (art_blob + style().raw(\"left\", \"30%\")\
+                      .raw(\"top\", \"-14%\").raw(\"width\", \"42%\").raw(\"height\", \"55%\")\
+                      .raw(\"background\", \"radial-gradient(closest-side, \
+                      rgba(178, 48, 86, 0.5), transparent)\"));\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let dg_blob_top = const (art_blob + style()\n\
+             \t.raw(\"left\", \"30%\")\n\
+             \t.raw(\"top\", \"-14%\")\n\
+             \t.raw(\"width\", \"42%\")\n\
+             \t.raw(\"height\", \"55%\")\n\
+             \t.raw(\"background\", \"radial-gradient(closest-side, \
+             rgba(178, 48, 86, 0.5), transparent)\"));\n",
+        );
+    }
+
+    /// A right operand that is not a *chain* is not a layout site: one call link
+    /// buys a line and no clarity, so the long line stays long. Nothing about
+    /// the arming is conditional on what it will find — the reprint simply
+    /// reproduces the inline bytes.
+    #[test]
+    fn a_single_link_right_operand_leaves_the_line_long() {
+        let statement = format!("let one = base + s.aa(\"{}\");\n", "P".repeat(90));
+        assert_over_budget(statement.trim_end());
+        assert_construct(&statement, &statement);
+    }
+
+    // --- B3: width only, both directions -------------------------------------
+
+    /// The collapse direction: the same shape under the budget joins back onto
+    /// one line, so a hand-split narrow chain is not preserved by accident.
+    #[test]
+    fn a_right_operand_chain_that_fits_collapses() {
+        let collapsed = "let small = const (art_blob + style().raw(\"left\", \"30%\")\
+                         .raw(\"top\", \"-14%\"));\n";
+        assert!(columns(collapsed.trim_end()) <= LINE_BUDGET);
+        assert_construct(
+            "let small = const (art_blob + style()\n\
+             \t.raw(\"left\", \"30%\")\n\
+             \t.raw(\"top\", \"-14%\"));\n",
+            collapsed,
+        );
+    }
+
+    /// The boundary at this position, arithmetically. What is measured is the
+    /// line *through the right operand*: `let v = base + s.aa("…").bb(2)` is 29
+    /// columns around the padding, so 71 padding characters make exactly the
+    /// budget and 72 make 101. The `;` the statement glues after the operand is
+    /// the statement's, not the operand's, and is deliberately not measured
+    /// (the same rule a chain link's line follows) — which is why the 101-column
+    /// statement here arms a split and then declines it, leaving its line as
+    /// written.
+    #[test]
+    fn a_right_operand_at_the_budget_stays_inline_and_one_column_over_splits() {
+        let statement = |padding: &str| format!("let v = base + s.aa(\"{padding}\").bb(2);\n");
+        let at_budget = "P".repeat(71);
+        let over_budget = "P".repeat(72);
+        assert_eq!(
+            columns(&format!("let v = base + s.aa(\"{at_budget}\").bb(2)")),
+            LINE_BUDGET
+        );
+        assert_eq!(
+            columns(&format!("let v = base + s.aa(\"{over_budget}\").bb(2)")),
+            LINE_BUDGET + 1
+        );
+        // Both statements are over the budget as statements, so the split is
+        // armed in both: the difference is the operand's own measurement.
+        assert_over_budget(statement(&at_budget).trim_end());
+        assert_construct(&statement(&at_budget), &statement(&at_budget));
+        assert_construct(
+            &statement(&over_budget),
+            &format!("let v = base + s\n\t.aa(\"{over_budget}\")\n\t.bb(2);\n"),
+        );
+    }
+
+    // --- B2: the left operand still wins -------------------------------------
+
+    /// With a breakable chain on both sides the LEFT splits, and the right
+    /// prints on the continuation line exactly as v1 printed `+ reveal` — the
+    /// right operand's own rule only asks whether *that* line is over budget,
+    /// and here it is not.
+    #[test]
+    fn a_left_operand_chain_wins_and_a_fitting_right_stays_inline() {
+        let source = "let both = const (style().raw(\"font-family\", display_face)\
+                      .font_size(Length::px(32.0)).margin(space(0)) + style().color(ink)\
+                      .gap(space(4)));\n";
+        assert_over_budget(source.trim_end());
+        assert!(columns("\t+ style().color(ink).gap(space(4)));") <= LINE_BUDGET);
+        assert_construct(
+            source,
+            "let both = const (style()\n\
+             \t.raw(\"font-family\", display_face)\n\
+             \t.font_size(Length::px(32.0))\n\
+             \t.margin(space(0))\n\
+             \t+ style().color(ink).gap(space(4)));\n",
+        );
+    }
+
+    /// …and when that continuation line is itself over budget, the right chain
+    /// splits from there — its links one level past the continuation, which is
+    /// the same measured-line rule a chain link's own line follows. This is
+    /// `std::json`'s `struct_json_impls` shape, the one std statement the rule
+    /// reached.
+    #[test]
+    fn an_over_budget_continuation_line_splits_the_right_chain_one_level_past_it() {
+        assert_over_budget(
+            "\t\t+ impl_of(target.name).implements(\"FromJson\").method(from_json)\
+             .method(from_json_value).render()",
+        );
+        assert_construct(
+            "fun impls(): str {\n\
+             \timpl_of(target.name).implements(\"Json\").method(to_json).render() \
+             + impl_of(target.name).implements(\"FromJson\").method(from_json)\
+             .method(from_json_value).render()\n\
+             }\n",
+            "fun impls(): str {\n\
+             \timpl_of(target.name)\n\
+             \t\t.implements(\"Json\")\n\
+             \t\t.method(to_json)\n\
+             \t\t.render()\n\
+             \t\t+ impl_of(target.name)\n\
+             \t\t\t.implements(\"FromJson\")\n\
+             \t\t\t.method(from_json)\n\
+             \t\t\t.method(from_json_value)\n\
+             \t\t\t.render()\n\
+             }\n",
+        );
+    }
+
+    // --- Both armings: a measured line inside a split reaches it too ---------
+
+    /// The rule is the per-line one, so it fires wherever a line is measured —
+    /// not only on a statement's own. Here the statement's chain splits, one
+    /// link's line is still over the budget, and the descent through that
+    /// call's last argument finds a sum whose right operand is the chain: it
+    /// breaks one level past the link, with the call's `)` glued after.
+    #[test]
+    fn a_link_line_reaches_the_right_operand_of_its_argument() {
+        let source = "let built = subject.first(1).wrap(base_value + style().raw(\"left\", \"30%\")\
+                      .raw(\"top\", \"-14%\").raw(\"width\", \"42%\").raw(\"height\", \"55%\"))\
+                      .tail(3);\n";
+        assert_over_budget(
+            "\t.wrap(base_value + style().raw(\"left\", \"30%\").raw(\"top\", \"-14%\")\
+             .raw(\"width\", \"42%\").raw(\"height\", \"55%\"))",
+        );
+        assert_construct(
+            source,
+            "let built = subject\n\
+             \t.first(1)\n\
+             \t.wrap(base_value + style()\n\
+             \t\t.raw(\"left\", \"30%\")\n\
+             \t\t.raw(\"top\", \"-14%\")\n\
+             \t\t.raw(\"width\", \"42%\")\n\
+             \t\t.raw(\"height\", \"55%\"))\n\
+             \t.tail(3);\n",
+        );
+    }
+
+    /// The other measured line inside a split: a list element's. An element
+    /// that is a sum with a breakable right operand splits the same way, its
+    /// links one level past the element and the list's comma glued after the
+    /// last of them.
+    #[test]
+    fn a_list_element_reaches_the_right_operand_of_its_sum() {
+        let source = "let listed = subject.first(1).wrap(panel([short_one(), base_value \
+                      + style().raw(\"left\", \"30%\").raw(\"top\", \"-14%\").raw(\"width\", \"42%\")\
+                      .raw(\"height\", \"55%\")])).tail(3);\n";
+        assert_over_budget(
+            "\t\tbase_value + style().raw(\"left\", \"30%\").raw(\"top\", \"-14%\")\
+             .raw(\"width\", \"42%\").raw(\"height\", \"55%\"),",
+        );
+        assert_construct(
+            source,
+            "let listed = subject\n\
+             \t.first(1)\n\
+             \t.wrap(panel([\n\
+             \t\tshort_one(),\n\
+             \t\tbase_value + style()\n\
+             \t\t\t.raw(\"left\", \"30%\")\n\
+             \t\t\t.raw(\"top\", \"-14%\")\n\
+             \t\t\t.raw(\"width\", \"42%\")\n\
+             \t\t\t.raw(\"height\", \"55%\"),\n\
+             \t]))\n\
+             \t.tail(3);\n",
+        );
+    }
+
+    // --- B4: a chained binary ------------------------------------------------
+
+    /// `a + b + c` parses left-nested, so the rule fires at the OUTERMOST binary
+    /// — the one whose right operand is the breakable chain. The inner sum is
+    /// the left operand there, it has nothing to break, and its own right
+    /// operand's line (`let chained = base + mid`) fits: everything through the
+    /// last operator stays on the statement's line and the chain breaks after it.
+    #[test]
+    fn a_chained_binary_splits_at_the_outermost_right_operand() {
+        let source = "let chained = base + mid + style().raw(\"left\", \"30%\")\
+                      .raw(\"top\", \"-14%\").raw(\"width\", \"42%\").raw(\"height\", \"55%\");\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let chained = base + mid + style()\n\
+             \t.raw(\"left\", \"30%\")\n\
+             \t.raw(\"top\", \"-14%\")\n\
+             \t.raw(\"width\", \"42%\")\n\
+             \t.raw(\"height\", \"55%\");\n",
+        );
+    }
+
+    // --- The shape as a whole is a fixed point -------------------------------
+
+    /// A file mixing the right-operand shape with v1's left-operand one is a
+    /// fixed point: each keeps its own layout and neither drifts into the
+    /// other's on a second pass.
+    #[test]
+    fn a_file_mixing_a_right_split_and_a_left_split_is_a_fixed_point() {
+        let source = "let heading = const style().raw(\"font-family\", display_face)\
+                      .font_size(Length::px(32.0)).raw(\"line-height\", \"48px\")\
+                      .font_weight(600).margin(space(0)) + reveal;\n\
+                      \n\
+                      let dg_blob_top = const (art_blob + style().raw(\"left\", \"30%\")\
+                      .raw(\"top\", \"-14%\").raw(\"width\", \"42%\").raw(\"height\", \"55%\")\
+                      .raw(\"background\", \"radial-gradient(closest-side, \
+                      rgba(178, 48, 86, 0.5), transparent)\"));\n\
+                      \n\
+                      let small = const (art_blob + style().raw(\"left\", \"30%\")\
+                      .raw(\"top\", \"-14%\"));\n";
+        let once = format(source);
+        assert_eq!(format(&once), once, "formatting is not a fixed point");
+        assert!(
+            once.contains("let heading = const style()\n\t.raw(\"font-family\", display_face)"),
+            "the left-operand chain did not split:\n{once}"
+        );
+        assert!(
+            once.contains("\t.margin(space(0))\n\t+ reveal;\n"),
+            "the left-operand continuation moved:\n{once}"
+        );
+        assert!(
+            once.contains("let dg_blob_top = const (art_blob + style()\n\t.raw(\"left\", \"30%\")"),
+            "the right-operand chain did not split:\n{once}"
+        );
+        assert!(
+            once.contains(
+                "let small = const (art_blob + style().raw(\"left\", \"30%\")\
+                 .raw(\"top\", \"-14%\"));\n"
+            ),
+            "the narrow sum did not stay inline:\n{once}"
         );
     }
 }
