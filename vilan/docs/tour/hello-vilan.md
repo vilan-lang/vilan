@@ -107,7 +107,8 @@ whenever a source file changes. `--platform browser` builds for the
 browser instead of node (`--target` also works). `--stdout` prints the JS
 instead of writing a file. `--entry <name>` picks which entry `vilan run`
 drives in a multi-entry package (see [the dev loop](../guide/dev-loop.md)
-for the full selection rules).
+for the full selection rules). Every command and flag, including
+`vilan upgrade`: [the CLI reference](../appendix/cli.md).
 
 A `*_test.vl` lives beside the code it tests and compiles as a file *of*
 its package: it imports `pkg::` siblings and the package's dependencies
