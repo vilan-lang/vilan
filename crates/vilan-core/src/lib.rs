@@ -45,11 +45,23 @@ use node::{Func, ImportBranch, Node, NodeList};
 use target::PlatformPattern as Pattern;
 
 /// Infers a build platform for editor analysis (which has no `--platform`) from a
-/// file's top-level imports: a file importing a module from one of `std`'s
-/// **browser**-serving layers (e.g. `std::dom`) is a browser file, otherwise Node.
-/// This lets the language server analyze a browser client without the cross-platform
-/// gate false-flagging it. The module's layer is read from `std`'s layer directory,
-/// not a hardcoded list.
+/// file's top-level imports. Evidence, per `import std::<module>` reference:
+///
+/// - a module served ONLY by a browser layer (`std::dom`) is browser evidence —
+///   the file cannot mean anything else;
+/// - a module served by a browser layer AND another root — a platform TWIN,
+///   like `std::ui` — is evidence only through the NAMES imported from it: a
+///   name declared by just the browser twin (`mount`) says browser, one
+///   declared by just the other side (`render`) says process, and a name both
+///   declare says nothing. B36: the old rule read *any* `std::ui` import as
+///   browser evidence, so a two-entry package's shared file importing the
+///   process twin's `render` analyzed as browser in the editor and its import
+///   red-flagged, while `vilan build` was clean on every entry.
+///
+/// Any browser evidence wins (the old bias, kept for a file whose imports
+/// contradict each other); otherwise Node, whose layer set serves the process
+/// twins. Layer directories are read from `std`'s manifest, not a hardcoded
+/// list.
 fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     let Some(browser_root) = std
         .layers
@@ -59,23 +71,100 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     else {
         return Platform::default();
     };
-    // Whether `name` is a module file in the browser layer (`name.vl` or `name/lib.vl`).
-    let in_browser_layer = |name: &str| {
-        browser_root.join(format!("{name}.vl")).exists()
-            || browser_root.join(name).join("lib.vl").exists()
-    };
-    fn std_child_in_browser(
-        branch: &ImportBranch,
-        in_browser_layer: &impl Fn(&str) -> bool,
-    ) -> bool {
+    // Every root that could serve a module to a NON-browser build: the other
+    // layers, then the base.
+    let other_roots: Vec<&Path> = std
+        .layers
+        .iter()
+        .filter(|layer| !layer.patterns.iter().any(|p| matches!(p, Pattern::Browser)))
+        .map(|layer| layer.root.as_path())
+        .chain(std::iter::once(std.base_root.as_path()))
+        .collect();
+    // The module file `name` resolves to under `root` (`name.vl` or `name/lib.vl`).
+    fn module_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+        let file = root.join(format!("{name}.vl"));
+        if file.exists() {
+            return Some(file);
+        }
+        let lib = root.join(name).join("lib.vl");
+        lib.exists().then_some(lib)
+    }
+    // Whether the module at `path` declares `name` at its top level (through
+    // the item wrappers). A file that fails to read or parse declares nothing —
+    // inference is a heuristic and must never error.
+    fn declares(path: &Path, name: &str) -> bool {
+        fn node_declares(node: &Node, name: &str) -> bool {
+            match node {
+                Node::Export(inner) | Node::Derive(_, inner) | Node::Service(_, inner) => {
+                    node_declares(&inner.0, name)
+                }
+                Node::Func(function) => function.name.0 == name,
+                Node::Struct(declared, ..)
+                | Node::Enum(declared, ..)
+                | Node::Trait(declared, ..)
+                | Node::Let(declared, ..) => declared.0 == name,
+                Node::Module(declared, _) => *declared == name,
+                _ => false,
+            }
+        }
+        let Ok(source) = util::read_source(path) else {
+            return false;
+        };
+        let Some((tree, _)) = parse_clean_cached(&source) else {
+            return false;
+        };
+        tree.0.iter().any(|node| node_declares(&node.0, name))
+    }
+    // The names an import branch takes from its module: the immediate segment
+    // of each leaf path (`render`, or `Option` of `Option::{ self, Some }`) —
+    // the identifier the module must declare at its top level.
+    fn leaf_names<'a>(branch: &'a ImportBranch, into: &mut Vec<&'a str>) {
         match branch {
-            ImportBranch::Path(module, _, _) => in_browser_layer(module),
-            ImportBranch::Set(branches) => branches
-                .iter()
-                .any(|branch| std_child_in_browser(branch, in_browser_layer)),
+            ImportBranch::Path(name, _, _) => into.push(name),
+            ImportBranch::Set(branches) => {
+                for branch in branches {
+                    leaf_names(branch, into);
+                }
+            }
         }
     }
-    let imports_browser_layer = |branch: &ImportBranch| matches!(branch, ImportBranch::Path("std", _, Some(child)) if std_child_in_browser(child, &in_browser_layer));
+    // Browser evidence for one `std::<module>` reference (see the doc comment).
+    fn child_is_browser_evidence(
+        branch: &ImportBranch,
+        browser_root: &Path,
+        other_roots: &[&Path],
+    ) -> bool {
+        match branch {
+            ImportBranch::Path(module, _, sub) => {
+                let Some(browser_file) = module_file(browser_root, module) else {
+                    return false;
+                };
+                let twin_files: Vec<std::path::PathBuf> = other_roots
+                    .iter()
+                    .filter_map(|root| module_file(root, module))
+                    .collect();
+                if twin_files.is_empty() {
+                    // Browser-exclusive — the module itself is the evidence.
+                    return true;
+                }
+                // A twin: only a name the browser side alone declares says
+                // browser. A bare `import std::ui;` names nothing — neutral.
+                let Some(sub) = sub else {
+                    return false;
+                };
+                let mut names = Vec::new();
+                leaf_names(sub, &mut names);
+                names.iter().any(|name| {
+                    declares(&browser_file, name)
+                        && !twin_files.iter().any(|file| declares(file, name))
+                })
+            }
+            ImportBranch::Set(branches) => branches
+                .iter()
+                .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
+        }
+    }
+    let imports_browser_layer = |branch: &ImportBranch| matches!(branch, ImportBranch::Path("std", _, Some(child)) if child_is_browser_evidence(child, browser_root, &other_roots));
     // Imports are block-scoped statements (backlog H2), so scan at every depth —
     // a browser import inside a function body flags the file too.
     fn any_node(nodes: &NodeList, matches: &mut dyn FnMut(&Node) -> bool) -> bool {

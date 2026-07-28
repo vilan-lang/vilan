@@ -3767,6 +3767,68 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // B36: a shared (non-entry) file in a two-entry package importing a name
+    // only the PROCESS twin of `std::ui` declares (`render`). The old
+    // inference read any `std::ui` import as browser evidence, analyzed the
+    // file as browser, and red-flagged the import — while `vilan build` was
+    // clean on every entry. Name-level evidence infers Node here.
+    #[test]
+    fn a_shared_file_importing_the_process_twins_name_is_not_red_flagged() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared = "import std::ui::{ view, View, render };\n\nfun page_markup(): str {\n\trender(view(\"main\").text(\"hi\"))\n}\n";
+        let entry = "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/page.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/page.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The mirror B36 guards: a shared file importing a name only the BROWSER
+    // twin declares (`mount`) must keep inferring browser — a module-level
+    // "twins are never evidence" rule would have broken this direction.
+    #[test]
+    fn a_shared_file_importing_the_browser_twins_name_still_infers_browser() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared = "import std::ui::{ view, View, mount };\n\nfun attach() {\n\tmount(\"app\", view(\"main\").text(\"hi\"));\n}\n";
+        let entry = "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/widget.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/widget.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The hover text at the cursor marked `|` in `src` (a bare manifest-less
     /// file, like `completions_at_cursor` — keep the sources closure-free, the
     /// marker would collide with closure pipes).
