@@ -24,7 +24,8 @@
     "bin/",
     "lib/",
     "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE-APACHE",
+    "THIRD-PARTY-NOTICES.txt"
   ],
   "engines": {
     "node": ">=18"

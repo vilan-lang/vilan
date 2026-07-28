@@ -470,6 +470,16 @@ fn install_binaries(
             format!("cannot replace {}: {error}", destination.display())
         })?;
     }
+    // The licenses and third-party notices travel with the binaries they
+    // cover (F10) — best-effort: an archive from before a file existed
+    // simply doesn't ship it, and a failed copy must not fail an upgrade
+    // whose binaries already landed.
+    for notice in ["LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.txt"] {
+        let source = workdir.join(notice);
+        if source.exists() {
+            let _ = std::fs::copy(&source, install_dir.join(notice));
+        }
+    }
     Ok(())
 }
 

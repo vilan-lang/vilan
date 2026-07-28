@@ -34,8 +34,10 @@ class Vilan < Formula
   def install
     bin.install "vilan", "vilan-lsp"
     # Both licenses travel with the binaries they cover: the archive carries
-    # them, and redistributing under either one means shipping its text.
+    # them, and redistributing under either one means shipping its text. The
+    # third-party notices cover the statically linked crates the same way.
     prefix.install "LICENSE-MIT", "LICENSE-APACHE"
+    prefix.install "THIRD-PARTY-NOTICES.txt" if File.exist?("THIRD-PARTY-NOTICES.txt")
   end
 
   test do

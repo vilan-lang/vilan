@@ -108,8 +108,14 @@ for row in $TARGETS; do
     fi
 
     # The archives carry both licenses; a package shipping the binary ships
-    # them with it.
+    # them with it. Third-party notices ride the same rule (F10); archives
+    # from releases before the file existed fall back to the repo's copy.
     cp "$unpacked/LICENSE-MIT" "$unpacked/LICENSE-APACHE" "$OUT/$package/"
+    if [ -f "$unpacked/THIRD-PARTY-NOTICES.txt" ]; then
+        cp "$unpacked/THIRD-PARTY-NOTICES.txt" "$OUT/$package/"
+    else
+        cp THIRD-PARTY-NOTICES.txt "$OUT/$package/"
+    fi
     cp "npm/platform/$package/package.json" "$OUT/$package/package.json"
     stamp "$OUT/$package/package.json"
     rm -rf "$unpacked"
@@ -119,7 +125,7 @@ done
 # npm renders on the package page, and the licenses from the repository root.
 mkdir -p "$OUT/vilan"
 cp -R npm/meta/bin npm/meta/lib "$OUT/vilan/"
-cp npm/meta/package.json npm/meta/README.md LICENSE-MIT LICENSE-APACHE "$OUT/vilan/"
+cp npm/meta/package.json npm/meta/README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt "$OUT/vilan/"
 chmod +x "$OUT/vilan/bin/vilan.js" "$OUT/vilan/bin/vilan-lsp.js"
 stamp "$OUT/vilan/package.json"
 

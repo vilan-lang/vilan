@@ -1,0 +1,22 @@
+# cargo-about config for THIRD-PARTY-NOTICES.txt (backlog F10): the licenses
+# the dependency graph is allowed to carry. Regenerate the notices after a
+# dependency change with:
+#
+#   cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt
+#
+# The notices completeness test (crates/vilan-cli/tests/third_party_notices.rs)
+# fails when Cargo.lock gains a crate the file does not mention.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+]
+# No `targets` filter: the notices cover the WHOLE lockfile, a deliberate
+# superset — a crate only some platform's binary links (or none, like the
+# Redox shims) is covered everywhere, which keeps the completeness test an
+# exact walk of Cargo.lock instead of a per-target reconstruction.

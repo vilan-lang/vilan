@@ -394,6 +394,13 @@ fn the_formula_installs_both_binaries_and_smoke_tests_the_version() {
         "the archives carry both licenses and a redistribution ships them"
     );
     assert!(
+        formula.contains(
+            r#"prefix.install "THIRD-PARTY-NOTICES.txt" if File.exist?("THIRD-PARTY-NOTICES.txt")"#
+        ),
+        "the third-party notices ship when the archive carries them (F10; \
+         conditional so the formula still installs archives from older releases)"
+    );
+    assert!(
         formula.contains(r##"assert_match version.to_s, shell_output("#{bin}/vilan --version")"##),
         "`brew test vilan` must run the compiler and see this version — which is \
          what `vilan --version` prints"

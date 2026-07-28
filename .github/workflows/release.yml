@@ -116,9 +116,9 @@ jobs:
           mkdir dist
           cp "target/${{ matrix.target }}/release/vilan" \
              "target/${{ matrix.target }}/release/vilan-lsp" \
-             LICENSE-MIT LICENSE-APACHE dist/
+             LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
           tar -czf "vilan-${{ matrix.target }}.tar.gz" -C dist \
-              vilan vilan-lsp LICENSE-MIT LICENSE-APACHE
+              vilan vilan-lsp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
       - name: Package (Windows)
         if: runner.os == 'Windows'
         # A `.zip` is the Windows convention, and what `install.ps1` and
@@ -134,7 +134,7 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/vilan.exe",
                     "target/${{ matrix.target }}/release/vilan-lsp.exe",
-                    LICENSE-MIT, LICENSE-APACHE dist/
+                    LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY-NOTICES.txt dist/
           Compress-Archive -Path dist/* -DestinationPath "vilan-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:
