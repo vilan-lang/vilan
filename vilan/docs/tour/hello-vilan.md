@@ -105,7 +105,9 @@ yours.
 Flags you'll actually use: `--watch` rebuilds (or re-runs, or re-checks)
 whenever a source file changes. `--platform browser` builds for the
 browser instead of node (`--target` also works). `--stdout` prints the JS
-instead of writing a file.
+instead of writing a file. `--entry <name>` picks which entry `vilan run`
+drives in a multi-entry package (see [the dev loop](../guide/dev-loop.md)
+for the full selection rules).
 
 A `*_test.vl` lives beside the code it tests and compiles as a file *of*
 its package: it imports `pkg::` siblings and the package's dependencies
@@ -149,6 +151,12 @@ The repository must be a `[library]` with its `vilan.toml` at the root.
 work offline, and a moved tag cannot change what you already built.
 Nothing else fetches: the editor uses the cache when it's there and
 never reaches the network.
+
+Two more keys earn their keep once a project grows. `[build] run` names
+a command (or a list of them) to run before each build and each
+`--watch` round — an asset pipeline, a codegen sidecar. And
+`default-entry` names the entry `vilan run` should drive when a package
+has several. Both are covered in [the dev loop](../guide/dev-loop.md).
 
 A workspace groups several packages so they build together with one
 `vilan build .` at the root. You need it less often than you might

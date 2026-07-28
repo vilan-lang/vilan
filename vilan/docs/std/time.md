@@ -95,6 +95,8 @@ A timer starts on construction and settles exactly once, on a **verdict**:
 `true` if it fired, `false` if `cancel()` got there first. The verdict is
 remembered, so every waiter sees the same answer — one parked before it
 settled, one arriving long after — and asking a settled timer is immediate.
+`cancel()` is idempotent: cancelling twice, or cancelling a timer that
+already fired, does nothing.
 
 ```vilan
 import std::print;
