@@ -88,8 +88,12 @@ let button = const style()
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
 `.last`, `.dark` (dark mode via `prefers-color-scheme`), and
 `.pseudo(name, inner)` for anything else. Breakpoints work the same way:
-`.sm(inner)`, `.md(inner)`, `.lg(inner)`, `.xl(inner)`, or
-`.media(min_width, inner)`.
+`.sm(inner)` (640px), `.md(inner)` (768px), `.lg(inner)` (1024px),
+`.xl(inner)` (1280px), or `.media(min_width, inner)` — all `min-width`
+conditions, so chains are mobile-first: in
+`.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching breakpoint wins
+(the stylesheet emits media rules in ascending min-width order, which is
+what makes that true).
 
 ## Dynamic values
 

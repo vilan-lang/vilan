@@ -12934,7 +12934,7 @@ fn a_const_emit_collects_assets() {
 }
 
 #[test]
-fn assets_deduplicate_and_sort_lexically() {
+fn assets_deduplicate_and_sort_in_cascade_order() {
     // Two consts emit overlapping lines and a media block; the assembled file
     // dedups and sorts — '.' < '@', so media rules take the LATER cascade
     // position they need (the CSS-soundness argument in assemble_assets).
@@ -12962,6 +12962,75 @@ fn assets_deduplicate_and_sort_lexically() {
     assert_eq!(
         css,
         ".bC7{background:blue}\n.pA3{padding:1rem}\n@media (min-width: 768px){.mX{padding:2rem}}\n"
+    );
+}
+
+#[test]
+fn media_rules_sort_by_ascending_min_width() {
+    // B35: the assembled order must be numeric, not lexical — '1' < '6' put
+    // the 1024px rule BEFORE the 640px one, and on a wide viewport (where
+    // both medias match and specificity ties) the narrow rule won the
+    // cascade. Emission order here is widest-first to prove the sort, not
+    // the collection order, decides.
+    let assets = collected_assets(
+        r#"
+        import std::asset::emit;
+        fun wide(): i32 {
+            emit("css", "@media (min-width: 1280px){.d{width:4rem}}");
+            emit("css", "@media (min-width: 1024px){.c{width:3rem}}");
+            1
+        }
+        fun narrow(): i32 {
+            emit("css", "@media (min-width: 640px){.a{width:1rem}}");
+            emit("css", "@media (min-width: 768px){.b{width:2rem}}");
+            emit("css", ".base{width:0}");
+            2
+        }
+        let _w = const wide();
+        let _n = const narrow();
+        fun main() {}
+        main();
+        "#,
+    );
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let css = assembled.get("css").expect("a css asset");
+    assert_eq!(
+        css,
+        ".base{width:0}\n\
+         @media (min-width: 640px){.a{width:1rem}}\n\
+         @media (min-width: 768px){.b{width:2rem}}\n\
+         @media (min-width: 1024px){.c{width:3rem}}\n\
+         @media (min-width: 1280px){.d{width:4rem}}\n"
+    );
+}
+
+#[test]
+fn a_sm_lg_pair_renders_the_lg_value_on_a_wide_viewport() {
+    // The B35 field case: two breakpoints on the SAME property. The sm rule
+    // must precede the lg rule in the assembled stylesheet so the widest
+    // matching breakpoint wins the cascade tie.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().sm(style().padding(space(2))).lg(style().padding(space(3)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let css = assembled.get("css").expect("a css asset");
+    let sm = css
+        .find("@media (min-width: 640px)")
+        .expect("an sm rule in {css:?}");
+    let lg = css
+        .find("@media (min-width: 1024px)")
+        .expect("an lg rule in {css:?}");
+    assert!(
+        sm < lg,
+        "the sm rule must precede the lg rule so lg wins the wide-viewport cascade tie:\n{css}"
     );
 }
 

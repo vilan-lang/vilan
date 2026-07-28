@@ -53,10 +53,16 @@ pub fn evaluate(
 /// Deduplicates and deterministically orders the collected `(kind, line)`
 /// pairs into per-kind file contents (newline-terminated). Lines sort
 /// lexically — which is SOUND for the CSS the styling system emits: `.class`
-/// rules ('.' = 0x2E) sort before `@media` blocks ('@' = 0x40), so media
-/// rules take the later cascade position they need, and pseudo-class rules
-/// don't compete with base rules on cascade order at all (their classes are
-/// distinct and their specificity is higher).
+/// rules ('.' = 0x2E) sort before `:root` variables and `@media` blocks
+/// ('@' = 0x40), so media rules take the later cascade position they need,
+/// and pseudo-class rules don't compete with base rules on cascade order at
+/// all (their classes are distinct and their specificity is higher) — EXCEPT
+/// among `@media (min-width: …)` lines themselves, which sort by ascending
+/// min-width, not by digit bytes. On a wide viewport every narrower
+/// `min-width` rule also matches, specificity ties, and cascade order
+/// decides — so the widest matching breakpoint must come last for a
+/// mobile-first `.sm(x).lg(y)` chain to render `y`. The lexical digit sort
+/// put `1024px` before `640px` and the narrow rule won (B35).
 pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> {
     let mut by_kind: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (kind, line) in assets {
@@ -65,11 +71,35 @@ pub fn assemble_assets(assets: &[(String, String)]) -> BTreeMap<String, String> 
     by_kind
         .into_iter()
         .map(|(kind, lines)| {
-            let mut content = lines.into_iter().collect::<Vec<_>>().join("\n");
+            let mut lines = lines.into_iter().collect::<Vec<_>>();
+            // Media lines as a group sort after everything else ('@' is the
+            // highest first byte the styling system emits) — the key only has
+            // to order them among themselves and keep the rest lexical.
+            lines.sort_by_key(|line| (media_min_width(line).map(f64::to_bits), *line));
+            let mut content = lines.join("\n");
             content.push('\n');
             (kind.to_string(), content)
         })
         .collect()
+}
+
+/// The numeric minimum width of an `@media (min-width: …)` line, in px —
+/// `em`/`rem` normalized at the CSS-initial 16px — or `None` for a non-media
+/// line, or a width in units the styling system doesn't emit (those keep
+/// their lexical position). `f64::to_bits` in the sort key above is
+/// order-preserving because widths are non-negative.
+fn media_min_width(line: &str) -> Option<f64> {
+    let rest = line.strip_prefix("@media (min-width: ")?;
+    let close = rest.find(')')?;
+    let number_end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(close);
+    let number: f64 = rest[..number_end].parse().ok()?;
+    match &rest[number_end..close] {
+        "px" => Some(number),
+        "em" | "rem" => Some(number * 16.0),
+        _ => None,
+    }
 }
 
 struct State<'p, 'src> {

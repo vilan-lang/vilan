@@ -95,15 +95,17 @@ fun last(self, inner: Style): Style       // :last-child
 fun dark(self, inner: Style): Style       // prefers-color-scheme: dark
 fun pseudo(self, name: str, inner: Style): Style
 
-fun sm(self, inner: Style): Style          // breakpoints (min-width)
-fun md(self, inner: Style): Style
+fun sm(self, inner: Style): Style          // breakpoints (min-width):
+fun md(self, inner: Style): Style          // 640px, 768px, 1024px, 1280px
 fun lg(self, inner: Style): Style
 fun xl(self, inner: Style): Style
 fun media(self, min_width: str, inner: Style): Style
 ```
 
 A breakpoint cannot wrap an already-media-conditioned style (panics at
-compile-time evaluation).
+compile-time evaluation). Media rules emit in ascending min-width order,
+so a chain like `.sm(x).lg(y)` is mobile-first — the widest matching
+breakpoint wins.
 
 ## Runtime-legal operations
 

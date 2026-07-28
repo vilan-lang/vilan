@@ -6,9 +6,11 @@ evaluation pass, in-place serialization — 21 pins + corpus `const.vl`), then
 the **asset channel + const-only bit** (§2–3, the styling prerequisite):
 `std::asset::emit` accumulates during `eval_const` only (a capability flag on
 the interpreter — macro expansion and the equivalence runner reject it), the
-channel dedups by line and orders lexically (SOUND for the styling system's
-CSS: `.class` < `@media`, so media blocks take the later cascade position —
-argued at `assemble_assets`), and `vilan build` writes `<output>.<kind>`
+channel dedups by line and orders lexically, EXCEPT `@media (min-width: …)`
+lines, which sort as a group in ascending min-width order (B35, 2026-07-28:
+the bare lexical digit sort put 1024px before 640px, so on a wide viewport
+the narrow rule won the cascade tie; base `.class` < `:root` < media still
+holds — argued at `assemble_assets`), and `vilan build` writes `<output>.<kind>`
 beside the JS (7 pins + an end-to-end CLI test). The const-only check is the
 R-fixpoint over the shared call graph: functions reaching `emit` through
 non-const call sites join R, roots (`main`, top-level initializers) never
@@ -147,8 +149,9 @@ compiler. After compilation the channel, per kind:
    output with no cross-binding coordination (the property that makes atomic
    CSS plateau).
 2. **Orders deterministically** — a kind-specific rule (CSS: base < pseudo <
-   media, then lexical), so outputs are byte-stable regardless of evaluation
-   or caching order.
+   media in ascending min-width order, then lexical — B35 fixed the digit
+   sort that put 1024px before 640px), so outputs are byte-stable regardless
+   of evaluation or caching order.
 3. **Writes `<out>.<ext>` beside the compiled `.js`** (e.g. `dist/client.css`).
 
 The channel is styling-agnostic: A7 SSR wants it for critical CSS, and any

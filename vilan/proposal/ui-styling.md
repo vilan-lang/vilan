@@ -205,7 +205,8 @@ the capability model instead of a lint.
 Almost everything is `const-eval.md`'s: the evaluator (exists — the macro
 interpreter), the `const` binding form, the const-only bit, the asset
 channel with its dedup/ordering/emission (CSS ordering: base < pseudo <
-media, then lexical). On top, this proposal adds only:
+media in ascending min-width order, then lexical — B35). On top, this
+proposal adds only:
 
 - **`std::ui::style`** — `Style` (the property map), `Add`, the property
   functions, condition combinators, token functions, `raw`. Pure std vilan.

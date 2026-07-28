@@ -79,3 +79,5 @@ console.log(class_list(card));
 console.log(class_list(add(card, active)));
 const wide = [ [ new Map([ [ "::width", [ "::width", [ "s178hckh", "width:37px" ] ] ] ]) ] ];
 console.log(class_list(wide));
+const responsive = [ [ new Map([ [ "640px::padding", [ "640px::padding", [ "sl8ru5a", "padding:var(--space-2)" ] ] ], [ "1024px::padding", [ "1024px::padding", [ "s4x9b8s", "padding:var(--space-3)" ] ] ] ]) ] ];
+console.log(class_list(responsive));

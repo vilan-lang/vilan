@@ -19,5 +19,11 @@ fun main() {
 	// Arbitrary values mint their own atomic class — the escape, not the norm.
 	let wide = const style().width(Length::px(37));
 	print(wide.class_list());
+
+	// Two breakpoints on ONE property: the golden pins the ascending
+	// min-width emission order (B35) — sm before lg, so the widest matching
+	// breakpoint wins the wide-viewport cascade tie.
+	let responsive = const style().sm(style().padding(space(2))).lg(style().padding(space(3)));
+	print(responsive.class_list());
 }
 main();

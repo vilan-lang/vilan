@@ -1,6 +1,7 @@
 //! End-to-end CLI test for the asset channel (proposal/const-eval.md §3):
 //! `vilan build` writes `<output>.<kind>` beside the compiled JS, with the
-//! collected lines deduplicated and lexically ordered — and, per hmr.md §11 S0,
+//! collected lines deduplicated and cascade-ordered (lexical, except media
+//! rules ascend by min-width — B35) — and, per hmr.md §11 S0,
 //! `vilan run` / `run --watch` write the same sidecar each round so the dev loop
 //! serves fresh assets.
 
