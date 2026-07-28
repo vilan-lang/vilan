@@ -165,6 +165,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__nursery_new_detached",
         "__nursery_run",
         "__sleep",
+        "__timer",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -587,6 +588,64 @@ fn helper_source(name: &str) -> &'static str {
              \t\t\treject(sig.reason);\n\
              \t\t}, { once: true });\n\
              \t});\n\
+             }"
+        }
+        // The cancelable host timer behind `std::time::Timer` — `setTimeout`
+        // and `clearTimeout` as one value. The handle memoizes a VERDICT:
+        // `true` once the timer fired, `false` once `cancel()` settled it
+        // first, and the first settlement wins forever. Every waiter — the
+        // ones already parked and the ones that arrive afterwards — observes
+        // that same verdict, so `wait()` past settlement is an immediate
+        // answer rather than a second timer.
+        //
+        // `wait` bridges an ambient cancel signal the way `__sleep` does, with
+        // the one difference that is the point of the type: an abort rejects
+        // THAT waiter (the structured teardown of the task awaiting) and
+        // leaves the verdict unsettled and the host timer running. The timer
+        // belongs to whoever holds the value, not to the nursery that happened
+        // to await it, so its other holders can still wait or cancel. A
+        // settled timer answers from the memo without consulting the signal —
+        // there is nothing left to tear down.
+        "__timer" => {
+            "class __Timer {\n\
+             \tconstructor(ms) {\n\
+             \t\tthis.settled = false;\n\
+             \t\tthis.verdict = false;\n\
+             \t\tthis.waiters = [];\n\
+             \t\tthis.id = setTimeout(() => this.__settle(true), ms);\n\
+             \t}\n\
+             \t__settle(verdict) {\n\
+             \t\tif (this.settled) return;\n\
+             \t\tthis.settled = true;\n\
+             \t\tthis.verdict = verdict;\n\
+             \t\tconst waiters = this.waiters;\n\
+             \t\tthis.waiters = [];\n\
+             \t\tfor (const wake of waiters) wake(verdict);\n\
+             \t}\n\
+             \tcancel() {\n\
+             \t\tif (this.settled) return;\n\
+             \t\tclearTimeout(this.id);\n\
+             \t\tthis.__settle(false);\n\
+             \t}\n\
+             \twait(signal) {\n\
+             \t\tif (this.settled) return Promise.resolve(this.verdict);\n\
+             \t\tconst sig = signal && signal[0] === 0 ? signal[1] : undefined;\n\
+             \t\treturn new Promise((resolve, reject) => {\n\
+             \t\t\tif (sig && sig.aborted) {\n\
+             \t\t\t\treject(sig.reason);\n\
+             \t\t\t\treturn;\n\
+             \t\t\t}\n\
+             \t\t\tthis.waiters.push(resolve);\n\
+             \t\t\tif (sig) sig.addEventListener(\"abort\", () => {\n\
+             \t\t\t\tconst parked = this.waiters.indexOf(resolve);\n\
+             \t\t\t\tif (parked >= 0) this.waiters.splice(parked, 1);\n\
+             \t\t\t\treject(sig.reason);\n\
+             \t\t\t}, { once: true });\n\
+             \t\t});\n\
+             \t}\n\
+             }\n\
+             function __timer(ms) {\n\
+             \treturn new __Timer(ms);\n\
              }"
         }
         // Reads `__task`'s third argument out of a safe holder's
@@ -5369,6 +5428,8 @@ const RESERVED_NAMES: &[&str] = &[
     "__nursery_is_cancel",
     "__Nursery",
     "__sleep",
+    "__timer",
+    "__Timer",
     "__hmr_active",
 ];
 

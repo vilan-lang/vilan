@@ -13,6 +13,8 @@ tracks the latest state.
 
 **Breaking: `serve_service` and `serve_connected` hand their ready callback the `Server`.** `on_ready` is now `|Server| void`, matching `serve_rpc` — which is what makes `serve_service(0, …)` usable: the server you're handed knows the port it actually bound (`server.port()`, new this release).
 
+**Cancelable timers.** `std::time::Timer` is a delay you keep hold of — `setTimeout` and `clearTimeout` as one value. `Timer::after(ms)` (or `after_for(duration)`) starts the timer immediately; `timer.wait()` yields `true` when it fires and `false` when `timer.cancel()` got there first, and that verdict is remembered, so every waiter — one parked before it settled, one arriving long after — gets the same answer, and asking a settled timer returns at once. Cancelling twice, or cancelling a timer that already fired, does nothing. This is the shape a re-clickable button wants: keep the pending timer in hand and call it off before starting the next one, instead of leaving a stale sleeper to wake up and hopefully notice it's stale. A `Timer` is an ordinary value wrapping one host handle, the way a `Signal` wraps one cell, so copying it shares the same timer. And the two kinds of cancellation stay distinct: `cancel()` is a verdict, while a cancelling nursery tears down only the task that was awaiting — the timer itself is untouched and its other holders can still wait on it or call it off.
+
 **Vilan has a new look.** The palette moved from indigo-and-lavender to blush on near-black (`#F9DFE7` on `#120004`), and every rendering of the brand moved with it: the repository header, the VS Code extension's icon and listing banner, the CLI's post-upgrade mark, and the website. The mark itself is unchanged.
 -->
 

@@ -197,3 +197,78 @@ fun sleep(ms: i32) {
 fun sleep_for(duration: Duration) {
 	sleep(duration.millis.as_i32());
 }
+
+// --- Cancelable timers ---------------------------------------------------------
+
+/// The host timer handle behind `Timer` — a `setTimeout` id plus the verdict
+/// it settles on (the `__timer` runtime helper). Not part of the surface;
+/// hold a `Timer`.
+external struct TimerHandle;
+
+[extern("__timer")]
+external fun __timer(ms: i32): TimerHandle;
+
+impl TimerHandle {
+	[extern(method, "wait")]
+	async external fun wait(self, signal: Option<CancelSignal>): bool;
+
+	[extern(method, "cancel")]
+	external fun cancel(self);
+}
+
+/// A running timer you can wait on or call off — `setTimeout` and
+/// `clearTimeout` as one value. Where `sleep` is a suspension nobody can
+/// reach into, a `Timer` is a thing you hold: start it now, hand it around,
+/// and later either learn that it fired or take it back.
+///
+/// It starts on construction, and it settles exactly once, on a verdict:
+/// `true` if it fired, `false` if `cancel()` got there first. That verdict is
+/// remembered, so every waiter — one parked before it settled, one arriving
+/// long after — gets the same answer, and asking a settled timer is
+/// immediate.
+///
+/// A `Timer` is an ordinary value wrapping that host handle, so copying it
+/// (assigning it, passing it, storing it in a field) shares the ONE timer,
+/// the way a `Signal` shares its cell: cancelling through any copy settles
+/// them all.
+///
+/// A pending timer keeps the host alive — on node the process will not exit
+/// while one is outstanding, exactly as an outstanding `sleep` holds it open.
+/// Cancel the timer if you want the program to be free to end.
+struct Timer {
+	handle: TimerHandle,
+}
+
+impl Timer {
+	/// Start a timer that fires in `ms` milliseconds. The clock starts here,
+	/// not at the first `wait` — nothing has to be awaiting it for it to run
+	/// out.
+	fun after(ms: i32): Timer {
+		Timer { handle = __timer(ms) }
+	}
+
+	/// `after`, taking a `Duration` (the `sleep_for` shape). Spans beyond i32
+	/// milliseconds (~24 days) are not supported by the host timer.
+	fun after_for(duration: Duration): Timer {
+		Timer::after(duration.millis.as_i32())
+	}
+
+	/// Wait for the verdict: `true` when the timer fired, `false` when it was
+	/// cancelled. Async — a caller awaits it implicitly. Inside a nursery's
+	/// dynamic extent the wait carries the ambient cancel signal, exactly as
+	/// `sleep` does: cancelling the nursery tears down THIS wait (the task
+	/// awaiting it unwinds) but does not touch the timer — no verdict, no
+	/// `clearTimeout` — because the timer belongs to whoever holds the value.
+	/// Its other holders can still wait on it, or cancel it.
+	fun wait(self): bool {
+		self.handle.wait(ambient_signal())
+	}
+
+	/// Call the timer off: clear the host timer and settle the verdict
+	/// `false`, so anything waiting resolves `false` at once. A timer that has
+	/// already settled — fired, or cancelled before — is untouched, so this is
+	/// idempotent and a late cancel never rewrites a `true` into a `false`.
+	fun cancel(self) {
+		self.handle.cancel();
+	}
+}

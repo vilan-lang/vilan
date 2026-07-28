@@ -742,7 +742,7 @@ impl Interpreter {
         // Free names are host references; the renamer guarantees user bindings
         // never collide with these (they're reserved).
         Err(match name {
-            "__scan" | "__env" | "__args" | "__random_int" | "__random_float" => {
+            "__scan" | "__env" | "__args" | "__random_int" | "__random_float" | "__timer" => {
                 Failure::unsupported(format!("`{name}`"))
             }
             _ => Failure::internal(format!("`{name}` is not defined")),
@@ -1332,7 +1332,14 @@ impl Interpreter {
             "__scan" | "__env" | "__args" | "__random_int" | "__random_float" => {
                 Err(Failure::unsupported(format!("`{name}`")))
             }
-            "fetch" | "setTimeout" | "setInterval" | "structuredClone" => {
+            // `std::time::Timer`'s handle constructor. A host timer needs an
+            // event loop to fire on, and this evaluator has none — so the
+            // capability is absent BY DESIGN, exactly like the bare
+            // `setTimeout` above it, and reaching one is a clean capability
+            // miss rather than an "unknown host call" (which would read as a
+            // compiler bug). Every observer of a timer is `wait`, which is
+            // async — already outside the subset — so nothing is lost.
+            "fetch" | "setTimeout" | "setInterval" | "structuredClone" | "__timer" => {
                 Err(Failure::unsupported(format!("`{name}`")))
             }
             other => Err(Failure::internal(format!("unknown host call `{other}`"))),

@@ -265,7 +265,25 @@ for it; keep bare spawns for genuine fire-and-forget.
 
 From `std::time`: `sleep_for(duration)` and `sleep(millis)` suspend.
 `Duration::millis/seconds/minutes/hours/days` build durations. `now()`
-reads the clock. Details in the [time reference](../std/time.md).
+reads the clock.
+
+A `Timer` is a delay you keep hold of — it starts on construction, and
+you either wait for its verdict or call it off:
+
+```vilan
+import std::print;
+import std::time::Timer;
+
+fun main() {
+	let pending = Timer::after(2400);
+	pending.cancel();
+	print(pending.wait());   // false — cancelled before it fired
+}
+```
+
+`wait()` yields `true` if the timer fired and `false` if it was
+cancelled, and that verdict is remembered for every later waiter.
+Details in the [time reference](../std/time.md).
 
 ## What async does NOT do
 

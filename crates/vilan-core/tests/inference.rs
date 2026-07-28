@@ -15649,6 +15649,357 @@ fn non_wire_fields_still_fail() {
     );
 }
 
+// --- `std::time::Timer` — the cancelable timer -------------------------------
+//
+// `setTimeout`/`clearTimeout` as one value (backlog-2026-07-18.md's "per-task
+// cancel handles" first field case). One pin per numbered semantic. Every
+// timing here is ORDERING, never a wall-clock race: a timer armed before a
+// longer sleep has fired by the time that sleep returns (node's timer list is
+// expiry-ordered), and everything else is cancel-before-fire.
+
+#[test]
+fn timer_after_starts_the_host_timer_at_construction() {
+    // §1 — the clock starts at `after`, not at the first `wait`. The
+    // discriminator is a race the two readings decide differently: the timer
+    // is armed for 60ms and left alone for 90ms, then its `wait` is run
+    // against a fresh 30ms sleep. Started at construction it has already
+    // fired, so its wait resolves on the microtask queue and wins; started
+    // lazily at `wait` it would need 60ms and lose to the 30ms sleeper.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(60);
+            sleep(90);
+
+            let order: Shared<List<str>> = Shared::new([]);
+            nursery(|n| {
+                let _fired = async {
+                    order.write().push(i"timer:{timer.wait()}");
+                };
+                let _slept = async {
+                    sleep(30);
+                    order.write().push("sleep");
+                };
+            });
+            for mark in order.read() {
+                print(mark);
+            }
+        }
+        main();
+        "#,
+        "timer:true\nsleep\n",
+    );
+}
+
+#[test]
+fn timer_after_for_mirrors_sleep_for() {
+    // §1 — the `Duration` spelling is the same timer (an i32-ms cap, like
+    // `sleep_for`): armed at construction, fires, verdict `true`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Duration, Timer };
+
+        fun main() {
+            let timer = Timer::after_for(Duration::millis(1i53));
+            sleep(30);
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn timer_wait_gives_concurrent_waiters_one_verdict() {
+    // §2 — two tasks parked on the same PENDING timer both observe the one
+    // verdict when it fires.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        import std::task::nursery;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(20);
+            let seen: Shared<List<str>> = Shared::new([]);
+            nursery(|n| {
+                let _one = async {
+                    seen.write().push(i"one:{timer.wait()}");
+                };
+                let _two = async {
+                    seen.write().push(i"two:{timer.wait()}");
+                };
+            });
+            for mark in seen.read() {
+                print(mark);
+            }
+        }
+        main();
+        "#,
+        "one:true\ntwo:true\n",
+    );
+}
+
+#[test]
+fn timer_wait_after_settlement_returns_the_memoized_verdict() {
+    // §2 — the verdict is MEMOIZED, not a second timer: waiting a settled
+    // timer answers immediately, as often as you ask, on both verdicts.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let fired = Timer::after(1);
+            sleep(30);
+            print(i"{fired.wait()} {fired.wait()}");
+
+            let called_off = Timer::after(60000);
+            called_off.cancel();
+            print(i"{called_off.wait()} {called_off.wait()}");
+        }
+        main();
+        "#,
+        "true true\nfalse false\n",
+    );
+}
+
+#[test]
+fn timer_cancel_before_settlement_resolves_waiters_false() {
+    // §3 — a waiter parked before the cancel resolves `false` at once, and so
+    // does everyone who asks afterwards.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(60000);
+            nursery(|n| {
+                let _waiter = async {
+                    print(i"waiter:{timer.wait()}");
+                };
+                sleep(5);
+                timer.cancel();
+            });
+            print(i"after:{timer.wait()}");
+        }
+        main();
+        "#,
+        "waiter:false\nafter:false\n",
+    );
+}
+
+#[test]
+fn timer_cancel_clears_the_host_timer() {
+    // §3 — the other half of `cancel`, which stdout cannot show: settling the
+    // verdict is not enough, the host timer must be CLEARED or a cancelled
+    // timer would go on holding the process open (see
+    // `a_pending_timer_keeps_the_process_alive`). Pinned on the emitted
+    // helper, since process-exit timing is only observable as a wall-clock
+    // race.
+    let js = compile(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(60000);
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+    )
+    .expect("a timer program compiles");
+    assert!(
+        js.contains("\tcancel() {\n\t\tif (this.settled) return;\n\t\tclearTimeout(this.id);\n"),
+        "`cancel` must clear the host timer before settling: {js}"
+    );
+}
+
+#[test]
+fn timer_cancel_after_firing_is_a_no_op() {
+    // §3 — first settlement wins forever: a late cancel never rewrites a
+    // `true` verdict into a `false` one.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(1);
+            sleep(30);
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn timer_cancel_is_idempotent() {
+    // §3 — cancelling twice is cancelling once; the second call finds the
+    // timer settled and does nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(60000);
+            timer.cancel();
+            timer.cancel();
+            timer.cancel();
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn a_cancelling_nursery_tears_down_the_waiter_but_not_the_timer() {
+    // §4 — the sharp distinction. `wait` carries the ambient cancel signal the
+    // way `sleep` does, so a cancelling nursery unwinds the task that was
+    // awaiting (neither UNREACHED line prints) — but that is structured
+    // teardown of ONE waiter, not a verdict: the timer is neither settled nor
+    // cleared, so afterwards `waited` still fires `true` and `called_off` is
+    // still cancellable to `false` by the holder of the value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::nursery;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let waited = Timer::after(60);
+            let called_off = Timer::after(60);
+            nursery(|n| {
+                let _a = async {
+                    print(i"UNREACHED-a:{waited.wait()}");
+                };
+                let _b = async {
+                    print(i"UNREACHED-b:{called_off.wait()}");
+                };
+                sleep(5);
+                n.cancel();
+            });
+            print("nursery returned");
+            called_off.cancel();
+            print(i"called_off:{called_off.wait()}");
+            print(i"waited:{waited.wait()}");
+        }
+        main();
+        "#,
+        "nursery returned\ncalled_off:false\nwaited:true\n",
+    );
+}
+
+#[test]
+fn a_timer_that_fires_with_no_waiters_memoizes_true() {
+    // §5 — nothing has to be awaiting a timer for it to run out; the verdict
+    // is waiting when someone finally asks.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep, Timer };
+
+        fun main() {
+            let timer = Timer::after(1);
+            sleep(30);
+            print(timer.wait());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn a_pending_timer_keeps_the_process_alive() {
+    // §6 — parity with `sleep`, and no unref knob. `main` returns with the
+    // timer pending and the only other thing in flight a task awaiting it. A
+    // pending promise does NOT hold node open by itself, so the second line
+    // prints only because the host timer does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun main() {
+            let timer = Timer::after(30);
+            let _watcher = async {
+                print(i"fired:{timer.wait()}");
+            };
+            print("main done");
+        }
+        main();
+        "#,
+        "main done\nfired:true\n",
+    );
+}
+
+#[test]
+fn copying_a_timer_shares_the_underlying_host_timer() {
+    // §7 — an ordinary value wrapping one external handle, like `Signal`:
+    // assigning it and passing it to a function both alias the ONE timer, so
+    // a cancel through any copy settles every copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::Timer;
+
+        fun call_off(timer: Timer) {
+            timer.cancel();
+        }
+
+        fun main() {
+            let original = Timer::after(60000);
+            let copy = original;
+            copy.cancel();
+            print(i"{original.wait()} {copy.wait()}");
+
+            let passed = Timer::after(60000);
+            call_off(passed);
+            print(passed.wait());
+        }
+        main();
+        "#,
+        "false false\nfalse\n",
+    );
+}
+
+#[test]
+fn timers_are_platform_neutral() {
+    // `setTimeout`/`clearTimeout` exist on every host, so `Timer` stays in
+    // std's base layer alongside `sleep` — the same program compiles for node
+    // AND browser.
+    let source = r#"
+        import std::time::{ Duration, Timer };
+
+        fun main() {
+            let timer = Timer::after_for(Duration::seconds(1i53));
+            let _verdict = timer.wait();
+            timer.cancel();
+        }
+        "#;
+    assert_compiles(source);
+    assert_compiles_browser(source);
+}
+
 // --- B22: return-expectation inference bound to the caller's generics --------
 //
 // A call's return-type-only generic inference (the `let n: Cell<i32> =
