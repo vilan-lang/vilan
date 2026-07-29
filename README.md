@@ -193,11 +193,12 @@ vilan/
 cargo test    # the whole suite: compiler, corpus, docs gate, e2e
 ```
 
-Three test layers keep the project honest: unit and behavior pins in
+Four test layers keep the project honest: unit and behavior pins in
 `crates/vilan-core/tests/`, a golden-file codegen corpus in `vilan/test/`
-(byte-identical, deliberately), and the docs gate, which extracts and
+(byte-identical, deliberately), the docs gate, which extracts and
 compiles every fenced example in `vilan/docs/`, including the ones on
-this page.
+this page, and an examples gate, which builds every project under
+`vilan/examples/` from a clean copy of its tracked files.
 
 ## License
 
