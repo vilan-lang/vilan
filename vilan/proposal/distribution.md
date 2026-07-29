@@ -132,7 +132,13 @@ latency; a tap ships today and migrates later if ever wanted):
   macOS x64/arm64 + linux x64/arm64 all supported by `on_macos`/`on_linux`
   + `Hardware::CPU` branches over the existing tarballs.
 - **CI**: a release-workflow job updates the formula (version + four
-  hashes) and pushes to the tap with a scoped token (`TAP_TOKEN`).
+  hashes) and pushes to the tap. Auth is a **GitHub App**
+  (`TAP_APP_ID` / `TAP_APP_PRIVATE_KEY`), matching the site deploy's, not a
+  PAT: an app's private key does not expire, and this credential runs only at
+  release time — a PAT's expiry would lapse unnoticed and surface mid-release
+  months later, and the disabled-until-secret gate cannot catch it because an
+  expired token is still a non-empty string. Each run mints an installation
+  token scoped to `homebrew-vilan` alone.
 - `install.sh` stays the README's first option; brew is listed beside it.
 
 ## 5. F5 — the project-model deferrals
@@ -183,7 +189,18 @@ notice), so the workflow stays green before accounts exist.
 
 npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
 marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
-says yes); the `homebrew-vilan` repo + `TAP_TOKEN`.
+says yes); the `homebrew-vilan` repo + a GitHub App
+(`TAP_APP_ID` / `TAP_APP_PRIVATE_KEY`).
+
+*Provisioned 2026-07-29: npm.* Recorded then: npm is deprecating
+2FA-bypass tokens — account changes early Aug 2026, direct publishing
+~Jan 2027 — so `NPM_TOKEN` is a bridge. The destination is trusted
+publishing (OIDC), which cannot do a package's FIRST publish (npm requires
+the package to exist before a trusted publisher can be configured), so the
+token creates the six packages and the migration follows. npm's new
+install-time defaults (scripts off, git and remote-URL deps blocked) were
+checked against `npm/` and affect nothing: no package here declares a
+`scripts` field, and resolution is `optionalDependencies` + `os`/`cpu`.
 
 *S5 residuals (2026-07-25):* **version skew** — an updated extension
 registers `**/vilan.toml` with whatever `vilan-lsp` it discovers; an

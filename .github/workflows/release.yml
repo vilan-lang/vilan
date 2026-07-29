@@ -429,22 +429,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Is there a token to push with?
+      - name: Is there an app to push with?
         id: brew
         # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
         # `secrets`, so the secret's presence becomes a step output the rest of
         # the job conditions on (distribution.md §6 — every publish job lands
-        # disabled-until-secret-exists). TAP_TOKEN needs contents:write on
-        # vilan-lang/homebrew-vilan and nothing else.
+        # disabled-until-secret-exists).
+        #
+        # A GitHub App rather than a PAT, matching the site deploy's auth: an
+        # App's private key does not expire, and this credential is used ONLY at
+        # release time — so a PAT's expiry would lapse unnoticed and surface
+        # months later, mid-release. (Worse, the gate below cannot catch it: an
+        # expired token is still a non-empty string, so the job would pass the
+        # check and fail at the push.) Each run mints a short-lived installation
+        # token instead.
         env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
+          TAP_APP_PRIVATE_KEY: ${{ secrets.TAP_APP_PRIVATE_KEY }}
         run: |
-          if [ -n "$TAP_TOKEN" ]; then
+          if [ -n "$TAP_APP_ID" ] && [ -n "$TAP_APP_PRIVATE_KEY" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Homebrew tap not updated::TAP_TOKEN is not configured, so vilan-lang/homebrew-vilan still points at the previous release. The rest of the release is unaffected."
+            echo "::notice title=Homebrew tap not updated::TAP_APP_ID / TAP_APP_PRIVATE_KEY are not configured, so vilan-lang/homebrew-vilan still points at the previous release. Create a GitHub App with contents read-write installed on vilan-lang/homebrew-vilan and store its id and private key as these secrets. The rest of the release is unaffected."
           fi
+      - name: Mint the tap token
+        id: app
+        if: steps.brew.outputs.publish == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: vilan-lang
+          # Scoped to the tap alone: the token this mints can reach nothing
+          # else in the org, whatever the app is installed on.
+          repositories: homebrew-vilan
       - name: The release's own checksums
         if: steps.brew.outputs.publish == 'true'
         # Taken from the release rather than recomputed from the build
@@ -458,7 +477,9 @@ jobs:
       - name: Update the tap
         if: steps.brew.outputs.publish == 'true'
         env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          # The app's installation token, minted above and valid for this run
+          # only. Same `x-access-token:` clone form a PAT used.
+          TAP_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           git clone --depth 1 \
