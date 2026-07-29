@@ -251,10 +251,43 @@ it, diagnostics beneath the editor.
 
 ## 8. Slices (suite-gated, docs same commit, per-case pins)
 
-- **S0 — the spike (hours):** `cargo check -p vilan-core --target
-  wasm32-unknown-unknown` (target already installed), then a throwaway
-  wasm-bindgen shim compiling one counter program end to end in a browser.
-  Output: a measured artifact size and a go/no-go note appended here.
+- **S0 — the spike — DONE 2026-07-29. Verdict: GO.**
+  - `cargo check -p vilan-core --target wasm32-unknown-unknown` is **clean** —
+    zero errors, zero warnings, 6.4s, and the whole dependency tree (indexmap,
+    toml, serde, hashbrown, winnow) comes along without a murmur. No `cfg`
+    surgery, no dependency swap, no forked crate. This was the architecture's
+    single biggest risk and it is simply not a problem.
+  - **Measured artifact: 1.58 MB raw (1,652,575 B), 0.54 MB gzip -9
+    (570,784 B).** With std's source alongside (476 KB raw, ~100 KB gzipped)
+    the page ships **~2.06 MB raw / ~0.64 MB compressed**. §4's estimate was
+    4–7 MB raw and 1.5–2.5 MB compressed — the real thing is ~4× smaller than
+    the optimistic end of that range, so every sizing argument in this
+    proposal has more headroom than it claimed, and the gzip-to-pages ship
+    plan is comfortable rather than tight.
+  - Method: a throwaway `cdylib` (scratchpad, not committed) depending on
+    `vilan-core` and exporting one `extern "C"` entry that calls
+    `analyze_source` then `transform`, so the linker retains both halves of
+    the pipeline. Built with §4's flags — `opt-level = "z"`, fat LTO,
+    `codegen-units = 1`, `strip = true`.
+  - **Read the number as a lower bound, for three reasons that push in both
+    directions.** Up: wasm-bindgen's glue is not in it, and code reachable
+    only from paths my one entry point does not touch may have been
+    dead-code-eliminated. Down: no `wasm-opt -Oz` pass ran (not installed),
+    which typically takes another 10–20%. The bound is loose enough that even
+    2× the measurement stays well inside budget, which is what makes this a GO
+    rather than a "measure again first".
+  - **Correction to this slice's own plan:** the second half as written —
+    "compiling one counter program end to end in a browser" — cannot happen at
+    S0. `analyze_source` resolves `import std::print` through the filesystem
+    (`PackageSpec` is `PathBuf`-rooted; `vilan-embedded-std::materialize()`
+    writes std to a cache dir), so a real compile needs the overlay work that
+    IS S1. The dependency runs S0 -> S1 -> end-to-end, not S0 -> end-to-end.
+    Nothing is lost: the size question is what S0 existed to answer, and it is
+    answered.
+  - **Tooling gap for S2:** `wasm-bindgen`, `wasm-opt` and `wasm-pack` are all
+    absent from this machine. S2 needs at least `wasm-bindgen`; the CI leg
+    will need it too, and `wasm-opt` if the release pipeline runs the
+    size pass (it should, per §4).
 - **S1 — overlay completion (vilan repo):** `resolve_module_file` +
   `util::read_source` consult the overlay; pins for overlay-only module
   resolution (including the LSP's unsaved-file case, which this fixes for
