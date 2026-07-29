@@ -62,6 +62,56 @@ fn no_tracked_file_contains_an_absolute_home_path() {
     );
 }
 
+/// Files that legitimately carry a consumer-mailbox address.
+const PERSONAL_MAILBOX_ALLOWLIST: &[(&str, &str)] = &[(
+    "THIRD-PARTY-NOTICES.txt",
+    "generated from upstream license headers — those addresses are the \
+     dependency authors' and are not ours to rewrite",
+)];
+
+/// No tracked file may publish a personal mailbox as a project contact.
+///
+/// Separate from the owner-string gate below on purpose: that one protects a
+/// mechanical invariant (never reuse the old repository name, or the
+/// `releases/download/…` redirects keeping installed binaries' `vilan upgrade`
+/// alive die with it). This one is about the project speaking with an
+/// organizational voice — a contact address in a public repo is scraped, it
+/// cannot be rotated without a commit, and it does not survive a second
+/// maintainer. Role addresses on `vilan-lang.org` do all three better.
+///
+/// Deliberately matched by consumer-mail DOMAIN rather than by the one address
+/// that prompted this, so the next one is caught too — the failure mode here is
+/// a new file, not a regression in an old one. A role address at the project's
+/// own domain passes; that is the point.
+///
+/// (Needles assembled at runtime so this file doesn't trip itself.)
+#[test]
+fn no_tracked_file_publishes_a_personal_mailbox() {
+    let needles = ["gmail", "outlook", "hotmail", "yahoo", "icloud", "proton"]
+        .map(|provider| format!("@{provider}."));
+    let mut offenders = Vec::new();
+    for (name, text) in tracked_text_files() {
+        if PERSONAL_MAILBOX_ALLOWLIST
+            .iter()
+            .any(|(allowed, _reason)| *allowed == name.as_str())
+        {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            let lowered = line.to_lowercase();
+            if needles.iter().any(|needle| lowered.contains(needle.as_str())) {
+                offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "personal mailboxes in tracked files (use a role address on \
+         vilan-lang.org, e.g. conduct@vilan-lang.org):\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// Documents *about* the migration, which necessarily name the old owner.
 /// Everything else must have been swept (F9 S4).
 const OWNER_STRING_ALLOWLIST: &[(&str, &str)] = &[

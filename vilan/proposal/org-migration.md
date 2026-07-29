@@ -20,11 +20,37 @@
 >   (runtime-assembled needles, case-insensitive, 3-file allowlist with inline
 >   reasons; the commit records a planted-probe non-vacuity proof).
 >
-> **Open tail:** the gate's needle is `reedsyllas/vilan`, so two
-> personal-identity strings sit outside its reach — `AI_STANCE.md` links
-> `github.com/ReedSyllas`, and `CODE_OF_CONDUCT.md` publishes a personal gmail
-> as the contact. Both may well be intended; the point is that a regression
-> there would never be caught. Decide and record.
+> **Open tail — DECIDED 2026-07-29.** The gate's needles are
+> `reedsyllas/vilan` and `reedsyllas.github.io`, so two personal-identity
+> strings sat outside its reach. They were never one problem, and they were
+> settled differently:
+>
+> - `CODE_OF_CONDUCT.md`'s personal gmail → **`conduct@vilan-lang.org`**. A
+>   contact address in a public repo gets scraped, cannot be rotated without a
+>   commit, and does not survive a second maintainer; a role address on the
+>   project's own domain fixes all three. Pinned by a SECOND hygiene test,
+>   `no_tracked_file_publishes_a_personal_mailbox`, kept separate from the
+>   owner-string gate because the reasoning is unrelated — that one protects a
+>   mechanical invariant (reusing the old repo name kills the
+>   `releases/download/…` redirects that keep installed binaries' `vilan
+>   upgrade` alive), this one is about the project speaking in an
+>   organizational voice. Matched by consumer-mail DOMAIN rather than by the
+>   one address that prompted it, since the failure mode here is a new file
+>   rather than a regression in an old one. One allowlist entry:
+>   `THIRD-PARTY-NOTICES.txt`, whose addresses are upstream authors' and not
+>   ours to rewrite.
+> - `AI_STANCE.md`'s byline → **kept, by user call.** "Reed Syllas" is the
+>   pseudonym the work is published under, and the line is an attestation that
+>   a human wrote the document without AI tooling — a claim whose whole force
+>   comes from a named person standing behind it. Stripping the name would
+>   leave a document vouching for itself. The bare profile URL is a separate,
+>   still-open question the user may yet remove; the name is not.
+>
+> Worth recording because it is the reason this was never urgent: removing
+> these strings would not have bought anonymity anyway. The tombstone below
+> serves `reedsyllas.github.io/vilan/*` — the account name is IN the url, and
+> that page must keep answering indefinitely — so the association is
+> structural and permanent by design.
 >
 > Prior status: RATIFIED 2026-07-25 — all §6 calls per recommendation (npm
 > placeholder publish of bare `vilan`: yes; claim `vilan-lang.org`: yes;
@@ -129,6 +155,31 @@ created and pushed *before* the transfer and sits dormant (while
 `ReedSyllas/vilan` exists, its project Pages wins the `/vilan` path); the
 instant the repo transfers away, the tombstone takes over. It stays up
 indefinitely (binaries ≤ v0.14.0 never stop linking the old URL).
+
+**It broke, and the way it broke is the lesson (found + fixed 2026-07-29,
+`ReedSyllas/reedsyllas.github.io@c9ec5c1`).** The tombstone forwarded to
+`vilan-lang.github.io/vilan`, correct when written — but the book then moved
+AGAIN, to `vilan-lang.org/docs` (`0a0bdd4`), and nothing updated this page.
+From that move until the fix, every old hover deep link went old URL →
+tombstone → **404**: the exact outcome the tombstone exists to prevent, and
+silently, because the page still returned *something*. Two changes came out
+of it, and one warning:
+
+- The path is **rewritten**, not passed through: `/vilan/<rest>` →
+  `/docs/<rest>`. The old version copied `location.pathname` verbatim, which
+  only ever worked because both hosts happened to share the `/vilan` prefix —
+  a coincidence, not a design. (Rewriting forces an exact prefix test: a bare
+  `indexOf('/vilan')` also matches `/vilanfoo`, which the slice would turn
+  into a nonsense `/docsfoo`.)
+- It targets the **apex domain**, not `vilan-lang.github.io`. That host 301s
+  to `vilan-lang.org` anyway, so aiming at it only added a hop that could rot
+  on its own — and did.
+
+The warning: **nothing tests this.** It is a static page, in a repo with no
+CI, pointing at a host it does not control, and it is load-bearing for every
+binary already installed. No gate in this repository can catch it. If the
+book moves a third time, this file is what silently stops working — check it
+by hand, and treat "the book moved" as a two-repo change.
 
 ## 4. The owner-string sweep (code slice, after transfer)
 
