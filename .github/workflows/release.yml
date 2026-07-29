@@ -314,7 +314,14 @@ jobs:
           for package in npm-dist/*/; do
             [ "$package" = npm-dist/vilan/ ] || publish "$package"
           done
-          publish npm-dist/vilan
+          # The trailing slash is load-bearing. Without it npm reads
+          # `npm-dist/vilan` as its `<user>/<repo>` GitHub shorthand and tries
+          # `git ls-remote ssh://git@github.com/npm-dist/vilan.git` instead of
+          # publishing the directory — which is exactly how v0.18.0 shipped
+          # five platform packages and no meta package. The loop above was
+          # always safe: its paths come from a `*/` glob, so they already end
+          # in one.
+          publish npm-dist/vilan/
 
   # The editor galleries (proposal/distribution.md §3): the `.vsix` the release
   # already carries, uploaded to the VS Code Marketplace and to Open VSX.
