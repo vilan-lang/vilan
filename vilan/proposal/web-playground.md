@@ -288,10 +288,28 @@ it, diagnostics beneath the editor.
     absent from this machine. S2 needs at least `wasm-bindgen`; the CI leg
     will need it too, and `wasm-opt` if the release pipeline runs the
     size pass (it should, per §4).
-- **S1 — overlay completion (vilan repo):** `resolve_module_file` +
-  `util::read_source` consult the overlay; pins for overlay-only module
-  resolution (including the LSP's unsaved-file case, which this fixes for
-  real); full suite, corpus byte-identical.
+- **S1 — overlay completion — DONE 2026-07-29** (`3f387fe`). `read_source` is
+  now the one overlay-then-disk seam and `resolve_module_file` reads "exists"
+  as on-disk-OR-buffered; `load_package_module` dropped the open-coded match
+  that was the reason the overlay reached it and nothing else. Both editor
+  bugs the slice promised are closed: an unsaved-only module was invisible
+  (the existence probe said no, so the one overlay reader was never reached),
+  and analysis-vs-publish read different texts for an unsaved on-disk module,
+  putting every diagnostic in it off by the line delta. The BOM asymmetry is
+  preserved and pinned (disk stripped, buffer verbatim). Five pins on a new
+  `analyze_overlay_package` helper that writes nothing to disk — **that helper
+  is S2's dry run for the wasm boot path**, so S2 starts with its module
+  resolution already proven. Both halves proven non-vacuous by planted probe;
+  corpus byte-identical (the CLI never populates the overlay, so the
+  `OnceLock` stays uninitialized); full suite green.
+  - *Unplanned fix the slice forced:* `location_for` routes EVERY non-entry
+    source through the LSP's `line_indices` cache, not just `std` despite its
+    comment, and that cache never invalidates. Once `read_source` answered
+    from the overlay it began caching buffer text forever — stale after one
+    keystroke, where before it was only stale after a save. A buffered path is
+    now indexed fresh and never cached. Worth knowing for S3: anything derived
+    from a buffer is valid only until the next edit, which is why
+    `document_overlay_contains` is public.
 - **S2 — `crates/vilan-wasm`:** boot-from-`FILES`, hand-built `PackageSpec`,
   `compile()` export with line/col diagnostics; the compile logic pinned by
   native tests (the wasm-bindgen layer stays too thin to hide bugs); a CI leg
