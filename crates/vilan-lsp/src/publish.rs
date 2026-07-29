@@ -204,7 +204,16 @@ fn attach_note(
 /// One analyzed document's diagnostics as per-target groups: the entry's own
 /// (always present, even when empty, so the owner's URI is always brought
 /// current) plus each imported file's, with spans converted through a fresh
-/// read of *that* file — the analysis read it from disk too, so they agree.
+/// read of *that* file — `read_source` answers from the open-document overlay
+/// when there is a buffer and the disk otherwise, which is exactly what the
+/// analysis read, so they agree.
+///
+/// They did not always. This comment used to justify the agreement with "the
+/// analysis read it from disk too", which stopped being true once the analyzer
+/// grew the overlay: analysis indexed the buffer, publishing re-read the disk,
+/// and every diagnostic in an edited-but-unsaved module landed off by the
+/// buffer-versus-disk line delta. Routing both through one reader is what makes
+/// the sentence above hold rather than merely assert.
 fn diagnostic_groups(document: &Document, owner: &Url) -> Vec<(Url, Vec<Diagnostic>)> {
     let mut entry_group: Vec<Diagnostic> = Vec::new();
     let mut extra_groups: Vec<(Url, Vec<Diagnostic>)> = Vec::new();

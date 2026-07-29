@@ -53,8 +53,159 @@ fn analyze_package(files: &[(&str, &str)], entry: &str, platform: Platform) -> V
         .collect()
 }
 
+/// As [`analyze_package_raw`], but the package lives ONLY in the open-document
+/// overlay — nothing is written to disk, and the root never exists. This is the
+/// editor's unsaved-buffer world, and the same world a compiler running without
+/// a filesystem sees (D11 S1).
+///
+/// The root is per-call unique because the overlay is one process-wide map and
+/// the test binary runs in parallel: two tests sharing `/overlay/foo.vl` would
+/// resolve into each other. Entries are removed before returning for the same
+/// reason.
+fn analyze_overlay_package(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = PathBuf::from(format!("/vilan_overlay_{}_{unique}", std::process::id()));
+    let paths: Vec<PathBuf> = files
+        .iter()
+        .map(|(relative, contents)| {
+            let path = root.join(relative);
+            vilan_core::analyzer::set_document_overlay(&path, Some((*contents).to_string()));
+            path
+        })
+        .collect();
+    let entry_path = root.join(entry);
+    let source = vilan_core::util::read_source(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (_program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &root,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    for path in &paths {
+        vilan_core::analyzer::set_document_overlay(path, None);
+    }
+    errors.into_iter().map(|error| error.msg).collect()
+}
+
 const ENTRY: &str = "import std::print;\nimport pkg::foo::bar;\nfun main() { print(bar()); }\n";
 const MODULE: &str = "fun bar(): i32 { 7 }\n";
+
+/// D11 S1, and the LSP's unsaved-file bug: a module that exists ONLY as an open
+/// buffer resolves. Before, `resolve_module_file` asked the disk alone, returned
+/// `None` for a file the user had just created and not saved, and the caller
+/// skipped the name — so `load_package_module`, the one place that ever read the
+/// overlay, was never reached and the import diagnosed as missing.
+#[test]
+fn a_module_that_exists_only_in_the_overlay_resolves() {
+    let errors = analyze_overlay_package(
+        &[("main.vl", ENTRY), ("foo.vl", MODULE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile with no file on disk, got: {errors:#?}"
+    );
+}
+
+/// The nested form resolves overlay-only too — `resolve_module_file` probes two
+/// candidate paths, and both must ask the overlay or the directory shape stays
+/// editor-invisible while the flat one works.
+#[test]
+fn a_nested_overlay_module_resolves() {
+    let errors = analyze_overlay_package(
+        &[("main.vl", ENTRY), ("foo/lib.vl", MODULE)],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(
+        errors.is_empty(),
+        "expected the directory form to resolve from the overlay, got: {errors:#?}"
+    );
+}
+
+/// Precision: resolution did not become permissive. An import naming a module
+/// that is in neither the overlay nor the disk still fails, so the new arm
+/// answers "is it buffered", not "yes".
+#[test]
+fn an_absent_overlay_module_still_fails_to_resolve() {
+    let errors = analyze_overlay_package(&[("main.vl", ENTRY)], "main.vl", Platform::default());
+    assert!(
+        errors.iter().any(|error| error.contains("bar")),
+        "expected the missing module to still diagnose, got: {errors:#?}"
+    );
+}
+
+/// The overlay is the file's CURRENT truth, so it outranks a stale disk copy —
+/// the E6 rule, pinned here at the resolution layer rather than the LSP's.
+/// The disk says `bar` returns 1; the buffer says 7. A clean compile that also
+/// sees the buffer's value proves the overlay won, not merely that something
+/// resolved.
+#[test]
+fn the_overlay_outranks_the_file_on_disk() {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "vilan_overlay_disk_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.vl"), ENTRY).unwrap();
+    std::fs::write(dir.join("foo.vl"), "fun bar(): i32 { 1 }\n").unwrap();
+
+    let buffered = dir.join("foo.vl");
+    vilan_core::analyzer::set_document_overlay(&buffered, Some(MODULE.to_string()));
+    let read_back = vilan_core::util::read_source(&buffered).unwrap();
+    vilan_core::analyzer::set_document_overlay(&buffered, None);
+    let from_disk = vilan_core::util::read_source(&buffered).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(read_back, MODULE, "the overlay must win over the disk copy");
+    assert_eq!(
+        from_disk, "fun bar(): i32 { 1 }\n",
+        "clearing the overlay must restore disk truth"
+    );
+}
+
+/// The BOM asymmetry, which the seam move could silently have erased: disk text
+/// is BOM-stripped so spans index the source proper, and buffered text is
+/// returned exactly as the client sent it (the client's line index is
+/// authoritative, and VS Code already strips the BOM over the wire). Stripping
+/// a buffer again here would shift every span in it by three bytes.
+#[test]
+fn a_buffer_keeps_its_byte_order_mark_while_a_disk_read_drops_one() {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("vilan_overlay_bom_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bom.vl");
+    std::fs::write(&path, "\u{feff}fun bar(): i32 { 7 }\n").unwrap();
+
+    let from_disk = vilan_core::util::read_source(&path).unwrap();
+    vilan_core::analyzer::set_document_overlay(
+        &path,
+        Some("\u{feff}fun bar(): i32 { 7 }\n".to_string()),
+    );
+    let buffered = vilan_core::util::read_source(&path).unwrap();
+    vilan_core::analyzer::set_document_overlay(&path, None);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !from_disk.starts_with('\u{feff}'),
+        "a disk read must drop the BOM"
+    );
+    assert!(
+        buffered.starts_with('\u{feff}'),
+        "a buffer must be returned verbatim, BOM included"
+    );
+}
 
 #[test]
 fn flat_module_resolves() {

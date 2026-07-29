@@ -23,7 +23,24 @@ pub fn strip_bom(text: &str) -> &str {
 /// sits on disk (an editor's line index is built from the same bytes), and the
 /// `\r\n`-is-one-terminator rule applies where a *value* is built, not to the
 /// span space.
+///
+/// **The open-document overlay wins over disk.** A registered buffer is the
+/// file's current truth: reading past it gave the analyzer one text and every
+/// span consumer another, so a diagnostic in an edited-but-unsaved module
+/// landed at the wrong line. Consulting it here puts every reader on one text,
+/// which is what the first paragraph above already promised. A buffer also
+/// satisfies a read for a path that is not on disk at all, which is what lets a
+/// module exist only in the editor — or, with no filesystem behind it, at all.
+///
+/// Buffered text is returned EXACTLY as the client sent it, with no BOM strip.
+/// That asymmetry is deliberate and predates this: the client's own line index
+/// is authoritative for its buffers, and VS Code already strips the BOM over
+/// the wire, so stripping again here would shift every span by three bytes.
 pub fn read_source(path: impl AsRef<Path>) -> std::io::Result<String> {
+    let path = path.as_ref();
+    if let Some(buffered) = crate::analyzer::document_overlay_get(path) {
+        return Ok(buffered);
+    }
     let contents = std::fs::read_to_string(path)?;
     match contents.strip_prefix(BYTE_ORDER_MARK) {
         Some(stripped) => Ok(stripped.to_string()),

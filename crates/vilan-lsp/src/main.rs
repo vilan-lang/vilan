@@ -1296,19 +1296,32 @@ impl Backend {
         });
     }
 
-    /// The line index for a `std` file, cached by path so a cross-file query
-    /// doesn't re-read and re-index the file on every lookup.
+    /// The line index for a file another source's span points into, cached by
+    /// path so a cross-file query doesn't re-read and re-index on every lookup.
+    ///
+    /// The cache holds only files whose text is STABLE for the session — which
+    /// is what "on disk, not open in the editor" means. A path with a buffer
+    /// registered is indexed fresh every time and never stored: its text is one
+    /// keystroke old, so a stored index would misplace every range it converts
+    /// from the next edit onward. (The session cache has no invalidation, by
+    /// design — it was written for `std`, whose files genuinely do not change.
+    /// Once `read_source` began answering from the overlay, "never invalidate"
+    /// stopped being safe for anything else, so the fix is to not cache those.)
     fn line_index_for(&self, path: &Path) -> Option<Arc<LineIndex>> {
-        if let Some(cached) = self.line_indices.get(path) {
+        let buffered = vilan_core::analyzer::document_overlay_contains(path);
+        if !buffered && let Some(cached) = self.line_indices.get(path) {
             return Some(Arc::clone(cached.value()));
         }
-        // BOM-stripped, matching the analyzer's read of the same file
-        // (windows-support.md §2), so this index and the spans it converts
-        // index the same text.
+        // A disk read is BOM-stripped, matching the analyzer's read of the same
+        // file (windows-support.md §2); a buffer comes back verbatim. Either
+        // way this index and the spans it converts index the same text the
+        // analyzer saw, which is the whole point.
         let text = vilan_core::util::read_source(path).ok()?;
         let line_index = Arc::new(LineIndex::new(&text));
-        self.line_indices
-            .insert(path.to_path_buf(), Arc::clone(&line_index));
+        if !buffered {
+            self.line_indices
+                .insert(path.to_path_buf(), Arc::clone(&line_index));
+        }
         Some(line_index)
     }
 

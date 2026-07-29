@@ -22326,12 +22326,31 @@ pub fn set_document_overlay(path: &Path, text: Option<String>) {
     }
 }
 
-fn document_overlay_get(path: &Path) -> Option<String> {
+pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
     let overlay = overlay
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     overlay.get(&crate::util::canonical_path(path)).cloned()
+}
+
+/// Whether the overlay holds `path` at all — the existence question, without
+/// paying for the buffer. `resolve_module_file` asks this for two candidate
+/// paths per import per root in the search list, where cloning whole buffers to
+/// answer "is there a file here" would be pure waste.
+///
+/// Public because a front-end needs it to decide whether a path's text is
+/// STABLE: anything derived from a buffer (a cached line index, say) is only
+/// valid until the next keystroke, while the same derivation over a disk file
+/// can be cached for the session.
+pub fn document_overlay_contains(path: &Path) -> bool {
+    let Some(overlay) = DOCUMENT_OVERLAY.get() else {
+        return false;
+    };
+    let overlay = overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    overlay.contains_key(&crate::util::canonical_path(path))
 }
 
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
@@ -22351,14 +22370,11 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
     let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    // A disk read drops a leading BOM (`windows-support.md` §2) so spans index
-    // the source proper. An editor's buffered text is left exactly as the client
-    // sent it — the client's own line index is authoritative for its buffers,
-    // and VS Code already strips the BOM over the wire.
-    let source = match document_overlay_get(path) {
-        Some(buffered) => buffered,
-        None => crate::util::read_source(path).ok()?,
-    };
+    // `read_source` is now the one overlay-then-disk seam (buffer verbatim, disk
+    // BOM-stripped per `windows-support.md` §2), so this reads like any other
+    // reader. It used to open-code that match here, which is precisely why the
+    // overlay reached the module loader and nothing else.
+    let source = crate::util::read_source(path).ok()?;
     let key = {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -23286,6 +23302,14 @@ struct ModuleResolution {
 /// when both somehow exist), and a flag set when *both* exist (an ambiguity the
 /// caller reports). `None` when neither exists — the name isn't a module here
 /// (e.g. the `print` in `std::print`), which the caller simply skips.
+///
+/// "Exists" means on disk OR in the open-document overlay. Asking only the disk
+/// made an editor-only module invisible: the buffer was registered, but this
+/// returned `None`, the caller skipped the name, and `load_package_module` — the
+/// one place that ever read the overlay — was never reached. So a file the user
+/// had just created and not yet saved diagnosed as missing while it sat on
+/// screen. The overlay is also the whole filesystem when there is no filesystem,
+/// which is what lets the compiler resolve modules compiled to wasm.
 fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
     let flat_relative = PathBuf::from(format!("{name}.vl"));
     let nested_relative = Path::new(name).join("lib.vl");
@@ -23297,7 +23321,8 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
         root: root.to_path_buf(),
         relative,
     };
-    match (flat.exists(), nested.exists()) {
+    let exists = |candidate: &Path| candidate.exists() || document_overlay_contains(candidate);
+    match (exists(&flat), exists(&nested)) {
         (true, both_exist) => Some(resolution(flat_relative, flat, both_exist)),
         (false, true) => Some(resolution(nested_relative, nested, false)),
         (false, false) => None,
