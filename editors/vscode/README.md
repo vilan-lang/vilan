@@ -1,35 +1,35 @@
 # Vilan for VS Code
 
 [Vilan](https://vilan-lang.org/docs/) is a language for building
-full-stack web apps. It compiles to JavaScript and runs on node and in the
+full-stack web apps. It compiles to JavaScript and runs on Node and in the
 browser, but it is not JavaScript: values are copied instead of shared, there
 is no `null` and no exceptions, `await` is implicit, and the compiler checks
 the things you usually find out at runtime.
 
 This extension is the editor half of that toolchain. Everything below is the
-compiler's own analysis, served by `vilan-lsp` — the same front end that
+compiler's own analysis, served by `vilan-lsp`, the same front end that
 builds your project, so the editor and the build never disagree.
 
 ## What you get
 
-- **Live diagnostics** — the compiler's errors as you type, with its notes and
+- **Live diagnostics**: the compiler's errors as you type, with its notes and
   help text.
-- **Completion** — call-shaped, with the signature and doc comment on the item;
+- **Completion**: call-shaped, with the signature and doc comment on the item;
   scope, member, and import-path positions, plus snippets for `fun`, `struct`,
   `for`, and `match`. Configurable down to plain names (`vilan.completion.functionCall`).
-- **Hover** — inferred types on locals and parameters (loan conventions
+- **Hover**: inferred types on locals and parameters (loan conventions
   included), doc comments on everything you declared, and documentation on the
   language's own keywords, deep-linked into the book.
-- **Inlay hints** — the inferred types of `let` bindings and parameters.
+- **Inlay hints**: the inferred types of `let` bindings and parameters.
 - **Semantic highlighting** from the analyzer, over a TextMate grammar
   (including `vilan` code fences in Markdown).
-- **Go to definition** — including into the `std` package.
+- **Go to definition**, including into the `std` package.
 - **Find references** and **rename** (locals, parameters, fields).
 - **Document outline**.
-- **Format Document** — `vilan fmt`'s formatter, byte for byte.
-- **Organize Imports** — sorts imports into canonical order and prunes unused
+- **Format Document**: `vilan fmt`'s formatter, byte for byte.
+- **Organize Imports**: sorts imports into canonical order and prunes unused
   ones, from the Source Action menu or on save.
-- **A `vilan.toml` schema** — completion and validation in the manifest, for
+- **A `vilan.toml` schema**: completion and validation in the manifest, for
   TOML extensions that consume contributed schemas (Even Better TOML).
 
 All of it keeps working while the file has errors: the server analyzes the
@@ -37,7 +37,7 @@ recovered parse, so a half-typed line does not take your hovers with it.
 
 ## Getting started
 
-**1. Install the toolchain** — the extension talks to `vilan-lsp`, which ships
+**1. Install the toolchain.** The extension talks to `vilan-lsp`, which ships
 with the compiler. On Linux and macOS:
 
 ```sh
@@ -50,8 +50,8 @@ On Windows, in PowerShell:
 irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 ```
 
-That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` — on Windows,
-`%USERPROFILE%\.vilan\bin`. The unix script prints the `PATH` line to add; the
+That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` (on Windows,
+`%USERPROFILE%\.vilan\bin`). The unix script prints the `PATH` line to add; the
 PowerShell one adds the directory to your user `PATH` itself, so open a new
 terminal afterwards. `vilan upgrade` updates both later, and
 [every release](https://github.com/vilan-lang/vilan/releases) also carries
@@ -59,15 +59,15 @@ plain archives if you would rather unpack one yourself.
 
 **2. Open a `.vl` file.** The extension starts the server on first open.
 
-Keep the two in step — the extension and the toolchain ship from one repo at
+Keep the two in step: the extension and the toolchain ship from one repo at
 one version, and a server older than the extension will not know about newer
 language features.
 
 ### Finding the server
 
 The extension runs `vilan-lsp` from your `PATH`. If it lives somewhere the
-editor's `PATH` does not reach — a checkout's `target/release/vilan-lsp`, or an
-install directory you did not add — point **`vilan.server.path`** at it
+editor's `PATH` does not reach (a checkout's `target/release/vilan-lsp`, or an
+install directory you did not add), point **`vilan.server.path`** at it
 (absolute, or a name to resolve on `PATH`).
 
 The server carries the `std` sources inside itself, so definitions into `std`
@@ -93,7 +93,7 @@ command, for when you have rebuilt the binary underneath it.)
 `vilan.organizeImports.onSave` is handled by the extension's own on-save hook,
 so it leaves your `editor.codeActionsOnSave` untouched. If you would rather
 drive it through that standard mechanism, leave this off and add
-`"editor.codeActionsOnSave": { "source.organizeImports": "explicit" }` instead —
+`"editor.codeActionsOnSave": { "source.organizeImports": "explicit" }` instead;
 organizing is a fixed point, so having both on is harmless.
 
 Pruning is conservative: it never runs while the file has errors, never removes
@@ -101,11 +101,11 @@ a re-export, and keeps any import that derive-generated code references.
 
 ## Learning Vilan
 
-- [The book](https://vilan-lang.org/docs/) — guide, tour, and the
+- [The book](https://vilan-lang.org/docs/): guide, tour, and the
   language specification.
-- [Coming from JavaScript](https://vilan-lang.org/docs/tour/coming-from-javascript.html)
-  — the differences that will bite first.
-- [The repository](https://github.com/vilan-lang/vilan) — including a working
+- [Coming from JavaScript](https://vilan-lang.org/docs/tour/coming-from-javascript.html):
+  the differences that will bite first.
+- [The repository](https://github.com/vilan-lang/vilan), including a working
   full-stack example app.
 
 > **Status: fast-moving alpha.** The language changes weekly and there are no
@@ -126,12 +126,12 @@ with the extension loaded, and open a `.vl` file to activate it. Point
 build of the server.
 
 `icon.png` is a derived asset, not a source: it is a vendored copy of the brand
-pipeline's `baked/icon_256.png` — the private `vilan-lang/branding` repository
-bakes it from the flat mark; re-vendor after any change to the mark.
+pipeline's `baked/icon_256.png`, which the private `vilan-lang/branding`
+repository bakes from the flat mark. Re-vendor after any change to the mark.
 
 ## License
 
-MIT or Apache-2.0, at your option — see
+MIT or Apache-2.0, at your option; see
 [LICENSE.md](https://github.com/vilan-lang/vilan/blob/main/editors/vscode/LICENSE.md).
 The Vilan
 logo and icon are covered by [their own license](https://github.com/vilan-lang/vilan/blob/main/assets/branding/LICENSE)

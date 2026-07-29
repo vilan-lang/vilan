@@ -231,7 +231,7 @@ fn cycle_error(
         // instantiates. Saying so makes a false positive self-explaining.
         message.push_str(
             "\n  the cycle runs through a dispatched call, so it includes every implementation \
-             of that method — one this program never instantiates still participates",
+             of that method; one this program never instantiates still participates",
         );
     }
     if component.len() > 1 {
@@ -239,7 +239,7 @@ fn cycle_error(
         // evaluating it (§2), which is why mutually-recursive module closures
         // are legal.
         message.push_str(
-            "\n  a closure's body is not evaluated at load — moving one of these reads inside a \
+            "\n  a closure's body is not evaluated at load; moving one of these reads inside a \
              closure breaks the cycle",
         );
     }

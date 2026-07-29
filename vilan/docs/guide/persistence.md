@@ -3,12 +3,12 @@
 This chapter covers the server half of a full-stack app: SQLite via
 `std::db`, http serving via `std::http`, files via `std::fs`, and the
 process itself via `std::process`. These modules live in the process
-layer, so they're available in node/deno/bun builds. The rpc layer that
+layer, so they're available in Node/Deno/Bun builds. The rpc layer that
 sits on top is [Services & RPC](services.md).
 
 ## SQLite: `std::db`
 
-Vilan ships with an embedded SQLite binding (node's built-in SQLite
+Vilan ships with an embedded SQLite binding (Node's built-in SQLite
 underneath). There is no ORM and no query builder. You write SQL, with
 `?` placeholders for values:
 
@@ -53,7 +53,7 @@ The whole surface fits in a few lines:
   and returns the last insert id, `.first(params)` fetches an
   `Option<Row>`, and `.all(params)` fetches a `List<Row>`.
 - Rows read by column name: `text`, `integer` (i32), `big_integer`
-  (i53 — use it for epoch-millis timestamps, which outgrow i32),
+  (i53; use it for epoch-millis timestamps, which outgrow i32),
   `real` (f64), and `is_null`.
 
 Two habits to keep:
@@ -61,7 +61,7 @@ Two habits to keep:
 - Values always go through `?` placeholders. Never interpolate them into
   the SQL string.
 - Don't name a column with an SQL keyword. `desc` is the one that bites
-  in practice — spell it `description`.
+  in practice: spell it `description`.
 
 The API is synchronous, which fits rpc handlers (the dispatch path is
 synchronous too), and there is no connection pool to manage.
@@ -134,7 +134,7 @@ fun scan(): str                // a line from stdin
 One behavior to plan around: **the process exits when `main` finishes.**
 A server stays alive because `start()` holds the event loop open. A
 long-lived *client* process (a probe holding a socket, say) has to keep
-`main` open itself — await something that ends with the app, or
+`main` open itself: await something that ends with the app, or
 `sleep_for` a long duration.
 
 ## Putting it together
@@ -145,7 +145,7 @@ The boot sequence of a full-stack server, in order:
    (`CREATE TABLE IF NOT EXISTS …`).
 2. Load the mirrored state from SQLite into the service's signals.
 3. Wire the service's handlers to statements. Write SQL first, then
-   update the signal — the mirror broadcasts the signal.
+   update the signal (the mirror broadcasts the signal).
 4. `fs::read_file_to_str` the client bundle and shell.
 5. `serve_service(port, protocol, fallback, on_ready)`.
 

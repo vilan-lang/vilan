@@ -370,7 +370,7 @@ pub(crate) fn register_file(
         diagnostics.push(Error {
             note: None,
             span: *span,
-            msg: "a `macro { .. }` block cannot appear inside macro code — the enclosing \
+            msg: "a `macro { .. }` block cannot appear inside macro code: the enclosing \
                   body already runs at expansion time"
                 .to_string(),
         });
@@ -387,7 +387,7 @@ pub(crate) fn register_file(
         diagnostics.push(Error {
             note: None,
             span: first_span,
-            msg: "the `macro_std` package was not found beside `std` — macros need the \
+            msg: "the `macro_std` package was not found beside `std`: macros need the \
                   toolchain's `macro_std`"
                 .to_string(),
         });
@@ -491,7 +491,7 @@ fn check_hermetic_imports(node: &Spanned<Node>, diagnostics: &mut Vec<Error>, he
             diagnostics.push(Error {
                 note: None,
                 span: node.1,
-                msg: "a macro body may import only from `macro_std` — the macro world is \
+                msg: "a macro body may import only from `macro_std`: the macro world is \
                       hermetic (macro-engine.md §4)"
                     .to_string(),
             });
@@ -888,7 +888,7 @@ impl Expander<'_, '_> {
                                 note: None,
                                 span: item.1,
                                 msg: "`[service]` expanded before std::rpc's `service` macro was \
-                                      loaded — a compiler load-ordering bug (B21's class); please \
+                                      loaded: a compiler load-ordering bug (B21's class); please \
                                       report how this module is reached"
                                     .to_string(),
                             });
@@ -968,7 +968,7 @@ impl Expander<'_, '_> {
             self.diagnostics.push(Error {
                 note: None,
                 span: site,
-                msg: "this `macro { .. }` block was not registered — see the file's \
+                msg: "this `macro { .. }` block was not registered; see the file's \
                       earlier macro errors"
                     .to_string(),
             });
@@ -1097,7 +1097,7 @@ impl Expander<'_, '_> {
                     span: site,
                     msg: format!(
                         "`{name}` is a macro HELPER (its signature is not a macro shape or it \
-                         doesn't return `Source`) — only other macros can call it"
+                         doesn't return `Source`): only other macros can call it"
                     ),
                 });
                 return;
@@ -1111,7 +1111,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: site,
                     msg: format!(
-                        "macro `{name}` is invocation-shaped (it takes no `Item`) — call it \
+                        "macro `{name}` is invocation-shaped (it takes no `Item`); call it \
                          as `macro {name}(..)`, not as an attribute"
                     ),
                 });
@@ -1160,7 +1160,7 @@ impl Expander<'_, '_> {
                     span: site,
                     msg: format!(
                         "`{name}` is a macro HELPER (its signature is not a macro shape or it \
-                         doesn't return `Source`) — only other macros can call it"
+                         doesn't return `Source`): only other macros can call it"
                     ),
                 });
                 if let Some(site_key) = expression_site {
@@ -1175,7 +1175,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: site,
                     msg: format!(
-                        "macro `{name}` is attribute-shaped (it takes an `Item`) — use it \
+                        "macro `{name}` is attribute-shaped (it takes an `Item`); use it \
                          as `[{name}]` on an item, not as an invocation"
                     ),
                 });
@@ -1225,7 +1225,7 @@ impl Expander<'_, '_> {
                 note: None,
                 span: site,
                 msg: format!(
-                    "macro expansion did not settle after {cap} rounds — the chain ends \
+                    "macro expansion did not settle after {cap} rounds: the chain ends \
                      at {label}"
                 ),
             });
@@ -1301,7 +1301,7 @@ impl Expander<'_, '_> {
                         note: None,
                         span: site,
                         msg: format!(
-                            "{label} generated invalid Vilan ({message}) — the \
+                            "{label} generated invalid Vilan ({message}); the \
                              output was: {}",
                             preview(&wrapped)
                         ),
@@ -1328,7 +1328,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: site,
                     msg: format!(
-                        "{label} generated a `macro {{ .. }}` block — macros cannot \
+                        "{label} generated a `macro {{ .. }}` block: macros cannot \
                          define macros (macro-engine.md §3)"
                     ),
                 });
@@ -1350,7 +1350,7 @@ impl Expander<'_, '_> {
                         note: None,
                         span: site,
                         msg: format!(
-                            "{label} generated invalid Vilan ({message}) — the \
+                            "{label} generated invalid Vilan ({message}); the \
                              output was: {}",
                             preview(stamped.as_deref().unwrap_or(raw))
                         ),
@@ -1363,7 +1363,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: site,
                     msg: format!(
-                        "{label} generated a `macro fun` — macros cannot define \
+                        "{label} generated a `macro fun`: macros cannot define \
                          macros (macro-engine.md §3)"
                     ),
                 });
@@ -1375,7 +1375,7 @@ impl Expander<'_, '_> {
                     note: None,
                     span: site,
                     msg: format!(
-                        "{label} generated a `macro {{ .. }}` block — macros cannot \
+                        "{label} generated a `macro {{ .. }}` block: macros cannot \
                          define macros (macro-engine.md §3)"
                     ),
                 });

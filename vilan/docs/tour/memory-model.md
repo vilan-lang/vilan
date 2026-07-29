@@ -102,7 +102,7 @@ Views come with a deliberate restriction: **they don't outlive the
 moment.** A view can be a parameter or a short-lived local. It cannot be
 stored in a struct field, put in a list, returned into long-lived state,
 or held across an `await`. Lend, use, done. That confinement is what
-makes views safe without a whole lifetime system — if you've heard Rust
+makes views safe without a whole lifetime system. If you've heard Rust
 horror stories, this is the part Vilan deliberately keeps small.
 
 Views also make loops that mutate in place. A plain `for x in list`
@@ -127,20 +127,20 @@ through to the list.
 > **Going deeper.** A method may return a view that projects its
 > receiver, like `fun get(&mut self, i: i32): &mut T`. The compiler
 > infers which parameter the view borrows from, and the returned view
-> obeys the same short-lived rules at the call site — anchored to what it
-> projects, so a `list.push(..)` while a view from `list.at(0)` is live
+> obeys the same short-lived rules at the call site, anchored to what
+> it projects: a `list.push(..)` while a view from `list.at(0)` is live
 > is the same compile error a direct `&mut list[0]` would raise.
 > `Option<&T>` covers "a view, maybe" (map lookups). The compiler is
 > precise about *which* mutations invalidate: only calls that may change
-> a container's geometry (grow, shrink, reallocate — inferred per method)
-> conflict with a live view; a method that just writes fields or elements
+> a container's geometry (grow, shrink, reallocate; inferred per method)
+> conflict with a live view; a method that only writes fields or elements
 > through `&mut self` passes freely. Hover a function to see both
 > inferred effects (`borrows`, `bumps`). Spec §6 has the precise rules.
 
 ## `Shared<T>`: one cell, many holders
 
-When two places genuinely need to see the same mutable state — a closure
-and its creator, most commonly — reach for `Shared<T>`. It's a small
+When two places need to see the same mutable state (a closure and its
+creator, most commonly), reach for `Shared<T>`. It's a small
 heap cell. Copying the `Shared` value copies the *handle*, and both
 handles point at one cell. That's the point:
 
@@ -167,8 +167,8 @@ Two methods, two behaviors, one trap:
 - The trap: `shared.read().push(x)` mutates the copy and is lost. Write
   through the cell: `shared.write().push(x)`.
 
-If you're reaching for `Shared` just to "avoid a copy" on a hot path,
-don't — values are cheap, and the compiler already elides copies it can
+If you're reaching for `Shared` to "avoid a copy" on a hot path,
+don't: values are cheap, and the compiler already elides copies it can
 prove away.
 
 ## `Arena` + `Handle`: graphs and cycles
@@ -204,8 +204,8 @@ pointing at the new occupant. The full API is in the
 One rule ties this chapter to the [async model](async.md): **a view may
 not be held across an `await`.** While your function is suspended, other
 code runs and may change or replace whatever the view pointed into. The
-compiler rejects the shape. The fix is always the same — re-derive after
-the suspension:
+compiler rejects the shape. The fix is always the same: re-derive after
+the suspension.
 
 ```vilan,fragment
 let row = &mut rows[i];

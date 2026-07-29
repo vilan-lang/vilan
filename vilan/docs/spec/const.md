@@ -10,11 +10,11 @@ that execute Vilan code at build time.
 
 `const` is a prefix operator over an expression. It captures
 **greedily**: everything to the end of the surrounding expression folds
-(`const 1 + 2 * 3` folds `7`); parenthesize to narrow the extent —
+(`const 1 + 2 * 3` folds `7`); parenthesize to narrow the extent:
 in `(const square(4)) + square(2)` the second call runs at runtime.
 
 A `const` expression may appear anywhere an expression may, including
-module-level initializers — where it is also the way to run *logic* at
+module-level initializers, where it is also the way to run *logic* at
 load position without runtime cost: a `const` initializer ships as a
 plain value, participates in no platform coloring (§11.2), and cannot
 violate the initializer rules of §7.4 (nothing of it remains to run at
@@ -31,15 +31,15 @@ The evaluated expression may use exactly what the compiler can know:
   const-evaluable.
 
 **Host capabilities do not exist at compile time.** A call that
-requires the host — the clock, the filesystem, network, randomness, any
-`external` function without a compile-time definition — is a compile
+requires the host (the clock, the filesystem, network, randomness, any
+`external` function without a compile-time definition) is a compile
 error inside `const` ("`now()` is not const-evaluable"), not a deferred
 runtime call: the answer would not be a constant.
 
 The one deliberate exception is `std::asset::emit(kind, content)`,
 callable **only** during const evaluation: it declares a build asset
 (the styling system's CSS, for example) that the build writes beside
-the output. Asset emission is deterministic — same inputs, same files.
+the output. Asset emission is deterministic: same inputs, same files.
 
 ## 9.3 Failure and resource limits
 
@@ -47,7 +47,7 @@ Const evaluation is total by construction of the budget: each run is
 bounded by the interpreter's **fuel** (steps) and **depth** (nesting),
 shared with macro expansion and configured by the manifest's `[macro]`
 section (§11.4). Exhausting either, or panicking during evaluation, is
-a compile error carrying the const expression's span — a runaway
+a compile error carrying the const expression's span. A runaway
 `const` fails the build; it cannot hang it.
 
 ## 9.4 Results

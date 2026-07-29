@@ -2,8 +2,8 @@
 
 `std::reactive` is Vilan's state layer. If you've used signals in Solid or
 Preact, you'll be at home immediately. If you're coming from React, think
-of a signal as a piece of state that components subscribe to directly —
-there is no re-render, no dependency array, no memoization dance. When a
+of a signal as a piece of state that components subscribe to directly:
+there is no re-render, dependency array, or memoization dance. When a
 signal changes, exactly the code that watches it runs.
 
 Four ideas make up the layer, and this chapter takes them in order:
@@ -82,7 +82,7 @@ Build state as a graph and let it recompute itself:
   	print(doubled.get());
   }
   ```
-- `combine((a, b, …))` gives a signal of the **tuple** of several
+- `combine((a, b, …))` gives a signal of the tuple of several
   signals' values. It fires when any of them changes. Takes two or more.
 - `nested.flatten()` on a `Signal<Signal<U>>` follows whichever inner
   signal is current, and detaches from a replaced one.
@@ -104,8 +104,8 @@ fun main() {
 }
 ```
 
-A named function can stand in for the closure (`signal.map(parse)`) —
-see [functions & closures](../tour/functions-and-closures.md).
+A named function can stand in for the closure (`signal.map(parse)`).
+See [functions & closures](../tour/functions-and-closures.md).
 
 ## Reacting: `effect` and `sub`
 
@@ -122,9 +122,9 @@ Two ways to run code on change. **Use `effect` by default.**
 ## Ownership: who cleans up
 
 Every effect is a subscription, and subscriptions must die when the
-thing that created them goes away — otherwise a page you navigated off
+thing that created them goes away. Otherwise a page you navigated off
 keeps reacting forever. That's a memory leak in any reactive system.
-Vilan's answer is **owners**, and the good news is that in normal app
+Vilan's answer is **owners**, and in normal app
 code you never manage them: the UI layer creates owners exactly where
 subtrees can die (a mounted root, a list row, a conditional block), and
 every `effect` you create automatically registers with the nearest one.
@@ -134,7 +134,7 @@ For tests, or when you're building your own machinery:
 - `Owner::new()` makes an owner; `owner.dispose()` disposes everything
   registered with it.
 - `run_with_owner(owner, || …)` runs a block with that owner ambient.
-  Every `effect` inside — however deep in function calls — registers
+  Every `effect` inside, however deep in function calls, registers
   into it.
 - `get_owner()` reads the ambient owner, e.g. to attach custom cleanup
   with `owner.defer(…)`.
@@ -164,14 +164,14 @@ before your first line of UI code ran.
 > ([functions & closures](../tour/functions-and-closures.md)): the
 > `owner_scope` context carries the current owner, and closure
 > parameters marked `context owner_scope` receive it invisibly. `comp`
-> runs a block under a fresh owner and returns `(result, owner)` — it's
+> runs a block under a fresh owner and returns `(result, owner)`; it's
 > the primitive under `mount_root`.
 
 ## Turns: when changes become visible
 
 If an event handler sets five signals, you want watchers to see the
 final state once, not five intermediate states. Vilan batches writes
-into **turns**. Inside a turn, `set` just records. When the turn
+into **turns**. Inside a turn, `set` only records. When the turn
 settles, each affected watcher runs once with the final values:
 
 ```text
@@ -204,12 +204,12 @@ flush()              // drain the ambient turn early
 
 > **Going deeper.** Suspension is where the shapes differ. An explicit
 > `turn` adapts to its body: a synchronous body settles when it ends
-> (the atomic turn), and an awaiting body holds every notification —
-> before the first await and in every continuation — until the whole
+> (the atomic turn), and an awaiting body holds every notification
+> (before the first await and in every continuation) until the whole
 > body finishes, then settles once: a true transaction. A *boundary*
 > turn around a fire-and-forget handler (a UI event) can't wait for the
 > handler's continuations, so it settles at the end of each synchronous
-> stretch — one wave per segment:
+> stretch, one wave per segment:
 >
 > ```text
 > handler:              |── writes ──|─── await ───|── writes ──|
@@ -232,8 +232,8 @@ server after". They differ in what happens on failure, and the
 difference is the point:
 
 **`optimistic(signal, value, commit)`** paints the value immediately,
-runs your async commit, and on failure **rolls back**. Use it for
-one-shot actions like a delete button — if the delete failed, the row
+runs your async commit, and on failure rolls back. Use it for
+one-shot actions like a delete button: if the delete failed, the row
 should come back.
 
 **`draft(initial, commit)`** is for *editing*. It keeps the user's text
@@ -255,7 +255,7 @@ draft.adopt(remote) // fold in a remote change
 The commit closure returns `None` on success or `Some(reason)` on
 failure, so an rpc-calling closure drops straight in.
 
-The whole lifecycle in one picture — note that the input never waits on
+The whole lifecycle in one picture. The input never waits on
 the wire, and every remote change funnels through `adopt`'s three rules:
 
 ```text
@@ -293,7 +293,7 @@ fun main() {
 
 > **Going deeper.** `push` is per-keystroke safe: a generation counter
 > means a slow older commit that lands late is discarded rather than
-> clobbering a newer one. `adopt` follows three rules — an **echo** of
+> clobbering a newer one. `adopt` follows three rules: an **echo** of
 > your own push changes nothing, a **clean** local adopts the remote
 > edit, and a **dirty** local wins (last-write-wins: the remote value is
 > remembered so your eventual push knowingly overwrites it). The

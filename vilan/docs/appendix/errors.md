@@ -10,12 +10,12 @@ topic rather than by message.)
 ## Names and imports
 
 **"cannot find '…' in this scope"** · **"cannot find type '…'"**
-The name isn't visible here. Usually a missing `import` — remember that
-everything, even `print`, is imported explicitly. If you did import it,
+The name isn't visible here. Usually a missing `import`: everything,
+even `print`, is imported explicitly. If you did import it,
 check for a typo or a shadowing local.
 → [Hello Vilan](../tour/hello-vilan.md), [spec §4](../spec/names.md)
 
-**"`std` is a namespace, not a value — import the module first …"**
+**"`std` is a namespace, not a value; import the module first …"**
 You wrote a qualified path like `std::math::min(1, 2)` inline. That
 spelling isn't supported. Import the module, then qualify through its
 name: `import std::math;` and `math::min(1, 2)`.
@@ -23,7 +23,7 @@ name: `import std::math;` and `math::min(1, 2)`.
 
 **"`…` requires the `…` layer of `std` and cannot run on `…`"**
 Code reachable from this build's entry calls into a module the platform
-doesn't have — `std::fs` from a browser build, `std::dom` from a node
+doesn't have: `std::fs` from a browser build, `std::dom` from a Node
 build. The error lists the call chain from `main` to the crossing.
 Importing the module is not the problem (imports are free); reaching it
 is. Move the call behind the right entry, or check the package's
@@ -33,29 +33,29 @@ is. Move the call behind the right entry, or check the package's
 **"`…` requires … and cannot run on `…` / reachable from `…`, fenced `[platform(…)]`"**
 A function declared a platform fence and something it (transitively)
 reaches requires a layer one of the fenced platforms doesn't serve. The
-chain shows the path from the fence. Fences check on every compile —
-narrowing the fence, or moving the colored call out from behind it, are
+chain shows the path from the fence. Fences check on every compile.
+Narrowing the fence, or moving the colored call out from behind it, are
 the two fixes.
 → [Platforms](../tour/platforms.md)
 
 **"cannot find module '…' to import"**
 The path names a module file that doesn't exist. `pkg::routes` means
-"`routes.vl` in this package's source root" — check the file name and
+"`routes.vl` in this package's source root". Check the file name and
 the package you're in.
 → [Hello Vilan](../tour/hello-vilan.md)
 
 **"module '…' resolved to '…' on disk, but it is imported as '…'"**
 Your filesystem ignores case (NTFS, and macOS by default) and answered
 the import with a differently-cased file. Module names match byte for
-byte (§4.2), so this would fail to build on a case-sensitive filesystem
-— rename the file or the import so the two agree.
+byte (§4.2), so this would fail to build on a case-sensitive
+filesystem. Rename the file or the import so the two agree.
 → [Names, modules, and packages](../spec/names.md)
 
 ## Types and generics
 
 **"Expected …, but got … instead."**
 The general type mismatch. One special case surprises people: an `i53`
-mixed with a bare integer literal — the literal is `i32`, and there are
+mixed with a bare integer literal: the literal is `i32`, and there are
 no implicit conversions. Suffix it (`stamp + 1000i53`).
 → [Values and types](../tour/values-and-types.md)
 
@@ -68,7 +68,7 @@ signature: `fun caller<U: PartialEq>(…)`.
 **"cannot call method '…' on …"**
 The value's type doesn't have that method. If the type is a generic
 parameter, you probably need a bound. If it says something like
-`|i32| i32`, you're calling a method on a closure — often a sign a
+`|i32| i32`, you're calling a method on a closure, often a sign a
 different value was passed than you think.
 → [Data and traits](../tour/data-and-traits.md)
 
@@ -81,11 +81,11 @@ demands a trait the type never implemented.
 A method an `impl … with Trait` provides must match the trait's
 declaration, not just its name: the receiver convention (`self` / `&self`
 / `&mut self` / `own self`), the parameter count and each parameter's
-convention and type, the return type, and — for a generic method — the
+convention and type, the return type, and, for a generic method, the
 type-parameter count. Types are compared with `Self` read as the impl's
 subject and the trait's generic parameters read as the `with`-clause
 arguments (`impl Meters with From<Feet>` expects `fun from(value: Feet):
-Meters`). Asyncness is not required to match — an async impl of a
+Meters`). Asyncness is not required to match: an async impl of a
 synchronous trait method is allowed (dispatch is monomorphized, so callers
 await it regardless).
 → [Data and traits](../tour/data-and-traits.md)
@@ -97,8 +97,8 @@ the feature: it's what fires everywhere when you add a variant.
 
 **"struct '…' has no field '…'"** · **"variant '…' does not belong to the matched enum"**
 A field or variant name is off. For the variant case inside `match`,
-remember patterns bind with `let` — a bare misspelled variant is an
-error here, never a silent catch-all.
+patterns bind with `let`: a bare misspelled variant is an error here,
+never a silent catch-all.
 → [Control flow](../tour/control-flow.md)
 
 **"`…` compares two values of the same type, but the operands are `…` and `…`"**
@@ -112,14 +112,14 @@ no implicit conversions. An unsuffixed literal adapts to its peer
 → [Values and types](../tour/values-and-types.md)
 
 **"type '…' does not implement the `…` operator; add `impl … with …` providing `…`"**
-An operator was used on a type without the matching trait impl — `+`
+An operator was used on a type without the matching trait impl: `+`
 needs `Add`, `==` needs `PartialEq`, `<`/`<=`/`>`/`>=` need
 `PartialOrd` (implement `partial_compare` once; the operators dispatch
 through it, and `lt`/`le`/`gt`/`ge` come free as defaults).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"the literal `…` is out of range for `…` (…)"**
-The number doesn't fit the type. For `i53`/`u53` the range is ±2^53 —
+The number doesn't fit the type. For `i53`/`u53` the range is ±2^53,
 JavaScript's exact-integer window. Bigger integers take `BigInt` (`7n`).
 → [Values and types](../tour/values-and-types.md)
 
@@ -129,7 +129,7 @@ those were renamed to `i53`/`u53`.
 → [Values and types](../tour/values-and-types.md)
 
 **"type of … could not be resolved"**
-Inference gave up somewhere upstream — this error is usually the *echo*
+Inference gave up somewhere upstream. This error is usually the *echo*
 of another one, so fix the first error in the list. When it appears
 alone, an annotation at the binding usually grounds it.
 → [gotchas](gotchas.md)
@@ -137,8 +137,8 @@ alone, an annotation at the binding usually grounds it.
 ## Memory and mutation
 
 **"cannot mutate immutable '…'"**
-The binding was declared with `let`. Declare it `mut` — or, if you're
-inside a method, take `&mut self`.
+The binding was declared with `let`. Declare it `mut`, or take
+`&mut self` if you're inside a method.
 → [The memory model](../tour/memory-model.md)
 
 **"a view cannot escape its scope: it may not be returned, stored in a field, placed in a collection, or carried in an enum payload. …"**
@@ -150,16 +150,16 @@ keep a reference around, store a plain value, a `Handle` into an
 **"cannot reassign '…' while a view into it is live (rule 4 …)"**
 Replacing the whole value would detach the view from live storage. Finish
 using the view first (its life ends with its block), or re-derive it after
-the replacement. Views anchor wherever they come from — `&x`, a
+the replacement. Views anchor wherever they come from: `&x`, a
 view-returning call (`list.at(0)`, `arena.get(h)`), or a `Some(let v)`
-capture of one — so the rule is the same for all three.
+capture of one. The rule is the same for all three.
 → [The memory model](../tour/memory-model.md)
 
 **"cannot mutate '…' with '….(..)' while a view into it is live (rule 4 …)"**
 The call may advance the container's *geometry* (grow, shrink, reallocate,
 swap an aggregate field) while a view points into it. Only
-geometry-advancing callees trigger this — a method that just writes fields
-or elements through `&mut self` passes freely (the compiler infers which is
+geometry-advancing callees trigger this: a method that writes fields or
+elements through `&mut self` passes freely (the compiler infers which is
 which). Do the mutation before taking the view, or after its block ends.
 → [The memory model](../tour/memory-model.md)
 
@@ -180,184 +180,186 @@ A `resource` type has a single owner and moves rather than copies; a
 struct, enum, or tuple holding one is a resource too, inferred by
 containment (`Option<Database>` is a resource, `Option<i32>` is not). A
 resource *moves* on binding (`let b = a`), on `own`-passing, on return, and
-into a constructor; it is *loaned* — no ownership change — through `self`,
+into a constructor; it is *loaned* (no ownership change) through `self`,
 `&`, and `&mut`. The `Drop` destructor trait and its restrictions are below.
 At each scope end the compiler runs the destructor on the still-owned resource
-locals, in reverse declaration order — through `try`/`finally`, so `ret`,
-`jump`, and a thrown panic all run it on the way out; a resource without a
-`Drop` impl still has its fields destroyed. A module-level resource lives for
+locals, in reverse declaration order. Destruction goes through
+`try`/`finally`, so `ret`, `jump`, and a thrown panic all run it on the way
+out; a resource without a `Drop` impl still has its fields destroyed. A
+module-level resource lives for
 the process and never drops. A drop that panics while a panic is already
 unwinding replaces the in-flight error (JS `finally` semantics). The tutorial
 is [Resources](../tour/resources.md); the normative rules are spec
 [§6.8](../spec/memory.md).
 
-**"use of `…` after it was moved — a resource has a single owner"**
+**"use of `…` after it was moved: a resource has a single owner"**
 The binding was moved (bound to another name, passed to an `own`
 parameter, returned, or matched by value) and then used again. The note
 points at the move. Loan it instead (`&x` / `&mut x`, or a method call),
 or, if you really need two owners, restructure with `Option` + `take`.
 → [Resources](../tour/resources.md)
 
-**"cannot move a resource field out of a live aggregate — … no partial moves …"**
+**"cannot move a resource field out of a live aggregate: … no partial moves …"**
 `let x = s.db`, or passing / returning `s.db` by value, would move a
-resource out of a struct that is still alive — there are no partial moves.
+resource out of a struct that is still alive: there are no partial moves.
 Loan the field (`&s.db`, `&mut s.db`, `s.db.method(…)`), or make the field
 an `Option<…>` and `take()` it out.
 → [Resources](../tour/resources.md)
 
-**"`…` is moved on one path through this branch but not another — …"**
+**"`…` is moved on one path through this branch but not another: …"**
 An `if`/`match` moves the binding on some paths and not others, so its
 end-of-scope ownership isn't static (there are no runtime drop flags). Move it
-on *every* path, or on none — or hold it in an `Option` and `take()` on the
+on *every* path, on none, or hold it in an `Option` and `take()` on the
 path that consumes it. A diverging leg (one that `ret`s or `jump`s out) is
 exempt: it never reaches the merge.
 → [Resources](../tour/resources.md)
 
-**"`…` is declared outside this loop and moved inside it — …"**
+**"`…` is declared outside this loop and moved inside it: …"**
 Moving a binding from a loop body would move it again on the next
 iteration. Move a value declared *inside* the loop, or loan the outer one
 (`&x` / `&mut x`).
 → [Resources](../tour/resources.md)
 
-**"`…` is a module-level resource — it has process lifetime and cannot be moved …"**
+**"`…` is a module-level resource: it has process lifetime and cannot be moved …"**
 A top-level `let` resource lives for the whole process and never drops (the
-serve-forever server's `Database`). Consuming it — moving it into a local,
-passing it to an `own` parameter, or `drop(x)` — would hand a
+serve-forever server's `Database`). Consuming it (moving it into a local,
+passing it to an `own` parameter, or `drop(x)`) would hand a
 process-lifetime resource to a droppable owner and close the shared handle
 out from under the rest of the program. Reach it by loan only: method calls,
 `&x`, `&mut x`. To own a database that closes at a scope's end, open it in a
 local instead.
 → [Resources](../tour/resources.md)
 
-**"a closure cannot capture the resource `…` — …"**
+**"a closure cannot capture the resource `…`; …"**
 A closure or `async`/spawn body referenced a *local* or *parameter* resource
 from an enclosing scope; capturing it would give the closure a second owner.
 Pass a loan into the call, give ownership to the struct that owns the
-closure's lifetime, or hoist the resource to **module level** — a module
+closure's lifetime, or hoist the resource to module level: a module
 global is loan-only and process-lifetime, so a closure may reference it
 without becoming an owner. (A closure's own *parameter* is per-call, not a
-capture — injected `context`-clause bodies are unaffected.)
+capture; injected `context`-clause bodies are unaffected.)
 → [Resources](../tour/resources.md)
 
-**"`…` is not move-clean when instantiated with a resource — …"**
+**"`…` is not move-clean when instantiated with a resource: …"**
 A generic function or method was called with a resource type argument
-(`Option<Database>`, `wrap(db)`), and its body — checked with that type
-parameter treated as a resource — breaks the affine rules in one of three
+(`Option<Database>`, `wrap(db)`), and its body (checked with that type
+parameter treated as a resource) breaks the affine rules in one of three
 ways. It uses a value of the parameter's type **more than once** (moves it
-on some paths but not all, or captures it in a closure) — a resource has a
-single owner; or an **`own` parameter of resource type is never moved out**
-— because the generic body is shared across every instantiation, it cannot
-run a destructor, so an `own T` must be moved out on *every* path (returned,
-or handed to another owner), or the function must take a concrete type; or
-it **passes such a value to `drop<T>`** — that erased body has no concrete
-destructor either, so the resource would leak (`drop(x)` on data is a fine
-no-op, which is why the data instantiation stays accepted — destroy at a
-concrete type, or move the value out to the caller). The error is spanned at
-the **call** (the instantiation), with a note into the generic's body. A
+on some paths but not all, or captures it in a closure); a resource has a
+single owner. Or an **`own` parameter of resource type is never moved
+out**: because the generic body is shared across every instantiation, it
+cannot run a destructor, so an `own T` must be moved out on *every* path
+(returned, or handed to another owner), or the function must take a
+concrete type. Or it **passes such a value to `drop<T>`**: that erased
+body has no concrete destructor either, so the resource would leak
+(`drop(x)` on data is a fine no-op, which is why the data instantiation
+stays accepted; destroy at a concrete type, or move the value out to the
+caller). The error is spanned at the call (the instantiation), with a
+note into the generic's body. A
 clean generic moves each such value exactly once (as `Option::unwrap(self):
 T` does), never copying, capturing, or forwarding it to the sink;
 `drop(concrete)` on a concrete resource *is* the destructor. Instantiating
 the same generic at a data type is unaffected.
 → [Resources](../tour/resources.md)
 
-**"the resource `…` cannot be used where `any` is expected — …"**
+**"the resource `…` cannot be used where `any` is expected: …"**
 `any` is a data sink, and a resource must keep its single owner: passing
 one to `print`, binding it to `let x: any`, or returning it as `any`
 would launder the discipline away. Debug-print the resource's fields
 instead.
 → [Resources](../tour/resources.md)
 
-**"`…` cannot hold the resource `…` — a native container's internals are host code …"**
+**"`…` cannot hold the resource `…`: a native container's internals are host code …"**
 `List`, `Map`, `Set`, and the external generics (`Shared`, `Task`,
-`Promise`, `Context`) can't hold a resource — the move checker
+`Promise`, `Context`) can't hold a resource: the move checker
 can't see inside host storage. `Option` is the sanctioned resource
 container; or keep the resource in a struct field.
 → [Resources](../tour/resources.md)
 
-**"field `…` of `[derive(Wire)]` / `[derive(Hashable)]` / `[derive(PartialEq)]` type `…` is the resource `…` — …"**
+**"field `…` of `[derive(Wire)]` / `[derive(Hashable)]` / `[derive(PartialEq)]` type `…` is the resource `…`: …"**
 A resource is not plain data: it cannot be sent over the wire, hashed by
 value, or compared by copy. Drop it from the derived type, or carry a
 plain-data handle (an id, a key) in its place.
 → [Resources](../tour/resources.md)
 
-**"`…` implements `Drop` but is not a resource — … declare it a `resource` …"**
-`Drop` — the destruction hook — may be implemented only for a `resource`
-type. A destructor without move discipline is exactly the double-close bug:
+**"`…` implements `Drop` but is not a resource: … declare it a `resource` …"**
+`Drop` (the destruction hook) may be implemented only for a `resource`
+type. A destructor without move discipline is the double-close bug:
 copy the value and each copy would run `drop`. Declare the type `resource`
 so it moves instead of being copied. (Plain-data, framework-driven teardown
 uses the cooperative `Disposable` protocol, not `Drop`.)
 → [Resources](../tour/resources.md)
 
-**"`drop` for `…` is async — teardown must be synchronous …"**
+**"`drop` for `…` is async: teardown must be synchronous …"**
 A `drop` body may not be `async`, nor await (call an async function): a
 destructor runs synchronously. Cancel owned tasks through an
-`OwnedNursery` — whose own `drop` cancels them — rather than awaiting them.
+`OwnedNursery` (whose own `drop` cancels them) rather than awaiting them.
 Awaited teardown is a future design.
 → [Resources](../tour/resources.md)
 
-**"`drop` for `…` requires an ambient context — teardown must be context-free …"**
-A `drop` body reached something that needs an ambient context — most often a
+**"`drop` for `…` requires an ambient context: teardown must be context-free …"**
+A `drop` body reached something that needs an ambient context, most often a
 `Signal` write, which threads the current turn as a hidden argument. A
 destructor's call sites are scope exits, which thread no context, so it
 cannot receive one. Keep teardown context-free: hand turn-joining or
-signal-writing work to an owner that runs inside a turn, not to the
-destructor.
+signal-writing work to an owner that runs inside a turn.
 → [Resources](../tour/resources.md)
 
 
 ## Async
 
-**"`…` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)"**
+**"`…` receives an async closure, but its type awaits nothing; declare it `async || T` (or return void for spawn semantics)"**
 A closure that suspends was stored into a struct field typed as a
 plain, value-returning closure (at the literal or a later assignment).
-Either the field should be `async |…| T`, or — if fire-and-forget is
-fine — its return type should be `void`. (A plain *parameter* no longer
-produces this error: it adapts — the callee instantiates an async copy
+Either the field should be `async |…| T`, or, if fire-and-forget is
+fine, its return type should be `void`. (A plain *parameter* no longer
+produces this error. It adapts: the callee instantiates an async copy
 that awaits the callback.)
 → [Async](../tour/async.md), [Functions & closures](../tour/functions-and-closures.md)
 
 **"`…` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol …"**
-The parameter is a `sync` contract position — `Signal::map`,
-`set_with`, `turn`/`batch` bodies, the UI render callbacks — where the
+The parameter is a `sync` contract position (`Signal::map`,
+`set_with`, `turn`/`batch` bodies, the UI render callbacks) where the
 callback must finish inside a synchronous protocol, so it cannot adapt.
 Move the async work outside the callback: an explicit `turn(…)` whose
-awaiting body holds one turn across its awaits, `Draft`/`optimistic` for local-first commits, or a
-spawned `async { … }` block. The transitive form ("this call passes an
-async closure that reaches `…`") points at the call that made the
-closure async and notes where it was forwarded.
+awaiting body holds one turn across its awaits, `Draft`/`optimistic`
+for local-first commits, or a spawned `async { … }` block. The
+transitive form ("this call passes an async closure that reaches `…`")
+points at the call that made the closure async and notes where it was
+forwarded.
 → [Async](../tour/async.md), [Reactivity](../guide/reactive.md)
 
-**"`…` is a host (`external`) function — it cannot await a Vilan closure …"**
+**"`…` is a host (`external`) function: it cannot await a Vilan closure …"**
 Host code can't await your callback, so an `external` function's
 value-returning closure parameters only accept synchronous closures
 (void-returning ones spawn, as everywhere). A parameter *declared*
-`async |…| T` is exempt — that is the host's explicit contract to await
+`async |…| T` is exempt: that is the host's explicit contract to await
 the closure itself.
 → [Async](../tour/async.md)
 
 **"an async closure cannot adapt a trait/generic-dispatched call …"**
 Adaptation instantiates a statically-known callee, and a
-trait/generic-dispatched call doesn't have one — the concrete method
+trait/generic-dispatched call doesn't have one: the concrete method
 varies per instantiation. Bind the receiver concretely before the call,
 or declare the trait method's parameter `async || T` so every impl
 takes the typed channel.
 → [Async](../tour/async.md)
 
-**"`…` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)"**
+**"`…` returns an async closure, but its declared return type awaits nothing; declare it `async || T` (or return void for spawn semantics)"**
 The function's declared return type is a plain, value-returning closure,
 but a `ret` (or the tail) hands back a closure that suspends. Mark the
-return type `async || T` so calls through the returned value await —
-`make()()` and `let go = make(); go()` both do — or return a
+return type `async || T` so calls through the returned value await
+(`make()()` and `let go = make(); go()` both do), or return a
 `void`-returning closure for spawn semantics.
 → [Async](../tour/async.md)
 
-**"the initializer of `…` calls `…`, which is async — a module-level binding cannot await"**
+**"the initializer of `…` calls `…`, which is async: a module-level binding cannot await"**
 A top-level `let` runs when the module loads, and module initialization
-is synchronous — there is no enclosing function to become async, so the
+is synchronous: there is no enclosing function to become async, so the
 value would be a live promise wearing the wrong type. Wrap the work in
 a function and call it from `main`. The variant "the initializer of
 `…` runs a closure that awaits" is the same rule when the awaiting
-thing has no name — an adopted async closure applied directly, a
+thing has no name: an adopted async closure applied directly, a
 `run(value, body)` whose body suspends, or a `nursery` at top level.
 (Creating an async closure at top level is fine; it awaits nothing
 until called.)
@@ -365,17 +367,17 @@ until called.)
 
 **"`…` form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order"**
 Module-level bindings initialize in dependency order (spec §7.1): each
-one runs after everything its initializer evaluates at load — the
+one runs after everything its initializer evaluates at load: the
 bindings it reads, plus whatever is read inside anything it *calls* on
 the way. A cycle among those evaluations has no valid order, so it is
 refused at compile time; the message names the round trip (`via A → B
-→ A`) and each participant's declaration. The self-referential form —
-"`…`'s initializer evaluates `…` itself, which has not initialized
-yet" — is the one-binding case of the same rule. Creating a closure
+→ A`) and each participant's declaration. The self-referential form
+("`…`'s initializer evaluates `…` itself, which has not initialized
+yet") is the one-binding case of the same rule. Creating a closure
 evaluates nothing, so two module-level closures may name each other
 freely; moving one of the cycle's reads inside a closure is the usual
 fix. If the chain runs through a dispatched call, every implementation
-of that method participates — including one your program never
+of that method participates, including one your program never
 instantiates; the message says so when it applies.
 → [Execution](../spec/execution.md)
 
@@ -390,12 +392,12 @@ closure or a UI handler, `match` instead.
 **"context `owner_scope` is read here, but this code can be reached without an enclosing `run`"**
 The most common first UI error: you built reactive state (an `effect`, a
 binding) outside every ownership boundary. Wrap the entry point in
-`mount_root` — or `run_with_owner` in a test.
+`mount_root`, or `run_with_owner` in a test.
 → [Building UI](../guide/ui.md), [Reactive state](../guide/reactive.md)
 
 **"`…` reads context `…`, so it can't be used as a value"**
 A function that reads an ambient context (like the current owner) can't
-be passed around as a plain closure — the context channel would be
+be passed around as a plain closure: the context channel would be
 severed. Wrap it in a closure literal at the use site instead.
 → [Functions & closures](../tour/functions-and-closures.md)
 
@@ -413,7 +415,7 @@ on purpose with `let _ = …`.
 
 ## Wire and rpc
 
-**"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire — …"**
+**"field `…` of `[derive(Wire)]` type `…` is `…`, which is not Wire: …"**
 Something unserializable (a closure, a `Signal`) is inside a payload
 type. Wire types carry data only: scalars, `str`, `bool`,
 `List`/`Option` of Wire, and other Wire types.
@@ -422,13 +424,13 @@ type. Wire types carry data only: scalars, `str`, `bool`,
 **`RpcError::Contract` at connect time**
 Client and server were built from different versions of the service.
 Rebuild both. During development, a *leaked old server* still holding
-the port is the usual culprit — `ss -tlnp | grep <port>` and kill it.
+the port is the usual culprit: `ss -tlnp | grep <port>` and kill it.
 → [Services & RPC](../guide/services.md), [gotchas](gotchas.md)
 
 **`RpcError::Transport("not connected")` / `("connection lost")`**
 The connection is down (fail-fast) or dropped mid-call (in-flight
 rejection). Nothing is retried automatically, because your rpc might
-not be safe to repeat. Retry at the app level if that's correct — a
+not be safe to repeat. Retry at the app level if that's correct; a
 draft's next push already does.
 → [Services & RPC](../guide/services.md)
 
@@ -449,7 +451,7 @@ output (a closure, a host object). Fold values, not behavior.
 
 **A struct literal in a condition parses as the block**
 Struct literals are ordinary operator operands (`Point { … } == q`
-compares), but condition positions exclude them — after `if Foo` or a
+compares), but condition positions exclude them: after `if Foo` or a
 `match` subject, the `{` is the block/arms, by design. Written without
 parentheses, `if p == Point { … } { … }` leaves a bare `Point` as the
 condition's operand, which reports **"`Point` is a type, not a value"**.
@@ -458,9 +460,9 @@ Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 
 **"a string cannot span lines unless it is triple-quoted …"**
 A `"…"` or `i"…"` ran into a line break before its closing quote. Either
-the quote is missing — that is the common case, and the error is reported
-on the string's own line rather than wherever the next `"` happens to be
-— or the text really is multi-line, in which case write it `"""…"""`
+the quote is missing (the common case; the error is reported on the
+string's own line rather than wherever the next `"` happens to be), or
+the text really is multi-line, in which case write it `"""…"""`
 (`i"""…"""` with holes). A single line break inside a one-line string is
 `\n`. Nothing escapes a line break: a trailing `\` does not continue the
 literal onto the next line.
@@ -469,7 +471,7 @@ literal onto the next line.
 **"`Name` is a type, not a value"** (also *"a trait / a type parameter /
 a module, not a value"*)
 A type, trait, type parameter, or module name was used where a value is
-expected (`let q = Point;`). A type names a kind, not a runtime value —
+expected (`let q = Point;`). A type names a kind, not a runtime value:
 construct it (`Point { … }`), name a variant (`Color::Red`), or call a
 static (`Point::new(…)`).
 → [spec §4.2](../spec/names.md)

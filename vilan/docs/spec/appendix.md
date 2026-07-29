@@ -39,7 +39,7 @@ Contextual (identifier everywhere else): `context`, `void`, `self`,
 
 ## A.3 Literal suffixes
 
-`i8 i16 i32 i53 u8 u16 u32 u53 f f32 f64 n` — §2.3 (unknown suffixes
+`i8 i16 i32 i53 u8 u16 u32 u53 f f32 f64 n`: §2.3 (unknown suffixes
 error; `i64`/`u64` were renamed to `i53`/`u53`). Unsuffixed: integer
 → `i32`, fractional → `f64`.
 

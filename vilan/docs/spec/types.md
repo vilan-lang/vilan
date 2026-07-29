@@ -4,32 +4,32 @@
 
 The type forms (grammar §3.9) denote:
 
-- **Nominal types** — structs and enums, possibly generic
+- **Nominal types**: structs and enums, possibly generic
   (`Task`, `Option<i32>`, `Map<str, List<i32>>`). Two nominal types are
-  equal iff they name the same declaration and their arguments are equal
-  — there is no structural typing of nominals.
-- **Primitives** — `bool`, `str`, `i8 i16 i32 i53 u8 u16 u32 u53`,
+  equal iff they name the same declaration and their arguments are
+  equal. There is no structural typing of nominals.
+- **Primitives**: `bool`, `str`, `i8 i16 i32 i53 u8 u16 u32 u53`,
   `f32 f64`, `BigInt`. Declared in std as external structs; nominally
   distinct (no implicit numeric conversions, §5.8).
-- **Tuples** — `(T, U, …)`; structural: equal iff element-wise equal.
+- **Tuples**: `(T, U, …)`; structural: equal iff element-wise equal.
   `()` and one-element tuples do not exist as distinct types (`(T)` is
   `T`; the unit is `void`).
-- **Closure types** — `|T, U| R`, `|| R`, `|| void`; structural in their
+- **Closure types**: `|T, U| R`, `|| R`, `|| void`; structural in their
   parameter and return types. An `async` closure type (§7.4) and a
   `context`-claused type (§8.5) are distinct from their plain
   counterparts.
-- **View types** — `&T`, `&mut T` (§6). Views are second-class: these
+- **View types**: `&T`, `&mut T` (§6). Views are second-class: these
   types appear in parameter and return positions and in short-lived
   locals only.
-- **`void`** — the unit: one value, also written `void`.
-- **`any`** — the dynamic top type, produced at host boundaries; it
+- **`void`**: the unit; one value, also written `void`.
+- **`any`**: the dynamic top type, produced at host boundaries; it
   unifies with every type (absorbing).
-- **`Never`** — the type of diverging expressions (`panic(..)`, `ret ..`,
+- **`Never`**: the type of diverging expressions (`panic(..)`, `ret ..`,
   `jump break`/`continue`). Never unifies by *yielding*: a diverging
   match leg or if branch doesn't constrain the construct's type, and a
-  `Never` value satisfies any expected type. Internal — not written in
+  `Never` value satisfies any expected type. Internal; not written in
   source.
-- **Generics** — a bound type parameter in scope (`T`) is a type; it is
+- **Generics**: a bound type parameter in scope (`T`) is a type; it is
   abstract within its binder's body.
 
 ## 5.2 `null`
@@ -61,13 +61,13 @@ impl type T: Display { … }              // blanket: every T that is Display
 ```
 
 An impl applies to a concrete type when the pattern matches it and every
-binder's bounds hold. Members may be functions (with or without `self`)
-— a function without `self` is a **static**, reached as
+binder's bounds hold. Members may be functions (with or without
+`self`). A function without `self` is a **static**, reached as
 `Subject::name(…)`.
 
 *Implementation note (soundness gap, tracked): a conditional impl's
 bounds are not yet re-checked when the impl is selected through a
-GENERIC bound — `List<B>` can satisfy a `Marker` bound via
+GENERIC bound: `List<B>` can satisfy a `Marker` bound via
 `impl List<type T: Marker>` even when `B` lacks `Marker`. Derive-based
 checks (`Wire`, `Json`) therefore verify field trees syntactically rather
 than through trait bounds.*
@@ -78,7 +78,7 @@ A trait declares required methods (signature-only) and defaults (with
 bodies). `trait X with Y` makes `Y` a supertrait: implementing `X`
 requires `Y`. A trait's generic parameters may carry defaults
 (`trait PartialEq<B = Self>`); `Self` in a trait body denotes the
-implementing type. Traits are used as **bounds**; a trait is not a type —
+implementing type. Traits are used as **bounds**; a trait is not a type:
 `let x: Display` is a compile error (no trait objects).
 
 Trait members resolve on a value when exactly one visible impl provides
@@ -99,7 +99,7 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
 2. A generic mentioned only in the return type is bound by unifying the
    declared return type against the call's expected type
    (`let c: Cell<i32> = Cell::fresh()` binds `T := i32`). Only the
-   **callee's own** binders participate — a caller-side generic
+   **callee's own** binders participate; a caller-side generic
    introduced by substitution is never re-bound against the expectation.
 3. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
@@ -136,7 +136,7 @@ arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 There are **no implicit conversions** between numeric types; use the
 `as_*` methods (value-converting, Rust-`as` semantics). There is **one
 implicit coercion**: a reference to a plain named function coerces to a
-matching closure type —
+matching closure type:
 
 ```vilan,fragment
 let transform: |str| i32 = measure;    // fun measure(text: str): i32
@@ -156,7 +156,7 @@ wrapping closure.
 A generic parameter with a **tuple bound** ranges over tuples:
 `T: (2..)` (arity ≥ 2), `T: (..: Display)` (every element `Display`).
 A **mapped type** `(U in T: F<U>)` denotes the tuple obtained by mapping
-each element `U` of `T` to `F<U>` — `combine`'s signature is the
+each element `U` of `T` to `F<U>`; `combine`'s signature is the
 canonical use:
 
 ```vilan,fragment
@@ -170,7 +170,7 @@ Tuple bounds are **enforced** at every binding site, alongside trait
 bounds: the bound value must be a tuple, its arity must fall inside the
 declared range (endpoints inclusive), and every element must satisfy the
 element bound. A generic parameter forwarded into a tuple-bounded
-position satisfies it only through its own declared tuple bound — a
+position satisfies it only through its own declared tuple bound: a
 contained arity range whose element bound names the same trait or a
 subtrait. *`keyof` and spread parameters are recorded future work.*
 
@@ -183,16 +183,16 @@ yields its region as a value (destructuring reads the same layout).
 
 Both dispatch through lang-item traits and desugar per expression:
 
-- `e!` — **try-assert**. With `v = e` of a type implementing
+- `e!`: **try-assert**. With `v = e` of a type implementing
   `Try<T, B>`: if `v.verdict()` is `Good(t)`, the value is `t`;
   if `Bad(b)`, the enclosing function returns
   `R::from_bad(b)` where `R` is its declared return type (which must
   implement `Try<_, B>` compatibly). `Option` and `Result` implement
   `Try` in std.
-- `e?.m…` — **lift**. With `v = e` of a container type implementing
+- `e?.m…`: **lift**. With `v = e` of a container type implementing
   `Lift` + `Try`: if `v` is good with value `t`, the continuation
   (`.m` and the following plain postfixes, §3.6) applies to `t`; the
-  result re-wraps in the container — unless the continuation itself
+  result re-wraps in the container, unless the continuation itself
   yields the container type, in which case it is returned as-is
   (flattening). If `v` is bad, the container passes through unchanged.
 
@@ -217,7 +217,7 @@ Normative rejection cases (each is a compile error):
   bound …`).
 - A `match` whose VALUE legs' types don't unify. Diverging legs
   (`ret`, `panic`, `jump`) are `Never` and don't participate (§5.1).
-- An `i53`/`i32` operand mix (no implicit widening — suffix the
+- An `i53`/`i32` operand mix (no implicit widening; suffix the
   literal).
 
 *Implementation note (tracked gaps): a closure bound to a local and

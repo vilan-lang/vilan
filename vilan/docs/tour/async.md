@@ -4,7 +4,7 @@
 
 If you know async/await in JavaScript, here is the whole model in one
 line: Vilan keeps the machinery and deletes the keywords. Calling an
-async function just gives you the value. You don't write `await`, you
+async function gives you the value. You don't write `await`, you
 don't mark functions `async`, and you never see `Promise<T>` in a return
 type. The compiler figures out which functions suspend and awaits the
 calls for you.
@@ -33,7 +33,7 @@ The explicit keywords exist for the one thing implicit awaiting can't
 express: *not* waiting.
 
 - `async expr` **spawns**: start the work, don't wait for it. It gives
-  you a `Task<T>` — a handle to the running work.
+  you a `Task<T>`, a handle to the running work.
 - `async { … }` spawns a block.
 - `await task` collects a task you spawned earlier.
 
@@ -55,14 +55,14 @@ fun main() {
 
 So in JS you mark the async case and waiting is explicit. In Vilan you
 mark the *concurrent* case and waiting is the default. Fire-and-forget
-is just spawning and dropping the task: `let _done = async
+is spawning and dropping the task: `let _done = async
 save(entry);`. To wait on many at once, `Task::settle_all(tasks)` from
 `std::task`.
 
 A task's failure can't crash the program from the outside: if the
 spawned work panics, a later `await` receives the panic, and a task
-nobody ever awaits reports the error to the console — with the name of
-the function that spawned it — and execution continues.
+nobody ever awaits reports the error to the console (with the name of
+the function that spawned it) and execution continues.
 
 ## Async closures
 
@@ -70,10 +70,10 @@ This section matters once you store async callbacks. Until then, skim.
 
 A call through a closure *value* can't be seen by the compiler's
 asyncness inference (there's no fixed callee to look at). Two things
-close the gap: the type carries the marker — `async |T| U`, written at
-any contract position — and unannotated bindings *adopt* asyncness from
-the closure they hold. Calls through either are awaited implicitly,
-like direct calls.
+close the gap: the type carries the marker (`async |T| U`, written at
+any contract position), and unannotated bindings *adopt* asyncness
+from the closure they hold. Calls through either are awaited
+implicitly, like direct calls.
 
 ```vilan,fragment
 // 1. An async-friendly callback parameter — sync closures pass fine too
@@ -92,7 +92,7 @@ fun make(): async || i32
 
 The marker is accepted at parameters, `let` annotations, struct fields,
 and function return types. An unannotated `let` (or a `mut`, through
-every rebind) holding an async closure needs no marker at all — the
+every rebind) holding an async closure needs no marker at all: the
 binding adopts the closure's asyncness.
 [Functions & closures](functions-and-closures.md) covers the same seams
 from the closure side.
@@ -101,8 +101,8 @@ from the closure side.
 
 A plain, value-returning closure **parameter** does something better
 than refuse: it *adapts*. Passing an async closure instantiates an
-async copy of the function — its calls through the parameter are
-awaited — while every sync call site keeps the untouched original.
+async copy of the function (its calls through the parameter are
+awaited), while every sync call site keeps the untouched original.
 `map` is one function, not two:
 
 ```vilan,norun
@@ -122,7 +122,7 @@ fun main() {
 ```
 
 The contract is **sequential**: each callback settles before the next
-begins — a 100-element `map` whose callback takes a second takes a
+begins, so a 100-element `map` whose callback takes a second takes a
 hundred seconds. When the elements are independent, opt into
 concurrency by starting them all first:
 
@@ -143,8 +143,8 @@ fun main() {
 }
 ```
 
-An adapting function traverses a *snapshot* of its receiver — the list
-as of the call — so work interleaved during the awaits can't tear the
+An adapting function traverses a *snapshot* of its receiver (the list
+as of the call), so work interleaved during the awaits can't tear the
 iteration. Adaptation follows the closure through plain parameters
 (`fun helper(xs, f) { xs.map(f) }` adapts end-to-end), but it cannot
 cross a host (`external`) boundary or a trait/generic dispatch, and it
@@ -166,7 +166,7 @@ flowing where a plain closure type is declared on a struct **field** or
 a function's declared **return type** is a compile error if that
 closure returns a value, because the reader would receive a promise
 disguised as the value (declare the field or return `async || T`
-instead). If it returns `void`, it's allowed anywhere — the call just
+instead). If it returns `void`, it's allowed anywhere; the call
 becomes fire-and-forget. That's why UI event handlers can await freely
 with no ceremony.
 
@@ -202,7 +202,7 @@ fun main() {
 The contract:
 
 - **Everything joins.** `nursery(body)` returns only when the body *and
-  every task spawned in its dynamic extent* have settled — spawns made
+  every task spawned in its dynamic extent* have settled: spawns made
   by the body, by functions it calls, and by the tasks themselves
   (grandchildren). No plumbing: the extent is ambient, like a context.
 - **The value passes through.** The nursery's value is the body's
@@ -211,7 +211,7 @@ The contract:
   that failure is the nursery's; otherwise the earliest-settled task
   failure is, re-raised from the `nursery` call with the name of the
   function that spawned the task. Either way the other tasks are
-  observed and their failures discarded — a losing task can never crash
+  observed and their failures discarded; a losing task can never crash
   the program later.
 
 ### Cancellation
@@ -241,8 +241,8 @@ fun main() {
 ```
 
 `n.cancel()` fires the nursery's host `AbortSignal`. std's IO carries
-that signal automatically — a `sleep` or an in-flight `fetch` inside
-the extent rejects promptly instead of running out — and those
+that signal automatically (a `sleep` or an in-flight `fetch` inside
+the extent rejects promptly instead of running out), and those
 cancellation rejections are *echoes*, absorbed at the join rather than
 treated as failures. The first real failure cancels the same way, so
 one task's error stops its siblings' work early. Details:
@@ -251,7 +251,7 @@ one task's error stops its siblings' work early. Details:
   (cancellable) suspension. Pure-compute loops can poll
   `n.is_cancelled()` between chunks.
 - Code after `n.cancel()` in the body still runs, and the body's value
-  is still returned — cancel kills the *children*, not the body. (If
+  is still returned: cancel kills the *children*, not the body. (If
   the body itself is suspended on IO when cancellation lands, that IO
   rejects and the cancellation becomes the nursery's outcome.)
 - Nurseries nest: an outer cancel reaches every inner nursery's IO.
@@ -267,7 +267,7 @@ From `std::time`: `sleep_for(duration)` and `sleep(millis)` suspend.
 `Duration::millis/seconds/minutes/hours/days` build durations. `now()`
 reads the clock.
 
-A `Timer` is a delay you keep hold of — it starts on construction, and
+A `Timer` is a delay you keep hold of. It starts on construction, and
 you either wait for its verdict or call it off:
 
 ```vilan
@@ -292,15 +292,15 @@ Details in the [time reference](../std/time.md).
 - **No hidden concurrency.** Everything waits, in order, unless you
   spawn. Same single-threaded event loop as JS underneath.
 - **No views across a suspension.** A `&`/`&mut` view held across an
-  await is rejected. Re-derive after — see
+  await is rejected. Re-derive after; see
   [the memory model](memory-model.md).
 
 ## Traps
 
-- On node, **the process exits when nothing is left to do**: once
+- On Node, **the process exits when nothing is left to do**: once
   `main` finishes, only live host handles (a running timer, a socket, a
   listening server) keep it alive. A dropped task that is merely
-  *pending* — awaiting something that will never wake — is silently
+  *pending* (awaiting something that will never wake) is silently
   abandoned at exit, and whether a spawn outlives `main` depends on
   what it holds. Joining spawns in a nursery makes the question moot; a
   long-lived client must keep `main` open by awaiting something that

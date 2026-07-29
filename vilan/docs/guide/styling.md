@@ -5,8 +5,8 @@ You build a `Style` value in code, the compiler evaluates it during the
 build and writes real CSS rules into your bundle's `.css` file, and at
 runtime the style is nothing but a set of class names on an element.
 
-If you've used Tailwind, the feel is similar — small composable pieces, a
-spacing scale, color ramps — except the pieces are typed function calls,
+If you've used Tailwind, the feel is similar (small composable pieces, a
+spacing scale, color ramps), except the pieces are typed function calls,
 so a typo is a compile error instead of a silently-ignored class.
 
 ```vilan,browser
@@ -32,7 +32,7 @@ fun main() {
 
 - `style()` starts an empty style. Every method fills one property and
   returns the new style, so you chain.
-- Styles are built inside `const` — that's the compile-time evaluation
+- Styles are built inside `const`, the compile-time evaluation
   prefix (see [Macros & const](../tour/macros-and-const.md)). The rules
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
@@ -40,7 +40,7 @@ fun main() {
 At runtime you can still *select and combine* styles you already built.
 `a + b` merges two styles (per property, the right side wins), and
 picking one of two styles in an `if` is fine. What you can't do is
-construct new rules at runtime — a bare `style()` chain outside `const`
+construct new rules at runtime: a bare `style()` chain outside `const`
 is a compile error. That restriction is what keeps the CSS static and
 the bundle predictable.
 
@@ -89,7 +89,7 @@ Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
 `.last`, `.dark` (dark mode via `prefers-color-scheme`), and
 `.pseudo(name, inner)` for anything else. Breakpoints work the same way:
 `.sm(inner)` (640px), `.md(inner)` (768px), `.lg(inner)` (1024px),
-`.xl(inner)` (1280px), or `.media(min_width, inner)` — all `min-width`
+`.xl(inner)` (1280px), or `.media(min_width, inner)`. All are `min-width`
 conditions, so chains are mobile-first: in
 `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching breakpoint wins
 (the stylesheet emits media rules in ascending min-width order, which is
@@ -125,7 +125,7 @@ This one channel covers most "dynamic styling" needs; for the rest,
 
 > **Going deeper.** Each property-under-a-condition becomes one atomic
 > CSS rule with a generated class name, deduplicated across the whole
-> build — two styles that both say `padding(space(4))` share one class.
+> build: two styles that both say `padding(space(4))` share one class.
 > `styled` sets `class_list()`, the space-joined class names. A
 > breakpoint can't wrap another media-conditioned style (you'll get a
 > compile-time panic saying so).

@@ -351,7 +351,7 @@ impl<'p, 'src> State<'p, 'src> {
                     note: None,
                     span: self.span_of(site),
                     msg: format!(
-                        "{name} is compile-time-only — evaluate this call inside a `const` \
+                        "{name} is compile-time-only; evaluate this call inside a `const` \
                          expression"
                     ),
                 },

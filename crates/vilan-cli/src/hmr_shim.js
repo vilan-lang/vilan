@@ -48,7 +48,7 @@
     // evaluation, so that is once per key per swap.
     function note(key) {
         if (typeof console !== "undefined" && console.info) {
-            console.info("[vilan] hmr: `" + key + "` changed shape — reinitialized");
+            console.info("[vilan] hmr: `" + key + "` changed shape, reinitialized");
         }
     }
 
@@ -267,7 +267,7 @@
     // `textContent`, so a diagnostic containing `<`/`>` can never inject markup.
     function showOverlay(message) {
         removeOverlay();
-        message = message || "build failed — see the terminal";
+        message = message || "build failed; see the terminal";
         var lines = message.split("\n");
         var count = 0;
         for (var i = 0; i < lines.length; i++) {
@@ -295,7 +295,7 @@
             "padding:12px 16px;background:#1e1e24;border-bottom:1px solid #2c2c34;";
         var title = document.createElement("span");
         title.style.cssText = "color:#ff6169;font-weight:600;letter-spacing:0.02em;";
-        title.textContent = "vilan — build failed";
+        title.textContent = "vilan: build failed";
         header.appendChild(title);
         if (count > 0) {
             var badge = document.createElement("span");
@@ -329,7 +329,7 @@
         hint.style.cssText =
             "padding:10px 16px;background:#1e1e24;border-top:1px solid #2c2c34;" +
             "color:#8a8a95;font-size:12px;";
-        hint.textContent = "Fixed on next save — this clears on the next successful build.";
+        hint.textContent = "Fixed on next save; this clears on the next successful build.";
         panel.appendChild(hint);
 
         backdrop.appendChild(panel);

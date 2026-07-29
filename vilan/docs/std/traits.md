@@ -1,4 +1,4 @@
-# Core traits — reference
+# Core traits reference
 
 The traits behind the operators and the derive set: `std::compare`,
 `std::default`, `std::operators`.
@@ -32,7 +32,7 @@ trait Ord with Eq + PartialOrd {
 
 - `==`/`!=` dispatch through `PartialEq`; `<`/`<=`/`>`/`>=` through
   `PartialOrd`. Numbers, `str`, and `bool` implement them in std.
-- For your own types, `[derive(PartialEq)]` gives structural equality —
+- For your own types, `[derive(PartialEq)]` gives structural equality,
   the usual path. Implement `PartialOrd`/`Ord` by hand when ordering is
   meaningful (`Instant` does this in std).
 - The `B = Self` parameter allows cross-type comparison impls; you'll
@@ -50,7 +50,7 @@ Zero for numbers, `""` for `str`, `false` for `bool`.
 `[derive(Default)]` composes fields' defaults. Used as a bound by helpers
 like `unwrap_or_default` and `List.sum`.
 
-## std::operators — the operator traits
+## std::operators: the operator traits
 
 Each operator dispatches through a trait; implement the trait, get the
 operator:
@@ -63,7 +63,7 @@ operator:
 | `Div` | `/` | | `BitOr` | `\|` |
 | `Rem` | `%` | | `BitXor` | `^` |
 
-The `B = Self` parameter types the right-hand side — mixed-operand impls
+The `B = Self` parameter types the right-hand side; mixed-operand impls
 are how std's `Instant + Duration` works:
 
 ```vilan
@@ -87,10 +87,10 @@ fun main() {
 }
 ```
 
-Compound assignment (`+=`, `/=`, …) rides the same impls. Note: the
+Compound assignment (`+=`, `/=`, …) rides the same impls. The
 operator's result type is `Self` (the left operand's type).
 
-## std::operators — `Try` and `Lift`
+## std::operators: `Try` and `Lift`
 
 The machinery behind `!` and `?.`
 ([control flow](../tour/control-flow.md)):

@@ -529,7 +529,7 @@ impl OverlayDiagnostic {
 pub fn render_overlay(leg_file: &str, diagnostics: &[OverlayDiagnostic], cap: usize) -> String {
     use std::fmt::Write;
     let shown = diagnostics.len().min(cap);
-    let mut out = format!("{leg_file} — {} error", diagnostics.len());
+    let mut out = format!("{leg_file}: {} error", diagnostics.len());
     if diagnostics.len() != 1 {
         out.push('s');
     }
@@ -790,7 +790,7 @@ mod tests {
         let rendered = render_overlay("src/app.vl", &diagnostics, OVERLAY_DIAGNOSTIC_CAP);
         assert_eq!(
             rendered,
-            "src/app.vl — 2 errors\n\n\
+            "src/app.vl: 2 errors\n\n\
              src/app.vl:2:10\n\
              cannot find `broken` in this scope\n\
              \x20   note: declared nowhere\n\n\
@@ -819,7 +819,7 @@ mod tests {
         let rendered = render_overlay("src/main.vl", &diagnostics, OVERLAY_DIAGNOSTIC_CAP);
         assert_eq!(
             rendered,
-            "src/main.vl — 1 error\n\n\
+            "src/main.vl: 1 error\n\n\
              src/helper.vl:2:10\n\
              cannot find `broken` in this scope"
         );
@@ -837,7 +837,7 @@ mod tests {
             })
             .collect();
         let rendered = render_overlay("a.vl", &diagnostics, 20);
-        assert!(rendered.starts_with("a.vl — 25 errors\n"));
+        assert!(rendered.starts_with("a.vl: 25 errors\n"));
         assert!(rendered.contains("a.vl:1:1\nproblem 0"));
         assert!(rendered.contains("a.vl:1:1\nproblem 19"));
         assert!(!rendered.contains("problem 20"));

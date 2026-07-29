@@ -852,7 +852,7 @@ enum IStringEnd {
 /// The rule an unescaped `}` in an interpolated string breaks. Curated
 /// (diagnostics-standard.md B6): the braces are the hole's, and the sanctioned
 /// spelling of a literal one is named.
-const UNESCAPED_BRACE: &str = "a literal `}` inside an interpolated string is written `\\}` — an unescaped \
+const UNESCAPED_BRACE: &str = "a literal `}` inside an interpolated string is written `\\}`: an unescaped \
      brace belongs to a `{expr}` hole";
 
 /// The rule a raw line break inside a `"…"` or `i"…"` breaks. Curated
@@ -861,7 +861,7 @@ const UNESCAPED_BRACE: &str = "a literal `}` inside an interpolated string is wr
 /// deliberate multi-line literal and a closing quote the author forgot — because
 /// the lexer cannot tell them apart, and "close it" is the fix for one while the
 /// triple-quoted forms are the fix for the other.
-const LINE_BREAK_IN_STRING: &str = "a string cannot span lines unless it is triple-quoted — close it before the line break; \
+const LINE_BREAK_IN_STRING: &str = "a string cannot span lines unless it is triple-quoted: close it before the line break; \
      multi-line text goes in `\"\"\"…\"\"\"` (`i\"\"\"…\"\"\"` when interpolating), and a single \
      line break is written `\\n`";
 

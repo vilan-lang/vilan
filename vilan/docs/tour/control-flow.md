@@ -55,9 +55,9 @@ let present = entry.map(|current| current is Some(let _task));
 One edge to know: a `match` can't sit directly inside a larger operator
 expression. Bind it to a local first.
 
-Arms that never produce a value — a `ret`, a `panic`, a
-`jump break`/`continue` — simply don't participate in the match's type.
-The other arms decide it:
+Arms that never produce a value (a `ret`, a `panic`, a
+`jump break`/`continue`) don't participate in the match's type. The
+other arms decide it:
 
 ```vilan,fragment
 let value = match slot {
@@ -114,15 +114,15 @@ fun parse(path: str): Route {
 
 Vilan has no `null` and no exceptions. Instead:
 
-- A value that might be absent is an `Option<T>` — either `Some(value)`
+- A value that might be absent is an `Option<T>`: either `Some(value)`
   or `None`.
-- An operation that might fail is a `Result<T, E>` — either `Ok(value)`
+- An operation that might fail is a `Result<T, E>`: either `Ok(value)`
   or `Err(error)`.
 
 Both are plain enums with a rich set of helper methods (`unwrap_or`,
-`map`, `is_some`, and friends — the
-[full list](../std/option-result.md)). You can always just `match` on
-them. Two operators make the common patterns short.
+`map`, `is_some`, and friends; the
+[full list](../std/option-result.md)). You can always `match` on them.
+Two operators make the common patterns short.
 
 **`!` unwraps, or propagates the failure.** Think of it as "give me the
 value, and if there isn't one, return the failure from this function":
@@ -156,8 +156,9 @@ fun main() {
 This is what `try`/`catch` becomes: failures travel up through return
 types, visibly, and the caller decides what to do.
 
-`!` returns the failure **as-is**, so the value's error type must already
-be the function's — Vilan doesn't convert it behind your back. When the
+`!` returns the failure **as-is**, so the value's error type must
+already be the function's: Vilan doesn't convert it behind your back.
+When the
 types differ, convert at the value, before the `!`: `.map_err(…)` changes
 a `Result`'s error, and `.ok_or(err)` turns an `Option`'s `None` into an
 `Err` you supply.
@@ -189,7 +190,7 @@ fun main() {
 ```
 
 **`?.` reaches inside the container.** It looks like optional chaining
-from JS, and on `Option` it plays the same role — with the compiler
+from JS, and on `Option` it plays the same role, with the compiler
 checking it:
 
 ```vilan
@@ -219,7 +220,7 @@ and wrap it back up; if it's `None`, stay `None`. It works on `Result`
 too, passing an `Err` through untouched.
 
 **A bare `?` lifts a whole expression.** Where `?.` continues a member
-chain, a `?` on its own lifts the rest of the surrounding expression —
+chain, a `?` on its own lifts the rest of the surrounding expression,
 operators included:
 
 ```vilan
@@ -236,13 +237,13 @@ fun main() {
 }
 ```
 
-With two `?`s the region is good only when every receiver is — and it
+With two `?`s the region is good only when every receiver is. It
 short-circuits left to right, so a receiver right of a `None`/`Err`
 never evaluates (like `&&`). On `Result`, the first `Err` wins and
 passes through unchanged, which also means every `Result` receiver in
 one expression must carry the same error type (convert first with
-`.map_err(…)`). The lift stops at natural boundaries: a call argument,
-a struct field, parentheses — `describe(status?)` is an error rather
+`.map_err(…)`). The lift stops at natural boundaries (a call argument,
+a struct field, parentheses): `describe(status?)` is an error rather
 than something spooky, and `(a? + 1) * 2` seals the lift inside the
 parens. A `?` in an `if` condition is rejected too: the condition
 would become an `Option<bool>`, so `match` on the lifted value
@@ -254,12 +255,12 @@ instead.
 > two-outcome type can implement them and join in. A `?.` continuation
 > that itself produces the container flattens instead of nesting, so
 > `find(key)?.shelf()` on an `Option`-returning method stays a single
-> `Option`. (A bare `?` lifts the std pair only for now — a user `Lift`
+> `Option`. (A bare `?` lifts the std pair only for now; a user `Lift`
 > container lifts through `?.` chains.)
 
 ## Panics and asserts
 
 `panic(message)` stops the program with a message. Use it for states
-that should be impossible, not for expected failures — those are
+that should be impossible, not for expected failures; those are
 `Result`s. `assert(condition, message)` panics when the condition is
 false, and it's how `vilan test` decides a test failed.

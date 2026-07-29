@@ -22,7 +22,7 @@ fun main() {
 
 Literal fields use `=`, not `:`. When a field's value is a binding with
 the same name, you can write it once: `Task { id, name }`. There are no
-field defaults — `derive(Default)` (below) covers the all-defaults case.
+field defaults; `derive(Default)` (below) covers the all-defaults case.
 
 If you're coming from TypeScript: a struct is like an interface plus an
 object literal in one, except it's a real nominal type. Two structs with
@@ -58,11 +58,12 @@ fun main() {
 
 `match` takes the value apart, and the compiler checks that you handled
 every variant. Add a variant later and every `match` that misses it
-becomes a compile error — that's the feature.
+becomes a compile error. That's the feature.
 
-`Option` and `Result` are ordinary enums from std. No special cases.
+`Option` and `Result` are ordinary enums from std, with no special
+cases.
 
-## impl — methods and statics
+## impl: methods and statics
 
 Methods live in `impl` blocks, separate from the data:
 
@@ -130,7 +131,7 @@ fun main() {
 }
 ```
 
-Note the impl-side syntax: `impl Pair<type T: PartialOrd>`. The `type T`
+The impl-side syntax is `impl Pair<type T: PartialOrd>`. The `type T`
 declares the parameter at the impl, and the bound says these methods
 exist only when `T` can be compared.
 
@@ -172,15 +173,15 @@ fun main() {
 }
 ```
 
-Traits are like interfaces, with two differences worth knowing. They're
-implemented explicitly (`impl Robot with Greet`), never structurally.
-And they appear as *bounds* on generics (`T: Greet`) rather than as
-standalone types — `let x: Greet = …` is a compile error. When you want
+Traits are like interfaces, with two differences. They're implemented
+explicitly (`impl Robot with Greet`), never structurally. And they
+appear as *bounds* on generics (`T: Greet`) rather than as standalone
+types: `let x: Greet = …` is a compile error. When you want
 "one of several things at runtime", use an enum.
 
 Operators are traits too. `+` dispatches through `Add`, `==` through
 `PartialEq`, `<` through `PartialOrd`, and so on. Implement the trait and
-your type gets the operator. `std::time` does exactly this so that
+your type gets the operator. `std::time` does this so that
 `instant + duration` works.
 
 ## Derives
@@ -191,7 +192,7 @@ write the boilerplate:
 | Derive | Gives you |
 |---|---|
 | `PartialEq` | structural `==` |
-| `Debug` | `.debug()` — a developer-facing rendering |
+| `Debug` | `.debug()`: a developer-facing rendering |
 | `Default` | `Default::default()` built from the fields' defaults |
 | `Hashable` | usability as a `Map` key or `Set` member (`std::hash`) |
 | `Json` | JSON encode/decode (`std::json`) |
@@ -219,6 +220,6 @@ The standard shape for a type that crosses the wire is
 `[derive(Wire, PartialEq, Debug)]`.
 
 > **Going deeper.** Derives are ordinary macros, and you can write your
-> own — see [Macros & const](macros-and-const.md). `Wire` and `Json`
+> own; see [Macros & const](macros-and-const.md). `Wire` and `Json`
 > check that every field is itself serializable, recursively, and report
 > at the derive site when one isn't.

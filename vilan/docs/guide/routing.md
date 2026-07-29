@@ -112,8 +112,8 @@ coercion from [the tour](../tour/functions-and-closures.md).)
 
 `View.swap(route, render)` is the page container. When the route
 changes, it tears down the old page (disposing all its bindings) and
-builds the new one. When the route *doesn't* change — say the user
-clicks a link to the page they're on — nothing happens at all. That's
+builds the new one. When the route *doesn't* change (say the user
+clicks a link to the page they're on), nothing happens at all. That's
 why route enums derive `PartialEq`.
 
 Nesting works the way you'd hope: the workspace page can `swap` on its
@@ -161,7 +161,7 @@ serve_service(4000, protocol, |request| {
 
 On the client side, a deep-linked page usually needs data that hasn't
 synced yet. Mount it under `when(present)` so it appears when the data
-does — see [Services & RPC](services.md).
+does (see [Services & RPC](services.md)).
 
 ## Traps
 

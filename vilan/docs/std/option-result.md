@@ -1,10 +1,10 @@
-# Option & Result — reference
+# Option & Result reference
 
 `Option<T>` is how Vilan says "maybe a value" (there is no `null`), and
 `Result<T, E>` is how it says "this can fail" (there are no exceptions).
 Both are plain enums with a large helper-method surface, listed here. For
-how they replace `null` checks and `try`/`catch` in practice — including
-the `!` and `?.` operators — read [Control flow](../tour/control-flow.md)
+how they replace `null` checks and `try`/`catch` in practice (including
+the `!` and `?.` operators), read [Control flow](../tour/control-flow.md)
 first.
 
 ```vilan,fragment
@@ -66,7 +66,7 @@ impl Option<(type T, type U)> { fun unzip(self): (Option<T>, Option<U>) }
 `take` and `replace` mutate the `Option` in place through `&mut self`: `take`
 swaps `None` in and hands the old contents back, `replace` swaps a new value in
 and hands the old back. Both leave a valid `Option` behind, which is what makes
-them the sanctioned way to move a value *out* of a place — for a `resource` this
+them the sanctioned way to move a value *out* of a place. For a `resource` this
 is the only legal partial move (`self.slot.take()`), and `match opt.take() {
 Some(let c) => drop(c), None => {} }` is the conditional-teardown idiom.
 
@@ -140,9 +140,9 @@ fun main() {
 }
 ```
 
-- Prefer `!` (propagate) and `unwrap_or*` over `unwrap` — `unwrap` is for
+- Prefer `!` (propagate) and `unwrap_or*` over `unwrap`: `unwrap` is for
   invariants, and it panics.
-- Application errors belong in `Result`'s `E`; only truly unreachable
+- Application errors belong in `Result`'s `E`; only unreachable
   states panic.
 - `match` with `Some(let x)` / `Ok(let x)` patterns is always available
-  when the method chain gets clever — clarity beats cleverness.
+  when the method chain gets clever. Clarity beats cleverness.

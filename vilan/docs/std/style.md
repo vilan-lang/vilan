@@ -1,4 +1,4 @@
-# std::style — reference
+# std::style reference
 
 Typed, compile-time atomic styles. Concepts and the emission model: the
 [styling guide](../guide/styling.md).
@@ -104,7 +104,7 @@ fun media(self, min_width: str, inner: Style): Style
 
 A breakpoint cannot wrap an already-media-conditioned style (panics at
 compile-time evaluation). Media rules emit in ascending min-width order,
-so a chain like `.sm(x).lg(y)` is mobile-first — the widest matching
+so a chain like `.sm(x).lg(y)` is mobile-first: the widest matching
 breakpoint wins.
 
 ## Runtime-legal operations

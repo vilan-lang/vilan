@@ -1,4 +1,4 @@
-# std::reactive — reference
+# std::reactive reference
 
 Signals, effects, ownership, turns, and the higher-level cells. Concepts and
 usage patterns: the [reactive guide](../guide/reactive.md).
@@ -54,7 +54,7 @@ impl Signal<Signal<type U>> {
   outside any turn it notifies immediately.
 - `map`'s result is a live derived signal; its internal subscription is
   unowned (lives as long as the source).
-- `effect` requires an ambient owner — calling it outside every owner is a
+- `effect` requires an ambient owner; calling it outside every owner is a
   compile error (context coverage). It fires once immediately.
 - `sub` does **not** fire immediately, and its `Subscription` is yours to
   dispose (or hand to `owner.take`).
@@ -113,7 +113,7 @@ fun comp<T>(body: (sync || T) context owner_scope): (T, Owner)     // fresh owne
 ```
 
 `body` parameters marked `context owner_scope` receive the ambient owner
-implicitly — your component functions thread ownership without mentioning it.
+implicitly: your component functions thread ownership without mentioning it.
 Establish owners at **disposal boundaries** (places where a subtree can die),
 not per object; in UI code the framework's boundaries (`mount_root`,
 `bind_each` rows, `when`/`swap` bodies) already do this.
@@ -132,8 +132,8 @@ fun flush()                                             // drain the ambient tur
 Inside a turn, signal writes are recorded and each subscriber runs once with
 final values when the turn settles. The body is asyncness-polymorphic (spec
 §7.4): a synchronous body settles at the end of its synchronous extent, and
-an awaiting body holds every notification until it fully completes — a
-transaction. Framework boundaries establish turns for you: UI event handlers
+an awaiting body holds every notification until it fully completes (a
+transaction). Framework boundaries establish turns for you: UI event handlers
 and `mount_root` (`AtSuspension`), RPC service handlers (`AtEnd`). Writes
 landing after a settle (from spawned work) drain in per-segment microtasks.
 
@@ -145,7 +145,7 @@ fun optimistic<T, E>(signal: Signal<T>, value: T, commit: async || Result<T, E>)
 
 Paint `value` into `signal` now, await `commit`, then reconcile: the
 confirmed value on `Ok`, the previous value **rolled back** on `Err`. Returns
-the outcome for error UX. For continuous editing, use `draft` instead —
+the outcome for error UX. For continuous editing, use `draft` instead:
 rollback is wrong mid-typing.
 
 ## Draft — local-first cells
@@ -175,7 +175,7 @@ impl Draft<type T: PartialEq> {
   parameter is `async`-typed so an RPC-calling closure flows in directly; a
   plain synchronous closure works too.
 - `push` is per-keystroke-safe: local-first (never waits on the wire), and a
-  generation counter ensures only the **newest** push settles `state` —
+  generation counter ensures only the **newest** push settles `state`:
   a slow older commit landing late is discarded.
 - `adopt` rules: value equal to the last synced value (an **echo** of your
   own push) → no-op; **clean** local (no unpushed edits) → adopt into
@@ -184,9 +184,9 @@ impl Draft<type T: PartialEq> {
 - On failure, `state` carries the reason and `local` keeps the user's text;
   the next `push` retries naturally.
 
-UI wiring: `View.bind_draft(draft)` — see the [browser reference](browser.md).
+UI wiring: `View.bind_draft(draft)`; see the [browser reference](browser.md).
 
-## reconcile — keyed list diffing
+## reconcile: keyed list diffing
 
 ```vilan,fragment
 enum RowStep {

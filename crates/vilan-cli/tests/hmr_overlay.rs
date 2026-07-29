@@ -68,7 +68,7 @@ hmr.handleEvent({{ kind: "error", version: 1, message: "src/app.vl:2:10\ncannot 
 const overlay = document.getElementById("__vilan_hmr_overlay__");
 check(!!overlay, "an error event shows the overlay");
 const text = overlay ? overlay.allText() : "";
-check(text.includes("vilan — build failed"), "the overlay has the header bar");
+check(text.includes("vilan: build failed"), "the overlay has the header bar");
 check(text.includes("cannot find `x` in this scope"), "the overlay carries the real diagnostic message");
 check(text.includes("src/app.vl:2:10"), "the overlay shows the file:line:col");
 check(text.includes("note: declared nowhere"), "the overlay shows the note");

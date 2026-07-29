@@ -1,8 +1,8 @@
 # Coming from JavaScript
 
-Vilan compiles to JavaScript and runs on node and in the browser. If you
-know JS or TypeScript, most of the syntax will feel familiar. A handful of
-ideas are genuinely different, though. This page is the five-minute
+Vilan compiles to JavaScript and runs on Node and in the browser. If you
+know JS or TypeScript, most of the syntax will feel familiar. A handful
+of ideas are different, though. This page is the five-minute
 orientation. Each topic links to the chapter that teaches it properly.
 
 ## The three big shifts
@@ -43,7 +43,7 @@ sound.
 
 **3. `await` is implicit.**
 
-Calling an async function just gives you the value. You don't write
+Calling an async function gives you the value. You don't write
 `await`, you don't see `Promise<T>` in return types, and a function
 becomes async automatically when it calls something async. You only reach
 for the explicit keywords when you *don't* want to wait. The
@@ -90,5 +90,5 @@ library is small and imported explicitly, so files start with a few
 Read [Hello Vilan](hello-vilan.md) to get a program running, then follow
 the tour in order. When you start building UI or talking to a server, the
 [guides](../guide/) take over. And whenever something surprises you, check
-the [gotchas page](../appendix/gotchas.md) — if it surprised us first, it
+the [gotchas page](../appendix/gotchas.md): if it surprised us first, it
 is written down there.

@@ -1,17 +1,17 @@
-# Notes — the docs walkthrough app
+# Notes: the docs walkthrough app
 
 The app the book's [full-stack walkthrough](../../docs/guide/walkthrough.md)
-builds, chapter by chapter: **Notes** — sign in, a note list that syncs live
-between browser windows, and an editor that saves as you type. Every snippet in
+builds, chapter by chapter: **Notes**, with sign-in, a note list that syncs
+live between browser windows, and an editor that saves as you type. Every snippet in
 that chapter is quoted from the files here, and the test suite builds this
 example on every run, so the chapter cannot quietly rot.
 
 ## The shape
 
-**One package, two entries** — the default full-stack shape (see
+One package, two entries, the default full-stack shape (see
 [Platforms](../../docs/tour/platforms.md)). The browser client and the Node
 server build from the same source tree; platform coloring keeps each entry
-honest about what it actually reaches, so there is no workspace, no `common`
+honest about what it reaches, so there is no workspace, no `common`
 library, and no path dependency to wire up.
 
 ```toml
@@ -41,7 +41,7 @@ walkthrough/
 `src/store.vl` uses `std::db` and `node:crypto` freely even though the browser
 entry imports `NotesClient` from it: only the *generated* stub crosses, and the
 server-colored bodies are unreachable from the client entry. That is the whole
-argument for this shape — the compiler sorts the platforms out, so you don't
+argument for this shape: the compiler sorts the platforms out, so you don't
 have to split the tree to do it.
 
 ## Run
@@ -53,7 +53,7 @@ vilan run .             # builds both entries, then starts the server
 ```
 
 Open two browser windows side by side. Sign in, add a note in one window, and
-watch it appear in the other. Open a note and type — the other window follows
+watch it appear in the other. Open a note and type; the other window follows
 keystroke by keystroke.
 
 Or build without running:

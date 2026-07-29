@@ -343,7 +343,7 @@ fn the_dev_channel_drives_the_watch_round() {
              not the generic fallback: {error_event}"
         );
         assert!(
-            !error_event.contains("build failed — see the terminal"),
+            !error_event.contains("build failed; see the terminal"),
             "the generic fallback string must be gone now that real text is threaded: {error_event}"
         );
         // Terminal-unchanged A/B: the SAME diagnostic is still rendered to the
@@ -929,7 +929,7 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
         );
         // The leg's entry still heads the overlay — it names which build failed.
         assert!(
-            error_event.contains("client.vl — 1 error"),
+            error_event.contains("client.vl: 1 error"),
             "the overlay header should still name the failing leg: {error_event}"
         );
     }));

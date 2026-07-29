@@ -1,4 +1,4 @@
-# Encoding — reference
+# Encoding reference
 
 JSON (`std::json`), the codec-agnostic wire layer (`std::wire`), the binary
 codec (`std::binary`), raw bytes (`std::bytes`), and base64
@@ -25,8 +25,8 @@ trait FromJson {                              // decode
 Encoding (`to_json`) is total, but **decoding is fallible**: the input is
 untrusted, so a missing field, a wrong-shaped value, or text that isn't
 JSON is a decode error rather than silent garbage or a crash. Both
-`from_json(text)` and `from_json_value(value)` return `Result<Self, str>`
-— handle it with `!`, `match`, or `is Ok(..)`:
+`from_json(text)` and `from_json_value(value)` return `Result<Self, str>`;
+handle it with `!`, `match`, or `is Ok(..)`:
 
 ```vilan
 import std::print;
@@ -75,12 +75,12 @@ value.is_null(): bool
 
 The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 
-- `trait Serialize` / `trait Deserialize` — visitor-style value
+- `trait Serialize` / `trait Deserialize`: visitor-style value
   description (`begin_struct`/`field`/`str_value`/`i53_value`/…). The
   wire scalars: `str`, `bool`, `i32`, `u32`, `i53`, `f64` (+ lists,
   options, structs, enum variants).
-- `Frame` — one encoded message.
-- `Codec` — a matched writer/reader pair: `json_codec()` (`std::json`,
+- `Frame`: one encoded message.
+- `Codec`: a matched writer/reader pair, `json_codec()` (`std::json`,
   readable) or `binary_codec()` (`std::binary`, compact). Client and
   server must agree.
 
@@ -90,7 +90,7 @@ types with a custom encoding.
 
 ## Bytes
 
-An immutable-length byte array (`Uint8Array` underneath) — the currency of
+An immutable-length byte array (`Uint8Array` underneath), the currency of
 the binary codec, crypto, and websockets:
 
 ```vilan,fragment
@@ -112,7 +112,7 @@ fun decode_utf(bytes: Bytes): str
 ```
 
 Lower still: `ByteBuffer`/`DataView` (host ArrayBuffer access,
-`read_f64`/`write_f64`) — the binary codec's float channel.
+`read_f64`/`write_f64`), the binary codec's float channel.
 
 ## Binary codec (`std::binary`)
 
@@ -123,12 +123,12 @@ fun decode_binary<T: Wire>(bytes: Bytes): T
 struct BinaryWriter { … }   // write_byte / write_i32 / write_str / finish(): Bytes
 ```
 
-Same model as JSON, compact layout. `i53` values ride as f64 bit patterns —
+Same model as JSON, compact layout. `i53` values ride as f64 bit patterns,
 exact to 2^53.
 
 ## Base64 (`std::base64`)
 
-URL-safe alphabet, no padding — the JWT flavor:
+URL-safe alphabet, no padding (the JWT flavor):
 
 ```vilan,fragment
 fun encode_url(bytes: Bytes): str

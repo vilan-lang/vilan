@@ -5,19 +5,19 @@
 A program's entry module executes its top-level statements in order. A
 function named `main` at the entry module's top level is the
 **entrypoint**: it is invoked automatically after the top-level
-statements. (An explicit top-level `main();` call is redundant — the
+statements. (An explicit top-level `main();` call is redundant; the
 program still runs `main` once.)
 
 **Module-level bindings initialize before `main`, in dependency order.**
 A binding's initializer runs after the initializer of every binding it
 **evaluates at load time**: the bindings its own initializer reads, and
 everything read inside whatever it calls while initializing. *Creating* a
-closure evaluates nothing — a closure body runs only when something calls
+closure evaluates nothing: a closure body runs only when something calls
 it, so the bindings it mentions order nothing (two module-level closures
 may name each other freely). Textual position carries no meaning: a
 binding may read one declared below it, in the same file or another,
 exactly as a function may call one declared later (§4.4). A **cycle** in
-that relation is a compile error, since no order satisfies it — including
+that relation is a compile error, since no order satisfies it, including
 the one-binding cycle of an initializer that reads itself. A `const`
 initializer evaluates during compilation (§9), so it evaluates nothing at
 load time and waits for nothing; a binding that reads *it* still
@@ -25,9 +25,9 @@ initializes after it.
 
 Where the relation leaves two bindings unordered, the one whose module
 loaded first initializes first. Modules load in a canonical order: the
-standard library's first, then the dependency packages' — each package
+standard library's first, then the dependency packages' (each package
 after the packages it depends on, in an order the dependency graph fixes
-rather than the manifest's listing — then the program's own; within one
+rather than the manifest's listing), then the program's own; within one
 package, modules load by name. Each package's root module follows, in
 that same package order, and the entry file is last. Within one file,
 bindings initialize in declaration order. Nothing here depends on how a
@@ -38,13 +38,13 @@ Only a binding something reachable from `main` references initializes at
 all (§11.2's reachability rule): an unreferenced binding's initializer
 never runs, so load-time side effects are not a promise.
 
-On process platforms (node/deno/bun), the process **exits when no live
-work remains**: after `main` completes, only live host handles — a
-running timer, an open socket, a listening server — keep it alive, per
+On process platforms (Node/Deno/Bun), the process **exits when no live
+work remains**: after `main` completes, only live host handles (a
+running timer, an open socket, a listening server) keep it alive, per
 the host event loop. Pending tasks holding such a handle run to
 completion; pending work that holds none is abandoned at exit. A
-program must therefore not rely on a dropped spawn completing (join it
-— §7.7 — to guarantee that), and a long-lived program must keep `main`
+program must therefore not rely on a dropped spawn completing (join it,
+§7.7, to guarantee that), and a long-lived program must keep `main`
 open (a listening server does so inherently; a socket-holding client
 must await something that ends with the app). On the browser platform,
 `main`'s completion leaves installed handlers and subscriptions live.
@@ -68,8 +68,8 @@ pattern matches).
 Arithmetic whose mathematical result exceeds the operand type's range is
 **undefined behavior**: a conforming program does not overflow, and an
 implementation may produce any value for one that does (the JS backend
-yields f64 artifacts — precision loss for the wide types, out-of-range
-magnitudes for the narrow ones — without trapping). Literals are
+yields f64 artifacts without trapping: precision loss for the wide
+types, out-of-range magnitudes for the narrow ones). Literals are
 range-checked at compile time (§2.3); runtime operations are not. An
 opt-in checked family (`add_safe`, …) is recorded future work; `BigInt`
 is the answer where the range itself is the problem.
@@ -85,26 +85,26 @@ inferred, and never written in return types:
 2. A **direct call** to an async function is implicitly awaited: the
    caller receives the plain declared value, and the caller becomes
    async (asyncness propagates through the call graph).
-3. A call **through a closure value** is never inferred async by itself
-   — there is no static callee. The closure *type* carries the marker
-   instead (§7.4).
+3. A call **through a closure value** is never inferred async by
+   itself: there is no static callee. The closure *type* carries the
+   marker instead (§7.4).
 
 The explicit forms:
 
-- `async expr` — **spawn**: evaluate `expr`'s suspending computation
+- `async expr` (**spawn**): evaluate `expr`'s suspending computation
   concurrently; the spawn expression itself does not suspend and yields
   `Task<T>` where `T` is `expr`'s type (the task handle is opaque, and
   copying it refers to the same task). `async { … }` spawns a block.
-- `await expr` — suspend until the `Task<T>` (or raw host `Promise<T>`)
+- `await expr`: suspend until the `Task<T>` (or raw host `Promise<T>`)
   operand settles; yields `T`.
 
 A spawned computation runs to its first suspension synchronously, then
 interleaves with its spawner per the host event loop. Dropping a task
-abandons nothing — the computation still runs; only its result is
+abandons nothing: the computation still runs; only its result is
 discarded. A task's failure is **absorbed at the spawn**: it is
 delivered to whichever `await` observes the task, and a failed task
 that is never observed is reported to the host console with its spawn
-origin — it does not terminate the program.
+origin; it does not terminate the program.
 
 ```vilan
 import std::print;
@@ -130,8 +130,8 @@ awaited (suspension points in the caller). The marker is legal on
 **function return types**; calls through a marked field read
 (`(self.hook)()`) and through a returned value (`make()()`, or via a
 binding) await like any other. An **unannotated binding adopts**
-asyncness from any value it holds — its initializer or any `mut`
-rebind — so a `let f = || { …await… };` needs no marker at all.
+asyncness from any value it holds (its initializer or any `mut`
+rebind), so a `let f = || { …await… };` needs no marker at all.
 
 A synchronous closure flowing into an async-typed position is fine
 (awaiting a non-promise yields it unchanged).
@@ -139,19 +139,19 @@ A synchronous closure flowing into an async-typed position is fine
 `sync |T| U` on a **parameter** declares the opposite contract: the
 callback completes inside the declaring function's synchronous
 protocol, and an async closure argument is an error. (`sync` is a
-contextual keyword — it only means the contract directly before a
+contextual keyword; it only means the contract directly before a
 closure type.) `std::reactive`'s recompute positions (`Signal::map`,
 `set_with`, `turn`/`batch` bodies, the UI render callbacks) are `sync`.
 
 **Adaptation.** A **plain**, value-returning closure parameter is
 *asyncness-polymorphic*: each call instantiates the function with the
-actual asyncness of its closure arguments —
+actual asyncness of its closure arguments:
 
 - an async argument instantiates an **async instance**: calls through
   the parameter are awaited **sequentially** (each callback settles
   before the next begins; effects are ordered exactly as the sync body
   orders them), the instance is async, and the caller awaits it;
-- sync arguments select the untouched plain instance — no awaits, no
+- sync arguments select the untouched plain instance: no awaits, no
   coloring, identical emission.
 
 An async adapted instance traverses a **snapshot** of any value it
@@ -160,23 +160,23 @@ work, which must not tear the traversal. Adaptation follows a closure
 through plain parameters transitively (`helper(xs, f)` forwarding `f`
 into `map` adapts both), and never crosses these boundaries:
 
-- a `sync` parameter (error, including transitively — the diagnostic
+- a `sync` parameter (error, including transitively; the diagnostic
   names the call that made the closure async);
-- a host (`external`) function's value-returning closure parameter —
+- a host (`external`) function's value-returning closure parameter:
   host code cannot await a Vilan closure;
-- a trait/generic-dispatched call — there is no statically-known callee
+- a trait/generic-dispatched call: there is no statically-known callee
   to instantiate (bind the receiver concretely, or declare the trait
   parameter `async`);
-- a module-level initializer — it cannot await (§7.6's J.3 rule).
+- a module-level initializer: it cannot await (§7.6's J.3 rule).
 
 **The divergence rule** (the remaining stores). An async closure flowing
 where a plain closure type is declared on a struct **field** or a
 function's declared **return type** is:
 
-- an **error** when that closure returns a value — the reader would
+- an **error** when that closure returns a value: the reader would
   receive a live promise typed as `T`; declare the field or return type
   `async |…| T` instead;
-- **legal** when it returns `void` — *spawn semantics*: the call fires
+- **legal** when it returns `void` (*spawn semantics*): the call fires
   the closure and nobody awaits it. This is what allows UI event
   handlers and other void callbacks to suspend freely, and it applies
   to parameters as well (a void parameter spawns rather than adapts).
@@ -184,7 +184,7 @@ function's declared **return type** is:
 ## 7.5 Suspension and state
 
 At every suspension point the enclosing function's live state is
-captured and restored on resumption — with one carve-out: **views may
+captured and restored on resumption, with one carve-out: **views may
 not be live across a suspension** (§6.6). Ambient context values (§8)
 are captured at closure creation and are therefore stable
 across suspensions by construction.
@@ -203,15 +203,15 @@ entrypoint contract of §7.1, and the module-level initialization order
 it fixes; `print` writing one line per call to the host console; panics
 rejecting/aborting with the given message; left-to-right evaluation per
 §7.2; truncating integer division and two's-complement `as_*` folds
-(overflow excepted — §7.2a); and `i53` exactness over the wire across
-its whole range. Everything else about the emitted code — names,
-formatting, module layout beyond that order, the `[build]` knobs — is
+(overflow excepted, §7.2a); and `i53` exactness over the wire across
+its whole range. Everything else about the emitted code (names,
+formatting, module layout beyond that order, the `[build]` knobs) is
 implementation-defined.
 
 ## 7.7 Nurseries
 
 `std::task::nursery(body)` runs `body` with a **nursery** established
-for its **dynamic extent** — the body's execution and everything it
+for its **dynamic extent**: the body's execution and everything it
 calls, under the ambient-value rules of §8 (in particular, closures
 capture the extent at creation). Within the extent, every spawn
 (§7.3's `async expr`) **registers** its task with the nursery; spawns
@@ -219,7 +219,7 @@ outside any nursery are unaffected. There is no implicit root nursery:
 a program's free spawns keep §7.3's unstructured behavior.
 
 **Join.** The `nursery` call returns the body's value, and returns only
-when the body and every registered task have settled — including tasks
+when the body and every registered task have settled, including tasks
 registered while draining (a running task's own spawns register with
 the same nursery). The call is async (its callers await it), and the
 body parameter is a plain closure parameter, so an awaiting body
@@ -233,17 +233,17 @@ selects an adapted instance per §7.4.
   origin (the spawning function's name) in its message.
 
 On the first failure the nursery cancels (below). Every other
-registered task is **absorbed**: observed — so it neither becomes a
-host unhandled rejection nor triggers §7.3's unobserved-failure report
-— with its result discarded.
+registered task is **absorbed**: observed (so it neither becomes a
+host unhandled rejection nor triggers §7.3's unobserved-failure
+report) with its result discarded.
 
 **Cancellation** is cooperative. Each nursery owns a host abort signal,
 fired by the body handle's `cancel()` or by the first failure; a
 nursery created inside another's extent chains to its parent's signal
 at creation. The standard library's IO primitives pass the ambient
 nursery's signal to the host operation, so cancellation rejects
-in-flight IO promptly; those rejections — and any rejection classified
-as a host abort — are **cancellation echoes**: absorbed at the join,
+in-flight IO promptly; those rejections, and any rejection classified
+as a host abort, are **cancellation echoes**: absorbed at the join,
 never selected as the failure. Execution is never preempted: code runs
 until its next cancellable suspension (`is_cancelled()` is the check
 for compute loops). After an explicit `cancel()` the body continues and

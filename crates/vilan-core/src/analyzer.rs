@@ -1615,11 +1615,11 @@ fn tuple_element(
 fn tuple_access_error(tuple_label: &str, member_name: &str, problem: TupleAccessProblem) -> String {
     match problem {
         TupleAccessProblem::NotAPosition => format!(
-            "a tuple's members are its positions — `{tuple_label}` has no member \
+            "a tuple's members are its positions: `{tuple_label}` has no member \
              '{member_name}'; use `.0`, `.1`, … (or destructure with `let (a, b) = …`)"
         ),
         TupleAccessProblem::OutOfRange(arity) => {
-            format!("`{tuple_label}` has no element {member_name} — its arity is {arity}")
+            format!("`{tuple_label}` has no element {member_name}: its arity is {arity}")
         }
     }
 }
@@ -2420,7 +2420,7 @@ impl<'src> Analyzer<'src> {
 
         let Type::Tuple(elements) = value_type else {
             return vec![format!(
-                "'{value_label}' is not a tuple — this argument's parameter is bound \
+                "'{value_label}' is not a tuple: this argument's parameter is bound \
                  '{bound_label}'"
             )];
         };
@@ -2436,7 +2436,7 @@ impl<'src> Analyzer<'src> {
         if let Some(lo) = requirement.lo {
             if arity < lo as usize {
                 violations.push(format!(
-                    "'{value_label}' has {} — the bound '{bound_label}' requires at least {lo}",
+                    "'{value_label}' has {}: the bound '{bound_label}' requires at least {lo}",
                     count(arity)
                 ));
             }
@@ -2444,7 +2444,7 @@ impl<'src> Analyzer<'src> {
         if let Some(hi) = requirement.hi {
             if arity > hi as usize {
                 violations.push(format!(
-                    "'{value_label}' has {} — the bound '{bound_label}' allows at most {hi}",
+                    "'{value_label}' has {}: the bound '{bound_label}' allows at most {hi}",
                     count(arity)
                 ));
             }
@@ -2480,7 +2480,7 @@ impl<'src> Analyzer<'src> {
                     .unwrap_or_else(|| "the element bound".to_string());
                 violations.push(format!(
                     "element {index} of '{value_label}' is '{element_type_label}', which does \
-                     not implement trait '{trait_label}' — required by the element bound \
+                     not implement trait '{trait_label}', required by the element bound \
                      '{bound_label}'"
                 ));
             }
@@ -2666,7 +2666,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         msg: format!(
                             "{label} of `[derive(Wire)]` type `{type_name}` is the resource \
-                             `{rendered}` — a resource is not plain data and cannot be sent over \
+                             `{rendered}`: a resource is not plain data and cannot be sent over \
                              the wire; carry a plain-data handle (an id, a key) instead"
                         ),
                     });
@@ -2679,7 +2679,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         msg: format!(
                             "{label} of `[derive(Wire)]` type `{type_name}` is `{rendered}`, \
-                             which is not Wire — every field of a Wire type must itself be Wire \
+                             which is not Wire: every field of a Wire type must itself be Wire \
                              (a scalar, `str`, `bool`, `List`/`Option` of Wire, or another \
                              `[derive(Wire)]` type)"
                         ),
@@ -2754,7 +2754,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         msg: format!(
                             "{label} of `[derive(Hashable)]` type `{type_name}` is the resource \
-                             `{rendered}` — a resource cannot be hashed by value; hash a plain-data \
+                             `{rendered}`: a resource cannot be hashed by value; hash a plain-data \
                              projection (an id, a key) instead"
                         ),
                     });
@@ -2767,7 +2767,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         msg: format!(
                             "{label} of `[derive(Hashable)]` type `{type_name}` is `{rendered}`, \
-                             which is not `Hashable` — every field must be (a scalar, `str`, \
+                             which is not `Hashable`: every field must be (a scalar, `str`, \
                              `bool`, `List`/`Option` of `Hashable`, or another \
                              `[derive(Hashable)]` type)"
                         ),
@@ -2792,7 +2792,7 @@ impl<'src> Analyzer<'src> {
                         span: *span,
                         msg: format!(
                             "{label} of `[derive(PartialEq)]` type `{type_name}` is the resource \
-                             `{rendered}` — a resource cannot be compared by value (equality would \
+                             `{rendered}`: a resource cannot be compared by value (equality would \
                              copy it); compare a plain-data projection instead"
                         ),
                     });
@@ -2820,7 +2820,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     span,
                     msg: format!(
-                        "`{rendered}` implements `Drop` but is not a resource — \
+                        "`{rendered}` implements `Drop` but is not a resource: \
                          destruction without move discipline is exactly the double-close \
                          bug; declare it a `resource` so it moves instead of being copied"
                     ),
@@ -2952,7 +2952,7 @@ impl<'src> Analyzer<'src> {
                 note,
                 span: impl_shape.name_span,
                 msg: format!(
-                    "`{}`'s `{}` declares {} type parameter(s), but `{}` declares {} — \
+                    "`{}`'s `{}` declares {} type parameter(s), but `{}` declares {}; \
                      match the trait's type-parameter list",
                     check.subject_name,
                     check.member_name,
@@ -3012,7 +3012,7 @@ impl<'src> Analyzer<'src> {
                 note,
                 span: impl_shape.name_span,
                 msg: format!(
-                    "`{}`'s `{}` takes {} parameter(s), but `{}` declares {} — \
+                    "`{}`'s `{}` takes {} parameter(s), but `{}` declares {}; \
                      match the declared parameter list",
                     check.subject_name,
                     check.member_name,
@@ -3040,7 +3040,7 @@ impl<'src> Analyzer<'src> {
                     span: anchor,
                     msg: if trait_shape.is_self[0] {
                         format!(
-                            "`{}`'s `{}` takes no receiver, but `{}` declares `{}` — \
+                            "`{}`'s `{}` takes no receiver, but `{}` declares `{}`; \
                              give it the declared receiver",
                             check.subject_name,
                             check.member_name,
@@ -3065,7 +3065,7 @@ impl<'src> Analyzer<'src> {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 let msg = if is_receiver {
                     format!(
-                        "`{}`'s `{}` receives `{}`, but `{}` declares `{}` — match the \
+                        "`{}`'s `{}` receives `{}`, but `{}` declares `{}`; match the \
                          receiver convention",
                         check.subject_name,
                         check.member_name,
@@ -3075,7 +3075,7 @@ impl<'src> Analyzer<'src> {
                     )
                 } else {
                     format!(
-                        "parameter {} of `{}`'s `{}` is {}, but `{}` declares {} — \
+                        "parameter {} of `{}`'s `{}` is {}, but `{}` declares {}; \
                          match the parameter convention",
                         position,
                         check.subject_name,
@@ -3114,7 +3114,7 @@ impl<'src> Analyzer<'src> {
                     span: anchor,
                     msg: format!(
                         "parameter {position} of `{}`'s `{}` is `{actual_label}`, but `{}` \
-                         declares `{expected_label}` — match the declared type",
+                         declares `{expected_label}`; match the declared type",
                         check.subject_name, check.member_name, check.trait_name
                     ),
                 });
@@ -3156,8 +3156,8 @@ impl<'src> Analyzer<'src> {
                 note,
                 span: impl_shape.name_span,
                 msg: format!(
-                    "`{}`'s `{}` returns `{actual_label}`, but `{}` declares `{expected_label}` \
-                     — match the declared return type",
+                    "`{}`'s `{}` returns `{actual_label}`, but `{}` declares `{expected_label}`; \
+                     match the declared return type",
                     check.subject_name, check.member_name, check.trait_name
                 ),
             });
@@ -3948,7 +3948,7 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span,
                         msg: format!(
-                            "`{container_name}` cannot hold the resource `{rendered}` — a native \
+                            "`{container_name}` cannot hold the resource `{rendered}`: a native \
                              container's internals are host code the move checker cannot see (v1); \
                              `Option` is the sanctioned resource container, or hold the resource in \
                              a struct field"
@@ -4042,7 +4042,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     span,
                     msg: format!(
-                        "the resource `{rendered}` cannot be used where `any` is expected — `any` \
+                        "the resource `{rendered}` cannot be used where `any` is expected: `any` \
                          is a data sink, and a resource must keep its single owner (it cannot be \
                          copied into one); debug-print its fields instead"
                     ),
@@ -4153,14 +4153,14 @@ impl<'src> Analyzer<'src> {
         let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
         let msg = if matches!(resolved, Type::Generic(_)) {
             format!(
-                "`{rendered}` is a generic type parameter here — `dev::stash`/`dev::take` \
+                "`{rendered}` is a generic type parameter here: `dev::stash`/`dev::take` \
                  need a concrete plain-data type at the call they appear in, and there is \
                  no bound that grants transferability; call them with concrete arguments \
                  (inline the stash where the type is known)"
             )
         } else {
             format!(
-                "`{rendered}` cannot cross a hot swap — a closure, view, resource, or \
+                "`{rendered}` cannot cross a hot swap: a closure, view, resource, or \
                  reactive cell (`Signal`/`Shared`) carries code or identity the new bundle \
                  cannot adopt; stash only plain data"
             )
@@ -4168,7 +4168,7 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             note: Some(crate::error::Note::here(
                 span,
-                "only plain data transfers — scalars, `str`, lists, options, and \
+                "only plain data transfers: scalars, `str`, lists, options, and \
                  structs/enums built from them"
                     .to_string(),
             )),
@@ -6393,12 +6393,12 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "use of `{name}` after it was moved — a resource has a single owner"
+                            "use of `{name}` after it was moved: a resource has a single owner"
                         ),
                         note: Some(crate::error::Note::here(
                             move_span,
                             format!(
-                                "`{name}` was moved here — a resource has one owner; loan it with \
+                                "`{name}` was moved here: a resource has one owner; loan it with \
                                  `&{name}` / `&mut {name}`, or restructure with `Option` + `take`"
                             ),
                         )),
@@ -6406,7 +6406,7 @@ impl<'src> Analyzer<'src> {
                 }
                 ResourceMoveViolation::PartialMove { at } => Error {
                     span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
-                    msg: "cannot move a resource field out of a live aggregate — a resource has \
+                    msg: "cannot move a resource field out of a live aggregate: a resource has \
                           one owner and v1 has no partial moves; loan it with `&` / `&mut`, or make \
                           the field an `Option` and use `take`"
                         .to_string(),
@@ -6417,7 +6417,7 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`{name}` is moved on one path through this branch but not another — a \
+                            "`{name}` is moved on one path through this branch but not another: a \
                              resource's end-of-scope ownership must be static; move it on every path, \
                              or restructure with `Option` + `take`"
                         ),
@@ -6429,7 +6429,7 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`{name}` is declared outside this loop and moved inside it — the move \
+                            "`{name}` is declared outside this loop and moved inside it: the move \
                              would repeat on the next iteration; move a value declared inside the \
                              loop, or loan `{name}` with `&` / `&mut`"
                         ),
@@ -6444,7 +6444,7 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "a closure cannot capture the resource `{name}` — pass a loan into the \
+                            "a closure cannot capture the resource `{name}`; pass a loan into the \
                              call, give ownership to the struct that owns this closure's lifetime, \
                              or hoist the resource to module level (process lifetime)"
                         ),
@@ -6456,7 +6456,7 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`{name}` is a module-level resource — it has process lifetime and \
+                            "`{name}` is a module-level resource: it has process lifetime and \
                              cannot be moved; loan it with `&{name}` / `&mut {name}` or a method \
                              call (`drop({name})` moves it, so it is rejected too)"
                         ),
@@ -6468,7 +6468,7 @@ impl<'src> Analyzer<'src> {
                     Error {
                         span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
-                            "`{name}` is a module-level resource — it has process lifetime and \
+                            "`{name}` is a module-level resource: it has process lifetime and \
                              cannot be overwritten (the old value's drop has nowhere to run); \
                              its initializer is the one write, and everything after is a loan"
                         ),
@@ -6662,9 +6662,9 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             span: site,
             msg: format!(
-                "`{name}` is not move-clean when instantiated with a resource — an `own` \
-                 parameter of resource type is never moved out; a generic body cannot destroy \
-                 a `T` — move it out on every path, or take a concrete type"
+                "`{name}` is not move-clean when instantiated with a resource: an `own` \
+                 parameter of resource type is never moved out, and a generic body cannot destroy \
+                 a `T`; move it out on every path, or take a concrete type"
             ),
             note: Some(note),
         });
@@ -6750,9 +6750,9 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             span: site,
             msg: format!(
-                "`{name}` is not move-clean when instantiated with a resource — this \
+                "`{name}` is not move-clean when instantiated with a resource: this \
                  instantiation would pass a resource to `drop<T>`, whose erased body has no \
-                 concrete destructor — destroy at a concrete type, or move the value out to the \
+                 concrete destructor; destroy at a concrete type, or move the value out to the \
                  caller"
             ),
             note: Some(note),
@@ -7222,7 +7222,7 @@ impl<'src> Analyzer<'src> {
                         *use_id,
                         "a resource-typed value is used more than once",
                         format!(
-                            "in `{name}`, `{binding_name}` is used here after it was moved — a \
+                            "in `{name}`, `{binding_name}` is used here after it was moved: a \
                              resource has a single owner"
                         ),
                     )
@@ -7231,7 +7231,7 @@ impl<'src> Analyzer<'src> {
                     *at,
                     "a resource-typed field is moved out of a live aggregate",
                     format!(
-                        "in `{name}`, a resource field is moved out of a live aggregate here — v1 \
+                        "in `{name}`, a resource field is moved out of a live aggregate here: v1 \
                          has no partial moves"
                     ),
                 ),
@@ -7266,7 +7266,7 @@ impl<'src> Analyzer<'src> {
                         *reference_id,
                         "a resource-typed value is captured by a closure",
                         format!(
-                            "in `{name}`, `{binding_name}` is captured by a closure here — a \
+                            "in `{name}`, `{binding_name}` is captured by a closure here: a \
                              closure cannot capture a resource"
                         ),
                     )
@@ -7280,8 +7280,8 @@ impl<'src> Analyzer<'src> {
                         *at,
                         "a module-level resource is moved",
                         format!(
-                            "in `{name}`, the module-level resource `{binding_name}` is moved here \
-                             — it can only be loaned"
+                            "in `{name}`, the module-level resource `{binding_name}` is moved here: \
+                             it can only be loaned"
                         ),
                     )
                 }
@@ -7292,7 +7292,7 @@ impl<'src> Analyzer<'src> {
                         "a module-level resource is overwritten",
                         format!(
                             "in `{name}`, the module-level resource `{binding_name}` is overwritten \
-                             here — the old value's drop has nowhere to run"
+                             here: the old value's drop has nowhere to run"
                         ),
                     )
                 }
@@ -7313,7 +7313,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error {
                 span: site,
                 msg: format!(
-                    "`{name}` is not move-clean when instantiated with a resource — {summary}; a \
+                    "`{name}` is not move-clean when instantiated with a resource: {summary}; a \
                      generic used with a resource type argument must use each resource value at \
                      most once, and never copy or capture it"
                 ),
@@ -7375,7 +7375,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             msg: format!(
                                 "{label} of `[rpc]` method `{method_name}` is `{rendered}`, \
-                                 which is not Wire — every `[rpc]` parameter and return must be \
+                                 which is not Wire: every `[rpc]` parameter and return must be \
                                  Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
                                  `[derive(Wire)]` type)"
                             ),
@@ -7387,7 +7387,7 @@ impl<'src> Analyzer<'src> {
                             span,
                             msg: format!(
                                 "{label} of `[rpc]` method `{method_name}` must declare a Wire \
-                                 type — arguments are decoded, and the reply encoded, at their \
+                                 type: arguments are decoded, and the reply encoded, at their \
                                  declared types"
                             ),
                         });
@@ -7418,7 +7418,7 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span,
                         msg: format!(
-                            "{label} is `[expose]`d, but its element `{rendered}` is not Wire — \
+                            "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
                              an exposed signal's values cross the wire, so the element must be \
                              Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
                              `[derive(Wire)]` type)"
@@ -7434,7 +7434,7 @@ impl<'src> Analyzer<'src> {
                         span,
                         msg: format!(
                             "{label} is `[expose]`d, but its type `{rendered}` is not a \
-                             `Signal` — only observable state (`Signal<T>` with a Wire `T`) can \
+                             `Signal`: only observable state (`Signal<T>` with a Wire `T`) can \
                              be exposed; a plain value has nothing to subscribe to"
                         ),
                     });
@@ -7549,14 +7549,14 @@ impl<'src> Analyzer<'src> {
         })?;
         match field_type_id.get_type(self) {
             Type::Closure(..) => Some(format!(
-                " — `{member_name}` is a field holding a closure: parenthesize the field \
+                "; `{member_name}` is a field holding a closure: parenthesize the field \
                  access to call it, `(x.{member_name})()` (a bare `.{member_name}()` only \
                  looks up methods)"
             )),
             field_type => {
                 let field_label = self.pretty_print_type(&field_type, &HashMap::new());
                 Some(format!(
-                    " — `{member_name}` is a field of type `{field_label}`, which is not \
+                    "; `{member_name}` is a field of type `{field_label}`, which is not \
                      callable: did you mean the plain access `x.{member_name}`?"
                 ))
             }
@@ -10057,10 +10057,10 @@ impl<'src> Analyzer<'src> {
                         .map(|root| root.name)
                     {
                         Some(root_name) => format!(
-                            "cannot hold a view across 'await': '{view_name}' (a view into '{root_name}') is still live here. Re-acquire the view after the await — the awaited turn may change what it points at."
+                            "cannot hold a view across 'await': '{view_name}' (a view into '{root_name}') is still live here. Re-acquire the view after the await; the awaited turn may change what it points at."
                         ),
                         None => format!(
-                            "cannot hold a view across 'await': '{view_name}' is still live here. Re-acquire the view after the await — the awaited turn may change what it points at."
+                            "cannot hold a view across 'await': '{view_name}' is still live here. Re-acquire the view after the await; the awaited turn may change what it points at."
                         ),
                     };
                     (anchor, msg)
@@ -11002,7 +11002,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: "a view can't be read as a value here; write `*` to copy the value out \
-                      (a view's value is explicit — `*v` is the only way to cross from view to value)"
+                      (a view's value is explicit: `*v` is the only way to cross from view to value)"
                     .to_string(),
             });
         }
@@ -11942,7 +11942,7 @@ impl<'src> Analyzer<'src> {
                 note: None,
                 span: condition.1,
                 msg: "the `?` lifts this condition to an `Option`/`Result`, which a \
-                      condition cannot take — `match` on the lifted value instead"
+                      condition cannot take; `match` on the lifted value instead"
                     .to_string(),
             });
         }
@@ -11961,7 +11961,7 @@ impl<'src> Analyzer<'src> {
                 self.diagnostics.push(Error {
                     note: None,
                     span: node.1,
-                    msg: "vilan has no const declarations — write `let x = const ..`".to_string(),
+                    msg: "Vilan has no const declarations; write `let x = const ..`".to_string(),
                 });
                 let id = self.new_entity_id();
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
@@ -12060,7 +12060,7 @@ impl<'src> Analyzer<'src> {
                             self.diagnostics.push(Error {
                                 note: None,
                                 span: member.1,
-                                msg: "a tuple position is a bare number (`.0`, `.1`) — drop the \
+                                msg: "a tuple position is a bare number (`.0`, `.1`); drop the \
                                       suffix"
                                     .to_string(),
                             });
@@ -12391,7 +12391,7 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span: node.1,
                         msg: format!(
-                            "the invocation `macro {name}(..)` was not expanded — splice \
+                            "the invocation `macro {name}(..)` was not expanded: splice \
                              syntax belongs in program code; inside the macro world, call \
                              `{name}(..)` as a plain function"
                         ),
@@ -12419,7 +12419,7 @@ impl<'src> Analyzer<'src> {
                     self.diagnostics.push(Error {
                         note: None,
                         span: node.1,
-                        msg: "this `macro { .. }` block was not expanded — a block cannot \
+                        msg: "this `macro { .. }` block was not expanded: a block cannot \
                               appear inside macro code (the enclosing body already runs at \
                               expansion time)"
                             .to_string(),
@@ -12806,7 +12806,7 @@ impl<'src> Analyzer<'src> {
                     self.diagnostics.push(Error {
                         note: None,
                         span: node.1,
-                        msg: "`?` lifts nothing here — the region is the whole expression; \
+                        msg: "`?` lifts nothing here: the region is the whole expression; \
                               use `?.` for member access, or remove the `?`"
                             .to_string(),
                     });
@@ -12824,7 +12824,7 @@ impl<'src> Analyzer<'src> {
                         self.diagnostics.push(Error {
                             note: None,
                             span: node.1,
-                            msg: "`!` cannot run after a `?` inside a lifted expression — it \
+                            msg: "`!` cannot run after a `?` inside a lifted expression: it \
                                   would early-return from inside the region; bind the `!` \
                                   result first (`let ok = value!;`)"
                                 .to_string(),
@@ -13065,7 +13065,7 @@ impl<'src> Analyzer<'src> {
                 if matches!(&target.0, Node::Dereference(_)) {
                     self.diagnostics.push(Error { note: None,
                         span: target.1,
-                        msg: "cannot assign through `*`: a view is written through directly — write `x = …`, not `*x = …`".to_string(),
+                        msg: "cannot assign through `*`: a view is written through directly; write `x = …`, not `*x = …`".to_string(),
                     });
                 }
                 let value_id = self.walk_expr_node(value, scope_id);
@@ -14187,7 +14187,7 @@ impl<'src> Analyzer<'src> {
                             note: None,
                             span: *span,
                             msg: format!(
-                                "cannot destructure {rendered} as a fixed array — \
+                                "cannot destructure {rendered} as a fixed array: \
                                  `[a, b, c]` binds a `[T; n]`"
                             ),
                         });
@@ -16925,7 +16925,7 @@ impl<'src> Analyzer<'src> {
                         match self.closure_parameter_fill_sites.get(parameter_type_id) {
                             Some(fill_span) => (
                                 format!(
-                                    " The parameter is unannotated — annotate it \
+                                    " The parameter is unannotated; annotate it \
                                      (e.g. `|x: {expected}|`) to pin the type deliberately."
                                 ),
                                 Some(crate::error::Note::here(
@@ -17169,14 +17169,14 @@ impl<'src> Analyzer<'src> {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
                         let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-                        format!("cannot call this as a function — it is {rendered}")
+                        format!("cannot call this as a function: it is {rendered}")
                     };
                     self.diagnostics.push(Error { note: None,
                         // The SUBJECT is what isn't callable (A1).
                         span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
                         msg: match struct_name {
                             Some(name) => format!(
-                                "cannot call '{name}': it is a struct, not a function — construct it with `{{ .. }}` or `::new(..)`"
+                                "cannot call '{name}': it is a struct, not a function; construct it with `{{ .. }}` or `::new(..)`"
                             ),
                             None => non_function_message.clone(),
                         },
@@ -17205,7 +17205,7 @@ impl<'src> Analyzer<'src> {
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot call this as a function — it is {rendered}"),
+                    msg: format!("cannot call this as a function: it is {rendered}"),
                 });
                 Resolution::Failed
             }
@@ -17586,7 +17586,7 @@ impl<'src> Analyzer<'src> {
                     .trait_only_provider(&subject_type, member_name)
                     .map(|trait_name| {
                         format!(
-                            " — it is `[trait_only]` on trait `{trait_name}`: reach it through \
+                            "; it is `[trait_only]` on trait `{trait_name}`: reach it through \
                              a `{trait_name}` bound, not the concrete type"
                         )
                     })
@@ -18153,7 +18153,7 @@ impl<'src> Analyzer<'src> {
                         note: None,
                         span: step_span,
                         msg: format!(
-                            "a bare `?` lifts an `Option` or a `Result` — this is {rendered} \
+                            "a bare `?` lifts an `Option` or a `Result`; this is {rendered} \
                              (expression lifting for user `Lift` containers is a recorded \
                              follow-up; `?.` chains already support them)"
                         ),
@@ -18173,7 +18173,7 @@ impl<'src> Analyzer<'src> {
                             msg: format!(
                                 "every `?` in one lifted expression must split the same \
                                  container: this region lifts both `{first}` and `{second}`. \
-                                 Convert first — `.ok_or(err)` turns an `Option` into a \
+                                 Convert first: `.ok_or(err)` turns an `Option` into a \
                                  `Result`."
                             ),
                         });
@@ -18354,12 +18354,12 @@ impl<'src> Analyzer<'src> {
         if let Some((module, is_std)) = hit {
             let root = if is_std { "std" } else { "pkg" };
             return Some(format!(
-                " — import it first (`import {root}::{module}::{name};`)"
+                "; import it first (`import {root}::{module}::{name};`)"
             ));
         }
         let module = self.std_export_index.as_ref()?.get(name)?;
         Some(format!(
-            " — import it first (`import std::{module}::{name};`)"
+            "; import it first (`import std::{module}::{name};`)"
         ))
     }
 
@@ -18414,7 +18414,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
-                    "`?.` lifts an `Option`, a `Result`, or a type opting in with `impl .. with Lift` — this is {rendered}"
+                    "`?.` lifts an `Option`, a `Result`, or a type opting in with `impl .. with Lift`; this is {rendered}"
                 ),
             });
             return Resolution::Failed;
@@ -18429,9 +18429,7 @@ impl<'src> Analyzer<'src> {
                 self.diagnostics.push(Error {
                     note: None,
                     span,
-                    msg: format!(
-                        "`?.` needs a container with an element type — this is {rendered}"
-                    ),
+                    msg: format!("`?.` needs a container with an element type; this is {rendered}"),
                 });
                 return Resolution::Failed;
             }
@@ -18460,7 +18458,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
-                    "`?.` on {rendered} needs a `{member_name}` method — the Lift contract (`map<U>(self, |T| U)`, `and_then<U>(self, |T| Self-of-U)`)"
+                    "`?.` on {rendered} needs a `{member_name}` method: the Lift contract (`map<U>(self, |T| U)`, `and_then<U>(self, |T| Self-of-U)`)"
                 ),
             });
             return Resolution::Failed;
@@ -18536,7 +18534,7 @@ impl<'src> Analyzer<'src> {
                         self.diagnostics.push(Error { note: None,
                             span: *span,
                             msg: format!(
-                                "a bare `ret` exits a closure whose body yields {tail_rendered} — return a value"
+                                "a bare `ret` exits a closure whose body yields {tail_rendered}; return a value"
                             ),
                         });
                     }
@@ -18549,7 +18547,7 @@ impl<'src> Analyzer<'src> {
                     if tail_is_void && !matches!(value_type, Type::Void) {
                         self.diagnostics.push(Error { note: None,
                             span: *span,
-                            msg: "the closure's body ends without a value, but this `ret` returns one — make the ret'd value the body's tail"
+                            msg: "the closure's body ends without a value, but this `ret` returns one; make the ret'd value the body's tail"
                                 .to_string(),
                         });
                     } else if self
@@ -18639,7 +18637,7 @@ impl<'src> Analyzer<'src> {
                     self.diagnostics.push(Error { note: None,
                         span,
                         msg: format!(
-                            "`!` on an `Option` returns `None` early, so the enclosing function must return `Option` — it returns {rendered}. If it returns `Result`, convert first: `.ok_or(err)` turns `None` into an `Err`."
+                            "`!` on an `Option` returns `None` early, so the enclosing function must return `Option`; it returns {rendered}. If it returns `Result`, convert first: `.ok_or(err)` turns `None` into an `Err`."
                         ),
                     });
                 }
@@ -18685,7 +18683,7 @@ impl<'src> Analyzer<'src> {
                     self.diagnostics.push(Error { note: None,
                         span,
                         msg: format!(
-                            "`!` on a `Result` returns the error early, so the enclosing function must return `Result` — it returns {rendered}"
+                            "`!` on a `Result` returns the error early, so the enclosing function must return `Result`; it returns {rendered}"
                         ),
                     });
                 }
@@ -18724,7 +18722,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
-                    "`!` needs a value implementing `Try` (an `Option`, a `Result`, or a type with an `impl .. with Try<..>`) — this is {rendered}"
+                    "`!` needs a value implementing `Try` (an `Option`, a `Result`, or a type with an `impl .. with Try<..>`); this is {rendered}"
                 ),
             });
             return Resolution::Failed;
@@ -18783,7 +18781,7 @@ impl<'src> Analyzer<'src> {
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
-                    "`!` on a `Try` type returns `from_bad(..)`, which rebuilds {receiver_rendered} — the enclosing function returns {return_rendered} (for user `Try` types the two must match exactly, v1)"
+                    "`!` on a `Try` type returns `from_bad(..)`, which rebuilds {receiver_rendered}; the enclosing function returns {return_rendered} (for user `Try` types the two must match exactly, v1)"
                 ),
             });
         }
@@ -19458,26 +19456,26 @@ impl<'src> Analyzer<'src> {
     fn bare_name_not_a_value(&self, subject_id: Id, name: &str) -> Option<String> {
         match self.expr_id_to_expr_map.get(&subject_id) {
             Some(Expr::Struct(_)) => Some(format!(
-                "`{name}` is a type, not a value — construct it (`{name} {{ .. }}`) \
+                "`{name}` is a type, not a value; construct it (`{name} {{ .. }}`) \
                  or call a static like `{name}::new(..)`"
             )),
             Some(Expr::Enum(_)) => Some(format!(
-                "`{name}` is a type, not a value — use one of its variants \
+                "`{name}` is a type, not a value; use one of its variants \
                  (`{name}::Variant`)"
             )),
             Some(Expr::Trait(_)) => Some(format!(
-                "`{name}` is a trait, not a value — vilan has no trait objects; use \
+                "`{name}` is a trait, not a value: vilan has no trait objects; use \
                  a generic parameter (`<T: {name}>`) or a concrete type"
             )),
             Some(Expr::Generic(_)) => Some(format!(
-                "`{name}` is a type parameter, not a value — it names a type, not a \
+                "`{name}` is a type parameter, not a value: it names a type, not a \
                  runtime value"
             )),
             Some(Expr::Module(_)) => Some(format!(
-                "`{name}` is a module, not a value — qualify through it (`{name}::item`)"
+                "`{name}` is a module, not a value; qualify through it (`{name}::item`)"
             )),
             Some(Expr::Macro) => Some(format!(
-                "`{name}` is a macro, not a value — use it as `[{name}]` on an item \
+                "`{name}` is a macro, not a value; use it as `[{name}]` on an item \
                  or invoke it with `macro {name}(..)`"
             )),
             _ => None,
@@ -19664,12 +19662,12 @@ impl<'src> Analyzer<'src> {
                                     }),
                                 msg: if own_initializer {
                                     format!(
-                                        "'{}' is the binding being declared — an initializer cannot read its own binding",
+                                        "'{}' is the binding being declared: an initializer cannot read its own binding",
                                         name
                                     )
                                 } else {
                                     format!(
-                                        "'{}' is declared here, later in the scope — a local binding is visible only after its declaration",
+                                        "'{}' is declared here, later in the scope: a local binding is visible only after its declaration",
                                         name
                                     )
                                 },
@@ -19776,7 +19774,7 @@ impl<'src> Analyzer<'src> {
                     // module name (`import std::math; … math::min(1, 2)`).
                     let message = if matches!(name, "std" | "pkg") {
                         format!(
-                            "`{name}` is a namespace, not a value — import the module first \
+                            "`{name}` is a namespace, not a value; import the module first \
                              (`import {name}::…;`) and qualify through its name"
                         )
                     } else {
@@ -19956,7 +19954,7 @@ impl<'src> Analyzer<'src> {
                             }
                             .map(|trait_name| {
                                 format!(
-                                    " — it is `[trait_only]` on trait `{trait_name}`: reach it \
+                                    "; it is `[trait_only]` on trait `{trait_name}`: reach it \
                                      through a `{trait_name}` bound, not the concrete type"
                                 )
                             })
@@ -20236,7 +20234,7 @@ impl<'src> Analyzer<'src> {
                         let function = self.functions.get(&function_id)?;
                         let signature = self.function_signature_label(function);
                         Some((
-                            format!(" — declare `{signature}`"),
+                            format!("; declare `{signature}`"),
                             Some(crate::error::Note {
                                 span: function.name_span,
                                 msg: "the trait declares it here".to_string(),
@@ -20513,7 +20511,7 @@ impl<'src> Analyzer<'src> {
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
-                                "`bool` has no ordering — `{symbol}` models `PartialOrd`, which \
+                                "`bool` has no ordering: `{symbol}` models `PartialOrd`, which \
                                  `bool` does not implement; compare with `==`/`!=`"
                             ),
                         });
@@ -20538,7 +20536,7 @@ impl<'src> Analyzer<'src> {
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!(
                                 "`{symbol}` compares two values of the same type, but the \
-                                 operands are `{lhs_label}` and `{rhs_label}` — there are no \
+                                 operands are `{lhs_label}` and `{rhs_label}`: there are no \
                                  implicit conversions; suffix the literal or convert with `as_*`"
                             ),
                         });
@@ -20733,10 +20731,10 @@ impl<'src> Analyzer<'src> {
                     let span = **span;
                     let hint = match suffix {
                         "i64" => {
-                            " — `i64` was renamed to `i53` (exact integers span ±2^53 on the JS backend; use `BigInt` for more)"
+                            "; `i64` was renamed to `i53` (exact integers span ±2^53 on the JS backend; use `BigInt` for more)"
                         }
                         "u64" => {
-                            " — `u64` was renamed to `u53` (exact integers span ±2^53 on the JS backend; use `BigInt` for more)"
+                            "; `u64` was renamed to `u53` (exact integers span ±2^53 on the JS backend; use `BigInt` for more)"
                         }
                         _ => "",
                     };
@@ -20798,7 +20796,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let range = if matches!(name, "i53" | "u53") {
-                "exact integers span ±2^53 on the JS backend — use `BigInt` for larger values"
+                "exact integers span ±2^53 on the JS backend; use `BigInt` for larger values"
                     .to_string()
             } else if signed {
                 format!("-{bound} ..= {}", bound - 1)
@@ -20980,7 +20978,7 @@ impl<'src> Analyzer<'src> {
                     span,
                     msg: format!(
                         "the type of '{name}' is never fully determined: `{rendered}` keeps \
-                         its callee's type parameters, so uses of it cannot be checked — \
+                         its callee's type parameters, so uses of it cannot be checked; \
                          annotate the binding (e.g. `: Map<str, i32>`)"
                     ),
                 });
@@ -23320,7 +23318,7 @@ pub fn check_library_contract(spec: &PackageSpec) -> Vec<Error> {
                     span,
                     msg: format!(
                         "`{importer}` imports `pkg::{module}`, but `{module}` is not available for \
-                         {} — it lives only in another platform's layer, and a module serving \
+                         {}: it lives only in another platform's layer, and a module serving \
                          those platforms must resolve for every one of them",
                         unavailable.join(", ")
                     ),
@@ -23816,8 +23814,8 @@ pub fn analyze<'src>(
                         span: EMPTY_SPAN,
                         msg: format!(
                             "library `{library_name}`'s base `lib.vl` re-exports `{module}`, a \
-                             platform-specific module (it lives in a platform layer, not the base) \
-                             — import it by path instead of re-exporting it"
+                             platform-specific module (it lives in a platform layer, not the base); \
+                             import it by path instead of re-exporting it"
                         ),
                     });
                 }
@@ -23937,7 +23935,7 @@ pub fn analyze<'src>(
                     span: EMPTY_SPAN,
                     msg: format!(
                         "module `{name}` is ambiguous: both `{name}.vl` and `{name}/lib.vl` \
-                     exist — keep only one"
+                     exist; keep only one"
                     ),
                 });
             }
@@ -23955,7 +23953,7 @@ pub fn analyze<'src>(
                     span: EMPTY_SPAN,
                     msg: format!(
                         "module `{name}` resolved to `{on_disk}` on disk, but it is imported as \
-                         `{requested}` — vilan matches module files by exact case, so this \
+                         `{requested}`: Vilan matches module files by exact case, so this \
                          builds only where the filesystem ignores case; rename one to match \
                          the other"
                     ),
@@ -25391,7 +25389,7 @@ pub fn check_async_drops(program: &mut Program) {
                     note: None,
                     span: *span,
                     msg: format!(
-                        "`drop` for `{subject}` is async — teardown must be synchronous; cancel \
+                        "`drop` for `{subject}` is async: teardown must be synchronous; cancel \
                          owned tasks via an `OwnedNursery`. Awaited teardown is a future design"
                     ),
                 },
@@ -25422,7 +25420,7 @@ pub fn check_context_drops(program: &mut Program) {
                     note: None,
                     span: *span,
                     msg: format!(
-                        "`drop` for `{subject}` requires an ambient context — teardown must be \
+                        "`drop` for `{subject}` requires an ambient context: teardown must be \
                          context-free; a `drop` body cannot require an ambient context (its call \
                          sites are scope exits, which do not thread contexts). Hand turn-joining \
                          work to an owner inside the turn"

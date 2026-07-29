@@ -1,7 +1,7 @@
 # Server-side rendering (render and replace)
 
-The A7 SSR model (`proposal/ssr.md`, and the
-[SSR guide](../../docs/guide/ssr.md)) in **one package with two entries** — the
+The A7 SSR model ([`proposal/ssr.md`](../../proposal/ssr.md), and the
+[SSR guide](../../docs/guide/ssr.md)) in one package with two entries, the
 default full-stack shape:
 
 ```
@@ -24,8 +24,8 @@ ssr/
 - **Render, then replace.** The server renders `app()` to markup per request and
   splices it into `src/app.html` at the `<!--ssr-->` marker. On boot the client
   builds the same view live and `mount_root` *clears* the container before
-  appending it. No hydration — no node adoption, no mismatch errors, no second
-  set of rules.
+  appending it. There is no hydration: no node adoption, no mismatch errors,
+  no second set of rules.
 - **Build pure, bind reactive** (`proposal/ssr.md` §5). Every binding here reads
   once on the server (the value at render time is the value served) and stays
   live on the client: a signal-fed list, an escaped heading, a `when` branch,
@@ -38,8 +38,8 @@ vilan run .
 # open http://localhost:8791/
 ```
 
-View the page source: the task list and heading are already in the HTML, before
-any script runs — first paint and SEO. Load it in a browser and the client boots
+View the page source: the task list and heading are already in the HTML before
+any script runs (first paint and SEO). Load it in a browser and the client boots
 and replaces the server markup in place.
 
 The data here is seeded in code, so both legs produce the same markup and the

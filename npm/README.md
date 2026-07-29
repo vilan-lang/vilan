@@ -18,7 +18,7 @@ npm/platform/win32-x64/      …
 **Why six packages and not one postinstall downloader**: a download at install
 time breaks behind firewalls, proxies and offline mirrors, and defeats
 `npm ci`'s reproducibility. npm resolves the `os`/`cpu` fields itself, so a
-machine downloads exactly the one platform package it can run — the
+machine downloads exactly the one platform package it can run: the
 esbuild/swc shape (distribution.md §2).
 
 **Versions are stamped by CI, not stored here.** Every `package.json` in this
@@ -37,7 +37,7 @@ the executable bit before publishing (npm's tarball preserves the mode, and
 npm's own `bin` shims are the meta package's stubs, not these files).
 
 **`preferUnplugged`** on the platform packages tells Yarn PnP to keep them
-unzipped on disk — an executable inside a PnP zip cannot be spawned.
+unzipped on disk, because an executable inside a PnP zip cannot be spawned.
 
 ## Trying it locally
 
@@ -47,9 +47,9 @@ npm pack --dry-run out/vilan               # what the meta package would ship
 (cd out && npm pack ./vilan ./linux-x64)   # then install the two .tgz files
 ```
 
-Install the **tarballs**, not the directories. A `file:` dependency (and
-`npm link`) installs a *symlink*, and node resolves symlinks before it walks
-`node_modules` upwards — so the stub ends up looking for its platform package
+Install the tarballs, not the directories. A `file:` dependency (and
+`npm link`) installs a *symlink*, and Node resolves symlinks before it walks
+`node_modules` upwards, so the stub ends up looking for its platform package
 next to the packaging sources rather than next to the installed copy, and
 reports the platform package as missing. Installing a `.tgz` copies the files
 in, which is what the registry does and what the tests reproduce.

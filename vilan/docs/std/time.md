@@ -1,6 +1,6 @@
-# std::time — reference
+# std::time reference
 
-Instants, durations, and timers. Both types are Wire — they ride rpc
+Instants, durations, and timers. Both types are Wire: they ride rpc
 payloads (`created_at: Instant` in a mirrored record is the standard
 timestamp shape).
 
@@ -10,7 +10,7 @@ import std::time::{ now, Instant, Duration, sleep, sleep_for, Timer };
 
 ## Instant
 
-A moment in time — epoch milliseconds in an `i53` under the hood.
+A moment in time: epoch milliseconds in an `i53` under the hood.
 
 ```vilan,fragment
 fun now(): Instant                       // the current wall-clock moment
@@ -62,7 +62,7 @@ fun main() {
 ```
 
 Ordering two instants (or durations) is the `<`/`<=`/`>`/`>=` operators
-dispatching through their `PartialOrd` impls — the same
+dispatching through their `PartialOrd` impls, the same
 `partial_compare` you'd call by hand.
 
 ## Sleeping
@@ -79,7 +79,7 @@ cancelling the nursery cuts it short instead of waiting the timer out.
 
 A sleep nobody can reach into is sometimes not what you want: you need to
 start a delay now, hand it around, and later either learn that it fired or
-take it back. That's a `Timer` — `setTimeout` and `clearTimeout` as one
+take it back. That's a `Timer`: `setTimeout` and `clearTimeout` as one
 value.
 
 ```vilan,fragment
@@ -93,8 +93,8 @@ impl Timer {
 
 A timer starts on construction and settles exactly once, on a **verdict**:
 `true` if it fired, `false` if `cancel()` got there first. The verdict is
-remembered, so every waiter sees the same answer — one parked before it
-settled, one arriving long after — and asking a settled timer is immediate.
+remembered, so every waiter sees the same answer (one parked before it
+settled, one arriving long after), and asking a settled timer is immediate.
 `cancel()` is idempotent: cancelling twice, or cancelling a timer that
 already fired, does nothing.
 
@@ -114,32 +114,32 @@ That is the re-clickable-button shape: keep the timer in hand, and a new
 click cancels the one still pending before starting its own.
 
 `Timer` is an ordinary value wrapping one host handle, the way a `Signal`
-wraps one cell — copying it (assigning, passing, storing it in a field)
+wraps one cell. Copying it (assigning, passing, storing it in a field)
 shares the same timer, so cancelling through any copy settles them all.
 
 ### Timers and nurseries
 
-`wait` carries the ambient cancel signal exactly as `sleep` does, and the
+`wait` carries the ambient cancel signal as `sleep` does, and the
 difference between the two cancellations matters:
 
 - **`timer.cancel()`** is a verdict. The host timer is cleared and every
   waiter resolves `false`.
-- **A cancelling nursery** tears down the task that was awaiting — the
-  structured path — and does *not* touch the timer. No verdict, no
+- **A cancelling nursery** tears down the task that was awaiting (the
+  structured path) and does *not* touch the timer. No verdict, no
   `clearTimeout`: the timer belongs to whoever holds the value, so its other
   holders can still wait on it, or call it off themselves.
 
 ## Notes
 
-- Duration constructors take `i53` — remember the suffix on computed
+- Duration constructors take `i53`; remember the suffix on computed
   literals (`Duration::millis(500i53 * factor)`); see
   [gotchas](../appendix/gotchas.md).
 - `now()` is a host call, so it can't be `const`-folded, and programs using
-  it aren't output-deterministic — keep it out of golden-file tests.
-- A pending `Timer` keeps the host alive: on node the process will not exit
-  while one is outstanding, exactly as an outstanding `sleep` holds it open.
-  There is no unref knob — cancel the timer if the program should be free to
+  it aren't output-deterministic; keep it out of golden-file tests.
+- A pending `Timer` keeps the host alive: on Node the process will not exit
+  while one is outstanding, just as an outstanding `sleep` holds it open.
+  There is no unref knob; cancel the timer if the program should be free to
   end.
-- Wire format: an `Instant` serializes as its `i53` millis — exact for any
+- Wire format: an `Instant` serializes as its `i53` millis, exact for any
   realistic date (i53 rides the wire as a float's 53 bits, safe past year
   200,000).

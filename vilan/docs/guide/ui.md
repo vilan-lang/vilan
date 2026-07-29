@@ -3,7 +3,7 @@
 `std::ui` is a declarative view layer with no virtual DOM. A `View`
 describes a DOM element. Methods chain to build it. Where React re-runs
 components and diffs the result, Vilan binds individual DOM properties to
-signals — when a signal changes, exactly that text node or attribute
+signals: when a signal changes, exactly that text node or attribute
 updates and nothing else runs.
 
 Available in browser builds (`target = "browser"` in `vilan.toml`, or
@@ -45,8 +45,9 @@ changes. There is no render loop to trigger.
 
 ## Components are just functions
 
-A "component" is a function that returns a `View`. No registration, no
-special types, no props system — parameters are the props:
+A "component" is a function that returns a `View`. There is no
+registration, special types, or props system; the parameters are the
+props:
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };
@@ -93,7 +94,7 @@ unsubscribe.
 Two ways to wire an `<input>`, for two different situations:
 
 **`bind_value(signal)`** is the simple two-way bind: the input shows the
-signal, typing writes it back. Use it for local state — a search box, a
+signal, typing writes it back. Use it for local state: a search box, a
 "new item" field.
 
 **`bind_draft(draft)`** binds the input to a local-first
@@ -131,11 +132,11 @@ fun main() {
 `Signal<List<T>>`. Rows are **keyed**, like React's `key` prop, and the
 key does real work here:
 
-- A row whose key survives a change is **reused**. Its element moves to
+- A row whose key survives a change is reused. Its element moves to
   the new position with its state and subscriptions intact.
-- A row whose key survives but whose *value* changed re-renders just
+- A row whose key survives but whose *value* changed re-renders only
   that row (that's why `T: PartialEq`).
-- Removed rows are disposed properly — each row is its own owner, so a
+- Removed rows are disposed: each row is its own owner, so a
   row's bindings die with the row.
 
 ```vilan,browser
@@ -176,7 +177,7 @@ not visible:
 
 | | Content while off | State | Use for |
 |---|---|---|---|
-| `.show(condition)` | mounted, hidden | **preserved** | tabs, collapsibles — anything that should keep its input text |
+| `.show(condition)` | mounted, hidden | preserved | tabs, collapsibles, anything that should keep its input text |
 | `.when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
 | `.swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
 
@@ -191,13 +192,13 @@ not visible:
 
 `when` and `swap` build their content under a fresh owner each time, so
 everything inside cleans up when the content goes away. `swap` re-renders
-only when the value actually *changes* (`T: PartialEq`), so navigating
+only when the value *changes* (`T: PartialEq`), so navigating
 to the page you're already on does nothing.
 
 ## The ownership picture
 
 Here is the whole cleanup model in one picture. Owners exist at the
-places marked `◆` — the boundaries where a subtree can die. Every
+places marked `◆`: the boundaries where a subtree can die. Every
 binding registers with the *nearest* boundary above it, no matter how
 many plain function calls sit in between:
 
@@ -218,7 +219,7 @@ many plain function calls sit in between:
             └─ .on("click", …)         → dies with ROW 2's DOM node
 ```
 
-Navigate away, and the page's owner is disposed — every binding the page
+Navigate away, and the page's owner is disposed. Every binding the page
 created dies with it. Delete row 2, and only row 2's bindings die. This
 is why there is no unsubscribe code anywhere in a Vilan app: the tree of
 boundaries *is* the cleanup logic, and the framework already placed
@@ -226,9 +227,9 @@ them where subtrees end.
 
 ## Server-side rendering
 
-The same component code runs on the server. On a node build `std::ui`
-builds an HTML **string** instead of live DOM, and `render(view)`
-serializes it — first paint and SEO, before any JavaScript. A route
+The same component code runs on the server. On a Node build `std::ui`
+builds an HTML string instead of live DOM, and `render(view)`
+serializes it: first paint and SEO, before any JavaScript. A route
 handler calls your own `app()` and splices the markup into its HTML
 shell. The [server-side rendering guide](ssr.md) walks the whole loop.
 
@@ -251,15 +252,15 @@ fun main() {
 Two rules make one component serve both legs:
 
 - **Bindings read once.** `bind_text`, `bind_attr`, `bind_each`, `when`, and
-  `swap` embed the signal's value *at render time* — no subscription is created,
+  `swap` embed the signal's value *at render time*: no subscription is created,
   and nothing survives the request (create, serialize, discard). Build pure, bind
   reactive: a component that leans on effect side-channels at build time renders
   stale. Text and attribute values are escaped, so a hostile string is inert.
 - **No `mount`/`mount_root` on the server.** Mounting is a client entry, not a
   renderable view, so the natural factoring is a shared `fun app(): View` with a
   per-leg `main`: `mount_root("app", app)` in the browser, `render(app())` on the
-  server. Event handlers (`on`) are accepted and discarded — a server-rendered
-  `<button>` is just a button. `std::dom` stays browser-only, so a component
+  server. Event handlers (`on`) are accepted and discarded; a server-rendered
+  `<button>` is a plain button. `std::dom` stays browser-only, so a component
   reaching for raw DOM cannot SSR; the cross-platform error says so at the import.
 
 ## Escaping to the DOM
@@ -272,11 +273,11 @@ directly: `get_element_by_id`, `query_selector`,
 
 ## Traps
 
-- `show` keeps bindings live while hidden — they keep firing. If the
+- `show` keeps bindings live while hidden, and they keep firing. If the
   hidden content is expensive, use `when`.
-- Inline SVG works — `view("svg").attr("viewBox", …).child(view("path")…)`
+- Inline SVG works: `view("svg").attr("viewBox", …).child(view("path")…)`
   creates real SVG-namespace elements, and the server render carries the
-  `xmlns` — but `show` drives the HTML-only `hidden` property, which SVG
+  `xmlns`. But `show` drives the HTML-only `hidden` property, which SVG
   ignores: toggle an SVG subtree with `when` (or a class) instead.
 - `bind_value` fights remote updates (every keystroke overwrites). For
   server-backed fields, use `bind_draft`.

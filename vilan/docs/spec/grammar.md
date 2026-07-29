@@ -75,7 +75,7 @@ extern-args = STRING [ "," STRING ]           (* module/global binding *)
             | ("method"|"get"|"set") [ "," STRING ] ;
 ```
 
-A `;` body is a signature-only declaration — legal for `external`
+A `;` body is a signature-only declaration: legal for `external`
 functions and required trait methods. A parameter's **convention** may
 come from the prefix (`own x`, `&mut self`) or from a view type
 (`x: &mut T`); the prefix wins if both are present (§6.3). The `borrows`
@@ -98,11 +98,11 @@ A `;`-bodied struct is legal only for `external` structs (host types). An
 explicit variant discriminant (`= 0`, `= -1`) fixes the variant's integer
 tag.
 
-The leading `resource` modifier marks a type declaration as a *resource* —
+The leading `resource` modifier marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in the resources
 chapter (forthcoming; the modifier currently reserves the surface). It
 precedes `external`, so the full modifier order is `resource external
-struct`, and it is accepted only on `struct` and `enum` declarations —
+struct`, and it is accepted only on `struct` and `enum` declarations;
 `resource` before any other item is a parse error.
 
 ### Impls and traits
@@ -116,7 +116,7 @@ trait = "trait" IDENT [ generic-params ] [ "with" type { "+" type } ]
 An impl's subject is a **type pattern**: `type X [: bounds]` binders
 anywhere inside it (`impl List<type T>`, `impl Option<(type T, type U)>`,
 bare `impl type T`) declare the impl's generic parameters (§5.6). `with`
-lists the implemented trait(s) — an impl without `with` provides inherent
+lists the implemented trait(s). An impl without `with` provides inherent
 members. A trait's `with` lists supertraits.
 
 ### Generic parameters and arguments
@@ -146,7 +146,7 @@ macro-invocation = "macro" IDENT "(" [ expr-span { "," expr-span } ] ")" ;
 macro-block      = "macro" block ;
 ```
 
-A macro attribute's arguments are captured as **source spans** — the
+A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `extern`, `must_use`, `rpc`,
 `trait_only`, `doc`, `expose`) are not available as user macro-attribute
@@ -163,7 +163,7 @@ jump       = "jump" IDENT ;          (* break | continue *)
 ```
 
 `let` binds immutably, `mut` mutably; a tuple binder destructures
-(irrefutably — names and nested tuples only). Both the type and the
+(irrefutably: names and nested tuples only). Both the type and the
 initializer are syntactically optional. A **place** is a chain expression
 (§3.6) denoting a location: a local, a field chain, an index, or a place
 reached through a call (`a.write().count`); the optional leading `*`
@@ -183,7 +183,7 @@ match-leg  = pattern { "," pattern } [ "if" expression ] "=>" expression ;
 ```
 
 A block's value is its trailing expression, or `void` if none. Conditions
-and `match`/`for` subjects are **secondary expressions** (§3.8) — struct
+and `match`/`for` subjects are **secondary expressions** (§3.8): struct
 initializers are excluded there, keeping `if Foo {` unambiguous. A
 match leg's comma-separated patterns form an or-pattern; the optional
 `if` guard applies to the whole leg; the trailing comma after a leg is
@@ -221,7 +221,7 @@ follows (`List<str>::new()`); otherwise `<` is a comparison. A member
 fuses at most ONE call; a further `(args)` is a **direct call** on the
 chain's result, calling a closure-typed value
 (`self.hook.read()(a, b)`). A `?.` link's **continuation** extends
-through the following plain postfixes up to the next `?.` or `!` —
+through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
 result (§5.10).
 
@@ -269,7 +269,7 @@ Two consequences of the tier split are normative:
 
 - A **struct initializer** is an operand of the operator/postfix chain
   (`Point { … } == q` compares; `Point { x = 1, y = 2 }.length()` folds
-  the member chain) — except in **condition positions**: an `if`/`for`
+  the member chain), except in **condition positions**: an `if`/`for`
   condition, a `for … in` iterable, and a `match` subject parse
   `condition-expr`, whose operands exclude struct initializers, so the
   `{` after `if Foo` is the block. Parenthesize a literal to use it in a
@@ -316,7 +316,7 @@ pattern = ("let" | "mut") binder                (* binding *)
 ```
 
 Bindings inside patterns are written explicitly (`Some(let x)`), so a
-bare name is always a **variant** reference, never a fresh binding — the
+bare name is always a **variant** reference, never a fresh binding: the
 classic mistyped-variant trap is a resolution error instead of a silent
 catch-all. `bool` and `null` literals match as variants of their enums.
 The `let`/parameter binder grammar (names and tuples, §3.3) is the

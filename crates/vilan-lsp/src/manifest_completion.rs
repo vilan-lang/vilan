@@ -127,7 +127,7 @@ pub const DEPENDENCY_KEYS: &[Key] = &[
     Key {
         name: "tag",
         documentation: "The tag a git dependency pins (exactly one of `tag` / `rev`). A \
-                        branch cannot be pinned — it moves.",
+                        branch cannot be pinned; it moves.",
         values: ValueSet::Open,
     },
     Key {
@@ -256,7 +256,7 @@ pub const TABLES: &[Table] = &[
             },
             Key {
                 name: "platform",
-                documentation: "The platforms this layer serves — at least one. A runtime, a \
+                documentation: "The platforms this layer serves (at least one). A runtime, a \
                                 runtime version, or a family like `@process`.",
                 values: ValueSet::PlatformPattern,
             },
@@ -268,7 +268,7 @@ pub const TABLES: &[Table] = &[
         keys: &[
             Key {
                 name: "packages",
-                documentation: "Paths to the member package directories — the build set of \
+                documentation: "Paths to the member package directories: the build set of \
                                 `vilan build .` at the root.",
                 values: ValueSet::Open,
             },
@@ -300,7 +300,7 @@ pub const TABLES: &[Table] = &[
             },
             Key {
                 name: "target",
-                documentation: "The entry's build platform. Must be a host — an entry is \
+                documentation: "The entry's build platform. Must be a host: an entry is \
                                 something to run.",
                 values: ValueSet::Platform,
             },

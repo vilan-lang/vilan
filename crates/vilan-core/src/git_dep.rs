@@ -222,14 +222,14 @@ pub fn materialize(
     }
     if config.policy == GitPolicy::CacheOnly {
         return Err(WorkspaceError::unfetched(format!(
-            "{} is not in the local cache, and this command does not fetch — \
+            "{} is not in the local cache, and this command does not fetch; \
              run `vilan build` (or `vilan check`) once to fetch it",
             source.describe()
         )));
     }
     if let Some(report) = config.report {
         report(&format!(
-            "fetching {label} — {} {}",
+            "fetching {label}: {} {}",
             source.url,
             source.reference.describe()
         ));
@@ -342,7 +342,7 @@ fn fetch(source: &GitSource, staging: &Path) -> Result<(), String> {
                 .arg(staging);
             run(command).map_err(|detail| {
                 format!(
-                    "cannot fetch {} from `{}` — check that the tag exists and the \
+                    "cannot fetch {} from `{}`; check that the tag exists and the \
                      repository is reachable\n  {detail}",
                     source.reference.describe(),
                     source.url
@@ -365,7 +365,7 @@ fn fetch(source: &GitSource, staging: &Path) -> Result<(), String> {
                 return Ok(());
             }
             Err(format!(
-                "`{tag}` is not a tag in `{}` — it named a branch, and a branch moves, so \
+                "`{tag}` is not a tag in `{}`: it named a branch, and a branch moves, so \
                  it cannot pin a dependency; use a released tag, or pin the commit with \
                  `rev = \"<commit sha>\"`",
                 source.url
@@ -401,7 +401,7 @@ fn fetch(source: &GitSource, staging: &Path) -> Result<(), String> {
                 .arg(rev);
             run(fetch).map_err(|detail| {
                 format!(
-                    "cannot fetch {} from `{}` — the commit may not exist, or the server \
+                    "cannot fetch {} from `{}`: the commit may not exist, or the server \
                      may refuse to serve a commit by SHA (git's \
                      `uploadpack.allowReachableSHA1InWant`, off by default on many hosts); \
                      depend on a `tag` instead\n  {detail}",
@@ -450,7 +450,7 @@ fn succeeds(mut command: Command) -> bool {
 /// digest of stderr — enough to see *why* without pasting a screen of progress.
 fn run(mut command: Command) -> Result<(), String> {
     let output = command.output().map_err(|error| {
-        format!("cannot run `git`: {error} — a git dependency needs `git` on the PATH")
+        format!("cannot run `git`: {error} (a git dependency needs `git` on the PATH)")
     })?;
     if output.status.success() {
         return Ok(());
@@ -483,7 +483,7 @@ fn verify_library(staging: &Path, source: &GitSource) -> Result<(), String> {
     let manifest_path = staging.join("vilan.toml");
     let Ok(contents) = crate::util::read_source(&manifest_path) else {
         return Err(format!(
-            "the checkout of {} has no `vilan.toml` at its root — a git dependency is a \
+            "the checkout of {} has no `vilan.toml` at its root: a git dependency is a \
              Vilan `[library]` package, and its manifest is what says so",
             source.describe()
         ));
@@ -505,8 +505,8 @@ fn verify_library(staging: &Path, source: &GitSource) -> Result<(), String> {
         "neither"
     };
     Err(format!(
-        "the checkout of {} declares {declared}, but a git dependency must be a `[library]` \
-         — an app is not importable, and a workspace root has no source of its own",
+        "the checkout of {} declares {declared}, but a git dependency must be a `[library]`: \
+         an app is not importable, and a workspace root has no source of its own",
         source.describe()
     ))
 }

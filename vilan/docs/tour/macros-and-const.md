@@ -8,7 +8,7 @@ Most days you'll use these indirectly: `[derive(…)]` is a macro, and
 `const style()` is how the styling system works. Writing your own comes
 up rarely, so treat the second half of this chapter as reference.
 
-## `const` — compute it at compile time
+## `const`: compute it at compile time
 
 Put `const` in front of an expression and the compiler evaluates it
 during the build, then writes the *result* into the output as a literal:
@@ -36,7 +36,7 @@ fun main() {
 Three rules to know:
 
 - `const` captures **greedily**: everything to the end of the expression
-  folds. Parenthesize to narrow it — in
+  folds. Parenthesize to narrow it: in
   `(const square(4)) + square(2)`, the second call runs at runtime.
 - The expression can only use things the compiler can know: literals,
   imports, and immutable bindings whose own initializers are const.
@@ -46,7 +46,7 @@ Three rules to know:
 The flagship user is styling: `const style()…` chains evaluate at build
 time and emit CSS. See the [styling guide](../guide/styling.md).
 
-## Derive macros — impls from a type's shape
+## Derive macros: impls from a type's shape
 
 You've already seen `[derive(PartialEq, Debug)]`. A derive is a macro: a
 function that runs at compile time, receives the type it annotates as
@@ -100,19 +100,19 @@ fun main() {
 How to read that:
 
 - `macro fun` declares the macro. Its body is ordinary Vilan, but it
-  compiles against `macro_std` — a small compile-time standard library
+  compiles against `macro_std`, a small compile-time standard library
   with `source`, the `meta` types (`Item`, `StructItem`, …), and the
   basics. Its imports are its own; it can't reach into your program.
 - The macro receives the annotated item as data. `item.as_struct()`
   gives the struct's name and fields.
 - It returns `Source`: text, usually built with interpolation. The
-  `i"""…"""` form is the one to reach for — the template is written as
+  `i"""…"""` form is the one to reach for: the template is written as
   the generated code will read, indented with the macro around it (the
   closing delimiter's indentation is stripped from every line). Literal
   braces in generated code are escaped as `\{` and `\}`; the holes'
   braces are not.
 - The returned source is spliced in *before* type checking, so generated
-  code is checked exactly like code you wrote by hand.
+  code is checked like code you wrote by hand.
 
 ## `macro { … }` blocks
 
@@ -141,8 +141,9 @@ fun main() {
 }
 ```
 
-For plain value folding, prefer `const` — reach for an expression-position
-macro block only when you're generating *code*, not computing a value.
+For plain value folding, prefer `const`. Reach for an
+expression-position macro block only when you're generating *code*, not
+computing a value.
 
 ## Choosing the right tool
 
@@ -157,6 +158,6 @@ macro block only when you're generating *code*, not computing a value.
 > **Going deeper.** Macro expansion is fueled: a runaway macro is a
 > compile error rather than a hung build, and the limits are tunable via
 > `[macro] fuel` / `depth` in `vilan.toml`. Macros see one item at a
-> time — there is no whole-program reflection. The `[service]`,
+> time; there is no whole-program reflection. The `[service]`,
 > `[rpc]`, and `[derive(Wire)]` attributes you meet in the guides are
 > this same mechanism, shipped in std.

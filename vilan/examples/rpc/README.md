@@ -1,9 +1,9 @@
-# RPC example — the hand-written paradigm (roadmap P6)
+# RPC example: the hand-written paradigm (roadmap P6)
 
-A working, end-to-end **RPC + reactive** runtime written out **by hand**. The library is a
+A working, end-to-end RPC + reactive runtime written out by hand. The library is a
 *guide*, not a generator (see [`proposal/transport-rpc.md`](../../proposal/transport-rpc.md)):
-it provides a codec, transports, and two sibling **protocols** over them — request/response
-(`RpcProtocol`) and publish/subscribe (`ReactiveProtocol`) — and a *paradigm* for using them.
+it provides a codec, transports, two sibling protocols over them (request/response
+`RpcProtocol` and publish/subscribe `ReactiveProtocol`), and a *paradigm* for using them.
 This example works that paradigm so the whole system is visible. The reusable runtime is in
 [`src/rpc.vl`](src/rpc.vl); the application in [`src/main.vl`](src/main.vl).
 
@@ -30,89 +30,89 @@ login -> true
 whoami -> ada (@ada)
 ```
 
-In-process, so it builds and runs today with **no network** — none of the Phase-0
+In-process, so it builds and runs today with no network; none of the Phase-0
 `fetch`-POST / `http` body work is needed.
 
 ## The data boundary (proposal §3)
 
 The headline of the paradigm: **data crosses the wire only as an explicit *wire type*, and
-sensitive data is simply a type that cannot cross.**
+sensitive data is a type that cannot cross.**
 
-- `Password` is **not Wire** — no `[derive(Wire)]`. So `[derive(Wire)] struct User { password:
+- `Password` is not Wire (no `[derive(Wire)]`). So `[derive(Wire)] struct User { password:
   Password, .. }` *will not compile*: the field `password` of type `Password` is not Wire, a
-  clear compile error. The boundary is enforced by the type system, not by a per-field reminder
+  compile error. The boundary is enforced by the type system, not by a per-field reminder
   you might forget.
 - `User` is the rich, server-side domain type; it holds a `Password`, so it never crosses.
 - `WireUser` is the **explicit projection** (`User::to_wire`), a `[derive(Wire)]` DTO of only
   Wire fields. It drops `password` and *adds* a computed `handle` the domain type has no field
-  for — the wire shape diverges freely from the source. The client only ever sees `WireUser`;
+  for: the wire shape diverges freely from the source. The client only ever sees `WireUser`;
   it has no `password` field to leak.
 
 `[derive(Wire)]` enforces the rule directly (proposal §3): **every field of a Wire type must
-itself be Wire** — a scalar, `str`, `bool`, `List`/`Option` of Wire, or another `[derive(Wire)]`
-type; anything else is a compile error. It reuses the `Json` round-trip for encode/decode, so a
-Wire type serializes like a `[derive(Json)]` one — the difference is the boundary check.
+itself be Wire**, whether a scalar, `str`, `bool`, a `List`/`Option` of Wire, or another
+`[derive(Wire)]` type; anything else is a compile error. It reuses the `Json` round-trip for encode/decode, so a
+Wire type serializes like a `[derive(Json)]` one; the difference is the boundary check.
 
 ## The layered runtime
 
-The pieces of the proposal, bottom-up — a codec, transports, and protocols over them:
+The pieces of the proposal, bottom-up (a codec, transports, and protocols over them):
 
 | Proposal piece | Here |
 | --- | --- |
 | **codec** (§6) | the `Json`/`FromJson` derives, used directly (frames are JSON `str`) |
 | **transport** (§5) | `trait Transport` (request/response) + `LocalTransport`; `trait DuplexTransport` + `DuplexEnd` / `duplex_pair` (full-duplex, in-process) |
-| **protocol** (§2) | `trait Protocol { receive }` — `RpcProtocol` (request/response) and `ReactiveServer`/`ReactiveClient` (pub/sub) all implement it |
-| **service** (§4.1 foundation + §4.2 generated) | the hand-written foundation (`accounts_dispatcher()` + `AccountsClient` over `call`/`Dispatcher`) **and** the generated form: `[service(Client)] struct Session` → `Session::dispatcher()`, the `Client` sibling, and `contract_hash()` |
-| **the turn** (`reactive-batching.md`) | every inbound frame is handled in a `batch` (`local_rpc`, both duplex `on_frame`s) — a handler's signal writes coalesce into one `Update` per source, delivered with the reply |
+| **protocol** (§2) | `trait Protocol { receive }`: `RpcProtocol` (request/response) and `ReactiveServer`/`ReactiveClient` (pub/sub) all implement it |
+| **service** (§4.1 foundation + §4.2 generated) | the hand-written foundation (`accounts_dispatcher()` + `AccountsClient` over `call`/`Dispatcher`) and the generated form: `[service(Client)] struct Session` → `Session::dispatcher()`, the `Client` sibling, and `contract_hash()` |
+| **the turn** (`reactive-batching.md`) | every inbound frame is handled in a `batch` (`local_rpc`, both duplex `on_frame`s), so a handler's signal writes coalesce into one `Update` per source, delivered with the reply |
 
-The client and server now go through the §4.1 **foundation** — `call<T>` collapses a client
+The client and server now go through the §4.1 foundation: `call<T>` collapses a client
 round-trip (build envelope → `await` → decode) into one line, and `Dispatcher` + `arg`/`reply`
 replace the hand-rolled envelope/`match`. It is plain Vilan (no compiler feature); the eventual
 `[service(Client)]` sugar just generates it, which is why it's built and proven first.
 
-The server `lookup_user` returns `Option<User>` — `None` is an *application-level* "not found"
+The server `lookup_user` returns `Option<User>`: `None` is an *application-level* "not found"
 (part of the return type), separate from an `RpcError` (an *infrastructure* failure). The
-dispatcher **projects** the domain `User` to a `WireUser` before encoding; the client stub
+dispatcher projects the domain `User` to a `WireUser` before encoding; the client stub
 returns `Result<Option<WireUser>, RpcError>`.
 
 ## The reactive protocol (proposal §8)
 
-A `Signal`/`Source` is **not data** — it is a *capability* (a live reference plus an event
+A `Signal`/`Source` is not data; it is a *capability* (a live reference plus an event
 stream), so it never rides the codec as a value. `ReactiveProtocol` is the second protocol, a
-sibling to RPC over a **duplex** transport:
+sibling to RPC over a duplex transport:
 
 - The server `ReactiveServer` holds a per-connection **capability table**: `expose(source)`
-  registers a source under a fresh **channel id** — the id is what crosses the wire in place of
+  registers a source under a fresh **channel id**; the id is what crosses the wire in place of
   the signal. On a `Subscribe(id)` frame it forwards that source's values as `Update(id, json)`
   frames.
-- The client holds a **typed `RemoteSource<i32>`** (the read-only half of the reactive
-  split — client code can't write a server signal; `get`/`sub` only, no `set`). Its `sub`
+- The client holds a typed `RemoteSource<i32>` (the read-only half of the reactive
+  split: client code can't write a server signal; `get`/`sub` only, no `set`). Its `sub`
   opens the channel and observes a local mirror (`Signal<Option<i32>>`, `None` until the
   first update) that inbound `Update` frames keep in sync; `count = 0` is the current
-  value, delivered on subscribe, then `1` and `2` as the server `set`s it — the observer
+  value, delivered on subscribe, then `1` and `2` as the server `set`s it. The observer
   receives decoded values, never wire text.
 
 The `Source` trait itself is a small, additive `std::reactive` change: `Signal`'s read-only
 `get`/`sub` moved into `trait Source<T>` (which `expose` is generic over). `RemoteSource<T>`
-mirrors the same `get`/`sub` shape without implementing the trait — its `get` is
+mirrors the same `get`/`sub` shape without implementing the trait: its `get` is
 `Option<T>` (no value before the first update), the honest remote signature.
 
 ## The wire turn (reactive batching)
 
 The scenario that motivated `std::reactive`'s batching (`proposal/reactive-batching.md`): an
-**RPC call mutates a signal the client is subscribed to**. Without a boundary, every `set`
+RPC call mutates a signal the client is subscribed to. Without a boundary, every `set`
 inside the handler pushes its own `Update` frame, mid-handler, before the reply even exists.
-So the runtime handles **every inbound frame in a `batch`** — the *turn* (`local_rpc` and both
+So the runtime handles every inbound frame in a `batch`, the *turn* (`local_rpc` and both
 duplex `on_frame`s). The demo shows all three behaviours:
 
-- A lone `set` outside any batch stays **eager** — one write, one `Update` (`count = 1`, `2`),
+- A lone `set` outside any batch stays **eager**: one write, one `Update` (`count = 1`, `2`),
   byte-for-byte the pre-batching behaviour.
 - An explicit `batch(|| { counter.set(5); counter.set(10); })` **coalesces**: the mirror
-  recomputes once, so ONE frame crosses (`count = 10` — the intermediate 5 is never observed).
-- The `add` RPC method writes the counter **twice** in its handler; `local_rpc`'s turn defers
+  recomputes once, so ONE frame crosses (`count = 10`; the intermediate 5 is never observed).
+- The `add` RPC method writes the counter twice in its handler; `local_rpc`'s turn defers
   both, so a single `Update` (`count = 16`) is delivered in the same turn as the reply
-  (`rpc add -> 16`). Values commit eagerly — the second write reads the first's result — only
-  the *notification* defers.
+  (`rpc add -> 16`). Values commit eagerly (the second write reads the first's result);
+  only the *notification* defers.
 
 In-process the update lands just before the reply (delivery is synchronous); a buffering
 transport (WebSocket, plan phase 4) would flush the coalesced frames and the reply together at
@@ -120,53 +120,53 @@ the turn's end via `transport.flush()`.
 
 ## The session service (proposal §4.2, by hand)
 
-`[service(Client)]` is **implemented — this section is generated**. From the annotated
+`[service(Client)]` is implemented; this section is generated. From the annotated
 `Session` struct and its `[rpc]` impl methods, the compiler generates
 `Session::dispatcher(self)` (one route per `[rpc]` method; handlers capture the session), the
-*sibling* `Client<T: Transport>` (the two-signature split — `Session::login(..): bool` vs
+*sibling* `Client<T: Transport>` (the two-signature split: `Session::login(..): bool` vs
 `Client::login(..): Result<bool, RpcError>`; the `[expose]`d `status` surfaces as a
 `RemoteSource` mirror), and a shared `contract_hash()` on both sides. The `[rpc]`/`[expose]`
 attributes are checked (an `[rpc]` signature must be Wire and declare a return; an `[expose]`d
 field must be a `Signal` of a Wire element). This demo previously wrote all of that out by
-hand; the generated code produces **byte-identical output** — the sugar mechanized the
+hand; the generated code produces byte-identical output. The sugar mechanized the
 paradigm without replacing it.
 
 - **Per-connection state (Q9).** One `Session` is created "on connect"; the dispatcher's
   handlers capture it, so state persists across the connection's calls (`login` then `whoami`).
-  Mutable state lives in `Signal`/`Shared` handles — closures capture a *copy* of the struct
+  Mutable state lives in `Signal`/`Shared` handles: closures capture a *copy* of the struct
   (value semantics), so the shared cells are what make the state one.
-- **Manual auth (Q4).** `whoami` is ordinary body logic over the state `login` populated —
-  unauthenticated is an application-level `None` (`whoami -> not logged in`), no `[rpc(auth)]`
-  attribute. The `Password` check happens entirely server-side (`matches` is the only operation
-  the type exposes; the hash never leaves).
+- **Manual auth (Q4).** `whoami` is ordinary body logic over the state `login` populated:
+  unauthenticated is an application-level `None` (`whoami -> not logged in`), with no
+  `[rpc(auth)]` attribute. The `Password` check happens entirely server-side (`matches` is the
+  only operation the type exposes; the hash never leaves).
 - **An exposed field (`[expose]`, §8).** `Session.status` is exported under a channel id; the
-  `Client` carries a `RemoteSource` mirror for it. A successful login flips it — and the wire
+  `Client` carries a `RemoteSource` mirror for it. A successful login flips it, and the wire
   turn delivers `status = online` in the same turn as `login -> true` (the failed login changes
-  nothing). The mirror is typed (`RemoteSource<str>`): observers receive decoded values — the
+  nothing). The mirror is typed (`RemoteSource<str>`): observers receive decoded values, and the
   codec chosen at wiring time is the only (de)serialization anywhere on the path.
 
 ## Quirks discovered
 
 Part of why this example is worth keeping: it surfaces compiler quirks the eventual generation
-will lean on. **#1, #3, #4, #5 were bugs — all fixed; #2 is intended syntax.** Bugs #3–#5 traced
-to one weakness — generic dispatch / monomorphization not threading type arguments through
-indirect, nested, or closure-capture contexts — the analyzer's B1 cluster, now closed across all
+will lean on. **#1, #3, #4, #5 were bugs, all fixed; #2 is intended syntax.** Bugs #3–#5 traced
+to one weakness (generic dispatch / monomorphization not threading type arguments through
+indirect, nested, or closure-capture contexts): the analyzer's B1 cluster, now closed across all
 three (#5 being the *closure-capture* case).
 
-### 1. `[derive(..)]` only expanded in the entry file — ✅ FIXED
+### 1. `[derive(..)]` only expanded in the entry file: ✅ FIXED
 
 Originally, putting the runtime in a separate `src/rpc.vl` and importing it gave
 `cannot find 'from_json' in RpcRequest` for every imported derived type, while a
-`[derive(Json)]` struct *in* `main.vl` worked — `expand_derives` ran on the **entry
-program only**.
+`[derive(Json)]` struct *in* `main.vl` worked: `expand_derives` ran on the entry
+program only.
 
-**Fixed** (commit 3592343): derive expansion now runs in *every* module — each loaded
-module and each dependency `lib.vl` — so a derived type's `to_json`/`from_json`/… work
+**Fixed** (commit 3592343): derive expansion now runs in *every* module (each loaded
+module and each dependency `lib.vl`), so a derived type's `to_json`/`from_json`/… work
 wherever it's defined. This example demonstrates it directly: the runtime and its
 derived envelope types live in `rpc.vl`, imported by `main.vl`. The proposal's shared
 `common` library of wire types is unblocked.
 
-### 2. Calling a method on a generic field needs parens + a struct-level bound (intended syntax — *not* a bug)
+### 2. Calling a method on a generic field needs parens + a struct-level bound (intended syntax, not a bug)
 
 The natural client stub is an object holding the transport, and the first instinct
 errors:
@@ -178,7 +178,7 @@ impl AccountsClient<type T> {
 }
 ```
 
-Two things are wrong, both **intended language rules**: a method call on a
+Two things are wrong, both intended language rules: a method call on a
 field-*projection* receiver must **parenthesize the receiver**, and the trait **bound
 must be declared on the struct definition** (so the field's type carries it). With
 both, it type-checks:
@@ -190,23 +190,23 @@ impl AccountsClient<type T> {                                   // impl infers i
 }
 ```
 
-The impl does **not** restate the bound: an `impl AccountsClient<type T>` can only
+The impl does not restate the bound: an `impl AccountsClient<type T>` can only
 apply to an `AccountsClient`, whose existence already requires `T: Transport`, so the
 binder inherits that bound. (Restating it, `impl AccountsClient<type T: Transport>`,
 is still accepted and means the same thing.)
 
 (`(self.transport).call(..)` is the same disambiguation that makes a *closure* field
-call `(self.handler)(request)` — which the runtime uses throughout, e.g. `Dispatcher`'s
+call `(self.handler)(request)`, which the runtime uses throughout, e.g. `Dispatcher`'s
 `(route.handler)(request)` and `ReactiveServer`'s `(self.transport).send(..)`. The
 `AccountsClient` stub above no longer needs it: `get_user` now passes the transport to the
 free `call` helper (§4.1), so the method-on-a-field form lives in `rpc.vl`, not `main.vl`.)
 
-### 3. …and that object stub used to *miscompile* — ✅ FIXED
+### 3. …and that object stub used to *miscompile*: ✅ FIXED
 
 The form from #2 type-checked, then printed `undefined`: the generic-field dispatch
 `(self.transport).call(..)` lowered to the empty abstract trait method, because the
 struct field's `T` carried the struct definition's generic id while the call's binding
-was keyed by the impl/receiver's id — `current_substitution` missed and the abstract
+was keyed by the impl/receiver's id, so `current_substitution` missed and the abstract
 `call` was emitted.
 
 **Fixed** by two root-cause changes (backlog B1, class B):
@@ -214,21 +214,21 @@ was keyed by the impl/receiver's id — `current_substitution` missed and the ab
 1. **Field access substitutes the receiver's type arguments** (`resolve_field_accessor`):
    `self.transport` on `AccountsClient<LocalTransport>` (or, inside the impl, on the
    impl's own `T`) now resolves to the concrete/impl-bound type instead of the struct's
-   abstract parameter — so the dispatch binding composes.
+   abstract parameter, so the dispatch binding composes.
 2. **A generic struct initializer no longer leaks an abstract type while deferred.**
    `let client = AccountsClient { transport = transport }` (field from a *variable*)
    used to ground `client` as `AccountsClient<Transport>` (the trait bound) because the
    initializer published an unbound type before the field value resolved. It now defers
    cleanly, so `client` grounds to `AccountsClient<LocalTransport>`.
 
-So the **object stub is the form used here** — `AccountsClient<T: Transport>`, constructed
+So the object stub is the form used here: `AccountsClient<T: Transport>`, constructed
 and called from `main`. Its `get_user` now passes the `T`-typed field to the generic `call`
 helper (§4.1) rather than dispatching on it directly; the same field-substitution fix makes
 that generic-through-generic path monomorphize (pinned by `generic_field_method_dispatch_runs`,
 `generic_field_from_a_variable_dispatches`, and `generic_call_over_a_bounded_transport_decodes`
 in `inference.rs`).
 
-### 4. `from_json` element-type inference through an indirect path — ✅ FIXED
+### 4. `from_json` element-type inference through an indirect path: ✅ FIXED
 
 ```vilan
 RpcReply::Success(let json) => Option::from_json(json),   // ✓ now binds WireUser
@@ -237,23 +237,23 @@ RpcReply::Success(let json) => Option::from_json(json),   // ✓ now binds WireU
 Here `Option::from_json` (which itself returns `Result<Option<WireUser>, str>`, I3)
 must infer its element type `WireUser` through the function's return type. That
 indirect path *used to* lower the inner
-decode to the empty abstract `from_json_value`, yielding `Some(undefined)` — so the
+decode to the empty abstract `from_json_value`, yielding `Some(undefined)`, so the
 stub pinned the type with a local `let user: Option<WireUser> = ..`.
 
 **Fixed** (the return-type-driven body inference, B1): a function's body is now
 inferred *against* its declared return type, and `resolve_match` propagates that
 expected type into each leg, so the type flows `Result<Option<WireUser>, _>` → the `Ok`
 arm → the `Ok(..)` wrapper → `Option::from_json`'s element. The stub above uses the
-natural indirect form directly — no pinning needed. (`enum_constructor_..` and
+natural indirect form directly, with no pinning needed. (`enum_constructor_..` and
 `from_json_return_type_flows_through_match_arm` in `inference.rs` pin both halves.)
 
-### 5. Generic element serialized inside a closure — ✅ FIXED
+### 5. Generic element serialized inside a closure: ✅ FIXED
 
 Building the reactive protocol surfaced a monomorphization gap that shaped `expose`. With
 `S: Source<T>`, `T: Json`, `source.sub(|value| value.to_json())` used to fail *two* ways:
 the closure parameter `value` lost its `T: Json` bound (a compile error, `cannot call method
-'to_json' on T`), and — since `T` appears only in the bound `F: Source<T>`, not a direct
-parameter — `T` was never derived from the concrete `Signal<i32>: Source<i32>` at the call
+'to_json' on T`), and (since `T` appears only in the bound `F: Source<T>`, not a direct
+parameter) `T` was never derived from the concrete `Signal<i32>: Source<i32>` at the call
 site, so `to_json` monomorphized to the empty abstract method (`undefined`). The same
 abstract-dispatch failure as #3/#4, but reached through a *closure capture* of a generic,
 which the earlier B1 fixes didn't cover.
@@ -263,30 +263,30 @@ a parameterized bound's arguments (so the closure parameter keeps its `T: Json`)
 `resolve_call_subject` / `bind_method_own_generics` derive a bound-only generic from the
 concrete argument's impl (`derive_generics_from_bounds`); and `resolve_method_call` defers a
 call whose method still has an unbound own-generic while an argument is unresolved, so an
-*inferred* source (`let s = Signal::new(7)`, no annotation) re-derives once its type lands —
+*inferred* source (`let s = Signal::new(7)`, no annotation) re-derives once its type lands;
 the method path now matches the free-function path. So `expose<T: Json, S: Source<T>>(source: S)`
-monomorphizes — the JSON erasure moved *inside* the runtime (a `Signal<str>` mirror per
-channel), off the application, which now just calls `server.expose(counter)`.
+monomorphizes: the JSON erasure moved *inside* the runtime (a `Signal<str>` mirror per
+channel), off the application, which now calls `server.expose(counter)`.
 
-One adjacent item remains, noted for honesty: **`param: SomeTrait` is not a generic bound**
+One adjacent item remains: **`param: SomeTrait` is not a generic bound**
 (you write the explicit `<S: Source<T>>`, so the proposal's `fun stringify(value: ToJson)`
 sketch is aspirational syntax). The capability table also still stores `str`, since it holds
 heterogeneous sources and Vilan has no trait objects.
 
 ## What this validates for the plan
 
-The **data boundary, both transports, the codec, both protocols (RPC and reactive), the
-capability table, over-the-wire subscription, the wire turn (reactive batching — an RPC
+The data boundary, both transports, the codec, both protocols (RPC and reactive), the
+capability table, over-the-wire subscription, the wire turn (reactive batching: an RPC
 handler's writes coalescing with its reply), the per-connection session (state + manual auth +
 an exposed, client-mirrored signal), and the `Result`/`Option` error layering all work
-today** — the hand-written core is real, and the *paradigm* (a domain type, an explicit
+today. The hand-written core is real, and the *paradigm* (a domain type, an explicit
 `to_wire` projection, a sensitive type that can't cross, a signal observed remotely) holds with
 today's features. The generic-dispatch cluster (B1) that P6 leaned on is now closed through the
 closure-capture case too (#5), so `expose` is generic over any `Source<T>`.
 
 The whole §4.2 sugar is now real: `[derive(Wire)]`, the `call`/`Dispatcher` foundation, the
 wire turn, and `[service(Client)]` generation (this example runs byte-identically on the
-generated `Session::dispatcher()`/`Client` — the sugar mechanized the paradigm without
-replacing it; the runtime lives in `std::rpc`). What's left is the *wire itself*: the real
+generated `Session::dispatcher()`/`Client`; the sugar mechanized the paradigm without
+replacing it, and the runtime lives in `std::rpc`). What's left is the *wire itself*: the real
 transports (HTTP + WebSocket, plan phase 4), which bring `Client::connect`, contract-hash
 enforcement on connect, and `transport.flush()` for the buffered turn.

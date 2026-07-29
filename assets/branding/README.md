@@ -1,8 +1,8 @@
-# vilan branding (vendored)
+# Vilan branding (vendored)
 
 > **Licensing:** unlike the rest of the repository, the files in this
 > directory are **not** MIT/Apache-2.0 — see [LICENSE](LICENSE) in this
-> directory. Short version: unmodified use to refer to vilan is fine;
+> directory. Short version: unmodified use to refer to Vilan is fine;
 > derivatives and reuse as another project's branding are not.
 
 These files are **vendored copies** from the private `vilan-lang/branding`

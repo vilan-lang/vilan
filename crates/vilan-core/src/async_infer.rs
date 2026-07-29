@@ -189,7 +189,7 @@ pub fn infer(program: &mut Program) {
                 program,
                 *parameter,
                 format!(
-                    "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
+                    "`{}` requires a synchronous closure (`sync`): its completion is part of the declaring function's synchronous protocol; move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)",
                     parameter_record.name
                 ),
                 None,
@@ -236,7 +236,7 @@ pub fn infer(program: &mut Program) {
                 program,
                 *argument,
                 format!(
-                    "`{}` is a host (`external`) function — it cannot await a Vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
+                    "`{}` is a host (`external`) function: it cannot await a Vilan closure, so this parameter only accepts synchronous closures (or a void-returning one for spawn semantics)",
                     external.name
                 ),
                 None,
@@ -299,7 +299,7 @@ pub fn infer(program: &mut Program) {
             program,
             value_id,
             format!(
-                "field `{}` of `{}` receives an async closure, but its type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                "field `{}` of `{}` receives an async closure, but its type awaits nothing; declare it `async || T` (or return void for spawn semantics)",
                 field.name, struct_.name
             ),
             None,
@@ -338,7 +338,7 @@ pub fn infer(program: &mut Program) {
             program,
             *value_id,
             format!(
-                "`{}` returns an async closure, but its declared return type awaits nothing — declare it `async || T` (or return void for spawn semantics)",
+                "`{}` returns an async closure, but its declared return type awaits nothing; declare it `async || T` (or return void for spawn semantics)",
                 function.name
             ),
             None,
@@ -452,7 +452,7 @@ pub fn infer(program: &mut Program) {
                 program,
                 call.call_id,
                 format!(
-                    "the initializer of `{binding_name}` {culprit} — a module-level \
+                    "the initializer of `{binding_name}` {culprit}: a module-level \
                      binding cannot await (module initialization is synchronous); wrap \
                      the work in a function and call it from `main`"
                 ),
@@ -1184,7 +1184,7 @@ fn sync_violations_at(
             program,
             primary,
             format!(
-                "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`) — move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
+                "this call passes an async closure that reaches `{parameter_name}`, which requires a synchronous closure (`sync`); move the async work outside the callback (e.g. a `turn` with an awaiting body, `Draft`, or a spawned `async` block)"
             ),
             note,
         ));
@@ -1249,7 +1249,7 @@ fn extern_violations_at(
             program,
             primary,
             format!(
-                "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure — only synchronous closures can cross",
+                "this call passes an async closure that reaches the host (`external`) function `{}`, which cannot await a Vilan closure: only synchronous closures can cross",
                 external.name
             ),
             note,
@@ -1306,7 +1306,7 @@ fn dispatch_refusals_at(
         diagnostics.push(anchored(
             program,
             call_id,
-            "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation) — bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
+            "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation); bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
             None,
         ));
     }

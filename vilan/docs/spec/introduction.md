@@ -31,15 +31,15 @@ operator traits, `PartialEq`/`PartialOrd`, `Context`, `Task`, `Promise`,
 A Vilan program is processed in phases; each phase's errors preclude the
 next. A **conforming program** passes all of them.
 
-1. **Lexing** (§2) — source text to tokens.
-2. **Parsing** (§3) — tokens to the syntax tree.
-3. **Macro expansion & loading** (§10) — module loading, attribute/
+1. **Lexing** (§2): source text to tokens.
+2. **Parsing** (§3): tokens to the syntax tree.
+3. **Macro expansion & loading** (§10): module loading, attribute/
    derive/block expansion, splicing. Generated code re-enters phases 1–2.
-4. **Name resolution** (§4) — names to declarations.
-5. **Type checking** (§5) — types, generic binding, bound checking.
-6. **Memory checking** (§6) — view confinement, the aliasing rules.
-7. **Context checking** (§8) — ambient-value coverage.
-8. **Async inference** (§7) — asyncness, seam checking.
+4. **Name resolution** (§4): names to declarations.
+5. **Type checking** (§5): types, generic binding, bound checking.
+6. **Memory checking** (§6): view confinement, the aliasing rules.
+7. **Context checking** (§8): ambient-value coverage.
+8. **Async inference** (§7): asyncness, seam checking.
 9. **Emission** (§7.1 for the observable guarantees).
 
 An error's phase is observable only in which other errors accompany it; a

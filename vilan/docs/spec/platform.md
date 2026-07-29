@@ -10,19 +10,19 @@ capability its platform lacks.
 
 The standard library is layered:
 
-- the **base** layer — platform-neutral, available everywhere;
+- the **base** layer: platform-neutral, available everywhere;
 - the **browser** layer (`std::dom`, `std::ui`, `std::router`,
-  `std::storage`) — browser builds only;
+  `std::storage`): browser builds only;
 - the **process** layer (`std::fs`, `std::http`, `std::db`,
-  `std::process`, `std::rpc_server`) — `@process` builds only.
+  `std::process`, `std::rpc_server`): `@process` builds only.
 
 A library may declare the same shape for itself (`[library.layer]`,
 §11.4): a neutral root plus per-platform overlay roots.
 
 ## 11.2 Coloring and the reachability check
 
-Every function is **colored** with the platform requirement it implies
-— seeded by the layer its externs and std calls live in, flowing
+Every function is **colored** with the platform requirement it
+implies: seeded by the layer its externs and std calls live in, flowing
 callee-to-caller through the call graph (the same inference shape as
 asyncness, §7.3), including through generic instantiations: a generic
 function's requirement is judged **per instantiation**, so `save<T>`
@@ -45,45 +45,45 @@ several) on a function declares the platforms it promises to run on.
 The promise is checked on **every** compile, whatever the build's
 entries: if code the fenced function reaches requires a layer one of
 the fenced platforms lacks, the error lands **at the fence** with the
-offending chain — not at some distant entry in a dependent build.
+offending chain, not at some distant entry in a dependent build.
 Fences add no runtime behavior; they are checked declarations.
 
 ## 11.4 Manifests (`vilan.toml`)
 
 The manifest declares what a directory builds. Sections:
 
-- **`[package]`** — an application or plain package: `name`,
+- **`[package]`**: an application or plain package: `name`,
   `description`, `root` (source root; default `src/`), `entry` (the
   entry file, when there is exactly one), `target` (a platform;
   default `node`), and `dependencies` (name → `{ path = "…" }` for a
   local directory, or `{ git = "…", tag | rev = "…" }` for a `[library]`
-  repository pinned to exactly one of a tag or a commit — registry
+  repository pinned to exactly one of a tag or a commit; registry
   dependencies are future work).
-- **`[entry.<name>]`** — one build entry per table: `path` (default
+- **`[entry.<name>]`**: one build entry per table: `path` (default
   `<root>/<name>.vl`) and `target` (default `node`). A package with
   entries builds each for its own platform; reachability (§11.2) is
   what lets one source tree serve several. `[package] default-entry`
   names the entry `vilan run` executes when several are runnable.
-- **`[library]`** — a dependency-only package: `name`, `description`,
+- **`[library]`**: a dependency-only package: `name`, `description`,
   `root`, `dependencies`, and **`[library.layer.<name>]`** overlays
   (`root`, `platform = ["…"]`) for per-platform sources.
-- **`[project]`** — a workspace: `packages = ["member", …]` (paths);
+- **`[project]`**: a workspace: `packages = ["member", …]` (paths);
   building the project builds every member against its own manifest.
   `default-entry` names the member `vilan run` executes when several
   are runnable.
   Its own `dependencies` are declared once for the members to share: a
   member writes `dep = { project = true }` to take that declaration
   (paths in it resolve against the **project root**). Inheritance is
-  per dependency and opt-in — nothing is inherited implicitly — and
+  per dependency and opt-in (nothing is inherited implicitly), and
   `project = true` combines with no other key.
-- **`[build]`** — `run`, plus codegen options: `preset` (`"debug"` |
+- **`[build]`**: `run`, plus codegen options: `preset` (`"debug"` |
   `"release"`) and the per-feature overrides `indent`, `spaces`,
   `debug-names`. Build options never change program semantics (§7.6),
-  only the emitted text. `run` is a command line — or a list of them —
+  only the emitted text. `run` is a command line (or a list of them)
   executed through the host shell **before** each build (each `--watch`
   round included), in the manifest's directory, in order; a non-zero
   exit fails the build. `vilan check` builds nothing and runs none.
-- **`[macro]`** — the compile-time interpreter budget: `fuel` (steps
+- **`[macro]`**: the compile-time interpreter budget: `fuel` (steps
   per macro/const run) and `depth` (nested expansion), §9.3/§10.4.
 
 ## 11.5 Build products
@@ -91,7 +91,7 @@ The manifest declares what a directory builds. Sections:
 Each entry emits `dist/<name>.js` for its platform (browser entries
 first, so a server that ships bundles finds them fresh), plus
 `dist/<name>.css` when const evaluation emitted style assets (§9.2).
-`vilan run` builds all entries and starts one `@process` entry — the
+`vilan run` builds all entries and starts one `@process` entry: the
 only one, the designated `default-entry`, or the one `--entry` names;
 `vilan check` checks every entry, always. The emitted text beyond
 §7.6's guarantees is implementation-defined.

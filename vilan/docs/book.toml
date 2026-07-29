@@ -3,7 +3,7 @@
 # in book/ (gitignored). The markdown stays the source of truth — this file
 # only adds navigation, search, and highlighting on top.
 [book]
-title = "The vilan documentation"
+title = "The Vilan documentation"
 language = "en"
 src = "."
 

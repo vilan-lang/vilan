@@ -138,7 +138,7 @@ pub fn render(error: &ParseError) -> String {
             delimiter,
         } => {
             format!(
-                "unclosed `{delimiter}` in {production} — expected a matching `{}`",
+                "unclosed `{delimiter}` in {production}: expected a matching `{}`",
                 matching_close(*delimiter)
             )
         }
@@ -167,7 +167,7 @@ pub fn render(error: &ParseError) -> String {
         write!(message, " in {label}").unwrap();
     }
     if let Some(hint) = error.hint {
-        write!(message, " — {hint}").unwrap();
+        write!(message, "; {hint}").unwrap();
     }
     message
 }
@@ -3274,7 +3274,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(
-                "`resource` is a type-declaration modifier — it may appear only \
+                "`resource` is a type-declaration modifier: it may appear only \
                  before a `struct` or `enum` declaration",
             ),
             context: Vec::new(),
@@ -4417,11 +4417,11 @@ mod tests {
     fn render_names_the_unclosed_delimiter_and_its_production() {
         assert_eq!(
             rendered_errors("fun f<1 2 3>() {}\n"),
-            vec!["unclosed `<` in generic parameters — expected a matching `>`".to_string()]
+            vec!["unclosed `<` in generic parameters: expected a matching `>`".to_string()]
         );
         assert_eq!(
             rendered_errors("struct S { 1 2 3 }\n"),
-            vec!["unclosed `{` in struct body — expected a matching `}`".to_string()]
+            vec!["unclosed `{` in struct body: expected a matching `}`".to_string()]
         );
     }
 
@@ -4431,7 +4431,7 @@ mod tests {
         assert_eq!(
             rendered_errors("resource fun foo() {}\n"),
             vec![
-                "`resource` is a type-declaration modifier — it may appear only \
+                "`resource` is a type-declaration modifier: it may appear only \
                  before a `struct` or `enum` declaration"
                     .to_string()
             ]
@@ -4446,7 +4446,7 @@ mod tests {
         assert_eq!(
             rendered_errors("let x = a!==b;\n"),
             vec![
-                "found '=' expected an expression — if this was postfix `!` before a \
+                "found '=' expected an expression; if this was postfix `!` before a \
                  comparison, the space is required: `a! == b` (`!=` always lexes as \
                  not-equals)"
                     .to_string()
@@ -4480,7 +4480,7 @@ mod tests {
         assert_eq!(
             rendered_errors("fun f() { let bad = a!==b; }\n"),
             vec![
-                "found '=' expected an expression — if this was postfix `!` before a \
+                "found '=' expected an expression; if this was postfix `!` before a \
                  comparison, the space is required: `a! == b` (`!=` always lexes as \
                  not-equals)"
                     .to_string()

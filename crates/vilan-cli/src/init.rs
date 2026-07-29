@@ -66,8 +66,8 @@ impl Template {
     /// The one-line description the prompt and the error list carry.
     fn summary(self) -> &'static str {
         match self {
-            Template::Node => "a package that runs on node — an entry, a module, and a test",
-            Template::Browser => "a reactive browser app — index.html beside the bundle",
+            Template::Node => "a package that runs on node: an entry, a module, and a test",
+            Template::Browser => "a reactive browser app: index.html beside the bundle",
             Template::Fullstack => "one package, two entries: a browser client and a node server",
         }
     }
@@ -78,7 +78,7 @@ impl Template {
         TEMPLATES
             .into_iter()
             .find(|template| template.flag() == text)
-            .ok_or_else(|| format!("unknown template `{text}` — {}", the_templates_are()))
+            .ok_or_else(|| format!("unknown template `{text}`; {}", the_templates_are()))
     }
 
     /// The template's files as (destination path relative to the project root,
@@ -250,7 +250,7 @@ fn choose_template(
     }
     if !interactive {
         return Err(format!(
-            "no template chosen, and stdin is not a terminal — there is nothing to prompt. \
+            "no template chosen, and stdin is not a terminal: there is nothing to prompt. \
              Pass `--template <name>`: {}",
             the_templates_are()
         ));
@@ -258,7 +258,7 @@ fn choose_template(
     match ask() {
         // End of input (Ctrl-D) or an unreadable stdin: nothing was chosen.
         None => Err(format!(
-            "no template chosen — pass `--template <name>`: {}",
+            "no template chosen; pass `--template <name>`: {}",
             the_templates_are()
         )),
         Some(answer) => parse_answer(answer.trim()),
@@ -332,14 +332,14 @@ fn refusal(directory: &Path, elsewhere: bool, template: Template) -> Option<Stri
             .is_some_and(|mut entries| entries.next().is_some())
     {
         return Some(format!(
-            "{} already exists and is not empty — pick a name that is free, or \
+            "{} already exists and is not empty; pick a name that is free, or \
              run `vilan init` inside a directory you have prepared",
             directory.display()
         ));
     }
     if !elsewhere && directory.join("vilan.toml").is_file() {
         return Some(format!(
-            "{} is already a Vilan project (it has a `vilan.toml`) — \
+            "{} is already a Vilan project (it has a `vilan.toml`); \
              run `vilan init <name>` to scaffold a new one beside it",
             directory.display()
         ));
@@ -354,7 +354,7 @@ fn refusal(directory: &Path, elsewhere: bool, template: Template) -> Option<Stri
         return None;
     }
     Some(format!(
-        "the `{}` template would overwrite {} in {} — `vilan init` never \
+        "the `{}` template would overwrite {} in {}: `vilan init` never \
          overwrites; move it aside or scaffold into a fresh directory",
         template.flag(),
         existing.join(", "),
@@ -399,7 +399,7 @@ fn package_name_from_path(directory: &Path) -> Result<String, String> {
         .and_then(package_name_from)
         .ok_or_else(|| {
             format!(
-                "cannot derive a package name from {} — run `vilan init <name>` \
+                "cannot derive a package name from {}; run `vilan init <name>` \
                  to name the project's directory",
                 directory.display()
             )

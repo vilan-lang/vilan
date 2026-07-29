@@ -252,7 +252,7 @@ impl Dependency {
         if let Some(project) = project {
             if !project {
                 return Err(
-                    "sets `project = false` — a dependency either inherits the workspace \
+                    "sets `project = false`: a dependency either inherits the workspace \
                      root's declaration (`project = true`) or declares its own source; \
                      drop the key to declare your own"
                         .to_string(),
@@ -269,7 +269,7 @@ impl Dependency {
             ] {
                 if present {
                     return Err(format!(
-                        "sets `project = true` alongside `{key}` — an inherited dependency \
+                        "sets `project = true` alongside `{key}`: an inherited dependency \
                          takes its WHOLE declaration from `[project.dependencies]`, so drop \
                          `{key}` (or drop `project = true` and declare it here)"
                     ));
@@ -283,7 +283,7 @@ impl Dependency {
             for (key, value) in [("tag", tag), ("rev", rev), ("branch", branch)] {
                 if value.is_some() {
                     return Err(format!(
-                        "declares `{key}` without `git` — `{key}` only means something on a \
+                        "declares `{key}` without `git`: `{key}` only means something on a \
                          git dependency, so add `git = \"<repository url>\"` or drop `{key}`"
                     ));
                 }
@@ -295,21 +295,21 @@ impl Dependency {
         };
         if path.is_some() {
             return Err(
-                "sets both `git` and `path` — a dependency is either a local directory \
+                "sets both `git` and `path`: a dependency is either a local directory \
                  or a repository checkout, not both"
                     .to_string(),
             );
         }
         if version.is_some() || registry.is_some() {
             return Err(
-                "sets `version`/`registry` alongside `git` — a git dependency is pinned by \
+                "sets `version`/`registry` alongside `git`: a git dependency is pinned by \
                  its `tag`/`rev`; there is no version resolution to take part in"
                     .to_string(),
             );
         }
         if let Some(branch) = branch {
             return Err(format!(
-                "pins the branch `{branch}` — a branch moves, so it cannot pin anything; \
+                "pins the branch `{branch}`: a branch moves, so it cannot pin anything; \
                  use `tag = \"v1.2.0\"` for a release or `rev = \"<commit sha>\"` for an \
                  exact commit"
             ));
@@ -334,21 +334,21 @@ impl Dependency {
                 if !crate::git_dep::is_commit_sha(rev) {
                     return Err(format!(
                         "has `rev = \"{rev}\"`, which is not a commit SHA (7 to 40 \
-                         hexadecimal digits) — a branch or tag name goes in `tag`"
+                         hexadecimal digits); a branch or tag name goes in `tag`"
                     ));
                 }
                 GitRef::Rev(rev.clone())
             }
             (Some(_), Some(_)) => {
                 return Err(
-                    "sets both `tag` and `rev` — a git dependency pins exactly one point, \
+                    "sets both `tag` and `rev`: a git dependency pins exactly one point, \
                      so pick the release (`tag`) or the commit (`rev`)"
                         .to_string(),
                 );
             }
             (None, None) => {
                 return Err(
-                    "has a `git` URL but no point to pin — add `tag = \"v1.2.0\"` or \
+                    "has a `git` URL but no point to pin; add `tag = \"v1.2.0\"` or \
                      `rev = \"<commit sha>\"` (there are no version ranges to fall back on)"
                         .to_string(),
                 );
@@ -449,7 +449,7 @@ impl Manifest {
         // (proposal/platform-coloring.md §4.2).
         if self.server.is_some() || self.client.is_some() {
             errors.push(
-                "the `[server]`/`[client]` form was removed — declare a `[package]` \
+                "the `[server]`/`[client]` form was removed; declare a `[package]` \
                  with `[entry.server]` / `[entry.client]` sections instead (each \
                  takes an optional `path` and `target`)"
                     .to_string(),
@@ -462,7 +462,7 @@ impl Manifest {
             + self.project.is_some() as u8;
         if kinds > 1 {
             errors.push(
-                "set exactly one of `[package]`, `[library]`, or `[project]` — an app, a \
+                "set exactly one of `[package]`, `[library]`, or `[project]`: an app, a \
                  library, and a workspace root are different manifests"
                     .to_string(),
             );
@@ -533,7 +533,7 @@ impl Manifest {
                 .any(|command| command.trim().is_empty())
             {
                 errors.push(
-                    "`[build] run` has an empty command — each entry is a command line \
+                    "`[build] run` has an empty command: each entry is a command line \
                      for the platform shell (`npx tailwindcss -i src/app.css -o dist/app.css`)"
                         .to_string(),
                 );
@@ -562,14 +562,14 @@ impl Manifest {
             if self.entries.is_empty() {
                 errors.push(format!(
                     "`[package] default-entry = \"{name}\"` has nothing to choose \
-                     between — it names one of several `[entry.<name>]` sections, \
+                     between: it names one of several `[entry.<name>]` sections, \
                      and this package declares none (its single `entry` is already \
                      what `vilan run` runs)"
                 ));
             } else if !self.entries.contains_key(name) {
                 errors.push(format!(
                     "`[package] default-entry = \"{name}\"` names no `[entry.{name}]` \
-                     section — declared entries: {}",
+                     section; declared entries: {}",
                     self.entries.keys().cloned().collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -595,7 +595,7 @@ impl Manifest {
             if package.entry.is_some() || package.target.is_some() {
                 errors.push(
                     "`[package] entry`/`target` can't be combined with \
-                     `[entry.<name>]` sections — with multiple entries, each \
+                     `[entry.<name>]` sections: with multiple entries, each \
                      declares its own `path` and `target`"
                         .to_string(),
                 );
@@ -604,7 +604,7 @@ impl Manifest {
         for (name, entry) in &self.entries {
             if !is_identifier(name) {
                 errors.push(format!(
-                    "`[entry.{name}]` — an entry name must be a valid identifier \
+                    "`[entry.{name}]`: an entry name must be a valid identifier \
                      (it names the `dist/{name}.js` output)"
                 ));
             }
@@ -723,7 +723,7 @@ fn validate_dependencies(
         match dependency.source() {
             Ok(DependencySource::Path(_)) | Ok(DependencySource::Git(_)) => {}
             Ok(DependencySource::Inherited) if !inheritable => errors.push(format!(
-                "`{table} {name}` sets `project = true`, but this IS the project's table — \
+                "`{table} {name}` sets `project = true`, but this IS the project's table: \
                  `project = true` is how a member package opts in to a dependency declared \
                  here, so give `{name}` a `path` or a `git` source"
             )),
@@ -1105,7 +1105,7 @@ fn resolve_dependency_edges(
                 let Some((project_dir, declared)) = &project else {
                     return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but `{}` is not \
-                         inside a workspace — inheritance reads the `[project.dependencies]` \
+                         inside a workspace: inheritance reads the `[project.dependencies]` \
                          of the nearest ancestor `vilan.toml` that declares a `[project]`",
                         base_dir.display()
                     )));
@@ -1113,7 +1113,7 @@ fn resolve_dependency_edges(
                 let Some(inherited) = declared.get(import_name) else {
                     return Err(WorkspaceError::broken(format!(
                         "dependency `{import_name}` sets `project = true`, but {} declares \
-                         no `{import_name}` — {}",
+                         no `{import_name}`; {}",
                         project_dir.join("vilan.toml").display(),
                         declared_names(declared)
                     )));
@@ -1136,7 +1136,7 @@ fn resolve_dependency_edges(
             Some(manifest) => error
                 .map_message(|message| {
                     format!(
-                        "{message} — `{import_name}` is inherited from {}",
+                        "{message}; `{import_name}` is inherited from {}",
                         manifest.display()
                     )
                 })

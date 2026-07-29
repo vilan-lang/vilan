@@ -1,4 +1,4 @@
-# Misc — reference
+# Misc reference
 
 The small modules that don't need a page of their own: `std::io`,
 `std::task`, `std::promise`, `std::context`, `std::crypto`, `std::jwt`,
@@ -13,7 +13,7 @@ fun assert(condition: bool, message: str)   // panic when false
 ```
 
 `panic` is for unreachable states (expected failures are `Result`). A
-`panic` arm in a `match` diverges — the other arms decide the match's
+`panic` arm in a `match` diverges: the other arms decide the match's
 type. `assert` is the `vilan test` failure mechanism.
 
 ## std::task
@@ -53,7 +53,7 @@ its spawn origin) instead of crashing the program. Keep the task instead
 of the results by spawning the `settle_all` itself:
 `let pending = async Task::settle_all(tasks);`.
 
-`nursery(body)` joins every task spawned in the body's dynamic extent —
+`nursery(body)` joins every task spawned in the body's dynamic extent:
 the body's value passes through, the first-observed failure re-raises
 with its spawn origin, and everything else is absorbed. `cancel()`
 aborts the nursery's signal; `sleep` and `fetch` carry the ambient
@@ -64,16 +64,16 @@ Spec: [§7.7](../spec/execution.md). `ambient_signal()` bridges host
 APIs std doesn't wrap.
 
 `OwnedNursery` is the owner for background work no function-scoped
-`nursery` can hold — a task whose lifetime is an object's, not a call's.
+`nursery` can hold: a task whose lifetime is an object's, not a call's.
 It is a `resource`: it has a single owner, moves, and is destroyed
 deterministically. `new()` makes a detached owner; `enter(body)` runs
 `body` with the owner's nursery ambient, so every task spawned inside
-registers with it — but, unlike `nursery`, `enter` does NOT join: it
+registers with it. Unlike `nursery`, `enter` does NOT join: it
 returns as soon as the body settles, leaving the tasks running.
 Dropping the owner (at scope end, or `drop(owner)`) cancels them, so
 in-flight bridged IO aborts. Because the owner's nursery is never joined
 it runs **detached**: a child's REAL failure reports to the console with
-its spawn origin — as a free-floating task would — instead of being
+its spawn origin (as a free-floating task would) instead of being
 absorbed for a join, and children do not cancel their siblings
 (ownership is lifetime, not fate-sharing). Cancellation echoes, from the
 owner's `cancel` or drop, stay silent.
@@ -89,12 +89,12 @@ impl Promise<type T> {
 
 The raw host promise, for direct host interop: an
 `[extern(new, "Promise")]` constructor or a promise-returning host API
-is typed `Promise<T>`, and `await` unwraps it exactly like a task. Code
+is typed `Promise<T>`, and `await` unwraps it like a task. Code
 that only spawns never sees this type.
 
 ## std::context
 
-Ambient values with dynamic extent — the machinery under `owner_scope` and
+Ambient values with dynamic extent, the machinery under `owner_scope` and
 `turn_scope`:
 
 ```vilan,fragment
@@ -107,7 +107,7 @@ impl Context<type T> {
 ```
 
 - `get` is **statically covered**: the compiler proves every call path runs
-  inside a `run` — an uncovered read is a compile error, not a runtime
+  inside a `run`; an uncovered read is a compile error, not a runtime
   `None`.
 - Closures capture their contexts **at creation**; parameters declare
   context needs with the `context` clause
@@ -128,8 +128,8 @@ fun equals_constant_time(a: Bytes, b: Bytes): bool   // timing-safe compare
 
 WebCrypto-backed (async where the host is). For password hashing on the
 server, bind the host's sync primitives as externs (the walkthrough
-example binds node's `pbkdf2Sync` this way) — candidates for std
-promotion.
+example binds Node's `pbkdf2Sync` this way). These are candidates for
+std promotion.
 
 ## std::jwt
 
@@ -150,6 +150,6 @@ fun decode_claims<C: Wire>(segment: str): Option<C>   // decode WITHOUT verifyin
 fun emit(kind: str, line: str)   // compile-time only: append to a build asset
 ```
 
-Callable only from `const` evaluation — it's how `std::style` writes the
+Callable only from `const` evaluation: it's how `std::style` writes the
 CSS file (`emit("css", rule)`). A browser build with emissions produces
 `<entry>.css` beside `<entry>.js`.

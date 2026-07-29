@@ -1,4 +1,4 @@
-# Collections — reference
+# Collections reference
 
 The container types: `List` (built in), `std::map::Map`, `std::set::Set`,
 `std::range::Range`, and the `std::iterator` protocol underneath `for`.
@@ -25,7 +25,7 @@ impl List<type T: Mul + Default> { fun product(self): T }
 ```
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
-`for e in &mut list` (in-place views — see the
+`for e in &mut list` (in-place views; see the
 [memory model](../tour/memory-model.md)).
 
 ```vilan
@@ -56,7 +56,7 @@ impl Map<type K: Hashable, type V> {
 ```
 
 Keys compare **by value**. Scalars work directly; a struct, enum, tuple, or
-`List` key works as long as it is `Hashable` — derive it:
+`List` key works as long as it is `Hashable`. Derive it:
 
 ```vilan
 import std::print;
@@ -103,7 +103,7 @@ iterates the elements in insertion order.
 
 ## `Hashable`
 
-A key's value is turned into a `Hash` — a canonical key — by `key.hash()`.
+A key's value is turned into a `Hash` (a canonical key) by `key.hash()`.
 `[derive(Hashable)]` implements it for a struct/enum whose fields are all
 `Hashable` (scalars, `str`, `bool`, `List`/`Option` of `Hashable`, or another
 derived type); a closure, `Set`, `Map`, or `Shared` field is rejected. You can
@@ -146,5 +146,5 @@ trait Iterable<T> { fun iter(self): Iterator<T>; }
 Iterator::from_fn(fn: || Option<T>): IteratorFromFn<T>   // an iterator from a closure
 ```
 
-Anything implementing `Iterator`/`Iterable` works in a `for` loop —
-`Range` is exactly this.
+Anything implementing `Iterator`/`Iterable` works in a `for` loop.
+`Range` is one such type.

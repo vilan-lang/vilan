@@ -9,7 +9,7 @@ would cancel the wrong tasks. These are **resources**: values with a single
 owner, that *move* instead of copying, and that are torn down
 deterministically when their owner's scope ends.
 
-You mark one with `resource`, and — if it needs cleanup — give it a `Drop`:
+You mark one with `resource` and, if it needs cleanup, give it a `Drop`:
 
 ```vilan
 import std::print;
@@ -33,9 +33,9 @@ fun main() {
 ```
 
 That program prints `body`, then `dropped second`, then `dropped first`.
-Two things to notice: `drop` ran on its own at the end of `main`, with no
-call from you — and the two guards tore down in **reverse** order, the way a
-stack unwinds.
+Two things to notice: `drop` ran on its own at the end of `main`, with
+no call from you, and the two guards tore down in **reverse** order,
+the way a stack unwinds.
 
 ## Moving, not copying
 
@@ -55,8 +55,8 @@ it by value.
 
 ## Loaning instead of moving
 
-Usually you don't want to give a resource away — you want to *use* it and
-keep it. Lend a **loan** (a view, `&` or `&mut`), exactly as with ordinary
+Usually you don't want to give a resource away; you want to *use* it
+and keep it. Lend a **loan** (a view, `&` or `&mut`), as with ordinary
 values:
 
 ```vilan
@@ -80,7 +80,7 @@ fun main() {
 }
 ```
 
-A loan changes no ownership, so `g` is still yours after each call — the
+A loan changes no ownership, so `g` is still yours after each call: the
 program prints `inspecting g` twice, then `done`, then `dropped g` when
 `main` ends. Method calls (`&self`, `&mut self`) are loans too; that is how
 a resource's own methods reach it without consuming it.
@@ -88,8 +88,8 @@ a resource's own methods reach it without consuming it.
 ## Teardown happens on every exit
 
 Because teardown is tied to the owner's scope, it runs however the scope
-ends — falling off the bottom, an early `ret`, a `jump` out of a loop, even
-a panic unwinding through. There are no drop flags and nothing to remember:
+ends: falling off the bottom, an early `ret`, a `jump` out of a loop,
+even a panic unwinding through. There are no drop flags and nothing to remember:
 if a binding still owns a resource when control leaves the scope, it drops.
 
 ## Tearing down early: `drop(x)`
@@ -115,15 +115,15 @@ fun main() {
 ```
 
 This prints `dropped a`, `after drop(a)`, `dropped b`. `drop` takes its
-argument by move, so `a` is spent at that line — there is no `close()` to
-call and no way to use `a` afterward by mistake. (On plain data, `drop(x)`
-just means "I'm done with this"; it does nothing.)
+argument by move, so `a` is spent at that line: there is no `close()`
+to call and no way to use `a` afterward by mistake. (On plain data,
+`drop(x)` means "I'm done with this"; it does nothing.)
 
 ## Conditional teardown: `Option.take`
 
 A resource can live in an `Option`, which is the one container that holds
-one. `take()` moves the resource out and leaves `None` behind — exactly what
-"tear it down only if it's there" needs:
+one. `take()` moves the resource out and leaves `None` behind, which is
+what "tear it down only if it's there" needs:
 
 ```vilan
 import std::print;
@@ -146,8 +146,9 @@ fun main() {
 ```
 
 After the `take`, `slot` is `None`, so nothing drops a second time at the
-end of `main`. `take` is also how a resource leaves a struct field — the one
-sanctioned way to move a resource out of something that is still alive.
+end of `main`. `take` is also how a resource leaves a struct field: the
+one sanctioned way to move a resource out of something that is still
+alive.
 
 ## A real resource: `Database`
 
@@ -183,15 +184,15 @@ fun main() {
 ```
 
 Every function reaches `db` by loan (a method call is a loan), never by
-moving it. A module-level resource is loan-only for exactly this reason:
-moving or `drop`ing it would close the shared handle out from under the rest
-of the program, so the compiler rejects that. When you *do* want a database
-that closes at the end of a scope, open it in a local instead — or `drop(db)`
-to close it early.
+moving it. A module-level resource is loan-only for this reason: moving
+or `drop`ing it would close the shared handle out from under the rest
+of the program, so the compiler rejects that. When you *do* want a
+database that closes at the end of a scope, open it in a local instead,
+or `drop(db)` to close it early.
 
 A **closure** may reach a module-level resource too. A closure that
-references `db` isn't capturing an owner — it borrows the same
-process-lifetime storage, per call, exactly as a function does. This is what
+references `db` isn't capturing an owner: it borrows the same
+process-lifetime storage, per call, as a function does. This is what
 gives the module-level idiom its reach: request handlers, injected hooks, and
 background tasks can all touch the database, as long as it lives at module
 level.
@@ -241,8 +242,8 @@ fun main() {
 }
 ```
 
-Unlike a `nursery`, `enter` does not wait for the spawned work — it returns
-right away, and the tasks keep running under `owner`. When `owner` drops (at
+Unlike a `nursery`, `enter` does not wait for the spawned work; it
+returns right away, and the tasks keep running under `owner`. When `owner` drops (at
 the end of `main`, or at an explicit `drop(owner)`), the tasks are cancelled.
 That is the whole point: the *owner's* lifetime bounds the work, and the
 owner is an ordinary resource the scope rules already know how to tear down.
@@ -251,13 +252,13 @@ owner is an ordinary resource the scope rules already know how to tear down.
 
 - **"Why can't I use it again?"** You moved it. Loan it (`&x` / `&mut x`, or
   a method call) instead of binding, passing, or returning it by value.
-- **A resource can't go in a `List`, `Map`, or `Set`** — the compiler can't
-  see inside those. Use an `Option`, or a struct field.
+- **A resource can't go in a `List`, `Map`, or `Set`**: the compiler
+  can't see inside those. Use an `Option`, or a struct field.
 - **A closure or spawn can't capture a *local* resource.** Pass a loan into
-  the call, give the resource to a struct (or an `OwnedNursery`) that owns the
-  closure's lifetime, or keep it at **module level** — a module global is
-  loan-only and process-lifetime, so a closure may reach it without becoming
-  an owner.
+  the call, give the resource to a struct (or an `OwnedNursery`) that
+  owns the closure's lifetime, or keep it at module level: a module
+  global is loan-only and process-lifetime, so a closure may reach it
+  without becoming an owner.
 - **`Drop` is only for resources**, must be exactly `fun drop(&mut self)`,
   and must be synchronous and context-free (no `await`, no signal writes).
   Cancel owned tasks through an `OwnedNursery` rather than awaiting them.

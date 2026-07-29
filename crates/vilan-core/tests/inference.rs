@@ -12800,7 +12800,7 @@ fn the_js_refugee_hint_names_the_idiom() {
         main();
         "#,
         "const x = 3",
-        "vilan has no const declarations",
+        "Vilan has no const declarations; write `let x = const ..`",
     );
 }
 
@@ -16698,7 +16698,7 @@ fn an_unknown_struct_steers_to_its_import() {
             mut table = Map { };
         }
         "#,
-        "unknown struct: Map — import it first (`import std::map::Map;`)",
+        "unknown struct: Map; import it first (`import std::map::Map;`)",
     );
 }
 
@@ -16780,7 +16780,7 @@ fn a_non_function_call_names_the_subjects_type() {
         }
         "#,
         "42",
-        "cannot call this as a function — it is i32",
+        "cannot call this as a function: it is i32",
     );
 }
 
@@ -16844,7 +16844,7 @@ fn an_unknown_type_steers_to_its_std_import() {
             let v: JsonValue = 1;
         }
         "#,
-        "cannot find type 'JsonValue' — import it first (`import std::json::JsonValue;`)",
+        "cannot find type 'JsonValue'; import it first (`import std::json::JsonValue;`)",
     );
 }
 
@@ -16872,7 +16872,7 @@ fn an_unknown_trait_steers_to_its_std_import() {
         }
         fun main() {}
         "#,
-        "cannot find trait 'PartialOrd' — import it first (`import std::compare::PartialOrd;`)",
+        "cannot find trait 'PartialOrd'; import it first (`import std::compare::PartialOrd;`)",
     );
 }
 
@@ -16966,7 +16966,7 @@ fn a_conflicting_later_call_names_the_first_call_inference() {
             let b = pass("two");
         }
         "#,
-        "The parameter is unannotated — annotate it",
+        "The parameter is unannotated; annotate it",
         "1",
         "inferred from this, the closure's first call",
     );
@@ -17825,7 +17825,7 @@ fn a_tuple_element_out_of_range_is_rejected() {
         }
         "#,
         "pair.2",
-        "has no element 2 — its arity is 2",
+        "has no element 2: its arity is 2",
     );
 }
 
@@ -19608,7 +19608,7 @@ fn an_arity_lower_bound_rejects_a_short_tuple() {
             needs_three((1, 2));
         }
         "#,
-        "has 2 elements — the bound '(3..)' requires at least 3",
+        "has 2 elements: the bound '(3..)' requires at least 3",
     );
 }
 
@@ -19621,7 +19621,7 @@ fn an_arity_upper_bound_rejects_a_long_tuple() {
             at_most_two((1, 2, 3));
         }
         "#,
-        "has 3 elements — the bound '(..2)' allows at most 2",
+        "has 3 elements: the bound '(..2)' allows at most 2",
     );
 }
 
@@ -19634,7 +19634,7 @@ fn a_non_tuple_argument_names_the_tuple_bound() {
             needs_tuple(5);
         }
         "#,
-        "'i32' is not a tuple — this argument's parameter is bound '(2..)'",
+        "'i32' is not a tuple: this argument's parameter is bound '(2..)'",
     );
 }
 
@@ -19759,7 +19759,7 @@ fn a_struct_construction_checks_its_tuple_bound() {
             let packed = Pack { items = (1, 2, 3) };
         }
         "#,
-        "has 3 elements — the bound '(..2)' allows at most 2",
+        "has 3 elements: the bound '(..2)' allows at most 2",
     );
 }
 
@@ -20186,7 +20186,7 @@ fn an_async_closure_into_an_extern_callback_is_refused() {
             });
         }
         "#,
-        "`host_transform` is a host (`external`) function — it cannot await a Vilan closure",
+        "`host_transform` is a host (`external`) function: it cannot await a Vilan closure",
     );
 }
 
@@ -25917,7 +25917,7 @@ fn a_genuine_non_function_call_still_reports_its_type() {
             let x = (42)(1);
         }
         "#,
-        "cannot call this as a function — it is i32",
+        "cannot call this as a function: it is i32",
     );
 }
 
@@ -27618,7 +27618,7 @@ fn a_dispatch_manufactured_cycle_is_an_error_that_explains_the_over_approximatio
     assert!(
         errors[0].contains(
             "the cycle runs through a dispatched call, so it includes every implementation \
-             of that method — one this program never instantiates still participates"
+             of that method; one this program never instantiates still participates"
         ),
         "the over-approximation states itself in the diagnostic: {errors:#?}"
     );

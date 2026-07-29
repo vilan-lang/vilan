@@ -5,31 +5,31 @@
 A module is one source file. Its top-level statements form its body; its
 declarations (`fun`, `struct`, `enum`, `trait`, `impl`, module-level
 `let`, `mod` blocks) are its items. There is no separate module
-declaration — a file `routes.vl` in a package's source root is the module
+declaration: a file `routes.vl` in a package's source root is the module
 `routes` of that package.
 
 ## 4.2 The three namespaces
 
 A path's first segment selects a namespace:
 
-- `std::name` — the standard library module `name`, resolved against the
+- `std::name`: the standard library module `name`, resolved against the
   std package's layers for the current platform (§11).
-- `pkg::name` — the module `name` of the **importing file's own
+- `pkg::name`: the module `name` of the **importing file's own
   package**.
-- `depname::name` — the module `name` of the dependency declared as
+- `depname::name`: the module `name` of the dependency declared as
   `depname` in the package manifest.
 
 Within std itself, sibling modules are referenced as `pkg::…` (std is its
 own package). The namespaces are disjoint: resolution is scoped by the
 root segment, so a package is free to name a module `ui` or `json` even
-though std has one — `pkg::ui` is always the package's own module,
+though std has one: `pkg::ui` is always the package's own module,
 `std::ui` always std's, and neither shadows the other. (Conversely,
 `pkg::` never reaches a std module.) A module name that resolves both as
 `name.vl` and `name/lib.vl` is an **ambiguity error**.
 
 A module name must match the on-disk directory entry **byte for byte**: a
 case-insensitive filesystem that answers `import foo` with `Foo.vl` is a
-**diagnostic naming both spellings**, not a resolution — so that a program
+**diagnostic naming both spellings**, not a resolution, so that a program
 compiles identically on case-sensitive and case-insensitive filesystems
 (`proposal/windows-support.md` §5). Every component of the resolved path
 carries the rule, so `foo/lib.vl` is reached by `import foo` only when the
@@ -37,13 +37,13 @@ directory is spelled `foo`.
 
 ## 4.3 Imports
 
-`import path` (§3.2) loads the target module (once per program — loading
+`import path` (§3.2) loads the target module (once per program: loading
 is idempotent and cycle-tolerant) and binds the imported items in the
 importing module's scope:
 
-- `import std::print;` — binds the item `print`.
-- `import std::reactive::{ Signal, combine };` — binds each set member.
-- `import std::option::Option::{ self, Some, None };` — a path into a
+- `import std::print;` binds the item `print`.
+- `import std::reactive::{ Signal, combine };` binds each set member.
+- `import std::option::Option::{ self, Some, None };` is a path into a
   TYPE: `self` binds the type itself; variant names bind the variants for
   unqualified use.
 
@@ -52,7 +52,7 @@ loading (variants, statics). `export statement` re-exports: importers of
 this module see the exported names as if declared here.
 
 Platform gating is not checked at the import: a module outside the
-current platform's layers (e.g. `std::ui` in a node build) still loads,
+current platform's layers (e.g. `std::ui` in a Node build) still loads,
 so its items type-check. The error is reported where platform-colored
 code becomes **reachable** from the build's entry (§11).
 
@@ -89,7 +89,7 @@ while uses before that point keep the earlier binding (parameters and
 loop/pattern bindings are shadowable the same way). Visibility starts at
 the **end** of the declaring statement, so an initializer never reads the
 binding it declares: in `let x = x + 1;` the right-hand `x` is the
-previous `x` — an enclosing or earlier same-scope binding — and an error
+previous `x` (an enclosing or earlier same-scope binding) and an error
 when none exists. Module-level bindings are the exception, as above: they
 are order-independent, one declaration per name, and a genuine
 initialization cycle is a compile error (§7 of the execution chapter).
@@ -104,7 +104,7 @@ A name is resolved differently by position:
 - In **value position**, lookup takes the nearest binding of any kind.
 
 Consequently a local variable named `Signal` does not break `let s:
-Signal<i32>` annotations in the same scope — but relying on this is poor
+Signal<i32>` annotations in the same scope, but relying on this is poor
 style.
 
 ## 4.6 Statics and members
@@ -120,6 +120,6 @@ impls (§5.7). Generic statics take their arguments at the path head:
 
 A small set of names is in scope without imports: the primitive types
 (`i32`, `str`, `bool`, …), `List`, `void`, and the boolean/`null`
-literals' types. Everything else — including `Option`, `Result`, `print`
-— must be imported. (The exact prelude is the lang-item table, appendix
+literals' types. Everything else (including `Option`, `Result`, `print`)
+must be imported. (The exact prelude is the lang-item table, appendix
 §A.4.)

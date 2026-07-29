@@ -6,7 +6,7 @@
 </p>
 
 Vilan is a language for building full-stack web apps. It compiles to
-JavaScript and runs on node and in the browser, but it is not JavaScript:
+JavaScript and runs on Node and in the browser, but it is not JavaScript:
 values are copied instead of shared, there is no `null` and no exceptions,
 `await` is implicit, and the compiler checks the things you usually find
 out at runtime.
@@ -14,9 +14,9 @@ out at runtime.
 It ships as one coherent stack. The language, a standard library, a
 fine-grained reactive UI layer, typed compile-time styling, an enum-based
 router, a service layer where the server exposes live-synced state and
-typed rpc methods from a single struct — no REST endpoints, no schema
-files, no client SDK to regenerate — and a dev loop to match: save a file
-and the running browser app updates in place, reactive state intact.
+typed rpc methods from a single struct (no REST endpoints, schema files,
+or client SDK to regenerate), and a dev loop to match: save a file and
+the running browser app updates in place, reactive state intact.
 
 > **Status: fast-moving alpha.** The language changes weekly and there are
 > no stability promises yet. It is, however, real: the test suite holds
@@ -43,7 +43,7 @@ fun main() {
 }
 ```
 
-And the full-stack model — one struct is the entire client/server
+And the full-stack model: one struct is the entire client/server
 contract. Exposed signals mirror live to every connected client, and
 `[rpc]` methods are callable remotely with typed results:
 
@@ -65,24 +65,24 @@ let _sync = client.notes.sub(|list| …);   // live-synced, typed
 ```
 
 The [full-stack walkthrough](vilan/docs/guide/walkthrough.md) builds a
-working notes app — sign-in, live sync between windows, an editor that
-saves as you type — in about 500 lines, and that app lives in
+working notes app (sign-in, live sync between windows, an editor that
+saves as you type) in about 500 lines, and that app lives in
 [`vilan/examples/walkthrough/`](vilan/examples/walkthrough/) where the
 test suite builds it on every run.
 
 ## Why it feels different
 
 - **Values copy.** Assigning or passing data gives the receiver its own
-  copy. Sharing is explicit and typed — a whole class of
+  copy. Sharing is explicit and typed, so a whole class of
   spooky-action-at-a-distance bugs doesn't exist.
 - **One law behind the memory model.** Every alias is a claim on an owner;
-  views are the statically-proven claims, handles the checked ones — and a
+  views are the statically-proven claims, handles the checked ones. A
   `resource` (a database handle, a task nursery) has exactly one owner and
   cleans up deterministically at scope end, with the double-close family
   rejected at compile time.
 - **No `null`, no exceptions.** Absence is `Option`, failure is `Result`,
   and the `!` and `?.` operators keep both ergonomic.
-- **`await` is implicit.** Calling an async function just gives you the
+- **`await` is implicit.** Calling an async function gives you the
   value. You only write `async` to *opt out* of waiting.
 - **Fine-grained reactive UI.** Signals bind to individual DOM
   properties. No virtual DOM, no re-renders, and cleanup is automatic by
@@ -100,7 +100,7 @@ test suite builds it on every run.
 ## Getting started
 
 Install the toolchain (Linux, macOS, or Windows; you'll also need
-[node](https://nodejs.org) to run what you build) — on Linux and macOS:
+[Node](https://nodejs.org) to run what you build). On Linux and macOS:
 
 ```sh
 curl -fsSL https://github.com/vilan-lang/vilan/releases/latest/download/install.sh | sh
@@ -112,16 +112,16 @@ and on Windows, in PowerShell:
 irm https://github.com/vilan-lang/vilan/releases/latest/download/install.ps1 | iex
 ```
 
-That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` — on Windows,
-`%USERPROFILE%\.vilan\bin`. The unix script prints the PATH line to add;
+That puts `vilan` and `vilan-lsp` in `~/.vilan/bin` (on Windows,
+`%USERPROFILE%\.vilan\bin`). The unix script prints the PATH line to add;
 the PowerShell one adds the directory to your user PATH itself, so open a
 new terminal afterwards. Update any time with `vilan upgrade` (it only touches the
 network when you run it). Each [release](https://github.com/vilan-lang/vilan/releases)
-also carries `vilan-vscode.vsix` — the VS Code extension: highlighting,
+also carries `vilan-vscode.vsix`, the VS Code extension: highlighting,
 diagnostics, hover with docs on everything (keywords included),
 go-to-definition, rename, call-shaped completion with signatures, inlay
-hints, semantic tokens, Organize Imports, and a formatter — all of it
-still working while the file has errors. Installed via "Extensions:
+hints, semantic tokens, Organize Imports, and a formatter. All of it
+keeps working while the file has errors. Install it via "Extensions:
 Install from VSIX".
 
 Or build the project from source (Rust required) with:
@@ -149,7 +149,7 @@ vilan run hello.vl
 ```
 
 For a whole project rather than a file, `vilan init` scaffolds one that
-already compiles — a manifest, sources, and a `.gitignore`:
+already compiles (a manifest, sources, and a `.gitignore`):
 
 ```sh
 vilan init my-app --template fullstack   # or node, or browser
@@ -157,16 +157,16 @@ cd my-app
 vilan run .
 ```
 
-For a full-stack project, `vilan run --watch .` is the whole dev loop —
-rebuild, hot-swap the browser, restart the server — described in
+For a full-stack project, `vilan run --watch .` is the whole dev loop
+(rebuild, hot-swap the browser, restart the server), described in
 [the dev-loop guide](vilan/docs/guide/dev-loop.md).
 
 From there, read the book. It starts with
 [Coming from JavaScript](vilan/docs/tour/coming-from-javascript.md) and
 ends with the full-stack walkthrough:
 
-- **Rendered** (search + sidebar): https://vilan-lang.org/docs/ —
-  or locally, `cargo install mdbook && mdbook serve vilan/docs`.
+- **Rendered** (search + sidebar): https://vilan-lang.org/docs/
+  (or locally, `cargo install mdbook && mdbook serve vilan/docs`).
 - **As files**: start at [vilan/docs/README.md](vilan/docs/README.md).
 
 ## Repository structure
@@ -195,7 +195,7 @@ cargo test    # the whole suite: compiler, corpus, docs gate, examples
 Three test layers keep the project honest: unit and behavior pins in
 `crates/vilan-core/tests/`, a golden-file codegen corpus in `vilan/test/`
 (byte-identical, deliberately), and the docs gate, which extracts and
-compiles every fenced example in `vilan/docs/` — including the ones on
+compiles every fenced example in `vilan/docs/`, including the ones on
 this page.
 
 ## License

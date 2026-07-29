@@ -4,7 +4,7 @@ A macro is a compile-time function that receives program structure as
 **data** and returns **source code** to splice into the program.
 Expansion happens before name resolution and type checking (§1.2,
 phase 3): generated code re-enters lexing and parsing and is then
-checked exactly like handwritten code — a macro cannot smuggle
+checked exactly like handwritten code. A macro cannot smuggle
 ill-typed code past the compiler.
 
 ## 10.1 Declaring and invoking
@@ -23,14 +23,14 @@ macro fun derive_display(item: Item): Source
 - **`macro { … }` blocks**: an anonymous macro expanded on the spot.
   In item position the returned source splices as items; in expression
   position the block folds to the value of the returned expression
-  (for plain values, prefer `const` — §9).
+  (for plain values, prefer `const`, §9).
 - Macros may call other macros as ordinary functions during expansion.
 
 ## 10.2 The macro environment
 
 A macro's body is ordinary Vilan, but it compiles against
-**`macro_std`** — the compile-time standard library (`source`, the
-`meta` item types, collections, strings) — and only that: a macro's
+**`macro_std`**, the compile-time standard library (`source`, the
+`meta` item types, collections, strings), and only that: a macro's
 imports are its own, and it cannot reference the surrounding program's
 bindings. Macros see **one item at a time**; there is no whole-program
 reflection, no ordering guarantee between expansions, and no
@@ -42,7 +42,7 @@ exhaustion, and panics, are compile errors at the invocation's span.
 
 The annotated item arrives as a `macro_std::meta` value (`Item`, with
 accessors such as `as_struct()` yielding names, fields, and types as
-data). The macro returns `Source` — text, usually built by
+data). The macro returns `Source`: text, usually built by
 interpolation (`source(i"…")`); literal braces in generated code are
 escaped `\{` `\}`.
 
@@ -57,14 +57,14 @@ rule), with the generated text available to tooling.
 ## 10.4 Limits
 
 The manifest's `[macro]` section (§11.4) bounds every compile-time
-run: `fuel` (interpreter steps per run) and `depth` (nested expansion
-— a macro whose output invokes macros). Exceeding either is a compile
+run: `fuel` (interpreter steps per run) and `depth` (nested expansion:
+a macro whose output invokes macros). Exceeding either is a compile
 error, so a runaway macro fails the build rather than hanging it.
 
 ## 10.5 Standard attributes (informative)
 
 `[derive(Wire)]`, `[derive(Hashable)]`, `[service(…)]`, `[rpc]`, and
 the other attributes the guides use are macros shipped in the standard
-library — the same mechanism as §10.1, not language special cases.
+library: the same mechanism as §10.1, not language special cases.
 Their semantics are library contracts specified by their reference
 pages.

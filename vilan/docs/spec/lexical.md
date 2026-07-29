@@ -6,8 +6,8 @@ file consisting only of trivia lexes to an empty token stream (and parses
 as an empty module).
 
 **Line terminators.** A line terminator is `\n`, and the two-character
-sequence `\r\n` is **one** line terminator. Text built from source — the
-value of any string literal — is built from the normalized text, so a
+sequence `\r\n` is **one** line terminator. Text built from source (the
+value of any string literal) is built from the normalized text, so a
 literal spanning lines carries `\n` per source line break and never
 `\r\n`, whatever the file's on-disk encoding. A lone `\r` (no following
 `\n`) is not a line terminator: between tokens it is ordinary whitespace,
@@ -15,7 +15,7 @@ and inside a string literal it is an ordinary character, preserved. A
 leading U+FEFF byte-order mark is an encoding marker rather than source
 text: it is ignored, and positions are counted from the byte after it. A
 U+FEFF anywhere else is content. Together these make a program's meaning
-independent of how an editor saved it — the same source is the same
+independent of how an editor saved it: the same source is the same
 program on every platform. (See `proposal/windows-support.md` §2; the
 canonical on-disk form is LF with no BOM, and `vilan fmt` writes it.)
 
@@ -30,7 +30,7 @@ block comments.
 IDENT = ascii_letter | "_" , { ascii_letter | digit | "_" } ;
 ```
 
-Identifiers are ASCII. The following words are **reserved** — they lex as
+Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
@@ -62,18 +62,18 @@ SUFFIX  = IDENT   (* immediately adjacent, no space *)
 ```
 
 The suffix names the literal's type: `i8 i16 i32 u8 u16 u32` (that
-two's-complement width), `i53`/`u53` (the wide integers — see below),
+two's-complement width), `i53`/`u53` (the wide integers; see below),
 `f` (`f64`), `f32`, `f64`, `n` (`BigInt`). An **unknown suffix is a
 compile error** (the retired `i64`/`u64` suffixes get a rename hint). An
 unsuffixed integer literal is `i32`; an unsuffixed fractional literal is
 `f64`. Every integer literal is **range-checked** against its type at
 compile time.
 
-`i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53] — the
+`i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53]: the
 window in which every integer is exactly representable in an IEEE-754
 double (the backing representation). The names deliberately follow
 JavaScript's safe-integer convention (53 bits of integer precision)
-rather than the two's-complement `iN` convention; there is no `i64` —
+rather than the two's-complement `iN` convention. There is no `i64`;
 integers beyond the window take `BigInt`.
 
 In a hex literal the digit run is maximal, so a suffix must begin with a
@@ -98,7 +98,7 @@ is stripped from every line of the content.
 
 A single-quoted string **must close on the line it opens**. A raw line
 break inside `"…"` is an error, and so is a backslash immediately before
-one — nothing escapes a line terminator, because the literal has to close
+one: nothing escapes a line terminator, because the literal has to close
 on its line either way. Multi-line text is written `"""…"""`; a single
 line break inside a one-line string is written `\n`. (The rule buys error
 locality: a forgotten closing quote is reported at its own line instead of
@@ -111,7 +111,7 @@ it is written into the literal, not read off the end of a line.
 ### Interpolated strings
 
 `i"…"` is an interpolated string: `{expr}` holes embed expressions; `\{`
-and `\}` are literal braces. The construct is defined by desugaring — an
+and `\}` are literal braces. The construct is defined by desugaring. An
 interpolated string is exactly equivalent to a parenthesized
 concatenation:
 
@@ -126,7 +126,7 @@ form is `str`; each part must therefore be valid as a `+` operand with
 `str` (§5's operator dispatch).
 
 `i"…"` obeys the single-line rule of its plain twin: a raw line break in
-its body — or a backslash before one — is the same error. Interpolated
+its body (or a backslash before one) is the same error. Interpolated
 multi-line text is `i"""…"""`, which is how a macro writes the code it
 returns.
 
@@ -151,14 +151,14 @@ order:
    other line, and stripping is a no-op inside the hole, where whitespace
    is trivia.
 2. **Fragmenting, on the trimmed text.** Exactly two escapes exist: `\{`
-   and `\}`, each a literal brace. Nothing else is an escape — a backslash
+   and `\}`, each a literal brace. Nothing else is an escape: a backslash
    before any other character is a literal backslash and that character,
    the same near-rawness as a plain `"""` (`\n` is a backslash and an
    `n`). An unescaped `}` outside a hole is an error, as it is in `i"…"`.
 
 The body is raw and runs to the first `"""`, so a single `"` and a `""`
-pair are ordinary content. The value is a `str`, and — this being one of
-the two forms that may span lines — a source line break in it contributes
+pair are ordinary content. The value is a `str`, and (this being one of
+the two forms that may span lines) a source line break in it contributes
 one `\n`.
 
 ```vilan,fragment
@@ -169,24 +169,24 @@ let report = i"""
 ```
 
 *Implementation note: because a hole is re-lexed as ordinary tokens, a
-string literal inside a hole cannot use `\"` escapes — nested quoting
+string literal inside a hole cannot use `\"` escapes; nested quoting
 inside holes is currently a parse error. Bind the value to a local first.*
 
 ### Other literals
 
 `true`, `false` (type `bool`); `null` (the host-boundary null, §5.2);
-`void` (the unit value — a contextual identifier, not a keyword).
+`void` (the unit value; a contextual identifier, not a keyword).
 
 ## 2.4 Operators and punctuation
 
 Two token classes:
 
-- **Operator tokens** — a maximal run of the characters `- : ! * / + = | &
+- **Operator tokens**: a maximal run of the characters `- : ! * / + = | &
   ^ ? %`, plus the arrow `=>` (lexed as one token). Maximal munch means
   `==`, `!=`, `+=`, `::`, `?.`'s `?`, `&&`, `||` each lex as single
   operator tokens; conversely `a+-b` lexes as `a`, `+-`, `b` and is a parse
   error.
-- **Control tokens** — the single characters `( ) [ ] { } < > ; , .`.
+- **Control tokens**: the single characters `( ) [ ] { } < > ; , .`.
 
 `<` and `>` are control tokens (they delimit generics), not operator
 characters. Consequently `<=`/`>=` lex as `<`/`>` followed by `=`, and the

@@ -300,7 +300,7 @@ pub fn analyze_source(
             vec![Error {
                 note: None,
                 span: crate::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug — the details are on stderr)".to_string(),
+                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
             }],
         )
     })

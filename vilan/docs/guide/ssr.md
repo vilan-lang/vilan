@@ -1,33 +1,33 @@
 # Server-side rendering
 
 A single-page app ships an empty `<div id="app">` and paints nothing until its
-JavaScript loads, runs, and fetches. That costs first paint and it costs SEO — a
+JavaScript loads, runs, and fetches. That costs first paint and it costs SEO: a
 crawler sees a blank page. Server-side rendering fixes both by doing the first
 render on the server: the page arrives already painted, and the client takes over
 from there.
 
-Vilan's model is **render, then replace**. There is no hydration — the client
+Vilan's model is **render, then replace**. There is no hydration: the client
 does not adopt the server's DOM. It renders the same view fresh and swaps it in.
 
 1. **Render.** The server calls your own view-building code against the process
-   layer's `std::ui`, which builds an HTML **string** instead of live DOM.
+   layer's `std::ui`, which builds an HTML string instead of live DOM.
    `render(view)` serializes it.
 2. **Serve.** The handler splices that markup into an HTML shell and serves the
-   page. The user (and the crawler) sees the full content — first paint and SEO
-   are done, before a line of JavaScript runs.
+   page. The user (and the crawler) sees the full content: first paint and SEO
+   are done before a line of JavaScript runs.
 3. **Replace.** On boot the client builds the same view as live DOM and `mount`
-   **clears the container first**, replacing the server markup with the live tree.
+   clears the container first, replacing the server markup with the live tree.
    Since the same component produced both, the swap is imperceptible when the data
-   matches; when it moved between render and boot, the replace simply shows the
+   matches; when it moved between render and boot, the replace shows the
    truth.
 
 ## One component, both legs
 
-The whole trick is a shared `fun app(): View`. It imports `std::ui`, which
+Both legs share one `fun app(): View`. It imports `std::ui`, which
 resolves *per entry*: the browser layer (live DOM) in the client leg, the
-process layer (an HTML string tree) in the server leg — the same source, no
+process layer (an HTML string tree) in the server leg. The same source, no
 annotation. Put it in a module beside the two entry files (one package, two
-entries — the [full-stack shape](../tour/platforms.md)); in a workspace, put it
+entries: the [full-stack shape](../tour/platforms.md)); in a workspace, put it
 in a `common` library both packages depend on instead.
 
 ```vilan
@@ -54,7 +54,7 @@ fun main() {
 
 The server reads the client bundle and an HTML shell from disk, then serves. The
 shell has a marker where the app goes; the handler replaces it with the render.
-The splice is plain user code — one `str::replace`, no framework:
+The splice is plain user code (one `str::replace`, no framework):
 
 ```vilan,norun
 import std::fs;
@@ -93,7 +93,7 @@ The shell puts the marker inside the mount point:
 ## On the client: mount replaces
 
 The client entry is the shared `app()` and one `mount_root`. There is no server
-mount — mounting is a client entry, not a renderable view, which is exactly why
+mount: mounting is a client entry, not a renderable view, which is why
 the natural factoring is a shared `fun app(): View` with a per-leg `main`.
 
 ```vilan,browser
@@ -116,12 +116,12 @@ fun main() {
 `mount`/`mount_root` call `replaceChildren()` before appending, so the live tree
 *replaces* the server-rendered nodes rather than stacking on top of them. For an
 ordinary client-only app the container was empty, so the clear is a no-op; on an
-SSR page it discards the server DOM and mounts fresh. No adoption, no node
-addressing, no reconciliation.
+SSR page it discards the server DOM and mounts fresh. The client never adopts
+server nodes, addresses them, or reconciles against them.
 
 ## Build pure, bind reactive
 
-The server render creates, serializes, and discards — no effects attach, no
+The server render creates, serializes, and discards: no effects attach, no
 subscriptions survive the request. So the bindings **read once**: `bind_text`,
 `bind_attr`, `bind_each`, `when`, and `swap` embed the signal's value *at render
 time*. That is the value served, and it is the value the client re-derives.
@@ -132,16 +132,16 @@ component that leans on an effect side-channel at build time renders stale on th
 server (effects don't run there). Text and attribute values are escaped, so a
 hostile string is inert markup, not injected HTML.
 
-## The double-fetch, honestly
+## The double-fetch
 
 Server-side rendering embeds no initial state today. A data-backed app
-still fetches its data over rpc on boot exactly as a client-only app does —
+still fetches its data over rpc on boot exactly as a client-only app does,
 so the data is fetched once for the server render and again on the client. A
-change between the two shows as a content update when the client replaces
-(the honest behavior, not a mismatch error).
+change between the two shows as a content update when the client replaces,
+not a mismatch error.
 
-Serializing the initial store into the page and adopting it client-side — so the
-first client fetch is skipped — is planned but not built, held back because it
+Serializing the initial store into the page and adopting it client-side (so the
+first client fetch is skipped) is planned but not built, held back because it
 introduces a cross-process state contract this version does not need. Further
 out is *resumability*: the server serializes the reactive graph and the handlers
 too, so the client executes nothing at boot. Render-and-replace is the fallback
@@ -149,10 +149,12 @@ that remains under both.
 
 ## Try it
 
-The repository carries the whole loop as a runnable example:
-[`vilan/examples/ssr/`](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/ssr/)
-— one package with two entries, `src/app.vl` (the shared `app()`),
-`src/client.vl` (browser), and `src/server.vl` (node). Clone it and run:
+The repository carries the whole loop as a runnable example,
+[`vilan/examples/ssr/`](https://github.com/vilan-lang/vilan/tree/main/vilan/examples/ssr/):
+one package with two entries, `src/app.vl` (the shared `app()`),
+`src/client.vl` (browser), and `src/server.vl` (Node). With the
+[toolchain](../tour/hello-vilan.md#install-the-toolchain) installed,
+clone it and run:
 
 ```sh
 git clone https://github.com/vilan-lang/vilan

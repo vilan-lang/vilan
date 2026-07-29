@@ -1,4 +1,4 @@
-# Networking — reference
+# Networking reference
 
 Client HTTP (`std::fetch`) and websocket framing (`std::ws`). The rpc
 transports that ride these: the [rpc reference](rpc.md).
@@ -39,16 +39,16 @@ fun main() {
 ```
 
 Streaming a body chunk by chunk: `response.body_stream().reader()` +
-`read_chunk()` (`finished()`/`payload()` per chunk) — the SSE fallback
+`read_chunk()` (`finished()`/`payload()` per chunk). The SSE fallback
 transport uses this.
 
-Note `fetch` is base-layer: it works in the browser *and* on node. For
+`fetch` is base-layer: it works in the browser *and* on Node. For
 talking to your own Vilan service, prefer the generated rpc client over
 hand-rolled fetch calls.
 
 ## std::ws
 
-Websocket **framing** — building and parsing raw frames. This is
+Websocket **framing**: building and parsing raw frames. This is
 server-side plumbing (`std::rpc_server` uses it to speak websocket on a
 plain TCP socket); browser clients get sockets from the host via the rpc
 transport instead.

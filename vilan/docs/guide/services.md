@@ -12,8 +12,8 @@ A **service** is that struct. Three attributes do the work:
 - `[expose]` on a `Signal<T>` field **mirrors** it: every connected
   client gets a live copy that updates when the server writes it.
 
-No REST endpoints, no fetch calls, no JSON shapes to keep in sync by
-hand. The compiler knows both sides.
+There are no REST endpoints, fetch calls, or JSON shapes to keep in
+sync by hand. The compiler knows both sides.
 
 Here's a complete little server:
 
@@ -112,15 +112,15 @@ async fun main() {
 
 In a real app the service lives in its own module, next to the
 resources its bodies use, and the client entry imports the generated
-`NotesClient` from it — see
+`NotesClient` from it. See
 [Where the service lives](#where-the-service-lives) below for why the
 browser build may do that, and the [walkthrough](walkthrough.md) for
 the full shape.
 
 ## What can cross the wire: `Wire`
 
-Everything that travels — rpc parameters, return types, mirrored
-payloads — must be serializable, which Vilan calls **Wire**. The scalars
+Everything that travels (rpc parameters, return types, mirrored
+payloads) must be serializable, which Vilan calls **Wire**. The scalars
 are Wire (`bool`, the integers including `i53`, floats, `str`). `List`
 and `Option` of Wire types are Wire. And your own types opt in with a
 derive:
@@ -144,9 +144,9 @@ one.
 
 ## Naming server entities: `Handle<T>`
 
-Payloads carry *data*. When a client needs to talk about a **thing the
-server owns** — the node to update, the draft to commit, the route's
-entity — it needs a name for it, and the name has to survive the round
+Payloads carry *data*. When a client needs to talk about a thing the
+server owns (the node to update, the draft to commit, the route's
+entity), it needs a name for it, and the name has to survive the round
 trip. That name is `Handle<T>` from `std::arena`, which is `Wire`:
 
 ```vilan,fragment
@@ -160,7 +160,7 @@ struct Docs {
 ```
 
 The server hands out handles; the client stores them and quotes them
-back. Only `{ index, generation }` travels — the `T` is phantom — so the
+back. Only `{ index, generation }` travels (the `T` is phantom), so the
 entity itself never has to be Wire, and never has to leave the server.
 
 The payoff is what happens when the entity is gone. The arena's
@@ -177,10 +177,10 @@ established and drop it with the session: a handle from one session then
 names nothing in another, by construction. Authorize the session first;
 then look the handle up in that session's arena.
 
-When the arena genuinely has to be shared, `Arena::branded()` numbers its
+When the arena has to be shared, `Arena::branded()` numbers its
 generations from a random base instead of `0`, so its handles resolve to
 `None` in any other arena rather than naming the slot of the same index.
-Nothing else changes — staleness, reuse and the `None` answer are as
+Nothing else changes: staleness, reuse and the `None` answer are as
 before. Treat it as a confusion guard, not an authorization check: the
 brand rides inside the handles it issues, so a client with one valid
 handle can derive it. It keeps tenants' names from colliding; the session
@@ -198,7 +198,7 @@ check is still what decides who may act.
   instead of calls corrupting halfway. This is the **contract check**.
 - On the server, each handler runs inside a turn, so all the signal
   writes one rpc makes are broadcast as a single consistent update.
-- Handler bodies can await — call another service, `sleep_for`, wait on
+- Handler bodies can await: call another service, `sleep_for`, wait on
   I/O. The reply is sent when the body finishes, and the turn holds
   across the awaits: writes before and after a suspension still
   coalesce into that same single update.
@@ -237,10 +237,10 @@ view("p").text("reconnecting…")
 	.show(state.map(|current| current == ConnectionState::Reconnecting))
 ```
 
-Second, honest call failures. A call in flight when the connection drops
+Second, explicit call failures. A call in flight when the connection drops
 rejects with "connection lost". A call made while down fails immediately
 with "not connected". Nothing is silently retried, because an rpc might
-not be safe to repeat. Retrying is the app's decision — a draft's next
+not be safe to repeat. Retrying is the app's decision: a draft's next
 push, or the user pressing the button again.
 
 > **Going deeper.** The backoff dials at 250 ms doubling to a 4 s cap,
@@ -269,10 +269,10 @@ generated dispatch yet.
 
 ## Where the service lives
 
-The service lives **next to the resources its methods use** — a
+The service lives **next to the resources its methods use**: a
 database handle, the filesystem, other services. In a single-package
-app (one `[package]` with an `[entry.client]` and an `[entry.server]`
-— see [Platforms](../tour/platforms.md)), that's just a module both
+app (one `[package]` with an `[entry.client]` and an `[entry.server]`;
+see [Platforms](../tour/platforms.md)), that's a module both
 entries can see:
 
 ```vilan,fragment
@@ -286,12 +286,12 @@ import pkg::store::TodoClient;
 
 In a multi-package workspace the same idea reads: the service sits in
 the server package, and the client package depends on it, importing
-just the generated client (`import server::store::TodoClient;`).
+only the generated client (`import server::store::TodoClient;`).
 
 Either way, the browser build takes only the stub and the contract hash
 from that module; the method bodies and the dispatcher are
 server-colored and out of its reach. A shared `common` library is still
-a fine home for the payload types both sides speak — it's just no
+a fine home for the payload types both sides speak; it's no
 longer the only legal home for anything.
 
 ## The server side
@@ -306,10 +306,10 @@ serve_service(
 ```
 
 `dispatcher()` is generated by `[service]`. The fallback answers every
-plain http request — serve `client.js` and `client.css`, and return the
+plain http request: serve `client.js` and `client.css`, and return the
 app shell for anything else so deep links work (see
 [Routing](routing.md)). For custom per-connection state, drop down to
-`serve_connected` — see the [rpc reference](../std/rpc.md).
+`serve_connected` (see the [rpc reference](../std/rpc.md)).
 
 ## Traps
 

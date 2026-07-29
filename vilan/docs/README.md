@@ -11,25 +11,25 @@ assumes only that the `vilan` command is on your PATH.
 
 ## Parts
 
-- **[Tour](tour/)** — the language itself, taught informally. Start with
+- **[Tour](tour/)**: the language itself, taught informally. Start with
   [Coming from JavaScript](tour/coming-from-javascript.md) if that's your
   background, then read in order. Come back any time you need a syntax
   reminder. Nothing in the tour assumes you know the other parts.
-- **[Guides](guide/)** — the frameworks, task by task: reactive state,
+- **[Guides](guide/)**: the frameworks, task by task. Reactive state,
   building UI, styling, routing, talking to a server. Each guide reads
   front to back and links into the reference for exact signatures.
-- **[std reference](std/)** — the standard library, signatures first.
+- **[std reference](std/)**: the standard library, signatures first.
   Go here to answer "what were the parameters again?".
-- **[Specification](spec/)** — the formal definition: grammar, type
+- **[Specification](spec/)**: the formal definition. Grammar, type
   rules, the memory model, execution. This is the advanced tier. The tour
   teaches; the spec defines; where they disagree, the spec wins.
-- **[Appendix](appendix/)** — the [error index](appendix/errors.md) ("you saw this message, go here"), the [gotchas checklist](appendix/gotchas.md), and the [glossary](appendix/glossary.md).
+- **[Appendix](appendix/)**: the [error index](appendix/errors.md) ("you saw this message, go here"), the [gotchas checklist](appendix/gotchas.md), and the [glossary](appendix/glossary.md).
 
 ## Where this book lives
 
-The published copy is at <https://vilan-lang.org/docs/> — search
-and a sidebar included, always built from the latest `main`. That is the
-copy to link to and the one most readers want.
+The published copy is at <https://vilan-lang.org/docs/>, with search and
+a sidebar, always built from the latest `main`. That is the copy to link
+to and the one most readers want.
 
 The source is markdown in the
 [repository](https://github.com/vilan-lang/vilan) under `vilan/docs/`, so
@@ -39,10 +39,10 @@ vilan/docs` gives you the same site locally with live reload.
 
 ## Conventions
 
-- Examples are complete programs unless explicitly labelled a fragment —
+- Examples are complete programs unless explicitly labelled a fragment:
   copy, `vilan build`, run.
 - **Every example compiles as part of the test suite** (`cargo test --test
-  docs`): a fenced ` ```vilan ` block must compile for the node target,
+  docs`): a fenced ` ```vilan ` block must compile for the Node target,
   ` ```vilan,browser ` for the browser target, ` ```vilan,norun ` compiles
   but needs external services to actually run, and ` ```vilan,fragment ` is
   prose-only (used sparingly, always labelled).
@@ -76,7 +76,7 @@ vilan/docs` gives you the same site locally with live reload.
 | [Services & RPC](guide/services.md) | `[service]`/`[rpc]`/`[expose]`, Wire, mirrors, reconnection, the server side |
 | [Persistence & the server](guide/persistence.md) | `std::db` (SQLite), the http server, files, the process |
 | [Server-side rendering](guide/ssr.md) | render-and-replace, one component on both legs, the HTML shell |
-| [A full-stack walkthrough](guide/walkthrough.md) | the Notes app end to end — every layer meeting, quoted from a real, tested example |
+| [A full-stack walkthrough](guide/walkthrough.md) | the Notes app end to end: every layer meeting, quoted from a real, tested example |
 | [The dev loop](guide/dev-loop.md) | `run --watch`, hot module replacement, what carries across a swap |
 
 ### std reference
@@ -93,9 +93,9 @@ vilan/docs` gives you the same site locally with live reload.
 | [net](std/net.md) | fetch, ws |
 | [reactive](std/reactive.md) | the full `std::reactive` API |
 | [style](std/style.md) | the full `std::style` API |
-| [rpc](std/rpc.md) | `std::rpc` — transports, clients, frames |
+| [rpc](std/rpc.md) | `std::rpc`: transports, clients, frames |
 | [browser](std/browser.md) | `std::dom`, `std::ui`, `std::router`, `std::storage` |
-| [dev / HMR](std/dev.md) | `std::dev` — `stash`/`take`, `on_teardown`, `hmr_active` |
+| [dev / HMR](std/dev.md) | `std::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, process, rpc_server |
 | [misc](std/misc.md) | io, task, promise, context, crypto, jwt, asset |
 

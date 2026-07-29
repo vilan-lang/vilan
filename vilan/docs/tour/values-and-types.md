@@ -27,19 +27,19 @@ thing. If that sounds strange coming from JavaScript, start with
 
 ## Primitives
 
-- `bool` — `true` and `false`.
-- `str` — immutable strings.
+- `bool`: `true` and `false`.
+- `str`: immutable strings.
 - Signed integers `i8 i16 i32 i53` and unsigned `u8 u16 u32 u53`. A bare
   literal like `42` is `i32`. Other widths take a suffix: `0xFFu8`,
   `60000u16`, `9007199254740992i53`.
 - Floats: `f64` (a bare `2.5`, or the `f` suffix) and `f32` (`2.5f32`).
-- `BigInt` — arbitrary precision, with the `n` suffix (`7n`).
+- `BigInt`: arbitrary precision, with the `n` suffix (`7n`).
 
 Why `i53` and not `i64`? Because Vilan runs on JavaScript, and JavaScript
 numbers are 64-bit floats. Every integer up to ±2^53 is exact in a float.
 Beyond that, precision silently disappears. Rather than offer an `i64`
-that quietly isn't one, Vilan names the type for what it actually
-delivers. If you need more than 53 bits, use `BigInt`.
+that quietly isn't one, Vilan names the type for what it delivers. If
+you need more than 53 bits, use `BigInt`.
 
 The compiler checks every literal against its type's range, so an
 out-of-range literal is a compile error rather than a wrong value.
@@ -64,7 +64,7 @@ Two rules that differ from JS:
   `i53` and an `i32` in one expression is a compile error. Convert
   explicitly with the `as_*` methods, or suffix the literal.
 
-That second rule has one trap worth memorizing. If `stamp` is an `i53`,
+That second rule has one trap. If `stamp` is an `i53`,
 write `stamp + 1000i53`, not `stamp + 1000`. The bare `1000` is an `i32`,
 and the mix won't compile.
 
@@ -72,7 +72,7 @@ and the mix won't compile.
 > floats truncate toward zero, and integers fold two's-complement into
 > the target width, so `(-1).as_u8()` is `255`. Conversions on literals
 > fold at compile time. Arithmetic that overflows a type's range is
-> undefined behavior — the compiler checks literals, not runtime math.
+> undefined behavior: the compiler checks literals, not runtime math.
 > Details in spec [§7.2a](../spec/execution.md).
 
 ## Strings and interpolation
@@ -97,7 +97,7 @@ on) is in the [strings reference](../std/strings.md).
 For text that spans lines, `"""…"""` is a **raw** multiline string:
 nothing follows the opening delimiter on its line, the closing delimiter
 sits alone on its line, and the whitespace before it is the indentation
-stripped from every line — so the literal can sit at the indentation of
+stripped from every line, so the literal can sit at the indentation of
 the code around it. Prefix it with `i` to get holes as well:
 
 ```vilan
@@ -118,13 +118,13 @@ fun main() {
 
 The trimming is decided before the holes are: a line that opens with a
 hole is indented like any other line. Inside `i"""…"""` exactly two
-escapes exist — `\{` and `\}` — and everything else is raw, just as in
-the plain form.
+escapes exist (`\{` and `\}`); everything else is raw, as in the plain
+form.
 
 The triple-quoted forms are the *only* ones that span lines. A `"…"` or
-`i"…"` must close on the line it opens; a raw line break inside one is an
-error that names both fixes — `"""…"""` for multi-line text, `\n` for a
-single break:
+`i"…"` must close on the line it opens; a raw line break inside one is
+an error that names both fixes (`"""…"""` for multi-line text, `\n` for
+a single break):
 
 ```vilan,fragment
 let wrong = "first line
@@ -190,10 +190,10 @@ really copies. If you're used to passing an array around and mutating it
 from several places, that's the habit to unlearn. The
 [memory model](memory-model.md) chapter shows what to do instead.
 
-When the size is fixed and known, `[T; n]` is a **fixed-length array** — the
-length is part of the type, so it can't grow or shrink, and `[i32; 3]` is a
-different type from `[i32; 4]`. Write `[value; n]` to fill `n` slots, or a
-plain literal under a `[T; n]` annotation:
+When the size is fixed and known, `[T; n]` is a **fixed-length
+array**: the length is part of the type, so it can't grow or shrink,
+and `[i32; 3]` is a different type from `[i32; 4]`. Write `[value; n]`
+to fill `n` slots, or a plain literal under a `[T; n]` annotation:
 
 ```vilan
 import std::print;
@@ -214,12 +214,13 @@ fun main() {
 }
 ```
 
-Reach for `[T; n]` over `List<T>` when the count never changes — a color, a
-matrix row, a lookup table. Everything else (`push`, growing) is what `List`
-is for. `.len()` on an array is free: the length lives in the type, so the
-compiler folds it to the constant. And because the length is known,
-`let [r, g, b] = rgb;` destructures one — irrefutably, with the element
-count checked against the type (works in parameter position too).
+Reach for `[T; n]` over `List<T>` when the count never changes (a
+color, a matrix row, a lookup table). Everything else (`push`, growing)
+is what `List` is for. `.len()` on an array is free: the length lives
+in the type, so the compiler folds it to the constant. And because the
+length is known, `let [r, g, b] = rgb;` destructures one irrefutably,
+with the element count checked against the type (works in parameter
+position too).
 
 > **Going deeper.** `Map` and `Set` key **by value**. Scalar keys (`i32`,
 > `str`) work directly; a struct, enum, or `List` key works once it derives

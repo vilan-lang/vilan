@@ -87,7 +87,7 @@ fun main() {
 
 This works for plain Vilan functions. It does not work for generic
 functions, methods, `async` functions, or externs. For those, write the
-small wrapping closure — the compiler will tell you when you hit one.
+small wrapping closure. The compiler will tell you when you hit one.
 
 ## Async closures
 
@@ -97,8 +97,8 @@ async work.
 A closure type can carry an `async` marker: `async |T| U`. Calls through
 a value of that type are awaited automatically, the same way direct
 calls to async functions are (see [Async](async.md)). Write it anywhere
-a closure type is declared — a parameter, a `let` annotation, a struct
-field, a return type:
+a closure type is declared (a parameter, a `let` annotation, a struct
+field, a return type):
 
 ```vilan,fragment
 fun draft<T>(initial: T, commit: async |T| Option<str>): Draft<T>   // a parameter
@@ -117,7 +117,7 @@ covers the same seams from the async side.
 
 There is one more rule, and it works in your favor. Passing an async
 closure where a plain closure is expected is an error if the plain type
-returns a value — you would receive a promise pretending to be the
+returns a value: you would receive a promise pretending to be the
 value. But if the plain type returns `void`, it is allowed, and the call
 becomes fire-and-forget. This is why UI event handlers can await things
 freely without any ceremony.
@@ -137,6 +137,8 @@ fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 fun turn<T>(policy: FlushPolicy, body: (sync || T) context turn_scope): T
 ```
 
+The `sync` marker in those signatures says the closure must stay
+synchronous; [Async](async.md#higher-order-functions-adapt) explains it.
 When you pass a closure literal into such a parameter, the ambient value
 (the current `Owner`, the current `Turn`) is threaded to it at the call
 site, through any depth of ordinary function calls in between. This is

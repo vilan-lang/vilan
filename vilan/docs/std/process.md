@@ -1,10 +1,10 @@
-# Process modules — reference
+# Process modules reference
 
-The process layer (node/deno/bun builds): `std::db`, `std::http`,
+The process layer (Node/Deno/Bun builds): `std::db`, `std::http`,
 `std::fs`, `std::process`, `std::rpc_server`. Task-oriented usage:
 [Persistence and the server](../guide/persistence.md).
 
-## std::db — SQLite
+## std::db: SQLite
 
 ```vilan,fragment
 resource external struct Database;       // a resource: moves, closes on drop
@@ -32,19 +32,18 @@ Parameters are `?` placeholders. Synchronous by design (fits the rpc
 dispatch path). `desc` and other SQL keywords fail as column names.
 
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
-copies, and it closes its `node:sqlite` handle when its owner's scope ends — a
-`let db =
-Database::open(..)` local closes on the function's return, with no `close()`
-method to remember. `drop(db)` closes it early (the move spends the binding).
-A **module-level** `Database` is the serve-forever idiom: it has process
-lifetime, never drops, and is reachable only by loan (method calls,
-`&`-passing) — moving or `drop`ing a module-level database is a compile error.
+copies, and it closes its `node:sqlite` handle when its owner's scope ends. A
+`let db = Database::open(..)` local closes on the function's return, with no
+`close()` method to remember. `drop(db)` closes it early (the move spends the
+binding). A **module-level** `Database` is the serve-forever idiom: it has
+process lifetime, never drops, and is reachable only by loan (method calls,
+`&`-passing). Moving or `drop`ing a module-level database is a compile error.
 Being a resource, a `Database` cannot go into a `List` (use `Option` or a
 struct field), cross the wire (`[derive(Wire)]` rejects it), or be a field of a
-`[service]` struct (the generated dispatcher would capture the store — keep the
+`[service]` struct (the generated dispatcher would capture the store; keep the
 database at module scope instead, next to the service).
 
-## std::http — the server
+## std::http: the server
 
 ```vilan,fragment
 impl Server { fun builder(): ServerBuilder }
@@ -87,7 +86,7 @@ impl ResponseStream {
 ```
 
 `ServerBuilder::port(0)` asks the OS for a free port instead of guessing
-one — and the `Server` handed to `on_start` carries the port it actually
+one, and the `Server` handed to `on_start` carries the port it actually
 bound, so `port()` and `url()` are right in either case:
 
 ```vilan,norun
@@ -106,10 +105,10 @@ fun main() {
 
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and
-writes chunks over time (SSE's shape — a suspending `on_open` runs as
+writes chunks over time (SSE's shape; a suspending `on_open` runs as
 spawned work). `on_upgrade` mounts a WebSocket-style handshake handler
 over the raw bindings (`NodeRequest`/`NodeSocket`). For an rpc-serving
-app you won't touch any of this directly — `serve_service` wraps it
+app you won't touch any of this directly: `serve_service` wraps it
 (below), and `serve_connected` itself now rides this surface.
 
 ## std::rpc_server
@@ -147,5 +146,5 @@ fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
 ```
 
-A completed `main` ends the process — long-lived programs must hold it open
+A completed `main` ends the process; long-lived programs must hold it open
 (a listening server does; a socket-holding client needs an explicit wait).

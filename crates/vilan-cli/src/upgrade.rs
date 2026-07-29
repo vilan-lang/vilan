@@ -180,12 +180,12 @@ fn steer_message(colored: bool, owner: (&str, &str), current: &str, newer: Optio
     let headline = match newer {
         Some(latest) => {
             format!(
-                "vilan {current} → {latest} available — {installer} installed this vilan, so {installer} upgrades it:"
+                "vilan {current} → {latest} available; {installer} installed this vilan, so {installer} upgrades it:"
             )
         }
         None => {
             format!(
-                "vilan {current} was installed by {installer}, which owns these files — upgrade it with:"
+                "vilan {current} was installed by {installer}, which owns these files; upgrade it with:"
             )
         }
     };
@@ -273,7 +273,7 @@ fn run(check_only: bool) -> Result<(), String> {
             None => paint::out(
                 Style::CYAN,
                 &format!(
-                    "vilan {} → {latest_label} available — run `vilan upgrade`.",
+                    "vilan {} → {latest_label} available; run `vilan upgrade`.",
                     env!("CARGO_PKG_VERSION")
                 ),
             )
@@ -323,7 +323,7 @@ fn download_verify_swap(
         paint::out(
             Style::DIM,
             &format!(
-                "vilan {} → v{latest_label} — downloading {asset} ...",
+                "vilan {} → v{latest_label}: downloading {asset} ...",
                 env!("CARGO_PKG_VERSION")
             )
         )
@@ -528,7 +528,7 @@ fn discover_latest(base: &str) -> Result<String, String> {
         .map_err(|error| format!("cannot run curl: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "cannot reach {base}/releases/latest — check your connection (or see {base}/releases)"
+            "cannot reach {base}/releases/latest; check your connection (or see {base}/releases)"
         ));
     }
     let final_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -559,7 +559,7 @@ fn verify_checksum(workdir: &Path, asset: &str) -> Result<(), String> {
         .ok_or_else(|| format!("sha256sums.txt has no entry for {asset}"))?;
     let actual = sha256_file(&workdir.join(asset))?;
     if !actual.eq_ignore_ascii_case(expected) {
-        return Err(format!("checksum mismatch for {asset} — aborting"));
+        return Err(format!("checksum mismatch for {asset}; aborting"));
     }
     Ok(())
 }
@@ -1168,7 +1168,7 @@ mod tests {
         let plain = steer_message(false, npm, "0.14.0", None);
         assert_eq!(
             plain,
-            "vilan 0.14.0 was installed by npm, which owns these files — upgrade it with:\n\n    npm update -g @vilan-lang/vilan"
+            "vilan 0.14.0 was installed by npm, which owns these files; upgrade it with:\n\n    npm update -g @vilan-lang/vilan"
         );
         let checked = steer_message(false, npm, "0.14.0", Some("0.15.0"));
         assert!(

@@ -1,41 +1,41 @@
 # Platforms
 
-One language, several runtimes. A package builds for **node** (the
-default), **deno**, **bun**, or the **browser** — set `target` in
+One language, several runtimes. A package builds for **Node** (the
+default), **Deno**, **Bun**, or the **browser**: set `target` in
 `vilan.toml`, or pass `--platform` on the CLI.
 
-The standard library is layered so each build only uses what its platform
-can actually do. Call a server function from code a browser build can
-reach, and you get a clear compile error naming the call chain — not a
+The standard library is layered so each build only uses what its
+platform can do. Call a server function from code a browser build can
+reach, and you get a clear compile error naming the call chain, not a
 runtime crash. That's the whole idea of this chapter.
 
 ## The std layers
 
-- **Base** — platform-neutral, available everywhere: collections,
+- **Base**: platform-neutral, available everywhere (collections,
   `Option`/`Result`, strings, numbers, `reactive`, `shared`, `time`,
   json/wire/binary, the rpc client machinery, `style`, `fetch`,
-  `crypto`, and friends.
-- **Browser layer** — `std::dom`, `std::ui`, `std::router`,
+  `crypto`, and friends).
+- **Browser layer**: `std::dom`, `std::ui`, `std::router`,
   `std::storage`. Browser builds only.
-- **Process layer** (node/deno/bun) — `std::db`, `std::http`, `std::fs`,
+- **Process layer** (Node/Deno/Bun): `std::db`, `std::http`, `std::fs`,
   `std::process`, `std::rpc_server`. Server builds only.
 
 > **Going deeper.** The check is on *reachable code*, not on imports. A
 > file may import `std::fs` and compile for the browser, as long as no
 > code the browser entry can reach actually calls into it. The compiler
 > colors every function with the platforms it can run on (seeded by the
-> std layers, flowing through calls — the same way `async` is inferred),
+> std layers, flowing through calls, the same way `async` is inferred),
 > and checks the colors only along paths that start at your `main`. When
 > a path crosses onto the wrong platform, the error shows that path.
 > Module-level `let`s follow the same rule: a binding's initializer runs
 > (and is checked, and is bundled) only if something reachable references
-> it — a server-only global in a shared file costs the browser build
+> it: a server-only global in a shared file costs the browser build
 > nothing. `const` initializers run at build time and ship as plain
 > values, so they never color anything.
 
 ## Full-stack packages
 
-A client + server app fits in **one package** with two entries — each
+A client + server app fits in **one package** with two entries: each
 `[entry.<name>]` names an entry file and the platform it builds for.
 This is the default shape; reach past it only when you have a reason:
 
@@ -63,15 +63,15 @@ app/
 `vilan build` compiles every entry for its own target into
 `dist/<name>.js` (browser entries first, so a server that ships bundles
 finds them fresh); `vilan run` builds everything and starts the one
-node entry; `vilan check` checks all entries, always. Reachability does
+Node entry; `vilan check` checks all entries, always. Reachability does
 the sorting: the same `store.vl` may use `std::fs` freely, because only
-the server entry reaches into it — if client code ever calls that far,
+the server entry reaches into it. If client code ever calls that far,
 the build fails with the call chain.
 
-The advanced form, for larger apps, is a workspace of packages — a
+The advanced form, for larger apps, is a workspace of packages (a
 shared `[library]` for payload types, a browser package, a server
-package — where each member has its own manifest and dependency set, and
-may declare its own entries:
+package), where each member has its own manifest and dependency set,
+and may declare its own entries:
 
 ```
 app/
@@ -83,28 +83,28 @@ app/
 
 `vilan build .` at the root builds every member the same way. The
 compiler checks each against its own platform, including that `common`
-stays platform-neutral. Either shape, the service lives next to its
+stays platform-neutral. In either shape, the service lives next to its
 resources (see [Services](../guide/services.md)).
 
 > **Going deeper.** Where a team wants an explicit boundary,
 > `[platform("browser")]` on a function declares the platforms it
-> promises to run on — the compiler checks the promise on every compile
+> promises to run on. The compiler checks the promise on every compile
 > (entry or not, whatever the build target), and a violation lands at the
 > fence with its chain instead of at some distant entry in a dependent
 > build. Patterns use the manifest layers' vocabulary: `"node"`,
 > `"browser"`, families like `"@process"`, or several at once for code
 > that must stay neutral. The editor shows the same information as you
 > write: violations appear as live diagnostics at the offending call, and
-> hovering a function shows its inferred requirement and how it got it —
+> hovering a function shows its inferred requirement and how it got it,
 > e.g. ``requires the `process` layer of `std` (via `save → write_file
 > (std::fs)`)``.
 
-## Externs — talking to the host
+## Externs: talking to the host
 
 You'll mostly consume host bindings through std. But when you need a
-node API or browser API that std doesn't wrap yet, you can bind it
-yourself with an extern declaration. This is exactly how std's own
-bindings are written:
+Node API or browser API that std doesn't wrap yet, you can bind it
+yourself with an extern declaration. This is how std's own bindings
+are written:
 
 ```vilan,fragment
 // A function from a host module (node:crypto):
@@ -138,13 +138,14 @@ rather than copying it between apps.
 
 ## Assets
 
-Browser builds produce `<entry>.js`, plus `<entry>.css` when styles were
-emitted. Your server serves those two files and an HTML shell — the
-[services guide](../guide/services.md) shows the standard fallback shape.
+Browser builds produce `<entry>.js`, plus `<entry>.css` when styles
+were emitted. Your server serves those two files and an HTML shell; the
+[services guide](../guide/services.md) shows the standard fallback
+shape.
 
 > **Going deeper.** Build assets come from `std::asset::emit(kind,
 > content)`, callable only during `const` evaluation. The styling
 > system's `const style()` chains call it to write CSS rules. Libraries
 > can also declare platform overlays of their own (a base root plus
 > per-platform roots in `[library.layer]`), which is how std itself is
-> layered — most libraries never need this.
+> layered; most libraries never need this.

@@ -1,4 +1,4 @@
-# Numbers — reference
+# Numbers reference
 
 The sized numeric family (`std::number`), generic `min`/`max` (`std::math`),
 and random values (`std::random`). Literal syntax and conversion semantics:
@@ -16,16 +16,16 @@ and random values (`std::random`). Literal syntax and conversion semantics:
 
 `i53`/`u53` are the **wide** integers, named for the precision they
 actually deliver: they are f64-backed on the JS backend, and every value
-in ±2^53 (JavaScript's safe-integer window) is exact. There is no `i64` —
+in ±2^53 (JavaScript's safe-integer window) is exact. There is no `i64`:
 a type that silently loses precision past 2^53 would be lying about its
-width; for genuinely bigger integers use `BigInt`.
+width; for bigger integers use `BigInt`.
 
 Literals are range-checked at compile time (an out-of-range `i53` literal
 is a compile error, not a rounded value). Integer division truncates
-toward zero. No implicit width coercion — convert with `as_*`. Arithmetic
-that overflows a type's range is **undefined behavior** (spec §7.2) — on
-JS it manifests as f64 artifacts; a checked `add_safe` family is recorded
-future work.
+toward zero. No implicit width coercion; convert with `as_*`. Arithmetic
+that overflows a type's range is **undefined behavior**
+(spec [§7.2a](../spec/execution.md)): on JS it manifests as f64
+artifacts; a checked `add_safe` family is recorded future work.
 
 ## Methods
 
@@ -63,9 +63,9 @@ comparison.
 
 ## Conversions: `as_*`
 
-Every numeric type converts to every other with Rust-`as` semantics —
-truncate toward zero (floats), fold two's-complement into the target width
-(integers):
+Every numeric type converts to every other with Rust-`as` semantics.
+Floats truncate toward zero; integers fold two's-complement into the
+target width:
 
 ```vilan
 import std::print;
@@ -107,5 +107,5 @@ fun main() {
 }
 ```
 
-Not cryptographic — for tokens and ids use `std::crypto`
+Not cryptographic: for tokens and ids use `std::crypto`
 (`random_uuid`, `random_bytes`; see [misc](misc.md)).

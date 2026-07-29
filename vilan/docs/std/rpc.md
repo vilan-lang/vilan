@@ -1,8 +1,8 @@
-# std::rpc — reference
+# std::rpc reference
 
 Transports, the generated service surface, errors, and connection state.
 Concepts and usage: the [services guide](../guide/services.md). Most apps
-touch only the **generated client**, `RpcError`, and `ConnectionState` —
+touch only the **generated client**, `RpcError`, and `ConnectionState`;
 everything else here is the machinery those sit on.
 
 ## The generated surface (`[service]`)
@@ -24,7 +24,7 @@ dispatcher.into_protocol(codec: Codec): RpcProtocol   // what serve_service take
 
 `connect` accepts a relative url (`"/"`) in the browser; it dials the same
 host over WebSocket, waits for the server's announcement, and verifies the
-**contract hash** — a drifted server fails the connect with
+**contract hash**: a drifted server fails the connect with
 `RpcError::Contract`.
 
 ## Errors
@@ -40,7 +40,7 @@ enum RpcError {
 }
 ```
 
-Infrastructure failures only — an *application* "not found" belongs in the
+Infrastructure failures only: an *application* "not found" belongs in the
 rpc's own return type (`Option<Task>`), not here.
 
 ## Connection state
@@ -58,7 +58,7 @@ calls reject with `Transport("connection lost")`, new calls fail fast with
 `Transport("not connected")`; dial with backoff (250 ms doubling, 4 s cap,
 10 attempts); on success → contract re-check, mirrors re-attach and resync,
 `Connected`. Backoff exhausted → `Closed`. Nothing is ever silently
-retried — retry is the app's decision.
+retried; retry is the app's decision.
 
 ## Transports
 
@@ -70,7 +70,7 @@ trait Transport {
 
 | Transport | Wire | Use |
 |---|---|---|
-| `SocketTransport` | WebSocket (reconnecting) | what `connect` gives you — the production client transport |
+| `SocketTransport` | WebSocket (reconnecting) | what `connect` gives you, the production client transport |
 | `HttpTransport` | one POST per call | stateless calls, no mirrors |
 | `LocalTransport` | in-process | tests: client and service in one process |
 
@@ -102,7 +102,7 @@ fun serve_service(
 (mirror attach/detach) + rpc dispatch, with `fallback` answering ordinary
 http. Each handler runs in a turn (`AtEnd`). For custom per-connection
 state (connection-scoped auth, an app-written attach), use
-`serve_connected(port, protocol, on_connection, fallback, on_ready)` — the
+`serve_connected(port, protocol, on_connection, fallback, on_ready)`, the
 same server with the session hook exposed.
 
 ## Envelope & codec layer

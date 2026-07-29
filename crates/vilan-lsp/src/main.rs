@@ -355,7 +355,7 @@ impl ManifestDocument {
 fn still_analyzing() -> JsonRpcError {
     JsonRpcError {
         code: ErrorCode::ServerError(-32803),
-        message: "still analyzing this file — retry in a moment".into(),
+        message: "still analyzing this file; retry in a moment".into(),
         data: None,
     }
 }
@@ -365,7 +365,7 @@ fn still_analyzing() -> JsonRpcError {
 fn content_modified() -> JsonRpcError {
     JsonRpcError {
         code: ErrorCode::ContentModified,
-        message: "still analyzing this file — retry in a moment".into(),
+        message: "still analyzing this file; retry in a moment".into(),
         data: None,
     }
 }
@@ -377,7 +377,7 @@ fn content_modified() -> JsonRpcError {
 fn handler_panicked() -> JsonRpcError {
     JsonRpcError {
         code: ErrorCode::ServerError(-32803),
-        message: "the request failed inside the language server — this is a vilan-lsp bug".into(),
+        message: "the request failed inside the language server; this is a vilan-lsp bug".into(),
         data: None,
     }
 }
@@ -1243,7 +1243,7 @@ impl Backend {
             Ok(answer) => answer,
             Err(payload) => {
                 let text = format!(
-                    "the {request} handler panicked: {} — answered with its fallback (this is a vilan-lsp bug; details on stderr)",
+                    "the {request} handler panicked: {}; answered with its fallback (this is a vilan-lsp bug; details on stderr)",
                     panic_message(payload.as_ref())
                 );
                 eprintln!("vilan-lsp: {text}");

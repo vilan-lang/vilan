@@ -1,4 +1,4 @@
-# Cells — reference
+# Cells reference
 
 The two sharing tools: `std::shared::Shared` (one shared mutable cell) and
 `std::arena::Arena` (stable identities for graphs). When to reach for
@@ -6,7 +6,7 @@ which: [the memory model](../tour/memory-model.md).
 
 ## `Shared<T>`
 
-A heap cell two places can hold at once — the escape hatch from
+A heap cell two places can hold at once: the escape hatch from
 value-semantics copying.
 
 ```vilan,fragment
@@ -33,17 +33,17 @@ fun main() {
 ```
 
 - `read()` copies: mutating the result is lost
-  (`shared.read().push(x)` — the classic trap). Mutate through `write()`.
-- `write()` returns a view — use it within the same statement
+  (`shared.read().push(x)`, the classic trap). Mutate through `write()`.
+- `write()` returns a view. Use it within the same statement
   (`cell.write() = v`, `cell.write().push(item)`); it obeys the usual view
   rules (no storing, no holding across `await`).
-- Copying the `Shared` value itself copies the *handle* — both handles see
+- Copying the `Shared` value itself copies the *handle*: both handles see
   one cell. That's the point.
 
 ## `Arena<T>` + `Handle<T>`
 
 A **generational arena**: insert values, get back small copyable
-`Handle<T>` keys. Handles are plain values — storable in struct fields and
+`Handle<T>` keys. Handles are plain values, storable in struct fields and
 lists (which views are not), so nodes can reference each other:
 
 ```vilan,fragment
@@ -94,14 +94,14 @@ fun main() {
   of aliasing the new occupant.
 - `get` returns a **view** (`Option<&T>`), second-class like any other: read
   through it, but it may not outlive an arena mutation or be stored. To change
-  a value, copy it out (`*view`), edit, and `set` it back — or design nodes so
+  a value, copy it out (`*view`), edit, and `set` it back, or design nodes so
   edges/fields update independently.
-- Traversal is re-`get` per step — the arena stays mutable while you walk.
+- Traversal is re-`get` per step, so the arena stays mutable while you walk.
 
 ### Handles cross the wire
 
 A handle is two integers, so `Handle<T>` is `Wire`: it can sit in an rpc
-payload, and a server-side arena becomes the **naming layer** for clients —
+payload, and a server-side arena becomes the **naming layer** for clients:
 the stable entity reference they quote back ("update node X"). The `T` is
 phantom; only `{ index, generation }` travels, so a handle names entities
 whose type is not itself Wire.
@@ -131,17 +131,17 @@ fun main() {
 }
 ```
 
-The generational rule becomes the **distributed staleness story** for free: a
+The generational rule becomes the distributed staleness story for free: a
 client acting on an entity another client deleted gets the same clean `None`
 (and `set` returns `false`) as local code holding a stale handle. No phantom
 write, one rule from a local list to an rpc boundary.
 
 Scope the arena to the session. A handle is a name, and `(index, generation)`
 is guessable, so an arena shared across tenants hands every client names that
-mean something to the others. A **per-session arena** — created when the
-session is established, dropped with it — makes a handle from one session name
-nothing in another, by construction. Authorize the session; then look the
-handle up in that session's arena.
+mean something to the others. A **per-session arena** (created when the
+session is established, dropped with it) makes a handle from one session
+name nothing in another, by construction. Authorize the session; then look
+the handle up in that session's arena.
 
 When one arena *is* shared and its handles must not be interchangeable,
 `Arena::branded()` adds the belt to that suspenders: its generation counters
@@ -166,11 +166,11 @@ fun main() {
 
 Everything else is unchanged: branding only moves where the counters start, so
 removal, staleness and slot reuse behave exactly as above, and a brand mismatch
-is the same clean `None` (and `false` from `set`) as a stale handle — never a
+is the same clean `None` (and `false` from `set`) as a stale handle, never a
 panic.
 
 A brand is a **confusion guard, not an authorization check**. It travels inside
 the handles it issues, so a client holding one valid handle can derive it. It
 stops one tenant's names from meaning something to another and stops blind
-guessing; it does not make a handle unforgeable. Authorize the session first —
-then look the handle up in that session's arena.
+guessing; it does not make a handle unforgeable. Authorize the session
+first, then look the handle up in that session's arena.

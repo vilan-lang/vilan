@@ -1,8 +1,8 @@
 # Spec §6 — The memory model
 
 Values are copied (§6.1); sharing is asked for explicitly. Every explicit
-sharing mechanism — views, projections, `Shared`, `Arena`/`Handle`, and the
-resource class (§6.8) — is a *claim* on an owner, and all of them obey the
+sharing mechanism (views, projections, `Shared`, `Arena`/`Handle`, and the
+resource class, §6.8) is a *claim* on an owner, and all of them obey the
 one law stated in §6.0. The numbered sections that follow are that law's
 projections: the four rules (design:
 `proposal/memory-management-rev-1.md`), the escape hatches, and resources
@@ -17,7 +17,7 @@ sections after it are its projections.
 
 An **owner** is any value with independent existence: a binding, a
 container, an arena slot, a counted cell, a resource. Every owner has an
-**epoch** — an abstract counter that advances on a fixed set of **events**,
+**epoch**: an abstract counter that advances on a fixed set of **events**,
 determined by the owner's shape:
 
 | owner shape | epoch events |
@@ -33,23 +33,23 @@ A **claim** is any alias to a place inside an owner: a `&`/`&mut` view
 abstract a claim is the triple *(owner identity, path, epoch at capture)*.
 
 **The law: a claim is valid while its owner's epoch is unchanged.** Nothing
-else is forbidden — aliasing is permitted, and writing through an alias is
+else is forbidden: aliasing is permitted, and writing through an alias is
 permitted (§6.4 declines exclusivity); only *using* a claim whose owner's
 epoch has advanced is illegal. A **suspension point** (`await`) is the
 degenerate event: while a function is suspended, other turns run, so every
-owner's epoch must be assumed to advance — `await` bumps the world (§6.6).
+owner's epoch must be assumed to advance. `await` bumps the world (§6.6).
 
 A claim's validity is established at exactly one of two times, giving **two
 enforcement regimes**:
 
-- **Static discharge — views (§6.3).** The compiler proves that no event
+- **Static discharge: views (§6.3).** The compiler proves that no event
   occurs between a view's capture and its last use. The proof needs a
   *surveyable interval*, which is why views are second-class: lexical
   liveness (declaration to block end) is the interval the compiler can
-  audit. Because the proof is total, the access is infallible and free —
+  audit. Because the proof is total, the access is infallible and free:
   a view compiles to a bare `(base, key)` and checks nothing at runtime.
-- **Dynamic carry — handles.** When a claim outlives every surveyable
-  interval — stored in a field, kept across `await`, held between turns —
+- **Dynamic carry: handles.** When a claim outlives every surveyable
+  interval (stored in a field, kept across `await`, held between turns),
   it carries its epoch as data (a `Handle`'s generation) and every access
   re-establishes validity by comparison, answering `Option<&T>`. The check
   runs at use time, so access is *failable, and the failability is in the
@@ -64,12 +64,12 @@ The same relation, read at compile time or at use time:
 | invalidation | rule 4 (§6.4): reassignment, mutating call | generation mismatch → `None` |
 | suspension | no view across `await` (§6.6) | handles cross freely; the next access re-validates |
 | death | resources: use-after-move; drops placed statically (§6.8) | a stale handle / `Weak` → `None` |
-| exclusivity | declined — aliased views and content writes are legal | traps only on *invalidating* overlap (§6.7) |
+| exclusivity | declined: aliased views and content writes are legal | traps only on *invalidating* overlap (§6.7) |
 
 Reading down the columns: the left is what the compiler proves when
 liveness is lexical; the right is the identical relation carried as data
 when the claim must outlive the compiler's sight. Sections 6.1–6.8 place
-each mechanism in a cell — rules 1–2 (§6.1–§6.2) govern owners that carry
+each mechanism in a cell: rules 1–2 (§6.1–§6.2) govern owners that carry
 no claims; rule 3 (§6.3) is the static column's interval requirement; rule
 4 (§6.4) is the static invalidation cell; `borrows` (§6.5) makes a claim's
 origin explicit; the escape hatches (§6.7) are the dynamic column; and
@@ -80,7 +80,7 @@ compile-time twin of a stale handle's `None`.
 
 Every binding, assignment, argument pass, field initialization, and
 return **copies** the value. After `mut b = a`, mutating `b` never
-affects `a` — for primitives, structs, enums, tuples, lists, and every
+affects `a`, for primitives, structs, enums, tuples, lists, and every
 other value type alike:
 
 ```vilan
@@ -99,7 +99,7 @@ fun main() {
 ## 6.2 Rule 2 — elision is an optimization, never observable
 
 An implementation may skip a copy (reuse the storage) when no conforming
-program can tell — e.g. when the source is never used again. Elision must
+program can tell, e.g. when the source is never used again. Elision must
 not change any program's output; a live view of the source counts as a
 use. (This rule licenses the JS backend to alias under the hood; it
 grants programs nothing.)
@@ -108,7 +108,7 @@ grants programs nothing.)
 
 `&place` / `&mut place` create a **view**: an alias of a place, readonly
 or writable. Views are values of view type (`&T`, `&mut T`) but are
-deliberately second-class — a view may not outlive the thing it views:
+deliberately second-class; a view may not outlive the thing it views:
 
 - A view may be a **parameter** (the caller's place is lent for the
   call), a **short-lived local**, or a **return projecting a parameter**
@@ -121,17 +121,17 @@ deliberately second-class — a view may not outlive the thing it views:
   the place; may not cross an `await` (§6.6).
 
 Mutating through a view writes the viewed place; reading its value
-requires an explicit `*`. A view in **value position** — passed where a
+requires an explicit `*`. A view in **value position** (passed where a
 value is expected, used as an operator's operand, or bound to a value
-type — is a compile error, never a silent coercion to the pointee (so the
+type) is a compile error, never a silent coercion to the pointee (so the
 `(base, key)` representation of a scalar view can't leak); write `*v` to
 copy the value out. Iteration by view (`for e in &mut list`) binds each
-element as a view — assignment and field writes go through; `*e` reads the
+element as a view: assignment and field writes go through; `*e` reads the
 element. The parameter conventions:
 
 | Convention | Written | Meaning |
 |---|---|---|
-| bare | `x: T` | by value (a copy — rule 1) |
+| bare | `x: T` | by value (a copy, rule 1) |
 | own | `own x: T` | by value, explicitly (documentation of intent) |
 | ref | `&x` / `x: &T` | readonly view |
 | ref mut | `&mut x` / `x: &mut T` | writable view |
@@ -143,26 +143,26 @@ view (replacing the aggregate that contains the place, removing the
 element it points into, resizing past it) are forbidden. The compiler
 enforces the statically-decidable half in full: reassigning the viewed
 root (or an enclosing place), and any call that may advance the root's
-*geometry* — the callee's inferred `bumps` verdict per parameter, so a
+*geometry*: the callee's inferred `bumps` verdict per parameter, so a
 content-stable `&mut` callee (one that only writes fields or elements
 through the parameter) passes freely. Views anchor at their origin roots
 wherever they arise: a direct `&place`, a view-returning call (the
 callee's `borrows` positions mapped through the arguments), or a
-wrapped-view `match` capture — a projection returned through a call is
+wrapped-view `match` capture. A projection returned through a call is
 policed exactly like the `&place` it came from.
 
 *Implementation note: the dynamic remainder (aliasing reached through
 calls, container-internal invalidation) is tracked future work. When it
 lands it enforces the **same event set** as the static rule above (§6.0's
 design invariant): a trap fires on a reassignment, a geometry change, or a
-death under a live claim — never on a mere overlap of content writes, which
+death under a live claim, never on a mere overlap of content writes, which
 the static rule deliberately permits (aliased views, and writing through
 them, are legal). `Shared.read()/write()` are the cell-level form of this
 dynamic check (§6.7).*
 
 ## 6.5 Projections: `borrows`
 
-A function may return a view **into one of its parameters** — the one
+A function may return a view **into one of its parameters**: the one
 sanctioned escape from rule 3's return ban. The projected parameter is
 named by a `borrows` clause, which is **inferred** when the body makes it
 evident (a method returning a view of `self` needs no clause):
@@ -180,20 +180,20 @@ Returning a view of a **local** is always an error (it would dangle).
 The clause is a *set*: a function whose branches return a view of
 different parameters projects them all (`borrows a, b`), and the call
 result anchors at every corresponding argument. Hover shows the inferred
-clause on any projection, alongside its sibling effect **`bumps`** — the
+clause on any projection, alongside its sibling effect **`bumps`**: the
 per-`&mut`-parameter *geometry verdict* §6.4's call rule fires on. A
 `&mut` parameter the body only writes fields or elements through is
 **content-stable** (absent from the clause; the owner's epoch holds); one
 the body may resize, insert into, remove from, or whole-reassign through
 **bumps**. Both effects are inferred, never written (the explicit
-`borrows` clause remains legal); an unknowable callee — a bodiless trait
-signature, an untabled host function — is treated as bumping and, when
+`borrows` clause remains legal); an unknowable callee (a bodiless trait
+signature, an untabled host function) is treated as bumping and, when
 view-typed, as projecting every argument: the conservative direction.
 
 `Option<&T>` is permitted as a return type for "a view, maybe" (map
 lookups); the `Some` payload obeys the same anchoring. An `Option<&mut T>`
 may also be built **inline as a transient** and matched in the same
-expression — `match Some(&mut a) { Some(let v) => … }`, including the
+expression: `match Some(&mut a) { Some(let v) => … }`, including the
 conditional form `match if c { Some(&mut x) } else { None } { … }` and
 forwarding a bare view parameter (`match Some(p) { … }` for `p: &mut T`).
 Because the transient never outlives the `match` that consumes it, its
@@ -224,12 +224,12 @@ closure values.
 
 `Shared<T>` (one shared cell; `read()` copies, `write()` yields a
 statement-scoped view of the contents) and `Arena<T>`/`Handle<T>` (stable,
-generation-checked identities — handles are plain values, storable where
+generation-checked identities: handles are plain values, storable where
 views are not) are std types built on these rules, not extensions of them.
 They are §6.0's **dynamic regime**: a `Handle`'s generation is its owner's
 epoch carried as data, and `Arena.get` answers `Option<&T>`. When the
 counted tier (§6.8) gives `Shared` a runtime check, that check enforces the
-same event set as rule 4 — a reassignment, geometry change, or death of the
+same event set as rule 4: a reassignment, geometry change, or death of the
 cell under another live view traps, while overlapping writes through the
 cell do not (the reconciled trap law of §6.0; a `write` view is *not*
 exclusive). See [cells](../std/cells.md).
@@ -239,10 +239,10 @@ exclusive). See [cells](../std/cells.md).
 *(Design: `proposal/destruction.md`.)* Rule 1 copies values, and a
 droppable value cannot survive copying: a copied file handle double-closes,
 a copied refcount miscounts. Destruction is therefore not bolted onto the
-data world — the world is partitioned. **Data** is everything above: copied
+data world: the world is partitioned. **Data** is everything above: copied
 on binding, elided at last use, reclaimed by the host. A **resource** is a
-small, explicitly-rooted class with *affine* discipline — one owner at a
-time, no copies — whose owner's scope end runs its destructor. This section
+small, explicitly-rooted class with *affine* discipline (one owner at a
+time, no copies) whose owner's scope end runs its destructor. This section
 is the static **death** cell of §6.0: a resource's move ends the source
 binding's epoch, and `drop` is its final event.
 
@@ -257,8 +257,8 @@ references above.
 - **`resource` is a declaration modifier**, written in `external`'s
   position: `resource struct S`, `resource external struct D`, `resource
   enum E`.
-- **Containment infers.** An aggregate — struct, enum, tuple, or fixed
-  array `[R; n]` — with a resource field, payload, element, or member type
+- **Containment infers.** An aggregate (struct, enum, tuple, or fixed
+  array `[R; n]`) with a resource field, payload, element, or member type
   *is* a resource, recursively (the `Wire`/`Hashable` all-fields machinery
   with the polarity flipped: any resource member marks the whole). Declaring
   `resource` on such a type is allowed and checked; omitting it never hides
@@ -277,45 +277,45 @@ references above.
 existing second-class view (`self` / `&` / `&mut` conventions, §6.3), which
 changes no ownership and is policed by rule 4.
 
-- **R1 — binding moves.** `let b = a;` transfers ownership; any later use of
+- **R1: binding moves.** `let b = a;` transfers ownership; any later use of
   `a` is a compile error naming the move site. No copies ever fire for a
   resource.
-- **R2 — overwrite drops.** Assigning onto a binding that still owns a
+- **R2: overwrite drops.** Assigning onto a binding that still owns a
   resource drops the old value first, then moves the new one in.
-- **R3 — parameters.** `self` / `&x` / `&mut x` are loans, unchanged; `own
-  x` is a move — and for a resource *only* a move: an `own` argument that is
+- **R3: parameters.** `self` / `&x` / `&mut x` are loans, unchanged; `own
+  x` is a move, and for a resource *only* a move: an `own` argument that is
   not the binding's last use is an error (where a data `own` would silently
   copy).
-- **R4 — returns move out**, including through `if` / `match` tails (a
+- **R4: returns move out**, including through `if` / `match` tails (a
   diverging leg is exempt).
-- **R5 — fields.** A struct literal moves resources in. A resource field is
+- **R5: fields.** A struct literal moves resources in. A resource field is
   read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
-  live aggregate is rejected — v1 has no partial moves. The sanctioned
+  live aggregate is rejected; v1 has no partial moves. The sanctioned
   partial move is `Option` (below).
-- **R6 — match consumes.** Matching a resource *by value* consumes the
+- **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm. Matching a loan
   (`match &self.state`) inspects without consuming.
-- **R7 — no conditional moves.** A binding must be moved on every path
+- **R7: no conditional moves.** A binding must be moved on every path
   through a scope or on none; moving it on one path only is an error. This
-  keeps end-of-scope ownership static — there are no runtime drop flags in
+  keeps end-of-scope ownership static: there are no runtime drop flags in
   v1.
-- **R8 — no moves in repeatable interiors.** Moving a binding declared
+- **R8: no moves in repeatable interiors.** Moving a binding declared
   outside a loop from inside its body is an error (the move would repeat).
-- **R9 — closures and spawns cannot capture resources.** Capturing one would
+- **R9: closures and spawns cannot capture resources.** Capturing one would
   give the closure a second owner. Injected `context`-clause bodies receive
-  resource *parameters* as loans — parameters are per-call, not captures —
+  resource *parameters* as loans (parameters are per-call, not captures),
   so `nursery(|n| ..)`-shaped APIs are unaffected. A closure referencing a
   **module-level** resource is likewise exempt: a module global is loan-only
   and lives for the process (see *Module-level resources never drop*, below),
-  so the closure can never own it and no second owner is created — the
+  so the closure can never own it and no second owner is created: the
   reference is a per-call loan, exactly like a parameter. Captures of a
   **local** or a **parameter** stay rejected.
-- **R10 — no resource elements in the native containers.** `List` / `Map` /
+- **R10: no resource elements in the native containers.** `List` / `Map` /
   `Set` and every external generic (`Shared`, `Task`, `Promise`, `Context`)
-  reject resource type arguments in v1 — their internals are host code the
+  reject resource type arguments in v1: their internals are host code the
   move checker cannot see. `Option` is the sanctioned container (it is a
   Vilan enum, checkable under R11).
-- **R11 — generics must be move-clean per instantiation.** Instantiating a
+- **R11: generics must be move-clean per instantiation.** Instantiating a
   type parameter with a resource type re-checks the instantiated body under
   the affine rules (T := the resource): every T-typed value is used at most
   once as a move, with no captures and no copies. `Option::unwrap(self): T`
@@ -323,7 +323,7 @@ changes no ownership and is policed by rule 4.
   site**, not inside std. For an `own T` parameter the rule tightens to
   *exactly* once (a generic body is emitted once and so cannot run an
   instantiation-conditional destructor; zero moves would leak).
-- **R12 — no coercion to `any`.** A resource passed where `any` is expected
+- **R12: no coercion to `any`.** A resource passed where `any` is expected
   is an error (`print(db)` included): `any` is a data sink, and the
   discipline must not launder away. Debug-print the fields instead.
 
@@ -337,20 +337,20 @@ trait Drop {
 
 The body cleans up through the `&mut self` loan; the compiler destroys the
 fields *afterward*, in reverse field order. `&mut self` is the exact and
-only accepted shape — a by-value `self` could move the value out and keep it
+only accepted shape: a by-value `self` could move the value out and keep it
 alive (resurrection), a `&self` receiver cannot run the mutating teardown,
 an extra parameter cannot be supplied by an inserted call, and a
 value-returning body is rejected. Two further restrictions are enforced:
 
-- **`drop` is synchronous.** An `async` or awaiting `drop` body is rejected
-  — teardown runs synchronously in v1. (Cancel owned tasks through an
+- **`drop` is synchronous.** An `async` or awaiting `drop` body is
+  rejected: teardown runs synchronously in v1. (Cancel owned tasks through an
   `OwnedNursery`, whose own `drop` cancels them.)
 - **`drop` is context-free.** A `drop` body that requires an ambient context
   (for example, one that writes a `Signal`, which threads the turn as a
   hidden context argument) is rejected: a destructor's call sites are scope
   exits, which thread no context.
 
-A resource without a `Drop` impl is legal — containment alone still enforces
+A resource without a `Drop` impl is legal: containment alone still enforces
 moves and destroys the resource's fields. `Drop` is distinct from the
 cooperative `Disposable` protocol, which is the data-world teardown hook
 (subscriptions, owners) and is capture-based (exactly why it is not a
@@ -361,8 +361,8 @@ resource mechanism).
 At the owner's scope end, still-owned resource locals drop in **reverse
 declaration order**. A value's own `drop` body runs **before its fields**,
 and the fields drop in reverse field order; an enum's payload drops with the
-value. **Every exit runs drops** — fall-through, `ret`, `jump break`, `jump
-continue` (out of the scopes they leave), and panic unwinding — because a
+value. **Every exit runs drops**: fall-through, `ret`, `jump break`, `jump
+continue` (out of the scopes they leave), and panic unwinding, because a
 resource-owning scope lowers to a `try`/`finally` and every exit flows
 through the `finally`. Concrete `own` resource *parameters* drop at scope
 end like locals (a generic `own T` is required to move out instead, per
@@ -376,7 +376,7 @@ R11).
 - **Panic during unwind.** A `drop` that panics while a panic is already
   unwinding replaces the in-flight error (JS `finally` semantics; a native
   backend would abort).
-- **Across `await`.** Owning a resource across a suspension is legal —
+- **Across `await`.** Owning a resource across a suspension is legal:
   frames own their locals, and §6.6's no-view-across-`await` restriction is
   about *loans*, not ownership. Under cancellation a bridged operation
   rejects, the frame unwinds, and drops run.
@@ -411,21 +411,21 @@ Moving a value into `drop` destroys it at that (immediate) scope end instead
 of waiting for the owner's scope to close. The call is rewritten at each
 site by the concrete argument type: for a resource it lowers to that type's
 destructor; for plain data it is a no-op that consumes the argument for its
-effects. There is no public `close()` to keep in sync with a destructor —
+effects. There is no public `close()` to keep in sync with a destructor;
 `drop(x)` is the early form. Inside a generic body a `drop(x)` on a value of
 a still-abstract type `T` has no concrete destructor (a generic body is
 emitted once, erased), so R11 rejects it **under a resource instantiation**
-("the erased body cannot destroy a `T` — move it out to the caller"); a data
+("whose erased body has no concrete destructor; destroy at a concrete type, or move the value out to the caller"); a data
 instantiation keeps the legitimate no-op consume.
 
 ### `OwnedNursery`
 
 `OwnedNursery` (`std::task`) is the resource-owner for object-lifetime
 background work that no function-scoped `nursery` can hold. It wraps a
-`Nursery` (which stays data — the ambient handle; `Context<R>` is
+`Nursery` (which stays data, the ambient handle; `Context<R>` is
 R10-rejected, so ownership lives only in the wrapper). `enter(body)` runs
-`body` with the owner's nursery established as ambient — every task spawned
-in the body's dynamic extent registers with the owner — but, unlike
+`body` with the owner's nursery established as ambient (every task spawned
+in the body's dynamic extent registers with the owner) but, unlike
 `nursery`, does *not* join: it returns the body's value as soon as the body
 settles, leaving the spawned tasks running under the owner. Its `Drop`
 cancels the owned nursery, so dropping the owner (at scope end or via
@@ -434,17 +434,17 @@ cancels the owned nursery, so dropping the owner (at scope end or via
 Its nursery runs in **detached mode**: because nothing ever joins the owned
 children, a child failure that is not a cancellation echo takes the
 free-task reporting path (console, with the spawn origin) rather than being
-stored for a join, and a child does not cancel its siblings — ownership is
+stored for a join, and a child does not cancel its siblings: ownership is
 lifetime, not fate-sharing. Cancellation echoes stay silent.
 
 ### Services and resources
 
 A `[service]` struct that owns a resource field is itself a resource by
 containment, and its generated dispatcher builds per-`[rpc]` handler
-closures that capture `self` — which R9 forbids. R9's module-level exemption
+closures that capture `self`, which R9 forbids. R9's module-level exemption
 does not apply here: `self` is a local store value, not a module global, so
 the capture is a genuine second owner. This collision is **by design**: the
-sanctioned shape is the module-level idiom — hoist the resource (a
+sanctioned shape is the module-level idiom: hoist the resource (a
 `Database`) to a module-level `let`, and let the store hold only its reactive
 state (plain data) and reach the resource by loan. The module-level resource
 is process-lifetime and never drops, and reachability keeps its initializer
@@ -455,8 +455,8 @@ out of the client bundle.
 The following are recorded limits the model does not promise, not bugs:
 
 - **A never-settling await leaks its frame's drops.** An *unbridged* await
-  that never resolves (nothing cancels it) leaves its frame — and the
-  resources the frame owns — undropped. This is structured concurrency's
+  that never resolves (nothing cancels it) leaves its frame, and the
+  resources the frame owns, undropped. This is structured concurrency's
   concern, not the memory model's.
 - **R11/R12 diagnostic residues** (completeness, not soundness). The
   per-instantiation move scan descends into *direct* lexical closures only,
@@ -464,7 +464,7 @@ The following are recorded limits the model does not promise, not bugs:
   flagged (its capture is still caught); dispatched (trait-typed-receiver)
   callees are not re-discovered by R11's scan or R12's `any`-coercion check,
   matching the standing convention that convention checks skip dispatched
-  callees — R11's per-instantiation re-check is the net under that residue.
+  callees; R11's per-instantiation re-check is the net under that residue.
   A cross-file instantiation may anchor its *primary* span imprecisely (the
   body note carries the correct source). A module-*initializer* global →
-  global move is not scanned — benign, since module globals never drop.
+  global move is not scanned (benign, since module globals never drop).

@@ -387,22 +387,22 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "struct",
-        "Declares a struct — a product type with named fields.",
+        "Declares a struct, a product type with named fields.",
         "tour/data-and-traits.html#structs",
     ),
     (
         "enum",
-        "Declares an enum — a sum type whose value is one of several variants.",
+        "Declares an enum, a sum type whose value is one of several variants.",
         "tour/data-and-traits.html#enums",
     ),
     (
         "trait",
-        "Declares a trait — a set of methods a type can implement.",
+        "Declares a trait, a set of methods a type can implement.",
         "tour/data-and-traits.html#traits",
     ),
     (
         "impl",
-        "Implements methods for a type — and, with a trait, that trait.",
+        "Implements methods for a type (and, with a trait, that trait).",
         "tour/data-and-traits.html#impl--methods-and-statics",
     ),
     (
@@ -417,12 +417,12 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "external",
-        "Declares a host (FFI) type or function — its surface comes from the host, not vilan.",
+        "Declares a host (FFI) type or function: its surface comes from the host, not Vilan.",
         "spec/types.html#53-declarations",
     ),
     (
         "macro",
-        "Declares a macro — code that runs at compile time to produce code.",
+        "Declares a macro, code that runs at compile time to produce code.",
         "spec/macros.html#101-declaring-and-invoking",
     ),
     (
@@ -453,7 +453,7 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "mut",
-        "Binds a mutable value — one that can be reassigned.",
+        "Binds a mutable value, one that can be reassigned.",
         "tour/values-and-types.html#bindings",
     ),
     (
@@ -463,7 +463,7 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "borrows",
-        "Names which parameter a function returns a view into — the one sanctioned way a view escapes a function (often inferred).",
+        "Names which parameter a function returns a view into: the one sanctioned way a view escapes a function (often inferred).",
         "spec/memory.html#65-projections-borrows",
     ),
     (
@@ -533,7 +533,7 @@ const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "null",
-        "The null literal — the sole value of the `null` type.",
+        "The null literal, the sole value of the `null` type.",
         "tour/values-and-types.html#wheres-null",
     ),
 ];
@@ -899,7 +899,7 @@ impl Document {
             diagnostics: vec![Error {
                 note: None,
                 span: vilan_core::span::Span::new((), 0..0),
-                msg: "internal error: the compiler panicked analyzing this file (this is a bug — the details are on stderr)"
+                msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
                     .to_string(),
             }],
             diagnostic_sources: vec![SourceId(0)],
@@ -1388,7 +1388,7 @@ impl Document {
             .iter()
             .find(|(keyword, _, _)| *keyword == lexeme)?;
         Some(format!(
-            "**`{lexeme}`** — {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
+            "**`{lexeme}`**: {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
         ))
     }
 

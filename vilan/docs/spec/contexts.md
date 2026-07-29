@@ -3,7 +3,7 @@
 A **context** is a dynamically-scoped value: established for the dynamic
 extent of a body, readable from anything that runs within that extent,
 invisible outside it. Contexts are Vilan's answer to ambient parameters
-— the current reactive owner, the current turn, the enclosing nursery —
+(the current reactive owner, the current turn, the enclosing nursery)
 without global mutable state and without threading a parameter by hand
 through every signature.
 
@@ -15,7 +15,7 @@ nothing. Everything in this chapter is checked at compile time.
 
 ## 8.1 The model
 
-`std::context::Context<T>` is the handle (appendix §A.4 — a lang item:
+`std::context::Context<T>` is the handle (appendix §A.4, a lang item:
 the compiler keys on its operations). A context is created once, at
 module level, and referred to by that name:
 
@@ -23,11 +23,11 @@ module level, and referred to by that name:
 let flavor: Context<i32> = Context::new();
 ```
 
-- `flavor.run(value, body)` — establish: `value` is the context's value
+- `flavor.run(value, body)` (establish): `value` is the context's value
   for the **dynamic extent** of `body` (the closure's execution and
   everything it calls, transitively). `run` yields `body`'s value.
-- `flavor.get()` — the **strict** read: yields the established `T`.
-- `flavor.get_safe()` — the **safe** read: yields `Option<T>` —
+- `flavor.get()` (the **strict** read): yields the established `T`.
+- `flavor.get_safe()` (the **safe** read): yields `Option<T>`,
   `Some(value)` under an enclosing `run`, `None` otherwise.
 
 `Context::new`, `run`, `get`, and `get_safe` are intrinsics: the
@@ -35,7 +35,7 @@ threading pass rewrites their call sites away. They must be applied
 directly to the context's **name** (a receiver that is not a named
 context is rejected). A context is not otherwise useful as a value:
 moving one through a parameter or a field severs the link between its
-`run`s and its reads — the reads can then never be covered. `run`'s
+`run`s and its reads; the reads can then never be covered. `run`'s
 body argument must be a closure literal (or an injected closure value,
 §8.5).
 
@@ -80,42 +80,42 @@ what they return at a covered site:
 Strictness is a property of *code regions*, propagated caller-ward: a
 function that (transitively) reaches a strict read is strict; a
 function whose only demands are safe reads is safe. One function may be
-strict for one context and safe for another — each context threads
+strict for one context and safe for another. Each context threads
 independently.
 
 ## 8.3 Coverage
 
-For every strict read, the compiler checks — over the whole call graph
-— that the reading code cannot be entered without the value. It is a
+For every strict read, the compiler checks, over the whole call graph,
+that the reading code cannot be entered without the value. It is a
 compile error ("context `…` is read here, but this code can be reached
 without an enclosing `run`") when a strict read is reachable from:
 
 - the program's top level or the entrypoint `main` (the uncovered
-  roots — `main` is semantically the outermost, run-less extent);
+  roots: `main` is semantically the outermost, run-less extent);
 - a module-level initializer;
 - any caller chain that does not pass through a `run` of that context.
 
 Trait/generic-dispatched calls are covered conservatively: a dispatch
 site is treated as reaching every candidate implementation (and the
 trait default), so a needy candidate demands coverage of the caller
-even if another candidate would have been selected. Dead code —
-a function with no callers at all — is exempt (it cannot run
+even if another candidate would have been selected. Dead code,
+a function with no callers at all, is exempt (it cannot run
 uncovered); a function called only from top level, or taken as a
 value, is not.
 
 A function that reads a context **cannot be used as a value**
 ("`…` reads context `…`, so it can't be used as a value"): an indirect
 call would bypass the hidden parameter. Wrap it in a closure literal at
-the use site — the closure captures the channel correctly (§8.4).
+the use site: the closure captures the channel correctly (§8.4).
 
 Safe reads never fence. In uncovered positions they read `None`; this
 is what lets library code ask "is there an ambient X?" from anywhere
-(the standard library's spawn registration does exactly this — §7.7).
+(the standard library's spawn registration does exactly this, §7.7).
 
 ## 8.4 Closures capture at creation
 
 A closure created inside a covered region **captures the context value
-at its creation site**, and the capture is what its body reads —
+at its creation site**, and the capture is what its body reads,
 regardless of where the closure is later called:
 
 ```vilan
@@ -142,7 +142,7 @@ extent and creation sites decide.)
 
 Capture-at-creation has one structural consequence: a closure literal
 passed **to** an establishing function is created *before* the extent
-exists, so it would capture the caller's (often absent) value — exactly
+exists, so it would capture the caller's (often absent) value: exactly
 wrong for helpers like `nursery(body)` or `run_with_owner(owner, body)`
 whose entire purpose is to run the body under a fresh value.
 
@@ -169,8 +169,8 @@ A parameter (or `let` binding) whose closure type carries
 Because the binding is deferred, an injected value may only flow where
 the threading can follow it: it can be **called**, **forwarded** to a
 parameter with the same clause, or passed as **`run`'s body**. Any
-other use — storing it in a field, returning it, putting it in a
-collection — is a compile error ("an injected (`context`-typed) closure
+other use (storing it in a field, returning it, putting it in a
+collection) is a compile error ("an injected (`context`-typed) closure
 can only be called, forwarded …, or passed to `run`").
 
 A clause may name several contexts (`context (a, b)`); the clause must
@@ -183,7 +183,7 @@ name context bindings, and it composes with the closure-type markers of
   is stable across every suspension of the extent by construction. An
   awaiting `run` body holds its value across its whole chain.
 - **Spawns** (§7.7): every spawn site is an implicit *safe* read of the
-  standard library's ambient nursery — inside a nursery's extent the
+  standard library's ambient nursery: inside a nursery's extent the
   value is present and the task registers; outside, the read is absent
   and the spawn stays free-floating.
 - **Platforms**: the threading pass runs before emission for every
@@ -193,8 +193,8 @@ name context bindings, and it composes with the closure-type markers of
 ## 8.7 The standard library's ambient values (informative)
 
 `std` builds its ambient machinery on this one mechanism: `owner_scope`
-(the reactive disposal owner — `run_with_owner`, `comp`),
-`turn_scope` (the current write-batching turn — `turn`, `batch`), and
-`ambient_nursery` (`std::task` — nursery registration and the
+(the reactive disposal owner: `run_with_owner`, `comp`),
+`turn_scope` (the current write-batching turn: `turn`, `batch`), and
+`ambient_nursery` (`std::task`: nursery registration and the
 cancellation signal). Their semantics are library contracts, not
 language rules; they are specified by their reference pages.

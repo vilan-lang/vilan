@@ -1,4 +1,4 @@
-# Browser modules — reference
+# Browser modules reference
 
 The browser layer of std: `std::dom`, `std::ui`, `std::router`,
 `std::storage`. Available only for browser builds. Concepts:
@@ -43,7 +43,7 @@ impl Event {
 }
 ```
 
-Raw `element.on` handlers do **not** establish a turn — that's `View.on`'s
+Raw `element.on` handlers do **not** establish a turn: that's `View.on`'s
 job. Prefer the `View` layer; drop to `dom` for what it doesn't cover.
 
 ## std::ui
@@ -56,11 +56,11 @@ fun mount_root(id: str, body: (|| View) context owner_scope): Owner
 ```
 
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
-owner (most apps let it live forever). `mount` is the attach half alone —
-use only when you already hold a boundary.
+owner (most apps let it live forever). `mount` is the attach half alone.
+Use it only when you already hold a boundary.
 
 `view` knows the SVG vocabulary: an SVG tag name (`svg`, `path`, `rect`,
-`clipPath`, … — exact case) creates its element in the SVG namespace, so
+`clipPath`, …; exact case) creates its element in the SVG namespace, so
 inline icons and diagrams render; on the server the `svg` root serializes
 with its `xmlns`. Tags that exist in both vocabularies (`a`, `title`,
 `style`, `script`) resolve to HTML. `class`/`styled` set the `class`
@@ -85,9 +85,9 @@ too.
 | `bind_attr` | `(name: str, source: Signal<str>): View` | reactive attribute |
 | `bind_value` | `(signal: Signal<str>): View` | two-way input bind |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
-| `bind_each` | `(source: Signal<List<T>>, key: \|T\| K, render: (\|T\| View) context owner_scope): View` — `T: PartialEq, K: PartialEq` | keyed rows; each row is a disposal boundary |
+| `bind_each` | `(source: Signal<List<T>>, key: \|T\| K, render: (\|T\| View) context owner_scope): View`; `T: PartialEq, K: PartialEq` | keyed rows; each row is a disposal boundary |
 | `when` | `(condition: Signal<bool>, body: (\|\| View) context owner_scope): View` | state-DROPPING conditional |
-| `swap` | `(source: Signal<T>, render: (\|T\| View) context owner_scope): View` — `T: PartialEq` | dispose + rebuild per changed value |
+| `swap` | `(source: Signal<T>, render: (\|T\| View) context owner_scope): View`; `T: PartialEq` | dispose + rebuild per changed value |
 | `show` | `(condition: Signal<bool>): View` | state-PRESERVING visibility toggle |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
@@ -104,7 +104,7 @@ trait Routable { fun to_path(self): str }
 fun link<R: Routable>(label: str, route: R): View   // a real <a>; intercepts plain left-clicks
 ```
 
-`current_path()` is a singleton signal — every caller gets the same one, and
+`current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor
 (middle-click, ctrl-click, and copy-link keep native behavior) and intercepts
 only a plain left click, calling `prevent_default` + `navigate`. Route

@@ -414,7 +414,7 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
         "{}",
         paint::err(
             paint::Style::CYAN,
-            &format!("[watch] watching {watched} for `.vl` changes — Ctrl-C to stop")
+            &format!("[watch] watching {watched} for `.vl` changes (Ctrl-C to stop)")
         )
     );
     // The baseline snapshot is taken BEFORE the first action, never after: the
@@ -435,7 +435,7 @@ fn watch_loop(roots: &[PathBuf], mut action: impl FnMut()) -> ExitCode {
             snapshot = next;
             eprintln!(
                 "\n{}",
-                paint::err(paint::Style::CYAN, "[watch] change detected — re-running")
+                paint::err(paint::Style::CYAN, "[watch] change detected, re-running")
             );
             action();
         }
@@ -589,7 +589,7 @@ fn hmr_round(
                 paint::error_prefix()
             );
             state.failed = true;
-            channel.push("error", Some("build failed — see the terminal"));
+            channel.push("error", Some("build failed; see the terminal"));
             return child;
         }
     };
@@ -601,7 +601,7 @@ fn hmr_round(
     if let Err(message) = hooks.run() {
         eprintln!("{} {message}", paint::error_prefix());
         state.failed = true;
-        channel.push("error", Some("build failed — see the terminal"));
+        channel.push("error", Some("build failed; see the terminal"));
         return child;
     }
 
@@ -685,7 +685,7 @@ fn hmr_round(
             Err(_) => {
                 state.failed = true;
                 let message = if overlay_text.is_empty() {
-                    "build failed — see the terminal"
+                    "build failed; see the terminal"
                 } else {
                     overlay_text.as_str()
                 };
@@ -743,7 +743,7 @@ fn hmr_round(
             dist.display()
         );
         state.failed = true;
-        channel.push("error", Some("build failed — see the terminal"));
+        channel.push("error", Some("build failed; see the terminal"));
         return child;
     }
     for leg in &next {
@@ -1471,7 +1471,7 @@ fn reject_output_collisions(members: &[(Unit, Platform)]) -> Result<(), String> 
         if !seen.insert(unit.name.as_str()) {
             return Err(format!(
                 "two build units are both named `{}`, so their outputs would \
-                 collide at dist/{}.js — rename one (the package name or the \
+                 collide at dist/{}.js; rename one (the package name or the \
                  `[entry.<name>]`)",
                 unit.name, unit.name
             ));
@@ -1813,7 +1813,7 @@ fn node_entry_candidates(node_members: &[&Unit]) -> String {
 /// manifest key for every run.
 fn ambiguous_node_entry(node_members: &[&Unit], default_entry_key: &str) -> String {
     format!(
-        "this workspace has more than one `node` package to run — pick one with \
+        "this workspace has more than one `node` package to run; pick one with \
          --entry <name>, or designate one for good with `{default_entry_key}` in \
          vilan.toml: {}",
         node_entry_candidates(node_members)
@@ -1827,7 +1827,7 @@ fn candidate_tail(node_members: &[&Unit]) -> String {
     if node_members.is_empty() {
         " (this workspace runs no `node` package)".to_string()
     } else {
-        format!(" — candidates: {}", node_entry_candidates(node_members))
+        format!("; candidates: {}", node_entry_candidates(node_members))
     }
 }
 
@@ -2146,8 +2146,8 @@ fn compile_to_js(
     // the diagnostic channel.
     if let Some((requested, on_disk)) = entry_case_mismatch(file, pkg_root) {
         eprintln!(
-            "{} entry {} resolved to `{on_disk}` on disk, but it is named `{requested}` — \
-             vilan matches source files by exact case, so this builds only where the \
+            "{} entry {} resolved to `{on_disk}` on disk, but it is named `{requested}`: \
+             Vilan matches source files by exact case, so this builds only where the \
              filesystem ignores case; rename one to match the other",
             paint::error_prefix(),
             file.display()
