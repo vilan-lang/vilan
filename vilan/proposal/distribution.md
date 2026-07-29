@@ -192,6 +192,15 @@ marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + a GitHub App
 (`TAP_APP_ID` / `TAP_APP_PRIVATE_KEY`).
 
+*Provisioned 2026-07-29: Open VSX.* The account and the `vilan-lang`
+namespace exist. Two corrections to the earlier note: the namespace being
+**unverified** does not block publishing (it only puts a warning icon on the
+listing instead of the shield), and the real gate is not `create-namespace`
+but the **Eclipse Foundation Open VSX Publisher Agreement** — a valid token
+without it cannot publish. Namespace ownership, which is what earns the
+shield, is claimed by a public issue on `EclipseFdn/open-vsx.org` and can
+follow the first publish.
+
 *Provisioned 2026-07-29: npm.* Recorded then: npm is deprecating
 2FA-bypass tokens — account changes early Aug 2026, direct publishing
 ~Jan 2027 — so `NPM_TOKEN` is a bridge. The destination is trusted

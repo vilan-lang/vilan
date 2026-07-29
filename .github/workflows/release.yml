@@ -396,12 +396,21 @@ jobs:
           name: release-vsix
       - name: Publish
         if: steps.openvsx.outputs.publish == 'true'
-        # Open VSX has no auto-created namespaces: the `vilan-lang` namespace
-        # must exist before the first publish, once, by hand —
-        # `npx ovsx create-namespace vilan-lang -p <token>`. That is part of
-        # provisioning the account (distribution.md §7), like owning the npm
-        # scope; publishing into a namespace that does not exist fails the job
-        # rather than inventing one.
+        # Two one-time provisioning steps sit behind this, both done by hand
+        # (distribution.md §7), and BOTH fail the job rather than being
+        # invented for you:
+        #
+        # 1. The `vilan-lang` namespace must exist — Open VSX auto-creates
+        #    none. `npx ovsx create-namespace vilan-lang -p <token>`.
+        #    (Done 2026-07-29.)
+        # 2. The Eclipse Foundation Open VSX **Publisher Agreement** must be
+        #    signed by the account the token belongs to. This is the real gate:
+        #    a valid token with no signed agreement still cannot publish.
+        #
+        # The namespace being UNVERIFIED does not block anything — it only
+        # means the listing carries a warning icon instead of the shield.
+        # Ownership is claimed separately, by a public issue on
+        # EclipseFdn/open-vsx.org, and can happen after the first publish.
         env:
           OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
         run: |
