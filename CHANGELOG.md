@@ -6,6 +6,12 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## v0.18.2 — 2026-07-29
+
+**The npm packages are signed now.** Publishing to npm no longer goes through a stored token. The release workflow proves who it is to npm per run instead, so there is no long-lived credential behind the channel at all — nothing to expire, rotate, or leak. The visible half is provenance: each of the six packages carries a "Built and signed on GitHub Actions" badge linking to the exact workflow run that built it, so what npm serves can be traced back to this repository's tagged source. Installing and running are unchanged.
+
+There are no language, standard-library, or toolchain changes in this release. If v0.18.1 is already installed, there is nothing here worth the download.
+
 ## v0.18.1 — 2026-07-29
 
 **`npm install -g @vilan-lang/vilan` works.** v0.18.0 published its five platform packages and then stopped: the command that publishes the meta package passed a path with no trailing slash, so npm read `npm-dist/vilan` as its `<user>/<repo>` GitHub shorthand and went looking for a git remote instead of a directory. One character. The packages themselves are unchanged, and the platform packages published by v0.18.0 are fine — this release simply gives them the meta package that ties them together.
