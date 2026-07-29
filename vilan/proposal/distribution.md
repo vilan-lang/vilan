@@ -102,10 +102,31 @@ today's behavior. Detection is by path inspection at runtime — no build
 variants, one binary everywhere.
 
 **CI**: a `publish-npm` job on the release workflow, after the build
-matrix: assemble the six packages from the built artifacts, `npm publish`
-each with `NPM_TOKEN`. Idempotence: a re-run must skip already-published
-versions cleanly (publish of an existing version errors — tolerate exactly
-that).
+matrix: assemble the six packages from the built artifacts and `npm publish`
+each. Idempotence: a re-run must skip already-published versions cleanly
+(publish of an existing version errors — tolerate exactly that).
+
+**Auth is trusted publishing (OIDC), not a token** — see §7 for why and
+when it moved. Three constraints the job encodes, each of which silently
+breaks the publish if undone:
+
+- `permissions: id-token: write`, and `contents: read` beside it, because a
+  job-level `permissions:` block replaces the workflow-level one outright.
+- **No `registry-url` on `actions/setup-node`.** It writes
+  `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into `.npmrc`, which
+  with no token in the environment expands to an *empty* credential; npm
+  reads the line's presence as "auth is configured", never starts the OIDC
+  exchange, and fails unauthenticated (actions/setup-node#1551). The default
+  registry is npmjs.org anyway.
+- **npm >= 11.5.1**, installed explicitly rather than inherited from
+  `node-version: 24` — which npm a Node release bundles is not ours to pin
+  and moves under us.
+
+Each of the six packages carries its own trusted publisher (org
+`vilan-lang`, repo `vilan`, workflow `release.yml`, action `npm publish`);
+all fields are case-sensitive on npm's side. Provenance attestations come
+free with it — no `--provenance` flag — and validate because every
+`package.json` under `npm/` already names this repository.
 
 ## 3. VS Code marketplace (+ Open VSX)
 
@@ -193,7 +214,8 @@ notice), so the workflow stays green before accounts exist.
 
 ## 7. What the user provides (once, all pseudonym-safe)
 
-npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
+npm account (owns `vilan` + the `@vilan-lang` scope) + a trusted publisher
+on each of the six packages — no secret;
 marketplace publisher id + an Entra federated identity
 (`AZURE_CLIENT_ID` / `AZURE_TENANT_ID`); Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + a GitHub App
@@ -221,15 +243,49 @@ without it cannot publish. Namespace ownership, which is what earns the
 shield, is claimed by a public issue on `EclipseFdn/open-vsx.org` and can
 follow the first publish.
 
-*Provisioned 2026-07-29: npm.* Recorded then: npm is deprecating
-2FA-bypass tokens — account changes early Aug 2026, direct publishing
-~Jan 2027 — so `NPM_TOKEN` is a bridge. The destination is trusted
-publishing (OIDC), which cannot do a package's FIRST publish (npm requires
-the package to exist before a trusted publisher can be configured), so the
-token creates the six packages and the migration follows. npm's new
-install-time defaults (scripts off, git and remote-URL deps blocked) were
-checked against `npm/` and affect nothing: no package here declares a
-`scripts` field, and resolution is `optionalDependencies` + `os`/`cpu`.
+*Provisioned 2026-07-29: npm.* `NPM_TOKEN` was always a bridge — npm is
+deprecating 2FA-bypass tokens (account changes early Aug 2026, direct
+publishing ~Jan 2027) — and the destination, trusted publishing (OIDC),
+cannot do a package's FIRST publish, because npm requires a package to
+exist before a trusted publisher can be configured on it. So the token's
+whole job was to create the six packages. It did, at v0.18.1, and the
+bridge came down the same day: `publish-npm` authenticates by OIDC (§2 for
+the three constraints that make it work). The mechanics are in §2 because
+they are load-bearing and non-obvious; what belongs here is the shape —
+this channel is meant to hold no stored credential, so there is nothing to
+rotate and nothing to leak.
+
+**Ordering, and the one way this bites:** the workflow change is inert
+until a tag is pushed, but a trusted publisher is configured *per package
+on npmjs.com*, and there are six. Until all six exist, a release
+authenticates as nobody and `publish-npm` fails — loudly, which is the
+intent, but the release would go out with npm a version behind. So: the six
+configs land before the next tag, not after.
+
+| step | state as of 2026-07-29 |
+| --- | --- |
+| `publish-npm` rewritten for OIDC | done |
+| trusted publisher on each of the six packages | **pending — user, on npmjs.com** |
+| a release publishes green by OIDC | pending — proof is the next tag |
+| `NPM_TOKEN` revoked on npm + deleted from repo secrets | pending — after that proof |
+
+The next release's changelog gets a line for it, because one part *is*
+user-visible: trusted publishing attaches provenance attestations, so the
+six packages start carrying a "Built and signed on GitHub Actions" badge
+linking back to the run that produced them.
+
+Also checked against `npm/` and affecting nothing: npm's new install-time
+defaults (scripts off, git and remote-URL deps blocked). No package here
+declares a `scripts` field, and resolution is `optionalDependencies` +
+`os`/`cpu`.
+
+One asymmetry this creates, recorded so it is not "fixed" back: alone among
+the four publish jobs, `publish-npm` has **no disabled-until-secret-exists
+gate** (§6). That gate lets a job land before its channel is provisioned;
+npm is provisioned, and trusted publishing leaves no secret whose absence
+could stand in for "not live yet". A silent skip is now the dangerous
+outcome — it is precisely how v0.18.0 shipped five of six packages and read
+green.
 
 *S5 residuals (2026-07-25):* **version skew** — an updated extension
 registers `**/vilan.toml` with whatever `vilan-lsp` it discovers; an

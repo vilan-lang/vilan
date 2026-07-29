@@ -246,37 +246,47 @@ jobs:
     # failed to go out.
     needs: [build, publish]
     runs-on: ubuntu-latest
+    permissions:
+      # Trusted publishing (distribution.md §2): npm trusts *this workflow in
+      # this repository* rather than a stored credential, so the job proves who
+      # it is with a per-run OIDC token and there is no NPM_TOKEN to expire,
+      # rotate, or leak. Each of the six packages carries the matching trusted
+      # publisher — org `vilan-lang`, repo `vilan`, workflow `release.yml` — and
+      # all three fields are case-sensitive on npm's side.
+      id-token: write
+      # A job-level `permissions:` block replaces the workflow-level one
+      # outright, so the checkout's read has to be named again here.
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          # Writes the .npmrc that reads $NODE_AUTH_TOKEN below.
-          registry-url: https://registry.npmjs.org
-      - name: Is there a token to publish with?
-        id: npm
-        # A job-level `if:` cannot read `secrets`, so the secret's presence
-        # becomes a step output that the rest of the job conditions on. No
-        # token means the channel is not live yet: skip with a notice and stay
-        # green (distribution.md §6 — every publish job lands
-        # disabled-until-secret-exists).
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Deliberately no `registry-url`, which is not an oversight and must
+          # not be "fixed" back in: it makes setup-node write
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc,
+          # and with no token in the environment that expands to an *empty*
+          # credential. npm reads the line's presence as "auth is already
+          # configured", never starts the OIDC exchange, and the publish fails
+          # unauthenticated (actions/setup-node#1551). The default registry is
+          # registry.npmjs.org anyway, so the line bought nothing.
+      - name: An npm that can publish by OIDC
+        # Trusted publishing needs npm >= 11.5.1. Which npm a Node release
+        # bundles is not ours to choose and moves under us, so the requirement
+        # is stated here instead of being inherited from `node-version: 24`.
+        # `^11.5.1` rather than `latest` on purpose: it is the major whose
+        # publish behavior this job was written against, every version in it
+        # satisfies the requirement, and a future npm 12 lands here as a
+        # deliberate bump rather than mid-release.
         run: |
-          if [ -n "$NPM_TOKEN" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=npm publish skipped::NPM_TOKEN is not configured, so the six @vilan-lang packages were not published. The rest of the release is unaffected."
-          fi
+          npm install -g npm@^11.5.1
+          npm --version
       - uses: actions/download-artifact@v4
-        if: steps.npm.outputs.publish == 'true'
         with:
           pattern: release-*
           merge-multiple: true
           path: release-assets
       - name: Assemble the six packages
-        if: steps.npm.outputs.publish == 'true'
         # Every package.json under npm/ carries `0.0.0-placeholder`; the script
         # stamps this tag's version over all six (the meta package's
         # optionalDependencies included, so they stay locked to the exact
@@ -284,9 +294,12 @@ jobs:
         # scripts/bump-version.sh knows nothing about npm.
         run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" release-assets npm-dist
       - name: Publish
-        if: steps.npm.outputs.publish == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No disabled-until-secret-exists gate, unlike the other three publish
+        # jobs, and the asymmetry is deliberate. That gate exists so a job can
+        # land before its channel is provisioned; npm is provisioned, and there
+        # is no longer a secret whose absence could stand in for "not live yet".
+        # A silent skip would now be the dangerous outcome — it is how v0.18.0
+        # shipped five of six packages and read green.
         run: |
           publish() {
             log="$(mktemp)"
@@ -358,10 +371,11 @@ jobs:
           node-version: 24
       - name: Is there an identity to publish with?
         id: marketplace
-        # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
-        # `secrets`, so the secret's presence becomes a step output the rest of
-        # the job conditions on (distribution.md §6 — every publish job lands
-        # disabled-until-secret-exists).
+        # A job-level `if:` cannot read `secrets`, so the secret's presence
+        # becomes a step output the rest of the job conditions on
+        # (distribution.md §6 — every publish job lands
+        # disabled-until-secret-exists). publish-npm no longer carries this:
+        # trusted publishing leaves it no secret to test.
         #
         # Entra workload identity federation rather than a PAT, and not by
         # preference: Azure DevOps retires global PATs — the "all accessible
@@ -474,10 +488,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Is there an app to push with?
         id: brew
-        # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
-        # `secrets`, so the secret's presence becomes a step output the rest of
-        # the job conditions on (distribution.md §6 — every publish job lands
-        # disabled-until-secret-exists).
+        # A job-level `if:` cannot read `secrets`, so the secret's presence
+        # becomes a step output the rest of the job conditions on
+        # (distribution.md §6 — every publish job lands
+        # disabled-until-secret-exists). publish-npm no longer carries this:
+        # trusted publishing leaves it no secret to test.
         #
         # A GitHub App rather than a PAT, matching the site deploy's auth: an
         # App's private key does not expire, and this credential is used ONLY at
