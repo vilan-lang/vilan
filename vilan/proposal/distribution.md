@@ -317,3 +317,48 @@ because it differs from the other three in kind:
 
 Take-up trigger: after this arc's channels are live, or when a Windows
 user asks for it — whichever comes first.
+
+### The VS Code Marketplace member step — unresolved 2026-07-29
+
+Everything up to the last step works: an Entra app registration with a
+federated credential bound to this repo's `marketplace` environment, the
+service principal materialized in the Azure DevOps organization (Basic access
+level), and the organization connected to the Entra directory
+`016be135-8d4e-4cb5-9335-425b9f136de4` — the same tenant the app is registered
+in, verified on both sides.
+
+**What fails:** adding the service principal to the `vilan-lang` Marketplace
+publisher's Members list. Every identifier returns `TF14045: The identity
+could not be found`:
+
+| Identifier | Value | Source |
+|---|---|---|
+| Application (client) ID | `55e41b2a-…` | App registration Overview; also what the Azure DevOps Users hub displays |
+| Service principal object ID | `c28b79e9-…` | Enterprise applications Overview |
+| Azure DevOps (SPS) identity ID | `f911b5fa-…` | `vssps.dev.azure.com/<org>/_apis/identities` |
+
+**What that rules out.** The SPS identity record is well-formed and healthy —
+`isActive: true`, `Domain` = the right tenant, `Account` and
+`objectidentifier` = the SP object ID, `ApplicationId` = the client ID,
+`SchemaClassName: User`, `SpecialType: Generic`. So the identity exists and
+Azure DevOps knows it. Three structurally different valid identifiers being
+rejected says the lookup is not failing to *find* an identity, it is looking
+somewhere the identity is not.
+
+**Leading hypothesis, untested:** the publisher is in a different identity
+domain than the service principal. The publisher was created under the
+personal Microsoft account (which is still how the owner appears in the
+organization's Users list, `reedsyllas@gmail.com`), and an MSA-rooted
+publisher cannot resolve AAD service principals whatever GUID it is given.
+If so the fix is not another identifier but moving the publisher into the
+work-account domain — which needs care, because publisher IDs are permanent
+and `vilan-lang` may already be held by the MSA-owned publisher. Confirm the
+domain before doing anything irreversible.
+
+**Next steps when this is picked up:** (1) check which account owns the
+publisher at marketplace.visualstudio.com/manage, signed in as the work
+account rather than the MSA; (2) if it is MSA-owned, ask Marketplace support
+whether the publisher can be moved rather than recreating it; (3) only then
+retry the member add. The release is unaffected throughout — the job gates on
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`, neither of which is set, so it skips with
+a notice and nothing is half-configured.
