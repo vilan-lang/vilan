@@ -267,7 +267,7 @@ configs land before the next tag, not after.
 | `publish-npm` rewritten for OIDC | done |
 | trusted publisher on each of the six packages | set by the user on all six — **unverified**, see below |
 | a release publishes green by OIDC | pending — proof is the next tag |
-| `NPM_TOKEN` revoked on npm + deleted from repo secrets | pending — see below |
+| `NPM_TOKEN` revoked on npm + deleted from repo secrets | done — revoked, and gone from the repo |
 
 "Unverified" is not hedging: npm exposes **no read path** for a package's
 trusted-publisher config. `npm access` has subcommands for status, mfa, and
@@ -287,9 +287,12 @@ trusted publishers keep working because they present OIDC tokens. It does
 change one thing though: on those four, `NPM_TOKEN` can no longer publish at
 all. The token therefore stopped being a fallback the moment that setting
 landed — a token that can rescue two of six packages cannot rescue a release,
-since a partial publish is the exact failure being guarded against. It is now
-dead weight with a live credential's blast radius, so it comes out of repo
-secrets now rather than waiting on the proof.
+since a partial publish is the exact failure being guarded against. So it came
+out ahead of the proof rather than after it: revoked on npm, then deleted from
+the repo's secrets. **There is deliberately no fallback credential.** If the
+next release's `publish-npm` fails, the fix is to correct the trusted-publisher
+config and re-run the job — not to reintroduce a token. Of the five secrets
+left, none can publish to npm.
 
 The next release's changelog gets a line for it, because one part *is*
 user-visible: trusted publishing attaches provenance attestations, so the
