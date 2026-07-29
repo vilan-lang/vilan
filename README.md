@@ -168,13 +168,14 @@ ends with the full-stack walkthrough:
 - **Rendered** (search + sidebar): https://vilan-lang.org/docs/
   (or locally, `cargo install mdbook && mdbook serve vilan/docs`).
 - **As files**: start at [vilan/docs/README.md](vilan/docs/README.md).
+- **What changed**: the [changelog](CHANGELOG.md), one section per release.
 
 ## Repository structure
 
 ```
 crates/
   vilan-core/      the compiler: lexer → parser → analyzer → transformer
-  vilan-cli/       the `vilan` binary (init / build / check / run / fmt / test)
+  vilan-cli/       the `vilan` binary (init / build / check / run / fmt / test / upgrade)
   vilan-lsp/       the language server
 editors/vscode/    the VS Code extension (grammar + LSP client)
 vilan/
@@ -183,13 +184,13 @@ vilan/
   examples/        runnable examples, incl. the walkthrough app
   test/            the codegen corpus (byte-identical golden files)
   proposal/        design documents — how and why things were built
-.github/           CI: docs build + deploy to Pages
+.github/           CI: the test matrix + the release pipeline
 ```
 
 ## Development
 
 ```sh
-cargo test    # the whole suite: compiler, corpus, docs gate, examples
+cargo test    # the whole suite: compiler, corpus, docs gate, e2e
 ```
 
 Three test layers keep the project honest: unit and behavior pins in

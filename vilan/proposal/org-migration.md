@@ -1,6 +1,32 @@
 # Org migration — `ReedSyllas/vilan` → `vilan-lang/vilan` (F9)
 
-> **Status: RATIFIED 2026-07-25 — all §6 calls per recommendation** (npm
+> **Status: MIGRATION COMPLETE — all slices done** (markers added 2026-07-29;
+> until then only commit prose recorded this, which left the file reading as
+> an unexecuted plan):
+>
+> - **S1 — DONE.** The org exists and `vilan-lang/vilan` is live; every repo
+>   URL in the tree points at it.
+> - **S2 — DONE, verified end to end 2026-07-29.** The old-host Pages
+>   tombstone answers: `reedsyllas.github.io/vilan/<page>` serves a `noindex`
+>   forwarder that JS-redirects fragment-intact to `vilan-lang.github.io`,
+>   which 301s to the custom domain, where a second forwarder maps
+>   `/vilan/*` -> `/docs/*` and lands on a **200**. Both hops return HTTP 404
+>   by Pages design, so status alone is not the test — the body is. This is
+>   what keeps `≤ v0.14.0` binaries' editor-hover book links working, and it
+>   must keep answering indefinitely.
+> - **S3 — DONE.** `vilan-lang.org` is claimed and serves the site + book.
+> - **S4 — DONE** (`5bb74b9`): the owner-string sweep plus the never-again
+>   gate, `tests/hygiene.rs::no_tracked_file_contains_a_pre_migration_owner_string`
+>   (runtime-assembled needles, case-insensitive, 3-file allowlist with inline
+>   reasons; the commit records a planted-probe non-vacuity proof).
+>
+> **Open tail:** the gate's needle is `reedsyllas/vilan`, so two
+> personal-identity strings sit outside its reach — `AI_STANCE.md` links
+> `github.com/ReedSyllas`, and `CODE_OF_CONDUCT.md` publishes a personal gmail
+> as the contact. Both may well be intended; the point is that a regression
+> there would never be caught. Decide and record.
+>
+> Prior status: RATIFIED 2026-07-25 — all §6 calls per recommendation (npm
 > placeholder publish of bare `vilan`: yes; claim `vilan-lang.org`: yes;
 > kolt stays personal; CHANGELOG history swept). Execution order stands as
 > §5; S1–S3 are user actions, S2's content and S4 are prepared/implemented

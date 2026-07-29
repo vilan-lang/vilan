@@ -1,0 +1,256 @@
+# Web playground — the compiler in the visitor's browser (D11)
+
+> **Status: DRAFT 2026-07-28; §7 calls SETTLED 2026-07-28** — the user took
+> every recommendation: (a) vendored CodeMirror 6, (b) toolchain rides the
+> site build's source, (c) compile on Run only in v1, (d) the path is
+> `/playground`; promotion timing stays with D5/D10.
+> Original status: DRAFT 2026-07-28 — for review. Backlog D11 (user request
+> 2026-07-28). Decides the architecture question the backlog poses: **(a)
+> in-browser WASM compile** is proposed; (b) a server-side compile service is
+> rejected for v1 (§1). Sequencing with D5 (promotion) and D10/F9 (org
+> identity) is the user's call and is recorded, not decided, here (§7d).
+
+## 0. What exists (all verified 2026-07-28)
+
+- `vilan-core` is the whole compiler behind two thin front-ends (`lib.rs:1`).
+  Its dependency closure is `indexmap`, `serde`, `toml` and their pure-Rust
+  transitives — no tokio, no rayon, no libc, no `getrandom`. Nothing on the
+  compile path touches threads, time, env, or process APIs (`git_dep.rs` and
+  `#[cfg(test)]` excepted, both avoidable). It should compile for
+  `wasm32-unknown-unknown` today; S0 verifies that in minutes.
+- **An in-memory compile path already exists and the LSP uses it**:
+  `analyze_source(source, std, pkg_root, entry_path, platform, workspace)`
+  (`lib.rs:283`) plus `transform` (`transformer.rs:16`), fed by the document
+  overlay `set_document_overlay(path, text)` (`analyzer.rs:22176`), which
+  `load_package_module` consults before disk. The overlay is incomplete —
+  `resolve_module_file`'s two `.exists()` probes (`analyzer.rs:23168`) and
+  `util::read_source` (`util.rs:26`) still go straight to the filesystem —
+  and that gap is the only core change this proposal needs (§2).
+- `vilan-embedded-std` carries the full `std` + `macro_std` trees as data (59
+  files, ~357 KB of source) but only exposes them by `materialize()`-ing to a
+  real directory — filesystem-shaped by design. `FILES` is already
+  `pub static`; the playground reads it directly and never materializes.
+- Browser-leg output is **one self-contained JS file with zero imports by
+  construction**: the browser layer's externs are module-less globals, the
+  `__` runtime helpers are inlined, std is compiled in like user code, and the
+  file is valid as a `<script type="module">`. CSS comes from the pure
+  `assemble_assets` (`const_eval.rs:66`). Nothing else is needed to run.
+- Diagnostics are minimal and structured — `Error { span, msg, note }` with
+  byte spans, severity positional (`Program.diagnostics` vs `.warnings`),
+  per-file attribution via `SourceId`. ariadne is CLI-only; the LSP's
+  `line_index.rs` (126 pure lines) already converts byte spans to UTF-16
+  line/col. Exactly the shape an editor pane wants.
+- The site is a single SSR page (`server.vl` matches three paths and a
+  catch-all); deploy.yml builds the toolchain from `vilan@main`, renders
+  `http://localhost:3000/`, and commits an explicit three-file allowlist to
+  the pages repo. The pages repo already serves multi-MB files (2.19 MB
+  search index) and has no root `.nojekyll` (only `docs/` has one).
+- Stale pointer, for the record: D11's "`examples/playground` is the
+  local-CLI cousin" — that directory was pruned in the D7 cleanup; only a
+  prose comment in `inference.rs` remembers it. The sibling workspace dir
+  `vilan-playground/` is personal scratch, unrelated.
+
+## 1. The decision — in-browser (architecture (a))
+
+The compiler compiles to WASM, runs in the visitor's browser, and the JS it
+emits executes in a sandboxed iframe. **No server exists anywhere in this
+project today, and this proposal does not create one.** A compile service
+(architecture (b)) would be the project's first hosted process — provisioned,
+rate-limited, patched, and paid for — to save a one-time download that §4
+budgets at roughly 2 MB compressed. It buys running node-leg programs nothing
+(executing visitor code server-side is off the table either way, per the
+backlog). Rejected for v1, not deferred out of difficulty: if (a) ships, (b)
+has no remaining job. The one thing (b) would have avoided — the WASM build's
+size and trap surface — is bounded and named in §6.
+
+The accepted asymmetry: browser-leg programs run; process-leg programs
+typecheck. That is the good half of the language's own platform story —
+`platform_color::check` reports a call chain from the entry when a browser
+build reaches `std::http`, and that diagnostic rendering in the pane *is* the
+pitch. Distinct from F3 throughout: F3 makes vilan *programs* target WASM;
+this compiles the *compiler* to WASM. They share nothing but the word.
+
+## 2. The mechanism — `vilan-wasm` over the document overlay
+
+A new workspace crate `crates/vilan-wasm` (`cdylib`, wasm-bindgen), a thin
+third front-end beside the CLI and LSP:
+
+- **Boot**: iterate `vilan_embedded_std::FILES`, registering each entry in the
+  document overlay under a synthetic root (`/toolchain/std/...`,
+  `/toolchain/macro_std/...`). Hand-construct the `PackageSpec` (all fields
+  `pub`) with std's known layer table — base `src`, `process = @process`,
+  `browser = browser` — skipping `resolve_std` and all manifest discovery.
+  `Workspace::default()` keeps `git_dep` unreachable.
+- **Core patch (the S1 arc)**: teach `resolve_module_file` and
+  `util::read_source` to consult the overlay before the filesystem, so overlay
+  entries resolve as modules without a disk. ~30 lines across two files, and
+  an honest improvement on its own: it completes the LSP's overlay story for
+  unsaved files. No new seam, no virtual-filesystem trait — the overlay is
+  already the seam.
+- **Export**: `compile(source: String) -> CompileResult` where the result
+  carries `js`, `css` (from `assemble_assets`), and a diagnostics array of
+  `{ start, end, line, col, message, note, severity, file }` — spans converted
+  to UTF-16 line/col on the Rust side (port of `line_index`, or move it into
+  core where both front-ends reach it). The compile is always
+  `Some(Platform::Browser)`, which also bypasses `infer_platform`'s disk
+  probing. Also exported: the toolchain version string for the page's badge.
+- **The user program** enters through the same overlay under `/project/`,
+  entry `main.vl`, single file in v1. `parse_clean_cached` is
+  content-addressed, so std parses once per instance and warm compiles are
+  cheap.
+
+## 3. The page
+
+`vilan-lang.org/playground` — a second SSR-rendered page in the website
+package, written in vilan like the rest of the site (the `[extern]` +
+`external struct` pattern in `client.vl` already binds ~100 lines of browser
+API; the editor binds the same way). Layout: editor pane, Run, output beside
+it, diagnostics beneath the editor.
+
+- **Compile**: the WASM instance lives in a Web Worker. Run sends the buffer,
+  the worker answers with `CompileResult`. Compile-on-Run only in v1 (§7c
+  records the live-diagnostics call); a queued single-flight discipline —
+  one compile in the instance at a time (core's global caches assume it).
+- **Run**: rebuild an `<iframe sandbox="allow-scripts" srcdoc=...>` per run —
+  opaque origin, no same-origin access, torn down and rebuilt each Run, which
+  is also the story for runaway loops (the frame is removed, not reasoned
+  with). The srcdoc carries `<style>` (the emitted CSS), a mount div, and the
+  emitted JS as a module script. `console.log`/`print` and uncaught errors
+  forward to the output pane via `postMessage`.
+- **Diagnostics**: errors and warnings rendered in-pane with the span
+  highlighted in the editor and the note attached — the compiler-showcase
+  treatment, not a raw dump. A compiler trap (panic) surfaces as "the
+  compiler crashed on this input — please report it" with a prefilled issue
+  link; the worker is recreated silently.
+- **Seeding**: an examples dropdown of a few curated browser-leg programs
+  (the reactive counter first), doubling as D6's try-it-without-installing
+  path.
+
+## 4. Delivery — building, shipping, serving
+
+- **Build**: `cargo build -p vilan-wasm --target wasm32-unknown-unknown
+  --release` with `opt-level = "z"`, fat LTO, `codegen-units = 1`,
+  `-C link-arg=-zstack-size=67108864` (§6), then `wasm-opt -Oz`. Estimate:
+  4–7 MB raw, ~1.5–2.5 MB compressed (the native CLI is 5.85 MB stripped and
+  carries ariadne/clap that WASM won't; std's 357 KB of source text
+  compresses well). S0/S2 replace the estimate with a measurement.
+- **Ship**: the artifact is committed to the pages repo **gzipped**
+  (`playground/vilan.wasm.gz`); the page fetches it, pipes through
+  `DecompressionStream("gzip")`, and instantiates from the buffer. This
+  sidesteps both unknowns GitHub Pages refuses to let us control — the
+  `.wasm` Content-Type and whether Pages compresses `application/wasm` — and
+  halves the git-history cost of each rebuild. Fetched lazily on the
+  playground route only; the landing page pays nothing.
+- **Wire**: deploy.yml grows a wasm build step against the `toolchain/`
+  checkout already present in the job, a second render
+  (`curl .../playground -o export/playground/index.html` plus the `<!--ssr-->`
+  guard, currently written against a single file), and the new paths added to
+  the explicit `cp` + `git add` allowlist — nothing ships from that job
+  unless allowlisted, deliberately. The wasm artifact is committed only when
+  the toolchain hash changes. A root `.nojekyll` lands alongside (the root is
+  Jekyll-processed today; `docs/` already carries one). The playground lives
+  at root, not under `docs/`, clear of docs.yml's `rm -rf docs` rebuild.
+- **Version**: the playground compiles with whatever the site's deploy
+  builds — `vilan@main` today, release tarballs when deploy.yml makes that
+  already-recorded switch. One lever, not two (§7b). The page badges the
+  version the wasm reports.
+
+## 5. What v1 explicitly does not do
+
+- **No server-side anything** — no compile service, no snippet storage, no
+  telemetry. Sharing, when it comes, is a URL fragment (§8, S4):
+  `CompressionStream`-deflated source, base64url, never in server logs.
+- **No process-leg execution**, and in v1 not even a process-leg check mode —
+  Run always compiles `Platform::Browser`. The check-only toggle is recorded
+  future work (§8), not scope.
+- **No editor intelligence beyond diagnostics** — no completion, hover, or
+  semantic tokens. That is the LSP compiled to WASM, a different and much
+  larger arc; recorded, not planned.
+- **No multi-file projects, no manifest editing** — one buffer, fixed
+  entry, std only. `Manifest::parse` is pure and ready when a driver appears.
+- **No wasm threads / SharedArrayBuffer** — Pages cannot set COOP/COEP, and
+  nothing here wants them.
+
+## 6. Risks, named
+
+- **`panic=abort` disarms the B40 fences.** `catch_unwind` at `lib.rs:290`
+  and `:369` is dead code on wasm32-unknown-unknown; a compiler panic traps
+  the instance and poisons its memory. Mitigation is structural: the worker
+  *is* the fence — trap → recreate instance → report (§3). The blast radius
+  is one compile, same as the LSP's per-request fence.
+- **Stack depth.** The CLI and LSP both run compiles on a 256 MB stack
+  (`main.rs:155` — deep AST/type recursion on valid programs); wasm defaults
+  to 1 MB, and overflow is an unrecoverable trap. `-zstack-size` to 64 MB
+  covers playground-scale programs; macro-world compiles (a full compile
+  nested inside a compile) are the deepest case and get watched in S2. A trap
+  is handled identically to a panic: recycle, report.
+- **Leaks by design.** `analyze_source` requires `&'static str`; every
+  compile `Box::leak`s its buffer, and four process-global caches never
+  evict. Linear memory only grows. Compile-on-Run bounds the rate; the worker
+  recycles the instance every N compiles (N tuned in S2) — a page-lifetime
+  ceiling, not a fix, and that is fine for a playground. One case tunes N
+  down, not up: a buffer that *defines* a macro recompiles its world on any
+  length-changing edit (`blank_to_world` is length-keyed), leaking a full
+  world `Program` per Run — E3 Phase 1's recorded-but-unmeasured residual.
+- **Size.** If S0/S2 measure materially above the ~2 MB compressed estimate,
+  the fallback levers are `wasm-opt` flags, dropping `macro_std` from the
+  embedded set for the playground build, and — only if it comes to it —
+  reopening (b). The estimate has to fail badly before a server beats a
+  lazy-loaded 3 MB fetch.
+- **Repo growth.** Each committed wasm rebuild is a multi-MB blob in the
+  pages repo's history forever. Commit-on-toolchain-change plus the
+  release-tarball switch (which drops rebuild frequency to release cadence)
+  keeps this to a few blobs per release. Named, accepted.
+
+## 7. Open calls — wanted before S1
+
+- **(a) Editor**: vendored CodeMirror 6 (one ESM bundle built once, committed
+  to `assets/`, ~200 KB, bound via the site's existing `external struct`
+  pattern; no CDN at runtime, per the site's zero-external-dependency stance)
+  vs a plain `<textarea>` v1 (no dependency, but no span highlighting — and
+  the diagnostics are the pitch). **Recommendation: vendored CodeMirror 6.**
+- **(b) Toolchain pinning**: ride the site build's source (main now, release
+  tarballs when deploy.yml switches) vs an independent release-only pin for
+  the playground. **Recommendation: ride the site build — one lever;** the
+  badge makes whatever it is honest.
+- **(c) Compile cadence**: Run-only vs debounced compile-as-you-type for live
+  diagnostics. **Recommendation: Run-only in v1** — it bounds the leak rate
+  and the worker churn; live diagnostics become an S4-or-later slice with the
+  recycling policy proven.
+- **(d) Name and promotion** (recorded as the user's call, per the backlog):
+  `/playground` as the path; when it gets linked from the landing page and
+  the book interacts with D5's traction plan and D10/F9's org timing. Nothing
+  in S1–S3 blocks on this — the page can exist unlinked.
+
+## 8. Slices (suite-gated, docs same commit, per-case pins)
+
+- **S0 — the spike (hours):** `cargo check -p vilan-core --target
+  wasm32-unknown-unknown` (target already installed), then a throwaway
+  wasm-bindgen shim compiling one counter program end to end in a browser.
+  Output: a measured artifact size and a go/no-go note appended here.
+- **S1 — overlay completion (vilan repo):** `resolve_module_file` +
+  `util::read_source` consult the overlay; pins for overlay-only module
+  resolution (including the LSP's unsaved-file case, which this fixes for
+  real); full suite, corpus byte-identical.
+- **S2 — `crates/vilan-wasm`:** boot-from-`FILES`, hand-built `PackageSpec`,
+  `compile()` export with line/col diagnostics; the compile logic pinned by
+  native tests (the wasm-bindgen layer stays too thin to hide bugs); a CI leg
+  building the wasm32 artifact so it cannot rot; stack-depth and
+  instance-recycle tuning measured here.
+- **S3 — the page (website + pages repos):** `playground.vl`, the
+  `server.vl` route, worker + iframe runner, diagnostics pane, examples
+  dropdown; deploy.yml wiring per §4 (second render, allowlist additions,
+  wasm build + commit-on-change, root `.nojekyll`). Gate: the deploy's
+  existing render check extended to the second page, plus a scripted
+  smoke-compile of each seeded example against the shipped wasm.
+- **S4 — polish:** share-via-fragment, version badge, editor niceties.
+  Each independently shippable after S3.
+
+## 9. Recorded future work (not planned)
+
+Process-leg check-only mode (one toggle, `Some(Platform::Node)`, the
+platform-coloring showcase); live diagnostics (§7c); multi-file/tabs and
+manifest editing; LSP-in-the-browser; snippet sharing beyond the fragment
+(anything with storage reopens the no-server stance deliberately, not by
+drift); prerendered playground embeds in the book's "Try it" blocks (D6's
+natural continuation).

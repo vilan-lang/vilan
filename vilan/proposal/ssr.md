@@ -1,7 +1,20 @@
 # Server-side rendering — render and replace (A7)
 
-> **Status: RATIFIED 2026-07-22 — implementation starts 2026-07-23 (user
-> call: too large for end of day).** The §6 calls landed per recommendation:
+> **Status: v1 SHIPPED 2026-07-23 — arc complete for S1 + S2** (S1 the
+> process-layer `std::ui` twin; S2 `386074a`, replace semantics + the
+> full-stack e2e). **S3 (the Wire initial-state blob) stays UNBUILT by
+> decision** — demand-gated per §6c, so v1 keeps the double-fetch. Two
+> residues carried, neither blocking: `style_var` is snapshot-pinned but sits
+> outside the differential (the DOM stub no-ops `style.setProperty`), and the
+> S2 amendment's applicability question — **kolt and the walkthrough cannot
+> SSR under v1**, since their views read the live rpc client at build time,
+> handlers capture it, and browser-layer imports come with it. That factoring
+> is filed nowhere else; take it up when an app demands SSR.
+> *Stale text below, flagged 2026-07-29: §S2 still describes `examples/ssr`
+> as a 3-package workspace — D7 converted it to one package, two entries.*
+>
+> Prior status: RATIFIED 2026-07-22 — implementation starts 2026-07-23 (user
+> call: too large for end of day). The §6 calls landed per recommendation:
 > (a) the process layer omits `mount_root`; (b) the shell splice stays in
 > user code for v1; (c) S3 waits on demand — kolt's usage decides.
 >
