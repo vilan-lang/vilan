@@ -6,6 +6,14 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## v0.18.1 — 2026-07-29
+
+**`npm install -g @vilan-lang/vilan` works.** v0.18.0 published its five platform packages and then stopped: the command that publishes the meta package passed a path with no trailing slash, so npm read `npm-dist/vilan` as its `<user>/<repo>` GitHub shorthand and went looking for a git remote instead of a directory. One character. The packages themselves are unchanged, and the platform packages published by v0.18.0 are fine — this release simply gives them the meta package that ties them together.
+
+**The editor extension is on the VS Code Marketplace.** The last channel is live. Nothing in the extension changed; what was missing was permission for the release pipeline's identity to publish under the `vilan-lang` publisher. Installing from the release `.vsix` or from Open VSX still works and always will.
+
+There are no language, standard-library, or toolchain changes in this release. If v0.18.0 installed for you, this one is not worth the download.
+
 ## v0.18.0 — 2026-07-29
 
 **Breaking: a generic trait member is held to what the trait promised.** Trait conformance has checked receiver, arity, parameter types and return type since v0.12.0, but two positions slipped through, and both now diagnose. An impl that *fixes* a generic parameter to a concrete type is rejected: `trait Mapper { fun go<T>(&self, x: T): i32; }` is not implemented by `fun go<T>(&self, x: str)`, because the trait promised to accept any `T` and the impl accepts only strings. And a parameter whose type is a `Self`-defaulted trait generic is compared rather than skipped: `trait Add<B = Self>` resolves `B` to the same type as `Self`, which used to make the position ambiguous enough to go unchecked, so `impl Meters with Add { fun add(self, b: str): Meters }` compiled and only failed where it was used. Both now say "match the declared type" at the impl. With an explicit argument the two read differently, as they should: `impl Instant with Add<Duration>` expects `fun add(self, b: Duration): Instant` — the argument changes, the `Self` return does not.
