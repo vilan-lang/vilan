@@ -1,0 +1,24 @@
+[package]
+name = "vilan-wasm"
+version = "0.17.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The Vilan compiler as a WebAssembly module, for the web playground."
+
+[lib]
+# `cdylib` is the shipped artifact; `rlib` is what lets the compile logic be
+# tested natively on the host. The wasm-bindgen layer stays thin enough that
+# building it is the only thing the wasm target has to prove.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vilan-core = { path = "../vilan-core" }
+vilan-embedded-std = { path = "../vilan-embedded-std" }
+
+# Only the binding layer needs wasm-bindgen, so the host build and the native
+# tests do not pull it in at all. The version is EXACT on purpose: the
+# `wasm-bindgen` crate and the `wasm-bindgen` CLI that post-processes the
+# artifact must agree, and a mismatch fails at runtime in the browser rather
+# than at build time here.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"

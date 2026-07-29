@@ -5,6 +5,7 @@ members = [
     "crates/vilan-cli",
     "crates/vilan-lsp",
     "crates/vilan-embedded-std",
+    "crates/vilan-wasm",
 ]
 
 # Distributed binaries carry no symbol tables (smaller, and fewer places for
@@ -18,3 +19,21 @@ strip = true
 inherits = "release"
 debug = true
 strip = false
+
+# The wasm artifact is downloaded before the playground can do anything, so it
+# is tuned for SIZE where the native binaries are tuned for speed — hence a
+# separate profile rather than flags on `release`, which would shrink and slow
+# the shipped compiler for everyone. `cargo build --profile wasm-release
+# --target wasm32-unknown-unknown -p vilan-wasm`.
+#
+# Deliberately NOT `panic = "abort"`, though it would shave more: core fences
+# its analysis in `catch_unwind` so a compiler panic degrades to one honest
+# diagnostic, and aborting would trade that for a dead instance. (Whether the
+# fence actually catches on wasm32 depends on the target's unwinding support —
+# if it does not, the page's instance-recycle path is what covers it, which is
+# why that path exists rather than being an optimization.)
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

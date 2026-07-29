@@ -102,7 +102,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: cfg-if 1.0.4
+Covers: cfg-if 1.0.4, wasm-bindgen-macro-support 0.2.126, wasm-bindgen-macro 0.2.126, wasm-bindgen-shared 0.2.126, wasm-bindgen 0.2.126
 
 Copyright (c) 2014 Alex Crichton
 
@@ -683,6 +683,37 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
+Covers: bumpalo 3.20.3
+
+Copyright (c) 2019 Nick Fitzgerald
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+MIT License
+
 Covers: tracing-attributes 0.1.31, tracing-core 0.1.36, tracing 0.1.44
 
 Copyright (c) 2019 Tokio Contributors
@@ -1066,7 +1097,7 @@ SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: vilan-cli 0.16.0, vilan-core 0.16.0, vilan-embedded-std 0.16.0, vilan-lsp 0.16.0, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
+Covers: vilan-cli 0.17.0, vilan-core 0.17.0, vilan-embedded-std 0.17.0, vilan-lsp 0.17.0, vilan-wasm 0.17.0, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
 
 MIT License
 
@@ -1117,7 +1148,7 @@ SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: async-trait 0.1.89, ctrlc 3.5.2, displaydoc 0.2.6, itoa 1.0.18, once_cell 1.21.4, pin-project-internal 1.1.13, pin-project-lite 0.2.17, pin-project 1.1.13, proc-macro2 1.0.106, quote 1.0.45, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_repr 0.1.20, syn 2.0.117, unicode-ident 1.0.24, zmij 1.0.21
+Covers: async-trait 0.1.89, ctrlc 3.5.2, displaydoc 0.2.6, itoa 1.0.18, once_cell 1.21.4, pin-project-internal 1.1.13, pin-project-lite 0.2.17, pin-project 1.1.13, proc-macro2 1.0.106, quote 1.0.45, rustversion 1.0.23, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_repr 0.1.20, syn 2.0.117, unicode-ident 1.0.24, zmij 1.0.21
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated

@@ -289,9 +289,13 @@ impl MacroDef {
 /// reported only when a program actually defines a macro.
 pub(crate) fn resolve_macro_std(std: &PackageSpec) -> Option<PackageSpec> {
     let dir = std.base_root.parent()?.parent()?.join("macro_std");
-    dir.join("vilan.toml")
-        .is_file()
-        .then(|| crate::manifest::resolve_std(&dir))
+    let manifest = dir.join("vilan.toml");
+    // Buffered counts as present, the same way it does for a source file: with
+    // no filesystem behind the compiler (the wasm build) the toolchain lives
+    // entirely in the overlay, and an `is_file()` gate alone would report
+    // `macro_std` missing for every program that defines a macro.
+    let present = manifest.is_file() || crate::analyzer::document_overlay_contains(&manifest);
+    present.then(|| crate::manifest::resolve_std(&dir))
 }
 
 /// The top-level `macro fun`s of a file, with each definition's full span.

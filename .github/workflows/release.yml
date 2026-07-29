@@ -162,8 +162,50 @@ jobs:
           path: vilan-vscode.vsix
           if-no-files-found: error
 
+  # The playground's compiler, shipped as a release asset (D11 §4, call (b)).
+  # The website's deploy downloads it from the release the same way it already
+  # downloads install.sh, so the site job stays free of Rust — the property
+  # 53aa11d bought and this deliberately does not spend.
+  wasm:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # Pinned to the `wasm-bindgen` crate version in vilan-wasm/Cargo.toml —
+      # a mismatch between the two fails in the browser, not in this job.
+      - name: wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Build
+        run: |
+          RUSTFLAGS="-C link-arg=-zstack-size=67108864" \
+            cargo build -p vilan-wasm --profile wasm-release \
+              --target wasm32-unknown-unknown
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
+      # Shipped gzipped: it halves what the visitor downloads, and it sidesteps
+      # the two things GitHub Pages will not let the site control — the `.wasm`
+      # Content-Type and whether Pages compresses it. The page inflates through
+      # `DecompressionStream`.
+      - name: Package
+        run: |
+          mkdir dist
+          gzip -9 -c pkg/vilan_wasm_bg.wasm > dist/vilan_wasm_bg.wasm.gz
+          cp pkg/vilan_wasm.js dist/
+          tar -czf vilan-playground-wasm.tar.gz -C dist \
+              vilan_wasm_bg.wasm.gz vilan_wasm.js
+      - uses: actions/upload-artifact@v4
+        with:
+          # The `release-*` prefix is what `publish` globs, so this joins the
+          # asset list and the checksum file with no edits there.
+          name: release-wasm32
+          path: vilan-playground-wasm.tar.gz
+          if-no-files-found: error
+
   publish:
-    needs: [build, vsix]
+    needs: [build, vsix, wasm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

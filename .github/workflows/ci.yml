@@ -43,3 +43,38 @@ jobs:
       # per push (the exit code still gates; cargo reports failure regardless).
       - name: The suite is green
         run: cargo test --workspace --no-fail-fast
+
+  # The playground's compiler (D11). Its BEHAVIOUR is covered by the workspace
+  # suite above — `vilan-wasm` is an rlib as well as a cdylib precisely so its
+  # compile logic is tested natively, and the wasm-bindgen layer is a type
+  # conversion with no decisions in it. So this leg exists to prove one thing
+  # the host tests cannot: that the crate still REACHES wasm32 at all. A `std`
+  # dependency that quietly stops compiling for the target would otherwise
+  # surface at release time, or on the site.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # Pinned to the `wasm-bindgen` crate version in vilan-wasm/Cargo.toml.
+      # The two must match exactly — a mismatch fails in the browser at
+      # runtime, not here, which is the worst place to find out.
+      - name: wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      # The same stack size the playground runs with: the compiler recurses
+      # over deep expression trees, and wasm's default stack is far smaller
+      # than a host thread's.
+      - name: The artifact builds
+        run: |
+          RUSTFLAGS="-C link-arg=-zstack-size=67108864" \
+            cargo build -p vilan-wasm --profile wasm-release \
+              --target wasm32-unknown-unknown
+      # Binding generation is part of "it builds": a signature wasm-bindgen
+      # cannot express fails here rather than on the page.
+      - name: The bindings generate
+        run: |
+          wasm-bindgen --target web --out-dir pkg \
+            target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
+          ls -l pkg/vilan_wasm_bg.wasm

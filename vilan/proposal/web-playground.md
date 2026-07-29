@@ -310,11 +310,51 @@ it, diagnostics beneath the editor.
     now indexed fresh and never cached. Worth knowing for S3: anything derived
     from a buffer is valid only until the next edit, which is why
     `document_overlay_contains` is public.
-- **S2 — `crates/vilan-wasm`:** boot-from-`FILES`, hand-built `PackageSpec`,
-  `compile()` export with line/col diagnostics; the compile logic pinned by
-  native tests (the wasm-bindgen layer stays too thin to hide bugs); a CI leg
-  building the wasm32 artifact so it cannot rot; stack-depth and
-  instance-recycle tuning measured here.
+- **S2 — `crates/vilan-wasm` — DONE 2026-07-29.** `["cdylib", "rlib"]`: the
+  boot-and-compile logic is plain Rust tested natively, the `wasm_bindgen`
+  layer is a type conversion gated to `target_arch = "wasm32"` (so a host build
+  never pulls the dependency), and the CI leg's only job is proving the crate
+  still REACHES wasm32 — the failure host tests cannot see. 15 pins.
+  **Measured: 2.22 MB raw / 0.64 MB gzipped**, embedded std included, matching
+  S0's projection. Needed a dedicated `[profile.wasm-release]`: putting §4's
+  size flags on `[profile.release]` would shrink and slow the native binaries
+  for everyone. `panic = "abort"` deliberately NOT set despite the size win —
+  core fences analysis in `catch_unwind` so a compiler panic degrades to one
+  diagnostic, and aborting trades that for a dead instance.
+  - **The layer order is load-bearing.** `Library::layer` is a `BTreeMap`, so
+    `resolve_std` yields `browser` before `process` whatever the manifest says,
+    and `matching_layers` sorts stably so ties keep it. The hand-built spec
+    reproduces that order; getting it backwards would resolve differently from
+    every other front-end. `the_hand_built_std_spec_matches_the_manifest`
+    compares the hard-coded spec against the manifest shipping in `FILES`, so
+    a new layer fails loudly instead of being silently dropped.
+  - **Two core patches S2 forced**, both the same root cause S1 fixed — a disk
+    probe that no overlay can answer. `resolve_macro_std` gated on `is_file()`,
+    so every program defining a `macro fun` or using `[service]` reported
+    `macro_std` missing; and `resolve_library` read the manifest with raw
+    `fs::read_to_string`, bypassing the seam. Both now go through the one
+    reader. Neither changes the editor: the LSP deliberately never REGISTERS a
+    `vilan.toml` overlay, so the lookup misses and falls through to disk
+    exactly as before.
+  - **Recorded v1 limitations, none blocking.** `analyze`'s std-module
+    inventory and `modules_in_root` both walk `read_dir`, which degrades to
+    empty rather than erroring — so a failed import in the playground loses its
+    "did you mean `std::option`?" steer. Cosmetic, and worth knowing before it
+    is reported as a bug. `macros.rs`'s `rpc.vl` `is_file()` guard is the same
+    class.
+  - **Release wiring (call (b)):** a `wasm` job ships
+    `vilan-playground-wasm.tar.gz` (gzipped wasm + the JS glue), joining
+    `publish`'s existing `release-*` glob and checksum step with no edits
+    there. `wasm-bindgen` is pinned `=0.2.126` in three places that must agree
+    — crate, CI, release — because a mismatch fails in the browser at runtime,
+    not at build time.
+  - **F10's gate fired, as designed:** the new dependencies put seven crates in
+    `Cargo.lock` that `THIRD-PARTY-NOTICES.txt` did not cover, and the suite
+    refused until it was regenerated. Working as intended, and a reminder that
+    adding a dependency to this workspace is never just a Cargo.toml edit.
+  - *Still open for S3:* stack-depth and instance-recycle tuning were not
+    measured here — they want a real browser, which S3 brings. The
+    `-zstack-size=67108864` link arg is carried from §6 unverified.
 - **S3 — the page (website + pages repos):** `playground.vl`, the
   `server.vl` route, worker + iframe runner, diagnostics pane, examples
   dropdown; deploy.yml wiring per §4 (second render, allowlist additions,

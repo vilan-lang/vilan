@@ -902,7 +902,12 @@ pub fn resolve_workspace(package_dir: &Path, git: &GitDeps) -> Result<Workspace,
 /// library's *own* layer structure (for `std`, and for the platform contract check),
 /// not a full dependency build.
 pub fn resolve_library(dir: &Path) -> PackageSpec {
-    if let Ok(contents) = std::fs::read_to_string(dir.join("vilan.toml")) {
+    // Through the one reader, so a manifest that exists only in the overlay
+    // resolves — which is the whole toolchain's situation under wasm. This does
+    // not change the editor: the language server deliberately never REGISTERS a
+    // `vilan.toml` overlay (a manifest edit is meant to take effect on save),
+    // so the lookup misses and this falls through to disk exactly as before.
+    if let Ok(contents) = crate::util::read_source(dir.join("vilan.toml")) {
         if let Ok((manifest, _)) = Manifest::parse(&contents) {
             if let Some(library) = manifest.library {
                 return library_spec(dir, &library, Vec::new());
