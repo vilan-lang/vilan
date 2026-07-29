@@ -262,22 +262,30 @@ authenticates as nobody and `publish-npm` fails — loudly, which is the
 intent, but the release would go out with npm a version behind. So: the six
 configs land before the next tag, not after.
 
-| step | state as of 2026-07-29 |
+**COMPLETE, proven by v0.18.2** (run 30471900925, 2026-07-29):
+
+| step | state |
 | --- | --- |
 | `publish-npm` rewritten for OIDC | done |
-| trusted publisher on each of the six packages | set by the user on all six — **unverified**, see below |
-| a release publishes green by OIDC | pending — proof is the next tag |
-| `NPM_TOKEN` revoked on npm + deleted from repo secrets | done — revoked, and gone from the repo |
+| trusted publisher on each of the six packages | done |
+| a release publishes green by OIDC | **done — v0.18.2** |
+| `NPM_TOKEN` revoked on npm + deleted from repo secrets | done |
 
-"Unverified" is not hedging: npm exposes **no read path** for a package's
-trusted-publisher config. `npm access` has subcommands for status, mfa, and
+The release was cut for this: npm exposes **no read path** for a package's
+trusted-publisher config — `npm access` has subcommands for status, mfa and
 team grants and nothing for OIDC, and the registry document does not carry
-it. So there is no way to confirm the six configs are right — including that
-every case-sensitive field matched — short of a release using them. Plan the
-next tag accordingly: if `publish-npm` fails, the GitHub Release has already
-gone out (it is a `needs:` dependency), the failure is loud, and re-running
-the job after a fix is safe because the already-published predicate tolerates
-a partial publish.
+it — so a release was the only instrument that could confirm the six configs
+were right, every case-sensitive field included. Verified at the source
+rather than off a green checkmark: npm 11.18.0 on the runner, all six
+packages at `0.18.2`, six provenance statements signed and written to the
+sigstore transparency log, and the registry serving two attestation
+predicates per package (npm's own `publish/v0.1` and `slsa.dev/provenance/v1`).
+
+Kept for the next person who has to reason about a failure here: if
+`publish-npm` fails, the GitHub Release has already gone out (it is a
+`needs:` dependency), so the blast radius is npm being one version behind.
+The failure is loud, and re-running the job after fixing the config is safe
+because the already-published predicate tolerates a partial publish.
 
 *Also 2026-07-29:* **Publishing access → "Require two-factor authentication
 and disallow tokens"** is set on four of the six packages; the other two
