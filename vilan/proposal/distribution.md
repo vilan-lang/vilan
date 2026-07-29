@@ -112,7 +112,13 @@ that).
 - **Publisher registration** — *done 2026-07-25 under F9*: the publisher
   is **`vilan-lang`** (registered via Azure DevOps as part of the org
   claim sitting); `package.json.publisher` already updated in F9's sweep.
-  What remains for S2 is the `VSCE_PAT` secret.
+  What remains for S2 is the publish identity — `AZURE_CLIENT_ID` /
+  `AZURE_TENANT_ID`, not the `VSCE_PAT` this originally said. Azure DevOps
+  retires global PATs (the "all accessible organizations" scope `vsce`
+  requires) on **2026-12-01**, so a PAT would have bought about four months.
+  The job authenticates by Entra workload identity federation instead:
+  `vsce publish --azure-credential` behind `azure/login`, with no stored
+  credential at all.
 - **An icon is required in practice** (the marketplace renders a gray box
   otherwise) — a small deliverable this arc: simple wordmark/glyph, no
   branding ambitions, checked into `editors/vscode/`.
@@ -188,9 +194,23 @@ notice), so the workflow stays green before accounts exist.
 ## 7. What the user provides (once, all pseudonym-safe)
 
 npm account (owns `vilan` + the `@vilan-lang` scope) + `NPM_TOKEN` secret;
-marketplace publisher id + `VSCE_PAT`; Open VSX account + token (if (c)
+marketplace publisher id + an Entra federated identity
+(`AZURE_CLIENT_ID` / `AZURE_TENANT_ID`); Open VSX account + token (if (c)
 says yes); the `homebrew-vilan` repo + a GitHub App
 (`TAP_APP_ID` / `TAP_APP_PRIVATE_KEY`).
+
+*Provisioned 2026-07-29: the VS Code Marketplace.* An Entra app
+registration with a federated credential bound to this repo's
+`marketplace` **environment** — the subject is
+`repo:vilan-lang/vilan:environment:marketplace`, which is why the job
+declares `environment: marketplace` and why deleting that line breaks
+auth rather than merely loosening it. Bound to the environment rather than
+the tag because release runs on a tag push and a tag-bound credential
+matches one literal tag, needing re-registration every release. Cost: none
+— app registrations are free permanently and survive the Azure trial
+lapsing, since they live in the tenant, not a subscription. (The `$3`
+"Entra Workload ID" SKU on the pricing page is a different, premium
+product and is not required for this.)
 
 *Provisioned 2026-07-29: Open VSX.* The account and the `vilan-lang`
 namespace exist. Two corrections to the earlier note: the namespace being
@@ -239,7 +259,7 @@ to unresolved-import diagnostics — the channel is S5-adjacent work.
 *S2 additions (2026-07-25):* Open VSX does **not** auto-create
 namespaces — before the first tagged release with `OVSX_TOKEN` set, run
 `npx ovsx create-namespace vilan-lang -p <token>` once. And the day
-`VSCE_PAT` lands, flip README's extension-install sentence from
+the marketplace identity lands, flip README's extension-install sentence from
 "Install from VSIX" to "search Vilan in the marketplace" (recorded in
 the S2 slice report; a documented install that doesn't exist yet is
 worse than none, so the sentence waits for the channel).

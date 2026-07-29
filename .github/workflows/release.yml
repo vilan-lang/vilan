@@ -336,37 +336,64 @@ jobs:
     # carry a version whose GitHub Release failed to go out.
     needs: [vsix, publish]
     runs-on: ubuntu-latest
+    # The environment is not decoration: the federated credential in Entra
+    # trusts the subject `repo:vilan-lang/vilan:environment:marketplace`, so
+    # GitHub only mints an OIDC token this app will accept when the job runs
+    # here. Removing this line does not weaken the auth, it breaks it.
+    environment: marketplace
+    permissions:
+      # Required for GitHub to issue the OIDC token `azure/login` exchanges.
+      id-token: write
+      contents: read
     steps:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Is there a token to publish with?
+      - name: Is there an identity to publish with?
         id: marketplace
         # Same mechanism as publish-npm's gate: a job-level `if:` cannot read
         # `secrets`, so the secret's presence becomes a step output the rest of
         # the job conditions on (distribution.md §6 — every publish job lands
         # disabled-until-secret-exists).
+        #
+        # Entra workload identity federation rather than a PAT, and not by
+        # preference: Azure DevOps retires global PATs — the "all accessible
+        # organizations" scope `vsce` requires — on 2026-12-01, after which a
+        # PAT-based publish simply stops. Federation also leaves NO stored
+        # credential to expire or leak; the ids below are identifiers, not
+        # secrets, and are kept as secrets only so this gate reads like the
+        # other three.
         env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         run: |
-          if [ -n "$VSCE_PAT" ]; then
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Marketplace publish skipped::VSCE_PAT is not configured, so the extension was not published to the VS Code Marketplace. The rest of the release is unaffected."
+            echo "::notice title=Marketplace publish skipped::AZURE_CLIENT_ID / AZURE_TENANT_ID are not configured, so the extension was not published to the VS Code Marketplace. Register an Entra app with a federated credential for this repo's `marketplace` environment and add it to the vilan-lang publisher. The rest of the release is unaffected."
           fi
       - uses: actions/download-artifact@v4
         if: steps.marketplace.outputs.publish == 'true'
         with:
           name: release-vsix
+      - name: Sign in to Entra
+        if: steps.marketplace.outputs.publish == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          # There is no Azure subscription behind this and there does not need
+          # to be: the app registration lives in the tenant, and publishing
+          # touches the Marketplace, not any Azure resource. Without this the
+          # action fails looking for a subscription to select.
+          allow-no-subscriptions: true
       - name: Publish
         if: steps.marketplace.outputs.publish == 'true'
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
           npx --yes @vscode/vsce publish \
             --packagePath vilan-vscode.vsix \
-            --pat "$VSCE_PAT" \
+            --azure-credential \
             --skip-duplicate
 
   publish-openvsx:
