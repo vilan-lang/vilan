@@ -265,9 +265,31 @@ configs land before the next tag, not after.
 | step | state as of 2026-07-29 |
 | --- | --- |
 | `publish-npm` rewritten for OIDC | done |
-| trusted publisher on each of the six packages | **pending — user, on npmjs.com** |
+| trusted publisher on each of the six packages | set by the user on all six — **unverified**, see below |
 | a release publishes green by OIDC | pending — proof is the next tag |
-| `NPM_TOKEN` revoked on npm + deleted from repo secrets | pending — after that proof |
+| `NPM_TOKEN` revoked on npm + deleted from repo secrets | pending — see below |
+
+"Unverified" is not hedging: npm exposes **no read path** for a package's
+trusted-publisher config. `npm access` has subcommands for status, mfa, and
+team grants and nothing for OIDC, and the registry document does not carry
+it. So there is no way to confirm the six configs are right — including that
+every case-sensitive field matched — short of a release using them. Plan the
+next tag accordingly: if `publish-npm` fails, the GitHub Release has already
+gone out (it is a `needs:` dependency), the failure is loud, and re-running
+the job after a fix is safe because the already-published predicate tolerates
+a partial publish.
+
+*Also 2026-07-29:* **Publishing access → "Require two-factor authentication
+and disallow tokens"** is set on four of the six packages; the other two
+errored on save, cause unknown, to be retried. This is independent
+of everything above — it constrains *traditional token* auth only, and
+trusted publishers keep working because they present OIDC tokens. It does
+change one thing though: on those four, `NPM_TOKEN` can no longer publish at
+all. The token therefore stopped being a fallback the moment that setting
+landed — a token that can rescue two of six packages cannot rescue a release,
+since a partial publish is the exact failure being guarded against. It is now
+dead weight with a live credential's blast radius, so it comes out of repo
+secrets now rather than waiting on the proof.
 
 The next release's changelog gets a line for it, because one part *is*
 user-visible: trusted publishing attaches provenance attestations, so the
