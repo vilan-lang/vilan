@@ -34,3 +34,36 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 - **Add unit tests for critical code.** Any change to a critical subsystem — the type solver / analyzer (`crates/vilan-core/src/analyzer.rs`), the transformer / codegen (`src/transformer.rs`), the language server (`crates/vilan-lsp/`), and the lexer/parser — must come with unit tests that pin its behavior, including the **edge cases** (the multi-parameter, nested, mixed, and ordering-sensitive forms — not just the happy path). The compiler-behavior harness lives in `crates/vilan-core/tests/inference.rs` (`assert_compiles`, `assert_compiles_and_runs`, `assert_fails`); a known-but-unfixed bug is pinned as an `#[ignore]`d test and un-ignored when fixed.
 - **Docs are gated and part of done.** Every fenced example in `vilan/docs/` is compiled by `cargo test --test docs`; a change to std, a framework, or the language updates the affected docs page **in the same commit** (see `vilan/proposal/documentation.md`).
 - **"Fixed" and "closed" require a pinned test — per case, not per example.** Do not claim a bug fixed, or a class of bugs closed, on the strength of a green suite plus one representative program. Each distinct case needs its own passing (or, if still open, `#[ignore]`d) test. Edge cases without a test are how a "closed" item silently regresses or turns out never to have been covered.
+
+## Running the suite
+
+`cargo test --workspace` is the gate and it is expensive — ~40 test binaries each
+linking the full crate, a ~100-program corpus built through the debug binary, a
+docs gate compiling every fence, and e2e legs that bind ports and spawn servers.
+Run it when it is the right instrument, not as a way of finding out what you
+just did.
+
+- **Never pipe it through `grep`, `head`, or `tail` and read the exit code.**
+  The pipeline reports the *filter's* status, so a red suite looks green — this
+  has produced real "all green" claims over genuine failures. Redirect and check
+  cargo's own code:
+  `cargo test --workspace --no-fail-fast > suite.log 2>&1; echo $?` — then grep
+  the log. Same trap with `cargo build`.
+- **Run it once, at the end, after every edit is done.** A run started
+  mid-editing tests a tree that no longer exists, and finishing it teaches you
+  nothing about the tree you have. If you edit after starting one, kill it.
+- **Pay the cheap gate before the expensive one.** Most failures are
+  predictable from what you touched, and the targeted binary costs seconds where
+  the suite costs minutes:
+  - added or bumped a dependency → `cargo test -p vilan-cli --test third_party_notices`
+    (the lockfile must stay covered by `THIRD-PARTY-NOTICES.txt`; regenerate with
+    `cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt`)
+  - touched the transformer / codegen → `cargo test -p vilan-cli --test corpus`
+  - touched the analyzer / type solver → `cargo test -p vilan-core --test inference`
+  - touched std, a framework, or the language → `cargo test -p vilan-core --test docs`
+  - touched module loading or paths → `cargo test -p vilan-core --test module_resolution`
+- **`cargo build` first when the change might not compile.** A failed build
+  inside `cargo test` costs the same as a successful one and tells you less.
+- **A new pin should be proven non-vacuous**, and that is cheap: plant the bug
+  the fix removes, watch the pin go red, restore. Do it with the targeted
+  binary, never by re-running the suite.
