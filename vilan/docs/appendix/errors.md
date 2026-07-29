@@ -85,9 +85,16 @@ convention and type, the return type, and, for a generic method, the
 type-parameter count. Types are compared with `Self` read as the impl's
 subject and the trait's generic parameters read as the `with`-clause
 arguments (`impl Meters with From<Feet>` expects `fun from(value: Feet):
-Meters`). Asyncness is not required to match: an async impl of a
-synchronous trait method is allowed (dispatch is monomorphized, so callers
-await it regardless).
+Meters`). When the trait's parameter has a `Self` default and you supply
+no argument, it reads as the subject: `impl Meters with Add` expects
+`fun add(self, b: Meters): Meters`, while `impl Meters with Add<Feet>`
+expects `fun add(self, b: Feet): Meters` — the argument changes, the
+`Self` return does not. A generic method's own type parameters are held
+to the trait's promise too: declaring `fun go<T>(&self, x: T)` and then
+implementing `fun go<T>(&self, x: str)` narrows what the trait promised
+to accept, and is rejected. Asyncness is not required to match: an async
+impl of a synchronous trait method is allowed (dispatch is monomorphized,
+so callers await it regardless).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"match is not exhaustive: missing …"** · **"match is not exhaustive: add a catch-all `_` leg"**

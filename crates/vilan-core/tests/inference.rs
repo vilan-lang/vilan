@@ -25227,15 +25227,12 @@ fn a_generic_method_with_matching_structure_compiles() {
     );
 }
 
+/// B29 residue, closed: a member's own generic parameters are RIGID under
+/// conformance (`compare_type_rigid`) — a trait promising to accept any `T` is
+/// not implemented by one fixing that position to `str`. Before the fix an
+/// unbounded generic compared equal to any concrete type and this passed.
 #[test]
-#[ignore = "B29 fallback: deep alpha-equivalent type comparison over a member's \
-            own generics is not done — a generic method that FIXES a generic \
-            parameter to a concrete type (accepting `str` where the trait \
-            promises to accept any `T`) is accepted leniently because an \
-            unbounded generic compares equal to any concrete type. The \
-            structural half (type-parameter count) is enforced; this deep-type \
-            case is the recorded residue."]
-fn a_generic_method_fixing_a_generic_parameter_to_a_concrete_type_should_be_rejected() {
+fn a_generic_method_fixing_a_generic_parameter_to_a_concrete_type_is_rejected() {
     assert_fails_with(
         r#"
         trait Mapper { fun go<T>(&self, x: T): i32; }
@@ -25389,15 +25386,16 @@ fn a_static_trait_member_type_mismatch_is_rejected() {
     );
 }
 
-// KNOWN GAP (recorded with B29's landing): a `= Self`-defaulted trait generic
-// (`Add<B = Self>`) interns to the same TypeId as `Self`, so the declared
-// position is ambiguous and its TYPE goes unchecked — a wrong impl type slips
-// conformance and only errors at use sites. The AST still knows whether the
-// author wrote `Self` or `B`; the fix compares those positions at the
-// declaration-node level. Un-ignore then.
+/// CLOSED (the gap recorded with B29's landing): a `= Self`-defaulted trait
+/// generic (`Add<B = Self>`) resolves to the same TYPE as `Self`, so the
+/// declared position was ambiguous and went unchecked — a wrong impl type
+/// slipped conformance and only errored at use sites. Types are not interned,
+/// so the written `Self` and the written `B` keep distinct type ids;
+/// conformance now recovers the spelling from `prepped_type_locals` and
+/// substitutes accordingly. Here no `with`-clause argument is given, so `B`
+/// takes its `= Self` default and the position promises `Meters`.
 #[test]
-#[ignore]
-fn a_self_defaulted_generic_position_with_a_wrong_type_should_be_rejected() {
+fn a_self_defaulted_generic_position_with_a_wrong_type_is_rejected() {
     assert_fails_with(
         r#"
         import std::operators::Add;
@@ -25408,6 +25406,102 @@ fn a_self_defaulted_generic_position_with_a_wrong_type_should_be_rejected() {
         fun main() {}
         "#,
         "match the declared type",
+    );
+}
+
+/// The other half of the same rule, and the case a naive fix breaks: when the
+/// `with` clause DOES supply an argument, a `= Self`-defaulted position promises
+/// that argument, not the subject. This is std's shape at `time.vl`
+/// (`impl Instant with Add<Duration>`) — substituting `B -> subject` here would
+/// false-reject the standard library.
+#[test]
+fn an_argued_self_defaulted_generic_position_takes_the_argument_not_the_subject() {
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+        struct Feet { value: i32 }
+        struct Meters { value: i32 }
+        impl Meters with Add<Feet> {
+            fun add(self, b: Feet): Meters { self }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// ...and the argument position is genuinely CHECKED under an explicit
+/// argument, not merely permissive: the subject is the wrong type there.
+#[test]
+fn an_argued_self_defaulted_generic_position_rejects_the_subject() {
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        struct Feet { value: i32 }
+        struct Meters { value: i32 }
+        impl Meters with Add<Feet> {
+            fun add(self, b: Meters): Meters { self }
+        }
+        fun main() {}
+        "#,
+        "match the declared type",
+    );
+}
+
+/// The return position takes the OTHER branch of the same rule: `Add` declares
+/// `fun add(self, b: B): Self`, so under `Add<Feet>` the argument is `Feet` and
+/// the return is still the subject. Returning the argument is the mistake this
+/// pins — the two ambiguous positions must not collapse onto one answer.
+#[test]
+fn a_self_defaulted_generic_return_stays_the_subject_under_an_explicit_argument() {
+    assert_fails_with(
+        r#"
+        import std::operators::Add;
+        struct Feet { value: i32 }
+        struct Meters { value: i32 }
+        impl Meters with Add<Feet> {
+            fun add(self, b: Feet): Feet { Feet { value = 1 } }
+        }
+        fun main() {}
+        "#,
+        "match the declared return type",
+    );
+}
+
+/// The argument-less form still conforms end to end (the 100+ std operator
+/// impls are this shape): `B` takes its `= Self` default, so both the argument
+/// and the return promise the subject.
+#[test]
+fn an_argument_less_self_defaulted_generic_impl_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::operators::Add;
+        struct Meters { value: i32 }
+        impl Meters with Add {
+            fun add(self, b: Meters): Meters { self }
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+/// std's own `time.vl` through the real library, not a reconstruction: `Instant`
+/// implements `Add<Duration>` and `Sub<Duration>`, the two explicit-argument
+/// sites in std, and both must keep compiling AND running.
+#[test]
+fn std_instant_arithmetic_conforms_through_the_real_library() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ now, Duration };
+
+        fun main() {
+            let start = now();
+            let later = start + Duration::millis(500i53);
+            let back = later - Duration::millis(500i53);
+            print(back == start);
+        }
+        "#,
+        "true\n",
     );
 }
 

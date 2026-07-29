@@ -637,6 +637,14 @@ pub struct Trait<'src> {
     /// id of `T`), so a parameterized-trait method call can substitute them with
     /// the trait's concrete arguments.
     pub generic_parameter_constraint_ids: Vec<TypeId>,
+    /// Those parameters' written NAMES, positionally aligned with the constraint
+    /// ids above. Needed by trait conformance (B29): a `= Self`-defaulted
+    /// parameter (`trait Add<B = Self>`) resolves to the very same *type* as
+    /// `Self`, so a declared `b: B` and a declared `Self` are indistinguishable
+    /// once resolved. The written name is what tells them apart, and it decides
+    /// whether the position substitutes to the subject or to the `with`-clause
+    /// argument.
+    pub generic_parameter_names: Vec<&'src str>,
     /// The members the trait declares, keyed by name. For a required method
     /// without a default body these point at signature-only functions.
     pub declarations: IndexMap<&'src str, Id>,
@@ -2924,12 +2932,62 @@ impl<'src> Analyzer<'src> {
     /// sound in vilan's monomorphized dispatch.
     fn check_trait_conformance(&mut self) {
         let checks = std::mem::take(&mut self.conformance_signature_checks);
+        // Every written type annotation's spelling, keyed by the id its walk
+        // minted. Types are deliberately NOT interned, so a written `Self` and a
+        // written `B` of a `= Self`-defaulted trait carry distinct ids even
+        // though they resolve to the same type — which is exactly what lets a
+        // conformance check tell those two positions apart.
+        let written_type_names: HashMap<TypeId, &'src str> = self
+            .prepped_type_locals
+            .iter()
+            .map(|(type_id, name, ..)| (*type_id, *name))
+            .collect();
         for check in &checks {
-            self.check_one_conformance(check);
+            self.check_one_conformance(check, &written_type_names);
         }
     }
 
-    fn check_one_conformance(&mut self, check: &ConformanceSignatureCheck) {
+    /// What a `= Self`-ambiguous position actually promises (the B29 residue).
+    ///
+    /// A `= Self`-defaulted trait generic (`trait Add<B = Self>`) resolves `B` to
+    /// the same type as `Self`, so a declared `b: B` and a declared `Self` are
+    /// indistinguishable once resolved — which is why such positions used to go
+    /// unchecked. The WRITTEN name separates them: `Self` promises the impl's
+    /// subject, while the parameter's own name promises the matching
+    /// `with`-clause argument (`impl Instant with Add<Duration>` promises
+    /// `Duration`), falling back to the subject when the clause supplied none —
+    /// which is precisely what the `= Self` default means. `None` leaves the
+    /// position unchecked, as before.
+    ///
+    /// Limitation inherited from `generic_context`: a generic SUPERTRAIT's
+    /// arguments are not recovered in v1, so its context is empty and such a
+    /// position takes the subject fallback. That is right for a `= Self`
+    /// default (the only shape reaching here) and is why the fallback is safe.
+    fn ambiguous_position_expectation(
+        &self,
+        written_name: Option<&str>,
+        self_trait: Id,
+        subject: TypeId,
+        context: &SubstitutionContext,
+    ) -> Option<TypeId> {
+        let written_name = written_name?;
+        if written_name == "Self" {
+            return Some(subject);
+        }
+        let trait_ = self.traits.get(&self_trait)?;
+        let index = trait_
+            .generic_parameter_names
+            .iter()
+            .position(|name| *name == written_name)?;
+        let constraint_id = *trait_.generic_parameter_constraint_ids.get(index)?;
+        Some(context.get(&constraint_id).copied().unwrap_or(subject))
+    }
+
+    fn check_one_conformance(
+        &mut self,
+        check: &ConformanceSignatureCheck,
+        written_type_names: &HashMap<TypeId, &'src str>,
+    ) {
         let (Some(trait_shape), Some(impl_shape)) = (
             self.member_signature_shape(check.trait_function_id),
             self.member_signature_shape(check.impl_function_id),
@@ -3098,14 +3156,27 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let trait_param_type = trait_shape.types[position].get_type(self);
-            // Skip an ambiguous `Self`/`B` position of a `= Self`-defaulted trait.
-            if self_ambiguous && is_self_trait_type(&trait_param_type) {
-                continue;
-            }
-            let expected_type =
-                self.substitute_member_type(&trait_param_type, self_trait, subject, &context);
+            // An ambiguous `Self`/`B` position of a `= Self`-defaulted trait is
+            // resolved by what the trait's author WROTE; only a position whose
+            // spelling cannot be recovered stays unchecked.
+            let expected_type = if self_ambiguous && is_self_trait_type(&trait_param_type) {
+                let written = written_type_names
+                    .get(&trait_shape.types[position])
+                    .copied();
+                match self.ambiguous_position_expectation(written, self_trait, subject, &context) {
+                    Some(expected) => expected.get_type(self),
+                    None => continue,
+                }
+            } else {
+                self.substitute_member_type(&trait_param_type, self_trait, subject, &context)
+            };
             let actual_type = impl_shape.types[position].get_type(self);
-            if !self.compare_type(&expected_type, &actual_type, &HashMap::new()) {
+            if !self.compare_type_rigid(
+                &expected_type,
+                &actual_type,
+                &HashMap::new(),
+                &impl_shape.generic_constraint_ids,
+            ) {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 let expected_label = self.pretty_print_type(&expected_type, &HashMap::new());
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::new());
@@ -3127,16 +3198,29 @@ impl<'src> Analyzer<'src> {
         let trait_return_type = trait_shape
             .return_type_id
             .map(|type_id| type_id.get_type(self));
-        if self_ambiguous
+        let return_is_ambiguous = self_ambiguous
             && trait_return_type
                 .as_ref()
-                .is_some_and(|type_| is_self_trait_type(type_))
-        {
-            return;
-        }
-        let expected_return = match &trait_return_type {
-            Some(resolved) => self.substitute_member_type(resolved, self_trait, subject, &context),
-            None => Type::Void,
+                .is_some_and(|type_| is_self_trait_type(type_));
+        let expected_return = if return_is_ambiguous {
+            // Same rule as the parameter positions: the written spelling decides
+            // whether the declared return is the subject or the `with`-clause
+            // argument. `impl Instant with Add<Duration>` declares `Self`, so it
+            // must return `Instant`, not `Duration`.
+            let written = trait_shape
+                .return_type_id
+                .and_then(|type_id| written_type_names.get(&type_id).copied());
+            match self.ambiguous_position_expectation(written, self_trait, subject, &context) {
+                Some(expected) => expected.get_type(self),
+                None => return,
+            }
+        } else {
+            match &trait_return_type {
+                Some(resolved) => {
+                    self.substitute_member_type(resolved, self_trait, subject, &context)
+                }
+                None => Type::Void,
+            }
         };
         // An unannotated impl return is compared by its body's INFERRED type, not
         // treated as void — std impls (`Iterator::next`, `Into::into`) legitimately
@@ -3148,7 +3232,12 @@ impl<'src> Analyzer<'src> {
                 .type_of_expr(impl_shape.body_tail_id)
                 .unwrap_or(Type::Unknown),
         };
-        if !self.compare_type(&expected_return, &actual_return, &HashMap::new()) {
+        if !self.compare_type_rigid(
+            &expected_return,
+            &actual_return,
+            &HashMap::new(),
+            &impl_shape.generic_constraint_ids,
+        ) {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::new());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::new());
@@ -13416,6 +13505,16 @@ impl<'src> Analyzer<'src> {
                 let body_scope_id = self.push_scope(body_scope);
                 let generic_parameter_constraint_ids =
                     self.register_generic_parameters(generic_parameters, body_scope_id);
+                let generic_parameter_names = generic_parameters
+                    .as_ref()
+                    .map(|parameters| {
+                        parameters
+                            .0
+                            .iter()
+                            .map(|parameter| parameter.name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 // Inside a trait, `Self` is the trait itself (abstractly): a
                 // `self`-typed receiver in a default method resolves its method
                 // calls against this trait's own declarations.
@@ -13441,6 +13540,7 @@ impl<'src> Analyzer<'src> {
                         name,
                         name_span,
                         generic_parameter_constraint_ids,
+                        generic_parameter_names,
                         declarations,
                         supertraits,
                     },
@@ -16220,25 +16320,55 @@ impl<'src> Analyzer<'src> {
     }
 
     fn compare_type(&self, a: &Type, b: &Type, substitution_context: &SubstitutionContext) -> bool {
+        self.compare_type_rigid(a, b, substitution_context, &[])
+    }
+
+    /// `compare_type`, plus a set of RIGID generic parameters (the B29 residue).
+    ///
+    /// Ordinary comparison treats a generic as a hole to be filled: an unmapped
+    /// one falls back to its own constraint, and an unbounded constraint matches
+    /// anything. That is right for binding a call's generics and wrong for trait
+    /// conformance — a member promising to accept any `T` is *not* implemented
+    /// by one that fixes the position to `str`. Under conformance the impl
+    /// member's own type parameters are passed here as `rigid`: such a parameter
+    /// matches only the identically-aligned parameter on the other side. `rigid`
+    /// is empty at every other call site, where these arms never fire.
+    fn compare_type_rigid(
+        &self,
+        a: &Type,
+        b: &Type,
+        substitution_context: &SubstitutionContext,
+        rigid: &[TypeId],
+    ) -> bool {
         match (a, b) {
             (Type::Unknown, _) | (_, Type::Unknown) | (Type::Any, _) | (_, Type::Any) => true,
             // A diverging expression fits any expected type (it never
             // produces a value to disagree).
             (Type::Never, _) | (_, Type::Never) => true,
             (Type::Unresolved, _) | (_, Type::Unresolved) => false,
+            // Rigid positions. These sit BELOW the unknown/diverging arms on
+            // purpose: a position that failed to resolve stays lenient, so a
+            // program that is already broken gains no extra conformance error.
+            (Type::Generic(left_id), Type::Generic(right_id))
+                if rigid.contains(left_id) || rigid.contains(right_id) =>
+            {
+                left_id == right_id
+            }
+            (Type::Generic(left_id), _) if rigid.contains(left_id) => false,
+            (_, Type::Generic(right_id)) if rigid.contains(right_id) => false,
             (Type::Generic(constraint_id), _) => {
                 let l = substitution_context
                     .get(constraint_id)
                     .map(|x| x.get_type(self))
                     .unwrap_or_else(|| constraint_id.get_type(self));
-                return self.compare_type(&l, b, substitution_context);
+                return self.compare_type_rigid(&l, b, substitution_context, rigid);
             }
             (_, Type::Generic(constraint_id)) => {
                 let r = substitution_context
                     .get(constraint_id)
                     .map(|x| x.get_type(self))
                     .unwrap_or_else(|| constraint_id.get_type(self));
-                return self.compare_type(a, &r, substitution_context);
+                return self.compare_type_rigid(a, &r, substitution_context, rigid);
             }
             // A concrete type satisfies a trait-typed slot (a generic bound like
             // `T: PartialEq`, or a trait-typed parameter) when it implements the
@@ -16254,22 +16384,22 @@ impl<'src> Analyzer<'src> {
                     .all(|(l_item_id, r_item_id)| {
                         let l = l_item_id.get_type(self);
                         let r = r_item_id.get_type(self);
-                        self.compare_type(&l, &r, substitution_context)
+                        self.compare_type_rigid(&l, &r, substitution_context, rigid)
                     })
             }
             // Same nominal type: compatible when the arguments are (a side with
             // no arguments is an erased/abstract `List`/`Option`, compatible with
             // any instantiation).
             (Type::Enum(l_id, l_arguments), Type::Enum(r_id, r_arguments)) if l_id == r_id => {
-                self.compare_argument_types(l_arguments, r_arguments, substitution_context)
+                self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
             (Type::Struct(l_id, l_arguments), Type::Struct(r_id, r_arguments)) if l_id == r_id => {
-                self.compare_argument_types(l_arguments, r_arguments, substitution_context)
+                self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
             // Same trait: compatible when their arguments are (an erased side —
             // `Iterator` written without `<T>` — matches any instantiation).
             (Type::Trait(l_id, l_arguments), Type::Trait(r_id, r_arguments)) if l_id == r_id => {
-                self.compare_argument_types(l_arguments, r_arguments, substitution_context)
+                self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
             }
             (
                 Type::Closure(l_parameter_ids, l_return_id),
@@ -16280,13 +16410,13 @@ impl<'src> Analyzer<'src> {
                         |(l_parameter_id, r_parameter_id)| {
                             let l = l_parameter_id.get_type(self);
                             let r = r_parameter_id.get_type(self);
-                            self.compare_type(&l, &r, substitution_context)
+                            self.compare_type_rigid(&l, &r, substitution_context, rigid)
                         },
                     )
                     && {
                         let l = l_return_id.get_type(self);
                         let r = r_return_id.get_type(self);
-                        self.compare_type(&l, &r, substitution_context)
+                        self.compare_type_rigid(&l, &r, substitution_context, rigid)
                     }
             }
             // A named function coerces to a matching closure type (backlog
@@ -16294,12 +16424,12 @@ impl<'src> Analyzer<'src> {
             (Type::Function(function_id), Type::Closure(..)) => self
                 .function_closure_type_recorded(*function_id)
                 .is_some_and(|function_type| {
-                    self.compare_type(&function_type, b, substitution_context)
+                    self.compare_type_rigid(&function_type, b, substitution_context, rigid)
                 }),
             (Type::Closure(..), Type::Function(function_id)) => self
                 .function_closure_type_recorded(*function_id)
                 .is_some_and(|function_type| {
-                    self.compare_type(a, &function_type, substitution_context)
+                    self.compare_type_rigid(a, &function_type, substitution_context, rigid)
                 }),
             (a, b) if a == b => true,
             _ => false,
@@ -16314,6 +16444,7 @@ impl<'src> Analyzer<'src> {
         left: &[TypeId],
         right: &[TypeId],
         substitution_context: &SubstitutionContext,
+        rigid: &[TypeId],
     ) -> bool {
         if left.is_empty() || right.is_empty() {
             return true;
@@ -16325,10 +16456,13 @@ impl<'src> Analyzer<'src> {
                 // A generic argument (an impl's type parameter, e.g. the `T` of
                 // `impl List<T: Add>`) is a hole to be bound, not a constraint to
                 // satisfy structurally — so it matches any concrete argument. The
-                // bound is enforced separately by member resolution.
-                matches!(left_type, Type::Generic(_))
-                    || matches!(right_type, Type::Generic(_))
-                    || self.compare_type(&left_type, &right_type, substitution_context)
+                // bound is enforced separately by member resolution. A RIGID
+                // parameter is the exception: under conformance it is the trait's
+                // promise, not a hole, so `List<T>` is not satisfied by
+                // `List<str>` (same rule as the scalar position, one level down).
+                matches!(left_type, Type::Generic(id) if !rigid.contains(&id))
+                    || matches!(right_type, Type::Generic(id) if !rigid.contains(&id))
+                    || self.compare_type_rigid(&left_type, &right_type, substitution_context, rigid)
             })
     }
 
