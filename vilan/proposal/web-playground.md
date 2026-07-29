@@ -141,23 +141,32 @@ it, diagnostics beneath the editor.
   `.wasm` Content-Type and whether Pages compresses `application/wasm` — and
   halves the git-history cost of each rebuild. Fetched lazily on the
   playground route only; the landing page pays nothing.
-> **STALE — found 2026-07-29, needs a call before S3 (S0–S2 unaffected).**
-> The two bullets below assume the site deploy job builds from a `toolchain/`
-> source checkout. It no longer does: `53aa11d` switched deploy.yml to install
-> the toolchain from the latest release via `install.sh`, and its header now
-> states the property outright — "No Rust toolchain, no cargo, no cache." The
-> job checks out only the website repo and the pages repo, so **a wasm build
-> step cannot run there as written.** Three ways out:
-> (a) re-add Rust + a vilan source checkout to the site job — gives back
-> exactly the weight `53aa11d` removed; (b) **build `vilan-wasm` in the vilan
-> repo's own release pipeline and publish it as a release asset, which the
-> site job downloads like it already downloads `install.sh`** — recommended:
-> it mirrors the pattern the toolchain itself now uses, keeps the site job
-> dependency-free, and makes the playground's version identically the release
-> version, which is the "one lever, not two" §7(b) asked for; (c) a separate
-> workflow that commits the artifact to the pages repo. Under (b) the
-> "Version" bullet's "whatever the site's deploy builds" becomes "whatever
-> release the site installs" — same single lever, one less moving part.
+> **AMENDED 2026-07-29 — the two bullets below are superseded on delivery;
+> everything else in them stands.** They assumed the site deploy job builds
+> from a `toolchain/` source checkout. It does not: `53aa11d` switched
+> deploy.yml to install the toolchain from the latest release via
+> `install.sh`, and its header states the property outright — "No Rust
+> toolchain, no cargo, no cache." The job checks out only the website repo and
+> the pages repo, so a wasm build step could not have run there.
+>
+> **The user's call (2026-07-29): architecture (b).** `vilan-wasm` builds in
+> THIS repo's release pipeline and publishes as a release asset; the site job
+> downloads it exactly as it already downloads `install.sh`. Rejected: (a)
+> re-adding Rust + a source checkout to the site job, which gives back the
+> weight `53aa11d` removed; (c) a separate workflow committing the artifact to
+> the pages repo, which adds a third moving part.
+>
+> Consequences to carry into S2/S3:
+> - The wasm artifact joins release.yml's build matrix and asset list, beside
+>   the platform archives and the vsix. The completeness gate that already
+>   walks release assets should cover it.
+> - The "Version" bullet becomes *whatever release the site installs* — still
+>   the single lever §7(b) wanted, with one less moving part, and the badge
+>   reports a released version rather than a main-of-the-moment build.
+> - The playground's freshness is now tied to cutting releases. Acceptable,
+>   and it makes the dormant publish channels (F7) worth more.
+> - The pages repo still receives the artifact via the site job's explicit
+>   allowlist; only its SOURCE changes (downloaded, not built in-job).
 >
 - **Wire**: deploy.yml grows a wasm build step against the `toolchain/`
   checkout already present in the job, a second render
