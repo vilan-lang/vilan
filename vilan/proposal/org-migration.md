@@ -38,7 +38,19 @@
 >   one address that prompted it, since the failure mode here is a new file
 >   rather than a regression in an old one. One allowlist entry:
 >   `THIRD-PARTY-NOTICES.txt`, whose addresses are upstream authors' and not
->   ours to rewrite.
+>   ours to rewrite. **Delivery confirmed by the user 2026-07-29** — the
+>   alias forwards. Note what that test had to be: alias mappings live in the
+>   registrar's dashboard, not in DNS, so nothing about them is verifiable from
+>   outside. DNS only ever proved the *infrastructure* (MX to Namecheap's
+>   forwarders, matching SPF); the alias itself needed a real message.
+>
+>   **Open, and it would quietly undo this:** the forwarding is RECEIVE-ONLY.
+>   There is no SMTP behind `conduct@vilan-lang.org`, so a reply to a conduct
+>   report leaves from a personal mailbox — putting the removed address back,
+>   in a worse setting than the one it came out of, since the recipient is a
+>   stranger mid-report. Costs nothing at zero users; fix before the project
+>   has a community. Either a real mailbox (Namecheap Private Email, ~$1/mo)
+>   or Gmail "send mail as" over some SMTP relay.
 > - `AI_STANCE.md`'s byline → **kept, by user call.** "Reed Syllas" is the
 >   pseudonym the work is published under, and the line is an attestation that
 >   a human wrote the document without AI tooling — a claim whose whole force
