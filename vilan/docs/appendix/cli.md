@@ -85,11 +85,17 @@ is the current directory. Formatting is conservative and a fixed point:
   below it), and the rule applies per line, recursively: a nested chain,
   list literal or struct literal that still overflows splits one level
   further in. A chain that fits stays on (or collapses back to) one line.
-- A list or struct literal over the budget breaks one element (or one
-  `field = value`) per line, with a trailing comma after every one — the
-  last included, so adding an entry is a one-line diff. One that fits
-  stays inline *without* a trailing comma, so the comma marks a split
-  literal and nothing else.
+- A list literal, a struct literal or an import's brace set over the
+  budget breaks one entry per line, with a trailing comma after every one
+  — the last included, so adding an entry is a one-line diff. One that
+  fits stays inline *without* a trailing comma, so the comma marks a
+  split and nothing else.
+- Width is measured on a line, not on a statement: a construct that opens
+  a line and continues below it — a block-bodied closure, a `match`, a
+  block — is judged by the line it opens, and its body lines are measured
+  where they are printed. So `view(…)…when(cond, || { … })` splits its
+  chain like any other; only what shares the opening line counts toward
+  that line's width.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - Argument lists are never wrapped: layout hangs off a call's last
