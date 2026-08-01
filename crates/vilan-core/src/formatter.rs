@@ -2816,6 +2816,13 @@ impl<'src> Printer<'src> {
                 self.print_expr(body);
                 self.out.push(')');
             }
+            // An element expression prints from source, verbatim — the same
+            // mechanism as i-strings. The author's markup layout is kept (the
+            // canonical element printer is the proposal's S3 slice), and the
+            // re-lex safety net still checks every token.
+            Node::Element(_) => {
+                self.out.push_str(&self.source[expr.1.into_range()]);
+            }
             _ => self.bailed = true,
         }
     }

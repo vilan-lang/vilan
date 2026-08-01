@@ -26503,6 +26503,186 @@ fn browser_text_children_ride_create_text_node() {
 }
 
 #[test]
+fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
+    // The silent-stub misrender (found by element-syntax S2's probe, general
+    // and pre-existing): a bound-generic METHOD call whose argument is an
+    // unannotated closure parameter resolved prematurely — the param was
+    // still Unknown, nothing was recorded in `method_call_substitution`, and
+    // the transformer monomorphized to the trait's empty abstract member.
+    // The method path now defers like the free-function path and retries
+    // once the closure's owning call lands the type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(dog: Dog, visit: |Dog| Kennel): Kennel {
+            visit(dog)
+        }
+        fun main() {
+            let direct = Kennel { log = "" }.hold(Dog { name = "rex" });
+            print(direct.log);
+            let via = apply(Dog { name = "rex" }, |d| Kennel { log = "" }.hold(d));
+            print(via.log);
+        }
+        "#,
+        "arf\narf\n",
+    );
+}
+
+#[test]
+fn bind_each_rows_dispatch_slot_children() {
+    // The same bug's std face, the one every real app hits: a row closure's
+    // `.child(t)` dropped the text (empty stub) while a literal child worked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let items: Signal<List<str>> = Signal::new(["alpha", "beta"]);
+            print(render(view("ul").bind_each(items, |t| t, |t| view("li").child(t))));
+        }
+        "#,
+        "<ul><li>alpha</li><li>beta</li></ul>\n",
+    );
+}
+
+#[test]
+fn a_closure_parameter_of_an_unimplemented_type_fails_the_bound() {
+    // The diagnostic hole the stub opened: with the param typed through the
+    // owning call, the bound audit must reject an argument type with no impl
+    // — this COMPILED CLEANLY and misrendered before the fix.
+    assert_fails_with(
+        r#"
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(n: i32, visit: |i32| Kennel): Kennel {
+            visit(n)
+        }
+        fun main() {
+            let _via = apply(5, |n| Kennel { log = "" }.hold(n));
+        }
+        "#,
+        "'i32' does not implement trait 'Speak'",
+    );
+}
+
+#[test]
+fn a_let_bound_closure_with_an_untypable_parameter_reports_honestly() {
+    // The one shape the deferral cannot finish: a let-bound closure whose
+    // parameter no owning call ever types. Before the fix this misrendered
+    // silently; now it is an honest unresolved-type diagnostic (annotating
+    // the parameter resolves it).
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, render, view };
+        fun main() {
+            let wrap = |x| view("p").child(x);
+            let _page = render(wrap("later"));
+        }
+        "#,
+        "could not be resolved",
+    );
+}
+
+#[test]
+fn an_annotated_closure_parameter_dispatches_directly() {
+    // Regression fence: an ANNOTATED closure param was never broken (the body
+    // types immediately) — it must stay direct.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(dog: Dog, visit: |Dog| Kennel): Kennel {
+            visit(dog)
+        }
+        fun main() {
+            let via = apply(Dog { name = "rex" }, |d: Dog| Kennel { log = "" }.hold(d));
+            print(via.log);
+        }
+        "#,
+        "arf\n",
+    );
+}
+
+#[test]
+fn a_generic_free_function_dispatches_a_bound_on_a_closure_parameter() {
+    // Regression fence: the free-function path always had the fill-or-defer
+    // rule (`resolve_call_subject`); the method fix must not disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        fun greet<C: Speak>(guest: C): str {
+            guest.speak()
+        }
+        fun apply(dog: Dog, visit: |Dog| str): str {
+            visit(dog)
+        }
+        fun main() {
+            print(apply(Dog { name = "rex" }, |d| greet(d)));
+        }
+        "#,
+        "arf\n",
+    );
+}
+
+#[test]
 fn browser_static_child_outside_a_boundary_is_fenced() {
     // The S1 widening's sharpened edge, pinned deliberately: a trait-dispatched
     // call carries the union of its impls' context needs, so the browser twin's

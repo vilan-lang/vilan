@@ -2138,6 +2138,57 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // --- The never-silent invariant (element-syntax S2's finding): ---
+        // --- a wired call whose member declares BOUNDED own generics   ---
+        // --- but recorded no binding for one would monomorphize to the ---
+        // --- trait's abstract (empty) member — a silent misrender the  ---
+        // --- loop above never sees, since it iterates what WAS         ---
+        // --- recorded. Make that state a diagnostic.                   ---
+        let wired_calls: Vec<(Id, Id)> = self
+            .function_calls
+            .iter()
+            .filter_map(|(&call_id, function_call)| {
+                match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(member_id)) => Some((call_id, *member_id)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (call_id, member_id) in wired_calls {
+            let Some((_, own_generics)) = self.method_signature(member_id) else {
+                continue;
+            };
+            for constraint_id in own_generics {
+                let bound_traits = self.generic_bound_traits(constraint_id);
+                if bound_traits.is_empty() {
+                    continue;
+                }
+                let recorded = self
+                    .method_call_substitution
+                    .get(&call_id)
+                    .is_some_and(|substitution| substitution.contains_key(&constraint_id));
+                if recorded {
+                    continue;
+                }
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::new());
+                let bound_labels: Vec<String> = bound_traits
+                    .iter()
+                    .filter_map(|(trait_id, arguments)| {
+                        self.bound_trait_label(*trait_id, arguments)
+                    })
+                    .collect();
+                errors.push((
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "cannot infer '{generic_label}' for this call; its bound ': {}' \
+                         cannot be checked",
+                        bound_labels.join(" + ")
+                    ),
+                    constraint_id,
+                ));
+            }
+        }
         // --- Construction sites: a struct literal or enum-variant call ---
         // --- binding a DECLARED generic must satisfy the declaration's  ---
         // --- bounds, independent of whether the value ever meets a call ---
@@ -12073,6 +12124,11 @@ impl<'src> Analyzer<'src> {
             // Handled by the forwarding arm above; a `Const` node never
             // reaches the entity match.
             Node::Const(..) => unreachable!("`const` forwards to its inner expression"),
+            // Elements desugar to their view chains before analysis
+            // (elements::rewrite_items, at every lift site); one reaching the
+            // entity match is a pass bug, degraded like a parse error rather
+            // than panicking an analysis.
+            Node::Element(..) => Some(Expr::Error),
             Node::Error => Some(Expr::Error),
             Node::Void => Some(Expr::Void),
             Node::Null => Some(Expr::Null),
@@ -17666,13 +17722,26 @@ impl<'src> Analyzer<'src> {
                     if some_unbound
                         && (unresolved_closure_argument
                             || argument_ids.iter().any(|argument_id| {
-                                !matches!(
-                                    self.expr_id_to_expr_map.get(argument_id),
-                                    Some(Expr::Closure(_))
-                                ) && matches!(
-                                    self.infer_type(*argument_id, &Type::Unknown, &substitution),
-                                    Type::Unresolved
-                                )
+                                // An argument that IS an unknown closure
+                                // parameter defers too — the free-function
+                                // path's rule (`resolve_call_subject`): its
+                                // type lands when the closure's OWNING call
+                                // resolves. Resolving now binds nothing, the
+                                // bounded generic freezes abstract, and the
+                                // call monomorphizes to the trait's empty
+                                // member — the silent-stub misrender.
+                                self.is_unknown_closure_parameter(*argument_id)
+                                    || (!matches!(
+                                        self.expr_id_to_expr_map.get(argument_id),
+                                        Some(Expr::Closure(_))
+                                    ) && matches!(
+                                        self.infer_type(
+                                            *argument_id,
+                                            &Type::Unknown,
+                                            &substitution
+                                        ),
+                                        Type::Unresolved
+                                    ))
                             }))
                     {
                         return Resolution::Deferred;
@@ -22436,6 +22505,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
+            crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked = &*Box::leak(Box::new(root));
             crate::leak_tally::record(

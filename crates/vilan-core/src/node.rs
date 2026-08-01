@@ -141,6 +141,37 @@ pub struct Closure<'src> {
     pub return_value: Box<Spanned<Node<'src>>>,
 }
 
+/// An element expression's payload (proposal/element-syntax.md §3): the tag,
+/// the head items, and the children. Desugared to a `view("tag")` method
+/// chain before analysis (`elements::rewrite_items`) — the analyzer,
+/// transformer, and interpreter never see this node.
+#[derive(Debug)]
+pub struct ElementBody<'src> {
+    /// The tag name's span (`div` in `<div …>`). A SPAN, not a slice: keyword
+    /// tags (`<use>`) and hyphenated custom elements (`<my-widget>`) span
+    /// several tokens, and the parser has no source access — the desugar pass
+    /// slices the text where the source is in scope.
+    pub tag: Span,
+    pub head: Vec<ElementHeadItem<'src>>,
+    pub children: NodeList<'src>,
+}
+
+/// One item in an element's head (proposal/element-syntax.md §2): undotted
+/// names are attributes, a leading dot is the builder chain verbatim, `on:` is
+/// the event form.
+#[derive(Debug)]
+pub enum ElementHeadItem<'src> {
+    /// `.m(args)` — a chain link, spliced verbatim: the `parse_member_call`
+    /// node (`Call(Accessor(m), generics, args)`, or a bare `Accessor`).
+    Chain(Spanned<Node<'src>>),
+    /// `on:evt(handler)` — the event name and the handler expression. The
+    /// desugar dispatches `.on` vs `.on_event` on a literal handler's arity.
+    Event(Spanned<&'src str>, Box<Spanned<Node<'src>>>),
+    /// `name(value)` / bare `name` — the name's span (sliced at desugar, like
+    /// the tag) and the optional value; a bare name is a boolean attribute.
+    Attribute(Span, Option<Spanned<Node<'src>>>),
+}
+
 #[derive(Debug)]
 pub struct If<'src> {
     pub condition: Box<Spanned<Node<'src>>>,
@@ -233,6 +264,11 @@ pub enum Node<'src> {
     // owned-resource modifier, destruction.md §3 — SURFACE ONLY, carried but
     // not yet classified on), and the variants — each a name, the types of its
     // optional data, and an optional explicit discriminant (`Less = -1`).
+    // An element expression `<div …> … </div>` (proposal/element-syntax.md) —
+    // markup sugar over the `std::ui` view chain. Exists only between parse
+    // and the pre-analysis desugar (`elements::rewrite_items`); the formatter
+    // prints it from source.
+    Element(ElementBody<'src>),
     Enum(
         Spanned<&'src str>,
         Option<GenericParameters<'src>>,
@@ -548,6 +584,22 @@ impl<'src> Node<'src> {
             Node::AccessorWithGenerics(_, arguments) => {
                 for argument in &arguments.0 {
                     visit(argument);
+                }
+            }
+            Node::Element(body) => {
+                for item in &body.head {
+                    match item {
+                        ElementHeadItem::Chain(link) => visit(link),
+                        ElementHeadItem::Event(_, handler) => visit(handler),
+                        ElementHeadItem::Attribute(_, value) => {
+                            if let Some(value) = value {
+                                visit(value);
+                            }
+                        }
+                    }
+                }
+                for child in &body.children {
+                    visit(child);
                 }
             }
             Node::Async(inner)
