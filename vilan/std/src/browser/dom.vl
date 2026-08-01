@@ -24,6 +24,13 @@ external fun create_element(tag: str): Element;
 [extern("document.createElementNS")]
 external fun create_element_ns(namespace: str, tag: str): Element;
 
+/// `document.createTextNode(content)` — a fresh, unattached text node. Text
+/// CHILDREN ride this (`std::ui`'s `child` on a `str` or `Signal<str>`): mixed
+/// content interleaves text nodes between element children as real siblings,
+/// never wrapper spans.
+[extern("document.createTextNode")]
+external fun create_text_node(content: str): Text;
+
 /// `document.querySelector(selector)` — the first element matching a CSS selector
 /// (e.g. `"#name"`, `".item"`, `"input[name=email]"`).
 [extern("document.querySelector")]
@@ -56,6 +63,11 @@ impl Element {
 	[extern(method, "appendChild")]
 	external fun append(self, child: Element): void;
 
+	/// Appends a text node as the element's last child — the `Text` overload of
+	/// `append` (the same `appendChild` binding; the DOM takes any node).
+	[extern(method, "appendChild")]
+	external fun append_text(self, child: Text): void;
+
 	/// Removes the element from the document (`element.remove()`).
 	[extern(method, "remove")]
 	external fun remove(self): void;
@@ -87,6 +99,16 @@ impl Element {
 	/// ignores it.
 	[extern(method, "addEventListener")]
 	external fun on_event(self, event: str, handler: |Event| void): void;
+}
+
+/// A DOM text node — an opaque handle like `Element`, carrying text only: no
+/// attributes, no children, no listeners.
+external struct Text;
+
+impl Text {
+	/// Replaces the node's text (`node.textContent = text`).
+	[extern(set, "textContent")]
+	external fun set_text(self, text: str): void;
 }
 
 /// A DOM event, as delivered to an `on_event` handler — an opaque handle like

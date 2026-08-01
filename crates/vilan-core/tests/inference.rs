@@ -26061,13 +26061,21 @@ fn browser_view_routes_svg_tags_through_create_element_ns() {
     // B37's browser half, pinned at the codegen level: an svg-family tag
     // creates through `createElementNS` (an HTML-namespace `<svg>` renders
     // nothing), a plain tag through `createElement`, and the ambiguous tags
-    // (`a`, `title`, `style`, `script`) stay HTML.
+    // (`a`, `title`, `style`, `script`) stay HTML. Built under an owner:
+    // since element-syntax S1 widened `child`/`attr` over `Slot`/`AttrValue`,
+    // the browser twin's methods sit behind the `owner_scope` fence even for
+    // static slots (a trait-dispatched call carries the union of its impls'
+    // context needs), so the test uses the sanctioned boundary escape hatch.
     let js = compile_browser(
         r#"
+        import std::reactive::{ Owner, run_with_owner };
         import std::ui::{ view, View };
         fun main() {
-            let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
-            let _link = view("div").child(view("a").attr("href", "/"));
+            let owner = Owner::new();
+            let _built = run_with_owner(owner, || {
+                let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
+                view("div").child(view("a").attr("href", "/"))
+            });
         }
         main();
         "#,
@@ -26380,6 +26388,169 @@ fn ssr_nested_component_composition() {
         }
         "#,
         "<div><span class=\"badge\">new</span><span class=\"badge\">hot</span></div>\n",
+    );
+}
+
+#[test]
+fn ssr_child_interleaves_text_and_element_children() {
+    // Element-syntax S1 (proposal/element-syntax.md §5): `child` is
+    // `Slot`-typed — a `str` child is a TEXT NODE, a sibling of element
+    // children, in written order, escaped like any text.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("p")
+                .child("Take ")
+                .child(view("code").text("vilan upgrade"))
+                .child(" & <go>")));
+        }
+        "#,
+        "<p>Take <code>vilan upgrade</code> &amp; &lt;go&gt;</p>\n",
+    );
+}
+
+#[test]
+fn ssr_child_reads_a_signal_text_node_once() {
+    // The `Signal<str>` arm of `Slot`, read once — the value at render time is
+    // the value served, escaped as text.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("p").child("now: ").child(Signal::new("a & b"))));
+        }
+        "#,
+        "<p>now: a &amp; b</p>\n",
+    );
+}
+
+#[test]
+fn ssr_child_accepts_a_list_of_views() {
+    // The `List<View>` arm of `Slot`: one child position, every view, in order.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            let pair: List<View> = [view("i").text("a"), view("b").text("b")];
+            print(render(view("p").child(pair)));
+        }
+        "#,
+        "<p><i>a</i><b>b</b></p>\n",
+    );
+}
+
+#[test]
+fn ssr_attr_reads_a_signal_value_once() {
+    // The `Signal<str>` arm of `AttrValue` — `attr` with a signal is exactly
+    // `bind_attr`: read once here, tracked on the browser twin.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("a").attr("href", Signal::new("/x")).text("go")));
+        }
+        "#,
+        "<a href=\"/x\">go</a>\n",
+    );
+}
+
+#[test]
+fn ssr_text_replaces_text_node_children_too() {
+    // `text`'s replace-children semantics reach the new text nodes: it clears
+    // them exactly as it clears element children.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("p").child("gone").text("kept")));
+        }
+        "#,
+        "<p>kept</p>\n",
+    );
+}
+
+#[test]
+fn browser_text_children_ride_create_text_node() {
+    // The browser twin's `str` and `Signal<str>` `Slot` arms append real text
+    // nodes (`document.createTextNode`) — siblings of element children, never
+    // wrapper spans. The signal arm re-sets the node's own text on change.
+    let js = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                let status = Signal::new("ready");
+                view("p").child("state: ").child(status).child(view("b").text("!"))
+            });
+        }
+        main();
+        "#,
+    )
+    .expect("a clean browser compile");
+    assert!(
+        js.contains("document.createTextNode"),
+        "text children must create text nodes:\n{js}"
+    );
+}
+
+#[test]
+fn browser_static_child_outside_a_boundary_is_fenced() {
+    // The S1 widening's sharpened edge, pinned deliberately: a trait-dispatched
+    // call carries the union of its impls' context needs, so the browser twin's
+    // `child`/`attr` sit behind the `owner_scope` fence even for static slots.
+    // The documented model always said build UI under a root; the fence now
+    // reaches these two methods. (Per-instantiation context precision is the
+    // recorded follow-up — proposal/element-syntax.md §6.)
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("div").child(view("span"));
+        }
+        main();
+        "#,
+    )
+    .expect_err("the browser twin fences static child outside a boundary");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn child_of_an_unimplemented_type_names_the_slot_trait() {
+    // The widened bound's failure mode: the diagnostic names the trait and
+    // points at the bound, not a generic mismatch.
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("p").child(42);
+        }
+        "#,
+        "'i32' does not implement trait 'Slot'",
+    );
+}
+
+#[test]
+fn attr_of_an_unimplemented_type_names_the_attr_value_trait() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("p").attr("n", true);
+        }
+        "#,
+        "'bool' does not implement trait 'AttrValue'",
     );
 }
 

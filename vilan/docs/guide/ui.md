@@ -34,7 +34,7 @@ view so you can keep going:
 
 - **Static content**: `.text(content)`, `.class(name)`,
   `.attr(name, value)`, `.styled(style)` (see [Styling](styling.md)).
-- **Structure**: `.child(view)`, `.children(views)`.
+- **Structure**: `.child(content)`, `.children(views)`.
 - **Events**: `.on(event, handler)`, or `.on_event(event, |e| …)` when
   you need the DOM event itself (`prevent_default`, `key()`, modifiers).
 - **Reactive bindings**: `.bind_text(signal)`, `.bind_class(signal)`,
@@ -42,6 +42,40 @@ view so you can keep going:
 
 Every `bind_*` sets the property now and re-sets it whenever the signal
 changes. There is no render loop to trigger.
+
+## Text children and mixed content
+
+`child` takes more than a `View`. Anything that can fill a child
+position works — the value's type decides what lands in the DOM:
+
+- a `View` appends as an element;
+- a `str` appends as a **text node**;
+- a `Signal<str>` appends as a text node kept in sync;
+- a `List<View>` appends every view, in order.
+
+Text nodes make mixed content direct: prose around an inline element is
+a run of siblings, not a pile of wrapper spans.
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+
+fun tip(): View {
+	view("p")
+		.child("Update any time with ")
+		.child(view("code").text("vilan upgrade"))
+		.child(".")
+}
+
+fun main() {
+	let _root = mount_root("app", || tip());
+}
+```
+
+`attr` is typed the same way: a `str` value sets once, a `Signal<str>`
+re-sets whenever it changes — `attr("href", signal)` and
+`bind_attr("href", signal)` are the same binding, chosen by type or by
+name. (`text` is unchanged: it still replaces everything the element
+contains, text nodes included, like the DOM's `textContent`.)
 
 ## Components are just functions
 

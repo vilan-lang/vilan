@@ -22,7 +22,14 @@
 
 import pkg::compare::PartialEq;
 import pkg::dev::{ hmr_active, on_teardown };
-import pkg::dom::{ Element, Event, create_element, create_element_ns, get_element_by_id };
+import pkg::dom::{
+	Element,
+	Event,
+	create_element,
+	create_element_ns,
+	create_text_node,
+	get_element_by_id,
+};
 import pkg::option::Option::{ None, Some, self };
 import pkg::reactive::{
 	Disposable,
@@ -141,9 +148,12 @@ impl View {
 		self
 	}
 
-	/// A static attribute.
-	fun attr(self, name: str, value: str): View {
-		self.element.set_attribute(name, value);
+	/// An attribute. The value's TYPE decides its life
+	/// (proposal/element-syntax.md §5): a `str` sets once; a `Signal<str>`
+	/// re-sets whenever it changes, exactly `bind_attr`. Anything `AttrValue`
+	/// fills the slot.
+	fun attr<V: AttrValue>(self, name: str, value: V): View {
+		value.apply(self, name);
 		self
 	}
 
@@ -167,9 +177,14 @@ impl View {
 		self
 	}
 
-	/// Append a child view — structure only, no ownership bookkeeping.
-	fun child(self, child: View): View {
-		self.element.append(child.element);
+	/// Append content — structure only, no ownership bookkeeping. Anything
+	/// `Slot` fills a child position (proposal/element-syntax.md §5): a `View`
+	/// appends as an element, a `str` as a text node, a `Signal<str>` as a
+	/// text node kept in sync, a `List<View>` appends each. Text and element
+	/// children interleave as real siblings — mixed content without wrapper
+	/// spans.
+	fun child<C: Slot>(self, content: C): View {
+		content.place(self);
 		self
 	}
 
@@ -411,6 +426,74 @@ impl View {
 			element.set_hidden(!visible);
 		});
 		self
+	}
+}
+
+/// Something that can fill a child position (proposal/element-syntax.md §5) —
+/// the type-directed half of `child`: the value's type carries the
+/// static-vs-tracked distinction, and ordinary trait dispatch decides what
+/// lands in the DOM.
+/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+trait Slot {
+	fun place(self, parent: View);
+}
+
+/// A child element.
+impl View with Slot {
+	fun place(self, parent: View) {
+		parent.element.append(self.element);
+	}
+}
+
+/// A static text node.
+impl str with Slot {
+	fun place(self, parent: View) {
+		parent.element.append_text(create_text_node(self));
+	}
+}
+
+/// A reactive text node — re-set whenever the signal changes: `bind_text`
+/// scoped to one node instead of the whole element. Registers with the
+/// nearest enclosing boundary, like every binding.
+impl Signal<str> with Slot {
+	fun place(self, parent: View) {
+		let node = create_text_node("");
+		parent.element.append_text(node);
+		self.effect(|value| {
+			node.set_text(value);
+		});
+	}
+}
+
+/// Several child elements, in order.
+impl List<View> with Slot {
+	fun place(self, parent: View) {
+		for item in self {
+			parent.element.append(item.element);
+		}
+	}
+}
+
+/// Something that can fill an attribute value (proposal/element-syntax.md §5).
+/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+trait AttrValue {
+	fun apply(self, parent: View, name: str);
+}
+
+/// Set once.
+impl str with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		parent.element.set_attribute(name, self);
+	}
+}
+
+/// Set and track — exactly `bind_attr`.
+impl Signal<str> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		let element = parent.element;
+		self.effect(|value| {
+			element.set_attribute(name, value);
+		});
 	}
 }
 
