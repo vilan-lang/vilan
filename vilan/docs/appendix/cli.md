@@ -82,9 +82,14 @@ is the current directory. Formatting is conservative and a fixed point:
 
 - A statement over 100 columns whose expression is a method chain
   splits (subject on the statement's line, one `.link(…)` per line
-  below it), and the rule applies per line, recursively: a nested chain
-  or list literal that still overflows splits one level further in. A
-  chain that fits stays on (or collapses back to) one line.
+  below it), and the rule applies per line, recursively: a nested chain,
+  list literal or struct literal that still overflows splits one level
+  further in. A chain that fits stays on (or collapses back to) one line.
+- A list or struct literal over the budget breaks one element (or one
+  `field = value`) per line, with a trailing comma after every one — the
+  last included, so adding an entry is a one-line diff. One that fits
+  stays inline *without* a trailing comma, so the comma marks a split
+  literal and nothing else.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
 - Argument lists are never wrapped: layout hangs off a call's last

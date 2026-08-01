@@ -261,7 +261,12 @@ fun connect_split(base_url: str): SplitDuplex {
 			rest = drain_sse(rest, dispatch);
 		}
 	};
-	SplitDuplex { connection = parse_announced(connection.read()), send_url = i"{base_url}/send?c={connection.read()}", inbound, early }
+	SplitDuplex {
+		connection = parse_announced(connection.read()),
+		send_url = i"{base_url}/send?c={connection.read()}",
+		inbound,
+		early,
+	}
 }
 
 /// The `__conn:<id>` announcement's id, parsed once at connect time. A
@@ -676,7 +681,17 @@ fun connect_socket(url: str): Result<SocketDuplex, str> {
 		Err(let reason) => Err(reason),
 		Ok(let opened) => {
 			let (socket, connection) = opened;
-			let duplex = SocketDuplex { socket = Shared::new(socket), url, connection = Shared::new(connection), state = Signal::new(ConnectionState::Connected), inbound, early, pending, next_request = Shared::new(0), on_reconnect = Shared::new([]) };
+			let duplex = SocketDuplex {
+				socket = Shared::new(socket),
+				url,
+				connection = Shared::new(connection),
+				state = Signal::new(ConnectionState::Connected),
+				inbound,
+				early,
+				pending,
+				next_request = Shared::new(0),
+				on_reconnect = Shared::new([]),
+			};
 			watch_socket(duplex);
 			// HMR (`hmr.md` §3, step 2): close the live socket before the next
 			// bundle re-dials — the fresh duplex resyncs from the server exactly as
@@ -1012,7 +1027,12 @@ struct ReactiveServer {
 
 impl ReactiveServer {
 	fun new(transport: DuplexEnd, codec: Codec): ReactiveServer {
-		let server = ReactiveServer { transport, codec, sources = Shared::new([]), live = Shared::new([]) };
+		let server = ReactiveServer {
+			transport,
+			codec,
+			sources = Shared::new([]),
+			live = Shared::new([]),
+		};
 		(server.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn (proposal/reactive-batching.md)
 			batch(|| server.receive(frame));
@@ -1148,7 +1168,13 @@ impl ReactiveClient {
 		};
 		let channel_cell = Shared::new(channel);
 		self.routes.write().push((channel_cell, deliver));
-		RemoteSource { channel = channel_cell, subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)), wanted = Shared::new(false), transport = self.transport, cache }
+		RemoteSource {
+			channel = channel_cell,
+			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
+			wanted = Shared::new(false),
+			transport = self.transport,
+			cache,
+		}
 	}
 
 	/// One inbound frame: an `Update` fans out to its channel's deliverers

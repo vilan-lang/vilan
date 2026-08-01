@@ -405,7 +405,7 @@ pub enum Node<'src> {
     StructInitializer(
         &'src str,
         Option<GenericArguments<'src>>,
-        Spanned<Vec<Spanned<(&'src str, Option<Spanned<Self>>)>>>,
+        Spanned<Vec<Spanned<StructInitializerField<'src>>>>,
     ),
     Trait(
         Spanned<&'src str>,
@@ -762,6 +762,10 @@ pub type EnumVariant<'src> = (&'src str, Vec<Spanned<Node<'src>>>, Option<i64>);
 // annotation, and whether it is `[expose]`d — observable by a service's client
 // as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
 pub type StructField<'src> = (Spanned<&'src str>, Option<Spanned<Node<'src>>>, bool);
+
+// One field of a struct LITERAL: its name, and the value assigned to it —
+// `None` for the shorthand form, where the name is also the value's binding.
+pub type StructInitializerField<'src> = (&'src str, Option<Spanned<Node<'src>>>);
 
 // A match-leg pattern.
 #[derive(Debug)]

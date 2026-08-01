@@ -78,7 +78,12 @@ struct WsParser {
 
 impl WsParser {
 	fun new(): WsParser {
-		WsParser { buffer = Shared::new(Bytes::alloc(0)), fragment_opcode = Shared::new(0), fragment_payload = Shared::new(Bytes::alloc(0)), violated = Shared::new(false) }
+		WsParser {
+			buffer = Shared::new(Bytes::alloc(0)),
+			fragment_opcode = Shared::new(0),
+			fragment_payload = Shared::new(Bytes::alloc(0)),
+			violated = Shared::new(false),
+		}
 	}
 
 	/// Consume `chunk`, returning every event completed by it, in order.

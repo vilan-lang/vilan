@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`vilan fmt` breaks up long struct literals.** A struct literal was the one composite the width rule did not reach: the printer joined its fields with `", "` no matter how many there were, so a hand-wrapped literal was *collapsed* onto a single line of whatever width it came to — and, having no layout of its own, could never be broken up again. A real one came out at 357 columns. A literal over the budget now renders one `field = value,` per line, one indentation level in, with `}` back at the opening line's indent, exactly as a list literal renders one element per line; the trailing comma follows the same rule, present on every field of a split literal (so adding a field is a one-line diff) and absent from one that fits. Generic arguments stay on the opening line with the name, shorthand fields take a line like any other, and an empty literal never breaks. Being the same rule, it composes with the existing ones in both directions at any depth: a field whose own line overflows splits in turn — as a nested literal, a chain, or a list — and a chain link's tail descent now reaches a struct literal sitting in its last argument, so `.child(Card { … })` breaks where `.child(column(…, [ … ]))` already did.
+
 ## v0.18.2 — 2026-07-29
 
 **The npm packages are signed now.** Publishing to npm no longer goes through a stored token. The release workflow proves who it is to npm per run instead, so there is no long-lived credential behind the channel at all — nothing to expire, rotate, or leak. The visible half is provenance: each of the six packages carries a "Built and signed on GitHub Actions" badge linking to the exact workflow run that built it, so what npm serves can be traced back to this repository's tagged source. Installing and running are unchanged.

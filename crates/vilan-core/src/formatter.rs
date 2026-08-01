@@ -9,7 +9,7 @@
 
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern,
+    NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -1947,6 +1947,57 @@ impl<'src> Printer<'src> {
         self.out.push(']');
     }
 
+    /// Prints a struct literal in split form: `{` closes the line that opened
+    /// it, every field takes its own line one indentation level in with a
+    /// trailing comma — the last one included, for the same reason a split list
+    /// carries one — and `}` returns to the opening line's indent, where the
+    /// caller's closing parens and terminator glue after it.
+    ///
+    /// A struct literal is a braced field list, so it breaks on exactly the rule
+    /// [`Self::print_split_list`] applies to a bracketed element list: each
+    /// field's line is measured in turn, and over budget the field rolls back
+    /// and reprints with [`Split::Tail`] armed, so a field whose value is itself
+    /// a chain or a list breaks with its own lines one level past the field. The
+    /// measured line includes the field's comma — the literal prints it, onto
+    /// the field's own line.
+    fn print_split_struct(&mut self, fields: &[Spanned<StructInitializerField<'src>>]) {
+        self.out.push_str(" {");
+        self.indent += 1;
+        for ((field_name, value), _) in fields {
+            let field_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.line();
+            let line_start = self.out.len();
+            self.print_struct_field(field_name, value);
+            self.out.push(',');
+            if self.over_line_budget(line_start) {
+                self.out.truncate(field_start);
+                self.cursor = comment_cursor;
+                self.line();
+                self.split = Split::Tail;
+                self.print_struct_field(field_name, value);
+                self.out.push(',');
+            }
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('}');
+    }
+
+    /// Prints one `name = value` field of a struct literal, in either form. Takes
+    /// the pending split the way `print_expr` does, so a shorthand field — which
+    /// has no value position to hand it to — drops it rather than leaking an
+    /// armed split onto whatever prints next.
+    fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
+        let split = std::mem::take(&mut self.split);
+        self.out.push_str(field_name);
+        if let Some(value) = value {
+            self.out.push_str(" = ");
+            self.split = split;
+            self.print_expr(value);
+        }
+    }
+
     /// Prints just the postfix a spine step applies — its subject is already
     /// printed. Mirrors the four postfix arms of `print_expr`.
     fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
@@ -2432,19 +2483,22 @@ impl<'src> Printer<'src> {
                     }
                     self.out.push('>');
                 }
+                // A struct literal whose line overflowed the budget breaks one
+                // field per line (see [`Self::print_split_struct`]); one that
+                // fits stays inline, WITHOUT a trailing comma, exactly as
+                // before. An empty literal never breaks — `{⏎}` buys a line and
+                // nothing else.
                 if fields.0.is_empty() {
                     self.out.push_str(" {}");
+                } else if split != Split::Off {
+                    self.print_split_struct(&fields.0);
                 } else {
                     self.out.push_str(" { ");
                     for (index, ((field_name, value), _)) in fields.0.iter().enumerate() {
                         if index > 0 {
                             self.out.push_str(", ");
                         }
-                        self.out.push_str(field_name);
-                        if let Some(value) = value {
-                            self.out.push_str(" = ");
-                            self.print_expr(value);
-                        }
+                        self.print_struct_field(field_name, value);
                     }
                     self.out.push_str(" }");
                 }
@@ -4193,6 +4247,290 @@ mod nested_layout {
             once.contains("\t\t.child(view(\"p\")\n\t\t\t.styled(art_caption)\n"),
             "the sibling link did not split:\n{once}"
         );
+    }
+}
+
+#[cfg(test)]
+mod struct_literal_layout {
+    //! A struct literal is a braced field list, so it breaks on exactly the rule
+    //! a bracketed element list breaks on (see [`super::nested_layout`]): over
+    //! the budget it renders one `field = value,` per line, one indentation
+    //! level in, with a trailing comma after every field — the last included, so
+    //! adding a field is a one-line diff — and `}` back at the opening line's
+    //! indent. What fits stays inline WITHOUT a trailing comma, so the comma
+    //! marks a split literal and nothing else.
+    //!
+    //! Before this, struct literals were the one composite the width rule did
+    //! not reach: a hand-wrapped literal was COLLAPSED onto a single line of
+    //! whatever width it came to, with no way to break it again (Kolt's
+    //! `KoltStore { … }` came out at 357 columns), because the printer joined
+    //! its fields with `", "` unconditionally.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`
+    //! (same tokens out, no silent bail, canonical in ONE pass, idempotent).
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    // --- The shape -----------------------------------------------------------
+
+    /// The motivating line, from Kolt's server: a struct literal the formatter
+    /// used to collapse onto one 357-column line.
+    #[test]
+    fn an_over_budget_struct_literal_splits_one_field_per_line() {
+        let source = "let store = KoltStore { workspaces = workspaces, tasks = tasks, \
+                      register_hook = Shared::new(register), login_hook = Shared::new(login), \
+                      create_hook = Shared::new(create) };\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let store = KoltStore {\n\
+             \tworkspaces = workspaces,\n\
+             \ttasks = tasks,\n\
+             \tregister_hook = Shared::new(register),\n\
+             \tlogin_hook = Shared::new(login),\n\
+             \tcreate_hook = Shared::new(create),\n\
+             };\n",
+        );
+    }
+
+    /// The other direction, and the trailing comma's whole rule — the same one
+    /// a list literal follows: a literal that fits stays inline WITHOUT one, and
+    /// a hand-written trailing comma in a fitting literal is dropped.
+    #[test]
+    fn a_struct_literal_that_fits_stays_inline_without_a_trailing_comma() {
+        assert_construct(
+            "let fits = Point { x = 1, y = 2 };\n",
+            "let fits = Point { x = 1, y = 2 };\n",
+        );
+        assert_construct(
+            "let fits = Point { x = 1, y = 2, };\n",
+            "let fits = Point { x = 1, y = 2 };\n",
+        );
+    }
+
+    /// The boundary, arithmetically: `let padded = P { aa = "…" };` is 27
+    /// columns of code around the padding string, so 73 padding characters make
+    /// exactly the 100-column budget and 74 make 101. At the budget the literal
+    /// stays inline; one column over, it splits.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("let padded = P {{ aa = \"{}\" }};\n", "P".repeat(73));
+        let over_budget = format!("let padded = P {{ aa = \"{}\" }};\n", "P".repeat(74));
+        assert_eq!(columns(at_budget.trim_end()), LINE_BUDGET);
+        assert_eq!(columns(over_budget.trim_end()), LINE_BUDGET + 1);
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("let padded = P {{\n\taa = \"{}\",\n}};\n", "P".repeat(74)),
+        );
+    }
+
+    /// The width is the statement's own line, so its leading indentation counts
+    /// (a tab as four columns): the same literal stays inline at the top level
+    /// and splits inside a block that pushes it over.
+    #[test]
+    fn indentation_counts_toward_the_budget() {
+        let padding = "P".repeat(70);
+        let statement = format!("let padded = P {{ aa = \"{padding}\" }};");
+        // 97 columns at the top level, 101 inside one block (one tab = four).
+        assert_eq!(columns(&statement), LINE_BUDGET - 3);
+        assert_construct(&format!("{statement}\n"), &format!("{statement}\n"));
+        assert_construct(
+            &format!("fun demo() {{\n\t{statement}\n}}\n"),
+            &format!(
+                "fun demo() {{\n\
+                 \tlet padded = P {{\n\
+                 \t\taa = \"{padding}\",\n\
+                 \t}};\n\
+                 }}\n"
+            ),
+        );
+    }
+
+    /// An EMPTY literal is never broken: `{⏎}` buys a line and no clarity. Here
+    /// the over-budget cause is an earlier argument, so the armed tail reaches
+    /// the empty literal and declines — the same pin the empty list carries.
+    #[test]
+    fn an_empty_struct_literal_at_an_over_budget_tail_stays_inline() {
+        let padding = "P".repeat(81);
+        let split_line = format!("\t.wrap(\"{padding}\", Empty {{}})");
+        assert_over_budget(&split_line);
+        assert_construct(
+            &format!("let built = subject.wrap(\"{padding}\", Empty {{}}).tail(3);\n"),
+            &format!("let built = subject\n{split_line}\n\t.tail(3);\n"),
+        );
+    }
+
+    /// Shorthand fields (no `= value`) and generic arguments ride the split
+    /// unchanged: the arguments stay on the opening line with the name, where
+    /// they belong, and a shorthand field takes a line like any other.
+    #[test]
+    fn shorthand_fields_and_generic_arguments_ride_the_split() {
+        let source = "let generic = Wrapper<Task> { alpha, beta_field_name, gamma = compute(a), \
+                      delta = other(b), epsilon = third(c) };\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let generic = Wrapper<Task> {\n\
+             \talpha,\n\
+             \tbeta_field_name,\n\
+             \tgamma = compute(a),\n\
+             \tdelta = other(b),\n\
+             \tepsilon = third(c),\n\
+             };\n",
+        );
+    }
+
+    // --- The recursion: a field's line is measured like any other ------------
+
+    /// A field whose own line overflows splits in turn, so a struct literal
+    /// nested in a field breaks one level past it — and the field that fits
+    /// stays inline beside it.
+    #[test]
+    fn an_over_budget_field_splits_a_nested_struct_literal() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet deep = Outer { name = \"a\", inner = Inner { alpha = one_value_here, \
+             beta = two_value_here, gamma = three_value, delta = four_value, epsilon = five }, \
+             tail = 1 };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet deep = Outer {\n\
+             \t\tname = \"a\",\n\
+             \t\tinner = Inner {\n\
+             \t\t\talpha = one_value_here,\n\
+             \t\t\tbeta = two_value_here,\n\
+             \t\t\tgamma = three_value,\n\
+             \t\t\tdelta = four_value,\n\
+             \t\t\tepsilon = five,\n\
+             \t\t},\n\
+             \t\ttail = 1,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The composition the other way: a field whose value is a postfix chain
+    /// splits as one, its links one level past the field.
+    #[test]
+    fn an_over_budget_field_splits_as_a_chain() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet chained = Holder { label = \"x\", built = subject.first_link(argument_one)\
+             .second_link(argument_two).third_link(three_arg).fourth(f) };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet chained = Holder {\n\
+             \t\tlabel = \"x\",\n\
+             \t\tbuilt = subject\n\
+             \t\t\t.first_link(argument_one)\n\
+             \t\t\t.second_link(argument_two)\n\
+             \t\t\t.third_link(three_arg)\n\
+             \t\t\t.fourth(f),\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// And into a list: the field's comma glues after the `]`, exactly as the
+    /// statement's `;` glues after a split list's.
+    #[test]
+    fn an_over_budget_field_splits_a_list() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet listed = Holder { label = \"x\", items = [alpha_element_one, \
+             beta_element_two, gamma_element_three, delta_element_four, epsilon] };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet listed = Holder {\n\
+             \t\tlabel = \"x\",\n\
+             \t\titems = [\n\
+             \t\t\talpha_element_one,\n\
+             \t\t\tbeta_element_two,\n\
+             \t\t\tgamma_element_three,\n\
+             \t\t\tdelta_element_four,\n\
+             \t\t\tepsilon,\n\
+             \t\t],\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The descent reaches a literal the same way it reaches a list: a chain
+    /// link whose line overflows breaks its LAST argument, and a struct literal
+    /// sitting there is now something breakable. The `})` closes at the link's
+    /// indent.
+    #[test]
+    fn a_links_tail_descends_into_a_struct_literal() {
+        assert_construct(
+            "fun tail(): View {\n\
+             \tview(\"div\").styled(shell).child(Card { title = \"A rather long title here\", \
+             body = \"and a body\", footer = \"plus a footer\" })\n\
+             }\n",
+            "fun tail(): View {\n\
+             \tview(\"div\")\n\
+             \t\t.styled(shell)\n\
+             \t\t.child(Card {\n\
+             \t\t\ttitle = \"A rather long title here\",\n\
+             \t\t\tbody = \"and a body\",\n\
+             \t\t\tfooter = \"plus a footer\",\n\
+             \t\t})\n\
+             }\n",
+        );
+    }
+
+    // --- Stability -----------------------------------------------------------
+
+    /// Backlog 41, unchanged in scope by this rule and pinned here for the
+    /// literal: a comment written BETWEEN fields reprints below the whole
+    /// statement, because the comment machinery still flushes at statement
+    /// boundaries. Never dropped — the law holds — but orphaned from the field
+    /// it explains, exactly as a mid-chain comment is, and exactly as this
+    /// input already behaved when the literal collapsed onto one line instead
+    /// of splitting. Attaching it to its field is 41's work; when that lands
+    /// this pin flips to the attached form.
+    #[test]
+    fn a_comment_between_fields_moves_below_the_statement() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet store = KoltStore {\n\
+             \t\t// the authoritative lists\n\
+             \t\tworkspaces = workspaces,\n\
+             \t\ttasks = tasks,\n\
+             \t\tregister_hook = Shared::new(register),\n\
+             \t\tlogin_hook = Shared::new(login),\n\
+             \t\tcreate_hook = Shared::new(create),\n\
+             \t};\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet store = KoltStore {\n\
+             \t\tworkspaces = workspaces,\n\
+             \t\ttasks = tasks,\n\
+             \t\tregister_hook = Shared::new(register),\n\
+             \t\tlogin_hook = Shared::new(login),\n\
+             \t\tcreate_hook = Shared::new(create),\n\
+             \t};\n\
+             \t// the authoritative lists\n\
+             }\n",
+        );
+    }
+
+    /// A file carrying both forms is a fixed point in one pass: the split
+    /// literal stays split, the fitting one stays inline and uncommaed, and
+    /// neither drifts on a second run.
+    #[test]
+    fn a_file_mixing_split_and_inline_struct_literals_is_a_fixed_point() {
+        let canonical = "let fits = Point { x = 1, y = 2 };\n\
+                         let store = KoltStore {\n\
+                         \tworkspaces = workspaces,\n\
+                         \ttasks = tasks,\n\
+                         \tregister_hook = Shared::new(register),\n\
+                         \tlogin_hook = Shared::new(login),\n\
+                         \tcreate_hook = Shared::new(create),\n\
+                         };\n";
+        assert_construct(canonical, canonical);
+        assert_eq!(format(canonical), canonical);
     }
 }
 

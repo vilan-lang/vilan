@@ -318,7 +318,12 @@ struct JsonWriter {
 
 impl JsonWriter {
 	fun new(): JsonWriter {
-		JsonWriter { out = Shared::new(""), pending_comma = Shared::new(false), saved_commas = Shared::new([]), variant_arities = Shared::new([]) }
+		JsonWriter {
+			out = Shared::new(""),
+			pending_comma = Shared::new(false),
+			saved_commas = Shared::new([]),
+			variant_arities = Shared::new([]),
+		}
 	}
 
 	/// Appends `text` as one value at the current level: separator first, and
@@ -356,7 +361,23 @@ impl JsonWriter {
 	/// The closure record a `Codec` hands out — thin delegates to the trait
 	/// methods below (the codec-as-a-value erasure; direct `encode_json` skips it).
 	fun serializer(self): Serializer {
-		Serializer { begin_struct = |fields| self.begin_struct(fields), field = |name| self.field(name), end_struct = || self.end_struct(), begin_list = |length| self.begin_list(length), end_list = || self.end_list(), begin_variant = |name, arity| self.begin_variant(name, arity), end_variant = || self.end_variant(), null_value = || self.null_value(), some_value = || self.some_value(), str_value = |value| self.str_value(value), i32_value = |value| self.i32_value(value), u32_value = |value| self.u32_value(value), i53_value = |value| self.i53_value(value), f64_value = |value| self.f64_value(value), bool_value = |value| self.bool_value(value) }
+		Serializer {
+			begin_struct = |fields| self.begin_struct(fields),
+			field = |name| self.field(name),
+			end_struct = || self.end_struct(),
+			begin_list = |length| self.begin_list(length),
+			end_list = || self.end_list(),
+			begin_variant = |name, arity| self.begin_variant(name, arity),
+			end_variant = || self.end_variant(),
+			null_value = || self.null_value(),
+			some_value = || self.some_value(),
+			str_value = |value| self.str_value(value),
+			i32_value = |value| self.i32_value(value),
+			u32_value = |value| self.u32_value(value),
+			i53_value = |value| self.i53_value(value),
+			f64_value = |value| self.f64_value(value),
+			bool_value = |value| self.bool_value(value),
+		}
 	}
 }
 
@@ -514,7 +535,26 @@ impl JsonReader {
 	/// The closure record a `Codec` hands out — thin delegates to the trait
 	/// methods below (direct `decode_json` skips it).
 	fun deserializer(self): Deserializer {
-		Deserializer { begin_struct = || self.begin_struct(), field = |name| self.field(name), end_struct = || self.end_struct(), begin_list = || self.begin_list(), end_list = || self.end_list(), variant_tag = || self.variant_tag(), begin_variant = |name, arity| self.begin_variant(name, arity), end_variant = || self.end_variant(), is_null = || self.is_null(), null_value = || self.null_value(), str_value = || self.str_value(), i32_value = || self.i32_value(), u32_value = || self.u32_value(), i53_value = || self.i53_value(), f64_value = || self.f64_value(), bool_value = || self.bool_value(), fail = |reason| self.fail(reason), failed = || self.failed() }
+		Deserializer {
+			begin_struct = || self.begin_struct(),
+			field = |name| self.field(name),
+			end_struct = || self.end_struct(),
+			begin_list = || self.begin_list(),
+			end_list = || self.end_list(),
+			variant_tag = || self.variant_tag(),
+			begin_variant = |name, arity| self.begin_variant(name, arity),
+			end_variant = || self.end_variant(),
+			is_null = || self.is_null(),
+			null_value = || self.null_value(),
+			str_value = || self.str_value(),
+			i32_value = || self.i32_value(),
+			u32_value = || self.u32_value(),
+			i53_value = || self.i53_value(),
+			f64_value = || self.f64_value(),
+			bool_value = || self.bool_value(),
+			fail = |reason| self.fail(reason),
+			failed = || self.failed(),
+		}
 	}
 }
 

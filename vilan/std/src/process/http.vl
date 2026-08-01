@@ -267,7 +267,13 @@ struct ServerBuilder {
 
 impl Server {
 	fun builder(): ServerBuilder {
-		ServerBuilder { port = 3000, request_handler = |request| Response::builder().code(404).body("Not Found").build(), on_start = |server| {}, on_stop = |server| {}, upgrade_handler = None }
+		ServerBuilder {
+			port = 3000,
+			request_handler = |request| Response::builder().code(404).body("Not Found").build(),
+			on_start = |server| {},
+			on_stop = |server| {},
+			upgrade_handler = None,
+		}
 	}
 
 	/// The port this server listens on: the requested one before `start`, the
@@ -361,6 +367,11 @@ impl ServerBuilder {
 	}
 
 	fun build(self): Server {
-		Server { port = self.port, request_handler = self.request_handler, on_start = self.on_start, upgrade_handler = self.upgrade_handler }
+		Server {
+			port = self.port,
+			request_handler = self.request_handler,
+			on_start = self.on_start,
+			upgrade_handler = self.upgrade_handler,
+		}
 	}
 }
