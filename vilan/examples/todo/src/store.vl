@@ -7,12 +7,12 @@
 // and the whole boot/persist lifecycle is the store's own business instead of
 // wiring injected from `main`.
 
-import std::reactive::Signal;
-import std::shared::Shared;
-import std::json::json_codec;
-import std::wire::{ encode, decode, Frame };
-import std::result::Result::{ self, Ok, Err };
 import std::fs;
+import std::json::json_codec;
+import std::reactive::Signal;
+import std::result::Result::{ Err, Ok, self };
+import std::shared::Shared;
+import std::wire::{ Frame, decode, encode };
 import pkg::todo::Todo;
 
 // Where the list lives between runs — reloaded on boot, rewritten on change.

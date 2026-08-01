@@ -2,8 +2,8 @@
 // server's HTML shell provides, and calls the same `common::greeting` the server
 // does (proof the shared package compiled into both bundles).
 
-import std::dom::{ Element, get_element_by_id, create_element };
-import std::fetch::{ fetch, Response };
+import std::dom::{ Element, create_element, get_element_by_id };
+import std::fetch::{ Response, fetch };
 import common::greeting;
 
 fun main() {

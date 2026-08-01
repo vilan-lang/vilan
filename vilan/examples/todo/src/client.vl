@@ -4,13 +4,13 @@
 // `items` itself — the server owns the data, and every change (this tab's
 // included) arrives over the wire.
 
+import std::json::json_codec;
 import std::print;
 import std::reactive::Signal;
-import std::json::json_codec;
-import std::result::Result::{ Ok, Err };
+import std::result::Result::{ Err, Ok };
 import std::ui::mount_root;
-import pkg::todo::Todo;
 import pkg::store::TodoClient;
+import pkg::todo::Todo;
 import pkg::todos::todos;
 
 async fun main() {

@@ -8,6 +8,11 @@ tracks the latest state.
 
 ## Unreleased
 
+**A comment written inside a chain, list, struct literal, import or signature stays where you put it.** The comment machinery flushes at statement boundaries, so a comment written *inside* an expression had nowhere to go: it was re-emitted below the whole statement, never dropped but orphaned from the thing it explained — a note above one chain link would resurface before the enclosing function's closing brace. Such a comment now attaches to the element it precedes, on its own line at that element's indentation, in all five constructs the formatter can split. It also keeps the construct split even when the line would otherwise fit, because a collapsed construct has no line to keep the comment on; that is what makes the attachment possible rather than a preference. A comment *inside* an element — in a closure body one link carries — belongs to that body, prints where it was written, and changes no layout. Code without comments is unaffected: a hand-split construct that fits still collapses.
+
+The examples were waiting on this. Seventeen of them reflow under the width rules shipped earlier in this release, and sweeping them before now would have moved their teaching comments away from the lines they teach; that sweep has landed with the comments untouched.
+
+
 **A chain whose `})` is followed by more chain now breaks, however narrow it is.** Width was the formatter's only reason to split a chain, so a chain that read badly without being wide was left alone — and put back if you broke it yourself. `Server::builder().port(3000).on_request(|request| {` … `}).on_start(|server| {` … `}).build();` is inside the budget on every line and unreadable anyway, because `}).on_start(|server| {` is the end of one argument, the start of the next link and the start of its argument, all at once. A chain now splits regardless of width when a call link that is not its last renders across lines. A chain that *ends* at its spanning link keeps its shape: `self.cleanups.write().push(|| { … });` is the ordinary trailing-closure idiom, it has no seam, and breaking it would buy two lines and no clarity. Whether a link spans lines is decided by rendering it and looking, not by guessing from its shape — the same discipline the width rule follows.
 
 ## v0.19.0 — 2026-08-01

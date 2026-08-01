@@ -2,9 +2,9 @@
 // startup, then serves the HTML shell on every path and the bundle at
 // `/client.js`. It shares `common::greeting` with the client.
 
-import std::print;
-import std::http::{ Server, Response, Request };
 import std::fs::read_file_to_str;
+import std::http::{ Request, Response, Server };
+import std::print;
 import common::greeting;
 
 async fun main() {
@@ -16,20 +16,11 @@ async fun main() {
 		.port(3000)
 		.on_request(|request| {
 			match request.path() {
-				"/client.js" => Response::builder()
-					.set_header("Content-Type", "text/javascript")
-					.body(client_js)
-					.build(),
+				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
 				// An API route the client calls with `fetch`. Its body uses the
 				// same shared `greeting` the client does.
-				"/api/hello" => Response::builder()
-					.set_header("Content-Type", "text/plain")
-					.body(greeting("the API"))
-					.build(),
-				_ => Response::builder()
-					.set_header("Content-Type", "text/html")
-					.body(page())
-					.build(),
+				"/api/hello" => Response::builder().set_header("Content-Type", "text/plain").body(greeting("the API")).build(),
+				_ => Response::builder().set_header("Content-Type", "text/html").body(page()).build(),
 			}
 		})
 		.on_start(|server| {

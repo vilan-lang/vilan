@@ -1,16 +1,16 @@
 // The client entry: connect, feed the mirror into a local signal, restore
 // the stored token, derive the route, and mount the screen.
 
+import std::json::json_codec;
 import std::print;
 import std::reactive::Signal;
-import std::json::json_codec;
-import std::result::Result::{ self, Ok, Err };
-import std::ui::mount_root;
+import std::result::Result::{ Err, Ok, self };
 import std::router::current_path;
 import std::storage;
+import std::ui::mount_root;
 import pkg::notes::Note;
-import pkg::store::NotesClient;
 import pkg::routes::{ Route, parse };
+import pkg::store::NotesClient;
 import pkg::views::screen;
 
 async fun main() {

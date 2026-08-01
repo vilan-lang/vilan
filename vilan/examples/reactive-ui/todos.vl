@@ -2,9 +2,9 @@
 // (`derive`), a two-input dependency (`combine`), a reactive keyed list, and
 // conditional rendering. The dependency graph is literally the combinator tree.
 
-import std::ui::{ view, View };
-import std::reactive::{ Signal, combine };
 import std::display::format;
+import std::reactive::{ Signal, combine };
+import std::ui::{ View, view };
 
 // `bind_each` reconciles by key and re-renders only CHANGED rows — `Todo`
 // derives `PartialEq` so the reconciler can tell.
@@ -40,12 +40,10 @@ fun todos(): View {
 	// yields a `Source<(List<Todo>, str)>`; `derive` then maps the pair. The graph
 	// is data: `visible` recomputes exactly when either input changes — no body is
 	// run to "find" the dependencies.
-	let visible: Signal<List<Todo>> =
-		combine((items, filter)).map(|(list, filter)| {
+	let visible: Signal<List<Todo>> = combine((items, filter)).map(|(list, filter)| {
 		mut shown: List<Todo> = [];
 		for todo in list {
-			let keep =
-				filter == "all" || (filter == "active" && !todo.done) || (filter == "done" && todo.done);
+			let keep = filter == "all" || (filter == "active" && !todo.done) || (filter == "done" && todo.done);
 			if keep {
 				shown.push(todo);
 			}
@@ -70,33 +68,30 @@ fun todos(): View {
 	view("section")
 		.class("todos")
 		.child(view("h2").text("Todos"))
-		.child(
-			view("div")
-				.class("row")
-				// `bind_value` is two-way: the input shows `draft` and writes it on input.
-				.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
-				.child(view("button").text("Add").on("click", add))
-		)
+		.child(view("div")
+			.class("row")
+			// `bind_value` is two-way: the input shows `draft` and writes it on input.
+			.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
+			.child(view("button").text("Add").on("click", add)))
 		.child(view("p").bind_text(remaining.map(|n| format(n) + " remaining")))
-		.child(
-			view("div")
-				.class("filters")
-				.child(filter_button(filter, "all", "All"))
-				.child(filter_button(filter, "active", "Active"))
-				.child(filter_button(filter, "done", "Done"))
-		)
+		.child(view("div")
+			.class("filters")
+			.child(filter_button(filter, "all", "All"))
+			.child(filter_button(filter, "active", "Active"))
+			.child(filter_button(filter, "done", "Done")))
 		// `bind_each` renders one view per element, keyed by `Todo.id`, and
 		// reconciles the DOM against `visible` as it changes.
 		.child(view("ul").bind_each(visible, |todo| todo.id, |todo| todo_row(items, todo)))
 		// `show` toggles VISIBILITY — the node stays mounted, state preserved.
-		.child(view("p").class("empty").text("Nothing here 🎉").show(visible.map(|list| list.len() == 0)))
+		.child(view("p")
+			.class("empty")
+			.text("Nothing here 🎉")
+			.show(visible.map(|list| list.len() == 0)))
 		// `when` mounts/unmounts CONTENT — a disposal boundary: the summary's
 		// binding below exists only while something is done, and is disposed
 		// (not just hidden) when the condition drops.
 		.when(items.map(|list| count_done(list) > 0), || {
-			view("p")
-				.class("summary")
-				.bind_text(items.map(|list| i"{count_done(list)} done"))
+			view("p").class("summary").bind_text(items.map(|list| i"{count_done(list)} done"))
 		})
 }
 
@@ -115,7 +110,11 @@ fun count_done(list: List<Todo>): i32 {
 fun filter_button(filter: Signal<str>, value: str, label: str): View {
 	view("button")
 		.text(label)
-		.bind_class(filter.map(|current| if current == value { "active" } else { "" }))
+		.bind_class(filter.map(|current| if current == value {
+			"active"
+		} else {
+			""
+		}))
 		.on("click", || filter.set(value))
 }
 
@@ -125,7 +124,11 @@ fun filter_button(filter: Signal<str>, value: str, label: str): View {
 // the list everyone reads from.
 fun todo_row(items: Signal<List<Todo>>, todo: Todo): View {
 	view("li")
-		.class(if todo.done { "done" } else { "" })
+		.class(if todo.done {
+			"done"
+		} else {
+			""
+		})
 		.child(view("input").attr("type", "checkbox").on("change", || toggle(items, todo.id)))
 		.child(view("span").text(todo.label))
 		.child(view("button").class("remove").text("✕").on("click", || remove(items, todo.id)))

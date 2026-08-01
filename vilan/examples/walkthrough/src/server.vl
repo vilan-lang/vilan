@@ -2,10 +2,10 @@
 // http + rpc on one port. Everything stateful lives in `pkg::store`, next to
 // its database.
 
-import std::print;
 import std::fs;
-import std::json::json_codec;
 import std::http::Response;
+import std::json::json_codec;
+import std::print;
 import std::rpc_server::serve_service;
 import pkg::store::boot;
 

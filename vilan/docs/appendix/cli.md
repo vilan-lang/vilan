@@ -101,6 +101,12 @@ is the current directory. Formatting is conservative and a fixed point:
   same line. A chain that ends at its spanning link is left alone, so the
   trailing-closure shape `self.cleanups.write().push(|| { … });` stays as
   written.
+- A comment you write *inside* one of these constructs keeps it split, and
+  attaches to the element it precedes — the link, element, field, imported
+  name or parameter below it. A construct that collapsed would have no line
+  to keep the comment on, which is why the comment decides the layout. A
+  comment inside an element (a closure body a link carries, say) is that
+  body's own and changes nothing.
 - A `fun` signature over the budget breaks its parameter list the same
   way, one parameter per line, with the return type, a `borrows` clause
   and the body's `{` (or a bodyless `;`) riding the closing `)`. An empty

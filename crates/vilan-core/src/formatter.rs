@@ -1315,8 +1315,18 @@ impl<'src> Printer<'src> {
                 if sort {
                     order.sort_by_cached_key(|branch| branch_key(&branch_from_ast(branch)));
                 }
-                if split != Split::Off && !order.is_empty() {
-                    self.print_split_import_set(&order, sort);
+                let member_spans: Vec<Span> = order
+                    .iter()
+                    .filter_map(|child| Self::branch_span(child))
+                    .collect();
+                let inside_comment = self
+                    .import_set_extent(&member_spans)
+                    .is_some_and(|extent| self.comment_outside_elements(extent, &member_spans));
+                if !order.is_empty() && (split != Split::Off || inside_comment) {
+                    let open = self
+                        .import_set_extent(&member_spans)
+                        .map_or(0, |extent| extent.into_range().start);
+                    self.print_split_import_set(&order, sort, open);
                 } else {
                     self.out.push_str("{ ");
                     for (index, child) in order.iter().enumerate() {
@@ -1331,6 +1341,28 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// The source extent of a brace set, from its `{` to its last member's end.
+    /// An `ImportBranch::Set` carries no span of its own, so it is recovered from
+    /// the source: the `{` that opens it is the last one before the first member
+    /// and after the statement boundary — the search stops at the previous `;` so
+    /// a `{` inside an earlier comment cannot be mistaken for it.
+    fn import_set_extent(&self, members: &[Span]) -> Option<Span> {
+        let first = members.first()?.into_range().start;
+        let last = members.last()?.into_range().end;
+        let statement_start = self.source[..first].rfind(';').map_or(0, |at| at + 1);
+        let open = self.source[statement_start..first].rfind('{')? + statement_start;
+        Some(Span::from(open..last))
+    }
+
+    /// The source span of an import branch's head name, when it has one — the
+    /// anchor a comment written before that member attaches to.
+    fn branch_span(branch: &ImportBranch<'src>) -> Option<Span> {
+        match branch {
+            ImportBranch::Path(_, span, _) => Some(*span),
+            ImportBranch::Set(_) => None,
+        }
+    }
+
     /// Prints a brace set in split form: one member per line, one indentation
     /// level in, with a trailing comma after every one, and `}` back at the
     /// opening line's indent where the `;` glues. The list literal's rule, on
@@ -1341,11 +1373,16 @@ impl<'src> Printer<'src> {
     /// Each member's line is measured in turn, so a nested set that is itself
     /// too wide breaks one level further in. No comment cursor rides along:
     /// comments inside an import run are attached by the run, never here.
-    fn print_split_import_set(&mut self, order: &[&ImportBranch<'src>], sort: bool) {
+    fn print_split_import_set(&mut self, order: &[&ImportBranch<'src>], sort: bool, open: usize) {
         self.out.push('{');
         self.indent += 1;
+        let mut prev_end = open;
         for child in order {
             let member_start = self.out.len();
+            if let Some(span) = Self::branch_span(child) {
+                self.flush_element_comments(span.into_range().start, prev_end);
+                prev_end = span.into_range().end;
+            }
             self.line();
             let line_start = self.out.len();
             self.print_import_branch(child, sort);
@@ -1625,7 +1662,7 @@ impl<'src> Printer<'src> {
         self.out.push_str("fun ");
         self.out.push_str(func.name.0);
         self.print_generic_parameters(&func.generic_parameters);
-        self.print_parameters(&func.parameters.0);
+        self.print_parameters(&func.parameters);
         if let Some(return_type) = &func.return_type {
             self.out.push_str(": ");
             self.print_type(&return_type.0);
@@ -1710,10 +1747,14 @@ impl<'src> Printer<'src> {
     /// What follows the `)` — the return type, a `borrows` clause, the body's
     /// `{` or a bodyless `;` — glues to the closing line, exactly as it does
     /// inline; none of it is a list entry.
-    fn print_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+    fn print_parameters(&mut self, parameters: &Spanned<Vec<crate::node::Parameter<'src>>>) {
+        let (parameters, list_span) = (&parameters.0, parameters.1);
         let split = std::mem::take(&mut self.split);
-        if split != Split::Off && !parameters.is_empty() {
-            self.print_split_parameters(parameters);
+        let parameter_spans: Vec<Span> = parameters.iter().map(|parameter| parameter.3).collect();
+        if !parameters.is_empty()
+            && (split != Split::Off || self.comment_outside_elements(list_span, &parameter_spans))
+        {
+            self.print_split_parameters(parameters, list_span.into_range().start);
             return;
         }
         self.out.push('(');
@@ -1730,10 +1771,13 @@ impl<'src> Printer<'src> {
     /// layout of its own, so a parameter too wide for its line has nowhere to
     /// break and simply stays wide — unlike a list element or a struct field,
     /// either of which may be a chain.
-    fn print_split_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+    fn print_split_parameters(&mut self, parameters: &[crate::node::Parameter<'src>], open: usize) {
         self.out.push('(');
         self.indent += 1;
+        let mut prev_end = open;
         for parameter in parameters {
+            self.flush_element_comments(parameter.3.into_range().start, prev_end);
+            prev_end = parameter.3.into_range().end;
             self.line();
             self.print_parameters_inner(std::slice::from_ref(parameter));
             self.out.push(',');
@@ -2085,16 +2129,42 @@ impl<'src> Printer<'src> {
         let link_start = self.out.len();
         let comment_cursor = self.cursor;
         self.indent += 1;
+        // A comment written before this link attaches ABOVE it, at link indent
+        // (`proposal/split-comment-attachment.md` rule B) — the split form is
+        // what finally gives it a line of its own.
+        let member_start = match &step.0 {
+            Node::MemberAccessor(inner, member) => {
+                let after_subject = inner.1.into_range().end;
+                self.flush_element_comments(member.1.into_range().start, after_subject);
+                member.1.into_range().start
+            }
+            _ => step.1.into_range().start,
+        };
+        let _ = member_start;
         self.line();
         let line_start = self.out.len();
         self.print_postfix_suffix(step);
         if self.over_line_budget(line_start) {
             self.out.truncate(link_start);
             self.cursor = comment_cursor;
-            self.line();
-            self.split = Split::Tail;
-            self.print_postfix_suffix(step);
+            self.indent -= 1;
+            self.print_split_link_retry(step);
+            return;
         }
+        self.indent -= 1;
+    }
+
+    /// The over-budget reprint of one link: same attachment, then the link with
+    /// [`Split::Tail`] armed so its last argument breaks one level further in.
+    fn print_split_link_retry(&mut self, step: &Spanned<Node<'src>>) {
+        self.indent += 1;
+        if let Node::MemberAccessor(inner, member) = &step.0 {
+            let after_subject = inner.1.into_range().end;
+            self.flush_element_comments(member.1.into_range().start, after_subject);
+        }
+        self.line();
+        self.split = Split::Tail;
+        self.print_postfix_suffix(step);
         self.indent -= 1;
     }
 
@@ -2110,12 +2180,15 @@ impl<'src> Printer<'src> {
     /// a chain breaks with its links one level past the element. The measured
     /// line includes the element's comma — unlike a link's terminator, the comma
     /// is printed by the list itself, onto the element's own line.
-    fn print_split_list(&mut self, elements: &[Spanned<Node<'src>>]) {
+    fn print_split_list(&mut self, elements: &[Spanned<Node<'src>>], open: usize) {
         self.out.push('[');
         self.indent += 1;
+        let mut prev_end = open;
         for element in elements {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
+            self.flush_element_comments(element.1.into_range().start, prev_end);
+            prev_end = element.1.into_range().end;
             self.line();
             let line_start = self.out.len();
             self.print_expr(element);
@@ -2123,6 +2196,7 @@ impl<'src> Printer<'src> {
             if self.over_line_budget(line_start) {
                 self.out.truncate(element_start);
                 self.cursor = comment_cursor;
+                self.flush_element_comments(element.1.into_range().start, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_expr(element);
@@ -2147,12 +2221,19 @@ impl<'src> Printer<'src> {
     /// a chain or a list breaks with its own lines one level past the field. The
     /// measured line includes the field's comma — the literal prints it, onto
     /// the field's own line.
-    fn print_split_struct(&mut self, fields: &[Spanned<StructInitializerField<'src>>]) {
+    fn print_split_struct(
+        &mut self,
+        fields: &[Spanned<StructInitializerField<'src>>],
+        open: usize,
+    ) {
         self.out.push_str(" {");
         self.indent += 1;
-        for ((field_name, value), _) in fields {
+        let mut prev_end = open;
+        for ((field_name, value), span) in fields {
             let field_start = self.out.len();
             let comment_cursor = self.cursor;
+            self.flush_element_comments(span.into_range().start, prev_end);
+            prev_end = span.into_range().end;
             self.line();
             let line_start = self.out.len();
             self.print_struct_field(field_name, value);
@@ -2160,6 +2241,7 @@ impl<'src> Printer<'src> {
             if self.over_line_budget(line_start) {
                 self.out.truncate(field_start);
                 self.cursor = comment_cursor;
+                self.flush_element_comments(span.into_range().start, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_struct_field(field_name, value);
@@ -2183,6 +2265,73 @@ impl<'src> Printer<'src> {
             self.split = split;
             self.print_expr(value);
         }
+    }
+
+    /// Whether a standalone comment sits in one of the GAPS between the source
+    /// spans in `elements` — the trigger for forcing a construct into its split
+    /// form (`proposal/split-comment-attachment.md` rule A). A collapsed
+    /// construct has no line to hold such a comment, so it would be flushed
+    /// below the whole statement, orphaned from what it explains.
+    ///
+    /// The gaps, not the construct's whole span: a comment inside an element —
+    /// a closure body a chain link carries, say — belongs to that body and
+    /// already prints where it was written.
+    fn comment_between_elements(&self, elements: &[Span]) -> bool {
+        elements
+            .windows(2)
+            .any(|pair| self.has_comment_in(pair[0].into_range().end, pair[1].into_range().start))
+    }
+
+    /// Whether a standalone comment sits inside `construct` but outside every one
+    /// of its `elements` — before the first, between two, or after the last.
+    ///
+    /// This is [`Self::comment_between_elements`] generalized to constructs whose
+    /// elements do not begin at the construct's own start: `Name { // note` puts
+    /// the comment before the first FIELD, which no between-elements gap covers.
+    /// A chain needs no such boundary because its subject is its first element.
+    fn comment_outside_elements(&self, construct: Span, elements: &[Span]) -> bool {
+        let outer = construct.into_range();
+        self.comments.iter().any(|(span, _)| {
+            let at = span.into_range().start;
+            at >= outer.start
+                && at < outer.end
+                && !elements
+                    .iter()
+                    .any(|element| element.into_range().contains(&at))
+        })
+    }
+
+    /// Emits the standalone comments preceding `element_start` on their own
+    /// lines at the current (element) indentation, then returns the offset the
+    /// caller should treat as the previous end. The split printers call this
+    /// before each element, which is what attaches a comment to the element it
+    /// precedes instead of letting it fall out below the statement.
+    fn flush_element_comments(&mut self, element_start: usize, prev_end: usize) -> usize {
+        self.flush_comments_before(element_start, prev_end)
+    }
+
+    /// The source spans a split chain lays out one per line: its subject, then
+    /// each `.name(…)` call link. The gaps between them are where a mid-chain
+    /// comment sits.
+    fn chain_element_spans(expr: &Spanned<Node<'src>>) -> Vec<Span> {
+        let (subject, spine) = Self::postfix_spine(expr);
+        let mut spans = vec![subject.1];
+        for step in spine {
+            if let Node::MemberAccessor(_, member) = &step.0 {
+                if matches!(member.0, Node::Call(_, _, _)) {
+                    spans.push(member.1);
+                }
+            }
+        }
+        spans
+    }
+
+    /// Whether `expr`'s chain must break because a comment sits between two of
+    /// its links (`proposal/split-comment-attachment.md` rule A). Collapsed,
+    /// there is no line to keep that comment on and it falls out below the
+    /// statement.
+    fn chain_has_comment_between_links(&self, expr: &Spanned<Node<'src>>) -> bool {
+        self.comment_between_elements(&Self::chain_element_spans(expr))
     }
 
     /// Whether `expr`'s chain must break regardless of width
@@ -2407,7 +2556,9 @@ impl<'src> Printer<'src> {
         // Two doors into the split form: the width rule armed a split, or the
         // chain carries a `})` seam (`proposal/chain-seam-split.md`).
         if Self::is_breakable_chain(expr)
-            && (split != Split::Off || self.chain_has_spanning_seam(expr))
+            && (split != Split::Off
+                || self.chain_has_comment_between_links(expr)
+                || self.chain_has_spanning_seam(expr))
         {
             self.print_split_chain(expr);
             return;
@@ -2741,10 +2892,13 @@ impl<'src> Printer<'src> {
                 // fits stays inline, WITHOUT a trailing comma, exactly as
                 // before. An empty literal never breaks — `{⏎}` buys a line and
                 // nothing else.
+                let field_spans: Vec<Span> = fields.0.iter().map(|field| field.1).collect();
                 if fields.0.is_empty() {
                     self.out.push_str(" {}");
-                } else if split != Split::Off {
-                    self.print_split_struct(&fields.0);
+                } else if split != Split::Off
+                    || self.comment_outside_elements(fields.1, &field_spans)
+                {
+                    self.print_split_struct(&fields.0, fields.1.into_range().start);
                 } else {
                     self.out.push_str(" { ");
                     for (index, ((field_name, value), _)) in fields.0.iter().enumerate() {
@@ -2761,8 +2915,12 @@ impl<'src> Printer<'src> {
             // inline, WITHOUT a trailing comma, exactly as before. An empty list
             // never breaks — `[⏎]` buys a line and nothing else.
             Node::List(elements) => {
-                if split != Split::Off && !elements.is_empty() {
-                    self.print_split_list(elements);
+                let element_spans: Vec<Span> = elements.iter().map(|element| element.1).collect();
+                if !elements.is_empty()
+                    && (split != Split::Off
+                        || self.comment_outside_elements(expr.1, &element_spans))
+                {
+                    self.print_split_list(elements, expr.1.into_range().start);
                 } else {
                     self.out.push('[');
                     self.print_expression_list(elements);
@@ -4213,31 +4371,22 @@ mod chain_splitting {
 
     // --- Comments and idempotency (S6/S7) ------------------------------------
 
-    /// E13's zero-bail law under the split: a comment written between two links
-    /// is never dropped. The attachment machinery has no place *between* links —
-    /// comments are flushed at statement boundaries, not inside an expression —
-    /// so it lands on its own line below the statement, exactly as it already
-    /// did under the collapse, and the paragraph-gap rule reads the chain lines
-    /// it skipped over as a gap and keeps a blank line after it. Pinned as the
-    /// actual behavior (split and collapsed both), not as an ideal: placing a
-    /// comment *between* links needs comment attachment inside expressions.
+    /// A comment written between two links attaches to the link it precedes
+    /// (`proposal/split-comment-attachment.md`). It also FORCES the split form:
+    /// collapsed, the chain has no line to keep the comment on, which is how it
+    /// used to end up orphaned below the whole statement. Both fixtures are
+    /// therefore fixed points — what the author wrote is what comes back.
     #[test]
-    fn a_mid_chain_comment_moves_below_the_statement() {
-        assert_construct(
-            "fun main() {\n\tlet short = one()\n\t\t// a note\n\t\t.two(2)\n\t\t.three(3);\n\tdone()\n}\n",
-            "fun main() {\n\tlet short = one().two(2).three(3);\n\t// a note\n\n\tdone()\n}\n",
-        );
+    fn a_mid_chain_comment_attaches_to_its_link() {
+        let short = "fun main() {\n\tlet short = one()\n\t\t// a note\n\t\t.two(2)\n\
+                     \t\t.three(3);\n\tdone()\n}\n";
+        assert_construct(short, short);
         let long = format!(
-            "fun main() {{\n\tlet padded = s\n\t\t// a note\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n\tdone()\n}}\n",
+            "fun main() {{\n\tlet padded = s\n\t\t// a note\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n\
+             \tdone()\n}}\n",
             "P".repeat(69)
         );
-        assert_construct(
-            &long,
-            &format!(
-                "fun main() {{\n\tlet padded = s\n\t\t.aa(\"{}\")\n\t\t.bb(2);\n\t// a note\n\n\tdone()\n}}\n",
-                "P".repeat(69)
-            ),
-        );
+        assert_construct(&long, &long);
     }
 
     /// Formatting is a fixed point over a file that mixes both forms: the split
@@ -4554,14 +4703,13 @@ mod nested_layout {
 
     // --- R7/R8: comments survive, and the shape is a one-pass fixed point ------
 
-    /// Comment handling is unchanged by the recursion: comments flush at
-    /// statement boundaries, so one written between the links of a NESTED chain
-    /// lands below the statement rather than inside it — never dropped, which
-    /// `assert_construct`'s token check enforces on every pin here. Pinned as
-    /// the actual behavior; placing it between links is backlog 41's
-    /// (comment attachment inside expressions).
+    /// The comment attaches where it was written, which is one level IN: it sits
+    /// between the nested chain's links, so that chain is the one forced to
+    /// split. The outer chain's own line fits and its only spanning link is its
+    /// last, so it stays inline — the rule reaches exactly the construct the
+    /// comment is inside of, and no further.
     #[test]
-    fn a_comment_inside_a_nested_split_moves_below_the_statement() {
+    fn a_comment_inside_a_nested_chain_attaches_there() {
         assert_construct(
             "fun noted(): View {\n\
              \troot().styled(base).child(view(\"div\").styled(inner_style)\n\
@@ -4569,14 +4717,12 @@ mod nested_layout {
              \t\t.child(leaf_one()).child(leaf_two_with_a_longer_name()).child(leaf_three_here()))\n\
              }\n",
             "fun noted(): View {\n\
-             \troot()\n\
-             \t\t.styled(base)\n\
-             \t\t.child(view(\"div\")\n\
-             \t\t\t.styled(inner_style)\n\
-             \t\t\t.child(leaf_one())\n\
-             \t\t\t.child(leaf_two_with_a_longer_name())\n\
-             \t\t\t.child(leaf_three_here()))\n\
-             \t// a note between the nested links\n\
+             \troot().styled(base).child(view(\"div\")\n\
+             \t\t.styled(inner_style)\n\
+             \t\t// a note between the nested links\n\
+             \t\t.child(leaf_one())\n\
+             \t\t.child(leaf_two_with_a_longer_name())\n\
+             \t\t.child(leaf_three_here()))\n\
              }\n",
         );
     }
@@ -4846,38 +4992,21 @@ mod struct_literal_layout {
 
     // --- Stability -----------------------------------------------------------
 
-    /// Backlog 41, unchanged in scope by this rule and pinned here for the
-    /// literal: a comment written BETWEEN fields reprints below the whole
-    /// statement, because the comment machinery still flushes at statement
-    /// boundaries. Never dropped — the law holds — but orphaned from the field
-    /// it explains, exactly as a mid-chain comment is, and exactly as this
-    /// input already behaved when the literal collapsed onto one line instead
-    /// of splitting. Attaching it to its field is 41's work; when that lands
-    /// this pin flips to the attached form.
+    /// Backlog 41, now shipped for the literal too: a comment between fields
+    /// attaches to the field it precedes and forces the split, so the literal
+    /// keeps the shape its author gave it. This fixture fits the budget, which
+    /// is the point — before, it collapsed and the comment fell out below.
     #[test]
-    fn a_comment_between_fields_moves_below_the_statement() {
-        assert_construct(
-            "fun demo() {\n\
-             \tlet store = KoltStore {\n\
-             \t\t// the authoritative lists\n\
-             \t\tworkspaces = workspaces,\n\
-             \t\ttasks = tasks,\n\
-             \t\tregister_hook = Shared::new(register),\n\
-             \t\tlogin_hook = Shared::new(login),\n\
-             \t\tcreate_hook = Shared::new(create),\n\
-             \t};\n\
-             }\n",
-            "fun demo() {\n\
-             \tlet store = KoltStore {\n\
-             \t\tworkspaces = workspaces,\n\
-             \t\ttasks = tasks,\n\
-             \t\tregister_hook = Shared::new(register),\n\
-             \t\tlogin_hook = Shared::new(login),\n\
-             \t\tcreate_hook = Shared::new(create),\n\
-             \t};\n\
-             \t// the authoritative lists\n\
-             }\n",
-        );
+    fn a_comment_between_fields_attaches_to_its_field() {
+        let source = "fun demo() {\n\
+                      \tlet store = KoltStore {\n\
+                      \t\t// the authoritative lists\n\
+                      \t\tworkspaces = workspaces,\n\
+                      \t\ttasks = tasks,\n\
+                      \t\tregister_hook = Shared::new(register),\n\
+                      \t};\n\
+                      }\n";
+        assert_construct(source, source);
     }
 
     /// A file carrying both forms is a fixed point in one pass: the split
@@ -5186,6 +5315,112 @@ mod import_set_layout {
                 ]
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod split_comment_attachment {
+    //! `proposal/split-comment-attachment.md` — backlog 41. A comment written
+    //! inside a splittable construct attaches to the element it precedes, at that
+    //! element's indent, and FORCES the construct into its split form: collapsed,
+    //! there is no line to keep the comment on, which is how such comments used
+    //! to end up flushed below the whole statement, orphaned from what they
+    //! explain.
+    //!
+    //! One mechanism, all five split forms — chains, list literals, struct
+    //! literals, import brace sets and parameter lists — because the item asked
+    //! for the fix to be written against the split construct generally rather
+    //! than the chain specifically.
+    //!
+    //! The trigger is the GAPS between elements, never an element's own interior:
+    //! a comment inside a closure body a link carries belongs to that body and
+    //! already prints where it was written.
+    use super::bailing_constructs::assert_construct;
+
+    /// A comment before the FIRST element, which no between-elements gap covers —
+    /// the case that needs the construct's own opening boundary. Fixture fits the
+    /// budget, so only the comment can be splitting it.
+    #[test]
+    fn a_comment_before_the_first_element_attaches_to_it() {
+        let source = "fun demo() {\n\
+                      \tlet store = Store {\n\
+                      \t\t// the authoritative lists\n\
+                      \t\tworkspaces = workspaces,\n\
+                      \t\ttasks = tasks,\n\
+                      \t};\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A list literal's element comment, same rule.
+    #[test]
+    fn a_list_element_comment_attaches_to_its_element() {
+        let source = "fun demo() {\n\
+                      \tlet items = [\n\
+                      \t\t// the first one matters\n\
+                      \t\talpha,\n\
+                      \t\tbeta,\n\
+                      \t];\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// An import brace set. The set carries no span of its own, so its extent is
+    /// recovered from the source (`import_set_extent`); the canonical SORT still
+    /// applies, and the comment stays attached to the member it precedes — here
+    /// the one that sorts first, so the fixture is already canonical.
+    #[test]
+    fn an_import_set_comment_attaches_to_its_member() {
+        let source = "import std::rpc::{\n\
+                      \t// the transport we actually use\n\
+                      \tRpcError,\n\
+                      \tSocketTransport,\n\
+                      };\n";
+        assert_construct(source, source);
+    }
+
+    /// A `fun` parameter list — the width rule's declaration site takes comment
+    /// attachment too, on a signature well inside the budget.
+    #[test]
+    fn a_parameter_comment_attaches_to_its_parameter() {
+        let source = "fun demo(\n\
+                      \t// the live client\n\
+                      \tclient: Client,\n\
+                      \ttoken: Signal<str>,\n\
+                      ) {\n\
+                      \twork()\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// The precision of the rule: a comment INSIDE an element — a closure body a
+    /// link carries — is not between elements, belongs to that body, and forces
+    /// nothing. All three constructs here stay inline.
+    #[test]
+    fn a_comment_inside_an_element_does_not_force_the_split() {
+        let source = "fun main() {\n\
+                      \tlet a = one().two(|| {\n\
+                      \t\t// inside the closure body\n\
+                      \t\twork();\n\
+                      \t});\n\
+                      \tlet b = Point { x = 1, y = 2 };\n\
+                      \tlet c = [alpha, beta];\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// Comment-free code is untouched by any of this: the collapse rules still
+    /// apply, so a hand-split construct that fits still comes back inline.
+    #[test]
+    fn comment_free_constructs_still_collapse() {
+        assert_construct(
+            "fun main() {\n\tlet short = one()\n\t\t.two(2)\n\t\t.three(3);\n}\n",
+            "fun main() {\n\tlet short = one().two(2).three(3);\n}\n",
+        );
+        assert_construct(
+            "fun main() {\n\tlet p = Point {\n\t\tx = 1,\n\t\ty = 2,\n\t};\n}\n",
+            "fun main() {\n\tlet p = Point { x = 1, y = 2 };\n}\n",
         );
     }
 }

@@ -7,7 +7,7 @@
 // reading an `<input>`'s value and reflecting it on each keystroke — all lowered
 // to DOM globals, with no Node host imports.
 
-import std::dom::{ Element, get_element_by_id, query_selector, create_element };
+import std::dom::{ Element, create_element, get_element_by_id, query_selector };
 
 fun main() {
 	let app = get_element_by_id("app");

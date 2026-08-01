@@ -5089,13 +5089,18 @@ pub(crate) mod tests {
         // them as user-file entities and the editor placed them at those bogus
         // offsets — landing inside the leading comment (and, on the em-dash, crashing
         // position conversion). The fix attributes them to `DERIVED_SOURCE`, so they
-        // are excluded from `entity_spans`/`document_symbols`. Pin that: the file's
-        // first real token is `import` on line 9, so no user-file span may begin in
-        // the comment block before it.
+        // are excluded from `entity_spans`/`document_symbols`. Pin that: no
+        // user-file span may begin in the leading comment block, which ends at the
+        // file's first `import`.
+        //
+        // The boundary is found as the first line-initial `import `, NOT a
+        // particular one: it used to look for `import std::print`, and when the
+        // formatter's canonical import sort reordered that block the proxy landed
+        // past two legitimate imports and the pin fired on them.
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/examples/rpc/src/main.vl");
         let text = std::fs::read_to_string(&path).unwrap();
-        let first_code = text.find("import std::print").expect("first import");
+        let first_code = text.find("\nimport ").expect("first import") + 1;
         let document = Document::analyze(&text, &std_root(), &path);
 
         for (start, _end, id) in &document.entity_spans {

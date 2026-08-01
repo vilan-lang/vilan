@@ -3,24 +3,24 @@
 // layouts, `parse`/`href` are an ordinary inverse pair, `link` takes a route
 // VALUE, and the page body swaps on the derived route signal.
 
-import std::ui::{ View, view, mount_root };
-import std::reactive::Signal;
-import std::router::{ current_path, segments, link, Routable };
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
 import std::range::Range;
+import std::reactive::Signal;
+import std::router::{ Routable, current_path, link, segments };
+import std::ui::{ View, mount_root, view };
 
 // === The route space =========================================================
 
 [derive(PartialEq)]
 enum Route {
-	Home,              // /
+	Home, // /
 	Items(ItemsRoute), // /items/..  (a nested layout with its own route space)
 	NotFound,
 }
 
 [derive(PartialEq)]
 enum ItemsRoute {
-	List,        // /items
+	List, // /items
 	Detail(i32), // /items/{id} — the param is a typed payload, not a string
 }
 
@@ -76,12 +76,10 @@ fun home_page(): View {
 // The nested layout: its own chrome (heading + subnav), then a match on the
 // INNER route — exactly the outer shell's shape, one level down.
 fun items_layout(inner: ItemsRoute): View {
-	view("section")
-		.child(view("h2").text("Items"))
-		.child(match inner {
-			ItemsRoute::List => items_list(),
-			ItemsRoute::Detail(let id) => item_detail(id),
-		})
+	view("section").child(view("h2").text("Items")).child(match inner {
+		ItemsRoute::List => items_list(),
+		ItemsRoute::Detail(let id) => item_detail(id),
+	})
 }
 
 fun items_list(): View {

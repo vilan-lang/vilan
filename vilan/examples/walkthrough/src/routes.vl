@@ -1,8 +1,8 @@
 // The route model: one enum, and parse/href as an inverse pair.
 // "/" is the note list; "/note/7" edits note 7.
 
-import std::router::{ segments, Routable };
-import std::option::Option::{ self, Some, None };
+import std::option::Option::{ None, Some, self };
+import std::router::{ Routable, segments };
 
 [derive(PartialEq)]
 enum Route {

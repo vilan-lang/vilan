@@ -2,18 +2,28 @@
 // one note's editor at "/note/{id}". Lists render live off the mirror;
 // the editor commits per keystroke through drafts.
 
+import std::option::Option::{ None, Some, self };
 import std::print;
-import std::ui::{ view, View };
-import std::reactive::{ Signal, draft, Draft, DraftState };
-import std::result::Result::{ self, Ok, Err };
-import std::rpc::{ SocketTransport, RpcError, ConnectionState };
+import std::reactive::{ Draft, DraftState, Signal, draft };
+import std::result::Result::{ Err, Ok, self };
 import std::router::{ link, navigate };
+import std::rpc::{ ConnectionState, RpcError, SocketTransport };
 import std::storage;
-import std::option::Option::{ self, Some, None };
-import std::style::{ style, space, Style, Color, Length, Display, FlexDirection, AlignItems, Cursor };
-import pkg::notes::{ Note, AuthOutcome };
-import pkg::store::NotesClient;
+import std::style::{
+	AlignItems,
+	Color,
+	Cursor,
+	Display,
+	FlexDirection,
+	Length,
+	Style,
+	space,
+	style,
+};
+import std::ui::{ View, view };
+import pkg::notes::{ AuthOutcome, Note };
 import pkg::routes::{ Route, href };
+import pkg::store::NotesClient;
 
 // --- styles (compiled at build time; see the styling guide) ---
 
@@ -26,10 +36,7 @@ let shell = const style()
 	.gap(space(3))
 	.raw("font-family", "system-ui, sans-serif");
 
-let row = const style()
-	.display(Display::Flex)
-	.gap(space(2))
-	.align_items(AlignItems::Center);
+let row = const style().display(Display::Flex).gap(space(2)).align_items(AlignItems::Center);
 
 let field = const style()
 	.padding(space(2))
@@ -51,7 +58,12 @@ let muted = const style().color(Color::gray(500));
 
 // The app shell: a connection banner, the sign-in gate, and the routed
 // app. The gate and the app toggle on whether a token exists.
-fun screen(client: NotesClient<SocketTransport>, notes: Signal<List<Note>>, token: Signal<str>, route: Signal<Route>): View {
+fun screen(
+	client: NotesClient<SocketTransport>,
+	notes: Signal<List<Note>>,
+	token: Signal<str>,
+	route: Signal<Route>,
+): View {
 	view("div")
 		.styled(shell)
 		.child(connection_banner(client))
@@ -94,14 +106,23 @@ fun sign_in_panel(client: NotesClient<SocketTransport>, token: Signal<str>): Vie
 		.styled(shell)
 		.child(view("h2").text("Notes"))
 		.child(view("input").styled(field).attr("placeholder", "username").bind_value(username))
-		.child(view("input").styled(field).attr("placeholder", "password").attr("type", "password").bind_value(password))
+		.child(view("input")
+			.styled(field)
+			.attr("placeholder", "password")
+			.attr("type", "password")
+			.bind_value(password))
 		.child(view("button").styled(button).text("Sign in").on("click", submit))
 		.child(view("p").styled(muted).bind_text(status))
 		.show(token.map(|current| current == ""))
 }
 
 // The routed app, visible once signed in. Pages swap on the route.
-fun authed_panel(client: NotesClient<SocketTransport>, notes: Signal<List<Note>>, token: Signal<str>, route: Signal<Route>): View {
+fun authed_panel(
+	client: NotesClient<SocketTransport>,
+	notes: Signal<List<Note>>,
+	token: Signal<str>,
+	route: Signal<Route>,
+): View {
 	view("div")
 		.styled(shell)
 		.swap(route, |current| match current {
@@ -113,7 +134,11 @@ fun authed_panel(client: NotesClient<SocketTransport>, notes: Signal<List<Note>>
 }
 
 // "/" — the live list plus an add form. Rows are keyed by note id.
-fun home_page(client: NotesClient<SocketTransport>, notes: Signal<List<Note>>, token: Signal<str>): View {
+fun home_page(
+	client: NotesClient<SocketTransport>,
+	notes: Signal<List<Note>>,
+	token: Signal<str>,
+): View {
 	let composing = Signal::new("");
 	let add = || {
 		let title = composing.get();
@@ -131,18 +156,17 @@ fun home_page(client: NotesClient<SocketTransport>, notes: Signal<List<Note>>, t
 
 	view("div")
 		.styled(shell)
-		.child(
-			view("div")
-				.styled(row)
-				.child(view("h2").text("Notes"))
-				.child(view("button").styled(button).text("Sign out").on("click", sign_out))
-		)
-		.child(
-			view("div")
-				.styled(row)
-				.child(view("input").styled(field).attr("placeholder", "New note").bind_value(composing))
-				.child(view("button").styled(button).text("Add").on("click", add))
-		)
+		.child(view("div")
+			.styled(row)
+			.child(view("h2").text("Notes"))
+			.child(view("button").styled(button).text("Sign out").on("click", sign_out)))
+		.child(view("div")
+			.styled(row)
+			.child(view("input")
+				.styled(field)
+				.attr("placeholder", "New note")
+				.bind_value(composing))
+			.child(view("button").styled(button).text("Add").on("click", add)))
 		.child(view("ul").bind_each(notes, |note| note.id, |note| note_row(client, note, token)))
 }
 
@@ -150,12 +174,20 @@ fun note_row(client: NotesClient<SocketTransport>, note: Note, token: Signal<str
 	view("li")
 		.styled(row)
 		.child(link(note.title, Route::Note(note.id)))
-		.child(view("button").styled(button).text("Delete").on("click", || report(client.delete_note(token.get(), note.id))))
+		.child(view("button")
+			.styled(button)
+			.text("Delete")
+			.on("click", || report(client.delete_note(token.get(), note.id))))
 }
 
 // "/note/{id}" — the editor. It mounts under `when` so a deep link waits
 // for the first mirror sync before rendering.
-fun note_page(client: NotesClient<SocketTransport>, note_id: i32, notes: Signal<List<Note>>, token: Signal<str>): View {
+fun note_page(
+	client: NotesClient<SocketTransport>,
+	note_id: i32,
+	notes: Signal<List<Note>>,
+	token: Signal<str>,
+): View {
 	let entry = notes.map(|list| {
 		mut found: Option<Note> = None;
 		for note in list {
@@ -177,7 +209,12 @@ fun note_page(client: NotesClient<SocketTransport>, note_id: i32, notes: Signal<
 // LOCAL-FIRST: each field commits through its own rpc as the user types.
 // Typing never waits on the wire; a failed commit keeps the text; mirror
 // updates adopt in without fighting in-flight edits.
-fun note_editor(client: NotesClient<SocketTransport>, note_id: i32, entry: Signal<Option<Note>>, token: Signal<str>): View {
+fun note_editor(
+	client: NotesClient<SocketTransport>,
+	note_id: i32,
+	entry: Signal<Option<Note>>,
+	token: Signal<str>,
+): View {
 	let (seed_title, seed_body) = match entry.get() {
 		Some(let note) => (note.title, note.body),
 		None => ("", ""),
@@ -200,7 +237,11 @@ fun note_editor(client: NotesClient<SocketTransport>, note_id: i32, entry: Signa
 		.styled(shell)
 		.child(view("input").styled(field).attr("placeholder", "Title…").bind_draft(title))
 		.child(view("span").styled(muted).bind_text(title.state.map(state_text)))
-		.child(view("textarea").styled(field).attr("placeholder", "Write…").attr("rows", "8").bind_draft(body))
+		.child(view("textarea")
+			.styled(field)
+			.attr("placeholder", "Write…")
+			.attr("rows", "8")
+			.bind_draft(body))
 		.child(view("span").styled(muted).bind_text(body.state.map(state_text)))
 }
 

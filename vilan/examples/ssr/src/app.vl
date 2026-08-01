@@ -22,7 +22,12 @@ fun app(): View {
 	let tasks: Signal<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	let show_note = Signal::new(true);
 	let label = Signal::new("idle");
-	view("main").class("app").child(heading()).child(task_list(tasks)).child(note(show_note)).child(action(label))
+	view("main")
+		.class("app")
+		.child(heading())
+		.child(task_list(tasks))
+		.child(note(show_note))
+		.child(action(label))
 }
 
 // The `&`, `<`, `>` are escaped by `render` — a hostile string renders inert.

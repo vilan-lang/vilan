@@ -6,9 +6,9 @@
 // closure, so there is nothing to re-discover and an `await` can never hide a
 // dependency.
 
-import std::ui::{ view, View };
 import std::reactive::Signal;
-import std::style::{ style, space, Style, Color, Display, FlexDirection };
+import std::style::{ Color, Display, FlexDirection, Style, space, style };
+import std::ui::{ View, view };
 
 // Typed atomic styles (proposal/ui-styling.md): built inside `const`, so the
 // rules land in app.css at build time; `.styled(..)` just sets the classes.

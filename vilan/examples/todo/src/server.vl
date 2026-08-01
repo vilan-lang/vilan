@@ -5,11 +5,11 @@
 // calls, and each session's SSE stream (`GET /events`) carries the list's
 // changes out to every subscribed tab.
 
-import std::print;
-import std::json::json_codec;
-import std::http::Response;
-import std::rpc_server::serve_service;
 import std::fs;
+import std::http::Response;
+import std::json::json_codec;
+import std::print;
+import std::rpc_server::serve_service;
 import pkg::store::boot;
 
 async fun main() {
@@ -33,4 +33,3 @@ async fun main() {
 		}
 	}, |server| print(i"todo server: {server.url()} — open it in two tabs"));
 }
-

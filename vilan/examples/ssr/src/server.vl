@@ -15,13 +15,18 @@ async fun main() {
 	let client_js = fs::read_file_to_str("dist/client.js");
 	let shell = fs::read_file_to_str("src/app.html");
 
-	Server::builder().port(8791).on_request(|request| {
-		match request.path() {
-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-			// Create, serialize, discard: a fresh `app()` is built and rendered
-			// per request, its markup spliced into the shell. No effects, no
-			// subscriptions, no owner survives the response.
-			_ => Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build(),
-		}
-	}).on_start(|server| print("ssr example: http://localhost:8791/")).build().start();
+	Server::builder()
+		.port(8791)
+		.on_request(|request| {
+			match request.path() {
+				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+				// Create, serialize, discard: a fresh `app()` is built and rendered
+				// per request, its markup spliced into the shell. No effects, no
+				// subscriptions, no owner survives the response.
+				_ => Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build(),
+			}
+		})
+		.on_start(|server| print("ssr example: http://localhost:8791/"))
+		.build()
+		.start();
 }

@@ -13,18 +13,29 @@
 //
 //     vilan run vilan/examples/rpc
 
-import std::print;
-import std::option::Option::{ self, Some, None };
-import std::result::Result::{ self, Ok, Err };
-import std::shared::Shared;
-import std::reactive::{ batch, Signal, Source };
-import std::wire::{ Serializer, Codec };
 import std::json::json_codec;
+import std::option::Option::{ None, Some, self };
+import std::print;
+import std::reactive::{ Signal, Source, batch };
+import std::result::Result::{ Err, Ok, self };
 import std::rpc::{
-	Transport, LocalTransport, RpcError, RpcOutcome,
-	local_rpc, Dispatcher, call, arg, reply, decode_failed,
-	duplex_pair, ReactiveServer, ReactiveClient, RemoteSource,
+	Dispatcher,
+	LocalTransport,
+	ReactiveClient,
+	ReactiveServer,
+	RemoteSource,
+	RpcError,
+	RpcOutcome,
+	Transport,
+	arg,
+	call,
+	decode_failed,
+	duplex_pair,
+	local_rpc,
+	reply,
 };
+import std::shared::Shared;
+import std::wire::{ Codec, Serializer };
 
 // --- The data boundary (would live in a `common` library, on both sides) ------
 
@@ -66,11 +77,7 @@ impl User {
 	// encodable) and adds a computed `handle` that the domain type has no field for.
 	// The wire shape diverges freely from the source.
 	fun to_wire(self): WireUser {
-		WireUser {
-			id = self.id,
-			username = self.username,
-			handle = "@" + self.username,
-		}
+		WireUser { id = self.id, username = self.username, handle = "@" + self.username }
 	}
 }
 
@@ -137,7 +144,10 @@ fun accounts_dispatcher(): Dispatcher {
 // `call` helper (rpc.vl §4.1): it passes the `T`-typed transport to a generic
 // `call<_, Tx: Transport>`, which monomorphizes to the concrete transport — so the stub reads
 // as the natural client, with no hand-rolled envelope.
-struct AccountsClient<T: Transport> { transport: T, codec: Codec }
+struct AccountsClient<T: Transport> {
+	transport: T,
+	codec: Codec,
+}
 
 impl AccountsClient<type T> {
 	// The client deals only in `WireUser` — it has no `User`, and no `password` field to
@@ -278,8 +288,8 @@ fun reactive_demo() {
 	// delivery is synchronous; a buffering transport would flush both together.)
 	let dispatcher = Dispatcher::new().on("add", |request| {
 		let amount: i32 = arg(request, 0);
-		counter.set(counter.get() + amount);   // 13 — the value commits at once...
-		counter.set(counter.get() + amount);   // 16 — ...so the second write sees it
+		counter.set(counter.get() + amount); // 13 — the value commits at once...
+		counter.set(counter.get() + amount); // 16 — ...so the second write sees it
 		reply(counter.get())
 	});
 	let rpc_transport = local_rpc(dispatcher.into_protocol(json_codec()));
@@ -290,8 +300,8 @@ fun reactive_demo() {
 		Err(let error) => print(i"rpc error: {error.debug()}"),
 	}
 
-	subscription.dispose();   // stop observing; the server's forward is a no-op with no client
-	counter.set(99);          // no output — unsubscribed
+	subscription.dispose(); // stop observing; the server's forward is a no-op with no client
+	counter.set(99); // no output — unsubscribed
 }
 
 // The session demo — the `[service]` paradigm end-to-end, by hand: per-connection state,
@@ -310,11 +320,7 @@ fun session_demo() {
 	// Client: what `Client::connect` assembles — the RPC transport plus a typed mirror
 	// for each exposed field (the annotated `let` binds the mirror's type).
 	let status_mirror: RemoteSource<str> = ReactiveClient::new(client_end, json_codec()).source(status_channel);
-	let client = Client {
-		transport = rpc_transport,
-		codec = json_codec(),
-		status = status_mirror,
-	};
+	let client = Client { transport = rpc_transport, codec = json_codec(), status = status_mirror };
 
 	// Observe the mirrored session state: "offline" now, "online" once login lands —
 	// delivered in the same wire turn as login's reply.
@@ -322,10 +328,10 @@ fun session_demo() {
 		print(i"status = {s}");
 	});
 
-	show_whoami(client.whoami());               // manual auth refuses: not logged in
-	show_login(client.login("ada", "wrong"));   // bad password -> false, status unchanged
+	show_whoami(client.whoami()); // manual auth refuses: not logged in
+	show_login(client.login("ada", "wrong")); // bad password -> false, status unchanged
 	show_login(client.login("ada", "hunter2")); // -> true; "status = online" in the same turn
-	show_whoami(client.whoami());               // the session remembers -> ada (@ada)
+	show_whoami(client.whoami()); // the session remembers -> ada (@ada)
 
 	watching.dispose();
 }

@@ -7,15 +7,15 @@
 // local list edit, no refetch — the change comes back over the wire and lands
 // in `items` like anyone else's would.
 
-import std::print;
-import std::ui::{ view, View };
-import std::reactive::{ Signal, combine };
 import std::display::format;
-import std::result::Result::{ self, Ok, Err };
-import std::rpc::{ SocketTransport, RpcError };
-import std::style::{ style, space, Style, Color, Length, Display, AlignItems, Cursor };
-import pkg::todo::Todo;
+import std::print;
+import std::reactive::{ Signal, combine };
+import std::result::Result::{ Err, Ok, self };
+import std::rpc::{ RpcError, SocketTransport };
+import std::style::{ AlignItems, Color, Cursor, Display, Length, Style, space, style };
+import std::ui::{ View, view };
 import pkg::store::TodoClient;
+import pkg::todo::Todo;
 
 // The styles (proposal/ui-styling.md): typed values built inside `const`, so
 // every rule below lands in `dist/client.css` at BUILD time — app.html's old
@@ -31,13 +31,9 @@ let shell = const style()
 	.line_height(1.5)
 	.raw("font-family", "system-ui, sans-serif");
 
-let row = const style()
-	.display(Display::Flex)
-	.gap(space(2));
+let row = const style().display(Display::Flex).gap(space(2));
 
-let list = const style()
-	.padding(space(0))
-	.raw("list-style", "none");
+let list = const style().padding(space(0)).raw("list-style", "none");
 
 let item = const style()
 	.display(Display::Flex)
@@ -45,9 +41,7 @@ let item = const style()
 	.align_items(AlignItems::Center)
 	.padding_y(space(1));
 
-let done_label = const style()
-	.opacity(0.5)
-	.raw("text-decoration", "line-through");
+let done_label = const style().opacity(0.5).raw("text-decoration", "line-through");
 
 let button = const style()
 	.padding_x(space(2))
@@ -76,18 +70,16 @@ fun todos(client: TodoClient<SocketTransport>, items: Signal<List<Todo>>): View 
 		open
 	});
 
-	let visible: Signal<List<Todo>> =
-		combine((items, filter)).map(|(list, current)| {
-			mut shown: List<Todo> = [];
-			for todo in list {
-				let keep =
-					current == "all" || (current == "active" && !todo.done) || (current == "done" && todo.done);
-				if keep {
-					shown.push(todo);
-				}
+	let visible: Signal<List<Todo>> = combine((items, filter)).map(|(list, current)| {
+		mut shown: List<Todo> = [];
+		for todo in list {
+			let keep = current == "all" || (current == "active" && !todo.done) || (current == "done" && todo.done);
+			if keep {
+				shown.push(todo);
 			}
-			shown
-		});
+		}
+		shown
+	});
 
 	let add = || {
 		let label = draft.get(); // a one-shot SAMPLE — we want the value, not a dependency
@@ -100,25 +92,26 @@ fun todos(client: TodoClient<SocketTransport>, items: Signal<List<Todo>>): View 
 	view("section")
 		.styled(shell)
 		.child(view("h2").text("Todos"))
-		.child(
-			view("div")
-				.styled(row)
-				// `bind_value` is two-way: the input shows `draft` and writes it on input.
-				.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
-				.child(view("button").styled(button).text("Add").on("click", add))
-		)
+		.child(view("div")
+			.styled(row)
+			// `bind_value` is two-way: the input shows `draft` and writes it on input.
+			.child(view("input").attr("placeholder", "What needs doing?").bind_value(draft))
+			.child(view("button").styled(button).text("Add").on("click", add)))
 		.child(view("p").bind_text(remaining.map(|n| format(n) + " remaining")))
-		.child(
-			view("div")
-				.styled(row)
-				.child(filter_button(filter, "all", "All"))
-				.child(filter_button(filter, "active", "Active"))
-				.child(filter_button(filter, "done", "Done"))
-		)
+		.child(view("div")
+			.styled(row)
+			.child(filter_button(filter, "all", "All"))
+			.child(filter_button(filter, "active", "Active"))
+			.child(filter_button(filter, "done", "Done")))
 		// `bind_each` renders one row per element and re-renders as `visible`
 		// changes — whether this tab caused the change or another one did.
-		.child(view("ul").styled(list).bind_each(visible, |todo| todo.id, |todo| todo_row(client, todo)))
-		.child(view("p").styled(empty_note).text("Nothing here 🎉").show(visible.map(|list| list.len() == 0)))
+		.child(view("ul")
+			.styled(list)
+			.bind_each(visible, |todo| todo.id, |todo| todo_row(client, todo)))
+		.child(view("p")
+			.styled(empty_note)
+			.text("Nothing here 🎉")
+			.show(visible.map(|list| list.len() == 0)))
 }
 
 // A filter button highlights itself when its value is the active filter —
@@ -130,7 +123,11 @@ fun filter_button(filter: Signal<str>, value: str, label: str): View {
 	let active_classes = active.class_list();
 	view("button")
 		.text(label)
-		.bind_class(filter.map(|current| if current == value { active_classes } else { base_classes }))
+		.bind_class(filter.map(|current| if current == value {
+			active_classes
+		} else {
+			base_classes
+		}))
 		.on("click", || filter.set(value))
 }
 
@@ -142,12 +139,21 @@ fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
 	view("li")
 		.styled(item)
 		.child(checkbox(client, todo))
-		.child(if todo.done { label.styled(done_label) } else { label })
-		.child(view("button").styled(remove_button).text("✕").on("click", || report(client.remove(todo.id))))
+		.child(if todo.done {
+			label.styled(done_label)
+		} else {
+			label
+		})
+		.child(view("button")
+			.styled(remove_button)
+			.text("✕")
+			.on("click", || report(client.remove(todo.id))))
 }
 
 fun checkbox(client: TodoClient<SocketTransport>, todo: Todo): View {
-	let box = view("input").attr("type", "checkbox").on("change", || report(client.toggle(todo.id)));
+	let box = view("input")
+		.attr("type", "checkbox")
+		.on("change", || report(client.toggle(todo.id)));
 	if todo.done {
 		box.attr("checked", "checked")
 	} else {

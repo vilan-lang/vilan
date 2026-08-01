@@ -4,10 +4,10 @@
 // here and takes only the generated stub and the contract hash — the bodies
 // below are server-colored, and only the server entry reaches them.
 
+import std::db::{ Database, Row, Statement };
+import std::option::Option::{ None, Some, self };
 import std::reactive::Signal;
-import std::db::{ Database, Statement, Row };
-import std::option::Option::{ self, Some, None };
-import pkg::notes::{ Note, AuthOutcome };
+import pkg::notes::{ AuthOutcome, Note };
 
 // --- node:crypto bindings for password hashing (sync, fits the dispatch
 // path). A candidate for std promotion once proven.
@@ -66,7 +66,8 @@ impl NotesStore {
 			},
 			None => {
 				let salt = fresh_token();
-				db.prepare("INSERT INTO account (username, salt, password_hash) VALUES (?, ?, ?)")
+				db
+					.prepare("INSERT INTO account (username, salt, password_hash) VALUES (?, ?, ?)")
 					.run([username, salt, hash_password(password, salt)]);
 				open_session(db, username)
 			},
@@ -80,7 +81,9 @@ impl NotesStore {
 	fun add_note(self, token: str, title: str): i32 {
 		match session_user(db, token) {
 			Some(let _user) => {
-				let id = db.prepare("INSERT INTO note (title, body) VALUES (?, ?)").run([title, ""]);
+				let id = db
+					.prepare("INSERT INTO note (title, body) VALUES (?, ?)")
+					.run([title, ""]);
 				self.notes.set_with(|list| {
 					mut updated = list;
 					updated.push(Note { id = id, title = title, body = "" });
@@ -167,9 +170,7 @@ fun open_database(): Database {
 // Boot: load the mirror once from the already-open database and hand back the
 // store. Every later write goes SQL-first through the methods above.
 fun boot(): NotesStore {
-	NotesStore {
-		notes = Signal::new(load_notes(db)),
-	}
+	NotesStore { notes = Signal::new(load_notes(db)) }
 }
 
 // The session table is the auth boundary: a token row names its user.
