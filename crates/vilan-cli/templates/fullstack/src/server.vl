@@ -13,10 +13,15 @@ async fun main() {
 	let client_js = fs::read_file_to_str("dist/client.js");
 	let shell = fs::read_file_to_str("src/app.html");
 
-	Server::builder().port(8080).on_request(|request| {
-		match request.path() {
-			"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-			_ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
-		}
-	}).on_start(|server| print(greeting() + " — http://localhost:8080/")).build().start();
+	Server::builder()
+		.port(8080)
+		.on_request(|request| {
+			match request.path() {
+				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+				_ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
+			}
+		})
+		.on_start(|server| print(greeting() + " — http://localhost:8080/"))
+		.build()
+		.start();
 }
