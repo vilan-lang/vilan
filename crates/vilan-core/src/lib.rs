@@ -397,7 +397,23 @@ fn analyze_source_unfenced(
     // raw trees, so source text prints back verbatim.
     lift::rewrite_items(&mut root.0);
     let root = Box::leak(Box::new(root));
-    leak_tally::record(leak_tally::LeakSite::EntryAst, std::mem::size_of_val(root));
+    // The tally is a tree-proportional estimate — one `Spanned<Node>` of
+    // storage per node — so growth in the tree is visible to the counters;
+    // the root box alone would record a constant ~40 B whatever the file
+    // holds. Vec spare capacity is not counted: a deterministic lower bound,
+    // not a heap audit (the leak_tally module doc has the full contract).
+    fn tree_estimate(nodes: &NodeList) -> usize {
+        fn count(node: &span::Spanned<Node>, total: &mut usize) {
+            *total += 1;
+            node.0.for_each_child(&mut |child| count(child, total));
+        }
+        let mut total = 0;
+        for node in nodes {
+            count(node, &mut total);
+        }
+        total * std::mem::size_of::<span::Spanned<Node>>()
+    }
+    leak_tally::record(leak_tally::LeakSite::EntryAst, tree_estimate(&root.0));
     // Use the front-end's resolved platform (e.g. from `vilan.toml`), else infer
     // one from the file's own imports: a file importing the browser DOM layer is a
     // browser file, otherwise Node. This keeps the platform gate from

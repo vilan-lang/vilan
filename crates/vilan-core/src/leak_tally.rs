@@ -7,8 +7,9 @@
 //! rebuilding and dropping the reachable `Program` every call, which swamps the
 //! few KiB of genuine per-analysis leak and is far too noisy to gate on.
 //!
-//! Every `Box::leak`/`String::leak` site in `vilan-core` and `vilan-lsp` calls
-//! [`record`] with a [`LeakSite`] tag and the byte count it just made immortal.
+//! Every `Box::leak`/`String::leak` site in `vilan-core`, `vilan-lsp`, and
+//! `vilan-wasm` calls [`record`] with a [`LeakSite`] tag and the byte count it
+//! just made immortal.
 //! A test reads a site's total with [`bytes`], the sum with [`total`], and
 //! zeroes them between measurements with [`reset`].
 //!
@@ -23,10 +24,15 @@
 //! `vilan-core` being built as a (non-test) dependency of `vilan-lsp`'s test
 //! binary in any case.
 //!
-//! Text-site counts are exact byte lengths. AST-site counts are the shallow
-//! `size_of_val` of the leaked box (a deterministic per-analysis constant): the
-//! growth assertions care whether a site's contribution *plateaus*, not the
-//! deep retained tree size, so the shallow figure is the right cheap signal.
+//! Text-site counts are exact byte lengths. AST-site counts differ by what
+//! their assertions need: the entry AST — the one site *allowed* to grow per
+//! analysis — records a tree-proportional estimate (node count × node size),
+//! so growth in the tree is visible to the counters; the cache-bounded AST
+//! sites record the shallow `size_of_val` of the leaked box, because their
+//! assertions care only that the site plateaus at zero, and zero is zero at
+//! any depth. No AST figure is a deep heap audit — `MacroWorldProgram`'s
+//! retained program in particular is far larger than its shallow record, and
+//! is bounded by the world cache, not by this tally.
 
 use std::cell::Cell;
 
@@ -35,7 +41,8 @@ use std::cell::Cell;
 pub enum LeakSite {
     /// The LSP entry source text, leaked so the `Program` can borrow it.
     LspEntryText,
-    /// The entry file's parsed AST, leaked in `analyze_source`.
+    /// The entry file's parsed AST, leaked in `analyze_source`. Recorded as a
+    /// tree-proportional estimate, not the shallow root box (see module doc).
     EntryAst,
     /// `parse_clean_cached`'s leaked source (content-keyed: one per content).
     ParseCleanCacheText,
@@ -61,10 +68,13 @@ pub enum LeakSite {
     MacroParseText,
     /// `parse_generated`'s leaked AST.
     MacroParseAst,
+    /// The wasm front-end's entry source text (content-interned: one per
+    /// distinct compiled source, however many Runs repeat it).
+    WasmEntryText,
 }
 
 /// The number of [`LeakSite`] variants — keep in step with the enum.
-const SITE_COUNT: usize = 14;
+const SITE_COUNT: usize = 15;
 
 thread_local! {
     static COUNTERS: [Cell<usize>; SITE_COUNT] = const { [const { Cell::new(0) }; SITE_COUNT] };

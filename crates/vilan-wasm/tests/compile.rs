@@ -203,3 +203,43 @@ fn the_hand_built_std_spec_matches_the_manifest() {
 fn the_reported_version_is_the_crate_version() {
     assert_eq!(vilan_wasm::version(), env!("CARGO_PKG_VERSION"));
 }
+
+/// A compile leaks one `'static` copy of its entry text (`analyze_source`
+/// borrows for `'static`) — interned by content and tallied at
+/// `WasmEntryText`: recompiling identical source must reuse the first leak,
+/// and the leak must be visible to the tally at all (the E23 sweep found this
+/// site both unbounded per compile and untallied). The counters are
+/// thread-local, so this thread sees exactly its own compiles; the source is
+/// unique to this test, so the process-global intern cannot be pre-warmed by
+/// a neighbor.
+#[test]
+fn recompiling_identical_source_interns_the_entry_text() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let source = "import std::print;\nfun main() { print(41047); }\n";
+    leak_tally::reset();
+    let first = compile(source);
+    assert!(
+        first.diagnostics.is_empty(),
+        "expected a clean compile, got: {:#?}",
+        first.diagnostics
+    );
+    assert_eq!(
+        leak_tally::bytes(LeakSite::WasmEntryText),
+        source.len(),
+        "the first compile of a distinct source must leak (and tally) exactly \
+         one copy of it"
+    );
+    leak_tally::reset();
+    let second = compile(source);
+    assert_eq!(
+        first.js, second.js,
+        "a repeated compile of identical source must be identical"
+    );
+    assert_eq!(
+        leak_tally::bytes(LeakSite::WasmEntryText),
+        0,
+        "recompiling identical source re-leaked the entry text — the intern is \
+         not deduping"
+    );
+}

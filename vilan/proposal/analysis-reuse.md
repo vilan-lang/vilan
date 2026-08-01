@@ -53,6 +53,15 @@
 > file did not, until now. `compile_world`'s "bounded: one leak per distinct
 > macro-definition set" is therefore true only while the non-macro text never
 > changes length.
+>
+> **E23 SHIPPED 2026-08-01** (with a second find: a BROKEN definition's world
+> failure was never cached, so it re-leaked per analysis even unedited — a
+> `FAILURES` cache keyed on content+offsets closes it). The same-day
+> `Box::leak` sweep then closed the remaining gaps, each pinned red-first:
+> the wasm front-end's per-compile UNTALLIED entry leak (content-interned,
+> `WasmEntryText`), the per-analysis dependency display-name leak
+> (content-interned), `flush_rust_fallback`'s uncached parse (now
+> `parse_cached`), and `EntryAst`'s shallow tally (now tree-proportional).
 
 ## 0. What the scout established (corrections to E3's framing)
 

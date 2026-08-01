@@ -23618,6 +23618,25 @@ struct LoadedPackage {
     dependencies: HashMap<String, Id>,
 }
 
+/// A dependency namespace's display name, interned by content: the same
+/// workspace re-analyzes on every keystroke and its package names never
+/// change, so the leak is one per distinct name per process, not one per
+/// dependency per analysis. Tallied at `DisplayName` on the miss.
+fn interned_display_name(name: String) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut names = names.lock().unwrap();
+    if let Some(existing) = names.get(&name).copied() {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+    crate::leak_tally::record(crate::leak_tally::LeakSite::DisplayName, leaked.len());
+    names.insert(name, leaked);
+    leaked
+}
+
 pub fn analyze<'src>(
     nodes: &'src Spanned<NodeList<'src>>,
     entry_source: &'src str,
@@ -23862,14 +23881,12 @@ pub fn analyze<'src>(
             let namespace_id = analyzer.new_entity_id();
             // The namespace module's display name is the package directory's base
             // name (a dependent addresses it by its own import name regardless).
-            let display_name: &'static str = Box::leak(
+            let display_name = interned_display_name(
                 spec.base_root
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "dep".to_string())
-                    .into_boxed_str(),
+                    .unwrap_or_else(|| "dep".to_string()),
             );
-            crate::leak_tally::record(crate::leak_tally::LeakSite::DisplayName, display_name.len());
             analyzer.modules.insert(
                 namespace_id,
                 Module {

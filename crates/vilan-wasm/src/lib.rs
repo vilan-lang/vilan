@@ -139,6 +139,34 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The entry source's `'static` copy, interned by content: `analyze_source`
+/// borrows its source for `'static`, so every front-end leaks — but a
+/// repeated compile of identical text must reuse the earlier leak instead of
+/// adding one, or an instance that outlives many Runs of the same buffer
+/// grows per Run. Tallied at `WasmEntryText` on the miss, like every other
+/// leak site.
+fn interned_entry(source: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static ENTRIES: OnceLock<Mutex<HashMap<u64, &'static str>>> = OnceLock::new();
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    let key = hasher.finish();
+    let entries = ENTRIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(existing) = entries.lock().unwrap().get(&key).copied() {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
+    vilan_core::leak_tally::record(
+        vilan_core::leak_tally::LeakSite::WasmEntryText,
+        leaked.len(),
+    );
+    entries.lock().unwrap().insert(key, leaked);
+    leaked
+}
+
 /// Compiles one Vilan source string for the browser platform.
 ///
 /// Always `Platform::Browser`: it is what the playground runs, and passing it
@@ -149,10 +177,7 @@ pub fn compile_program(source: &str) -> CompileOutput {
     let entry_path = PathBuf::from(PROJECT_ROOT).join(ENTRY_NAME);
     vilan_core::analyzer::set_document_overlay(&entry_path, Some(source.to_string()));
 
-    // `analyze_source` borrows its source for `'static`. Every front-end leaks
-    // here; core's content-addressed cache means a repeated compile of the same
-    // text reuses the earlier leak rather than adding one.
-    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let leaked = interned_entry(source);
     let (program, errors) = analyze_source(
         leaked,
         &embedded_std_spec(),

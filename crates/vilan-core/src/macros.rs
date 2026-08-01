@@ -1161,7 +1161,11 @@ impl Expander<'_, '_> {
             prelude.push_str("import std::option::Option;\n");
         }
         let combined = format!("{prelude}{}", self.rust_source);
-        match parse_generated(&combined) {
+        // Deterministic per input (fixed prelude order, file-order source
+        // accumulation, no gensyms), so it caches like any other generated
+        // text: an unchanged program's re-analysis reuses the tree instead of
+        // re-leaking one per analysis (the E23 sweep's uncached straggler).
+        match parse_cached(&combined) {
             Ok((parsed, _)) => self.output.items.insert(0, ((0..0).into(), parsed)),
             Err(message) => self.diagnostics.push(Error {
                 note: None,

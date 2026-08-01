@@ -1253,3 +1253,117 @@ fn compiling_a_std_file_directly_resolves_its_pkg_imports() {
         "expected a clean std-self compile, got: {errors:#?}"
     );
 }
+
+/// A dependency namespace's display name must be interned, not re-leaked per
+/// analysis: the LSP leak harness's fixtures are dependency-free (its
+/// `display` term is vacuously zero there), so the plateau is pinned here,
+/// where a dependency actually exists (the E23 sweep's coverage gap). The
+/// first analysis must also RECORD the leak — if the site stops firing, this
+/// pin has gone vacuous and says so.
+#[test]
+fn dependency_display_names_intern_across_analyses() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    let entry =
+        "import std::print;\nimport internpin::greeting;\nfun main() { print(greeting()); }\n";
+    let dep = Dep {
+        import_name: "internpin",
+        files: &[("lib.vl", "fun greeting(): str { \"hi\" }\n")],
+    };
+    leak_tally::reset();
+    let errors = analyze_workspace(entry, &[dep], Platform::default());
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+    assert!(
+        leak_tally::bytes(LeakSite::DisplayName) > 0,
+        "the first analysis of a dependency workspace recorded no display-name \
+         leak — the site moved and this pin is vacuous"
+    );
+    let dep = Dep {
+        import_name: "internpin",
+        files: &[("lib.vl", "fun greeting(): str { \"hi\" }\n")],
+    };
+    leak_tally::reset();
+    let errors = analyze_workspace(entry, &[dep], Platform::default());
+    assert!(
+        errors.is_empty(),
+        "expected a clean compile, got: {errors:#?}"
+    );
+    assert_eq!(
+        leak_tally::bytes(LeakSite::DisplayName),
+        0,
+        "re-analyzing the same dependency workspace re-leaked its namespace \
+         display name — the intern is not deduping"
+    );
+}
+
+/// The Rust-fallback derive path — a derive with NO macro in scope, the case
+/// fixture stds and macro-world compiles hit — must parse its generated impls
+/// through the content cache: an unchanged program's re-analysis reuses the
+/// tree instead of re-leaking one. Pinned here rather than in the LSP leak
+/// harness because it needs a std WITHOUT the std macros, and this file
+/// already owns the hand-built-spec fixtures (the E23 sweep's coverage gap).
+#[test]
+fn rust_fallback_derives_parse_through_the_content_cache() {
+    use vilan_core::leak_tally::{self, LeakSite};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("vilan_fallback_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // A std whose loader-forced modules are empty stubs and which defines no
+    // `macro fun` anywhere: `[derive(PartialEq)]` finds no macro in scope and
+    // falls back to the Rust generators. (The generated prelude's imports then
+    // fail to resolve against the stubs — irrelevant here: the leak this pins
+    // happens at the parse, before resolution.)
+    let std_src = root.join("std").join("src");
+    std::fs::create_dir_all(&std_src).unwrap();
+    for module in [
+        "boolean", "list", "null", "promise", "compare", "default", "debug", "json", "hash",
+    ] {
+        std::fs::write(std_src.join(format!("{module}.vl")), "").unwrap();
+    }
+    let fixture_std = PackageSpec {
+        base_root: std_src,
+        layers: Vec::new(),
+        dependencies: Vec::new(),
+        surface: true,
+    };
+    let app_dir = root.join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let entry_path = app_dir.join("main.vl");
+    let source = "[derive(PartialEq)]\nstruct FallbackPin { x: i32 }\n";
+    std::fs::write(&entry_path, source).unwrap();
+    let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
+
+    let analyze = || {
+        let (_program, _errors) = analyze_source(
+            leaked,
+            &fixture_std,
+            &app_dir,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        );
+    };
+    leak_tally::reset();
+    analyze();
+    assert!(
+        leak_tally::bytes(LeakSite::MacroParseText) > 0,
+        "the fixture never took the Rust-fallback path — no generated text was \
+         parsed, and this pin is vacuous"
+    );
+    leak_tally::reset();
+    analyze();
+    let releaked =
+        leak_tally::bytes(LeakSite::MacroParseText) + leak_tally::bytes(LeakSite::MacroParseAst);
+    assert_eq!(
+        releaked, 0,
+        "the Rust-fallback derive re-leaked {releaked} B on an unchanged \
+         re-analysis — `flush_rust_fallback` is not parsing through the \
+         content cache"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
