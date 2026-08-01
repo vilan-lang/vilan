@@ -746,6 +746,19 @@ impl<'src> Printer<'src> {
         start_from: usize,
         top_level: bool,
     ) -> usize {
+        // A statement list is a fresh layout context: a split armed OUTSIDE it
+        // never reaches a statement inside it. Every statement here earns its
+        // own permission from its own measured line, which is the only thing
+        // that permission was ever about.
+        //
+        // Without this, a declaration's own measurement leaks into its body. An
+        // over-budget `fun` signature is the first line of the function's
+        // rendering, so the statement rule arms a split on it; the signature has
+        // no layout to spend it on (argument lists are never wrapped), so the
+        // permission travelled into the body and broke the first statement
+        // there — `let age = now().since(t).describe();` at 54 columns split
+        // three ways because the `fun` above it was 108.
+        self.split = Split::Off;
         let mut prev_end = start_from;
         let mut index = 0;
         while index < items.len() {
@@ -4621,7 +4634,7 @@ mod spanning_renderings {
     //! Each pin runs the whole formatter contract through `assert_construct`.
     use super::LINE_BUDGET;
     use super::bailing_constructs::assert_construct;
-    use super::chain_splitting::columns;
+    use super::chain_splitting::{assert_over_budget, columns};
 
     /// The motivating shape, reduced from `todos.vl`: a chain whose last link
     /// takes a block-bodied closure. The chain splits like any other, the link
@@ -4682,6 +4695,30 @@ mod spanning_renderings {
                 "P".repeat(68)
             ),
         );
+    }
+
+    /// A declaration's own measurement stops at its body. Measuring first lines
+    /// made `fun` signatures measurable for the first time — this one is 108
+    /// columns — and a signature has no layout to spend a split on, so the
+    /// permission used to travel into the body and break the first statement
+    /// there. `let age = now().since(t).describe();` is 54 columns and stays on
+    /// its line; the same statement under a short signature is untouched too, so
+    /// the pin is about the leak and not about the statement.
+    #[test]
+    fn an_over_budget_declaration_does_not_arm_its_body() {
+        let wide_signature = "fun task_row(client: KoltClient<SocketTransport>, workspace_id: i32, \
+                              task: Task, token: Signal<str>): View {\n\
+                              \tlet age = now().since(task.created_at).describe();\n\
+                              \tview(\"li\").styled(row)\n\
+                              }\n";
+        assert_over_budget(wide_signature.lines().next().unwrap());
+        assert_construct(wide_signature, wide_signature);
+
+        let narrow_signature = "fun short(a: i32): View {\n\
+                                \tlet age = now().since(task.created_at).describe();\n\
+                                \tview(\"li\").styled(row)\n\
+                                }\n";
+        assert_construct(narrow_signature, narrow_signature);
     }
 
     /// The other half of "first line only": a statement whose opening line fits
