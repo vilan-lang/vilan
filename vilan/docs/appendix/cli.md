@@ -101,6 +101,11 @@ is the current directory. Formatting is conservative and a fixed point:
   same line. A chain that ends at its spanning link is left alone, so the
   trailing-closure shape `self.cleanups.write().push(|| { … });` stays as
   written.
+- A list or struct literal also splits *regardless of width* when one of
+  its elements spans lines, because its closing `}` or `]` — and usually a
+  `)` and `;` after it — would otherwise pile onto that element's last
+  line. Unlike a chain, the *last* element counts: a composite has no
+  position where a spanning element leaves a clean line.
 - A comment you write *inside* one of these constructs keeps it split, and
   attaches to the element it precedes — the link, element, field, imported
   name or parameter below it. A construct that collapsed would have no line

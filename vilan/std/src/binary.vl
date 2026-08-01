@@ -400,17 +400,20 @@ fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 /// The binary codec (§6.2): byte frames over the writer/reader pair. A text
 /// frame poisons the reader — a sticky decode error, never a crash.
 fun binary_codec(): Codec {
-	Codec { writer = || {
-		let writer = BinaryWriter::new();
-		(writer.serializer(), || Frame::Binary(writer.finish()))
-	}, reader = |frame| {
-		match frame {
-			Frame::Binary(let bytes) => BinaryReader::new(bytes).deserializer(),
-			Frame::Text(let text) => {
-				let reader = BinaryReader::new(Bytes::alloc(0));
-				reader.report("binary codec: received a text frame");
-				reader.deserializer()
-			},
-		}
-	} }
+	Codec {
+		writer = || {
+			let writer = BinaryWriter::new();
+			(writer.serializer(), || Frame::Binary(writer.finish()))
+		},
+		reader = |frame| {
+			match frame {
+				Frame::Binary(let bytes) => BinaryReader::new(bytes).deserializer(),
+				Frame::Text(let text) => {
+					let reader = BinaryReader::new(Bytes::alloc(0));
+					reader.report("binary codec: received a text frame");
+					reader.deserializer()
+				},
+			}
+		},
+	}
 }

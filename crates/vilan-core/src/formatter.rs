@@ -2387,6 +2387,50 @@ impl<'src> Printer<'src> {
         spans
     }
 
+    /// Whether `expr` renders across lines. Measured by rendering it and looking,
+    /// with the probe discipline [`Self::link_spans_lines`] uses: everything the
+    /// render touched is restored, and probes do not nest.
+    fn expr_spans_lines(&mut self, expr: &Spanned<Node<'src>>) -> bool {
+        if self.probing {
+            return false;
+        }
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let bailed = self.bailed;
+        let split = self.split;
+        self.probing = true;
+        self.print_expr(expr);
+        self.probing = false;
+        let spans = self.out[start..].contains('\n');
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.bailed = bailed;
+        self.split = split;
+        spans
+    }
+
+    /// Whether a list literal must break because one of its elements renders
+    /// across lines (`proposal/composite-spanning-split.md`).
+    ///
+    /// ANY element, where a chain needs a NON-FINAL link: a composite's closing
+    /// delimiter always follows its last element — and usually an enclosing `)`
+    /// and `;` after that — so there is no position in which a spanning element
+    /// leaves a clean line. `{ id, notify = || { … } }` closes on `} });`.
+    fn any_element_spans_lines(&mut self, elements: &[Spanned<Node<'src>>]) -> bool {
+        elements
+            .iter()
+            .any(|element| self.expr_spans_lines(element))
+    }
+
+    /// The same, over a struct literal's field values.
+    fn any_field_spans_lines(&mut self, fields: &[Spanned<StructInitializerField<'src>>]) -> bool {
+        fields.iter().any(|((_, value), _)| {
+            value
+                .as_ref()
+                .is_some_and(|value| self.expr_spans_lines(value))
+        })
+    }
+
     /// Prints just the postfix a spine step applies — its subject is already
     /// printed. Mirrors the four postfix arms of `print_expr`.
     fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
@@ -2909,6 +2953,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {}");
                 } else if split != Split::Off
                     || self.comment_outside_elements(fields.1, &field_spans)
+                    || self.any_field_spans_lines(&fields.0)
                 {
                     self.print_split_struct(&fields.0, fields.1.into_range().start);
                 } else {
@@ -2930,7 +2975,8 @@ impl<'src> Printer<'src> {
                 let element_spans: Vec<Span> = elements.iter().map(|element| element.1).collect();
                 if !elements.is_empty()
                     && (split != Split::Off
-                        || self.comment_outside_elements(expr.1, &element_spans))
+                        || self.comment_outside_elements(expr.1, &element_spans)
+                        || self.any_element_spans_lines(elements))
                 {
                     self.print_split_list(elements, expr.1.into_range().start);
                 } else {
@@ -5340,6 +5386,88 @@ mod import_set_layout {
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod composite_spanning_layout {
+    //! `proposal/composite-spanning-split.md` — backlog 49, and backlog 47's
+    //! recorded residue. A list or struct literal whose ELEMENT renders across
+    //! lines splits regardless of width, because its closing delimiter always
+    //! follows that element: `{ id, notify = || { … } }` inside a call closes on
+    //! `} });`, three closings of three different things on one line.
+    //!
+    //! ANY element, where the chain rule needs a NON-FINAL link. The two differ
+    //! because the constructs differ: a chain that ENDS at its spanning link
+    //! leaves a clean line and is the trailing-closure idiom, and a composite has
+    //! no equivalent position. Both halves of that asymmetry are pinned here.
+    use super::bailing_constructs::assert_construct;
+
+    /// The motivating shape, from `std/reactive.vl` — every line inside the
+    /// budget, and its author had written it split before the formatter
+    /// collapsed it.
+    #[test]
+    fn a_struct_literal_holding_a_spanning_field_breaks() {
+        assert_construct(
+            "fun demo() {\n\
+             \tpush(Subscriber { id, notify = || {\n\
+             \t\tobserver(get());\n\
+             \t} });\n\
+             }\n",
+            "fun demo() {\n\
+             \tpush(Subscriber {\n\
+             \t\tid,\n\
+             \t\tnotify = || {\n\
+             \t\t\tobserver(get());\n\
+             \t\t},\n\
+             \t});\n\
+             }\n",
+        );
+    }
+
+    /// A list literal, same rule.
+    #[test]
+    fn a_list_holding_a_spanning_element_breaks() {
+        assert_construct(
+            "fun demo() {\n\
+             \thandle([alpha, || {\n\
+             \t\twork();\n\
+             \t}]);\n\
+             }\n",
+            "fun demo() {\n\
+             \thandle([\n\
+             \t\talpha,\n\
+             \t\t|| {\n\
+             \t\t\twork();\n\
+             \t\t},\n\
+             \t]);\n\
+             }\n",
+        );
+    }
+
+    /// The asymmetry, stated as a pin rather than left to the prose: the
+    /// spanning field above is the literal's LAST, and it still breaks, while a
+    /// chain whose spanning link is its last is left alone. Both fixtures here
+    /// are within the budget, so only these rules can be acting.
+    #[test]
+    fn a_chains_last_link_is_still_exempt_where_a_composites_last_element_is_not() {
+        let trailing_closure = "fun demo() {\n\
+                                \tchain.write().push(|| {\n\
+                                \t\titem.dispose();\n\
+                                \t});\n\
+                                }\n";
+        assert_construct(trailing_closure, trailing_closure);
+    }
+
+    /// Composites whose elements all fit are untouched — the collapse rules are
+    /// unchanged for code that has nothing spanning in it.
+    #[test]
+    fn a_composite_whose_elements_all_fit_stays_inline() {
+        let source = "fun demo() {\n\
+                      \tlet plain = Point { x = 1, y = 2 };\n\
+                      \tlet list = [alpha, beta];\n\
+                      }\n";
+        assert_construct(source, source);
     }
 }
 

@@ -376,9 +376,12 @@ impl Signal<type T> with Source<T> {
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
 		let id = fresh_id();
-		self.subscribers.write().push(Subscriber { id, notify = || {
-			observer(self.get());
-		} });
+		self.subscribers.write().push(Subscriber {
+			id,
+			notify = || {
+				observer(self.get());
+			},
+		});
 		observer(self.get());
 		Subscription { subscribers = self.subscribers, id }
 	}
@@ -419,9 +422,12 @@ impl Signal<type T> {
 
 	fun map<U>(self, transform: sync |T| U): Signal<U> {
 		let derived = Signal::new(transform(self.get()));
-		self.subscribers.write().push(Subscriber { id = fresh_id(), notify = || {
-			derived.set(transform(self.get()));
-		} });
+		self.subscribers.write().push(Subscriber {
+			id = fresh_id(),
+			notify = || {
+				derived.set(transform(self.get()));
+			},
+		});
 		derived
 	}
 }

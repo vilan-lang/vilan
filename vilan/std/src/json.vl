@@ -739,17 +739,20 @@ fun opened_reader(text: str): JsonReader {
 /// The JSON codec (§6.2): text frames over the writer/reader pair. A binary
 /// frame poisons the reader — a sticky decode error, never a crash.
 fun json_codec(): Codec {
-	Codec { writer = || {
-		let writer = JsonWriter::new();
-		(writer.serializer(), || Frame::Text(writer.result()))
-	}, reader = |frame| {
-		// Liberal in what it accepts: a binary frame is read as UTF-8 JSON
-		// (server mounts read request bodies as bytes without sniffing).
-		match frame {
-			Frame::Text(let text) => opened_reader(text).deserializer(),
-			Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)).deserializer(),
-		}
-	} }
+	Codec {
+		writer = || {
+			let writer = JsonWriter::new();
+			(writer.serializer(), || Frame::Text(writer.result()))
+		},
+		reader = |frame| {
+			// Liberal in what it accepts: a binary frame is read as UTF-8 JSON
+			// (server mounts read request bodies as bytes without sniffing).
+			match frame {
+				Frame::Text(let text) => opened_reader(text).deserializer(),
+				Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)).deserializer(),
+			}
+		},
+	}
 }
 
 // The `Json` and `Wire` derives (macro-engine.md §10): prelude macros —
