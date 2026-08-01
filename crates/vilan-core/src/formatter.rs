@@ -508,6 +508,7 @@ pub fn organize_import_runs(
         source,
         bailed: false,
         split: Split::Off,
+        probing: false,
     };
     Some(printer.organize_runs(&items, keep))
 }
@@ -558,6 +559,7 @@ pub fn format(original: &str) -> String {
         source,
         bailed: false,
         split: Split::Off,
+        probing: false,
     };
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
@@ -633,6 +635,9 @@ struct Printer<'src> {
     bailed: bool,
     /// The pending [`Split`] permission for the next expression printed.
     split: Split,
+    /// True while a seam probe is rendering a chain link to see whether it spans
+    /// lines ([`Printer::link_spans_lines`]). Probes do not nest.
+    probing: bool,
 }
 
 impl<'src> Printer<'src> {
@@ -2180,6 +2185,56 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// Whether `expr`'s chain must break regardless of width
+    /// (`proposal/chain-seam-split.md`): a call link that is NOT the chain's last
+    /// renders across lines, so its closing `})` lands on a line that then
+    /// continues with more chain — the seam.
+    ///
+    /// The last link is excluded because it has no seam: when the chain ends at
+    /// its spanning link, the `})` closes the statement and nothing follows it,
+    /// which is the ordinary trailing-closure idiom and is already readable.
+    fn chain_has_spanning_seam(&mut self, expr: &Spanned<Node<'src>>) -> bool {
+        // A probe already in progress renders its subtree once, with no further
+        // seam checks inside it. This bounds the cost and changes no answer: a
+        // nested chain only seam-splits when a body already spans lines, which
+        // the probe sees whether or not that inner split happens.
+        if self.probing {
+            return false;
+        }
+        let (_, spine) = Self::postfix_spine(expr);
+        let last_call = spine.iter().rposition(|step| Self::is_call_link(&step.0));
+        for (index, step) in spine.iter().enumerate() {
+            if !Self::is_call_link(&step.0) || Some(index) == last_call {
+                continue;
+            }
+            if self.link_spans_lines(step) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Renders one chain link and reports whether it spans lines, then takes the
+    /// rendering back out. Measured rather than predicted from the AST, for the
+    /// reason the width rule measures: only the printer knows what the printer
+    /// will do. Everything the render touched — output, comment cursor, bail
+    /// flag, pending split — is restored, so a probe leaves no trace.
+    fn link_spans_lines(&mut self, step: &Spanned<Node<'src>>) -> bool {
+        let start = self.out.len();
+        let cursor = self.cursor;
+        let bailed = self.bailed;
+        let split = self.split;
+        self.probing = true;
+        self.print_postfix_suffix(step);
+        self.probing = false;
+        let spans = self.out[start..].contains('\n');
+        self.out.truncate(start);
+        self.cursor = cursor;
+        self.bailed = bailed;
+        self.split = split;
+        spans
+    }
+
     /// Prints just the postfix a spine step applies — its subject is already
     /// printed. Mirrors the four postfix arms of `print_expr`.
     fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
@@ -2349,7 +2404,11 @@ impl<'src> Printer<'src> {
             self.out.push_str(interpolated);
             return;
         }
-        if split != Split::Off && Self::is_breakable_chain(expr) {
+        // Two doors into the split form: the width rule armed a split, or the
+        // chain carries a `})` seam (`proposal/chain-seam-split.md`).
+        if Self::is_breakable_chain(expr)
+            && (split != Split::Off || self.chain_has_spanning_seam(expr))
+        {
             self.print_split_chain(expr);
             return;
         }
@@ -4037,15 +4096,21 @@ mod chain_splitting {
         assert_construct(plain_call, plain_call);
     }
 
-    /// The width rule reads a single-line rendering only: a statement that
-    /// already spans lines (here a closure with a block body) is left alone, so
-    /// the measured width always describes the line it is about.
+    /// WIDTH does not split a statement that spans lines: the budget is read from
+    /// the opening line (backlog 44), and here that line fits. The spanning link
+    /// is the chain's LAST, so the seam rule (`proposal/chain-seam-split.md`) has
+    /// nothing to say about it either — which is what makes this a pin about
+    /// width rather than about the trailing closure.
+    ///
+    /// This fixture used to end `}).on("beta", …)`, which is a seam, and the
+    /// pin asserted it stayed inline. That expectation moved with backlog 48;
+    /// the seam form is pinned in [`super::chain_seam_layout`].
     #[test]
-    fn a_statement_that_already_spans_lines_is_not_split() {
+    fn a_spanning_last_link_is_not_split_by_width() {
         let source = "fun main() {\n\
-                      \tlet built = registry.on(\"alpha\", |event| {\n\
+                      \tlet built = registry.first(argument).on(\"beta\", |event| {\n\
                       \t\thandle(event);\n\
-                      \t}).on(\"beta\", |event| handle_the_other_one_with_a_long_name(event));\n\
+                      \t});\n\
                       }\n";
         assert_construct(source, source);
     }
@@ -5121,6 +5186,134 @@ mod import_set_layout {
                 ]
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_seam_layout {
+    //! `proposal/chain-seam-split.md` — the width rule's second door. A chain
+    //! splits regardless of width when a call link that is NOT its last renders
+    //! across lines, because that link's closing `})` lands on a line which then
+    //! continues with more chain: the end of one argument, the start of the next
+    //! link, and the start of ITS argument, all on one line.
+    //!
+    //! The last link is excluded deliberately — a chain that ENDS at its
+    //! spanning link has no seam, and that is the ordinary trailing-closure
+    //! idiom. Counting it too would have touched 8 files and 170 lines across
+    //! std and the examples instead of 5 and 121, every std case being a
+    //! trailing closure that should stay put.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::LINE_BUDGET;
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::columns;
+
+    /// The motivating shape, from `examples/fullstack`: every line inside the
+    /// budget, and unreadable anyway.
+    #[test]
+    fn a_seam_splits_a_chain_that_fits() {
+        let source = "fun main() {\n\
+                      \tlet server = Server::builder().port(3000).on_request(|request| {\n\
+                      \t\troute(request);\n\
+                      \t}).on_start(|server| {\n\
+                      \t\tprint(server.url());\n\
+                      \t}).build();\n\
+                      }\n";
+        for line in source.lines() {
+            assert!(
+                columns(line) <= LINE_BUDGET,
+                "fixture must be within the budget, so the pin is about the seam \
+                 and not about width: {line:?}"
+            );
+        }
+        assert_construct(
+            source,
+            "fun main() {\n\
+             \tlet server = Server::builder()\n\
+             \t\t.port(3000)\n\
+             \t\t.on_request(|request| {\n\
+             \t\t\troute(request);\n\
+             \t\t})\n\
+             \t\t.on_start(|server| {\n\
+             \t\t\tprint(server.url());\n\
+             \t\t})\n\
+             \t\t.build();\n\
+             }\n",
+        );
+    }
+
+    /// The exclusion, and the whole reason the rule says "not the last": the
+    /// trailing-closure idiom stays exactly as written. `std`'s `Owner::take` is
+    /// this shape, and breaking it buys two lines and no clarity.
+    #[test]
+    fn a_spanning_last_link_is_left_alone() {
+        let source = "fun take<T: Disposable>(self, item: T): T {\n\
+                      \tself.cleanups.write().push(|| {\n\
+                      \t\titem.dispose();\n\
+                      \t});\n\
+                      \titem\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// One call link is not a chain, so there is no shape to show and nothing to
+    /// break — the seam rule inherits the split form's own entry condition.
+    #[test]
+    fn a_single_link_is_not_a_chain() {
+        let source = "fun main() {\n\
+                      \tregistry.on(\"alpha\", |event| {\n\
+                      \t\thandle(event);\n\
+                      \t});\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// A triple-quoted string spans lines because of its CONTENTS, not its
+    /// structure. An earlier draft of this rule triggered on "the statement's
+    /// rendering spans lines" and broke this at the `+`; restricting it to chain
+    /// links is what excludes it.
+    #[test]
+    fn a_multiline_string_is_not_a_seam() {
+        let source = "fun main() {\n\
+                      \tlet line = \"\"\"\n\
+                      \t\tkey: value\n\
+                      \t\t\"\"\" + \"!\";\n\
+                      \tprint(line);\n\
+                      }\n";
+        assert_construct(source, source);
+    }
+
+    /// The rule composes with width rather than replacing it. The statement's
+    /// OPENING line is 41 columns, so width cannot arm the split and the seam is
+    /// the only thing that can — and once split, the `.wrap(…)` link's own line
+    /// is over the budget, so it recurses into its last argument exactly as a
+    /// width-split link does. Both doors, one statement.
+    #[test]
+    fn a_seam_split_link_still_recurses_on_width() {
+        let padding = "P".repeat(70);
+        let source = format!(
+            "fun main() {{\n\
+             \tlet built = subject.on(\"x\", |event| {{\n\
+             \t\thandle(event);\n\
+             \t}}).wrap(\"{padding}\", inner.aa(1).bb(2));\n\
+             }}\n"
+        );
+        // The measured line — the first — fits, so this pin cannot pass by width.
+        assert_eq!(columns(source.lines().nth(1).unwrap()), 41);
+        assert_construct(
+            &source,
+            &format!(
+                "fun main() {{\n\
+                 \tlet built = subject\n\
+                 \t\t.on(\"x\", |event| {{\n\
+                 \t\t\thandle(event);\n\
+                 \t\t}})\n\
+                 \t\t.wrap(\"{padding}\", inner\n\
+                 \t\t\t.aa(1)\n\
+                 \t\t\t.bb(2));\n\
+                 }}\n"
+            ),
         );
     }
 }

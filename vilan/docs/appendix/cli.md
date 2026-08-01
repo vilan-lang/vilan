@@ -96,6 +96,11 @@ is the current directory. Formatting is conservative and a fixed point:
   where they are printed. So `view(…)…when(cond, || { … })` splits its
   chain like any other; only what shares the opening line counts toward
   that line's width.
+- A chain also splits *regardless of width* when a link that is not its
+  last spans lines — when a `})` would be followed by more chain on the
+  same line. A chain that ends at its spanning link is left alone, so the
+  trailing-closure shape `self.cleanups.write().push(|| { … });` stays as
+  written.
 - A `fun` signature over the budget breaks its parameter list the same
   way, one parameter per line, with the return type, a `borrows` clause
   and the body's `{` (or a bodyless `;`) riding the closing `)`. An empty
