@@ -95,6 +95,26 @@ fn recovers_garbled_generic_arguments() {
 }
 
 #[test]
+fn recovers_a_garbled_element_to_an_error_atom() {
+    // A committed element whose parse fails recovers the balanced `<…>` head
+    // region to an `Error` atom (element-syntax S2): a partial tree (a), a
+    // documented placeholder (b), at least one diagnostic (c).
+    for_each_frontend(
+        "fun main() { let p = <div 1 2>; }\n",
+        |name, tree, errors| {
+            assert!(
+                errors > 0,
+                "[{name}] a garbled element must report (c): {tree}"
+            );
+            assert!(
+                tree.contains("Error"),
+                "[{name}] recovered to an Error placeholder (b); got: {tree}"
+            );
+        },
+    );
+}
+
+#[test]
 fn recovers_garbled_struct_initializer_fields() {
     // parser.rs ~299: a garbled `Name { .. }` struct-initializer field list
     // recovers via `|span| (None, span)` (then mapped to an empty vec) to EMPTY

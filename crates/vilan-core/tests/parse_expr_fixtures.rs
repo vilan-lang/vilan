@@ -384,6 +384,27 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "a.take()",
     "self.observed",
     "Bytes::alloc(0)",
+    // --- Elements (element-syntax S2) --------------------------------------
+    "<div/>",
+    "<div />",
+    "<div></div>",
+    "<div class(\"x\")/>",
+    "<input type(\"checkbox\") disabled/>",
+    "<div aria-label(\"Copy command\")/>",
+    "<my-widget/>",
+    "<button on:click(add)>\"Add\"</button>",
+    "<button on:click(|| go())/>",
+    "<button on:click(|e| e.prevent_default())/>",
+    "<div .styled(card) .show(f)/>",
+    "<ul .bind_each(items, |t| t.id, |t| row(t))/>",
+    "<p>\"text\"</p>",
+    "<p>{value}</p>",
+    "<p>i\"a {b}\"</p>",
+    "<div><span/></div>",
+    "<div/>.show(f)",
+    "<p>\"a\" <b/> {c}</p>",
+    "x < <div/>",            // a comparison whose right operand is an element
+    "<div hidden.show(f)/>", // bare attr, then a chain link, no space (positional)
 ];
 
 /// Fixtures parsed in CONDITION position (`if <fixture> { }`) — struct literals are
@@ -465,4 +486,10 @@ const DECLINER_FIXTURES: &[&str] = &[
     "a::",       // a `::` with no member
     "match x {", // an unclosed match
     "(",         // an unclosed paren
+    // --- Elements (element-syntax S2) --------------------------------------
+    "<div>",             // an unclosed element
+    "<div></span>",      // a mismatched closing tag
+    "<h2>Todos</h2>",    // bare text children are quoted strings
+    "<div name(a, b)/>", // an attribute takes one value
+    "<div>< /div>",      // a non-adjacent `</` is not a close marker
 ];

@@ -26503,6 +26503,148 @@ fn browser_text_children_ride_create_text_node() {
 }
 
 #[test]
+fn element_lowering_is_the_chain_byte_for_byte() {
+    // Element-syntax §4's contract at the strongest level: the desugar builds
+    // the very trees the chain parses to, so the emitted JS is byte-identical.
+    let element = r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let name = Signal::new("world");
+            let page = <p data-live(name) title("hi")>
+                "Take "
+                <code>"vilan upgrade"</code>
+                {name}
+            </p>;
+            print(render(page));
+        }
+        "#;
+    let chain = r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let name = Signal::new("world");
+            let page = view("p").attr("data-live", name).attr("title", "hi")
+                .child("Take ")
+                .child(view("code").child("vilan upgrade"))
+                .child(name);
+            print(render(page));
+        }
+        "#;
+    assert_eq!(
+        compile(element).expect("the element program compiles"),
+        compile(chain).expect("the chain program compiles"),
+        "the element lowering must emit the chain's exact JS"
+    );
+}
+
+#[test]
+fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
+    // The browser leg, and the `on:` table rows: a zero-parameter literal is
+    // `.on`, a one-parameter literal is `.on_event` — byte-identical to the
+    // chain spellings.
+    let element = r#"
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                view("div")
+                    .child(<button on:click(|| beep())>"go"</button>)
+                    .child(<a on:click(|e| e.prevent_default())>"stay"</a>)
+            });
+        }
+        fun beep() {}
+        main();
+        "#;
+    let chain = r#"
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                view("div")
+                    .child(view("button").on("click", || beep()).child("go"))
+                    .child(view("a").on_event("click", |e| e.prevent_default()).child("stay"))
+            });
+        }
+        fun beep() {}
+        main();
+        "#;
+    assert_eq!(
+        compile_browser(element).expect("the element program compiles"),
+        compile_browser(chain).expect("the chain program compiles"),
+        "the element event lowering must emit the chain's exact JS"
+    );
+}
+
+#[test]
+fn ssr_element_renders_mixed_content() {
+    // An element program end to end on the process twin: written-order
+    // attributes, escaped text children, a nested element.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<p title("a & b")>
+                "Take "
+                <code>"vilan upgrade"</code>
+                " & <go>"
+            </p>));
+        }
+        "#,
+        "<p title=\"a &amp; b\">Take <code>vilan upgrade</code> &amp; &lt;go&gt;</p>\n",
+    );
+}
+
+#[test]
+fn an_element_without_view_in_scope_fails_at_the_element_head() {
+    // No auto-import: the desugared `view` accessor spans `<tag`, so the
+    // unresolved-name diagnostic underlines the element head the user wrote.
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "<div",
+        "cannot find 'view' in this scope",
+    );
+}
+
+#[test]
+fn a_macro_generated_element_desugars() {
+    // parse_generated runs the element desugar too — markup emitted by a
+    // macro lowers like hand-written markup.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let banner = macro {
+                import macro_std::source;
+                source("<p>\"from a macro\"</p>")
+            };
+            print(render(banner));
+        }
+        "#,
+        "<p>from a macro</p>\n",
+    );
+}
+
+#[test]
+fn a_mismatched_closing_tag_names_the_expected_close() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <div>"x"</span>;
+        }
+        "#,
+        "</div>",
+    );
+}
+
+#[test]
 fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
     // The silent-stub misrender (found by element-syntax S2's probe, general
     // and pre-existing): a bound-generic METHOD call whose argument is an

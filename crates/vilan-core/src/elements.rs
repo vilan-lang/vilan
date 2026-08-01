@@ -97,13 +97,17 @@ fn build_chain<'src>(
         children,
     } = body;
     let tag_text = &source[tag.into_range()];
+    // The generated `view` accessor spans `<tag` — an unresolved `view` (the
+    // import is missing) then underlines the element head itself, which is
+    // what the user wrote. The tailored import note rides S4 with the docs.
+    let head_span: Span = (span.start..tag.end).into();
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::Accessor("view"), tag)),
+            Box::new((Node::Accessor("view"), head_span)),
             None,
             (vec![(Node::String(tag_text), tag)], tag),
         ),
-        (span.start..tag.end).into(),
+        head_span,
     );
     for item in head {
         let member = match item {
