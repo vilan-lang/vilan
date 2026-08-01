@@ -416,6 +416,28 @@ it, diagnostics beneath the editor.
   the shipped wasm.
 - **S4 — polish:** share-via-fragment, version badge, editor niceties.
   Each independently shippable after S3.
+  - **Upgrade round SHIPPED 2026-08-01** (website 2fd4dd9..6920d30, four
+    commits, deployed + production-verified): auto-run on arrival (gated on
+    compiler-ready AND doc-settled — a shared link inflates async; worker
+    recycles must not re-run), localStorage buffer persistence
+    (fragment > saved > seeded), Ctrl+Enter run / Shift+Alt+F format
+    (bundle keymap, events queued so wiring order cannot lose them), the
+    example buttons became a picker in the Program pane header (a pick rides
+    the command event channel), Share flashes its outcome on the button, the
+    on-page em-dashes went (h1 colon, statuses in parens), buttons
+    non-selectable, role=status on the status line, panes flex to the fold.
+    The highlighter grew a mode stack — i-string HOLES tokenize as code with
+    ember brace seams — plus attributes, function names (def + call), `::`
+    paths, operators; one derived tint (peach #F0A886) for callables;
+    `code.vl` speaks the same vocabulary (`fn`/`ty`/`hl`) and the two
+    home-page panels are re-marked, so site and playground agree. Delivery
+    moved to VERSIONED immutable dirs (`playground/<tag>/vilan_wasm*`) with
+    one moving always-revalidated `manifest.json` — the rollover
+    mixed-pair window is gone, and `worker.js?v=<tag>` is the version
+    selector's ready hook (old versions accumulate on pages as its
+    inventory). Remaining S4: the badge placement call (the status line
+    already reports the version) and the selector UI when a second version
+    earns it; live diagnostics stays the recorded next slice.
   - **Share-via-fragment — SHIPPED 2026-08-01** (website `4a229f9`, deployed).
     `#code=<base64url(deflate-raw(source))>` per §5: Share writes the
     fragment into the address bar (`window.history.replaceState` — bare
