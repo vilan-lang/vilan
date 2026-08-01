@@ -1,6 +1,9 @@
 # Web playground — the compiler in the visitor's browser (D11)
 
-> **Status: DRAFT 2026-07-28; §7 calls SETTLED 2026-07-28** — the user took
+> **Status: S0–S3 BUILT — S3 DONE 2026-08-01** (website repo, uncommitted
+> pending review; committing + pushing the website deploys the page). S4
+> (share-via-fragment, badge placement, editor niceties) remains, each
+> independently shippable. §7 calls SETTLED 2026-07-28 — the user took
 > every recommendation: (a) vendored CodeMirror 6, (b) toolchain rides the
 > site build's source, (c) compile on Run only in v1, (d) the path is
 > `/playground`; promotion timing stays with D5/D10.
@@ -355,12 +358,62 @@ it, diagnostics beneath the editor.
   - *Still open for S3:* stack-depth and instance-recycle tuning were not
     measured here — they want a real browser, which S3 brings. The
     `-zstack-size=67108864` link arg is carried from §6 unverified.
-- **S3 — the page (website + pages repos):** `playground.vl`, the
-  `server.vl` route, worker + iframe runner, diagnostics pane, examples
-  dropdown; deploy.yml wiring per §4 (second render, allowlist additions,
-  wasm build + commit-on-change, root `.nojekyll`). Gate: the deploy's
-  existing render check extended to the second page, plus a scripted
-  smoke-compile of each seeded example against the shipped wasm.
+- **S3 — the page (website + pages repos) — DONE 2026-08-01** (website repo,
+  uncommitted pending review; the next website push DEPLOYS it). What
+  shipped, and where it deliberately differs from the sketch above:
+  - **A third entry, not a second render of one page**: `[entry.playground]`
+    in the manifest — `src/playground_page.vl` is the shared view (both legs,
+    SSR parity), `src/playground.vl` the browser entry, `src/playground.html`
+    the shell. The landing page pays nothing. `server.vl` serves the routes
+    (`/playground` + `/playground/*` assets, both slash spellings) and reads
+    the gzipped wasm as `Bytes` via a local `readFile` extern.
+  - **The vilan/JS split found its seam**: the page's STATE and rendering are
+    vilan (signals in, closures in, `bind_each` panes); the vendored bundle
+    owns the DELIVERY machinery vilan cannot express — the editor widget, the
+    worker lifecycle (a Worker needs `new`), and the per-Run
+    `sandbox="allow-scripts"` srcdoc iframe with its console/error
+    `postMessage` bootstrap. `window.VilanPlayground` is the whole interface.
+  - **Vendored CodeMirror 6 per call (a)**: `playground/editor-src/` (npm,
+    esbuild) builds the committed `playground/editor.js` (328 KB minified
+    IIFE): brand theme, a StreamLanguage vilan tokenizer (the lexer's keyword
+    list), `@codemirror/lint` squiggles fed straight from the worker's
+    diagnostics (UTF-16 line/col for the anchor; byte-length end, recorded
+    approximation).
+  - **Worker policy (§6 made concrete)**: single-flight with a latest-pending
+    queue (a Run is never silently lost), crash → recycle + respawn, recycle
+    after 32 compiles at idle, load-failure respawn capped at 3. The 64 MB
+    stack link-arg rode the release build the browser test ran against;
+    neither it nor N=32 has been stress-measured — tune when a real program
+    complains.
+  - **Examples are files, not a dropdown**: `playground/examples/*.vl`
+    (counter, hello, styles) picked by buttons; shipped as the GENERATED
+    `playground/examples.js` (`scripts/gen-examples.mjs`, deterministic), so
+    the smoke gate can regenerate and byte-compare — a stale copy fails the
+    deploy instead of shipping. (The gate caught exactly that when `vilan
+    fmt` reflowed two examples during the build-out.)
+  - **Delivery per the 2026-07-29 amendment**: `scripts/fetch-wasm.sh` pulls
+    `vilan-playground-wasm.tar.gz` from `releases/latest` — the same lever as
+    the toolchain install — locally into gitignored `playground/wasm/` and in
+    deploy.yml before the build. The deploy renders both pages (ssr-marker
+    guard on each), runs `scripts/smoke-playground.mjs` (wasm loads + reports
+    a version; examples.js current; every example compiles clean), and
+    commits the enumerated `playground/` set + root `.nojekyll` to the pages
+    repo; unchanged wasm bytes drop out of the commit naturally.
+  - **Verified end to end in a real browser** (headless Chrome against the
+    local server): editor mounts, worker gunzips + inits wasm ("Ready — vilan
+    0.18.2"), Run compiles and mounts the counter, a click inside the iframe
+    drives its signal, console forwards to the pane, a broken program renders
+    the compiler's steer in-pane AND squiggles the span, and the styles
+    example's compiler-emitted CSS applies. The status line already reports
+    the wasm's version, so S4's badge is a placement question, not plumbing.
+  - **The page is UNLINKED** per §7d — no nav or landing-page link anywhere;
+    promotion stays with D5/D10.
+  Original slice text: `playground.vl`, the `server.vl` route, worker +
+  iframe runner, diagnostics pane, examples dropdown; deploy.yml wiring per
+  §4 (second render, allowlist additions, wasm build + commit-on-change, root
+  `.nojekyll`). Gate: the deploy's existing render check extended to the
+  second page, plus a scripted smoke-compile of each seeded example against
+  the shipped wasm.
 - **S4 — polish:** share-via-fragment, version badge, editor niceties.
   Each independently shippable after S3.
 
