@@ -261,7 +261,12 @@ fun connect_split(base_url: str): SplitDuplex {
 			rest = drain_sse(rest, dispatch);
 		}
 	};
-	SplitDuplex { connection = parse_announced(connection.read()), send_url = i"{base_url}/send?c={connection.read()}", inbound, early }
+	SplitDuplex {
+		connection = parse_announced(connection.read()),
+		send_url = i"{base_url}/send?c={connection.read()}",
+		inbound,
+		early,
+	}
 }
 
 /// The `__conn:<id>` announcement's id, parsed once at connect time. A
@@ -477,7 +482,11 @@ fun settle_pending(pending: Shared<List<PendingCall>>, request: i32, reply: Fram
 }
 
 /// Route one duplex frame to the handler, or the early queue before one is set.
-fun deliver_inbound(inbound: Shared<Option<|Frame| void>>, early: Shared<List<Frame>>, payload: Frame) {
+fun deliver_inbound(
+	inbound: Shared<Option<|Frame| void>>,
+	early: Shared<List<Frame>>,
+	payload: Frame,
+) {
 	match inbound.read() {
 		Some(let handler) => handler(payload),
 		None => early.write().push(payload),
@@ -564,7 +573,11 @@ fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispat
 /// frames land in the SAME places across reconnects). Resolves `Ok((socket,
 /// connection))` when the `__conn:<id>` announcement arrives, `Err` when the
 /// socket closes or errors first (an unreachable server).
-fun dial(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(WebSocket, i32), str> {
+fun dial(
+	url: str,
+	settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+): Result<(WebSocket, i32), str> {
 	let socket = new_web_socket(url);
 	socket.set_binary_type("arraybuffer");
 	let connection: Shared<str> = Shared::new("");
@@ -596,7 +609,11 @@ fun dial(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(W
 /// §2.3): 10 attempts, doubling from 250ms and capped at 4s — fast for the
 /// blip, capped pressure for the outage. Railway's attempt budget, better
 /// curve. The first attempt is immediate.
-fun dial_with_backoff(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(WebSocket, i32), str> {
+fun dial_with_backoff(
+	url: str,
+	settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+): Result<(WebSocket, i32), str> {
 	mut outcome: Result<(WebSocket, i32), str> = Err(i"could not reach {url}");
 	mut attempt = 0;
 	mut delay = 250i53;
@@ -676,7 +693,17 @@ fun connect_socket(url: str): Result<SocketDuplex, str> {
 		Err(let reason) => Err(reason),
 		Ok(let opened) => {
 			let (socket, connection) = opened;
-			let duplex = SocketDuplex { socket = Shared::new(socket), url, connection = Shared::new(connection), state = Signal::new(ConnectionState::Connected), inbound, early, pending, next_request = Shared::new(0), on_reconnect = Shared::new([]) };
+			let duplex = SocketDuplex {
+				socket = Shared::new(socket),
+				url,
+				connection = Shared::new(connection),
+				state = Signal::new(ConnectionState::Connected),
+				inbound,
+				early,
+				pending,
+				next_request = Shared::new(0),
+				on_reconnect = Shared::new([]),
+			};
 			watch_socket(duplex);
 			// HMR (`hmr.md` §3, step 2): close the live socket before the next
 			// bundle re-dials — the fresh duplex resyncs from the server exactly as
@@ -825,7 +852,12 @@ fun local_rpc(protocol: RpcProtocol): LocalTransport {
 /// describes itself into the envelope's serializer), await the round-trip, and
 /// decode the reply as `T` (inferred from the call site). Infrastructure
 /// failures — transport, decode, a remote error — surface as `Err(RpcError)`.
-fun call<T: Wire, Tx: Transport>(transport: Tx, codec: Codec, method: str, args: List<|Serializer| void>): Result<T, RpcError> {
+fun call<T: Wire, Tx: Transport>(
+	transport: Tx,
+	codec: Codec,
+	method: str,
+	args: List<|Serializer| void>,
+): Result<T, RpcError> {
 	let outcome = await transport.call(encode_request(codec, method, args));
 	match outcome {
 		// The transport itself failed — a dropped connection, an unreachable
@@ -1012,7 +1044,12 @@ struct ReactiveServer {
 
 impl ReactiveServer {
 	fun new(transport: DuplexEnd, codec: Codec): ReactiveServer {
-		let server = ReactiveServer { transport, codec, sources = Shared::new([]), live = Shared::new([]) };
+		let server = ReactiveServer {
+			transport,
+			codec,
+			sources = Shared::new([]),
+			live = Shared::new([]),
+		};
 		(server.transport).on_frame(|frame| {
 			// every inbound frame is handled in a turn (proposal/reactive-batching.md)
 			batch(|| server.receive(frame));
@@ -1148,7 +1185,13 @@ impl ReactiveClient {
 		};
 		let channel_cell = Shared::new(channel);
 		self.routes.write().push((channel_cell, deliver));
-		RemoteSource { channel = channel_cell, subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)), wanted = Shared::new(false), transport = self.transport, cache }
+		RemoteSource {
+			channel = channel_cell,
+			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
+			wanted = Shared::new(false),
+			transport = self.transport,
+			cache,
+		}
 	}
 
 	/// One inbound frame: an `Update` fans out to its channel's deliverers
@@ -1243,7 +1286,13 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 /// the fresh connection id, and rebind each mirror positionally (the
 /// `__attach` reply is ordered by the service's exposed-field order). The
 /// generated `connect` pushes one `on_reconnect` hook calling this.
-fun reattach_mirrors(socket: SocketDuplex, transport: SocketTransport, codec: Codec, expected_contract: str, rebinds: List<|i32, Frame| void>) {
+fun reattach_mirrors(
+	socket: SocketDuplex,
+	transport: SocketTransport,
+	codec: Codec,
+	expected_contract: str,
+	rebinds: List<|i32, Frame| void>,
+) {
 	let remote: Result<str, RpcError> = call(transport, codec, "__contract", []);
 	match remote {
 		// Unreachable again already — the next drop cycle handles it.

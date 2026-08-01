@@ -9,7 +9,7 @@
 
 use crate::node::{
     BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern,
+    NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -746,6 +746,19 @@ impl<'src> Printer<'src> {
         start_from: usize,
         top_level: bool,
     ) -> usize {
+        // A statement list is a fresh layout context: a split armed OUTSIDE it
+        // never reaches a statement inside it. Every statement here earns its
+        // own permission from its own measured line, which is the only thing
+        // that permission was ever about.
+        //
+        // Without this, a declaration's own measurement leaks into its body. An
+        // over-budget `fun` signature is the first line of the function's
+        // rendering, so the statement rule arms a split on it; the signature has
+        // no layout to spend it on (argument lists are never wrapped), so the
+        // permission travelled into the body and broke the first statement
+        // there — `let age = now().since(t).describe();` at 54 columns split
+        // three ways because the `fun` above it was 108.
+        self.split = Split::Off;
         let mut prev_end = start_from;
         let mut index = 0;
         while index < items.len() {
@@ -833,7 +846,7 @@ impl<'src> Printer<'src> {
         entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         for (_, position, trailing) in &entries {
             self.line();
-            self.print_import_like(&run[*position].0);
+            self.print_import_statement(&run[*position].0);
             if let Some(text) = trailing {
                 self.out.push(' ');
                 self.out.push_str(text);
@@ -946,7 +959,7 @@ impl<'src> Printer<'src> {
                 replacement.push('\n');
             }
             self.out.clear();
-            self.print_import_like(statement.node());
+            self.print_import_statement(statement.node());
             replacement.push_str(&self.out);
             if let Some(text) = trailing {
                 replacement.push(' ');
@@ -1260,30 +1273,89 @@ impl<'src> Printer<'src> {
     /// Prints an import/use path: `a::b::{ c, d }`. When `sort`, a brace set's
     /// branches print in canonical order (`{ c, d }`) — used for top-level
     /// imports; block-scoped imports pass `false` to print them as written.
+    /// Prints one import/use statement, re-printing it in split form when its
+    /// own line overflows the budget. Both import paths go through here — `fmt`'s
+    /// output and Organize Imports — because [`Self::organize_run`] depends on
+    /// producing byte-for-byte what `fmt` would; if only one of them split, the
+    /// editor action and the formatter would rewrite each other forever.
+    ///
+    /// The caller has already emitted this line's indentation, so the rollback
+    /// keeps it and reprints only the statement.
+    fn print_import_statement(&mut self, node: &Node<'src>) {
+        let statement_start = self.out.len();
+        self.print_import_like(node);
+        if self.over_line_budget(statement_start) {
+            self.out.truncate(statement_start);
+            self.split = Split::Statement;
+            self.print_import_like(node);
+        }
+    }
+
     fn print_import_branch(&mut self, branch: &ImportBranch<'src>, sort: bool) {
+        // Take the pending split here, as `print_expr` does. A path FORWARDS it
+        // to the child it leads to — `std::rpc::{…}` breaks at the set, not at
+        // the `::` — and the set is what consumes it.
+        let split = std::mem::take(&mut self.split);
         match branch {
             ImportBranch::Path(name, _, child) => {
                 self.out.push_str(name);
                 if let Some(child) = child {
                     self.out.push_str("::");
+                    self.split = split;
                     self.print_import_branch(child, sort);
                 }
             }
             ImportBranch::Set(branches) => {
-                self.out.push_str("{ ");
                 let mut order: Vec<&ImportBranch<'src>> = branches.iter().collect();
                 if sort {
                     order.sort_by_cached_key(|branch| branch_key(&branch_from_ast(branch)));
                 }
-                for (index, child) in order.iter().enumerate() {
-                    if index > 0 {
-                        self.out.push_str(", ");
+                if split != Split::Off && !order.is_empty() {
+                    self.print_split_import_set(&order, sort);
+                } else {
+                    self.out.push_str("{ ");
+                    for (index, child) in order.iter().enumerate() {
+                        if index > 0 {
+                            self.out.push_str(", ");
+                        }
+                        self.print_import_branch(child, sort);
                     }
-                    self.print_import_branch(child, sort);
+                    self.out.push_str(" }");
                 }
-                self.out.push_str(" }");
             }
         }
+    }
+
+    /// Prints a brace set in split form: one member per line, one indentation
+    /// level in, with a trailing comma after every one, and `}` back at the
+    /// opening line's indent where the `;` glues. The list literal's rule, on
+    /// the one brace list that is not an expression — and the token-level import
+    /// grammar allows the trailing comma, so a split run still sorts and
+    /// organizes.
+    ///
+    /// Each member's line is measured in turn, so a nested set that is itself
+    /// too wide breaks one level further in. No comment cursor rides along:
+    /// comments inside an import run are attached by the run, never here.
+    fn print_split_import_set(&mut self, order: &[&ImportBranch<'src>], sort: bool) {
+        self.out.push('{');
+        self.indent += 1;
+        for child in order {
+            let member_start = self.out.len();
+            self.line();
+            let line_start = self.out.len();
+            self.print_import_branch(child, sort);
+            self.out.push(',');
+            if self.over_line_budget(line_start) {
+                self.out.truncate(member_start);
+                self.line();
+                self.split = Split::Tail;
+                self.print_import_branch(child, sort);
+                self.out.push(',');
+            }
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('}');
     }
 
     /// Prints a type expression: `i32`, `List<T>`, `Map<str, i32>`, `&mut T`.
@@ -1561,9 +1633,45 @@ impl<'src> Printer<'src> {
     /// Prints a `(name: T, &mut self, …)` parameter list. The `&`/`&mut`/`own`
     /// convention prefix is reprinted only when it came from a prefix rather than
     /// the parameter's reference type (which already carries it).
+    /// Prints a `fun`'s parameter list, breaking it one parameter per line when
+    /// the signature's own line is over the budget (`proposal/signature-layout.md`).
+    /// Reached only from [`Self::print_func`] — a closure's parameters go through
+    /// [`Self::print_closure_parameters`] and are never broken, being an
+    /// expression's own punctuation.
+    ///
+    /// What follows the `)` — the return type, a `borrows` clause, the body's
+    /// `{` or a bodyless `;` — glues to the closing line, exactly as it does
+    /// inline; none of it is a list entry.
     fn print_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+        let split = std::mem::take(&mut self.split);
+        if split != Split::Off && !parameters.is_empty() {
+            self.print_split_parameters(parameters);
+            return;
+        }
         self.out.push('(');
         self.print_parameters_inner(parameters);
+        self.out.push(')');
+    }
+
+    /// The split form: `(` closes the signature's line, every parameter takes its
+    /// own line one level in with a trailing comma — the last included, so adding
+    /// a parameter is a one-line diff — and `)` returns to the declaration's
+    /// indent.
+    ///
+    /// No line is re-measured here. A parameter is `name: Type` and a type has no
+    /// layout of its own, so a parameter too wide for its line has nowhere to
+    /// break and simply stays wide — unlike a list element or a struct field,
+    /// either of which may be a chain.
+    fn print_split_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+        self.out.push('(');
+        self.indent += 1;
+        for parameter in parameters {
+            self.line();
+            self.print_parameters_inner(std::slice::from_ref(parameter));
+            self.out.push(',');
+        }
+        self.indent -= 1;
+        self.line();
         self.out.push(')');
     }
 
@@ -1770,22 +1878,33 @@ impl<'src> Printer<'src> {
     // (`const (art_blob + style()` ⏎ `.raw(…)`), the continuation line when the
     // left broke — and rolls back into a split of its own if that line is over.
     //
+    // A rendering that spans lines is measured by its FIRST line, because that
+    // is the line the decision is about. A statement carrying a block-bodied
+    // closure, a `match` or a block renders as `…prefix… || {` and then more
+    // lines; the prefix is a line like any other and breaks like one, while the
+    // construct's own body lines are its business and are measured where they
+    // are printed. (This used to refuse to measure such a rendering at all,
+    // which exempted the whole statement from the budget: a `std::ui` tree
+    // ending in `.when(cond, || { … })` stayed inline at any width — one
+    // hand-split example collapsed to 707 columns.)
+    //
     // What still does not break: an EARLIER argument that is the over-budget
     // cause (R5 — last-argument layout is the universal builder convention;
-    // breaking an earlier one needs argument-list layout design), a `?.` lift
-    // chain (it has no postfix spine), and anything whose inline rendering
-    // already spans lines — a closure with a block body, a `match`, a block —
-    // which is what keeps a measured width describing the line it is about.
+    // breaking an earlier one needs argument-list layout design) and a `?.`
+    // lift chain (it has no postfix spine).
 
     /// Whether the line printed from output offset `start` — which must be the
-    /// first byte after that line's indentation — overflows the line budget. A
-    /// rendering that already spans several lines never splits: the width rule
-    /// reads a single-line rendering only, so that the measured width and the
-    /// line it describes are the same thing.
+    /// first byte after that line's indentation — overflows the line budget.
+    ///
+    /// A rendering that spans several lines is judged by its first line: the
+    /// measured width and the line it describes stay the same thing, which is
+    /// the property that keeps the rule honest, and a construct that opens a
+    /// line and continues below no longer immunizes everything printed before
+    /// it on that line.
     fn over_line_budget(&self, start: usize) -> bool {
         let rendered = &self.out[start..];
-        !rendered.contains('\n')
-            && self.indent * TAB_COLUMNS + display_width(rendered) > LINE_BUDGET
+        let first_line = rendered.split('\n').next().unwrap_or(rendered);
+        self.indent * TAB_COLUMNS + display_width(first_line) > LINE_BUDGET
     }
 
     /// Whether the line the printer is on right now — everything emitted since
@@ -1945,6 +2064,57 @@ impl<'src> Printer<'src> {
         self.indent -= 1;
         self.line();
         self.out.push(']');
+    }
+
+    /// Prints a struct literal in split form: `{` closes the line that opened
+    /// it, every field takes its own line one indentation level in with a
+    /// trailing comma — the last one included, for the same reason a split list
+    /// carries one — and `}` returns to the opening line's indent, where the
+    /// caller's closing parens and terminator glue after it.
+    ///
+    /// A struct literal is a braced field list, so it breaks on exactly the rule
+    /// [`Self::print_split_list`] applies to a bracketed element list: each
+    /// field's line is measured in turn, and over budget the field rolls back
+    /// and reprints with [`Split::Tail`] armed, so a field whose value is itself
+    /// a chain or a list breaks with its own lines one level past the field. The
+    /// measured line includes the field's comma — the literal prints it, onto
+    /// the field's own line.
+    fn print_split_struct(&mut self, fields: &[Spanned<StructInitializerField<'src>>]) {
+        self.out.push_str(" {");
+        self.indent += 1;
+        for ((field_name, value), _) in fields {
+            let field_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.line();
+            let line_start = self.out.len();
+            self.print_struct_field(field_name, value);
+            self.out.push(',');
+            if self.over_line_budget(line_start) {
+                self.out.truncate(field_start);
+                self.cursor = comment_cursor;
+                self.line();
+                self.split = Split::Tail;
+                self.print_struct_field(field_name, value);
+                self.out.push(',');
+            }
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('}');
+    }
+
+    /// Prints one `name = value` field of a struct literal, in either form. Takes
+    /// the pending split the way `print_expr` does, so a shorthand field — which
+    /// has no value position to hand it to — drops it rather than leaking an
+    /// armed split onto whatever prints next.
+    fn print_struct_field(&mut self, field_name: &str, value: &Option<Spanned<Node<'src>>>) {
+        let split = std::mem::take(&mut self.split);
+        self.out.push_str(field_name);
+        if let Some(value) = value {
+            self.out.push_str(" = ");
+            self.split = split;
+            self.print_expr(value);
+        }
     }
 
     /// Prints just the postfix a spine step applies — its subject is already
@@ -2432,19 +2602,22 @@ impl<'src> Printer<'src> {
                     }
                     self.out.push('>');
                 }
+                // A struct literal whose line overflowed the budget breaks one
+                // field per line (see [`Self::print_split_struct`]); one that
+                // fits stays inline, WITHOUT a trailing comma, exactly as
+                // before. An empty literal never breaks — `{⏎}` buys a line and
+                // nothing else.
                 if fields.0.is_empty() {
                     self.out.push_str(" {}");
+                } else if split != Split::Off {
+                    self.print_split_struct(&fields.0);
                 } else {
                     self.out.push_str(" { ");
                     for (index, ((field_name, value), _)) in fields.0.iter().enumerate() {
                         if index > 0 {
                             self.out.push_str(", ");
                         }
-                        self.out.push_str(field_name);
-                        if let Some(value) = value {
-                            self.out.push_str(" = ");
-                            self.print_expr(value);
-                        }
+                        self.print_struct_field(field_name, value);
                     }
                     self.out.push_str(" }");
                 }
@@ -4197,6 +4370,714 @@ mod nested_layout {
 }
 
 #[cfg(test)]
+mod struct_literal_layout {
+    //! A struct literal is a braced field list, so it breaks on exactly the rule
+    //! a bracketed element list breaks on (see [`super::nested_layout`]): over
+    //! the budget it renders one `field = value,` per line, one indentation
+    //! level in, with a trailing comma after every field — the last included, so
+    //! adding a field is a one-line diff — and `}` back at the opening line's
+    //! indent. What fits stays inline WITHOUT a trailing comma, so the comma
+    //! marks a split literal and nothing else.
+    //!
+    //! Before this, struct literals were the one composite the width rule did
+    //! not reach: a hand-wrapped literal was COLLAPSED onto a single line of
+    //! whatever width it came to, with no way to break it again (Kolt's
+    //! `KoltStore { … }` came out at 357 columns), because the printer joined
+    //! its fields with `", "` unconditionally.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`
+    //! (same tokens out, no silent bail, canonical in ONE pass, idempotent).
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    // --- The shape -----------------------------------------------------------
+
+    /// The motivating line, from Kolt's server: a struct literal the formatter
+    /// used to collapse onto one 357-column line.
+    #[test]
+    fn an_over_budget_struct_literal_splits_one_field_per_line() {
+        let source = "let store = KoltStore { workspaces = workspaces, tasks = tasks, \
+                      register_hook = Shared::new(register), login_hook = Shared::new(login), \
+                      create_hook = Shared::new(create) };\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let store = KoltStore {\n\
+             \tworkspaces = workspaces,\n\
+             \ttasks = tasks,\n\
+             \tregister_hook = Shared::new(register),\n\
+             \tlogin_hook = Shared::new(login),\n\
+             \tcreate_hook = Shared::new(create),\n\
+             };\n",
+        );
+    }
+
+    /// The other direction, and the trailing comma's whole rule — the same one
+    /// a list literal follows: a literal that fits stays inline WITHOUT one, and
+    /// a hand-written trailing comma in a fitting literal is dropped.
+    #[test]
+    fn a_struct_literal_that_fits_stays_inline_without_a_trailing_comma() {
+        assert_construct(
+            "let fits = Point { x = 1, y = 2 };\n",
+            "let fits = Point { x = 1, y = 2 };\n",
+        );
+        assert_construct(
+            "let fits = Point { x = 1, y = 2, };\n",
+            "let fits = Point { x = 1, y = 2 };\n",
+        );
+    }
+
+    /// The boundary, arithmetically: `let padded = P { aa = "…" };` is 27
+    /// columns of code around the padding string, so 73 padding characters make
+    /// exactly the 100-column budget and 74 make 101. At the budget the literal
+    /// stays inline; one column over, it splits.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("let padded = P {{ aa = \"{}\" }};\n", "P".repeat(73));
+        let over_budget = format!("let padded = P {{ aa = \"{}\" }};\n", "P".repeat(74));
+        assert_eq!(columns(at_budget.trim_end()), LINE_BUDGET);
+        assert_eq!(columns(over_budget.trim_end()), LINE_BUDGET + 1);
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("let padded = P {{\n\taa = \"{}\",\n}};\n", "P".repeat(74)),
+        );
+    }
+
+    /// The width is the statement's own line, so its leading indentation counts
+    /// (a tab as four columns): the same literal stays inline at the top level
+    /// and splits inside a block that pushes it over.
+    #[test]
+    fn indentation_counts_toward_the_budget() {
+        let padding = "P".repeat(70);
+        let statement = format!("let padded = P {{ aa = \"{padding}\" }};");
+        // 97 columns at the top level, 101 inside one block (one tab = four).
+        assert_eq!(columns(&statement), LINE_BUDGET - 3);
+        assert_construct(&format!("{statement}\n"), &format!("{statement}\n"));
+        assert_construct(
+            &format!("fun demo() {{\n\t{statement}\n}}\n"),
+            &format!(
+                "fun demo() {{\n\
+                 \tlet padded = P {{\n\
+                 \t\taa = \"{padding}\",\n\
+                 \t}};\n\
+                 }}\n"
+            ),
+        );
+    }
+
+    /// An EMPTY literal is never broken: `{⏎}` buys a line and no clarity. Here
+    /// the over-budget cause is an earlier argument, so the armed tail reaches
+    /// the empty literal and declines — the same pin the empty list carries.
+    #[test]
+    fn an_empty_struct_literal_at_an_over_budget_tail_stays_inline() {
+        let padding = "P".repeat(81);
+        let split_line = format!("\t.wrap(\"{padding}\", Empty {{}})");
+        assert_over_budget(&split_line);
+        assert_construct(
+            &format!("let built = subject.wrap(\"{padding}\", Empty {{}}).tail(3);\n"),
+            &format!("let built = subject\n{split_line}\n\t.tail(3);\n"),
+        );
+    }
+
+    /// Shorthand fields (no `= value`) and generic arguments ride the split
+    /// unchanged: the arguments stay on the opening line with the name, where
+    /// they belong, and a shorthand field takes a line like any other.
+    #[test]
+    fn shorthand_fields_and_generic_arguments_ride_the_split() {
+        let source = "let generic = Wrapper<Task> { alpha, beta_field_name, gamma = compute(a), \
+                      delta = other(b), epsilon = third(c) };\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "let generic = Wrapper<Task> {\n\
+             \talpha,\n\
+             \tbeta_field_name,\n\
+             \tgamma = compute(a),\n\
+             \tdelta = other(b),\n\
+             \tepsilon = third(c),\n\
+             };\n",
+        );
+    }
+
+    // --- The recursion: a field's line is measured like any other ------------
+
+    /// A field whose own line overflows splits in turn, so a struct literal
+    /// nested in a field breaks one level past it — and the field that fits
+    /// stays inline beside it.
+    #[test]
+    fn an_over_budget_field_splits_a_nested_struct_literal() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet deep = Outer { name = \"a\", inner = Inner { alpha = one_value_here, \
+             beta = two_value_here, gamma = three_value, delta = four_value, epsilon = five }, \
+             tail = 1 };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet deep = Outer {\n\
+             \t\tname = \"a\",\n\
+             \t\tinner = Inner {\n\
+             \t\t\talpha = one_value_here,\n\
+             \t\t\tbeta = two_value_here,\n\
+             \t\t\tgamma = three_value,\n\
+             \t\t\tdelta = four_value,\n\
+             \t\t\tepsilon = five,\n\
+             \t\t},\n\
+             \t\ttail = 1,\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The composition the other way: a field whose value is a postfix chain
+    /// splits as one, its links one level past the field.
+    #[test]
+    fn an_over_budget_field_splits_as_a_chain() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet chained = Holder { label = \"x\", built = subject.first_link(argument_one)\
+             .second_link(argument_two).third_link(three_arg).fourth(f) };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet chained = Holder {\n\
+             \t\tlabel = \"x\",\n\
+             \t\tbuilt = subject\n\
+             \t\t\t.first_link(argument_one)\n\
+             \t\t\t.second_link(argument_two)\n\
+             \t\t\t.third_link(three_arg)\n\
+             \t\t\t.fourth(f),\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// And into a list: the field's comma glues after the `]`, exactly as the
+    /// statement's `;` glues after a split list's.
+    #[test]
+    fn an_over_budget_field_splits_a_list() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet listed = Holder { label = \"x\", items = [alpha_element_one, \
+             beta_element_two, gamma_element_three, delta_element_four, epsilon] };\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet listed = Holder {\n\
+             \t\tlabel = \"x\",\n\
+             \t\titems = [\n\
+             \t\t\talpha_element_one,\n\
+             \t\t\tbeta_element_two,\n\
+             \t\t\tgamma_element_three,\n\
+             \t\t\tdelta_element_four,\n\
+             \t\t\tepsilon,\n\
+             \t\t],\n\
+             \t};\n\
+             }\n",
+        );
+    }
+
+    /// The descent reaches a literal the same way it reaches a list: a chain
+    /// link whose line overflows breaks its LAST argument, and a struct literal
+    /// sitting there is now something breakable. The `})` closes at the link's
+    /// indent.
+    #[test]
+    fn a_links_tail_descends_into_a_struct_literal() {
+        assert_construct(
+            "fun tail(): View {\n\
+             \tview(\"div\").styled(shell).child(Card { title = \"A rather long title here\", \
+             body = \"and a body\", footer = \"plus a footer\" })\n\
+             }\n",
+            "fun tail(): View {\n\
+             \tview(\"div\")\n\
+             \t\t.styled(shell)\n\
+             \t\t.child(Card {\n\
+             \t\t\ttitle = \"A rather long title here\",\n\
+             \t\t\tbody = \"and a body\",\n\
+             \t\t\tfooter = \"plus a footer\",\n\
+             \t\t})\n\
+             }\n",
+        );
+    }
+
+    // --- Stability -----------------------------------------------------------
+
+    /// Backlog 41, unchanged in scope by this rule and pinned here for the
+    /// literal: a comment written BETWEEN fields reprints below the whole
+    /// statement, because the comment machinery still flushes at statement
+    /// boundaries. Never dropped — the law holds — but orphaned from the field
+    /// it explains, exactly as a mid-chain comment is, and exactly as this
+    /// input already behaved when the literal collapsed onto one line instead
+    /// of splitting. Attaching it to its field is 41's work; when that lands
+    /// this pin flips to the attached form.
+    #[test]
+    fn a_comment_between_fields_moves_below_the_statement() {
+        assert_construct(
+            "fun demo() {\n\
+             \tlet store = KoltStore {\n\
+             \t\t// the authoritative lists\n\
+             \t\tworkspaces = workspaces,\n\
+             \t\ttasks = tasks,\n\
+             \t\tregister_hook = Shared::new(register),\n\
+             \t\tlogin_hook = Shared::new(login),\n\
+             \t\tcreate_hook = Shared::new(create),\n\
+             \t};\n\
+             }\n",
+            "fun demo() {\n\
+             \tlet store = KoltStore {\n\
+             \t\tworkspaces = workspaces,\n\
+             \t\ttasks = tasks,\n\
+             \t\tregister_hook = Shared::new(register),\n\
+             \t\tlogin_hook = Shared::new(login),\n\
+             \t\tcreate_hook = Shared::new(create),\n\
+             \t};\n\
+             \t// the authoritative lists\n\
+             }\n",
+        );
+    }
+
+    /// A file carrying both forms is a fixed point in one pass: the split
+    /// literal stays split, the fitting one stays inline and uncommaed, and
+    /// neither drifts on a second run.
+    #[test]
+    fn a_file_mixing_split_and_inline_struct_literals_is_a_fixed_point() {
+        let canonical = "let fits = Point { x = 1, y = 2 };\n\
+                         let store = KoltStore {\n\
+                         \tworkspaces = workspaces,\n\
+                         \ttasks = tasks,\n\
+                         \tregister_hook = Shared::new(register),\n\
+                         \tlogin_hook = Shared::new(login),\n\
+                         \tcreate_hook = Shared::new(create),\n\
+                         };\n";
+        assert_construct(canonical, canonical);
+        assert_eq!(format(canonical), canonical);
+    }
+}
+
+#[cfg(test)]
+mod spanning_renderings {
+    //! A rendering that spans lines is measured by its FIRST line, because that
+    //! is the line the split decision is about. The body lines of a block-bodied
+    //! closure, a `match` or a block are printed — and measured — where they
+    //! are; they say nothing about the line that opened them.
+    //!
+    //! This used to be the opposite: a rendering containing any newline was
+    //! refused a measurement, which exempted the ENTIRE statement from the
+    //! budget. One block-bodied closure at the tail of a `std::ui` tree kept the
+    //! whole chain inline at any width — `examples/reactive-ui/todos.vl`, hand
+    //! split by its author, reformatted into a single 707-column line, and the
+    //! formatter had no way back out of it.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::LINE_BUDGET;
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+
+    /// The motivating shape, reduced from `todos.vl`: a chain whose last link
+    /// takes a block-bodied closure. The chain splits like any other, the link
+    /// opens its line with `|| {`, and the closure's body indents one level past
+    /// the link — the body was never the problem.
+    #[test]
+    fn a_chain_ending_in_a_block_closure_splits() {
+        assert_construct(
+            "fun demo(): View {\n\
+             \tview(\"section\").class(\"todos\").child(view(\"h2\").text(\"Todos\"))\
+             .when(items.map(|list| count_done(list) > 0), || {\n\
+             \t\tview(\"p\").class(\"summary\")\n\
+             \t})\n\
+             }\n",
+            "fun demo(): View {\n\
+             \tview(\"section\")\n\
+             \t\t.class(\"todos\")\n\
+             \t\t.child(view(\"h2\").text(\"Todos\"))\n\
+             \t\t.when(items.map(|list| count_done(list) > 0), || {\n\
+             \t\t\tview(\"p\").class(\"summary\")\n\
+             \t\t})\n\
+             }\n",
+        );
+    }
+
+    /// The boundary, with the spanning construct in place: the measured line is
+    /// the opening one, `\tsubject.first("…").second(|| {`, which is 33 columns
+    /// around the padding at one tab of indent. 67 padding characters make
+    /// exactly the budget and stay inline; 68 make 101 and split.
+    #[test]
+    fn the_opening_line_is_what_is_measured_at_the_boundary() {
+        let at_budget = format!(
+            "fun demo() {{\n\tsubject.first(\"{}\").second(|| {{\n\t\tbody()\n\t}})\n}}\n",
+            "P".repeat(67)
+        );
+        let over_budget = format!(
+            "fun demo() {{\n\tsubject.first(\"{}\").second(|| {{\n\t\tbody()\n\t}})\n}}\n",
+            "P".repeat(68)
+        );
+        // The opening line, indentation included — `columns` already counts the
+        // leading tab as its four.
+        assert_eq!(columns(at_budget.lines().nth(1).unwrap()), LINE_BUDGET);
+        assert_eq!(
+            columns(over_budget.lines().nth(1).unwrap()),
+            LINE_BUDGET + 1
+        );
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!(
+                "fun demo() {{\n\
+                 \tsubject\n\
+                 \t\t.first(\"{}\")\n\
+                 \t\t.second(|| {{\n\
+                 \t\t\tbody()\n\
+                 \t\t}})\n\
+                 }}\n",
+                "P".repeat(68)
+            ),
+        );
+    }
+
+    /// A declaration's own measurement stops at its body. Measuring first lines
+    /// made `fun` signatures measurable for the first time — this one is 108
+    /// columns — and the permission used to travel past the signature into the
+    /// body and break the first statement it found there.
+    ///
+    /// The signature now SPENDS that permission on its own parameter list
+    /// (`proposal/signature-layout.md`), which is what it was always measuring;
+    /// what this pin is about is the line below it. `let age = …` is 54 columns
+    /// and stays whole either way — under the wide signature, where the split
+    /// stops at the `)`, and under a short one, where nothing was armed at all.
+    #[test]
+    fn an_over_budget_declaration_does_not_arm_its_body() {
+        let wide_signature = "fun task_row(client: KoltClient<SocketTransport>, workspace_id: i32, \
+                              task: Task, token: Signal<str>): View {\n\
+                              \tlet age = now().since(task.created_at).describe();\n\
+                              \tview(\"li\").styled(row)\n\
+                              }\n";
+        assert_over_budget(wide_signature.lines().next().unwrap());
+        assert_construct(
+            wide_signature,
+            "fun task_row(\n\
+             \tclient: KoltClient<SocketTransport>,\n\
+             \tworkspace_id: i32,\n\
+             \ttask: Task,\n\
+             \ttoken: Signal<str>,\n\
+             ): View {\n\
+             \tlet age = now().since(task.created_at).describe();\n\
+             \tview(\"li\").styled(row)\n\
+             }\n",
+        );
+
+        let narrow_signature = "fun short(a: i32): View {\n\
+                                \tlet age = now().since(task.created_at).describe();\n\
+                                \tview(\"li\").styled(row)\n\
+                                }\n";
+        assert_construct(narrow_signature, narrow_signature);
+    }
+
+    /// The other half of "first line only": a statement whose opening line fits
+    /// does NOT split, however wide the lines below it are. `match` opens with
+    /// `let verdict = match outcome {` and is left alone; so is a closure whose
+    /// body carries a 104-column line, because that line is the body's own and
+    /// has nothing breakable on it anyway.
+    #[test]
+    fn a_statement_whose_opening_line_fits_is_left_alone() {
+        let matched = "fun demo(): i32 {\n\
+                       \tlet verdict = match outcome {\n\
+                       \t\tSome(let value) => value,\n\
+                       \t\tNone => 0,\n\
+                       \t};\n\
+                       \tverdict\n\
+                       }\n";
+        assert_construct(matched, matched);
+
+        let long_body = "fun demo() {\n\
+                         \tlet handler = || {\n\
+                         \t\tlet a_rather_long_line_inside_the_body = compute(alpha, beta, gamma, \
+                         delta, epsilon, zeta, eta);\n\
+                         \t\ta_rather_long_line_inside_the_body\n\
+                         \t};\n\
+                         }\n";
+        assert_construct(long_body, long_body);
+    }
+}
+
+#[cfg(test)]
+mod import_set_layout {
+    //! An import's brace set is a list with braces, and over the budget it
+    //! breaks like one: one name per line, one indentation level in, trailing
+    //! comma on every one, `}` back at the opening line's indent where the `;`
+    //! glues. A set that fits stays inline WITHOUT a trailing comma. The
+    //! canonical sort happens first, so a split run is the sorted run.
+    //!
+    //! The trailing comma is safe on both sides of the toolchain: the language
+    //! grammar accepts it, and so does the TOKEN-level import parser behind
+    //! Organize Imports (`parse_token_branch`, "comma-separated,
+    //! allow-trailing"), which is what lets a split run still sort.
+    //!
+    //! Both printers go through `print_import_statement`, because
+    //! `organize_run` promises byte-for-byte agreement with `fmt` — if only one
+    //! split, the editor action and the formatter would rewrite each other on
+    //! every save.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::organize::organize;
+    use super::{LINE_BUDGET, format};
+
+    /// The motivating line, from `std/src/rpc.vl`: an import at 184 columns.
+    #[test]
+    fn an_over_budget_import_splits_one_name_per_line() {
+        let source = "import std::rpc::{ Dispatcher, LocalTransport, RemoteSource, RpcError, \
+                      RpcOutcome, Transport, arg, call, decode_failed };\n";
+        assert_over_budget(source.trim_end());
+        assert_construct(
+            source,
+            "import std::rpc::{\n\
+             \tDispatcher,\n\
+             \tLocalTransport,\n\
+             \tRemoteSource,\n\
+             \tRpcError,\n\
+             \tRpcOutcome,\n\
+             \tTransport,\n\
+             \targ,\n\
+             \tcall,\n\
+             \tdecode_failed,\n\
+             };\n",
+        );
+    }
+
+    /// The other direction, and the trailing comma's rule — the same one the
+    /// list and struct literals follow.
+    #[test]
+    fn an_import_that_fits_stays_inline_without_a_trailing_comma() {
+        assert_construct(
+            "import std::option::Option::{ self, Some, None };\n",
+            "import std::option::Option::{ None, Some, self };\n",
+        );
+        assert_construct(
+            "import std::x::{ alpha, beta, };\n",
+            "import std::x::{ alpha, beta };\n",
+        );
+    }
+
+    /// The boundary: `import p::{ …, X };` is 18 columns around the padded name,
+    /// so an 82-character name makes exactly the budget and 83 makes 101.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("import p::{{ {}, X }};\n", "A".repeat(82));
+        let over_budget = format!("import p::{{ {}, X }};\n", "A".repeat(83));
+        assert_eq!(columns(at_budget.trim_end()), LINE_BUDGET);
+        assert_eq!(columns(over_budget.trim_end()), LINE_BUDGET + 1);
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("import p::{{\n\t{},\n\tX,\n}};\n", "A".repeat(83)),
+        );
+    }
+
+    /// The recursion, one brace level in: the outer set breaks, and a nested set
+    /// whose own line still overflows breaks past it — while a nested set that
+    /// fits stays inline on its member line.
+    #[test]
+    fn a_nested_set_breaks_only_when_its_own_line_overflows() {
+        assert_construct(
+            "import std::outer::{ alpha, beta::{ gamma_name_here, delta_name_here, \
+             epsilon_name_here, zeta_name_here }, omega };\n",
+            "import std::outer::{\n\
+             \talpha,\n\
+             \tbeta::{ delta_name_here, epsilon_name_here, gamma_name_here, zeta_name_here },\n\
+             \tomega,\n\
+             };\n",
+        );
+        assert_construct(
+            "import std::outer::{ alpha, beta::{ gamma_name_here, delta_name_here, \
+             epsilon_name_here, zeta_name_here, eta_name_here, theta_name_here }, omega };\n",
+            "import std::outer::{\n\
+             \talpha,\n\
+             \tbeta::{\n\
+             \t\tdelta_name_here,\n\
+             \t\tepsilon_name_here,\n\
+             \t\teta_name_here,\n\
+             \t\tgamma_name_here,\n\
+             \t\ttheta_name_here,\n\
+             \t\tzeta_name_here,\n\
+             \t},\n\
+             \tomega,\n\
+             };\n",
+        );
+    }
+
+    /// The agreement `organize_run` depends on: Organize Imports renders a split
+    /// run identically to `fmt`, so the action and the formatter agree instead of
+    /// undoing each other. Pruning a leaf that brings the set back under the
+    /// budget collapses it to the inline form, which is the same rule read
+    /// backwards.
+    #[test]
+    fn organize_imports_renders_a_split_run_the_way_fmt_does() {
+        let source = "import std::rpc::{ Dispatcher, LocalTransport, RemoteSource, RpcError, \
+                      RpcOutcome, Transport, arg, call, decode_failed };\n";
+        assert_eq!(organize(source, &[]), format(source));
+        assert_eq!(
+            organize(source, &[]),
+            "import std::rpc::{\n\
+             \tDispatcher,\n\
+             \tLocalTransport,\n\
+             \tRemoteSource,\n\
+             \tRpcError,\n\
+             \tRpcOutcome,\n\
+             \tTransport,\n\
+             \targ,\n\
+             \tcall,\n\
+             \tdecode_failed,\n\
+             };\n"
+        );
+        // Pruning six leaves puts the set back under the budget: inline again.
+        assert_eq!(
+            organize(
+                source,
+                &[
+                    "LocalTransport",
+                    "RemoteSource",
+                    "RpcOutcome",
+                    "Transport",
+                    "arg",
+                    "decode_failed"
+                ]
+            ),
+            "import std::rpc::{ Dispatcher, RpcError, call };\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod signature_layout {
+    //! `proposal/signature-layout.md` — the width rule's first DECLARATION site.
+    //! A `fun` signature over the budget breaks its parameter list one parameter
+    //! per line, one level in, trailing comma on every one, `)` back at the
+    //! declaration's indent with the return type, `borrows` clause and the body's
+    //! `{` (or a bodyless `;`) glued after it. The list rule, on the one
+    //! bracketed list that is not an expression.
+    //!
+    //! Two things deliberately do NOT break: a closure's parameters, which are an
+    //! expression's own punctuation, and a call's ARGUMENT list, which stays
+    //! last-argument-driven (R5 / backlog 43). The proposal states that asymmetry
+    //! and why it is intended rather than an oversight.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// The motivating signature, from `std/src/process/rpc_server.vl`: 172
+    /// columns of closure-typed parameters, wide by construction.
+    #[test]
+    fn an_over_budget_signature_splits_one_parameter_per_line() {
+        let source = "fun serve_connected(port: i32, protocol: RpcProtocol, \
+                      on_connect: |i32, DuplexEnd| void, on_disconnect: |i32| void, \
+                      fallback: |Request| Response, on_ready: |Server| void) {\n\
+                      \tbody()\n\
+                      }\n";
+        assert_over_budget(source.lines().next().unwrap());
+        assert_construct(
+            source,
+            "fun serve_connected(\n\
+             \tport: i32,\n\
+             \tprotocol: RpcProtocol,\n\
+             \ton_connect: |i32, DuplexEnd| void,\n\
+             \ton_disconnect: |i32| void,\n\
+             \tfallback: |Request| Response,\n\
+             \ton_ready: |Server| void,\n\
+             ) {\n\
+             \tbody()\n\
+             }\n",
+        );
+    }
+
+    /// A signature that fits stays inline WITHOUT a trailing comma, and a
+    /// hand-written one is dropped — the comma marks a split list here too.
+    #[test]
+    fn a_signature_that_fits_stays_inline_without_a_trailing_comma() {
+        assert_construct(
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+        );
+        assert_construct(
+            "fun f(a: i32, b: i32,) {\n\tbody()\n}\n",
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+        );
+    }
+
+    /// The boundary: `fun f(…: i32) {` is 14 columns around the parameter name,
+    /// so an 86-character name makes exactly the budget and 87 makes 101.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("fun f({}: i32) {{\n\tbody()\n}}\n", "a".repeat(86));
+        let over_budget = format!("fun f({}: i32) {{\n\tbody()\n}}\n", "a".repeat(87));
+        assert_eq!(columns(at_budget.lines().next().unwrap()), LINE_BUDGET);
+        assert_eq!(
+            columns(over_budget.lines().next().unwrap()),
+            LINE_BUDGET + 1
+        );
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("fun f(\n\t{}: i32,\n) {{\n\tbody()\n}}\n", "a".repeat(87)),
+        );
+    }
+
+    /// What follows the `)` rides the closing line, whatever it is: a return
+    /// type, or a bodyless declaration's `;`. Neither is a list entry.
+    #[test]
+    fn the_return_type_and_a_bodyless_semicolon_ride_the_closing_line() {
+        assert_construct(
+            "fun with_ret(alpha_parameter: i32, beta_parameter: str, gamma_parameter: bool, \
+             delta_parameter: i32, eps: i32): Result<List<i32>, RpcError> {\n\tbuild()\n}\n",
+            "fun with_ret(\n\
+             \talpha_parameter: i32,\n\
+             \tbeta_parameter: str,\n\
+             \tgamma_parameter: bool,\n\
+             \tdelta_parameter: i32,\n\
+             \teps: i32,\n\
+             ): Result<List<i32>, RpcError> {\n\
+             \tbuild()\n\
+             }\n",
+        );
+        assert_construct(
+            "external fun pbkdf2_sync(password: str, salt: str, iterations: i32, \
+             key_length: i32, digest: str, extra: str): HashBuffer;\n",
+            "external fun pbkdf2_sync(\n\
+             \tpassword: str,\n\
+             \tsalt: str,\n\
+             \titerations: i32,\n\
+             \tkey_length: i32,\n\
+             \tdigest: str,\n\
+             \textra: str,\n\
+             ): HashBuffer;\n",
+        );
+    }
+
+    /// An EMPTY parameter list never breaks — `(⏎)` buys a line and no clarity —
+    /// so a signature pushed over by its NAME simply stays long. Same rule the
+    /// empty list and the empty struct literal follow.
+    #[test]
+    fn an_empty_parameter_list_never_breaks() {
+        let source = "fun a_function_whose_name_alone_runs_well_past_the_hundred_column_budget\
+                      _without_any_parameters(): i32 {\n\tbody()\n}\n";
+        assert_over_budget(source.lines().next().unwrap());
+        assert_construct(source, source);
+    }
+
+    /// A CLOSURE's parameters are untouched: they are an expression's own
+    /// punctuation, printed through `print_closure_parameters`, and only
+    /// `print_parameters` — reached solely from a `fun` declaration — splits.
+    #[test]
+    fn closure_parameters_do_not_break() {
+        let source = "fun demo() {\n\
+                      \tlet handler = |alpha_parameter: i32, beta_parameter: str, \
+                      gamma_parameter: bool, delta: i32| compute(alpha_parameter);\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(source, source);
+    }
+}
+
+#[cfg(test)]
 mod binary_operand_layout {
     //! Both operands of a binary are layout sites, and the LEFT wins. The left
     //! prints first; if it broke, the operator and the right operand take a
@@ -4660,7 +5541,7 @@ mod organize {
 
     /// Applies the organizer's edits to `source`, treating every leaf named in
     /// `dead` as unused. Edits apply back-to-front so earlier offsets stay valid.
-    fn organize(source: &str, dead: &[&str]) -> String {
+    pub(super) fn organize(source: &str, dead: &[&str]) -> String {
         let keep = |span: Span| !dead.contains(&&source[span.into_range()]);
         let mut edits = organize_import_runs(source, &keep).expect("source parses cleanly");
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.into_range().start));
