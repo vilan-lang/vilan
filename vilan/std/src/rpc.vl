@@ -1300,7 +1300,9 @@ fun reattach_mirrors(
 		Ok(let hash) => {
 			if hash == expected_contract {
 				let connection = socket.connection.read();
-				let attached: Result<List<i32>, RpcError> = call(transport, codec, "__attach", [|serializer: Serializer| connection.describe(serializer)]);
+				let attached: Result<List<i32>, RpcError> = call(transport, codec, "__attach", [
+					|serializer: Serializer| connection.describe(serializer),
+				]);
 				match attached {
 					Err(let _failed) => {},
 					Ok(let channels) => {
@@ -1520,7 +1522,10 @@ macro fun service(item: Item): Source {
 			statements.push(i"reply(self.{method.name}())");
 		} else {
 			let argument_list = join(arguments, ", ");
-			statements.push(match_of("decode_failed(request)").arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))").arm("Option::None", i"reply(self.{method.name}({argument_list}))").render());
+			statements.push(match_of("decode_failed(request)")
+				.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
+				.arm("Option::None", i"reply(self.{method.name}({argument_list}))")
+				.render());
 		}
 		routes.push(route_block(method.name, statements));
 	}
@@ -1539,7 +1544,10 @@ macro fun service(item: Item): Source {
 		.render();
 	mut attach_statements: List<str> = [];
 	attach_statements.push("let connection: i32 = arg(request, 0);");
-	attach_statements.push(match_of("decode_failed(request)").arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))").arm("Option::None", attach_reply).render());
+	attach_statements.push(match_of("decode_failed(request)")
+		.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
+		.arm("Option::None", attach_reply)
+		.render());
 	routes.push(route_block("__attach", attach_statements));
 	mut chain = "Dispatcher::new()";
 	for route in routes {

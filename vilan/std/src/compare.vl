@@ -143,7 +143,10 @@ macro fun PartialEq(item: Item): Source {
 			.parameter(i"other: {target.name}")
 			.returns("bool")
 			.expr(comparison);
-		ret source("import std::compare::PartialEq;\n" + impl_of(target.name).implements("PartialEq").method(eq).render());
+		ret source("import std::compare::PartialEq;\n" + impl_of(target.name)
+			.implements("PartialEq")
+			.method(eq)
+			.render());
 	}
 	if item.as_enum() is Some(let target) {
 		// `match (self, other) { (E::V(let s0,..), E::V(let o0,..)) => s0
@@ -175,7 +178,10 @@ macro fun PartialEq(item: Item): Source {
 			.parameter(i"other: {target.name}")
 			.returns("bool")
 			.expr(arms.render());
-		ret source("import std::compare::PartialEq;\n" + impl_of(target.name).implements("PartialEq").method(eq).render());
+		ret source("import std::compare::PartialEq;\n" + impl_of(target.name)
+			.implements("PartialEq")
+			.method(eq)
+			.render());
 	}
 	// Anything else (a bodyless external struct): nothing, like the Rust
 	// generator. (One recorded divergence: the Rust path also skips a

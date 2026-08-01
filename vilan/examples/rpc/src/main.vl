@@ -294,7 +294,9 @@ fun reactive_demo() {
 	});
 	let rpc_transport = local_rpc(dispatcher.into_protocol(json_codec()));
 	let amount = 3;
-	let added: Result<i32, RpcError> = call(rpc_transport, json_codec(), "add", [|s: Serializer| amount.describe(s)]);
+	let added: Result<i32, RpcError> = call(rpc_transport, json_codec(), "add", [
+		|s: Serializer| amount.describe(s),
+	]);
 	match added {
 		Ok(let n) => print(i"rpc add -> {n}"),
 		Err(let error) => print(i"rpc error: {error.debug()}"),

@@ -114,12 +114,14 @@ is the current directory. Formatting is conservative and a fixed point:
   stays long. A closure's parameters are never broken.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
-- A call's *argument* list is never wrapped: layout hangs off the last
-  argument, so a long earlier argument leaves a long line. This is
-  deliberately not symmetric with the parameter rule above — an argument
-  list sits inside an expression, where the builder convention decides
-  layout, while a parameter list is a declaration's own contract and has
-  no shape but one-per-line.
+- A call's *argument* list is never wrapped, but the split reaches the
+  **last** argument, so a statement whose only breakable construct sits
+  there still breaks it — `list.push(T { … })` splits the literal. A long
+  *earlier* argument still leaves a long line: layout hangs off the final
+  argument. This is deliberately not symmetric with the parameter rule
+  above — an argument list sits inside an expression, where the builder
+  convention decides layout, while a parameter list is a declaration's own
+  contract and has no shape but one-per-line.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
   untouched, never half-formatted.
 

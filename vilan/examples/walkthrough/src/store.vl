@@ -190,7 +190,11 @@ fun open_session(db: Database, username: str): AuthOutcome {
 fun load_notes(db: Database): List<Note> {
 	mut list: List<Note> = [];
 	for row in db.prepare("SELECT id, title, body FROM note ORDER BY id").all([]) {
-		list.push(Note { id = row.integer("id"), title = row.text("title"), body = row.text("body") });
+		list.push(Note {
+			id = row.integer("id"),
+			title = row.text("title"),
+			body = row.text("body"),
+		});
 	}
 	list
 }

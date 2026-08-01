@@ -614,15 +614,18 @@ enum Split {
     /// A STATEMENT's own line overflowed. The statement's value position may
     /// break — a postfix chain into one link per line, a list literal into one
     /// element per line — reached through the prefix and binary operand
-    /// positions that keep the value on the statement's own line. It
-    /// deliberately does not descend into a call's arguments: a chain nested in
-    /// an argument of a statement that is not itself a chain stays inline (v1's
-    /// boundary).
+    /// positions that keep the value on the statement's own line, and through a
+    /// call's LAST argument (`proposal/argument-tail-descent.md`), which is what
+    /// lets `list.push(T { … })` break the literal that is its only breakable
+    /// construct.
     Statement,
     /// A line *inside* a split rendering overflowed — a chain link's line, a
-    /// list element's line. Everything `Statement` allows, plus the descent
-    /// through a call's LAST argument that lets `.child(footer_column(t, [..]))`
-    /// reach the list literal at its tail.
+    /// list element's line.
+    ///
+    /// The two permissions allow exactly the same thing since backlog 43 closed
+    /// the argument-descent gap between them; what survives is the distinction
+    /// of where each was armed, which is what the rollback sites read to decide
+    /// whether they are re-printing a statement or a line inside one.
     Tail,
 }
 
@@ -2491,7 +2494,11 @@ impl<'src> Printer<'src> {
             if index > 0 {
                 self.out.push_str(", ");
             }
-            if split == Split::Tail && index + 1 == arguments.len() {
+            // Either permission descends through the LAST argument
+            // (`proposal/argument-tail-descent.md`). Only the last: R5 stands,
+            // so an earlier argument that is the over-budget cause still leaves
+            // a long line.
+            if split != Split::Off && index + 1 == arguments.len() {
                 self.split = Split::Tail;
             }
             self.print_expr(argument);
@@ -2617,6 +2624,11 @@ impl<'src> Printer<'src> {
             Node::MemberAccessor(subject, member) => {
                 self.print_postfix_subject(subject);
                 self.out.push('.');
+                // The callee of `list.push(…)` IS the member, so a permission
+                // dropped here never reaches the call's arguments — which made
+                // a method call's tail unreachable from statement level however
+                // far `print_call_arguments` was widened.
+                self.split = split;
                 self.print_expr(member);
             }
             Node::StaticAccessor(subject, member) => {
@@ -4225,17 +4237,29 @@ mod chain_splitting {
         );
     }
 
-    /// The statement-level arming stops at a call's arguments: a statement that
-    /// is not itself a chain has no link line to measure, so a chain nested in
-    /// one of its arguments stays inline however wide the statement gets. (The
-    /// recursion in [`super::nested_layout`] is entered from a line a split
-    /// produced, not from a statement that never split.)
+    /// A chain that is a call's LAST argument breaks there
+    /// (`proposal/argument-tail-descent.md`): the statement is not itself a
+    /// chain, so its only breakable construct is the one inside the argument,
+    /// and the permission now reaches it. The links indent one level past the
+    /// statement and the enclosing `))` glues after the last of them.
+    ///
+    /// This pin asserted the opposite until backlog 43 — that was
+    /// `Split::Statement`'s v1 scope, and the line simply stayed long.
     #[test]
-    fn a_chain_nested_in_an_argument_stays_inline() {
+    fn a_chain_nested_in_an_argument_splits_at_the_tail() {
         let source = "let nested = outer(subject.first(1).second(2).third(3).fourth(4)\
                       .fifth(5).sixth(666666666666666666));\n";
         assert_over_budget(source.trim_end());
-        assert_construct(source, source);
+        assert_construct(
+            source,
+            "let nested = outer(subject\n\
+             \t.first(1)\n\
+             \t.second(2)\n\
+             \t.third(3)\n\
+             \t.fourth(4)\n\
+             \t.fifth(5)\n\
+             \t.sixth(666666666666666666));\n",
+        );
     }
 
     /// One `.name(…)` link is not a chain — breaking it would buy a line and no
@@ -4416,8 +4440,8 @@ mod chain_splitting {
             "the narrow chain did not stay inline:\n{once}"
         );
         assert!(
-            once.contains(".fifth(5).sixth(666666666666666666));\n"),
-            "the nested chain did not stay inline:\n{once}"
+            once.contains("\tlet nested = outer(subject\n\t\t.first(1)\n"),
+            "the chain nested in an argument did not split at the tail:\n{once}"
         );
         assert!(
             once.contains("\tregistry\n\t\t.on(\"alpha\", handle_alpha)\n"),
@@ -5316,6 +5340,79 @@ mod import_set_layout {
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod argument_tail_descent {
+    //! `proposal/argument-tail-descent.md` — backlog 43. A statement's split
+    //! descends through a call's LAST argument, the way a link's already did, so
+    //! a statement whose only breakable construct sits in an argument can reach
+    //! it. `list.push(T { … })` is the shape: one call link, so the statement is
+    //! not a chain and has nothing to break at its own level.
+    //!
+    //! Only the last argument. R5 stands — layout hangs off a call's final
+    //! argument, so an earlier one that is the over-budget cause still leaves a
+    //! long line, and that is pinned here beside the new behavior.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+
+    /// The motivating shape, from Kolt's `load_tasks` and `examples/walkthrough`'s
+    /// `load_notes` — the same function, wherever a row is read into a record.
+    /// 152 columns, and stable at 152 before this.
+    #[test]
+    fn a_struct_literal_in_a_call_argument_breaks() {
+        let source = "fun demo() {\n\
+                      \tlist.push(Task { id = row.integer(\"id\"), workspace_id = \
+                      row.integer(\"workspace_id\"), name = row.text(\"name\") });\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun demo() {\n\
+             \tlist.push(Task {\n\
+             \t\tid = row.integer(\"id\"),\n\
+             \t\tworkspace_id = row.integer(\"workspace_id\"),\n\
+             \t\tname = row.text(\"name\"),\n\
+             \t});\n\
+             }\n",
+        );
+    }
+
+    /// The descent has to survive the `.` of a method call: the callee of
+    /// `list.push(…)` IS the member, so a permission dropped at the member
+    /// access never reaches the arguments. Pinned separately from the shape
+    /// above because widening only the argument printer left this a no-op.
+    #[test]
+    fn the_descent_reaches_through_a_method_call() {
+        let source = "fun demo() {\n\
+                      \tregistry.register([alpha_element_one, beta_element_two, \
+                      gamma_element_three, delta_element_four, epsilon_five]);\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun demo() {\n\
+             \tregistry.register([\n\
+             \t\talpha_element_one,\n\
+             \t\tbeta_element_two,\n\
+             \t\tgamma_element_three,\n\
+             \t\tdelta_element_four,\n\
+             \t\tepsilon_five,\n\
+             \t]);\n\
+             }\n",
+        );
+    }
+
+    /// R5, unchanged: only the LAST argument is reachable, so an EARLIER
+    /// argument that is the over-budget cause still leaves a long line. This is
+    /// the boundary backlog 43 deliberately did not move.
+    #[test]
+    fn an_earlier_argument_is_still_not_reachable() {
+        let padding = "P".repeat(72);
+        let source = format!("let built = wrap(inner.aa(\"{padding}\").bb(2), tail);\n");
+        assert_over_budget(source.trim_end());
+        assert_construct(&source, &source);
     }
 }
 
