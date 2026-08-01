@@ -246,7 +246,15 @@ it, diagnostics beneath the editor.
 - **(c) Compile cadence**: Run-only vs debounced compile-as-you-type for live
   diagnostics. **Recommendation: Run-only in v1** — it bounds the leak rate
   and the worker churn; live diagnostics become an S4-or-later slice with the
-  recycling policy proven.
+  recycling policy proven. **SUPERSEDED 2026-08-01 — live diagnostics
+  SHIPPED** (website 5369d47), the recycling condition having been proven in
+  production: edits schedule a debounced (400 ms) background CHECK — the
+  same compile, diagnostics only, the mounted program untouched; execution
+  stays explicit (Run / auto-run-on-arrival). Latest-wins queueing while
+  typing, a queued Run outranks a queued check, a stale check result (text
+  already changed) is dropped instead of squiggling the wrong spans, and
+  checks pay the same recycle budget as compiles. Status reports "No
+  problems (vilan X)." / "N problems; see the diagnostics." per check.
 - **(d) Name and promotion** (recorded as the user's call, per the backlog):
   `/playground` as the path; when it gets linked from the landing page and
   the book interacts with D5's traction plan and D10/F9's org timing. Nothing
