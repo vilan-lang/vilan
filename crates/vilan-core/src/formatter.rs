@@ -1633,9 +1633,45 @@ impl<'src> Printer<'src> {
     /// Prints a `(name: T, &mut self, …)` parameter list. The `&`/`&mut`/`own`
     /// convention prefix is reprinted only when it came from a prefix rather than
     /// the parameter's reference type (which already carries it).
+    /// Prints a `fun`'s parameter list, breaking it one parameter per line when
+    /// the signature's own line is over the budget (`proposal/signature-layout.md`).
+    /// Reached only from [`Self::print_func`] — a closure's parameters go through
+    /// [`Self::print_closure_parameters`] and are never broken, being an
+    /// expression's own punctuation.
+    ///
+    /// What follows the `)` — the return type, a `borrows` clause, the body's
+    /// `{` or a bodyless `;` — glues to the closing line, exactly as it does
+    /// inline; none of it is a list entry.
     fn print_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+        let split = std::mem::take(&mut self.split);
+        if split != Split::Off && !parameters.is_empty() {
+            self.print_split_parameters(parameters);
+            return;
+        }
         self.out.push('(');
         self.print_parameters_inner(parameters);
+        self.out.push(')');
+    }
+
+    /// The split form: `(` closes the signature's line, every parameter takes its
+    /// own line one level in with a trailing comma — the last included, so adding
+    /// a parameter is a one-line diff — and `)` returns to the declaration's
+    /// indent.
+    ///
+    /// No line is re-measured here. A parameter is `name: Type` and a type has no
+    /// layout of its own, so a parameter too wide for its line has nowhere to
+    /// break and simply stays wide — unlike a list element or a struct field,
+    /// either of which may be a chain.
+    fn print_split_parameters(&mut self, parameters: &[crate::node::Parameter<'src>]) {
+        self.out.push('(');
+        self.indent += 1;
+        for parameter in parameters {
+            self.line();
+            self.print_parameters_inner(std::slice::from_ref(parameter));
+            self.out.push(',');
+        }
+        self.indent -= 1;
+        self.line();
         self.out.push(')');
     }
 
@@ -4699,11 +4735,14 @@ mod spanning_renderings {
 
     /// A declaration's own measurement stops at its body. Measuring first lines
     /// made `fun` signatures measurable for the first time — this one is 108
-    /// columns — and a signature has no layout to spend a split on, so the
-    /// permission used to travel into the body and break the first statement
-    /// there. `let age = now().since(t).describe();` is 54 columns and stays on
-    /// its line; the same statement under a short signature is untouched too, so
-    /// the pin is about the leak and not about the statement.
+    /// columns — and the permission used to travel past the signature into the
+    /// body and break the first statement it found there.
+    ///
+    /// The signature now SPENDS that permission on its own parameter list
+    /// (`proposal/signature-layout.md`), which is what it was always measuring;
+    /// what this pin is about is the line below it. `let age = …` is 54 columns
+    /// and stays whole either way — under the wide signature, where the split
+    /// stops at the `)`, and under a short one, where nothing was armed at all.
     #[test]
     fn an_over_budget_declaration_does_not_arm_its_body() {
         let wide_signature = "fun task_row(client: KoltClient<SocketTransport>, workspace_id: i32, \
@@ -4712,7 +4751,18 @@ mod spanning_renderings {
                               \tview(\"li\").styled(row)\n\
                               }\n";
         assert_over_budget(wide_signature.lines().next().unwrap());
-        assert_construct(wide_signature, wide_signature);
+        assert_construct(
+            wide_signature,
+            "fun task_row(\n\
+             \tclient: KoltClient<SocketTransport>,\n\
+             \tworkspace_id: i32,\n\
+             \ttask: Task,\n\
+             \ttoken: Signal<str>,\n\
+             ): View {\n\
+             \tlet age = now().since(task.created_at).describe();\n\
+             \tview(\"li\").styled(row)\n\
+             }\n",
+        );
 
         let narrow_signature = "fun short(a: i32): View {\n\
                                 \tlet age = now().since(task.created_at).describe();\n\
@@ -4892,6 +4942,138 @@ mod import_set_layout {
             ),
             "import std::rpc::{ Dispatcher, RpcError, call };\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod signature_layout {
+    //! `proposal/signature-layout.md` — the width rule's first DECLARATION site.
+    //! A `fun` signature over the budget breaks its parameter list one parameter
+    //! per line, one level in, trailing comma on every one, `)` back at the
+    //! declaration's indent with the return type, `borrows` clause and the body's
+    //! `{` (or a bodyless `;`) glued after it. The list rule, on the one
+    //! bracketed list that is not an expression.
+    //!
+    //! Two things deliberately do NOT break: a closure's parameters, which are an
+    //! expression's own punctuation, and a call's ARGUMENT list, which stays
+    //! last-argument-driven (R5 / backlog 43). The proposal states that asymmetry
+    //! and why it is intended rather than an oversight.
+    //!
+    //! Each pin runs the whole formatter contract through `assert_construct`.
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::{LINE_BUDGET, format};
+
+    /// The motivating signature, from `std/src/process/rpc_server.vl`: 172
+    /// columns of closure-typed parameters, wide by construction.
+    #[test]
+    fn an_over_budget_signature_splits_one_parameter_per_line() {
+        let source = "fun serve_connected(port: i32, protocol: RpcProtocol, \
+                      on_connect: |i32, DuplexEnd| void, on_disconnect: |i32| void, \
+                      fallback: |Request| Response, on_ready: |Server| void) {\n\
+                      \tbody()\n\
+                      }\n";
+        assert_over_budget(source.lines().next().unwrap());
+        assert_construct(
+            source,
+            "fun serve_connected(\n\
+             \tport: i32,\n\
+             \tprotocol: RpcProtocol,\n\
+             \ton_connect: |i32, DuplexEnd| void,\n\
+             \ton_disconnect: |i32| void,\n\
+             \tfallback: |Request| Response,\n\
+             \ton_ready: |Server| void,\n\
+             ) {\n\
+             \tbody()\n\
+             }\n",
+        );
+    }
+
+    /// A signature that fits stays inline WITHOUT a trailing comma, and a
+    /// hand-written one is dropped — the comma marks a split list here too.
+    #[test]
+    fn a_signature_that_fits_stays_inline_without_a_trailing_comma() {
+        assert_construct(
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+        );
+        assert_construct(
+            "fun f(a: i32, b: i32,) {\n\tbody()\n}\n",
+            "fun f(a: i32, b: i32) {\n\tbody()\n}\n",
+        );
+    }
+
+    /// The boundary: `fun f(…: i32) {` is 14 columns around the parameter name,
+    /// so an 86-character name makes exactly the budget and 87 makes 101.
+    #[test]
+    fn exactly_the_budget_stays_inline_and_one_column_over_splits() {
+        let at_budget = format!("fun f({}: i32) {{\n\tbody()\n}}\n", "a".repeat(86));
+        let over_budget = format!("fun f({}: i32) {{\n\tbody()\n}}\n", "a".repeat(87));
+        assert_eq!(columns(at_budget.lines().next().unwrap()), LINE_BUDGET);
+        assert_eq!(
+            columns(over_budget.lines().next().unwrap()),
+            LINE_BUDGET + 1
+        );
+        assert_construct(&at_budget, &at_budget);
+        assert_construct(
+            &over_budget,
+            &format!("fun f(\n\t{}: i32,\n) {{\n\tbody()\n}}\n", "a".repeat(87)),
+        );
+    }
+
+    /// What follows the `)` rides the closing line, whatever it is: a return
+    /// type, or a bodyless declaration's `;`. Neither is a list entry.
+    #[test]
+    fn the_return_type_and_a_bodyless_semicolon_ride_the_closing_line() {
+        assert_construct(
+            "fun with_ret(alpha_parameter: i32, beta_parameter: str, gamma_parameter: bool, \
+             delta_parameter: i32, eps: i32): Result<List<i32>, RpcError> {\n\tbuild()\n}\n",
+            "fun with_ret(\n\
+             \talpha_parameter: i32,\n\
+             \tbeta_parameter: str,\n\
+             \tgamma_parameter: bool,\n\
+             \tdelta_parameter: i32,\n\
+             \teps: i32,\n\
+             ): Result<List<i32>, RpcError> {\n\
+             \tbuild()\n\
+             }\n",
+        );
+        assert_construct(
+            "external fun pbkdf2_sync(password: str, salt: str, iterations: i32, \
+             key_length: i32, digest: str, extra: str): HashBuffer;\n",
+            "external fun pbkdf2_sync(\n\
+             \tpassword: str,\n\
+             \tsalt: str,\n\
+             \titerations: i32,\n\
+             \tkey_length: i32,\n\
+             \tdigest: str,\n\
+             \textra: str,\n\
+             ): HashBuffer;\n",
+        );
+    }
+
+    /// An EMPTY parameter list never breaks — `(⏎)` buys a line and no clarity —
+    /// so a signature pushed over by its NAME simply stays long. Same rule the
+    /// empty list and the empty struct literal follow.
+    #[test]
+    fn an_empty_parameter_list_never_breaks() {
+        let source = "fun a_function_whose_name_alone_runs_well_past_the_hundred_column_budget\
+                      _without_any_parameters(): i32 {\n\tbody()\n}\n";
+        assert_over_budget(source.lines().next().unwrap());
+        assert_construct(source, source);
+    }
+
+    /// A CLOSURE's parameters are untouched: they are an expression's own
+    /// punctuation, printed through `print_closure_parameters`, and only
+    /// `print_parameters` — reached solely from a `fun` declaration — splits.
+    #[test]
+    fn closure_parameters_do_not_break() {
+        let source = "fun demo() {\n\
+                      \tlet handler = |alpha_parameter: i32, beta_parameter: str, \
+                      gamma_parameter: bool, delta: i32| compute(alpha_parameter);\n\
+                      }\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(source, source);
     }
 }
 

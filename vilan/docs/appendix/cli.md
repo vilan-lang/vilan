@@ -96,10 +96,19 @@ is the current directory. Formatting is conservative and a fixed point:
   where they are printed. So `view(…)…when(cond, || { … })` splits its
   chain like any other; only what shares the opening line counts toward
   that line's width.
+- A `fun` signature over the budget breaks its parameter list the same
+  way, one parameter per line, with the return type, a `borrows` clause
+  and the body's `{` (or a bodyless `;`) riding the closing `)`. An empty
+  parameter list never breaks, so a signature pushed over by its *name*
+  stays long. A closure's parameters are never broken.
 - Parenthesized groups you wrote are kept, even where the grammar
   doesn't need them: a redundant paren is usually there for clarity.
-- Argument lists are never wrapped: layout hangs off a call's last
-  argument, so a long earlier argument leaves a long line.
+- A call's *argument* list is never wrapped: layout hangs off the last
+  argument, so a long earlier argument leaves a long line. This is
+  deliberately not symmetric with the parameter rule above — an argument
+  list sits inside an expression, where the builder convention decides
+  layout, while a parameter list is a declaration's own contract and has
+  no shape but one-per-line.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
   untouched, never half-formatted.
 

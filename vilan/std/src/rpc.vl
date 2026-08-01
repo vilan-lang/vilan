@@ -482,7 +482,11 @@ fun settle_pending(pending: Shared<List<PendingCall>>, request: i32, reply: Fram
 }
 
 /// Route one duplex frame to the handler, or the early queue before one is set.
-fun deliver_inbound(inbound: Shared<Option<|Frame| void>>, early: Shared<List<Frame>>, payload: Frame) {
+fun deliver_inbound(
+	inbound: Shared<Option<|Frame| void>>,
+	early: Shared<List<Frame>>,
+	payload: Frame,
+) {
 	match inbound.read() {
 		Some(let handler) => handler(payload),
 		None => early.write().push(payload),
@@ -569,7 +573,11 @@ fun route_socket_bytes(message: Bytes, pending_settle: |i32, Frame| void, dispat
 /// frames land in the SAME places across reconnects). Resolves `Ok((socket,
 /// connection))` when the `__conn:<id>` announcement arrives, `Err` when the
 /// socket closes or errors first (an unreachable server).
-fun dial(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(WebSocket, i32), str> {
+fun dial(
+	url: str,
+	settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+): Result<(WebSocket, i32), str> {
 	let socket = new_web_socket(url);
 	socket.set_binary_type("arraybuffer");
 	let connection: Shared<str> = Shared::new("");
@@ -601,7 +609,11 @@ fun dial(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(W
 /// §2.3): 10 attempts, doubling from 250ms and capped at 4s — fast for the
 /// blip, capped pressure for the outage. Railway's attempt budget, better
 /// curve. The first attempt is immediate.
-fun dial_with_backoff(url: str, settle: |i32, Frame| void, dispatch: |Frame| void): Result<(WebSocket, i32), str> {
+fun dial_with_backoff(
+	url: str,
+	settle: |i32, Frame| void,
+	dispatch: |Frame| void,
+): Result<(WebSocket, i32), str> {
 	mut outcome: Result<(WebSocket, i32), str> = Err(i"could not reach {url}");
 	mut attempt = 0;
 	mut delay = 250i53;
@@ -840,7 +852,12 @@ fun local_rpc(protocol: RpcProtocol): LocalTransport {
 /// describes itself into the envelope's serializer), await the round-trip, and
 /// decode the reply as `T` (inferred from the call site). Infrastructure
 /// failures — transport, decode, a remote error — surface as `Err(RpcError)`.
-fun call<T: Wire, Tx: Transport>(transport: Tx, codec: Codec, method: str, args: List<|Serializer| void>): Result<T, RpcError> {
+fun call<T: Wire, Tx: Transport>(
+	transport: Tx,
+	codec: Codec,
+	method: str,
+	args: List<|Serializer| void>,
+): Result<T, RpcError> {
 	let outcome = await transport.call(encode_request(codec, method, args));
 	match outcome {
 		// The transport itself failed — a dropped connection, an unreachable
@@ -1269,7 +1286,13 @@ fun dial_for_service(url: str): Result<SocketDuplex, RpcError> {
 /// the fresh connection id, and rebind each mirror positionally (the
 /// `__attach` reply is ordered by the service's exposed-field order). The
 /// generated `connect` pushes one `on_reconnect` hook calling this.
-fun reattach_mirrors(socket: SocketDuplex, transport: SocketTransport, codec: Codec, expected_contract: str, rebinds: List<|i32, Frame| void>) {
+fun reattach_mirrors(
+	socket: SocketDuplex,
+	transport: SocketTransport,
+	codec: Codec,
+	expected_contract: str,
+	rebinds: List<|i32, Frame| void>,
+) {
 	let remote: Result<str, RpcError> = call(transport, codec, "__contract", []);
 	match remote {
 		// Unreachable again already — the next drop cycle handles it.
