@@ -494,3 +494,47 @@ fn the_codegen_failure_renders_in_the_entry_that_lacks_main() {
         "never in the module it happened to load: {stderr}"
     );
 }
+
+/// The leak tally's production surface (backlog E24): with `VILAN_LEAK_REPORT`
+/// set, every top-level analysis prints one cumulative per-site line to
+/// stderr — the same split the leak harness asserts on, so a live session's
+/// growth can be corroborated in the field, not RSS-inferred. Off by default,
+/// and stderr-only for the same reason warnings are: it must never corrupt
+/// `build --stdout`'s JavaScript.
+#[test]
+fn leak_report_env_var_prints_the_per_site_split() {
+    let dir = temp_package(
+        "leakreport",
+        "import std::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_LEAK_REPORT", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[vilan leak]"),
+        "VILAN_LEAK_REPORT=1 printed no leak report; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("ParseCleanCacheText") && stderr.contains("total"),
+        "the report must carry the per-site split the harness asserts on \
+         (every front-end parses std through `parse_clean_cached`, so that \
+         site is always in a build's line); stderr was: {stderr}"
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env_remove("VILAN_LEAK_REPORT");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("[vilan leak]"),
+        "the leak report must be off by default; stderr was: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

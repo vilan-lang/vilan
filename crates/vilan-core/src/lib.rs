@@ -460,3 +460,13 @@ fn analyze_source_unfenced(
         Err(_) => (None, diagnostics),
     }
 }
+
+/// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value
+/// but empty or `0`). Read once and cached: an env var does not change under a
+/// live process, and the LSP asks on every keystroke.
+pub(crate) fn leak_report_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VILAN_LEAK_REPORT").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}

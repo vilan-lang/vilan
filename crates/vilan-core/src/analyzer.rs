@@ -25449,6 +25449,18 @@ pub fn analyze<'src>(
         recorded
     };
 
+    // The leak tally's production surface (backlog E24): one cumulative line
+    // per top-level analysis when `VILAN_LEAK_REPORT` is set. It prints HERE —
+    // `analyze` is the one chokepoint every front-end shares (the CLI calls it
+    // directly; `analyze_source` fronts it for the LSP and wasm), and the
+    // counters are thread-local, so only the analysis thread can read them.
+    // Macro worlds are nested analyses whose leaks tally into this thread's
+    // next line; their own pass stays silent. Stderr for the same reason
+    // warnings are: it must never corrupt `build --stdout`'s JavaScript.
+    if !crate::macros::in_macro_world() && crate::leak_report_enabled() {
+        eprintln!("[vilan leak] {}", crate::leak_tally::report());
+    }
+
     Program {
         platform,
         closures: analyzer.closures,

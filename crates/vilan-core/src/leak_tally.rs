@@ -76,6 +76,26 @@ pub enum LeakSite {
 /// The number of [`LeakSite`] variants — keep in step with the enum.
 const SITE_COUNT: usize = 15;
 
+/// Every site in declaration order — keep in step with the enum; [`report`]
+/// iterates it.
+const ALL_SITES: [LeakSite; SITE_COUNT] = [
+    LeakSite::LspEntryText,
+    LeakSite::EntryAst,
+    LeakSite::ParseCleanCacheText,
+    LeakSite::ParseCleanCacheAst,
+    LeakSite::MacroBlockEntryName,
+    LeakSite::DisplayName,
+    LeakSite::ModuleErrorText,
+    LeakSite::ModuleErrorAst,
+    LeakSite::MacroPreludeText,
+    LeakSite::MacroWorldText,
+    LeakSite::MacroWorldProgram,
+    LeakSite::MacroExpansion,
+    LeakSite::MacroParseText,
+    LeakSite::MacroParseAst,
+    LeakSite::WasmEntryText,
+];
+
 thread_local! {
     static COUNTERS: [Cell<usize>; SITE_COUNT] = const { [const { Cell::new(0) }; SITE_COUNT] };
 }
@@ -106,4 +126,43 @@ pub fn reset() {
             cell.set(0);
         }
     });
+}
+
+/// The current thread's counters as one line: the total, then every nonzero
+/// site by name — the same per-site split the leak harness asserts on, so a
+/// field report and a harness run read identically (backlog E24). Cumulative
+/// since thread start: production never calls [`reset`], so the line is the
+/// thread's whole history, and growth shows as growth.
+pub fn report() -> String {
+    let mut parts = Vec::new();
+    for site in ALL_SITES {
+        let leaked = bytes(site);
+        if leaked > 0 {
+            parts.push(format!("{site:?} {leaked} B"));
+        }
+    }
+    if parts.is_empty() {
+        return "total 0 B".to_string();
+    }
+    format!("total {} B: {}", total(), parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The report is the harness's split: the total, then each nonzero site by
+    /// its enum name — and ONLY nonzero sites, so a quiet thread reads
+    /// "total 0 B" rather than fifteen zeros. Counters are thread-local and
+    /// the test runner gives each test its own thread, so the reset here
+    /// cannot race a neighbor.
+    #[test]
+    fn the_report_names_nonzero_sites_and_the_total() {
+        reset();
+        assert_eq!(report(), "total 0 B");
+        record(LeakSite::EntryAst, 40);
+        record(LeakSite::MacroWorldText, 100);
+        assert_eq!(report(), "total 140 B: EntryAst 40 B, MacroWorldText 100 B");
+        reset();
+    }
 }
