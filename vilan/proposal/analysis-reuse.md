@@ -1,7 +1,9 @@
 # Analysis reuse — the E3 arc (leak closure, the prelude checkpoint)
 
 > **Status: Phase 1 SHIPPED 2026-07-21; Phase 2 CLOSED BY MEASUREMENT same
-> day — its own gate fired. E3 closes at Phase 1; Phase 3 keeps the evidence.**
+> day — its own gate fired. E3 closes at Phase 1; Phase 3 keeps the evidence.
+> 2026-08-01: a Phase-1 residual (macro-DEFINING buffers) is filed as backlog
+> E23 — recorded in the residual block below.**
 >
 > **The Phase 2 stop (implementation step 1, no code shipped):** the §3
 > premise — "snapshot after prelude/dependency loading, analyze only the
@@ -37,6 +39,20 @@
 > ~60 KiB/analysis of RSS allocator churn**, which is §0's inference made
 > fact and Phase 2's whole motivation: the churn *is* the re-analysis, and
 > only the checkpoint removes it.
+>
+> **Phase 1 residual (found 2026-07-28 scoping D11's leak exposure; filed
+> 2026-08-01 as backlog E23):** the world cache keys on the hash of the
+> length-preserving BLANKED source — every byte outside the macro definitions
+> becomes a space — so the key depends on the whole file's length and newline
+> layout, and a buffer that DEFINES macros recompiles and re-leaks its world
+> (`MacroWorldText`, ~file size, plus a whole `MacroWorldProgram`) on any
+> length-changing edit outside the macro spans. The Phase-1 harness never
+> measures this, deliberately: `gensym_expansion_leak_plateaus` holds its
+> edit tail at a fixed four digits so the blanked source stays byte-identical
+> and the world stays cached — a dodge the harness comments state but this
+> file did not, until now. `compile_world`'s "bounded: one leak per distinct
+> macro-definition set" is therefore true only while the non-macro text never
+> changes length.
 
 ## 0. What the scout established (corrections to E3's framing)
 

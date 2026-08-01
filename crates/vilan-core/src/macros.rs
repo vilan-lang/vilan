@@ -63,6 +63,8 @@ impl Default for MacroLimits {
 /// A compiled per-file macro world: the transformed program the interpreter
 /// executes, plus each macro's emitted entry name and parameter count.
 pub(crate) struct World {
+    /// The `world_key` it was compiled under — `cached_run` keys expansions
+    /// by it, so cached expansions too survive edits outside the macro spans.
     key: u64,
     program: JsProgram<'static>,
     /// macro name → its emitted function name.
@@ -240,8 +242,18 @@ pub(crate) struct MacroDef {
     /// The file's blanked world source (shared by the file's macros) and its
     /// location — the world compiles LAZILY on first dispatch (registration
     /// stays syntactic, so a program pays only for the macros it uses), cached
-    /// process-globally by blanked content.
+    /// process-globally by the definitions' content (`world_key`).
     blanked: Arc<String>,
+    /// The world cache key: the definition and block segments' content, in
+    /// file order. Nothing else about the file reaches the compiled world's
+    /// BEHAVIOR — the filler between segments is spaces and newlines — so the
+    /// cache survives edits outside the macro spans instead of recompiling
+    /// (and re-leaking) a world per keystroke (backlog E23).
+    world_key: u64,
+    /// The failure cache key: `world_key` plus the segments' offsets.
+    /// World-compile DIAGNOSTICS carry spans into the defining file, so a
+    /// cached failure replays only while the definitions hold their offsets.
+    failure_key: u64,
     file: PathBuf,
     /// The defining file's source in THIS analysis — world-compile errors
     /// attribute here (their spans point into the defining file).
@@ -265,7 +277,14 @@ impl MacroDef {
                         msg: "the `macro_std` package was not found beside `std`".to_string(),
                     }]);
                 };
-                let world = compile_world((*self.blanked).clone(), &self.file, std, &macro_std)?;
+                let world = compile_world(
+                    (*self.blanked).clone(),
+                    self.world_key,
+                    self.failure_key,
+                    &self.file,
+                    std,
+                    &macro_std,
+                )?;
                 *self.world.borrow_mut() = Some(world.clone());
                 world
             }
@@ -419,6 +438,7 @@ pub(crate) fn register_file(
     let _ = macro_std; // presence checked above; the world resolves it lazily
     let block_spans: Vec<Span> = blocks.iter().map(|(_, span)| *span).collect();
     let blanked = Arc::new(blank_to_world(text, &definitions, &block_spans));
+    let (world_key, failure_key) = world_cache_keys(&blanked, &definitions, &block_spans);
     let module = registry.by_module.entry(key.clone()).or_default();
     for (function, _) in &definitions {
         let name = function.name.0.to_string();
@@ -436,6 +456,8 @@ pub(crate) fn register_file(
                 name,
                 shape: macro_shape(function),
                 blanked: blanked.clone(),
+                world_key,
+                failure_key,
                 file: file.to_path_buf(),
                 source,
                 world: std::cell::RefCell::new(None),
@@ -451,6 +473,8 @@ pub(crate) fn register_file(
                     name: block_entry_name(ordinal),
                     shape: Some(MacroShape::Unit),
                     blanked: blanked.clone(),
+                    world_key,
+                    failure_key,
                     file: file.to_path_buf(),
                     source,
                     world: std::cell::RefCell::new(None),
@@ -569,6 +593,41 @@ fn blank_to_world(text: &str, definitions: &[(&Func, Span)], blocks: &[Span]) ->
     String::from_utf8(blanked).expect("blanking preserves UTF-8 (multibyte bytes become spaces)")
 }
 
+/// The world cache keys for one file's definition set. `world_key` hashes
+/// ONLY the definition and block segments of the blanked source, in file
+/// order (slice hashing is length-prefixed, so segment boundaries cannot
+/// alias): the filler between segments is spaces and newlines, so the
+/// compiled world's BEHAVIOR depends on the segments alone, and an edit
+/// outside the macro spans reuses the cached world instead of recompiling
+/// (and re-leaking) one per keystroke (backlog E23). `failure_key`
+/// additionally hashes each segment's offsets: world-compile DIAGNOSTICS
+/// carry spans into the defining file, so a cached failure is replayed only
+/// while the definitions sit at those offsets. The file's length is NOT part
+/// of the key — text below the last definition may grow and shrink freely —
+/// so a replayed span recorded under a longer file is clamped into range at
+/// the replay site.
+fn world_cache_keys(blanked: &str, definitions: &[(&Func, Span)], blocks: &[Span]) -> (u64, u64) {
+    let bytes = blanked.as_bytes();
+    let mut segments: Vec<std::ops::Range<usize>> = definitions
+        .iter()
+        .map(|(_, span)| span.into_range())
+        .chain(blocks.iter().map(|span| span.into_range()))
+        .map(|range| range.start.min(bytes.len())..range.end.min(bytes.len()))
+        .collect();
+    segments.sort_by_key(|range| range.start);
+    let mut content = DefaultHasher::new();
+    let mut layout = DefaultHasher::new();
+    for range in segments {
+        bytes[range.clone()].hash(&mut content);
+        (range.start, range.end).hash(&mut layout);
+    }
+    let world_key = content.finish();
+    // The failure key subsumes the content key: identical definitions at
+    // identical offsets in a same-length file fail identically.
+    world_key.hash(&mut layout);
+    (world_key, layout.finish())
+}
+
 fn content_key(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
@@ -646,15 +705,35 @@ pub(crate) fn world_prelude_nodes(
 
 fn compile_world(
     blanked: String,
+    world_key: u64,
+    failure_key: u64,
     file: &Path,
     std: &PackageSpec,
     macro_std: &PackageSpec,
 ) -> Result<Arc<World>, Vec<Error>> {
     static WORLDS: OnceLock<Mutex<HashMap<u64, Arc<World>>>> = OnceLock::new();
-    let key = content_key(&blanked);
+    // Failed compiles, by `failure_key`. A failure inserts nothing into
+    // `WORLDS`, so without this a buffer holding a BROKEN macro definition
+    // would recompile the world — and re-leak its text — on every analysis,
+    // edited or not (backlog E23).
+    static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new();
     let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(world) = worlds.lock().unwrap().get(&key) {
+    if let Some(world) = worlds.lock().unwrap().get(&world_key) {
         return Ok(world.clone());
+    }
+    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(errors) = failures.lock().unwrap().get(&failure_key) {
+        // The cached spans are true for this definition layout; only a span
+        // at the END of a since-shortened file could overshoot — clamp it.
+        return Err(errors
+            .iter()
+            .map(|error| {
+                let range = error.span.into_range();
+                let mut error = error.clone();
+                error.span = (range.start.min(blanked.len())..range.end.min(blanked.len())).into();
+                error
+            })
+            .collect());
     }
 
     let leaked: &'static str = Box::leak(blanked.into_boxed_str());
@@ -684,21 +763,30 @@ fn compile_world(
     );
     IN_MACRO_WORLD.with(|flag| flag.set(previously_in_world));
     if !errors.is_empty() {
-        return Err(errors
-            .into_iter()
-            .map(|error| Error {
-                note: None,
-                span: error.span,
-                msg: format!("in this macro: {}", error.msg),
-            })
-            .collect());
+        // The text above is already leaked; caching the failure bounds that to
+        // one leak per distinct (definition set, layout) instead of one per
+        // analysis.
+        let errors: Arc<Vec<Error>> = Arc::new(
+            errors
+                .into_iter()
+                .map(|error| Error {
+                    note: None,
+                    span: error.span,
+                    msg: format!("in this macro: {}", error.msg),
+                })
+                .collect(),
+        );
+        failures.lock().unwrap().insert(failure_key, errors.clone());
+        return Err((*errors).clone());
     }
     let Some(program) = program else {
-        return Err(vec![Error {
+        let errors = Arc::new(vec![Error {
             note: None,
             span: (0..0).into(),
             msg: "the macro world failed to compile".to_string(),
         }]);
+        failures.lock().unwrap().insert(failure_key, errors.clone());
+        return Err((*errors).clone());
     };
     // The world outlives this analysis (it's cached process-globally), so the
     // program is leaked — bounded: one leak per distinct macro-definition set,
@@ -726,19 +814,26 @@ fn compile_world(
             root_names.push(name.to_string());
         }
     }
-    let (js_program, emitted) = transform_functions(program, &BuildOptions::default(), &roots)
-        .map_err(|error| vec![error])?;
+    let (js_program, emitted) = match transform_functions(program, &BuildOptions::default(), &roots)
+    {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            let errors = Arc::new(vec![error]);
+            failures.lock().unwrap().insert(failure_key, errors.clone());
+            return Err((*errors).clone());
+        }
+    };
     let entries = roots
         .iter()
         .zip(root_names)
         .map(|(id, name)| (name, emitted.get(id).cloned().unwrap_or_default()))
         .collect();
     let world = Arc::new(World {
-        key,
+        key: world_key,
         program: js_program,
         entries,
     });
-    worlds.lock().unwrap().insert(key, world.clone());
+    worlds.lock().unwrap().insert(world_key, world.clone());
     Ok(world)
 }
 

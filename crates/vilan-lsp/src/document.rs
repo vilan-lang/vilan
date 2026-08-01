@@ -6251,4 +6251,96 @@ mod leak_measurement {
             "the changing gensym fixture leaked no entry text — it may not be re-analyzing",
         );
     }
+
+    // The E23 pin: the SAME macro-defining program under a keystroke that
+    // CHANGES THE FILE'S LENGTH every analysis (a growing trailing comment)
+    // without touching the macro definition. Blanking preserves length, so
+    // before the fix every analysis produced a distinct blanked source, missed
+    // the world cache, and re-leaked a full world (`MacroWorldText` +
+    // `MacroWorldProgram`) — the leak the gensym fixture's fixed-width tail
+    // deliberately dodges. The world key hashes only the definition segments,
+    // so the world compiled during warmup must serve every subsequent
+    // analysis: the whole macro path plateaus.
+    #[test]
+    fn world_leak_plateaus_under_length_changing_edits() {
+        let warmup = 8;
+        let measured = 40;
+        let report = on_big_stack(move || {
+            let report = measure(
+                |i| format!("{}// {}\n", gensym_text(1000), "x".repeat(i)),
+                warmup,
+                measured,
+            );
+            for site in MACRO_SITES {
+                println!(
+                    "[length-changing] {:?} = {} B",
+                    site,
+                    leak_tally::bytes(*site)
+                );
+            }
+            report
+        });
+        report.print("length-changing");
+
+        assert_eq!(
+            report.macro_bytes, 0,
+            "a length-changing edit outside the macro definition re-leaked {} B on the \
+             macro path over {} analyses — the world cache is keyed on the file's \
+             layout, not the definitions' content (backlog E23; see the per-site \
+             breakdown above)",
+            report.macro_bytes, report.measured,
+        );
+        assert!(
+            report.entry_text > 0,
+            "the length-changing fixture leaked no entry text — it may not be re-analyzing",
+        );
+    }
+
+    // A macro whose WORLD does not compile (its body calls an undefined name).
+    // Failures never reached the world cache — only `Ok` worlds were inserted —
+    // so a buffer holding a broken macro definition re-leaked the world's text
+    // per analysis, even UNEDITED. The failure cache (keyed on the definition
+    // segments AND their offsets, so the cached diagnostics' spans stay true)
+    // must make the macro path plateau while the diagnostics keep being
+    // reported. The tail edit stays BELOW the definition: the offsets hold, so
+    // the cached failure stays valid. (An edit that MOVES a still-broken
+    // definition recompiles once per layout — recorded, accepted.)
+    #[test]
+    fn broken_world_failure_plateaus_without_releaking() {
+        fn broken_macro_text(i: usize) -> String {
+            format!(
+                "import std::print;\n\n\
+                 macro fun broken(arguments: Arguments): Source {{\n\
+                 \timport macro_std::source;\n\
+                 \timport macro_std::meta::{{ Arguments, Source }};\n\
+                 \tsource(undefined_name())\n\
+                 }}\n\n\
+                 fun main() {{\n\tlet x = macro broken(1);\n\tprint(x);\n}}\n\n\
+                 main();\n// {}\n",
+                "x".repeat(i)
+            )
+        }
+        let warmup = 8;
+        let measured = 40;
+        let report = on_big_stack(move || {
+            let report = measure(broken_macro_text, warmup, measured);
+            for site in MACRO_SITES {
+                println!("[broken-world] {:?} = {} B", site, leak_tally::bytes(*site));
+            }
+            report
+        });
+        report.print("broken-world");
+
+        assert_eq!(
+            report.macro_bytes, 0,
+            "a broken macro definition re-leaked {} B on the macro path over {} \
+             analyses — world-compile failures are not being cached (backlog E23; \
+             see the per-site breakdown above)",
+            report.macro_bytes, report.measured,
+        );
+        assert!(
+            report.entry_text > 0,
+            "the broken-world fixture leaked no entry text — it may not be re-analyzing",
+        );
+    }
 }

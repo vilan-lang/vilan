@@ -99,7 +99,10 @@ fn no_tracked_file_publishes_a_personal_mailbox() {
         }
         for (index, line) in text.lines().enumerate() {
             let lowered = line.to_lowercase();
-            if needles.iter().any(|needle| lowered.contains(needle.as_str())) {
+            if needles
+                .iter()
+                .any(|needle| lowered.contains(needle.as_str()))
+            {
                 offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
             }
         }

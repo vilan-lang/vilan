@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Editing a file that defines a macro no longer leaks a compiler per keystroke.** A macro's body compiles once into an isolated world the expander then runs. That world was cached by the layout of the whole defining file, so any edit that changed the file's length — typing almost anywhere — discarded the cached world and compiled and leaked a fresh one, in the editor, on every analysis. The world is now cached by the macro definitions themselves and survives edits around them. A macro definition that does not compile had it worse: its failure was never cached at all, so the world recompiled and leaked on every analysis even with the file untouched. Failed compiles now replay their diagnostics from cache, and the leak-measurement harness pins both behaviors so they cannot quietly return.
+
 ## v0.18.2 — 2026-07-29
 
 **The npm packages are signed now.** Publishing to npm no longer goes through a stored token. The release workflow proves who it is to npm per run instead, so there is no long-lived credential behind the channel at all — nothing to expire, rotate, or leak. The visible half is provenance: each of the six packages carries a "Built and signed on GitHub Actions" badge linking to the exact workflow run that built it, so what npm serves can be traced back to this repository's tagged source. Installing and running are unchanged.
