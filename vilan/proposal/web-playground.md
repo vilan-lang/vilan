@@ -416,6 +416,17 @@ it, diagnostics beneath the editor.
   the shipped wasm.
 - **S4 — polish:** share-via-fragment, version badge, editor niceties.
   Each independently shippable after S3.
+  - **Share-via-fragment — SHIPPED 2026-08-01** (website `4a229f9`, deployed).
+    `#code=<base64url(deflate-raw(source))>` per §5: Share writes the
+    fragment into the address bar (`window.history.replaceState` — bare
+    `history` inside the bundle is CodeMirror's undo extension, a real
+    collision found by the first test run) and copies the full URL; the
+    status line reports "copied" or, when the clipboard refuses (permission,
+    insecure context), "ready in the address bar" — the link exists either
+    way. A page opened with a fragment loads it in place of the default
+    example; a mangled payload falls back. Browser-verified: clipboard
+    exact, unicode round-trips byte-identically, the shared program
+    compiles and runs, malformed links fall back.
   - **Format button — SHIPPED 2026-08-01 (dormant until the next release).**
     `vilan-wasm` exports `format` (the CLI's `formatter::format` exactly:
     canonical layout or the original bytes on a bail; two pins in
