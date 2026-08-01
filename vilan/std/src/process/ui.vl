@@ -21,10 +21,10 @@
 //
 // Only available when building for a process platform (node).
 
-import pkg::reactive::{ Signal, Owner, owner_scope, run_with_owner, turn_scope, Draft };
+import pkg::compare::PartialEq;
+import pkg::reactive::{ Draft, Owner, Signal, owner_scope, run_with_owner, turn_scope };
 import pkg::shared::Shared;
 import pkg::style::Style;
-import pkg::compare::PartialEq;
 
 /// One attribute in an element's ordered attribute list. Ordering is INSERTION
 /// ORDER — the component wrote them in code order — so serialization is
@@ -58,12 +58,7 @@ fun view(tag: str): View {
 	if tag == "svg" {
 		set_attribute(attributes, "xmlns", "http://www.w3.org/2000/svg");
 	}
-	View {
-		tag,
-		attributes,
-		children = Shared::new([]),
-		text = Shared::new(""),
-	}
+	View { tag, attributes, children = Shared::new([]), text = Shared::new("") }
 }
 
 /// Set-or-replace an attribute BY NAME, in place — mirrors the DOM's
@@ -236,7 +231,11 @@ impl View {
 
 	/// The dynamic-subtree swap, server side: renders the branch for `source`'s
 	/// CURRENT value. Read once — there is no later change to follow.
-	fun swap<T: PartialEq>(self, source: Signal<T>, build: (sync |T| View) context owner_scope): View {
+	fun swap<T: PartialEq>(
+		self,
+		source: Signal<T>,
+		build: (sync |T| View) context owner_scope,
+	): View {
 		let value = source.get();
 		let owner = Owner::new();
 		self.children.write().push(run_with_owner(owner, || build(value)));

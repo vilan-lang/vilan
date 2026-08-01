@@ -12,8 +12,8 @@
 /// console with the task's spawn origin, and the program continues.
 
 import pkg::context::Context;
-import pkg::option::Option::{ self, Some, None };
 import pkg::drop::Drop;
+import pkg::option::Option::{ None, Some, self };
 
 external struct Task<T>;
 

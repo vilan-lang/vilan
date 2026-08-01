@@ -20,13 +20,27 @@
 //
 // Only available when building for the browser (`vilan build --target browser`).
 
-import pkg::dom::{ Element, Event, get_element_by_id, create_element, create_element_ns };
-import pkg::reactive::{ Signal, Owner, Disposable, reconcile, RowStep, owner_scope, get_owner, run_with_owner, comp, turn_scope, turn, FlushPolicy, Draft };
+import pkg::compare::PartialEq;
+import pkg::dev::{ hmr_active, on_teardown };
+import pkg::dom::{ Element, Event, create_element, create_element_ns, get_element_by_id };
+import pkg::option::Option::{ None, Some, self };
+import pkg::reactive::{
+	Disposable,
+	Draft,
+	FlushPolicy,
+	Owner,
+	RowStep,
+	Signal,
+	comp,
+	get_owner,
+	owner_scope,
+	reconcile,
+	run_with_owner,
+	turn,
+	turn_scope,
+};
 import pkg::shared::Shared;
 import pkg::style::Style;
-import pkg::compare::PartialEq;
-import pkg::option::Option::{ self, Some, None };
-import pkg::dev::{ hmr_active, on_teardown };
 
 /// A handle to a DOM element under construction — nothing more: ownership is
 /// the enclosing boundary's job.
@@ -353,7 +367,11 @@ impl View {
 	/// disposal boundary like a `bind_each` row; whichever is live when the
 	/// enclosing boundary goes is disposed with it. Routing is the first
 	/// customer (`std::router`): `swap(route, |current| match current { .. })`.
-	fun swap<T: PartialEq>(self, source: Signal<T>, render: (sync |T| View) context owner_scope): View {
+	fun swap<T: PartialEq>(
+		self,
+		source: Signal<T>,
+		render: (sync |T| View) context owner_scope,
+	): View {
 		let element = self.element;
 		let last_value: Shared<Option<T>> = Shared::new(None);
 		let live_view: Shared<Option<View>> = Shared::new(None);

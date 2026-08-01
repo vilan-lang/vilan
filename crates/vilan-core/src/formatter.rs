@@ -1439,6 +1439,49 @@ impl<'src> Printer<'src> {
                 self.print_expr(length);
                 self.out.push(']');
             }
+            // `(|| void) context turn_scope` / `T context (a, b)` — a type with the
+            // ambient contexts its value demands (`proposal/ambient-owner.md`). One
+            // name may be written bare or parenthesized and both reprint as
+            // written: the parser records only the names, so the source decides.
+            Node::TypeWithContexts(inner, contexts) => {
+                self.print_type(&inner.0);
+                self.out.push_str(" context ");
+                let parenthesized = contexts.len() > 1
+                    || contexts.first().is_some_and(|(_, span)| {
+                        self.source
+                            .get(inner.1.into_range().end..span.into_range().start)
+                            .is_some_and(|between| between.contains('('))
+                    });
+                if parenthesized {
+                    self.out.push('(');
+                }
+                for (index, (name, _)) in contexts.iter().enumerate() {
+                    if index > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.out.push_str(name);
+                }
+                if parenthesized {
+                    self.out.push(')');
+                }
+            }
+            // `(U in T: Signal<U>)` — a mapped tuple type: `template` applied to
+            // each element of the tuple `source`, with `binder` naming the element
+            // type. The parentheses are the form's own, not a group around it.
+            Node::MappedType {
+                binder,
+                source,
+                template,
+                ..
+            } => {
+                self.out.push('(');
+                self.out.push_str(binder);
+                self.out.push_str(" in ");
+                self.print_type(&source.0);
+                self.out.push_str(": ");
+                self.print_type(&template.0);
+                self.out.push(')');
+            }
             _ => self.bailed = true,
         }
     }
@@ -1488,6 +1531,26 @@ impl<'src> Printer<'src> {
             }
             self.out.push_str(parameter.name);
             self.print_bounds(&parameter.bounds);
+            // `T: (2..)` / `(..10)` / `(..: Display)` — a tuple-arity bound, which
+            // REPLACES the trait-bound list rather than joining it, so exactly one
+            // of the two prints. Omitted endpoints stay omitted: `(2..)` is not
+            // `(2..0)`. This was dropped entirely, which cost `reactive.vl` its
+            // `combine<T: (2..)>` and, through the safety net, its whole file.
+            if let Some(tuple_bound) = &parameter.tuple_bound {
+                self.out.push_str(": (");
+                if let Some(lo) = tuple_bound.lo {
+                    self.out.push_str(&lo.to_string());
+                }
+                self.out.push_str("..");
+                if let Some(hi) = tuple_bound.hi {
+                    self.out.push_str(&hi.to_string());
+                }
+                if let Some(element) = &tuple_bound.element {
+                    self.out.push_str(": ");
+                    self.print_type(&element.0);
+                }
+                self.out.push(')');
+            }
             if let Some(default) = &parameter.default {
                 self.out.push_str(" = ");
                 self.print_type(&default.0);
@@ -2316,7 +2379,19 @@ impl<'src> Printer<'src> {
             }
             Node::Bool(value) => self.out.push_str(if *value { "true" } else { "false" }),
             Node::Null => self.out.push_str("null"),
-            Node::Void => {}
+            // `void` written as a value prints as `void`. The parser also
+            // SYNTHESIZES a `Void` for a block that ends without a tail
+            // expression, and that one is not text — it prints as nothing. The
+            // two are told apart by span: a synthesized tail is zero-width at the
+            // block's end, a written `void` covers its four characters. Printing
+            // both as nothing dropped the argument from `Verdict::Bad(void)`,
+            // which the safety net then caught as token drift — silently
+            // returning `option.vl` unformatted, forever.
+            Node::Void => {
+                if !expr.1.into_range().is_empty() {
+                    self.out.push_str("void");
+                }
+            }
             Node::Accessor(name) => self.out.push_str(name),
             Node::AccessorWithGenerics(name, arguments) => {
                 self.out.push_str(name);
@@ -2663,6 +2738,24 @@ impl<'src> Printer<'src> {
                 self.print_operand(subject, 3);
                 self.out.push_str(" is ");
                 self.print_match_pattern(pattern);
+            }
+            // `(source in sources => source.get())` — a tuple comprehension:
+            // `body` evaluated for each element of the tuple `source`, with
+            // `binder` naming the element. Like its type-level counterpart
+            // `MappedType`, the parentheses are the form's own.
+            Node::TupleComprehension {
+                binder,
+                source,
+                body,
+                ..
+            } => {
+                self.out.push('(');
+                self.out.push_str(binder);
+                self.out.push_str(" in ");
+                self.print_expr(source);
+                self.out.push_str(" => ");
+                self.print_expr(body);
+                self.out.push(')');
             }
             _ => self.bailed = true,
         }
@@ -3105,7 +3198,22 @@ mod idempotency {
     /// The real invariant: formatting is a fixed point. `format(x)` may tidy `x`,
     /// but formatting the result again must change nothing.
     fn assert_fixed_point(name: &str, source: &str) {
+        // A BAILING file satisfies the fixed-point property trivially — `format`
+        // hands back its input, so `once == twice` whatever the printer can or
+        // cannot render. Two of the fixtures below were in exactly that state
+        // (`option.vl`, `reactive.vl`), which made their pins prove nothing;
+        // `reactive_vl` is here precisely to catch a dropped `[must_use]`
+        // tripping the safety net into a silent no-op, and it was tripped.
+        //
+        // So assert non-bail first, the way `assert_construct` does: appending
+        // blank lines is pure trivia, and a formatter that actually ran
+        // canonicalizes it away, while a bail returns it verbatim.
         let once = format(source);
+        assert_eq!(
+            format(&format!("{source}\n\n")),
+            once,
+            "formatter silently BAILED on {name} — its fixed-point pin proves nothing"
+        );
         let twice = format(&once);
         assert_eq!(once, twice, "formatting {name} is not a fixed point");
     }
@@ -3480,6 +3588,78 @@ mod bailing_constructs {
             "[derive(Json, Debug)]\nstruct Packet {\n\tkind: u8,\n}\n",
             "[derive(Json, Debug)]\nstruct Packet {\n\tkind: u8,\n}\n",
         );
+    }
+
+    // --- Backlog 47: the std bail set ---------------------------------------
+    //
+    // Five std files bailed for four missing printer arms and one dropped node,
+    // unnoticed because the zero-bail gate watched the CORPUS ALONE — these
+    // constructs appear in the standard library and nowhere in `vilan/test`.
+    // The gate now watches std, the examples and the templates too
+    // (`parse_differential::formattable_files`), and each construct is pinned
+    // here per shape rather than only in aggregate.
+
+    /// `(|| void) context turn_scope` — a type carrying the ambient contexts its
+    /// value demands. One context may be written bare or parenthesized, and both
+    /// reprint as WRITTEN: the parser keeps only the names, so the source decides
+    /// (and rewriting `context (a)` to `context a` would be token drift, which is
+    /// a bail — the failure mode this whole item is about).
+    #[test]
+    fn type_with_contexts() {
+        assert_construct(
+            "fun ctx(body: (|| void) context turn_scope): i32 {\n\t0\n}\n",
+            "fun ctx(body: (|| void) context turn_scope): i32 {\n\t0\n}\n",
+        );
+        assert_construct(
+            "fun ctx(body: (|| void) context (a, b)): i32 {\n\t0\n}\n",
+            "fun ctx(body: (|| void) context (a, b)): i32 {\n\t0\n}\n",
+        );
+        assert_construct(
+            "fun ctx(body: (|| void) context (a)): i32 {\n\t0\n}\n",
+            "fun ctx(body: (|| void) context (a)): i32 {\n\t0\n}\n",
+        );
+    }
+
+    /// `(U in T: Signal<U>)` — a mapped tuple type, and its expression-level
+    /// counterpart `(source in sources => source.get())`. The parentheses belong
+    /// to each form (the parser consumes them), so the printer emits them.
+    #[test]
+    fn mapped_type_and_tuple_comprehension() {
+        assert_construct(
+            "fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {\n\
+             \tlet snapshot = || (source in sources => source.get());\n\
+             \tSignal::new(snapshot())\n\
+             }\n",
+            "fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {\n\
+             \tlet snapshot = || (source in sources => source.get());\n\
+             \tSignal::new(snapshot())\n\
+             }\n",
+        );
+    }
+
+    /// `T: (2..)` / `(..10)` / `(..: Display)` / `(2..4: Display)` — a tuple-arity
+    /// bound, which REPLACES the trait-bound list. It was dropped outright, so
+    /// `combine<T: (2..)>` reprinted as `combine<T>` and the drift bailed
+    /// `reactive.vl` entirely. An omitted endpoint stays omitted.
+    #[test]
+    fn tuple_arity_bounds() {
+        assert_construct(
+            "fun bounds<A: (..10), B: (..: Display), C: (2..4: Display)>() {\n\tbody()\n}\n",
+            "fun bounds<A: (..10), B: (..: Display), C: (2..4: Display)>() {\n\tbody()\n}\n",
+        );
+    }
+
+    /// `void` written as a VALUE prints as `void`; the `Void` the parser
+    /// synthesizes for a block with no tail expression is not text and prints as
+    /// nothing. Printing both as nothing dropped the argument from
+    /// `Verdict::Bad(void)` — token drift, and `option.vl` never formatted again.
+    #[test]
+    fn written_void_survives_and_a_synthesized_tail_stays_silent() {
+        assert_construct(
+            "fun voided(): Verdict<i32, void> {\n\tVerdict::Bad(void)\n}\n",
+            "fun voided(): Verdict<i32, void> {\n\tVerdict::Bad(void)\n}\n",
+        );
+        assert_construct("fun empty_tail() {\n}\n", "fun empty_tail() {}\n");
     }
 }
 

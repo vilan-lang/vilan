@@ -1,9 +1,8 @@
-
-import pkg::shared::Shared;
-import pkg::option::Option::{ self, Some, None };
-import pkg::result::Result::{ self, Ok, Err };
 import pkg::compare::PartialEq;
 import pkg::context::Context;
+import pkg::option::Option::{ None, Some, self };
+import pkg::result::Result::{ Err, Ok, self };
+import pkg::shared::Shared;
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
 /// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.
@@ -377,12 +376,9 @@ impl Signal<type T> with Source<T> {
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription {
 		let id = fresh_id();
-		self.subscribers.write().push(Subscriber {
-			id,
-			notify = || {
-				observer(self.get());
-			},
-		});
+		self.subscribers.write().push(Subscriber { id, notify = || {
+			observer(self.get());
+		} });
 		observer(self.get());
 		Subscription { subscribers = self.subscribers, id }
 	}
@@ -423,12 +419,9 @@ impl Signal<type T> {
 
 	fun map<U>(self, transform: sync |T| U): Signal<U> {
 		let derived = Signal::new(transform(self.get()));
-		self.subscribers.write().push(Subscriber {
-			id = fresh_id(),
-			notify = || {
-				derived.set(transform(self.get()));
-			},
-		});
+		self.subscribers.write().push(Subscriber { id = fresh_id(), notify = || {
+			derived.set(transform(self.get()));
+		} });
 		derived
 	}
 }
@@ -442,7 +435,9 @@ fun combine<T: (2..)>(sources: (U in T: Signal<U>)): Signal<T> {
 	let derived = Signal::new(snapshot());
 	// Subscribe each input (the comprehension's `.map` runs `sub` per element);
 	// the resulting subscriptions are intentionally dropped.
-	let subscriptions = (source in sources => source.sub(|_| { derived.set(snapshot()); }));
+	let subscriptions = (source in sources => source.sub(|_| {
+		derived.set(snapshot());
+	}));
 	derived
 }
 

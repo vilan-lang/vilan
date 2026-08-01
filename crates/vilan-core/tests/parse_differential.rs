@@ -15,10 +15,15 @@
 //! The fmt tripwire converts the formatter's silent-no-op failure mode (§0: the
 //! re-lex-and-compare safety net turns `fmt` into a no-op when the token stream
 //! drifts, indistinguishable from an already-canonical file) into loud, external
-//! checks: `formatter_output_token_matches_input_over_the_corpus` guards against
-//! token-drifting output, and `formatter_never_silently_bails_over_the_corpus`
-//! (the E13 closing gate, live since 2026-07-22) asserts `fmt` never silently
-//! no-ops on a corpus file.
+//! checks: `formatter_output_token_matches_input` guards against token-drifting
+//! output, and `formatter_never_silently_bails` (the E13 closing gate, live
+//! since 2026-07-22) asserts `fmt` never silently no-ops.
+//!
+//! Both watch [`formattable_files`] — the corpus, std, the examples and the
+//! `vilan init` templates. They watched the CORPUS ALONE until 2026-08-01, and
+//! that gap is how five std files sat in a silent bail (backlog 47): the corpus
+//! is where regressions are deliberately planted, not where the language's own
+//! source lives.
 
 use std::path::{Path, PathBuf};
 use vilan_core::token::Token;
@@ -317,8 +322,46 @@ fn corpus_files() -> Vec<PathBuf> {
     files
 }
 
+/// Every `*.vl` the formatter is expected to handle faithfully: the regression
+/// corpus, the standard library, the examples, and the embedded `vilan init`
+/// templates.
+///
+/// The two tripwires below used to watch the CORPUS ALONE, and that is exactly
+/// how five std files sat in a silent bail long enough to be discovered by
+/// accident (backlog 47) — `browser/ui.vl`, `option.vl`, `process/ui.vl`,
+/// `reactive.vl`, `task.vl`, between them a `context` clause, a mapped type, a
+/// tuple comprehension, a tuple-arity bound, and a written `void` the printer
+/// dropped. Two of them are `formatter::idempotency` fixtures, whose fixed-point
+/// assertion a bailing file satisfies trivially, so the pins agreed with the
+/// silence. The corpus is where regressions are DESIGNED to land; it is not
+/// where the language's own source lives.
+fn formattable_files() -> Vec<PathBuf> {
+    let mut files = corpus_files();
+    collect_vl(&repo_vilan().join("std"), &mut files);
+    collect_vl(&repo_vilan().join("examples"), &mut files);
+    collect_vl(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vilan-cli/templates"),
+        &mut files,
+    );
+    files
+}
+
+/// A repo-relative label for a file in [`formattable_files`]. Base names are not
+/// unique across the roots (`std/src/browser/ui.vl` and `std/src/process/ui.vl`
+/// are both `ui.vl`), so a failure has to say which one.
+fn label(path: &Path) -> String {
+    let full = path.to_string_lossy().replace('\\', "/");
+    match full.rfind("/vilan/") {
+        Some(at) => full[at + 1..].to_string(),
+        None => match full.rfind("/crates/") {
+            Some(at) => full[at + 1..].to_string(),
+            None => full,
+        },
+    }
+}
+
 #[test]
-fn formatter_output_token_matches_input_over_the_corpus() {
+fn formatter_output_token_matches_input() {
     // The durable tripwire: whatever `format` returns for a corpus file, its token
     // stream must match the input's (unchanged output matches trivially; a
     // successful reprint matches by the formatter's contract). This catches any
@@ -332,10 +375,10 @@ fn formatter_output_token_matches_input_over_the_corpus() {
     // shared implementation) to confirm the difference is import order and
     // nothing else. That fallback leaves non-import tokens in place, so a genuine
     // non-import reordering still diverges and still fires this tripwire.
-    let files = corpus_files();
+    let files = formattable_files();
     assert!(
-        files.len() > 60,
-        "suspiciously few corpus files: {}",
+        files.len() > 150,
+        "suspiciously few formattable files: {}",
         files.len()
     );
     let mut mismatches: Vec<String> = Vec::new();
@@ -350,7 +393,7 @@ fn formatter_output_token_matches_input_over_the_corpus() {
         let (Some(input_tokens), Some(output_tokens)) =
             (normalized_tokens(&source), normalized_tokens(&output))
         else {
-            mismatches.push(format!("{} (did not lex)", path.display()));
+            mismatches.push(format!("{} (did not lex)", label(path)));
             continue;
         };
         if input_tokens == output_tokens {
@@ -359,7 +402,7 @@ fn formatter_output_token_matches_input_over_the_corpus() {
         // The streams differ: the only legitimate cause is import-run reordering.
         if formatter::sort_import_runs(&input_tokens) != formatter::sort_import_runs(&output_tokens)
         {
-            mismatches.push(format!("{}", path.display()));
+            mismatches.push(label(path));
         }
     }
     assert!(
@@ -382,15 +425,13 @@ fn formatter_output_token_matches_input_over_the_corpus() {
 /// (Verified: every flagged file returns BOTH inputs verbatim — `format(x)==x` —
 /// while controls strip the perturbation, the clean bail-vs-canonical signal.)
 fn current_bail_set() -> Vec<String> {
-    let mut bails: Vec<String> = corpus_files()
+    let mut bails: Vec<String> = formattable_files()
         .into_iter()
         .filter_map(|path| {
             let source = std::fs::read_to_string(&path).ok()?;
             let base = formatter::format(&source);
             let perturbed = formatter::format(&format!("{source}\n\n"));
-            (base != perturbed)
-                .then(|| path.file_name()?.to_str().map(str::to_string))
-                .flatten()
+            (base != perturbed).then(|| label(&path))
         })
         .collect();
     bails.sort();
@@ -417,7 +458,7 @@ fn current_bail_set() -> Vec<String> {
 /// corpus carries no such shape today (it was canonicalized), so this gate does
 /// not exercise the fix — `formatter::paren_groups` pins it per shape.
 #[test]
-fn formatter_never_silently_bails_over_the_corpus() {
+fn formatter_never_silently_bails() {
     let bails = current_bail_set();
     assert!(
         bails.is_empty(),

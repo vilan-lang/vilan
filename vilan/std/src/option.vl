@@ -1,15 +1,15 @@
 import pkg::compare::PartialEq;
 import pkg::default::Default;
-import pkg::operators::{ Lift, Try, Verdict };
 import pkg::io::panic;
-import pkg::result::Result::{ self, Ok, Err };
+import pkg::operators::{ Lift, Try, Verdict };
+import pkg::result::Result::{ Err, Ok, self };
 
 enum Option<T> {
 	Some(T),
 	None,
 }
 
-use Option::{ Some, None };
+use Option::{ None, Some };
 
 // `!` on an `Option`: `Some` is good; `None` is bad, its residual `void` (the
 // unit — the absence carries no information), rebuilt as `None` at the
