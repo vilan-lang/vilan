@@ -416,6 +416,19 @@ it, diagnostics beneath the editor.
   the shipped wasm.
 - **S4 — polish:** share-via-fragment, version badge, editor niceties.
   Each independently shippable after S3.
+  - **Format button — SHIPPED 2026-08-01 (dormant until the next release).**
+    `vilan-wasm` exports `format` (the CLI's `formatter::format` exactly:
+    canonical layout or the original bytes on a bail; two pins in
+    `tests/compile.rs`). The page feature-detects it: the worker imports the
+    glue as a NAMESPACE (a static named import of a missing export would fail
+    the whole module on an older glue) and reports `canFormat` in its ready
+    message; the button `show`s on it. Verified in-browser against a
+    next-built wasm (format + idempotence + bail-untouched + compile-after)
+    AND against the v0.18.2 release wasm (button hidden). Also shipped with
+    it, same website commit: the workbench column widened to 1880px (the
+    site's 1264 column stays everywhere else), and the styles example hoists
+    its view chain into a `let` so the formatter can split it (the
+    mount-argument shape is backlog 43's boundary, sidestepped).
 
 ## 9. Recorded future work (not planned)
 

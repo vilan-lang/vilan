@@ -270,6 +270,14 @@ pub fn compile_program(source: &str) -> CompileOutput {
     }
 }
 
+/// Formats one Vilan source string — the CLI's `vilan fmt` rule exactly
+/// (`formatter::format`): canonical layout when the reprint round-trips, the
+/// ORIGINAL bytes when it does not (the source does not parse, or the printer
+/// bails). Pure text work: no boot, no overlay, no platform.
+pub fn format_program(source: &str) -> String {
+    vilan_core::formatter::format(source)
+}
+
 /// The toolchain version this module was built from, for the page's badge.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -349,6 +357,14 @@ mod bindings {
                 })
                 .collect(),
         }
+    }
+
+    /// Formats Vilan source; the input comes back unchanged when it cannot be
+    /// safely reformatted. The page feature-detects this export, so a glue
+    /// built before it existed simply hides its Format button.
+    #[wasm_bindgen]
+    pub fn format(source: String) -> String {
+        crate::format_program(&source)
     }
 
     /// The toolchain version, for the page's badge.

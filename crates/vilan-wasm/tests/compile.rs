@@ -243,3 +243,30 @@ fn recompiling_identical_source_interns_the_entry_text() {
          not deduping"
     );
 }
+
+// --- format: the fmt button's contract ---------------------------------------
+
+#[test]
+fn a_misindented_program_formats_to_the_canonical_layout() {
+    let formatted = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
+    assert_eq!(
+        formatted, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
+        "format must canonicalize indentation the way `vilan fmt` does"
+    );
+    assert_eq!(
+        vilan_wasm::format_program(&formatted),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
+#[test]
+fn a_program_that_does_not_parse_formats_to_itself() {
+    let broken = "fun main( {\n   let a = ;\n";
+    assert_eq!(
+        vilan_wasm::format_program(broken),
+        broken,
+        "a bail must return the original bytes untouched — a file the \
+         formatter does not understand is not one to rewrite"
+    );
+}
