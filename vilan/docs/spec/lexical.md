@@ -192,7 +192,13 @@ Two token classes:
 characters. Consequently `<=`/`>=` lex as `<`/`>` followed by `=`, and the
 shift operators `<<`/`>>` are two adjacent control tokens; the parser
 accepts them as shifts only when **span-adjacent** (no whitespace):
-`a << b` is a shift, `a < < b` is a parse error (§3.7).
+`a << b` is a shift, `a < < b` is a parse error (§3.7). The element form
+(grammar spec, *atom*) reuses the same discipline: `</` and `/>` are
+span-adjacent pairs, `on:` joins by adjacency, and a hyphenated element
+or attribute name (`aria-label`, `my-widget`) is a span-adjacent
+name-`-`-name run — `data - id` is three tokens of arithmetic, not a
+name. The lexer itself is untouched by the element form: every token it
+produces already existed.
 
 ## 2.5 Trivia and token separation
 

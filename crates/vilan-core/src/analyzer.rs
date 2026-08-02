@@ -1204,6 +1204,11 @@ pub struct Analyzer<'src> {
     // `analyze`) so constraint resolution can attribute its diagnostics via
     // `source_of_id`. Moved into `Program.source_ranges` at the end.
     source_ranges: Vec<SourceRange>,
+    // Each analyzed file's text, keyed by its SourceId (element-syntax S4):
+    // lets a diagnostic inspect the source its span points into — the
+    // element-origin detectors read it. First entry wins; files this never
+    // covers simply get no source-inspecting note.
+    source_texts: Vec<(SourceId, &'src str)>,
     // Each named type reference in a type position (`Option`, `i32`, a trait
     // bound, ...): its file, name span, the definition it resolves to (when one
     // exists), and its type id (rendered to a hover label after `build`, once
@@ -1757,6 +1762,7 @@ impl<'src> Analyzer<'src> {
             current_source_id: SourceId(0),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
+            source_texts: Vec::new(),
             type_references: Vec::new(),
             external_functions: IndexMap::new(),
             constraints: Vec::new(),
@@ -2140,6 +2146,57 @@ impl<'src> Analyzer<'src> {
                         constraint_id,
                     ));
                 }
+            }
+        }
+        // --- The never-silent invariant (element-syntax S2's finding): ---
+        // --- a wired call whose member declares BOUNDED own generics   ---
+        // --- but recorded no binding for one would monomorphize to the ---
+        // --- trait's abstract (empty) member — a silent misrender the  ---
+        // --- loop above never sees, since it iterates what WAS         ---
+        // --- recorded. Make that state a diagnostic.                   ---
+        let wired_calls: Vec<(Id, Id)> = self
+            .function_calls
+            .iter()
+            .filter_map(|(&call_id, function_call)| {
+                match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(member_id)) => Some((call_id, *member_id)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (call_id, member_id) in wired_calls {
+            let Some((_, own_generics)) = self.method_signature(member_id) else {
+                continue;
+            };
+            for constraint_id in own_generics {
+                let bound_traits = self.generic_bound_traits(constraint_id);
+                if bound_traits.is_empty() {
+                    continue;
+                }
+                let recorded = self
+                    .method_call_substitution
+                    .get(&call_id)
+                    .is_some_and(|substitution| substitution.contains_key(&constraint_id));
+                if recorded {
+                    continue;
+                }
+                let generic_label =
+                    self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::new());
+                let bound_labels: Vec<String> = bound_traits
+                    .iter()
+                    .filter_map(|(trait_id, arguments)| {
+                        self.bound_trait_label(*trait_id, arguments)
+                    })
+                    .collect();
+                errors.push((
+                    **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                    format!(
+                        "cannot infer '{generic_label}' for this call; its bound ': {}' \
+                         cannot be checked",
+                        bound_labels.join(" + ")
+                    ),
+                    constraint_id,
+                ));
             }
         }
         // --- Construction sites: a struct literal or enum-variant call ---
@@ -11302,6 +11359,91 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The text of the file `source` points at, when this analysis registered
+    /// it (element-syntax S4). First match wins — the entry registers first.
+    fn source_text(&self, source: SourceId) -> Option<&'src str> {
+        self.source_texts
+            .iter()
+            .find(|(id, _)| *id == source)
+            .map(|(_, text)| *text)
+    }
+
+    /// Element syntax lowers to `std::ui::view` (element-syntax S4): an
+    /// unresolved `view` whose span is MARKUP — it starts with `<`, a span
+    /// only the element desugar produces for an accessor — gets the import
+    /// steer as a note. A hand-written `view` accessor's span is the ident.
+    fn element_view_import_note(&self, id: Id, name: &str) -> Option<Note> {
+        if name != "view" {
+            return None;
+        }
+        let span = **self.span_map.get(&id)?;
+        let source = self.source_of_id(id).unwrap_or(SourceId(0));
+        let text = self.source_text(source)?;
+        if !text.get(span.into_range())?.starts_with('<') {
+            return None;
+        }
+        Some(Note::here(
+            span,
+            "element syntax lowers to std::ui::view; add `import std::ui::{ view, View };`"
+                .to_string(),
+        ))
+    }
+
+    /// Element-syntax S4: `<div text("hi")>` — an undotted `text(…)` head item
+    /// is an ATTRIBUTE (it lowers to `.attr("text", …)` and sets a `text`
+    /// attribute), while the author almost certainly meant the `.text(…)`
+    /// content method — the one str-typed method the type system cannot catch
+    /// undotted. Element origin is detectable post-desugar because the lowered
+    /// name argument's span covers the UNQUOTED attribute name; a hand-written
+    /// `.attr("text", …)` argument is a quoted literal. Non-fatal — pushed to
+    /// `warnings`, like `[must_use]`.
+    fn check_element_attribute_shadowing(&mut self) {
+        let candidates: Vec<(Id, Id)> = self
+            .function_calls
+            .iter()
+            .filter_map(|(&call_id, call)| {
+                let member_id = match self.expr_id_to_expr_map.get(&call.subject_id) {
+                    Some(Expr::Local(member_id)) => *member_id,
+                    _ => return None,
+                };
+                if self.functions.get(&member_id)?.name != "attr" {
+                    return None;
+                }
+                // Arguments carry the receiver at index 0; the attribute name
+                // is index 1.
+                Some((call_id, call.argument_ids.get(1).copied()?))
+            })
+            .collect();
+        for (_, name_argument) in candidates {
+            if !matches!(
+                self.expr_id_to_expr_map.get(&name_argument),
+                Some(Expr::String("text"))
+            ) {
+                continue;
+            }
+            let span = **self.span_map.get(&name_argument).unwrap_or(&&EMPTY_SPAN);
+            let source = self.source_of_id(name_argument).unwrap_or(SourceId(0));
+            let unquoted = self
+                .source_text(source)
+                .and_then(|text| text.get(span.into_range()))
+                .is_some_and(|slice| !slice.starts_with('"'));
+            if !unquoted {
+                continue;
+            }
+            self.warnings.push(Error {
+                note: None,
+                span,
+                msg: concat!(
+                    "`text(…)` in an element head is an attribute; it lowers to ",
+                    "`.attr(\"text\", …)` and sets a `text` ATTRIBUTE. For text ",
+                    "content, write a child (`<p>\"hi\"</p>`) or the chain form `.text(…)`"
+                )
+                .to_string(),
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
     /// `[must_use]` (a warning): a call to a `must_use` function whose result is
     /// *dropped* — a bare statement in a block, its value discarded. Binding the
     /// result (`let s = …`, `let _ = …`, or passing it as an argument like
@@ -12121,6 +12263,11 @@ impl<'src> Analyzer<'src> {
             // Handled by the forwarding arm above; a `Const` node never
             // reaches the entity match.
             Node::Const(..) => unreachable!("`const` forwards to its inner expression"),
+            // Elements desugar to their view chains before analysis
+            // (elements::rewrite_items, at every lift site); one reaching the
+            // entity match is a pass bug, degraded like a parse error rather
+            // than panicking an analysis.
+            Node::Element(..) => Some(Expr::Error),
             Node::Error => Some(Expr::Error),
             Node::Void => Some(Expr::Void),
             Node::Null => Some(Expr::Null),
@@ -17730,13 +17877,26 @@ impl<'src> Analyzer<'src> {
                     if some_unbound
                         && (unresolved_closure_argument
                             || argument_ids.iter().any(|argument_id| {
-                                !matches!(
-                                    self.expr_id_to_expr_map.get(argument_id),
-                                    Some(Expr::Closure(_))
-                                ) && matches!(
-                                    self.infer_type(*argument_id, &Type::Unknown, &substitution),
-                                    Type::Unresolved
-                                )
+                                // An argument that IS an unknown closure
+                                // parameter defers too — the free-function
+                                // path's rule (`resolve_call_subject`): its
+                                // type lands when the closure's OWNING call
+                                // resolves. Resolving now binds nothing, the
+                                // bounded generic freezes abstract, and the
+                                // call monomorphizes to the trait's empty
+                                // member — the silent-stub misrender.
+                                self.is_unknown_closure_parameter(*argument_id)
+                                    || (!matches!(
+                                        self.expr_id_to_expr_map.get(argument_id),
+                                        Some(Expr::Closure(_))
+                                    ) && matches!(
+                                        self.infer_type(
+                                            *argument_id,
+                                            &Type::Unknown,
+                                            &substitution
+                                        ),
+                                        Type::Unresolved
+                                    ))
                             }))
                     {
                         return Resolution::Deferred;
@@ -19873,6 +20033,7 @@ impl<'src> Analyzer<'src> {
                             }
                         },
                     );
+                    let note = note.or_else(|| self.element_view_import_note(id, name));
                     self.diagnostics.push(Error {
                         note,
                         span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
@@ -22508,6 +22669,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     );
     let root: &'static crate::span::Spanned<NodeList<'static>> = match tree {
         Some(mut root) => {
+            crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked = &*Box::leak(Box::new(root));
             crate::leak_tally::record(
@@ -23727,6 +23889,9 @@ pub fn analyze<'src>(
     let mut sources: Vec<PathBuf> = vec![entry_path.to_path_buf()];
     let mut source_hashes: Vec<u64> = vec![crate::content_hash(entry_source)];
     let mut analyzer = Analyzer::new();
+    // The entry file's text, registered first so SourceId(0) always resolves
+    // (element-syntax S4 — the source-inspecting diagnostics read it).
+    analyzer.source_texts.push((SourceId(0), entry_source));
     // The std module inventory for the B4 import steer (module name, path) —
     // every layer's `*.vl` except the package surface itself. Recorded
     // eagerly (a cheap directory walk); parsed lazily, only if a resolution
@@ -24212,7 +24377,7 @@ pub fn analyze<'src>(
             // Use the entry's (buffer) AST for its own module; load the rest from
             // disk. The entry module keeps SourceId 0 so editor features resolve to
             // the open document.
-            let (ast, module_text, module_source_id): (&Spanned<NodeList>, &str, SourceId) =
+            let (ast, module_text, module_source_id): (&Spanned<NodeList>, &'src str, SourceId) =
                 if is_entry_module {
                     entry_is_module = true;
                     (nodes, entry_source, SourceId(0))
@@ -24234,6 +24399,7 @@ pub fn analyze<'src>(
                         SourceId((sources.len() - 1) as u32),
                     )
                 };
+            analyzer.source_texts.push((module_source_id, module_text));
             let module_scope = analyzer.create_scope(Some(global_scope_id));
             let module_scope_id = analyzer.push_scope(module_scope);
             let module_id = analyzer.new_entity_id();
@@ -24995,6 +25161,7 @@ pub fn analyze<'src>(
     analyzer.check_view_arguments();
     analyzer.check_view_value_reads();
     analyzer.check_must_use();
+    analyzer.check_element_attribute_shadowing();
     analyzer.check_view_escape();
     analyzer.check_invalidation();
     analyzer.check_reseat_escape();

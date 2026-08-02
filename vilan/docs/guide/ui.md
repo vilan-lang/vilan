@@ -34,7 +34,7 @@ view so you can keep going:
 
 - **Static content**: `.text(content)`, `.class(name)`,
   `.attr(name, value)`, `.styled(style)` (see [Styling](styling.md)).
-- **Structure**: `.child(view)`, `.children(views)`.
+- **Structure**: `.child(content)`, `.children(views)`.
 - **Events**: `.on(event, handler)`, or `.on_event(event, |e| …)` when
   you need the DOM event itself (`prevent_default`, `key()`, modifiers).
 - **Reactive bindings**: `.bind_text(signal)`, `.bind_class(signal)`,
@@ -42,6 +42,117 @@ view so you can keep going:
 
 Every `bind_*` sets the property now and re-sets it whenever the signal
 changes. There is no render loop to trigger.
+
+## Text children and mixed content
+
+`child` takes more than a `View`. Anything that can fill a child
+position works — the value's type decides what lands in the DOM:
+
+- a `View` appends as an element;
+- a `str` appends as a **text node**;
+- a `Signal<str>` appends as a text node kept in sync;
+- a `List<View>` appends every view, in order.
+
+Text nodes make mixed content direct: prose around an inline element is
+a run of siblings, not a pile of wrapper spans.
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+
+fun tip(): View {
+	view("p")
+		.child("Update any time with ")
+		.child(view("code").text("vilan upgrade"))
+		.child(".")
+}
+
+fun main() {
+	let _root = mount_root("app", || tip());
+}
+```
+
+`attr` is typed the same way: a `str` value sets once, a `Signal<str>`
+re-sets whenever it changes — `attr("href", signal)` and
+`bind_attr("href", signal)` are the same binding, chosen by type or by
+name. (`text` is unchanged: it still replaces everything the element
+contains, text nodes included, like the DOM's `textContent`.)
+
+## Element syntax
+
+The chain has a markup coat. An **element expression** is HTML-shaped
+sugar that lowers, before analysis, to exactly the chain you would have
+written — the same methods, in the same order, emitting the same code:
+
+```vilan,browser
+import std::reactive::Signal;
+import std::ui::{ View, mount_root, view };
+
+fun counter(): View {
+	let count = Signal::new(0);
+	<div>
+		<h2>"Counter"</h2>
+		<button on:click(|| count.set_with(|n| n + 1))>"+1"</button>
+		<p>{count.map(|n: i32| i"clicked {n} times")}</p>
+	</div>
+}
+
+fun main() {
+	let _root = mount_root("app", || counter());
+}
+```
+
+One rule governs the head — everything between `<tag` and `>`:
+
+- An **undotted** `name(value)` is an attribute: `.attr("name", value)`,
+  the value's type deciding static vs tracked as always. A bare name
+  (`disabled`) is a boolean attribute. Keyword and hyphenated names
+  (`type`, `aria-label`) are ordinary attribute names.
+- A **leading dot** is the chain, verbatim: `.styled(card)`,
+  `.bind_value(draft)`, `.show(flag)`, `.bind_each(rows, |r| r.id,
+  |r| row(r))`. Every `View` method works in head position — the dot is
+  what keeps attributes and methods from ever colliding, so a new
+  method can never change what existing markup means.
+- `on:click(handler)` is an event. A zero-parameter closure literal
+  lowers to `.on`, a one-parameter literal to `.on_event`; a named
+  one-parameter handler is written in chain form
+  (`.on_event("click", handler)`).
+
+Children — everything between `>` and `</tag>` — are nested elements,
+**quoted** strings (`i"…"` interpolation included), and `{expression}`
+holes; each lowers to `.child(…)` in written order. Text children are
+quoted because Vilan's lexer is context-free and stays that way — and
+the payoff is that interpolation, escapes, and expressions work in
+markup exactly as they do everywhere else. Bare text is a parse error
+that suggests the quoted form.
+
+An element is an ordinary expression: it nests in holes, sits in match
+arms, and takes postfix chains. The two forms mix freely —
+
+```vilan,browser
+import std::reactive::Signal;
+import std::ui::{ View, mount_root, view };
+
+fun panel(items: Signal<List<str>>, flag: Signal<bool>): View {
+	<section class("panel")>
+		<input placeholder("What needs doing?") />
+		<ul .bind_each(items, |t| t, |t| <li>{t}</li>) />
+		<p .show(flag)>"empty"</p>
+	</section>
+}
+
+fun main() {
+	let _root = mount_root("app", || panel(Signal::new(["alpha"]), Signal::new(false)));
+}
+```
+
+Components stay what they are — functions returning `View` — and are
+called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
+an `if` or `match` inside a hole runs once at build, exactly as it does
+in a chain; reactive structure is `.show`/`.when`/`.swap`/`.bind_each`
+in head position, and `Signal` values in slots. The sugar adds no
+semantics: `import std::ui::{ view, View }` is still required (the
+compiler points the way if it is missing), and everything this guide
+says about ownership, boundaries, and binding types applies unchanged.
 
 ## Components are just functions
 

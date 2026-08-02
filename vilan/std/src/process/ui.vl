@@ -34,6 +34,14 @@ struct Attribute {
 	value: str,
 }
 
+/// One child in an element's ordered child list — an element or a TEXT NODE.
+/// Text children make mixed content real: prose interleaves with inline
+/// elements as siblings, never through wrapper spans.
+enum Child {
+	Element(View),
+	Text(str),
+}
+
 /// A node under construction: an HTML element as a string tree. `View` carries
 /// no owner — nothing survives the request — and its mutable parts are `Shared`,
 /// so a `View` is a REFERENCE (like the browser's `Element`): chaining and
@@ -41,7 +49,7 @@ struct Attribute {
 struct View {
 	tag: str,
 	attributes: Shared<List<Attribute>>,
-	children: Shared<List<View>>,
+	children: Shared<List<Child>>,
 	text: Shared<str>,
 }
 
@@ -124,9 +132,11 @@ impl View {
 		self
 	}
 
-	/// A static attribute.
-	fun attr(self, name: str, value: str): View {
-		set_attribute(self.attributes, name, value);
+	/// An attribute. The value's TYPE decides its life
+	/// (proposal/element-syntax.md §5): a `str` sets once; a `Signal<str>` is
+	/// read once, exactly `bind_attr`. Anything `AttrValue` fills the slot.
+	fun attr<V: AttrValue>(self, name: str, value: V): View {
+		value.apply(self, name);
 		self
 	}
 
@@ -148,16 +158,19 @@ impl View {
 		self
 	}
 
-	/// Append a child view.
-	fun child(self, child: View): View {
-		self.children.write().push(child);
+	/// Append content. Anything `Slot` fills a child position
+	/// (proposal/element-syntax.md §5): a `View` appends as an element, a
+	/// `str` as a text node, a `Signal<str>` as a text node read once, a
+	/// `List<View>` appends each.
+	fun child<C: Slot>(self, content: C): View {
+		content.place(self);
 		self
 	}
 
 	/// Append several child views.
 	fun children(self, items: List<View>): View {
 		for item in items {
-			self.children.write().push(item);
+			self.children.write().push(Child::Element(item));
 		}
 		self
 	}
@@ -213,7 +226,7 @@ impl View {
 		let items: List<T> = source.get();
 		for item in items {
 			let owner = Owner::new();
-			self.children.write().push(run_with_owner(owner, || build(item)));
+			self.children.write().push(Child::Element(run_with_owner(owner, || build(item))));
 		}
 		self
 	}
@@ -224,7 +237,7 @@ impl View {
 	fun when(self, condition: Signal<bool>, body: (sync || View) context owner_scope): View {
 		if condition.get() {
 			let owner = Owner::new();
-			self.children.write().push(run_with_owner(owner, body));
+			self.children.write().push(Child::Element(run_with_owner(owner, body)));
 		}
 		self
 	}
@@ -238,7 +251,7 @@ impl View {
 	): View {
 		let value = source.get();
 		let owner = Owner::new();
-		self.children.write().push(run_with_owner(owner, || build(value)));
+		self.children.write().push(Child::Element(run_with_owner(owner, || build(value))));
 		self
 	}
 
@@ -249,6 +262,64 @@ impl View {
 			set_attribute(self.attributes, "hidden", "");
 		}
 		self
+	}
+}
+
+/// Something that can fill a child position (proposal/element-syntax.md §5) —
+/// the type-directed half of `child`: the value's type carries the
+/// static-vs-tracked distinction; on this twin every arm reads once.
+/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+trait Slot {
+	fun place(self, parent: View);
+}
+
+/// A child element.
+impl View with Slot {
+	fun place(self, parent: View) {
+		parent.children.write().push(Child::Element(self));
+	}
+}
+
+/// A static text node.
+impl str with Slot {
+	fun place(self, parent: View) {
+		parent.children.write().push(Child::Text(self));
+	}
+}
+
+/// A text node, read once — the value at render time is the value served.
+impl Signal<str> with Slot {
+	fun place(self, parent: View) {
+		parent.children.write().push(Child::Text(self.get()));
+	}
+}
+
+/// Several child elements, in order.
+impl List<View> with Slot {
+	fun place(self, parent: View) {
+		for item in self {
+			parent.children.write().push(Child::Element(item));
+		}
+	}
+}
+
+/// Something that can fill an attribute value (proposal/element-syntax.md §5).
+/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+trait AttrValue {
+	fun apply(self, parent: View, name: str);
+}
+
+/// Set once.
+impl str with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		set_attribute(parent.attributes, name, self);
+	}
+}
+
+/// Read once — exactly `bind_attr`.
+impl Signal<str> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		set_attribute(parent.attributes, name, self.get());
 	}
 }
 
@@ -299,7 +370,14 @@ fun render(view: View): str {
 	}
 	out = out + escape_text(view.text.read());
 	for child in view.children.read() {
-		out = out + render(child);
+		match child {
+			Child::Element(let element) => {
+				out = out + render(element);
+			},
+			Child::Text(let content) => {
+				out = out + escape_text(content);
+			},
+		}
 	}
 	out + "</" + view.tag + ">"
 }

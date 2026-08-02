@@ -1638,8 +1638,10 @@ fn parse_generated(source: &str) -> Result<(&'static NodeList<'static>, &'static
     }
     match tree {
         Some(mut root) => {
-            // Expansion output walks like any other tree — its bare-`?`
-            // marks become lift regions here (expression-lifting.md).
+            // Expansion output walks like any other tree — its elements
+            // desugar and its bare-`?` marks become lift regions here
+            // (element-syntax.md §4, expression-lifting.md).
+            crate::elements::rewrite_items(&mut root.0, source);
             crate::lift::rewrite_items(&mut root.0);
             let leaked: &'static crate::span::Spanned<NodeList<'static>> =
                 Box::leak(Box::new(root));

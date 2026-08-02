@@ -2196,9 +2196,11 @@ fn compile_to_js(
             let clean = errors.is_empty();
             parse_errors = errors;
             tree.filter(|_| clean).map(|(mut items, span)| {
-                // Bare-`?` marks become lift regions before analysis
-                // (expression-lifting.md); the cached path is lifted inside
-                // `parse_clean_cached`, so lift exactly once here.
+                // Elements desugar, then bare-`?` marks become lift regions,
+                // before analysis (element-syntax.md §4, expression-lifting.md);
+                // the cached path gets both inside `parse_clean_cached`, so
+                // each runs exactly once here.
+                vilan_core::elements::rewrite_items(&mut items, src.as_str());
                 vilan_core::lift::rewrite_items(&mut items);
                 (items, span)
             })

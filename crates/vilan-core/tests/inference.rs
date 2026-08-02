@@ -26061,13 +26061,21 @@ fn browser_view_routes_svg_tags_through_create_element_ns() {
     // B37's browser half, pinned at the codegen level: an svg-family tag
     // creates through `createElementNS` (an HTML-namespace `<svg>` renders
     // nothing), a plain tag through `createElement`, and the ambiguous tags
-    // (`a`, `title`, `style`, `script`) stay HTML.
+    // (`a`, `title`, `style`, `script`) stay HTML. Built under an owner:
+    // since element-syntax S1 widened `child`/`attr` over `Slot`/`AttrValue`,
+    // the browser twin's methods sit behind the `owner_scope` fence even for
+    // static slots (a trait-dispatched call carries the union of its impls'
+    // context needs), so the test uses the sanctioned boundary escape hatch.
     let js = compile_browser(
         r#"
+        import std::reactive::{ Owner, run_with_owner };
         import std::ui::{ view, View };
         fun main() {
-            let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
-            let _link = view("div").child(view("a").attr("href", "/"));
+            let owner = Owner::new();
+            let _built = run_with_owner(owner, || {
+                let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
+                view("div").child(view("a").attr("href", "/"))
+            });
         }
         main();
         "#,
@@ -26380,6 +26388,540 @@ fn ssr_nested_component_composition() {
         }
         "#,
         "<div><span class=\"badge\">new</span><span class=\"badge\">hot</span></div>\n",
+    );
+}
+
+#[test]
+fn ssr_child_interleaves_text_and_element_children() {
+    // Element-syntax S1 (proposal/element-syntax.md §5): `child` is
+    // `Slot`-typed — a `str` child is a TEXT NODE, a sibling of element
+    // children, in written order, escaped like any text.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("p")
+                .child("Take ")
+                .child(view("code").text("vilan upgrade"))
+                .child(" & <go>")));
+        }
+        "#,
+        "<p>Take <code>vilan upgrade</code> &amp; &lt;go&gt;</p>\n",
+    );
+}
+
+#[test]
+fn ssr_child_reads_a_signal_text_node_once() {
+    // The `Signal<str>` arm of `Slot`, read once — the value at render time is
+    // the value served, escaped as text.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("p").child("now: ").child(Signal::new("a & b"))));
+        }
+        "#,
+        "<p>now: a &amp; b</p>\n",
+    );
+}
+
+#[test]
+fn ssr_child_accepts_a_list_of_views() {
+    // The `List<View>` arm of `Slot`: one child position, every view, in order.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            let pair: List<View> = [view("i").text("a"), view("b").text("b")];
+            print(render(view("p").child(pair)));
+        }
+        "#,
+        "<p><i>a</i><b>b</b></p>\n",
+    );
+}
+
+#[test]
+fn ssr_attr_reads_a_signal_value_once() {
+    // The `Signal<str>` arm of `AttrValue` — `attr` with a signal is exactly
+    // `bind_attr`: read once here, tracked on the browser twin.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            print(render(view("a").attr("href", Signal::new("/x")).text("go")));
+        }
+        "#,
+        "<a href=\"/x\">go</a>\n",
+    );
+}
+
+#[test]
+fn ssr_text_replaces_text_node_children_too() {
+    // `text`'s replace-children semantics reach the new text nodes: it clears
+    // them exactly as it clears element children.
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::print;
+        fun main() {
+            print(render(view("p").child("gone").text("kept")));
+        }
+        "#,
+        "<p>kept</p>\n",
+    );
+}
+
+#[test]
+fn browser_text_children_ride_create_text_node() {
+    // The browser twin's `str` and `Signal<str>` `Slot` arms append real text
+    // nodes (`document.createTextNode`) — siblings of element children, never
+    // wrapper spans. The signal arm re-sets the node's own text on change.
+    let js = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                let status = Signal::new("ready");
+                view("p").child("state: ").child(status).child(view("b").text("!"))
+            });
+        }
+        main();
+        "#,
+    )
+    .expect("a clean browser compile");
+    assert!(
+        js.contains("document.createTextNode"),
+        "text children must create text nodes:\n{js}"
+    );
+}
+
+#[test]
+fn element_lowering_is_the_chain_byte_for_byte() {
+    // Element-syntax §4's contract at the strongest level: the desugar builds
+    // the very trees the chain parses to, so the emitted JS is byte-identical.
+    let element = r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let name = Signal::new("world");
+            let page = <p data-live(name) title("hi")>
+                "Take "
+                <code>"vilan upgrade"</code>
+                {name}
+            </p>;
+            print(render(page));
+        }
+        "#;
+    let chain = r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let name = Signal::new("world");
+            let page = view("p").attr("data-live", name).attr("title", "hi")
+                .child("Take ")
+                .child(view("code").child("vilan upgrade"))
+                .child(name);
+            print(render(page));
+        }
+        "#;
+    assert_eq!(
+        compile(element).expect("the element program compiles"),
+        compile(chain).expect("the chain program compiles"),
+        "the element lowering must emit the chain's exact JS"
+    );
+}
+
+#[test]
+fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
+    // The browser leg, and the `on:` table rows: a zero-parameter literal is
+    // `.on`, a one-parameter literal is `.on_event` — byte-identical to the
+    // chain spellings.
+    let element = r#"
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                view("div")
+                    .child(<button on:click(|| beep())>"go"</button>)
+                    .child(<a on:click(|e| e.prevent_default())>"stay"</a>)
+            });
+        }
+        fun beep() {}
+        main();
+        "#;
+    let chain = r#"
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            mount_root("app", || {
+                view("div")
+                    .child(view("button").on("click", || beep()).child("go"))
+                    .child(view("a").on_event("click", |e| e.prevent_default()).child("stay"))
+            });
+        }
+        fun beep() {}
+        main();
+        "#;
+    assert_eq!(
+        compile_browser(element).expect("the element program compiles"),
+        compile_browser(chain).expect("the chain program compiles"),
+        "the element event lowering must emit the chain's exact JS"
+    );
+}
+
+#[test]
+fn ssr_element_renders_mixed_content() {
+    // An element program end to end on the process twin: written-order
+    // attributes, escaped text children, a nested element.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            print(render(<p title("a & b")>
+                "Take "
+                <code>"vilan upgrade"</code>
+                " & <go>"
+            </p>));
+        }
+        "#,
+        "<p title=\"a &amp; b\">Take <code>vilan upgrade</code> &amp; &lt;go&gt;</p>\n",
+    );
+}
+
+#[test]
+fn an_element_without_view_in_scope_fails_at_the_element_head() {
+    // No auto-import: the desugared `view` accessor spans `<tag`, so the
+    // unresolved-name diagnostic underlines the element head the user wrote —
+    // and carries the import steer as a note (element-syntax S4).
+    assert_fails_spanning(
+        r#"
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "<div",
+        "cannot find 'view' in this scope",
+    );
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "cannot find 'view' in this scope",
+        "<div",
+        "element syntax lowers to std::ui::view",
+    );
+}
+
+#[test]
+fn an_element_text_attribute_warns_toward_the_content_method() {
+    // Element-syntax S4: `text(…)` undotted in a head is an attribute — the
+    // one str-typed method name the type system cannot catch. The warning
+    // fires on the element form only (the lowered name argument's span is the
+    // UNQUOTED attribute name).
+    let messages = warnings(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <div text("hi") />;
+        }
+        "#,
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`text(…)` in an element head is an attribute")),
+        "expected the element text-attribute warning, got {messages:?}"
+    );
+}
+
+#[test]
+fn a_hand_written_text_attr_does_not_warn() {
+    let messages = warnings(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = view("div").attr("text", "hi");
+        }
+        "#,
+    );
+    assert!(
+        messages.is_empty(),
+        "expected no warnings, got {messages:?}"
+    );
+}
+
+#[test]
+fn a_macro_generated_element_desugars() {
+    // parse_generated runs the element desugar too — markup emitted by a
+    // macro lowers like hand-written markup.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let banner = macro {
+                import macro_std::source;
+                source("<p>\"from a macro\"</p>")
+            };
+            print(render(banner));
+        }
+        "#,
+        "<p>from a macro</p>\n",
+    );
+}
+
+#[test]
+fn a_mismatched_closing_tag_names_the_expected_close() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <div>"x"</span>;
+        }
+        "#,
+        "</div>",
+    );
+}
+
+#[test]
+fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
+    // The silent-stub misrender (found by element-syntax S2's probe, general
+    // and pre-existing): a bound-generic METHOD call whose argument is an
+    // unannotated closure parameter resolved prematurely — the param was
+    // still Unknown, nothing was recorded in `method_call_substitution`, and
+    // the transformer monomorphized to the trait's empty abstract member.
+    // The method path now defers like the free-function path and retries
+    // once the closure's owning call lands the type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(dog: Dog, visit: |Dog| Kennel): Kennel {
+            visit(dog)
+        }
+        fun main() {
+            let direct = Kennel { log = "" }.hold(Dog { name = "rex" });
+            print(direct.log);
+            let via = apply(Dog { name = "rex" }, |d| Kennel { log = "" }.hold(d));
+            print(via.log);
+        }
+        "#,
+        "arf\narf\n",
+    );
+}
+
+#[test]
+fn bind_each_rows_dispatch_slot_children() {
+    // The same bug's std face, the one every real app hits: a row closure's
+    // `.child(t)` dropped the text (empty stub) while a literal child worked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        import std::ui::{ View, render, view };
+        fun main() {
+            let items: Signal<List<str>> = Signal::new(["alpha", "beta"]);
+            print(render(view("ul").bind_each(items, |t| t, |t| view("li").child(t))));
+        }
+        "#,
+        "<ul><li>alpha</li><li>beta</li></ul>\n",
+    );
+}
+
+#[test]
+fn a_closure_parameter_of_an_unimplemented_type_fails_the_bound() {
+    // The diagnostic hole the stub opened: with the param typed through the
+    // owning call, the bound audit must reject an argument type with no impl
+    // — this COMPILED CLEANLY and misrendered before the fix.
+    assert_fails_with(
+        r#"
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(n: i32, visit: |i32| Kennel): Kennel {
+            visit(n)
+        }
+        fun main() {
+            let _via = apply(5, |n| Kennel { log = "" }.hold(n));
+        }
+        "#,
+        "'i32' does not implement trait 'Speak'",
+    );
+}
+
+#[test]
+fn a_let_bound_closure_with_an_untypable_parameter_reports_honestly() {
+    // The one shape the deferral cannot finish: a let-bound closure whose
+    // parameter no owning call ever types. Before the fix this misrendered
+    // silently; now it is an honest unresolved-type diagnostic (annotating
+    // the parameter resolves it).
+    assert_fails_with(
+        r#"
+        import std::ui::{ View, render, view };
+        fun main() {
+            let wrap = |x| view("p").child(x);
+            let _page = render(wrap("later"));
+        }
+        "#,
+        "could not be resolved",
+    );
+}
+
+#[test]
+fn an_annotated_closure_parameter_dispatches_directly() {
+    // Regression fence: an ANNOTATED closure param was never broken (the body
+    // types immediately) — it must stay direct.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        struct Kennel {
+            log: str,
+        }
+        impl Kennel {
+            fun hold<C: Speak>(self, guest: C): Kennel {
+                Kennel { log = self.log + guest.speak() }
+            }
+        }
+        fun apply(dog: Dog, visit: |Dog| Kennel): Kennel {
+            visit(dog)
+        }
+        fun main() {
+            let via = apply(Dog { name = "rex" }, |d: Dog| Kennel { log = "" }.hold(d));
+            print(via.log);
+        }
+        "#,
+        "arf\n",
+    );
+}
+
+#[test]
+fn a_generic_free_function_dispatches_a_bound_on_a_closure_parameter() {
+    // Regression fence: the free-function path always had the fill-or-defer
+    // rule (`resolve_call_subject`); the method fix must not disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Speak {
+            fun speak(self): str;
+        }
+        struct Dog {
+            name: str,
+        }
+        impl Dog with Speak {
+            fun speak(self): str {
+                "arf"
+            }
+        }
+        fun greet<C: Speak>(guest: C): str {
+            guest.speak()
+        }
+        fun apply(dog: Dog, visit: |Dog| str): str {
+            visit(dog)
+        }
+        fun main() {
+            print(apply(Dog { name = "rex" }, |d| greet(d)));
+        }
+        "#,
+        "arf\n",
+    );
+}
+
+#[test]
+fn browser_static_child_outside_a_boundary_is_fenced() {
+    // The S1 widening's sharpened edge, pinned deliberately: a trait-dispatched
+    // call carries the union of its impls' context needs, so the browser twin's
+    // `child`/`attr` sit behind the `owner_scope` fence even for static slots.
+    // The documented model always said build UI under a root; the fence now
+    // reaches these two methods. (Per-instantiation context precision is the
+    // recorded follow-up — proposal/element-syntax.md §6.)
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("div").child(view("span"));
+        }
+        main();
+        "#,
+    )
+    .expect_err("the browser twin fences static child outside a boundary");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn child_of_an_unimplemented_type_names_the_slot_trait() {
+    // The widened bound's failure mode: the diagnostic names the trait and
+    // points at the bound, not a generic mismatch.
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("p").child(42);
+        }
+        "#,
+        "'i32' does not implement trait 'Slot'",
+    );
+}
+
+#[test]
+fn attr_of_an_unimplemented_type_names_the_attr_value_trait() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View };
+        fun main() {
+            let _x = view("p").attr("n", true);
+        }
+        "#,
+        "'bool' does not implement trait 'AttrValue'",
     );
 }
 

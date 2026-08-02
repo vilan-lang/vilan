@@ -7,6 +7,7 @@ pub mod async_infer;
 pub mod call_graph;
 pub mod const_eval;
 pub mod context;
+pub mod elements;
 pub mod error;
 pub mod formatter;
 pub mod git_dep;
@@ -243,6 +244,7 @@ pub fn parse_clean_cached(
         broken.lock().unwrap().insert(key);
         return None;
     };
+    elements::rewrite_items(&mut root.0, leaked);
     lift::rewrite_items(&mut root.0);
     let leaked_root: &'static Spanned<node::NodeList<'static>> = Box::leak(Box::new(root));
     leak_tally::record(
@@ -392,9 +394,11 @@ fn analyze_source_unfenced(
         }
     }
 
-    // Bare-`?` marks become lift regions before the tree freezes
-    // (expression-lifting.md) — the formatter parses separately and keeps
+    // Elements desugar to their view chains, then bare-`?` marks become lift
+    // regions, before the tree freezes (element-syntax.md §4,
+    // expression-lifting.md) — the formatter parses separately and keeps
     // raw trees, so source text prints back verbatim.
+    elements::rewrite_items(&mut root.0, source);
     lift::rewrite_items(&mut root.0);
     let root = Box::leak(Box::new(root));
     // The tally is a tree-proportional estimate — one `Spanned<Node>` of

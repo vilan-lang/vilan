@@ -793,6 +793,9 @@ pub enum TokenKind {
     Property,
     EnumMember,
     Macro,
+    /// A markup tag name (element-syntax S5) — rendered as the LSP `type`
+    /// token, the class-ish color themes give components and tags.
+    Tag,
 }
 
 /// Token-modifier bits, index-aligned with `TOKEN_MODIFIERS`.
@@ -803,7 +806,7 @@ pub const MODIFIER_READONLY: u32 = 1 << 1;
 pub const TOKEN_MODIFIERS: [&str; 2] = ["declaration", "readonly"];
 
 /// The LSP legend, index-aligned with `TokenKind`.
-pub const TOKEN_TYPES: [&str; 12] = [
+pub const TOKEN_TYPES: [&str; 13] = [
     "namespace",
     "struct",
     "enum",
@@ -816,6 +819,7 @@ pub const TOKEN_TYPES: [&str; 12] = [
     "property",
     "enumMember",
     "macro",
+    "type",
 ];
 
 /// One diagnostic as the language server publishes it: the file it belongs to
@@ -835,6 +839,62 @@ pub struct PublishedDiagnostic {
 /// The span of an entity, flattened from the `&Span` stored in `span_map`.
 fn span_of(program: &Program, id: Id) -> Option<Span> {
     program.span_map.get(&id).map(|span| **span)
+}
+
+/// The markup spans of a raw parse (element-syntax S5): tag names (open and
+/// close), attribute and event names, and the desugar-scaffolding spans whose
+/// analyzed tokens the markup replaces.
+#[derive(Default)]
+struct MarkupSpans {
+    scaffolding: Vec<Span>,
+    tags: Vec<Span>,
+    attributes: Vec<Span>,
+}
+
+fn collect_markup_spans(
+    node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    out: &mut MarkupSpans,
+) {
+    use vilan_core::node::{ElementHeadItem, Node};
+    if let Node::Element(body) = &node.0 {
+        out.scaffolding.push((node.1.start..body.tag.end).into());
+        out.tags.push(body.tag);
+        if let Some(close) = body.close_tag {
+            out.tags.push(close);
+        }
+        for item in &body.head {
+            match item {
+                ElementHeadItem::Attribute(name, _) => out.attributes.push(*name),
+                ElementHeadItem::Event((_, name_span), _) => out.attributes.push(*name_span),
+                ElementHeadItem::Chain(_) => {}
+            }
+        }
+    }
+    node.0
+        .for_each_child(&mut |child| collect_markup_spans(child, out));
+}
+
+/// The innermost element whose open or close TAG NAME contains `offset`,
+/// as (open, close) spans — `None` when the cursor is elsewhere or the
+/// element is self-closing. Children visit after their parent, so the last
+/// hit is the innermost.
+fn find_linked_tags(
+    node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
+    offset: usize,
+    out: &mut Option<(Span, Span)>,
+) {
+    use vilan_core::node::Node;
+    if let Node::Element(body) = &node.0 {
+        if let Some(close) = body.close_tag {
+            let open = body.tag;
+            let touches = |span: Span| span.start <= offset && offset <= span.end;
+            if touches(open) || touches(close) {
+                *out = Some((open, close));
+            }
+        }
+    }
+    node.0
+        .for_each_child(&mut |child| find_linked_tags(child, offset, out));
 }
 
 /// Whether an expression is a value-position use of the definition `def_id` — the
@@ -1278,6 +1338,21 @@ impl Document {
     /// declaration's leading `//` comment as prose, and the platform
     /// requirement line where one is inferred. Anything else keeps its
     /// rendered type.
+    /// The matching-tag pair at `offset` (element-syntax S5): the open and
+    /// close tag-name spans of the innermost element whose open or close name
+    /// the cursor touches — the linked-editing nicety, so renaming one tag
+    /// renames the other. Raw-parsed per request, like `keyword_hover`'s lex:
+    /// cheap, and independent of analysis succeeding.
+    pub fn linked_tag_ranges(&self, offset: usize) -> Option<(Span, Span)> {
+        let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
+        let root = tree?;
+        let mut found: Option<(Span, Span)> = None;
+        for item in &root.0 {
+            find_linked_tags(item, offset, &mut found);
+        }
+        found
+    }
+
     pub fn hover(&self, offset: usize) -> Option<String> {
         // A keyword under the cursor: its one-line meaning + a book link. This
         // is purely lexical, so it works even when analysis produced no program
@@ -1850,6 +1925,38 @@ impl Document {
             };
             tokens.push((*span, kind, 0));
         }
+        // Markup (element-syntax S5): tags and attribute names come from a
+        // RAW parse — the desugar retires `Node::Element` before analysis, so
+        // the analyzed program has no entity for a tag and the closing tag
+        // has no node at all. The `view` scaffolding accessor keeps its wide
+        // `<tag` span for the missing-import note, so its Function token is
+        // suppressed here and the tag painted from the markup itself. (A
+        // per-request parse is the `keyword_hover` pattern: cheap, and
+        // independent of analysis succeeding.)
+        {
+            let mut markup = MarkupSpans::default();
+            let (tree, _errors) = vilan_core::parsing::parse(self.analyzed_text());
+            if let Some(root) = &tree {
+                for item in &root.0 {
+                    collect_markup_spans(item, &mut markup);
+                }
+            }
+            if !markup.scaffolding.is_empty() {
+                let scaffolding: std::collections::HashSet<(usize, usize)> = markup
+                    .scaffolding
+                    .iter()
+                    .map(|span| (span.start, span.end))
+                    .collect();
+                tokens.retain(|(span, _, _)| !scaffolding.contains(&(span.start, span.end)));
+            }
+            for span in markup.tags {
+                tokens.push((span, TokenKind::Tag, 0));
+            }
+            for span in markup.attributes {
+                tokens.push((span, TokenKind::Property, 0));
+            }
+        }
+
         // Sort and drop overlaps: narrowest-first at each start, then keep
         // strictly non-overlapping tokens (the LSP requires it).
         tokens.sort_by_key(|(span, _, _)| {
@@ -3960,6 +4067,76 @@ pub(crate) mod tests {
         // A member CALL is a method (the same `.name` shape as the property
         // read above — only semantics can split them).
         assert_eq!(kind_of("abs", 0), Some(TokenKind::Method), "{tokens:?}");
+    }
+
+    #[test]
+    fn semantic_tokens_paint_markup() {
+        // Element-syntax S5: tags (open AND close) paint as Tag, attribute and
+        // event names as Property, and the desugar's `<tag` scaffolding token
+        // is suppressed. The fixture builds UI outside a boundary, so analysis
+        // reports the owner fence — tokens are computed regardless, which is
+        // itself the salvage property the markup pass relies on.
+        let text = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div aria-label(\"x\")>\"hi\" <span/></div>\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
+            let mut start = 0;
+            let mut position = None;
+            for _ in 0..=occurrence {
+                position = text[start..].find(snippet).map(|at| start + at);
+                start = position? + 1;
+            }
+            let at = position?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + snippet.len()
+                })
+                .map(|(_, kind, _)| *kind)
+        };
+        // `div` appears in the import line? No — occurrence 0 is the open tag.
+        assert_eq!(kind_of("div", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("div", 1), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(kind_of("span", 0), Some(TokenKind::Tag), "{tokens:?}");
+        assert_eq!(
+            kind_of("aria-label", 0),
+            Some(TokenKind::Property),
+            "{tokens:?}"
+        );
+        // The `<div` scaffolding Function token is suppressed.
+        assert_eq!(kind_of("<div", 0), None, "{tokens:?}");
+        // The invariant the sweep guarantees, re-checked over markup.
+        let mut last_end = 0usize;
+        for (span, _, _) in &tokens {
+            let range = span.into_range();
+            assert!(
+                range.start >= last_end && range.end > range.start,
+                "{tokens:?}"
+            );
+            last_end = range.end;
+        }
+    }
+
+    #[test]
+    fn linked_tag_ranges_pair_open_and_close() {
+        let text =
+            "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div>\"hi\"</div>\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let open_at = text.find("<div").expect("fixture") + 1;
+        let (open, close) = document.linked_tag_ranges(open_at).expect("a pair");
+        assert_eq!(&text[open.into_range()], "div");
+        assert_eq!(&text[close.into_range()], "div");
+        assert!(close.start > open.end);
+        // From inside the CLOSING tag, the same pair.
+        let close_at = close.start + 1;
+        assert_eq!(document.linked_tag_ranges(close_at), Some((open, close)));
+        // A self-closing element has no pair; elsewhere in the file, none.
+        let solo = "import std::ui::{ view, View };\n\nfun page(): View {\n\t<div />\n}\n";
+        let document = Document::analyze(solo, &std_root(), Path::new("test.vl"));
+        let at = solo.find("<div").expect("fixture") + 1;
+        assert_eq!(document.linked_tag_ranges(at), None);
+        assert_eq!(document.linked_tag_ranges(0), None);
     }
 
     #[test]

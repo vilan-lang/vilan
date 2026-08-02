@@ -13,6 +13,7 @@ external struct Element;
 fun get_element_by_id(id: str): Element
 fun create_element(tag: str): Element
 fun create_element_ns(namespace: str, tag: str): Element   // createElementNS
+fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
 
@@ -22,6 +23,7 @@ impl Element {
 	fun set_attribute(self, name: str, value: str)
 	fun set_style_property(self, name: str, value: str) // style.setProperty (CSS custom props)
 	fun append(self, child: Element)
+	fun append_text(self, child: Text)                 // appendChild, text-node overload
 	fun remove(self)                                   // detach from the document
 	fun clear(self)                                    // remove every child
 	fun set_hidden(self, hidden: bool)
@@ -29,6 +31,11 @@ impl Element {
 	fun set_value(self, value: str)
 	fun on(self, event: str, handler: || void)
 	fun on_event(self, event: str, handler: |Event| void)
+}
+
+external struct Text;                // a text node — text only, no attributes
+impl Text {
+	fun set_text(self, text: str)                      // textContent =
 }
 
 external struct Event;
@@ -53,6 +60,9 @@ struct View { element: Element }
 fun view(tag: str): View
 fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (|| View) context owner_scope): Owner
+
+trait Slot { fun place(self, parent: View) }          // View | str | Signal<str> | List<View>
+trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Signal<str>
 ```
 
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
@@ -74,11 +84,11 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: str): View` | static attribute |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `Signal<str>` tracks |
 | `style_var` | `(name: str, source: Signal<str>): View` | reactive CSS custom property |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
-| `child` | `(child: View): View` | append one |
+| `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`Signal<str>`), or `List<View>` |
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: Signal<str>): View` | reactive text |
 | `bind_class` | `(source: Signal<str>): View` | reactive class |

@@ -2183,6 +2183,157 @@ impl<'src> Printer<'src> {
     /// a chain breaks with its links one level past the element. The measured
     /// line includes the element's comma — unlike a link's terminator, the comma
     /// is printed by the list itself, onto the element's own line.
+    /// Prints an element expression canonically (element-syntax S3). Inline —
+    /// `<h2>"Todos"</h2>` — when the children are at most one non-element
+    /// child and the rendering stays on its line within budget; otherwise the
+    /// children take one line each at +1, `</tag>` back at the element's
+    /// indent. A head too wide for the tag line breaks one item per line with
+    /// `>` / `/>` at the element's indent (the signature-layout shape).
+    /// Self-closing tags space before the slash: `<div />`, never `<div/>`.
+    fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
+        let must_split = body.children.len() > 1
+            || body
+                .children
+                .first()
+                .is_some_and(|child| matches!(child.node().0, Node::Element(_)));
+        if !must_split {
+            let element_start = self.out.len();
+            let comment_cursor = self.cursor;
+            self.print_element_inline(body);
+            if !self.out[element_start..].contains('\n') && !self.current_line_over_budget() {
+                return;
+            }
+            self.out.truncate(element_start);
+            self.cursor = comment_cursor;
+        }
+        self.print_element_split(body);
+    }
+
+    fn print_element_inline(&mut self, body: &crate::node::ElementBody<'src>) {
+        self.out.push('<');
+        self.out.push_str(&self.source[body.tag.into_range()]);
+        for item in &body.head {
+            self.out.push(' ');
+            self.print_element_head_item(item);
+        }
+        if body.self_closing {
+            self.out.push_str(" />");
+            return;
+        }
+        self.out.push('>');
+        for (index, child) in body.children.iter().enumerate() {
+            if index > 0 {
+                self.out.push(' ');
+            }
+            self.print_element_child(child);
+        }
+        self.out.push_str("</");
+        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push('>');
+    }
+
+    fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>) {
+        // The head: on the tag line while it fits; one item per line otherwise,
+        // measured by rendering it and looking, like every width decision.
+        let head_start = self.out.len();
+        let comment_cursor = self.cursor;
+        self.out.push('<');
+        self.out.push_str(&self.source[body.tag.into_range()]);
+        for item in &body.head {
+            self.out.push(' ');
+            self.print_element_head_item(item);
+        }
+        let head_spans = self.out[head_start..].contains('\n') || self.current_line_over_budget();
+        let split_head = head_spans && !body.head.is_empty();
+        if split_head {
+            self.out.truncate(head_start);
+            self.cursor = comment_cursor;
+            self.out.push('<');
+            self.out.push_str(&self.source[body.tag.into_range()]);
+            self.indent += 1;
+            for item in &body.head {
+                let item_start = self.out.len();
+                let item_cursor = self.cursor;
+                self.line();
+                let line_start = self.out.len();
+                self.print_element_head_item(item);
+                if self.over_line_budget(line_start) {
+                    self.out.truncate(item_start);
+                    self.cursor = item_cursor;
+                    self.line();
+                    self.split = Split::Tail;
+                    self.print_element_head_item(item);
+                }
+            }
+            self.indent -= 1;
+            self.line();
+        }
+        if body.self_closing {
+            if split_head {
+                self.out.push_str("/>");
+            } else {
+                self.out.push_str(" />");
+            }
+            return;
+        }
+        self.out.push('>');
+        self.indent += 1;
+        for child in &body.children {
+            let child_start = self.out.len();
+            let child_cursor = self.cursor;
+            self.line();
+            let line_start = self.out.len();
+            self.print_element_child(child);
+            if self.over_line_budget(line_start) {
+                self.out.truncate(child_start);
+                self.cursor = child_cursor;
+                self.line();
+                self.split = Split::Tail;
+                self.print_element_child(child);
+            }
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push_str("</");
+        self.out.push_str(&self.source[body.tag.into_range()]);
+        self.out.push('>');
+    }
+
+    fn print_element_head_item(&mut self, item: &crate::node::ElementHeadItem<'src>) {
+        match item {
+            crate::node::ElementHeadItem::Chain(link) => {
+                self.out.push('.');
+                self.print_expr(link);
+            }
+            crate::node::ElementHeadItem::Event((name, _), handler) => {
+                self.out.push_str("on:");
+                self.out.push_str(name);
+                self.out.push('(');
+                self.print_expr(handler);
+                self.out.push(')');
+            }
+            crate::node::ElementHeadItem::Attribute(name, value) => {
+                self.out.push_str(&self.source[name.into_range()]);
+                if let Some(value) = value {
+                    self.out.push('(');
+                    self.print_expr(value);
+                    self.out.push(')');
+                }
+            }
+        }
+    }
+
+    fn print_element_child(&mut self, child: &crate::node::ElementChild<'src>) {
+        match child {
+            crate::node::ElementChild::Hole(inner) => {
+                self.out.push('{');
+                self.print_expr(inner);
+                self.out.push('}');
+            }
+            crate::node::ElementChild::Bare(inner) => self.print_expr(inner),
+        }
+    }
+
     fn print_split_list(&mut self, elements: &[Spanned<Node<'src>>], open: usize) {
         self.out.push('[');
         self.indent += 1;
@@ -3032,6 +3183,7 @@ impl<'src> Printer<'src> {
                 self.print_expr(body);
                 self.out.push(')');
             }
+            Node::Element(body) => self.print_element(body),
             _ => self.bailed = true,
         }
     }
@@ -5907,6 +6059,102 @@ mod signature_layout {
                       }\n";
         assert_over_budget(source.lines().nth(1).unwrap());
         assert_construct(source, source);
+    }
+}
+
+#[cfg(test)]
+mod element_layout {
+    use super::bailing_constructs::assert_construct;
+    use super::chain_splitting::assert_over_budget;
+
+    #[test]
+    fn a_self_closing_element_spaces_before_the_slash() {
+        assert_construct(
+            "fun demo(): View {\n\t<div/>\n}\n",
+            "fun demo(): View {\n\t<div />\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_single_string_child_stays_inline() {
+        assert_construct(
+            "fun demo(): View {\n\t<h2>\"Todos\"</h2>\n}\n",
+            "fun demo(): View {\n\t<h2>\"Todos\"</h2>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_single_hole_child_stays_inline_and_keeps_its_braces() {
+        // `{\"x\"}` and `\"x\"` differ in tokens, so the braces are structural
+        // (ElementChild::Hole), never inferred from the text.
+        assert_construct(
+            "fun demo(): View {\n\t<li class(\"item\")>{ label }</li>\n}\n",
+            "fun demo(): View {\n\t<li class(\"item\")>{label}</li>\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_element_child_splits_one_per_line() {
+        assert_construct(
+            "fun demo(): View {\n\t<div><span/></div>\n}\n",
+            "fun demo(): View {\n\t<div>\n\t\t<span />\n\t</div>\n}\n",
+        );
+    }
+
+    #[test]
+    fn mixed_content_splits_one_child_per_line() {
+        assert_construct(
+            "fun demo(): View {\n\t<p .styled(lead)>\"Take \" <code>\"vilan upgrade\"</code> \".\"</p>\n}\n",
+            "fun demo(): View {\n\t<p .styled(lead)>\n\t\t\"Take \"\n\t\t<code>\"vilan upgrade\"</code>\n\t\t\".\"\n\t</p>\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_over_budget_head_splits_one_item_per_line() {
+        let source = "fun demo(): View {\n\t<input placeholder(\"What needs doing?\") disabled aria-label(\"A long label here to push the head far past the hundred column budget\") />\n}\n";
+        assert_over_budget(source.lines().nth(1).unwrap());
+        assert_construct(
+            source,
+            "fun demo(): View {\n\t<input\n\t\tplaceholder(\"What needs doing?\")\n\t\tdisabled\n\t\taria-label(\"A long label here to push the head far past the hundred column budget\")\n\t/>\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_open_empty_element_keeps_its_form() {
+        // `<div></div>` and `<div />` differ in TOKENS — the re-lex net forbids
+        // converting one to the other; each form round-trips as written.
+        assert_construct(
+            "fun demo(): View {\n\t<div></div>\n}\n",
+            "fun demo(): View {\n\t<div></div>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_an_element_moves_below_the_statement() {
+        // The chain/list/struct precedent: comments flush at statement
+        // boundaries, so one written inside markup relocates below.
+        assert_construct(
+            "fun demo(): View {\n\t<div>\n\t\t// a note\n\t\t<span/>\n\t</div>\n}\n",
+            "fun demo(): View {\n\t<div>\n\t\t<span />\n\t</div>\n\t// a note\n}\n",
+        );
+    }
+
+    #[test]
+    fn an_element_subject_chain_glues_links_after_the_closing_tag() {
+        // A multi-line element as a chain subject keeps its own layout; links
+        // within budget continue on the closing tag's line.
+        assert_construct(
+            "fun demo(): View {\n\t<div><span/></div>.show(f).hide(g)\n}\n",
+            "fun demo(): View {\n\t<div>\n\t\t<span />\n\t</div>.show(f).hide(g)\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_chain_link_holding_an_inline_element_stays_inline() {
+        assert_construct(
+            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+        );
     }
 }
 

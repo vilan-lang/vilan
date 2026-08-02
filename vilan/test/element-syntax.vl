@@ -1,0 +1,43 @@
+import std::print;
+import std::reactive::Signal;
+import std::ui::{ View, render, view };
+
+// Element syntax (proposal/element-syntax.md, S2): markup sugar lowering to
+// the view chain in the pre-analysis desugar. This program and its golden pin
+// the lowering through the corpus byte-gate; the inference pins prove the
+// emitted JS byte-identical to the hand-written chain's.
+
+fun row(label: str): View {
+	<li class("item")>{label}</li>
+}
+
+fun main() {
+	// Mixed content: attributes in written order, text children — plain,
+	// interpolation-bearing, signal-read-once — interleaved with elements.
+	let name = Signal::new("world & <you>");
+	print(render(<p data-live(name) title("hi")>
+		"Take "
+		<code>"vilan upgrade"</code>
+		" & enjoy. "
+		{name}
+	</p>));
+
+	// Keyword and hyphenated attribute names; a bare boolean attribute; a
+	// void element, self-closing with the conventional space.
+	print(render(<input type("checkbox") disabled aria-label("Done") />));
+
+	// Components are calls in holes.
+	print(render(<ul>
+		{row("alpha")}
+		{row("beta")}
+	</ul>));
+
+	// The SVG rules are view()'s: the root serializes with its namespace.
+	print(render(<svg viewBox("0 0 24 24")>
+		<path d("M5 12h14") />
+	</svg>));
+
+	// An element is an expression: postfix chains hang off it.
+	print(render(<div />.child(<span>"chained"</span>)));
+}
+main();

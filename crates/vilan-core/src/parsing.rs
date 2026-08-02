@@ -43,9 +43,9 @@
 
 use crate::lexing;
 use crate::node::{
-    BinaryOp, Closure, Convention, EnumVariant, ExternBinding, Func, GenericArguments,
-    GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node, NodeIfBranch, NodeList,
-    Parameter, Pattern, StructField, TupleBound,
+    BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
+    ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
+    MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -1582,6 +1582,21 @@ impl<'a, 'src> Parser<'a, 'src> {
             self.bump();
             return Some((node, span));
         }
+        // An element expression `<div …>` (proposal/element-syntax.md §3): `<`
+        // begins no other expression, so atom-position `<` followed by a name
+        // is markup. The attempt keeps a garbled element's notes (the farthest
+        // failure survives backtracking) while the cursor rolls back for the
+        // balanced `<…>` head recovery below.
+        if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+            if let Some(element) = self.attempt(Self::parse_element) {
+                return Some(element);
+            }
+            if let Some(span) =
+                self.recover_delimited("element", '<', '>', &[('(', ')'), ('[', ']'), ('{', '}')])
+            {
+                return Some((Node::Error, span));
+            }
+        }
         if self.peek_is_ctrl('[') {
             if let Some(list) = self.parse_bracket_atom() {
                 return Some(list);
@@ -1697,6 +1712,239 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }
             }
         })
+    }
+
+    // --- Elements (proposal/element-syntax.md) -------------------------------
+
+    /// True when the token at `offset` can begin an element or attribute NAME:
+    /// an identifier, any keyword (`type`, `for` — ordinary HTML attribute
+    /// names), or a bool literal. Everything carrying punctuation or a value
+    /// shape is excluded.
+    fn peek_at_is_name(&self, offset: usize) -> bool {
+        !matches!(
+            self.peek_at(offset),
+            None | Some(
+                Token::Ctrl(_)
+                    | Token::Op(_)
+                    | Token::String(_)
+                    | Token::MultilineString(_)
+                    | Token::Number(..)
+            )
+        )
+    }
+
+    /// True when the tokens at `first`/`second` (offsets from the cursor) touch
+    /// — the span-adjacency test `<<`/`>>` reassembly uses, generalized.
+    fn tokens_adjacent(&self, first: usize, second: usize) -> bool {
+        match (
+            self.tokens.get(self.position + first),
+            self.tokens.get(self.position + second),
+        ) {
+            (Some(a), Some(b)) => a.1.end == b.1.start,
+            _ => false,
+        }
+    }
+
+    fn peek_at_is_op(&self, offset: usize, symbol: &str) -> bool {
+        matches!(self.peek_at(offset), Some(Token::Op(found)) if *found == symbol)
+    }
+
+    /// A (possibly hyphenated) element NAME — `div`, `type`, `aria-label`,
+    /// `my-widget`: a name token, then any number of SPAN-ADJACENT `-`-name
+    /// joints (`data - id` is two names and an operator, not a name). Returns
+    /// the name's span and its token range; the TEXT is sliced at desugar time
+    /// — the parser has no source access, and keyword tokens carry none.
+    fn parse_element_name(&mut self) -> Option<(Span, std::ops::Range<usize>)> {
+        if !self.peek_at_is_name(0) {
+            return None;
+        }
+        let start_index = self.position;
+        let start_span = self.here_span();
+        self.bump();
+        let mut end = start_span.end;
+        while matches!(self.peek(), Some(Token::Op("-")))
+            && self.tokens_adjacent(0, 1)
+            && self.peek_at_is_name(1)
+            && self.tokens[self.position].1.start == end
+        {
+            end = self.tokens[self.position + 1].1.end;
+            self.bump();
+            self.bump();
+        }
+        Some(((start_span.start..end).into(), start_index..self.position))
+    }
+
+    /// A name's text, rebuilt from its tokens (for diagnostics only — the tree
+    /// stores spans and the desugar slices the source).
+    fn element_name_text(&self, range: &std::ops::Range<usize>) -> String {
+        self.tokens[range.clone()]
+            .iter()
+            .map(|(token, _)| token.to_string())
+            .collect()
+    }
+
+    /// An element expression: `<tag head-items… />` or
+    /// `<tag head-items…> children… </tag>`. Committed once `<` + a name is
+    /// seen; the caller wraps the whole parse in `attempt`, so a decline here
+    /// leaves only its farthest-failure note behind.
+    fn parse_element(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        self.expect_ctrl('<')?;
+        let (tag, tag_tokens) = self.parse_element_name()?;
+        let mut head = Vec::new();
+        let children = loop {
+            // `/>` — self-closing (span-adjacent, like `<<`).
+            if self.peek_is_op("/") && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1) {
+                self.bump();
+                self.bump();
+                break (Vec::new(), true, None);
+            }
+            if self.eat_ctrl('>') {
+                let (children, close_tag) = self.parse_element_children(&tag_tokens)?;
+                break (children, false, Some(close_tag));
+            }
+            if self.at_end() {
+                self.note_expected("`>` or `/>`");
+                return None;
+            }
+            head.push(self.parse_element_head_item()?);
+        };
+        let (children, self_closing, close_tag) = children;
+        let body = ElementBody {
+            tag,
+            head,
+            children,
+            self_closing,
+            close_tag,
+        };
+        Some((Node::Element(body), self.span_from(start)))
+    }
+
+    /// One head item: a `.method(…)` chain link, an `on:event(handler)`, an
+    /// attribute `name(value)`, or a bare boolean attribute `name`
+    /// (proposal/element-syntax.md §2 — the dot is the disambiguator, so the
+    /// grammar never consults any method list).
+    fn parse_element_head_item(&mut self) -> Option<ElementHeadItem<'src>> {
+        // Chain form — the link node exactly as a written chain builds it.
+        if self.peek_is_ctrl('.') {
+            self.bump();
+            let link = self.parse_member_call()?;
+            return Some(ElementHeadItem::Chain(link));
+        }
+        // Event form — `on`, an adjacent `:`, an adjacent event name.
+        if matches!(self.peek(), Some(Token::Ident("on")))
+            && self.peek_at_is_op(1, ":")
+            && self.tokens_adjacent(0, 1)
+            && matches!(self.peek_at(2), Some(Token::Ident(_)))
+            && self.tokens_adjacent(1, 2)
+        {
+            self.bump();
+            self.bump();
+            let event_span = self.here_span();
+            let Some(Token::Ident(event)) = self.peek() else {
+                unreachable!("guarded above");
+            };
+            let event = *event;
+            self.bump();
+            self.expect_ctrl('(')?;
+            let handler = self.parse_expression()?;
+            self.expect_ctrl(')')?;
+            return Some(ElementHeadItem::Event(
+                (event, event_span),
+                Box::new(handler),
+            ));
+        }
+        // Attribute form.
+        let Some((name, _)) = self.parse_element_name() else {
+            self.note_expected("an attribute, a `.method(…)` link, or `>`");
+            return None;
+        };
+        if !self.peek_is_ctrl('(') {
+            return Some(ElementHeadItem::Attribute(name, None));
+        }
+        self.bump();
+        let value = self.parse_expression()?;
+        if self.peek_is_ctrl(',') {
+            self.note_expected("`)` (an attribute takes one value; a chain link starts with `.`)");
+            return None;
+        }
+        self.expect_ctrl(')')?;
+        Some(ElementHeadItem::Attribute(name, Some(value)))
+    }
+
+    /// Children up to the matching `</tag>`: nested elements, quoted strings
+    /// (an i-string arrives as its lexed paren group), and `{expression}`
+    /// holes. Bare text is a parse error that teaches the quoted form.
+    fn parse_element_children(
+        &mut self,
+        open_tokens: &std::ops::Range<usize>,
+    ) -> Option<(Vec<ElementChild<'src>>, Span)> {
+        let mut children: Vec<ElementChild<'src>> = Vec::new();
+        loop {
+            // `</tag>` — the close (span-adjacent `</`), name-matched against
+            // the opener token-by-token.
+            if self.peek_is_ctrl('<') && self.peek_at_is_op(1, "/") && self.tokens_adjacent(0, 1) {
+                self.bump();
+                self.bump();
+                let close = self.parse_element_name();
+                let matches_open = close.as_ref().is_some_and(|(_, close_tokens)| {
+                    close_tokens.len() == open_tokens.len()
+                        && self.tokens[close_tokens.clone()]
+                            .iter()
+                            .zip(&self.tokens[open_tokens.clone()])
+                            .all(|(a, b)| a.0 == b.0)
+                });
+                if !matches_open {
+                    let open_name = self.element_name_text(open_tokens);
+                    self.note_expected(&format!("`</{open_name}>`"));
+                    return None;
+                }
+                self.expect_ctrl('>')?;
+                let (close_span, _) = close.expect("matched above");
+                return Some((children, close_span));
+            }
+            if self.at_end() {
+                let open_name = self.element_name_text(open_tokens);
+                self.note_expected(&format!("`</{open_name}>`"));
+                return None;
+            }
+            // A nested element.
+            if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
+                children.push(ElementChild::Bare(self.parse_element()?));
+                continue;
+            }
+            // A quoted string child.
+            if let Some(Token::String(text)) = self.peek() {
+                let node = Node::String(text);
+                let span = self.here_span();
+                self.bump();
+                children.push(ElementChild::Bare((node, span)));
+                continue;
+            }
+            if let Some(Token::MultilineString(text)) = self.peek() {
+                let node = Node::MultilineString(text);
+                let span = self.here_span();
+                self.bump();
+                children.push(ElementChild::Bare((node, span)));
+                continue;
+            }
+            // An i-string child — the lexer already turned it into a paren
+            // group, so it arrives as `(`; a literal parenthesized expression
+            // parses identically (the recorded wrinkle).
+            if self.peek_is_ctrl('(') {
+                children.push(ElementChild::Bare(self.parse_paren_atom()?));
+                continue;
+            }
+            // A `{expression}` hole.
+            if self.eat_ctrl('{') {
+                let child = self.parse_expression()?;
+                self.expect_ctrl('}')?;
+                children.push(ElementChild::Hole(child));
+                continue;
+            }
+            self.note_expected("a child: an element, a quoted string, or a `{expression}` hole");
+            return None;
+        }
     }
 
     // --- Generic arguments ---------------------------------------------------

@@ -38,8 +38,26 @@ fun main() {
 
 	// An svg root carries its namespace (B37) — seeded first, so a component's
 	// own attributes follow it; descendants inherit and need none.
-	print(render(view("svg")
-		.attr("viewBox", "0 0 24 24")
-		.child(view("path").attr("d", "M5 12h14"))));
+	print(render(view("svg").attr("viewBox", "0 0 24 24").child(view("path").attr("d", "M5 12h14"))));
+
+	// Mixed content (element-syntax S1): text children — plain and
+	// signal-read-once — interleave with elements as real siblings, in written
+	// order, each text arm escaped. A `Signal<str>` attribute reads once too.
+	let name = Signal::new("world & <you>");
+	let mixed = view("p")
+		.attr("data-live", Signal::new("a \"quoted\" & value"))
+		.child("Take ")
+		.child(view("code").text("vilan upgrade"))
+		.child(" & enjoy. ")
+		.child(name);
+	print(render(mixed));
+
+	// A `List<View>` fills one child position, in order.
+	let pair: List<View> = [view("i").text("a"), view("b").text("b")];
+	print(render(view("p").child(pair)));
+
+	// `.text` still REPLACES children (the DOM's textContent), text nodes
+	// included.
+	print(render(view("p").child("gone").text("kept")));
 }
 main();
