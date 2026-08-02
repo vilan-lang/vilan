@@ -2015,10 +2015,12 @@ impl Document {
     ///
     /// Conservatism, per the surfaces a use can land in: a reference on ANY of
     /// them keeps the import.
-    ///  - (A) Type/trait positions — `type_references`, filtered to this file.
-    ///    This includes derive-GENERATED type/trait references, which the
-    ///    analyzer attributes to the deriving (this) file, so a derive-only
-    ///    import survives.
+    ///  - (A) Type/trait positions — `type_references`, from this file or from
+    ///    code generated out of it, so a derive-only import survives (`[derive(
+    ///    Json)]` alone references `Json`). Generated references used to arrive
+    ///    mislabeled as this file's own and were counted by accident; they now
+    ///    carry `DERIVED_SOURCE` and are counted on purpose, which is what (B)
+    ///    below has always done.
     ///  - (B) Value positions (call subject, bare value) — the entity map, whose
     ///    per-use source lets us filter to this file (or code generated from it).
     ///    `reference_count` is deliberately NOT used: an import binds its leaf
@@ -2037,13 +2039,21 @@ impl Document {
         else {
             return true;
         };
-        // (A) Type / trait references in this file, beyond this import's own leaf.
+        // (A) Type / trait references in this file, beyond this import's own
+        // leaf — or anywhere in code generated from it, where there is no leaf to
+        // exclude: those spans index a template, so comparing them to this file's
+        // offsets is meaningless and any reference among them is a real use.
         let referenced_as_type =
             program
                 .type_references
                 .iter()
                 .any(|(source, span, definition, _)| {
-                    *source == entry && *definition == Some(def_id) && *span != leaf_span
+                    *definition == Some(def_id)
+                        && if *source == DERIVED_SOURCE {
+                            true
+                        } else {
+                            *source == entry && *span != leaf_span
+                        }
                 });
         if referenced_as_type {
             return true;
@@ -5116,6 +5126,112 @@ pub(crate) mod tests {
                 start >= first_code,
                 "symbol {:?} selection starts at {start}, inside the leading comment",
                 symbol.name
+            );
+        }
+    }
+
+    // The same leak as `derive_synthesized_entities_are_excluded_from_the_user_file`,
+    // one channel over. That fix converted the ENTITY channel (`source_ranges`,
+    // hence `entity_spans`/`document_symbols`); `type_references` — the span-keyed
+    // channel behind semantic tokens, hover and go-to-definition — kept recording
+    // the DERIVING file, because the generated walk never changed
+    // `current_source_id`. Every type name in a derive's template therefore
+    // arrived as a user-file token at a generated-text offset, painting the
+    // leading comment and (worse) swallowing real tokens: `semantic_tokens` drops
+    // overlaps, so a bogus wide span starting earlier evicts the genuine ones
+    // behind it.
+    #[test]
+    fn semantic_tokens_exclude_derive_generated_spans() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/examples/rpc/src/main.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first_code = text.find("\nimport ").expect("first import") + 1;
+        let document = Document::analyze(&text, &std_root(), &path);
+
+        for (span, kind, _) in document.semantic_tokens() {
+            let range = span.into_range();
+            assert!(
+                range.start >= first_code,
+                "a {kind:?} token spans {range:?}, inside the leading comment \
+                 (a derive-generated span leaking into the user file)"
+            );
+        }
+        // The hover / go-to-definition half of the same channel.
+        let program = document.program.as_ref().expect("the example analyzes");
+        for offset in 0..first_code {
+            assert!(
+                document.type_reference_at(program, offset).is_none(),
+                "a type reference covers offset {offset}, inside the leading comment"
+            );
+        }
+    }
+
+    // A written generic type application highlights as its HEAD name plus its
+    // arguments, each a name of its own. The reference used to be recorded at the
+    // whole `Name<Args>` span, and since `semantic_tokens` drops overlaps, that
+    // one token ate every argument's: `Signal<List<str>>` lit up as a single
+    // struct and both arguments went dark. Nesting and a closure argument are
+    // both here — a closure's parameter and return types are the case the whole
+    // span reached furthest over.
+    #[test]
+    fn a_generic_type_application_tokenizes_its_head_and_arguments() {
+        let text = "import std::reactive::Signal;\nimport std::shared::Shared;\n\nstruct Row {\n\tcells: Signal<List<str>>,\n\thook: Shared<|i32| bool>,\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        // The token covering exactly the `occurrence`-th `name` in the text.
+        let token_at = |name: &str, occurrence: usize| -> Option<TokenKind> {
+            let mut start = 0;
+            let mut position = None;
+            for _ in 0..=occurrence {
+                position = text[start..].find(name).map(|at| start + at);
+                start = position? + 1;
+            }
+            let at = position?;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + name.len()
+                })
+                .map(|(_, kind, _)| *kind)
+        };
+        // The head of each application, name-sized rather than swallowing its
+        // arguments.
+        assert!(token_at("Signal", 1).is_some(), "Signal head: {tokens:?}");
+        assert!(token_at("Shared", 1).is_some(), "Shared head: {tokens:?}");
+        // The arguments, no longer eaten: nested nominal, and a closure's
+        // parameter and return types.
+        assert!(token_at("List", 0).is_some(), "List argument: {tokens:?}");
+        // Occurrence 1: the first `str` in this text is the one inside `struct`.
+        assert!(token_at("str", 1).is_some(), "str argument: {tokens:?}");
+        assert!(token_at("i32", 0).is_some(), "i32 parameter: {tokens:?}");
+        assert!(token_at("bool", 0).is_some(), "bool return: {tokens:?}");
+    }
+
+    // The invariant the wire format depends on and the leak broke: the classifier
+    // only ever produces NAME-sized spans, so every token's text is an identifier.
+    // A generated-template offset laid over this file lands mid-word or across
+    // punctuation, which no real name does. Held over a program whose derives
+    // synthesize a lot (`Wire` alone writes a to/from-wire impl pair).
+    #[test]
+    fn every_semantic_token_covers_an_identifier() {
+        let text = "// A leading comment, wide enough to catch a generated offset.\nimport std::json::Json;\n\n[derive(Json, PartialEq)]\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let tokens = document.semantic_tokens();
+        assert!(!tokens.is_empty(), "the program should produce tokens");
+        for (span, kind, _) in &tokens {
+            let range = span.into_range();
+            let lexeme = text.get(range.clone()).unwrap_or_else(|| {
+                panic!(
+                    "a {kind:?} token spans {range:?}, which is not a char boundary of this file"
+                )
+            });
+            assert!(
+                !lexeme.is_empty()
+                    && lexeme
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_'),
+                "a {kind:?} token spans {range:?} = {lexeme:?}, which is not an identifier"
             );
         }
     }

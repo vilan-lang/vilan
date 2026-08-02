@@ -8085,6 +8085,50 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// One expansion, walked into `scope_id` with the whole attribution its
+    /// output needs — the ONE place a generated walk is set up, so a fourth
+    /// caller cannot get half of it (the three that existed before this was
+    /// factored out each got the entity half and missed the span half).
+    ///
+    /// Generated items are attributed twice over, because two different things
+    /// are being placed:
+    ///
+    ///  - **Their spans** index the generated TEMPLATE, which no file holds. The
+    ///    entity ids record under [`DERIVED_SOURCE`] via `source_ranges`, and so
+    ///    does `current_source_id` for the duration of the walk — that is what
+    ///    every span-keyed record captures, including the `prepped_*` lists that
+    ///    resolve into `type_references` much later, in `build()`. An editor that
+    ///    believed those spans belonged to the deriving file would draw them over
+    ///    whatever it happens to have at those offsets.
+    ///  - **Their diagnostics** belong to the user, who cannot edit a template:
+    ///    they re-anchor at the attribute that generated the code, which is the
+    ///    one location acting on it means editing (standard A2).
+    fn walk_generated_expansion(
+        &mut self,
+        generated: &'src NodeList<'src>,
+        scope_id: Id,
+        origin: Span,
+        origin_source: SourceId,
+    ) {
+        let walking = self.current_source_id;
+        let generated_start = self.entity_id;
+        let diagnostics_before = self.diagnostics.len();
+        self.set_current_source(DERIVED_SOURCE);
+        self.walk_generated_items(generated, scope_id);
+        self.source_ranges.push(SourceRange {
+            start: generated_start,
+            end: self.entity_id,
+            source: DERIVED_SOURCE,
+        });
+        self.derived_origins
+            .push((generated_start..self.entity_id, origin, origin_source));
+        // Runs BEFORE the restore: it closes the attribution run it opens with
+        // whatever `current_source_id` then is, so the walk's own source has to
+        // still be current for the marks to bracket the generated diagnostics.
+        self.redirect_derived_range(diagnostics_before, origin, origin_source);
+        self.set_current_source(walking);
+    }
+
     fn hoist_generated_declarations(
         &mut self,
         node: &Node<'src>,
@@ -14367,11 +14411,25 @@ impl<'src> Analyzer<'src> {
                 // the head and arguments. Recording every application keeps the
                 // check total (an inferred instantiation is R11's concern, later).
                 self.generic_type_applications.push((type_id, node.1));
+                // The REFERENCE is the head name, not the whole application. The
+                // arguments were just walked and recorded their own references;
+                // recording `node.1` here — which reaches to the closing `>` —
+                // laid a second reference right over them, and the language
+                // server, which drops overlapping tokens, then kept only the
+                // outer one: `Signal<List<str>>` highlighted (and hovered, and
+                // navigated) as one name, with `List` and `str` dark. The head is
+                // the application's leading token, so it starts where the node
+                // does; the `min` keeps a span inside its node whatever a future
+                // spelling of `name` does.
+                let application = node.1.into_range();
+                let head_span: Span = (application.start
+                    ..(application.start + name.len()).min(application.end))
+                    .into();
                 self.prepped_type_locals.push((
                     type_id,
                     name,
                     scope_id,
-                    node.1,
+                    head_span,
                     argument_type_ids,
                     self.current_source_id,
                 ));
@@ -24492,24 +24550,9 @@ pub fn analyze<'src>(
         });
         // Macro-generated items (derives included — expansion is unified) walk
         // into the module's own scope right after its body, so they see its
-        // types; their
-        // spans point into leaked generated text, so they too record under
-        // `DERIVED_SOURCE` (editor features skip them).
+        // types.
         for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            let generated_start = analyzer.entity_id;
-            let diagnostics_before = analyzer.diagnostics.len();
-            analyzer.walk_generated_items(generated, *module_scope_id);
-            analyzer.source_ranges.push(SourceRange {
-                start: generated_start,
-                end: analyzer.entity_id,
-                source: DERIVED_SOURCE,
-            });
-            analyzer.derived_origins.push((
-                generated_start..analyzer.entity_id,
-                *origin,
-                *source_id,
-            ));
-            analyzer.redirect_derived_range(diagnostics_before, *origin, *source_id);
+            analyzer.walk_generated_expansion(generated, *module_scope_id, *origin, *source_id);
         }
     }
     if let Some(lib_ast) = lib_ast {
@@ -24536,23 +24579,9 @@ pub fn analyze<'src>(
             end: analyzer.entity_id,
             source: *source_id,
         });
-        // Macro-generated items (derives included) walk into the lib's
-        // namespace; generated-text spans record under `DERIVED_SOURCE`.
+        // Macro-generated items (derives included) walk into the lib's namespace.
         for (origin, generated) in generated_by_source.get(source_id).into_iter().flatten() {
-            let generated_start = analyzer.entity_id;
-            let diagnostics_before = analyzer.diagnostics.len();
-            analyzer.walk_generated_items(generated, *namespace_scope_id);
-            analyzer.source_ranges.push(SourceRange {
-                start: generated_start,
-                end: analyzer.entity_id,
-                source: DERIVED_SOURCE,
-            });
-            analyzer.derived_origins.push((
-                generated_start..analyzer.entity_id,
-                *origin,
-                *source_id,
-            ));
-            analyzer.redirect_derived_range(diagnostics_before, *origin, *source_id);
+            analyzer.walk_generated_expansion(generated, *namespace_scope_id, *origin, *source_id);
         }
     }
     // Remember `panic` so its calls can be typed as never and lowered to a throw.
@@ -24839,24 +24868,9 @@ pub fn analyze<'src>(
             source: SourceId(0),
         });
         // Synthesized `[derive(..)]` impls are walked into the same (entry) scope,
-        // right after the user's items, so they see the derived types — but their
-        // spans are generated-template offsets, not the user's file, so record them
-        // under `DERIVED_SOURCE` so editor features skip them.
+        // right after the user's items, so they see the derived types.
         for (origin, generated) in generated_by_source.get(&SourceId(0)).into_iter().flatten() {
-            let generated_start = analyzer.entity_id;
-            let diagnostics_before = analyzer.diagnostics.len();
-            analyzer.walk_generated_items(generated, global_scope_id);
-            analyzer.source_ranges.push(SourceRange {
-                start: generated_start,
-                end: analyzer.entity_id,
-                source: DERIVED_SOURCE,
-            });
-            analyzer.derived_origins.push((
-                generated_start..analyzer.entity_id,
-                *origin,
-                SourceId(0),
-            ));
-            analyzer.redirect_derived_range(diagnostics_before, *origin, SourceId(0));
+            analyzer.walk_generated_expansion(generated, global_scope_id, *origin, SourceId(0));
         }
     }
     // Constraint resolution and the post-passes attribute their diagnostics per
