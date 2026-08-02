@@ -48,15 +48,25 @@ runs.
 
 Ordered by measured payoff; estimates assume the others have not landed.
 
-- **E25 — run the binaries in parallel** (the big one): 130.7 s of serial
-  execution against a longest-single-binary of 29.9 s is a theoretical ~4.4×.
-  `cargo-nextest` is the obvious instrument; note it runs each TEST in its
-  own process, which makes today's in-process serialization (vilan-wasm's
-  mutex, the LSP's overlay locks) unnecessary rather than broken, and the
-  port-binding legs already survived E19's port-0 migration. The risks to
-  clear per-binary: stdout-parsing e2e legs, node-spawn storms under load
-  (the E20 flake history marks where timing pressure bites), and CI parity.
-  Est: 131 s → ~35–45 s.
+- **E25 — run the binaries in parallel — SHIPPED 2026-08-02** via
+  cargo-nextest (0.9.140; local install from get.nexte.st, CI via
+  taiki-e/install-action). Measured on the post-E27 tree: 112 s →
+  **63.5 s** (82.2 s unconfigured; the committed `.config/nextest.toml`
+  turns fail-fast off and priority-starts the Linux leak plateaus, whose
+  longest test — 32 s idle, ~52 s under full load — is the critical path
+  when scheduled last). From the audit baseline: 131 s → 63.5 s. Parity
+  exact: 2270 run + 1 skipped = cargo test's 2271 enumeration, all three
+  doc-test sets empty (CI keeps a `cargo test --workspace --doc` leg so a
+  future doc-test cannot silently stop running). Three full runs green,
+  zero flakes — the stdout-parsing e2e legs and node-storm risks did not
+  bite. Plant-proven red (exit 100, named FAIL with full report). The cost
+  worth recording: user CPU rises ~70 % (530 s → ~915 s) — the per-test
+  process tax under WSL2 exec plus cache contention at full interleave;
+  wall is what the suite gates on, but this is why the floor is ~57 s
+  (915/16), not 33 s. CLAUDE.md's suite section now names nextest as the
+  gate; `cargo test --workspace --no-fail-fast` remains a correct, slower
+  equivalent; release.yml's tag-time gate stays on plain cargo test,
+  unchanged.
 - **E26 — batch inference's node runs — CLOSED NEGATIVE, see §2.1**: the
   filed premise (534 spawns × ~35 ms IS the 18.7 s) was arithmetic derived
   from the wall, not an independent measurement. Built, measured, and
@@ -133,9 +143,20 @@ Two corrections propagate:
   not attribution).
 
 Sequencing after the correction: **E27 → E25 → (E28/E30/E29 as E25's
-outcome dictates)**. E27 (shipped: −25.4 s) takes the serial floor to
-~105 s; E25's real ceiling wants re-estimating from CPU sums; E30 is the
-only lever left on inference and it needs the analyzer-arc decision first.
+outcome dictates)**. Both shipped 2026-08-02: E27 −25.4 s, then E25 landing
+the suite at **63.5 s** (2.1× from the audit's 131 s).
+
+E25's outcome settles the dependents:
+- **E28 and E30 as filed are foreclosed**: nextest's per-test processes
+  cannot share an in-process `OnceLock` analysis. Either lever now means a
+  disk-cached std/fixture snapshot (an analyzer arc, not a test tweak) or
+  cutting the per-analysis cost itself — and the payoff shrank: the leak
+  plateaus and the CPU floor (~915 s ÷ 16), not fixture repetition, now
+  bound the wall.
+- **E29's consolidation sub-lever is dead** (nextest prefers many
+  binaries); the faster-linker sub-lever (mold/lld) stands, and the 16 s
+  relink tax is now a QUARTER of a suite run rather than an eighth —
+  relatively more worth cutting. Evidence first, as filed.
 
 ## 3. What was NOT found
 
