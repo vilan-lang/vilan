@@ -1504,7 +1504,9 @@ impl LanguageServer for Backend {
                     text_document_sync: Some(TextDocumentSyncCapability::Options(
                         TextDocumentSyncOptions {
                             open_close: Some(true),
-                            change: Some(TextDocumentSyncKind::FULL),
+                            // B39c: the client sends ranged edits, not the
+                            // whole buffer per keystroke.
+                            change: Some(TextDocumentSyncKind::INCREMENTAL),
                             save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                             ..Default::default()
                         },
@@ -1632,28 +1634,55 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
         self.fenced("did_change", (), || {
-            if let Some(change) = params.content_changes.pop() {
-                let uri = params.text_document.uri;
-                if is_manifest(&uri) {
-                    self.manifests
-                        .insert(uri, ManifestDocument::new(change.text));
-                    return;
-                }
-                // Apply the new text to the open document immediately so a completion
-                // request arriving before the debounced re-analysis still sees the
-                // just-typed character (e.g. the `.` that selects member completion).
-                if let Some(mut document) = self.documents.get_mut(&uri) {
-                    document.set_text(&change.text);
-                }
-                // The overlay updates immediately (pre-debounce), so any analysis
-                // that runs meanwhile — a dependent's, this one's — sees the edit.
-                if let Ok(path) = uri.to_file_path() {
-                    vilan_core::analyzer::set_document_overlay(&path, Some(change.text.clone()));
-                }
-                self.on_change(uri, change.text);
+            if params.content_changes.is_empty() {
+                return;
             }
+            let uri = params.text_document.uri;
+            if is_manifest(&uri) {
+                // Manifests fold the same ordered-events contract over their
+                // own stored text; they keep no edit log (nothing maps).
+                let mut text = self
+                    .manifests
+                    .get(&uri)
+                    .map(|manifest| manifest.text.clone())
+                    .unwrap_or_default();
+                for change in &params.content_changes {
+                    match change.range {
+                        None => text = change.text.clone(),
+                        Some(range) => {
+                            let index = LineIndex::new(&text);
+                            let start = index.offset(range.start);
+                            let end = index.offset(range.end).max(start);
+                            text.replace_range(start..end, &change.text);
+                        }
+                    }
+                }
+                self.manifests.insert(uri, ManifestDocument::new(text));
+                return;
+            }
+            // Apply the edits to the open document immediately — in order,
+            // each against the text as already edited (the incremental-sync
+            // contract) — so a completion request arriving before the
+            // debounced re-analysis still sees the just-typed character.
+            // A document the protocol never opened has no base to splice
+            // into; ranged events for it are dropped by the same guard.
+            let text = {
+                let Some(mut document) = self.documents.get_mut(&uri) else {
+                    return;
+                };
+                for change in &params.content_changes {
+                    document.apply_change(change.range, &change.text);
+                }
+                document.text.clone()
+            };
+            // The overlay updates immediately (pre-debounce), so any analysis
+            // that runs meanwhile — a dependent's, this one's — sees the edit.
+            if let Ok(path) = uri.to_file_path() {
+                vilan_core::analyzer::set_document_overlay(&path, Some(text.clone()));
+            }
+            self.on_change(uri, text);
         })
     }
 
@@ -1742,14 +1771,26 @@ impl LanguageServer for Backend {
                     // slid every hint below it — and the viewport filter on the next
                     // line then dropped the ones that slid out of range entirely.
                     //
-                    // The filter itself compares this analyzed-space position to
-                    // `params.range`, which is live-space — under FULL sync there
-                    // is no mapping between the two, so this is as good as it gets
-                    // (backlog 39c): exact for same-line edits, off by the inserted
-                    // or deleted lines near the viewport edge for the ~200 ms until
-                    // the refresh lands.
+                    // The filter compares against `params.range`, which is
+                    // live-space. With incremental sync (B39c) the recorded
+                    // edits map the anchor into live space and the compare
+                    // is EXACT; when the map is broken (a whole-text set, an
+                    // analysis of an older text) it falls back to the old
+                    // approximation — exact for same-line edits, off by the
+                    // inserted or deleted lines near the viewport edge until
+                    // the refresh lands. The HINT keeps its analyzed-space
+                    // position either way: program answers describe the
+                    // analyzed snapshot (the snapshot-consistency rule), and
+                    // the client clips out-of-range answers harmlessly.
                     let position = document.analyzed_position(offset);
-                    (position >= range.start && position <= range.end).then(|| InlayHint {
+                    let visible = match document.live_offset(offset) {
+                        Some(live) => {
+                            let live_position = document.line_index.position(live);
+                            live_position >= range.start && live_position <= range.end
+                        }
+                        None => position >= range.start && position <= range.end,
+                    };
+                    visible.then(|| InlayHint {
                         position,
                         label: InlayHintLabel::String(label),
                         kind: Some(InlayHintKind::TYPE),
@@ -2859,6 +2900,164 @@ mod semantic_token_delta_protocol_tests {
                 .iter()
                 .all(|token| token.delta_line == 0),
             "everything answered sits on the requested line"
+        );
+    }
+}
+
+/// B39c: incremental sync through the handler — ordered ranged events
+/// rebuild the text a full sync would have sent (documents and manifests
+/// both), and the inlay viewport filter goes EXACT when the edit map holds:
+/// a line inserted above moves the hint's live line, and the filter follows
+/// it instead of answering the stale window.
+#[cfg(test)]
+mod incremental_sync_tests {
+    use super::snapshot_consistency_tests::{SOURCE, backend};
+    use super::*;
+
+    fn change(line: u32, start: u32, end: u32, text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                Position::new(line, start),
+                Position::new(line, end),
+            )),
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
+
+    fn uri() -> Url {
+        Url::parse("file:///incremental/main.vl").unwrap()
+    }
+
+    #[tokio::test]
+    async fn ranged_events_rebuild_the_document_text() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(
+            uri.clone(),
+            crate::document::Document::analyze(
+                SOURCE,
+                &crate::document::tests::std_root(),
+                std::path::Path::new("/incremental/main.vl"),
+            ),
+        );
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![
+                    // `let value = 1;` -> `let value = 9;`, then append a
+                    // comment on the next event AGAINST THE EDITED TEXT.
+                    change(1, 13, 14, "9"),
+                    change(0, 12, 12, " // edited"),
+                ],
+            })
+            .await;
+        let text = backend.documents.get(&uri).unwrap().text.clone();
+        assert_eq!(
+            text,
+            SOURCE
+                .replace("= 1;", "= 9;")
+                .replace("fun main() {", "fun main() { // edited"),
+            "ordered ranged events rebuild what full sync would have sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_folds_ranged_events_too() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = Url::parse("file:///incremental/vilan.toml").unwrap();
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 1,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "[package]\nname = \"a\"\n".to_string(),
+                }],
+            })
+            .await;
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![change(1, 8, 9, "b")],
+            })
+            .await;
+        let text = backend.manifests.get(&uri).unwrap().text.clone();
+        assert_eq!(text, "[package]\nname = \"b\"\n");
+    }
+
+    #[tokio::test]
+    async fn the_viewport_filter_follows_a_hint_moved_by_an_edit_above() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        let document = crate::document::Document::analyze(
+            SOURCE,
+            &crate::document::tests::std_root(),
+            std::path::Path::new("/incremental/main.vl"),
+        );
+        backend.documents.insert(uri.clone(), document);
+
+        // The fixture's hints sit on lines 1 and 2 (the two lets). The LAST
+        // one makes the pin sharp: no other hint's unmapped position can
+        // reach the window below it, so only the real mapping answers.
+        let hint_line = {
+            let document = backend.documents.get(&uri).unwrap();
+            document
+                .inlay_hints()
+                .into_iter()
+                .map(|(offset, _)| document.analyzed_position(offset).line)
+                .max()
+                .expect("a hint")
+        };
+
+        // Insert a whole line above via the handler: the hint's LIVE line is
+        // now one greater, with no analysis landed.
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![change(0, 0, 0, "// pushed down\n")],
+            })
+            .await;
+
+        let ask = |line: u32| InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(line, 0), Position::new(line, 999)),
+            work_done_progress_params: Default::default(),
+        };
+        let at_live_line = backend
+            .inlay_hint(ask(hint_line + 1))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !at_live_line.is_empty(),
+            "the hint's live line answers it - the exact filter follows the edit"
+        );
+        let at_stale_line_only = backend
+            .inlay_hint(ask(hint_line))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            at_stale_line_only
+                .iter()
+                .all(|hint| hint.position.line != hint_line + 1),
+            "the stale window no longer over-answers the moved hint"
         );
     }
 }

@@ -732,11 +732,30 @@ fn clamp_preview(mut rendered: String) -> String {
 /// [`analyzed_range`](Document::analyzed_range). Converting a stale program's
 /// byte offsets through the *live* index is what made highlighting and inlay
 /// hints slide around while typing: same bytes, different text.
+/// One applied live edit: `old_len` bytes at `start` became `new_len` bytes,
+/// offsets in the text the edit applied to. The document's log of these —
+/// accumulated since the analyzed snapshot — is what maps an analyzed-space
+/// offset into live space (backlog B39c: the inlay viewport filter's
+/// exactness under incremental sync).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditDelta {
+    pub start: usize,
+    pub old_len: usize,
+    pub new_len: usize,
+}
+
 pub struct Document {
     /// The LIVE line index: the text as of the last edit. Shared as an `Arc`
     /// with `analyzed_index` while the two snapshots agree, which is the
     /// steady state — an edit replaces this one alone.
     pub line_index: Arc<LineIndex>,
+    /// The edits applied to the live text SINCE the analyzed snapshot, in
+    /// application order — `Some(vec![])` is identity (the two texts agree),
+    /// `None` is UNMAPPABLE (a whole-text replacement, or any text change
+    /// that bypassed [`Document::apply_change`]) and consumers fall back to
+    /// their approximate behavior. An analysis only ever lands on the live
+    /// text (see `land`), so adoption resets this to identity.
+    pub live_edits: Option<Vec<EditDelta>>,
     /// The ANALYZED line index: the text the current `program` was built from.
     /// A `LineIndex` owns its text, so this IS the analyzed-text record — there
     /// is no second `String` to keep in step.
@@ -952,6 +971,8 @@ impl Document {
     fn internal_error(text: &str) -> Self {
         let line_index = Arc::new(LineIndex::new(text));
         Document {
+            // A fresh analysis IS the analyzed text: the map is identity.
+            live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: None,
@@ -1059,6 +1080,8 @@ impl Document {
             .unwrap_or_default();
 
         Document {
+            // A fresh analysis IS the analyzed text: the map is identity.
+            live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program,
@@ -1217,6 +1240,52 @@ impl Document {
     pub fn set_text(&mut self, text: &str) {
         self.line_index = Arc::new(LineIndex::new(text));
         self.text = text.to_string();
+        // A whole-text set has no edit shape to record: the map from the
+        // analyzed snapshot is broken until the next analysis lands.
+        self.live_edits = None;
+    }
+
+    /// Apply one LSP content change to the LIVE snapshot: a ranged event
+    /// splices at UTF-16 positions against the current live text (the
+    /// incremental-sync contract — events in one notification apply in
+    /// order, each against the text as already edited) and RECORDS its
+    /// shape in `live_edits`; an event without a range is the full-sync
+    /// form and resets the log to unmappable.
+    pub fn apply_change(&mut self, range: Option<tower_lsp::lsp_types::Range>, replacement: &str) {
+        let Some(range) = range else {
+            self.set_text(replacement);
+            return;
+        };
+        let start = self.line_index.offset(range.start);
+        let end = self.line_index.offset(range.end).max(start);
+        let mut text = self.text.clone();
+        text.replace_range(start..end, replacement);
+        self.line_index = Arc::new(LineIndex::new(&text));
+        self.text = text;
+        if let Some(edits) = self.live_edits.as_mut() {
+            edits.push(EditDelta {
+                start,
+                old_len: end - start,
+                new_len: replacement.len(),
+            });
+        }
+    }
+
+    /// Map an ANALYZED-space byte offset into the live text, through the
+    /// recorded edits — `None` when the log is unmappable. An offset inside
+    /// a replaced region clamps into the replacement (the anchor's text is
+    /// gone; its nearest surviving position is the honest answer).
+    pub fn live_offset(&self, offset: usize) -> Option<usize> {
+        let edits = self.live_edits.as_ref()?;
+        let mut offset = offset;
+        for edit in edits {
+            if offset >= edit.start + edit.old_len {
+                offset = offset - edit.old_len + edit.new_len;
+            } else if offset > edit.start {
+                offset = edit.start + (offset - edit.start).min(edit.new_len);
+            }
+        }
+        Some(offset)
     }
 
     /// The line index of the text the current analysis consumed: the coordinate
@@ -1305,6 +1374,7 @@ impl Document {
             warnings,
             warning_sources,
             text: analyzed_text,
+            live_edits: _,
             text_hash,
             entity_spans,
             platform_requirements,
@@ -1326,6 +1396,12 @@ impl Document {
         if self.text == analyzed_text {
             self.text = analyzed_text;
             self.line_index = analyzed_live_index;
+            // Live and analyzed agree again: the edit map is identity.
+            self.live_edits = Some(Vec::new());
+        } else {
+            // The adopted analysis matches an older text; the recorded
+            // edits no longer start from this snapshot.
+            self.live_edits = None;
         }
     }
 
@@ -6405,6 +6481,108 @@ pub(crate) mod tests {
             "with no recorded source set, re-analysis is the conservative direction"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- B39c: incremental edits apply in order and stay mappable ---
+    //
+    // `apply_change` is the sync contract (ordered ranged splices at UTF-16
+    // positions, full-replacement resets), and `live_offset` is the map the
+    // inlay filter's exactness rides on. Each case pins a distinct shape.
+
+    fn plain_document(text: &str) -> Document {
+        let dir = std::env::temp_dir().join(format!(
+            "vilan_lsp_b39c_{}_{:p}",
+            std::process::id(),
+            text.as_ptr()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, text).unwrap();
+        Document::analyze(text, &std_root(), &entry)
+    }
+
+    fn range_at(line: u32, start: u32, end: u32) -> tower_lsp::lsp_types::Range {
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(line, start),
+            tower_lsp::lsp_types::Position::new(line, end),
+        )
+    }
+
+    #[test]
+    fn ordered_ranged_edits_rebuild_the_text_a_full_sync_would_send() {
+        let mut document = plain_document("fun main() {\n\tlet a = 1;\n}\n");
+        // Two events in one notification: insert, then edit AFTER the insert
+        // against the already-edited text - the incremental-sync contract.
+        document.apply_change(Some(range_at(1, 5, 6)), "value");
+        document.apply_change(Some(range_at(1, 13, 14)), "2");
+        assert_eq!(document.text, "fun main() {\n\tlet value = 2;\n}\n");
+        assert_eq!(
+            document.live_edits.as_ref().map(|edits| edits.len()),
+            Some(2),
+            "both splices recorded"
+        );
+    }
+
+    #[test]
+    fn a_ranged_edit_at_an_astral_column_splices_at_the_character() {
+        // The emoji is one character, two UTF-16 units: a column AFTER it
+        // must land after all four of its bytes.
+        let mut document = plain_document("// \u{1F980} x\n");
+        document.apply_change(Some(range_at(0, 6, 7)), "y");
+        assert_eq!(document.text, "// \u{1F980} y\n");
+    }
+
+    #[test]
+    fn a_multi_line_deletion_splices_across_lines() {
+        let mut document = plain_document("fun main() {\n\tlet a = 1;\n\tlet b = 2;\n}\n");
+        let range = tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 0),
+            tower_lsp::lsp_types::Position::new(2, 0),
+        );
+        document.apply_change(Some(range), "");
+        assert_eq!(document.text, "fun main() {\n\tlet b = 2;\n}\n");
+    }
+
+    #[test]
+    fn a_full_replacement_event_resets_the_map() {
+        let mut document = plain_document("fun main() {}\n");
+        document.apply_change(Some(range_at(0, 0, 0)), "x");
+        assert!(document.live_edits.is_some(), "ranged edits keep the map");
+        document.apply_change(None, "fun other() {}\n");
+        assert_eq!(document.text, "fun other() {}\n");
+        assert!(
+            document.live_edits.is_none(),
+            "a whole-text replacement has no shape to record"
+        );
+    }
+
+    #[test]
+    fn live_offset_maps_through_the_recorded_edits() {
+        let mut document = plain_document("fun main() {\n\tlet a = 1;\n}\n");
+        // Insert a whole line above: everything below shifts by its length.
+        document.apply_change(Some(range_at(0, 0, 0)), "// note\n");
+        let shifted = document.live_offset(13).expect("mappable");
+        assert_eq!(shifted, 13 + "// note\n".len());
+        assert_eq!(
+            document.live_offset(0),
+            Some(8),
+            "the old start sits after the insert"
+        );
+        // An anchor INSIDE a replaced region clamps into the replacement.
+        let mut replaced = plain_document("fun main() {\n\tlet abc = 1;\n}\n");
+        replaced.apply_change(Some(range_at(1, 5, 8)), "x");
+        let inside = replaced.live_offset(20).expect("mappable");
+        assert!(
+            inside >= 18 && inside <= 19,
+            "clamped into the replacement, got {inside}"
+        );
+        // A broken map answers None; adoption restores identity.
+        let mut broken = plain_document("fun main() {}\n");
+        broken.set_text("fun main() {}\n");
+        assert_eq!(broken.live_offset(3), None, "set_text breaks the map");
+        let fresh = plain_document("fun main() {}\n");
+        broken.adopt_analysis(fresh);
+        assert_eq!(broken.live_offset(3), Some(3), "adoption restores identity");
     }
 }
 
