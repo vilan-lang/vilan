@@ -8,6 +8,8 @@ tracks the latest state.
 
 ## Unreleased
 
+**The playground compiler can check the server leg.** `vilan-wasm` exports `compile_for(source, platform)`: "node" analyzes the program as a process-leg build — platform coloring, twin resolution and all — so the playground's server mode can typecheck HTTP services in the browser without pretending to run them. The page feature-detects the export; older wasm builds hide the mode toggle.
+
 **A chain whose `})` is followed by more chain now breaks, however narrow it is.** Width was the formatter's only reason to split a chain, so a chain that read badly without being wide was left alone — and put back if you broke it yourself. `Server::builder().port(3000).on_request(|request| {` … `}).on_start(|server| {` … `}).build();` is inside the budget on every line and unreadable anyway, because `}).on_start(|server| {` is the end of one argument, the start of the next link and the start of its argument, all at once. A chain now splits regardless of width when a call link that is not its last renders across lines. A chain that *ends* at its spanning link keeps its shape: `self.cleanups.write().push(|| { … });` is the ordinary trailing-closure idiom, it has no seam, and breaking it would buy two lines and no clarity. Whether a link spans lines is decided by rendering it and looking, not by guessing from its shape — the same discipline the width rule follows.
 
 ## v0.19.0 — 2026-08-01
