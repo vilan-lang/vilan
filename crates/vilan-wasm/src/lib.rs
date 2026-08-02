@@ -167,11 +167,20 @@ fn interned_entry(source: &str) -> &'static str {
     leaked
 }
 
-/// Compiles one Vilan source string for the browser platform.
-///
-/// Always `Platform::Browser`: it is what the playground runs, and passing it
-/// explicitly also bypasses `infer_platform`, which probes the disk.
+/// Compiles one Vilan source string for the browser platform — what the
+/// playground runs. See [`compile_program_for`] for the platform-explicit
+/// form behind the page's server check mode.
 pub fn compile_program(source: &str) -> CompileOutput {
+    compile_program_for(source, Platform::Browser)
+}
+
+/// Compiles for an explicit platform. `Platform::Browser` is the running
+/// mode; a process platform is the playground's CHECK-ONLY server mode — the
+/// diagnostics (platform coloring above all) are real, and the emitted
+/// program, while genuine, is for a process host the page does not have.
+/// Passing the platform explicitly also bypasses `infer_platform`, which
+/// probes the disk.
+pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
     boot();
 
     let entry_path = PathBuf::from(PROJECT_ROOT).join(ENTRY_NAME);
@@ -183,7 +192,7 @@ pub fn compile_program(source: &str) -> CompileOutput {
         &embedded_std_spec(),
         Path::new(PROJECT_ROOT),
         &entry_path,
-        Some(Platform::Browser),
+        Some(platform),
         &Workspace::default(),
     );
 
@@ -335,10 +344,7 @@ mod bindings {
         }
     }
 
-    /// Compiles Vilan source to JavaScript for the browser.
-    #[wasm_bindgen]
-    pub fn compile(source: String) -> CompileResult {
-        let output = crate::compile_program(&source);
+    fn convert(output: crate::CompileOutput) -> CompileResult {
         CompileResult {
             js: output.js,
             css: output.css,
@@ -357,6 +363,25 @@ mod bindings {
                 })
                 .collect(),
         }
+    }
+
+    /// Compiles Vilan source to JavaScript for the browser.
+    #[wasm_bindgen]
+    pub fn compile(source: String) -> CompileResult {
+        convert(crate::compile_program(&source))
+    }
+
+    /// Compiles for a named platform: "node" checks the process leg (the
+    /// playground's server mode); anything else is the browser. The page
+    /// feature-detects this export, so an older wasm simply hides the mode
+    /// toggle.
+    #[wasm_bindgen]
+    pub fn compile_for(source: String, platform: String) -> CompileResult {
+        let platform = match platform.as_str() {
+            "node" => crate::Platform::default(), // Node, current LTS
+            _ => crate::Platform::Browser,
+        };
+        convert(crate::compile_program_for(&source, platform))
     }
 
     /// Formats Vilan source; the input comes back unchanged when it cannot be

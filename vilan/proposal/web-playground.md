@@ -1,12 +1,16 @@
 # Web playground — the compiler in the visitor's browser (D11)
 
-> **Status: S0–S3 BUILT — S3 DONE 2026-08-01** (website repo, uncommitted
-> pending review; committing + pushing the website deploys the page). S4
-> (share-via-fragment, badge placement, editor niceties) remains, each
-> independently shippable. §7 calls SETTLED 2026-07-28 — the user took
-> every recommendation: (a) vendored CodeMirror 6, (b) toolchain rides the
-> site build's source, (c) compile on Run only in v1, (d) the path is
-> `/playground`; promotion timing stays with D5/D10.
+> **Status: LIVE AND COMPLETE THROUGH S4+ (2026-08-01)** —
+> vilan-lang.org/playground serves the whole arc: S0–S3, share-via-fragment,
+> Format, auto-run + persistence + keybindings, the template picker, the
+> full-color highlighter, versioned wasm delivery, live diagnostics (§7c
+> superseded), and the server check mode (§9, live with v0.20.0). Remaining
+> by choice: badge placement (the status line carries the version) and the
+> version-selector UI (delivery groundwork in place). §7 calls SETTLED
+> 2026-07-28 — the user took every recommendation: (a) vendored CodeMirror 6,
+> (b) toolchain rides the site build's source, (c) compile on Run only in v1
+> (since superseded, §7c), (d) the path is `/playground`; promotion timing
+> stays with D5/D10.
 > Original status: DRAFT 2026-07-28 — for review. Backlog D11 (user request
 > 2026-07-28). Decides the architecture question the backlog poses: **(a)
 > in-browser WASM compile** is proposed; (b) a server-side compile service is
@@ -246,7 +250,15 @@ it, diagnostics beneath the editor.
 - **(c) Compile cadence**: Run-only vs debounced compile-as-you-type for live
   diagnostics. **Recommendation: Run-only in v1** — it bounds the leak rate
   and the worker churn; live diagnostics become an S4-or-later slice with the
-  recycling policy proven.
+  recycling policy proven. **SUPERSEDED 2026-08-01 — live diagnostics
+  SHIPPED** (website 5369d47), the recycling condition having been proven in
+  production: edits schedule a debounced (400 ms) background CHECK — the
+  same compile, diagnostics only, the mounted program untouched; execution
+  stays explicit (Run / auto-run-on-arrival). Latest-wins queueing while
+  typing, a queued Run outranks a queued check, a stale check result (text
+  already changed) is dropped instead of squiggling the wrong spans, and
+  checks pay the same recycle budget as compiles. Status reports "No
+  problems (vilan X)." / "N problems; see the diagnostics." per check.
 - **(d) Name and promotion** (recorded as the user's call, per the backlog):
   `/playground` as the path; when it gets linked from the landing page and
   the book interacts with D5's traction plan and D10/F9's org timing. Nothing
@@ -416,6 +428,28 @@ it, diagnostics beneath the editor.
   the shipped wasm.
 - **S4 — polish:** share-via-fragment, version badge, editor niceties.
   Each independently shippable after S3.
+  - **Upgrade round SHIPPED 2026-08-01** (website 2fd4dd9..6920d30, four
+    commits, deployed + production-verified): auto-run on arrival (gated on
+    compiler-ready AND doc-settled — a shared link inflates async; worker
+    recycles must not re-run), localStorage buffer persistence
+    (fragment > saved > seeded), Ctrl+Enter run / Shift+Alt+F format
+    (bundle keymap, events queued so wiring order cannot lose them), the
+    example buttons became a picker in the Program pane header (a pick rides
+    the command event channel), Share flashes its outcome on the button, the
+    on-page em-dashes went (h1 colon, statuses in parens), buttons
+    non-selectable, role=status on the status line, panes flex to the fold.
+    The highlighter grew a mode stack — i-string HOLES tokenize as code with
+    ember brace seams — plus attributes, function names (def + call), `::`
+    paths, operators; one derived tint (peach #F0A886) for callables;
+    `code.vl` speaks the same vocabulary (`fn`/`ty`/`hl`) and the two
+    home-page panels are re-marked, so site and playground agree. Delivery
+    moved to VERSIONED immutable dirs (`playground/<tag>/vilan_wasm*`) with
+    one moving always-revalidated `manifest.json` — the rollover
+    mixed-pair window is gone, and `worker.js?v=<tag>` is the version
+    selector's ready hook (old versions accumulate on pages as its
+    inventory). Remaining S4: the badge placement call (the status line
+    already reports the version) and the selector UI when a second version
+    earns it; live diagnostics stays the recorded next slice.
   - **Share-via-fragment — SHIPPED 2026-08-01** (website `4a229f9`, deployed).
     `#code=<base64url(deflate-raw(source))>` per §5: Share writes the
     fragment into the address bar (`window.history.replaceState` — bare
@@ -443,9 +477,25 @@ it, diagnostics beneath the editor.
 
 ## 9. Recorded future work (not planned)
 
-Process-leg check-only mode (one toggle, `Some(Platform::Node)`, the
-platform-coloring showcase); live diagnostics (§7c); multi-file/tabs and
+~~Process-leg check-only mode~~ **SHIPPED 2026-08-01, LIVE with v0.20.0**
+(vilan `ceb317f` + website `32e9f1e`; the v0.20.0 release lit it up in
+production the same day): a mode select beside Run — Browser compiles and runs,
+Server routes the buffer through `compile_for("node")` and CHECKS it (the
+Run button reads Check; results never touch the mounted program). The
+platform-coloring showcase both ways: the seeded server example (a typed
+HTTP service) checks clean under node and, flipped to Browser, refuses
+`std::http` with the call-chain diagnostic; a DOM program under node is
+refused by NAME resolution (the process twin never declares `mount`), which
+the wasm pin records as the real mechanism. Feature-detected like Format;
+the smoke gate pins the browser rejection in the old-wasm era. Still not
+planned: live diagnostics (~~§7c~~ shipped, see §7c); multi-file/tabs and
 manifest editing; LSP-in-the-browser; snippet sharing beyond the fragment
 (anything with storage reopens the no-server stance deliberately, not by
-drift); prerendered playground embeds in the book's "Try it" blocks (D6's
-natural continuation).
+drift); ~~prerendered playground embeds in the book's "Try it" blocks~~
+**SHIPPED 2026-08-01 as links, not embeds** (vilan `e436a10`, live): the
+book's additional-js gives every complete-program fence an
+Open-in-playground link — the code rides the share codec in the URL
+fragment, process-leg examples carry `&mode=node` and open straight into
+the server check. Links beat embeds here: zero weight on the book, and the
+reader gets the whole workbench (live diagnostics, mode, share) instead of
+a widget.

@@ -270,3 +270,64 @@ fn a_program_that_does_not_parse_formats_to_itself() {
          formatter does not understand is not one to rewrite"
     );
 }
+
+// --- compile_for: the server check mode's contract ---------------------------
+
+fn compile_for_node(source: &str) -> CompileOutput {
+    let _guard = compiler();
+    vilan_wasm::compile_program_for(source, vilan_core::Platform::default())
+}
+
+const SERVER_PROGRAM: &str = "import std::http::{ Response, Server };\n\
+    import std::print;\n\n\
+    async fun main() {\n\
+    \tServer::builder().port(3000).on_request(|request| {\n\
+    \t\tResponse::builder().body(\"ok\").build()\n\
+    \t}).on_start(|server| print(server.url())).build().start();\n\
+    }\n";
+
+#[test]
+fn a_server_program_checks_clean_for_node() {
+    let output = compile_for_node(SERVER_PROGRAM);
+    assert!(
+        output.diagnostics.is_empty(),
+        "a process-leg program must check clean under the node platform, got: {:#?}",
+        output.diagnostics
+    );
+    assert!(
+        output.js.is_some(),
+        "the node leg emits a real program even though the page never runs it"
+    );
+}
+
+#[test]
+fn a_server_program_is_rejected_for_the_browser() {
+    let output = compile(SERVER_PROGRAM);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("cannot run on `browser`")),
+        "the browser build must reject std::http with the platform-coloring \
+         diagnostic, got: {:#?}",
+        output.diagnostics
+    );
+}
+
+#[test]
+fn a_browser_program_is_rejected_for_node() {
+    // The rejection comes from NAME resolution, not platform coloring:
+    // std::ui resolves to its process twin under node, and that twin never
+    // declares `mount` — the name is absent rather than fenced.
+    let output = compile_for_node(
+        "import std::ui::{ mount, view };\n\nfun main() {\n\tmount(\"app\", view(\"p\").text(\"hi\"));\n}\n",
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("cannot find 'mount'")),
+        "a DOM program must reject under the node platform, got: {:#?}",
+        output.diagnostics
+    );
+}
