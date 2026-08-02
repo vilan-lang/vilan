@@ -187,7 +187,11 @@ If you create a reactive binding — a `bind_*`, a `Signal` in a slot, a
 error mentioning `owner_scope`. It means "wrap this in `mount_root`"
 (or `run_with_owner` in a test). Purely static structure needs no
 boundary: `mount("app", view("div").child(view("p").text("hi")))` is
-fine, because nothing in it subscribes.
+fine, because nothing in it subscribes. That holds through your own
+generic helpers too — a `fun card<T: Slot>(content: T): View` called
+with static content needs no boundary, while the same helper called
+with a `Signal` keeps the requirement: the compiler follows each call's
+actual instantiation.
 
 ## Events run in turns
 

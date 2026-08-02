@@ -6,6 +6,12 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Two holes in the owner fence are closed.** Both were found by the requirement-polymorphism design recon and proven with red probes. First: a trait-bound method called on a generic value *inside a closure* contributed no coverage edges at all — a `Signal` slot placed through such a call compiled with no boundary anywhere and registered against an undefined owner at runtime (a v0.21.1 regression; v0.20.0's blanket conservatism fenced it). Second, and much older: one covered caller laundered any number of uncovered top-level calls to the same function — `covered(); needy();` at top level compiled whenever `covered` provided a boundary somewhere else, and the top-level path read an undefined value. An uncovered entry now fences regardless of what other callers provide.
+
+**The owner fence follows instantiation chains.** v0.21.1 made the fence instantiation-aware one call deep; it now resolves the whole chain. A generic forwarding helper — `fun card<T: Slot>(content: T): View { view("div").child(content) }` — no longer demands a boundary for static content: the compiler chases each call site's recorded bindings through any number of forwarding levels (self- and mutual recursion included, resolved exactly), fences the calls that instantiate a subscribing arm, and leaves the rest free. Each call site is judged by its own instantiation, so one uncovered static call and one covered `Signal` call through the same helper both compile. Unresolvable chains — a helper taken as a value, or itself reached through dispatch — keep the conservative union, and concrete-receiver (`OnType`) dispatch is unchanged.
+
 ## v0.22.0 — 2026-08-02
 
 **The editor sends keystrokes, not files.** Text sync is incremental: the client ships each edit as a ranged splice instead of re-sending the whole buffer per keystroke, and the server applies them in order — full-replacement events still work, and manifests fold the same contract. The recorded edit shapes also buy precision: the inlay-hint viewport filter now maps each hint's anchor through the edits since the last analysis, so a line inserted above the viewport no longer drops the hints near its edge for the beat until the refresh lands.

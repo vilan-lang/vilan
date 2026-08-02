@@ -506,23 +506,26 @@ fn analyze(
         })
         .collect();
 
-    // --- Coverage-only dispatch refinement (element-syntax H8 residual):
-    // the union edges above stay for needs/strict/threading — sound, and the
-    // hidden value physically flows caller → generic body → impl either way —
-    // but COVERAGE follows the resolved instantiation where a call records
-    // one. `view("a").child(view("b"))` binds `child`'s `C` to `View`, whose
-    // `place` reads nothing; the Signal arm's owner fence must not reach that
-    // caller. Per `OnConstraint` site in a body F: each incoming direct call
-    // into F draws coverage edges from ITS caller to only the impl members
-    // its recorded binding selects (a top-level incoming call marks them
-    // outside-entered instead — always uncovered); a generic or missing
-    // binding, a value-taken F, an F itself reachable through dispatch, or a
-    // site owned by a CLOSURE (its entries are not `CallTarget::Function`
-    // edges, so they cannot be enumerated here) falls back to the union
-    // edge, so a generic forwarding wrapper keeps the conservative fence.
-    // `OnType` sites keep the union: this residual is the bounded-generic
-    // shape, and narrowing concrete-receiver dispatch is a separate
-    // tightening.
+    // --- Coverage-only dispatch refinement (element-syntax H8 →
+    // proposal/requirement-polymorphism.md): the union edges above stay for
+    // needs/strict/threading — sound, and the hidden value physically flows
+    // caller → generic body → impl either way — but COVERAGE follows the
+    // resolved instantiation. Per `OnConstraint` site, a WALK enumerates the
+    // entries of the function owning the constraint (a closure-owned site
+    // resolves as its parent function does): an entry whose recorded
+    // bindings — explicit generic arguments over the inferred substitution —
+    // resolve the constraint concretely draws coverage edges from ITS caller
+    // to only the impl members that type selects (a top-level entry marks
+    // them outside-entered — always uncovered); a binding that leads to
+    // another generic parameter recurses to the entry's own enclosing
+    // function, so a forwarding wrapper resolves per call site; an
+    // unresolvable binding falls back per entry (every candidate, from that
+    // entry's caller). A revisited (function, constraint) pair is skipped
+    // exactly — its edges are a function of the pair alone — so recursion
+    // needs no cap. Only a value-taken or dispatch-reachable level, whose
+    // entries cannot be enumerated, falls back to the whole-site union.
+    // `OnType` sites keep the union: narrowing concrete-receiver dispatch is
+    // a separate tightening.
     let impl_members_for = |resolved: &Type, member: &str| -> Vec<Id> {
         let matches_subject = |subject: &Type| match (subject, resolved) {
             (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => {
@@ -561,33 +564,51 @@ fn analyze(
             })
             .collect()
     };
-    let refined_for_call =
-        |incoming_call: Id, constraint: crate::type_::TypeId, member: &str| -> Option<Vec<Id>> {
-            let substitution = program.method_call_substitution.get(&incoming_call)?;
-            let mut resolved = *substitution.get(&constraint)?;
-            for _ in 0..16 {
-                match program.type_id_to_type_map.get(&resolved) {
-                    Some(Type::Generic(inner)) => match substitution.get(inner) {
-                        Some(bound) if *bound != resolved => resolved = *bound,
-                        _ => break,
-                    },
-                    _ => break,
-                }
-            }
-            let resolved = program.type_id_to_type_map.get(&resolved)?;
-            if matches!(
-                resolved,
-                Type::Generic(_) | Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
-            ) {
-                return None;
-            }
-            let members = impl_members_for(resolved, member);
-            if members.is_empty() {
-                None
-            } else {
-                Some(members)
-            }
+    enum Resolution {
+        Concrete(crate::type_::TypeId),
+        Parameter(crate::type_::TypeId),
+        Opaque,
+    }
+    // Chase a constraint through one call's recorded bindings —
+    // `method_call_substitution` is the single channel every instantiation
+    // shape records into, explicit generic arguments included.
+    let resolve_through = |bindings: Option<&crate::type_::SubstitutionContext>,
+                           constraint: crate::type_::TypeId|
+     -> Resolution {
+        let Some(bindings) = bindings else {
+            return Resolution::Opaque;
         };
+        let Some(mut resolved) = bindings.get(&constraint).copied() else {
+            return Resolution::Opaque;
+        };
+        for _ in 0..16 {
+            match program.type_id_to_type_map.get(&resolved) {
+                Some(Type::Generic(inner)) => match bindings.get(inner) {
+                    Some(bound) if *bound != resolved => resolved = *bound,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        match program.type_id_to_type_map.get(&resolved) {
+            Some(Type::Generic(inner)) => Resolution::Parameter(*inner),
+            Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)) | None => {
+                Resolution::Opaque
+            }
+            Some(_) => Resolution::Concrete(resolved),
+        }
+    };
+    // The nearest enclosing function of a graph node (identity for a
+    // function; a closure hops its lexical parents).
+    let enclosing_function = |node: Id| -> Option<Id> {
+        let mut current = node;
+        loop {
+            if program.functions.contains_key(&current) {
+                return Some(current);
+            }
+            current = graph.closure_parent_of(current)?;
+        }
+    };
     // Incoming direct calls per function, and top-level incoming calls.
     let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::new();
     for node in graph.nodes() {
@@ -626,30 +647,67 @@ fn analyze(
                 continue;
             }
         };
-        if !program.functions.contains_key(owner)
-            || value_taken.contains(owner)
-            || dispatch_callers.contains_key(owner)
-        {
+        // Concrete resolution → the impl members the type selects; an
+        // empty selection (defensive — the bound audit rejects no-impl
+        // types) falls back to every candidate.
+        let selected_for = |resolved: crate::type_::TypeId| -> Vec<Id> {
+            let selected = program
+                .type_id_to_type_map
+                .get(&resolved)
+                .map(|type_| impl_members_for(type_, member))
+                .unwrap_or_default();
+            if selected.is_empty() {
+                candidates.clone()
+            } else {
+                selected
+            }
+        };
+        let Some(root) = enclosing_function(*owner) else {
             union_fallback(&mut coverage_dispatch_callers);
             continue;
-        }
-        for (caller, incoming_call) in incoming_calls.get(owner).into_iter().flatten() {
-            match refined_for_call(*incoming_call, constraint, member) {
-                Some(selected) => {
-                    for candidate in selected {
-                        coverage_dispatch_callers
-                            .entry(candidate)
-                            .or_default()
-                            .push(*caller);
-                    }
-                }
-                None => union_fallback(&mut coverage_dispatch_callers),
+        };
+        let mut visited: HashSet<(Id, crate::type_::TypeId)> = HashSet::new();
+        let mut walk: Vec<(Id, crate::type_::TypeId)> = vec![(root, constraint)];
+        while let Some((function, constraint)) = walk.pop() {
+            if !visited.insert((function, constraint)) {
+                // A revisit re-derives identical edges — skipping is exact.
+                continue;
             }
-        }
-        for incoming_call in top_level_incoming.get(owner).into_iter().flatten() {
-            match refined_for_call(*incoming_call, constraint, member) {
-                Some(selected) => coverage_outside.extend(selected),
-                None => union_fallback(&mut coverage_dispatch_callers),
+            if value_taken.contains(&function) || dispatch_callers.contains_key(&function) {
+                // This level's entries cannot be enumerated.
+                union_fallback(&mut coverage_dispatch_callers);
+                continue;
+            }
+            for (caller, incoming_call) in incoming_calls.get(&function).into_iter().flatten() {
+                let bindings = program.method_call_substitution.get(incoming_call);
+                let selected = match resolve_through(bindings, constraint) {
+                    Resolution::Concrete(resolved) => selected_for(resolved),
+                    Resolution::Parameter(parameter) => match enclosing_function(*caller) {
+                        Some(outer) => {
+                            walk.push((outer, parameter));
+                            continue;
+                        }
+                        None => candidates.clone(),
+                    },
+                    Resolution::Opaque => candidates.clone(),
+                };
+                for candidate in selected {
+                    coverage_dispatch_callers
+                        .entry(candidate)
+                        .or_default()
+                        .push(*caller);
+                }
+            }
+            for incoming_call in top_level_incoming.get(&function).into_iter().flatten() {
+                let bindings = program.method_call_substitution.get(incoming_call);
+                match resolve_through(bindings, constraint) {
+                    Resolution::Concrete(resolved) => {
+                        coverage_outside.extend(selected_for(resolved));
+                    }
+                    // Top-level code has no generic parameters to recurse
+                    // into — an unresolved binding marks every candidate.
+                    _ => coverage_outside.extend(candidates.iter().copied()),
+                }
             }
         }
     }

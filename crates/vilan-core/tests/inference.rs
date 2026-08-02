@@ -26931,12 +26931,13 @@ fn a_signal_attr_outside_a_boundary_stays_fenced() {
 }
 
 #[test]
-fn a_generic_slot_forwarder_keeps_the_conservative_fence() {
-    // A forwarding wrapper binds `C` to its own generic — no concrete
-    // instantiation at the inner call, so coverage falls back to the union
-    // and the fence holds. Requirement polymorphism is the recorded
-    // follow-up refactor, not this fix.
-    let errors = compile_browser(
+fn a_generic_slot_forwarder_with_a_static_slot_compiles() {
+    // Requirement polymorphism: the inner call binds `C` to `wrap`'s own
+    // generic, and the walk resolves `T` at `wrap`'s call sites — a static
+    // instantiation selects only the `str` arm, which reads nothing, so no
+    // boundary is demanded (requirement-polymorphism.md §3; flipped from the
+    // S1-era conservative pin, proven red against the union fallback).
+    compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
@@ -26948,11 +26949,172 @@ fn a_generic_slot_forwarder_keeps_the_conservative_fence() {
         main();
         "#,
     )
-    .expect_err("generic forwarding keeps the conservative fence");
+    .expect("a static slot through a forwarder needs no boundary");
+}
+
+#[test]
+fn a_signal_through_a_generic_forwarder_stays_fenced() {
+    // The walk must not loosen the reactive arm: the same forwarder with a
+    // Signal instantiation selects the subscribing impl, entered from an
+    // uncovered top-level call — fenced.
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        import std::reactive::Signal;
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun main() {
+            mount("app", wrap(Signal::new("live")));
+        }
+        main();
+        "#,
+    )
+    .expect_err("a Signal through a forwarder keeps the fence");
     assert!(
         errors.iter().any(|error| error.contains("owner_scope")),
         "the fence must name owner_scope:\n{errors:?}"
     );
+}
+
+#[test]
+fn mixed_forwarder_call_sites_fence_by_their_own_instantiation() {
+    // Edge attribution is the outermost resolving caller, not the forwarder:
+    // an uncovered STATIC call through `wrap` must not poison a covered
+    // SIGNAL call through the same `wrap`. Attaching edges to the forwarder
+    // itself would conflate the two paths and reject this program.
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, mount_root, view, View };
+        import std::reactive::Signal;
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun main() {
+            mount("app", wrap("static"));
+            mount_root("live", || wrap(Signal::new("ticking")));
+        }
+        main();
+        "#,
+    )
+    .expect("each call site fences by its own instantiation");
+}
+
+#[test]
+fn a_two_level_forwarder_resolves_through_both_levels() {
+    // The walk recurses: `outer` binds `wrap`'s `T` to its own `U`, and `U`
+    // resolves at `outer`'s call sites.
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun outer<U: Slot>(content: U): View {
+            wrap(content)
+        }
+        fun main() {
+            mount("app", outer("static"));
+        }
+        main();
+        "#,
+    )
+    .expect("two forwarding levels resolve to the static arm");
+}
+
+#[test]
+fn a_two_level_forwarder_keeps_the_fence_for_a_signal() {
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        import std::reactive::Signal;
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun outer<U: Slot>(content: U): View {
+            wrap(content)
+        }
+        fun main() {
+            mount("app", outer(Signal::new("live")));
+        }
+        main();
+        "#,
+    )
+    .expect_err("a Signal through two forwarding levels keeps the fence");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_self_recursive_forwarder_resolves_exactly() {
+    // The visited-skip is exact, not a fallback: the self-call re-derives
+    // the same (function, constraint) pair, and every real path enters
+    // through the external call, which resolves statically.
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T, depth: i32): View {
+            if depth > 0 {
+                wrap(content, depth - 1)
+            } else {
+                view("p").child(content)
+            }
+        }
+        fun main() {
+            mount("app", wrap("static", 3));
+        }
+        main();
+        "#,
+    )
+    .expect("self-recursion resolves through the external entry");
+}
+
+#[test]
+fn a_self_recursive_forwarder_keeps_the_fence_for_a_signal() {
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        import std::reactive::Signal;
+        fun wrap<T: Slot>(content: T, depth: i32): View {
+            if depth > 0 {
+                wrap(content, depth - 1)
+            } else {
+                view("p").child(content)
+            }
+        }
+        fun main() {
+            mount("app", wrap(Signal::new("live"), 3));
+        }
+        main();
+        "#,
+    )
+    .expect_err("a Signal through a recursive forwarder keeps the fence");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn explicit_type_arguments_resolve_the_forwarder() {
+    // An explicit-generic-argument call resolves like an inferred one:
+    // `method_call_substitution` is the single channel every instantiation
+    // shape records into, explicit arguments included.
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun main() {
+            mount("app", wrap<str>("static"));
+        }
+        main();
+        "#,
+    )
+    .expect("explicit type arguments resolve the instantiation");
 }
 
 #[test]
@@ -26986,11 +27148,11 @@ fn a_signal_through_a_closure_owned_dispatch_site_stays_fenced() {
 }
 
 #[test]
-fn a_static_slot_through_a_closure_owned_dispatch_site_stays_fenced() {
-    // The conservative half of the §1b fix: a closure-owned site unions, so
-    // even a static instantiation fences. S2 (the resolution walk) flips
-    // this pin — the closure resolves through its parent chain.
-    let errors = compile_browser(
+fn a_static_slot_through_a_closure_owned_dispatch_site_compiles() {
+    // S2 flips S1's conservative half of the §1b fix: a closure-owned site
+    // resolves as its parent function does, and `wrap`'s call sites bind the
+    // static arm (proven red against S1's union fallback).
+    compile_browser(
         r#"
         import std::ui::{ Slot, mount, view, View };
         fun wrap<T: Slot>(content: T): View {
@@ -27005,11 +27167,7 @@ fn a_static_slot_through_a_closure_owned_dispatch_site_stays_fenced() {
         main();
         "#,
     )
-    .expect_err("S1 keeps the closure-owned site conservative");
-    assert!(
-        errors.iter().any(|error| error.contains("owner_scope")),
-        "the fence must name owner_scope:\n{errors:?}"
-    );
+    .expect("a closure-owned site resolves through its parent chain");
 }
 
 #[test]

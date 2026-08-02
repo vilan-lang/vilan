@@ -95,13 +95,20 @@ without an enclosing `run`") when a strict read is reachable from:
 - a module-level initializer;
 - any caller chain that does not pass through a `run` of that context.
 
-Trait/generic-dispatched calls are covered conservatively: a dispatch
-site is treated as reaching every candidate implementation (and the
-trait default), so a needy candidate demands coverage of the caller
-even if another candidate would have been selected. Dead code,
-a function with no callers at all, is exempt (it cannot run
-uncovered); a function called only from top level, or taken as a
-value, is not.
+A call dispatched on a **generic bound** is covered by instantiation:
+the compiler resolves each call chain's recorded type bindings — through
+generic forwarding functions, recursively — and a needy candidate
+implementation demands coverage only of the callers whose instantiation
+actually selects it. A chain the compiler cannot resolve (an
+unrecorded binding, a function taken as a value or itself reachable
+through dispatch) is covered conservatively: the site is treated as
+reaching every candidate, so a needy candidate demands coverage of the
+caller even if another candidate would have been selected. A call
+dispatched on a **concrete receiver's type** is always covered
+conservatively. Dead code, a function with no callers at all, is
+exempt (it cannot run uncovered); a function called from top level, or
+taken as a value, is entered without the value and is never covered,
+whatever its other callers.
 
 A function that reads a context **cannot be used as a value**
 ("`…` reads context `…`, so it can't be used as a value"): an indirect

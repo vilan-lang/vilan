@@ -1,9 +1,11 @@
 # Requirement polymorphism — the coverage fence follows instantiation chains
 
-Status: **DRAFT 2026-08-02** — the recorded follow-up refactor from the H8
-residual fix (`element-syntax.md` §6, backlog H8, commit `8d6980e`), plus two
-soundness holes its design recon surfaced, both proven with red probes before
-this document was written.
+Status: **BOTH SLICES SHIPPED 2026-08-02** (backlog B51) — the recorded
+follow-up refactor from the H8 residual fix (`element-syntax.md` §6, backlog
+H8, commit `8d6980e`), plus two soundness holes its design recon surfaced,
+both proven with red probes before this document was written. S1 (the holes)
+landed as `f7dcb66`; S2 (the walk) follows it on the same branch. §7 holds
+the ship record.
 
 ## 1. The problem, in three shapes
 
@@ -101,24 +103,31 @@ dispatch site with candidate impl members:
    with its parent's substitution, and its coverage is already defined by its
    parent's boundness. (This closes hole (b): the closure-owned site resolves
    exactly as if the call were written in `F`'s body.)
-2. **Entry enumeration at `F`.** If `F` is value-taken, dispatch-reachable,
-   or the walk has visited `F` before (a cycle), the site falls back to the
-   union — its entries cannot be enumerated. Otherwise its entries are
-   `incoming_calls[F]` plus `top_level_incoming[F]`.
+2. **Entry enumeration at `F`.** If `F` is value-taken or
+   dispatch-reachable, the site falls back to the union — its entries cannot
+   be enumerated. Otherwise its entries are `incoming_calls[F]` plus
+   `top_level_incoming[F]`. A `(F, constraint)` pair the walk has already
+   processed is **skipped, exactly**: its edge contribution is a function of
+   the pair alone, so a revisit re-derives identical edges — recursion
+   (self- or mutual) needs no fallback and no depth cap; the visited set
+   bounds the walk.
 3. **Per-entry chase.** For each entry call, resolve the constraint through
-   the call's bindings — the recorded `method_call_substitution` merged with
-   **explicit generic arguments** (`generic_argument_ids` zipped with the
-   callee's constraints, the same two channels the transformer's
-   `call_substitution` reads), chasing `Generic` links within the merged map
-   as today:
+   the call's recorded `method_call_substitution` — the single channel every
+   instantiation shape records into, explicit generic arguments included (a
+   merged explicit-args channel was implemented and proven dead by plant:
+   disabling it changed no pin, so it was removed) — chasing `Generic` links
+   within the map as today:
    - **Concrete resolution** → `impl_members_for` selects the candidates;
      the edge attaches to *this entry's* caller node — or to the
      outside-entered set for a top-level entry.
-   - **`Generic(P)` where `P` is a parameter of the entry's owner function**
-     → recurse from step 1 with that owner and `P`. The walk carries a
-     visited set and a depth cap (16); either trips → union fallback.
+   - **`Generic(P)`** → recurse from step 1 with the entry's enclosing
+     function and `P` (a closure entry hops to its parent function — `P` can
+     only be a function's parameter).
    - **Anything else unresolvable** (`Any`/`Unknown`/`Unresolved`/`Trait`,
-     or no recorded bindings) → union fallback for this entry.
+     or no recorded bindings) → *per-entry* fallback: every candidate gets an
+     edge from this entry's caller (or joins the outside-entered set for a
+     top-level entry) — conservative for exactly the paths through this
+     entry, refined edges elsewhere untouched.
 
 **Edge attribution is the outermost resolving caller**, not the forwarder:
 for `F → wrap → child → place`, the `Signal` arm's edge attaches to `F`.
@@ -152,10 +161,10 @@ paths provably bind a different impl.
 ## 5. Slices
 
 - **S1 — make the fence sound again** (the two holes; release-urgent since
-  (b) shipped in v0.21.1): closure-owner normalization *as a fallback check*
-  (a closure-owned site unions, restoring v0.20.0's behavior for shape (b))
-  and the outside-entry hoist for shape (c). Both pinned red-first. Fence
-  strictly tightens; no user-visible loosening.
+  (b) shipped in v0.21.1 *and* v0.22.0): closure-owner normalization *as a
+  fallback check* (a closure-owned site unions, restoring v0.20.0's behavior
+  for shape (b)) and the outside-entry hoist for shape (c). Both pinned
+  red-first. Fence strictly tightens; no user-visible loosening.
 - **S2 — the walk** (requirement polymorphism proper): the recursive
   resolution replacing the one-level `refined_for_call`, subsuming S1's
   closure fallback with real precision (a closure-owned site resolves
@@ -174,7 +183,32 @@ first against S1); `wrap(Signal::new(…))` uncovered stays fenced;
 `wrap(sig)` under a boundary plus `wrap("static")` at top level both in one
 program compile (edge attribution — red first, this is the shape one-level
 composition gets wrong); two-level forwarder (`outer<U: Slot>` → `wrap<T>`)
-static compiles / `Signal` fences; a self-recursive generic forwarder keeps
-the conservative fence (cycle guard); explicit type arguments
-(`wrap<str>("static")`) compile unfenced; closure-owned site + static slot
-compiles (b′ flip); the five existing `8d6980e` pins unchanged.
+static compiles / `Signal` fences; a self-recursive generic forwarder with a
+static slot compiles and with a `Signal` fences (the visited-skip is exact,
+not a fallback); explicit type arguments (`wrap<str>("static")`) compile
+unfenced; closure-owned site + static slot compiles (b′ flip); the five
+existing `8d6980e` pins unchanged.
+
+## 7. Ship record (2026-08-02)
+
+- **S1** — commit `f7dcb66`: the closure-owner union fallback and the
+  outside-entry hoist. Four pins, three proven red first (the static-slot
+  closure-owned pin recorded S1's deliberate conservatism and flipped under
+  S2 as planned).
+- **S2** — the walk, same branch: `resolve_through` (the within-map chase,
+  classifying Concrete / Parameter / Opaque), `enclosing_function` (closure →
+  parent hop), and a per-site worklist over `(function, constraint)` pairs
+  with an exact visited-skip. Per-entry fallbacks attach every candidate to
+  that entry's caller; only value-taken / dispatch-reachable levels union
+  whole-site. Two flips proven red against S1; the edge-attribution pin
+  proven by plant (attributing to the forwarder reds it); the
+  explicit-generic-args pin kept as a behavior pin after its dedicated
+  channel was proven dead by plant and removed (§3). Nine S2 pins; 1216
+  inference pins green.
+- **Deviations from the draft**: the cycle guard became an exact visited-skip
+  (no depth cap, no fallback — a revisit re-derives identical edges); the
+  explicit-args channel was dropped as dead; per-entry fallback replaced the
+  draft's whole-site union for unresolvable bindings (strictly more precise,
+  same soundness argument).
+- **Still open**: `OnType` narrowing (the separate tightening); requirement
+  polymorphism for *injected closures* was never in scope (§2).
