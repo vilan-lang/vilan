@@ -33,8 +33,8 @@ The serial 130.7 s decomposes (per-binary `finished in`, top of 51 sets):
 |---------|-------|----------------------------|----------------------------------------|
 | 29.9    | 241   | vilan-lsp unit tests       | ~81 fixture sites each running a real `Document::analyze` against on-disk std (~150 ms apiece) |
 | 18.7    | 1205  | tests/inference.rs         | ~1400 full-pipeline `compile()` calls burning ~276 CPU-seconds across all 16 cores — **compile-bound**, at ~90 % parallel efficiency already. (First attributed to its 534 node spawns; §2.1's measurement corrected that.) |
-| 16.7    | 8     | tests/docs.rs              | every book fence compiled **serially** inside 8 tests; runnable fences also spawn node |
-| 14.9    | 9     | tests/interpreter.rs       | per-case `CARGO_BIN_EXE_vilan` spawns, serial |
+| 16.7    | 8     | tests/docs.rs              | every book fence compiled **serially** inside one test (the audit's "also spawns node" was wrong — the gate only compiles). E27 parallelized it: → 3.7 s |
+| 14.9    | 9     | tests/interpreter.rs       | the equivalence sweep runs each admitted corpus program **serially** (in-process compile + node run + interpreter; no CLI spawns, another audit slip). E27 parallelized it: → 2.8 s |
 | 8.1     | 2     | tests/examples.rs          | 9 examples staged via `git ls-files` and built through the debug binary |
 | 5.4     | 6     | tests/corpus.rs            | already 8-way parallel (`thread::scope`, chunked) — the shape the others should copy |
 | 4.7/4.2/2.8 | — | hmr / rpc_http / transport | e2e legs: ports (post-E19 they bind port 0) + real servers |
@@ -63,10 +63,16 @@ Ordered by measured payoff; estimates assume the others have not landed.
   withdrawn 2026-08-02: removing every spawn moved the wall from 19.39 s to
   19.20 s — noise. The binary is compile-bound (§2.1); the real lever is
   E30.
-- **E27 — parallelize the docs gate and interpreter cases**: both are
-  serial loops over independent compiles; corpus.rs already demonstrates
-  the safe 8-way chunk shape in this very suite. Est: 16.7 s → ~4 s and
-  14.9 s → ~4 s.
+- **E27 — parallelize the docs gate and interpreter cases — SHIPPED
+  2026-08-02**: both were serial loops over independent compiles (verified
+  by the E26-lesson user-time check first: docs 16.6 s user at 99 % CPU,
+  interpreter 14.8 s at 104 % — genuinely single-threaded, real headroom).
+  corpus.rs's 8-way `thread::scope` chunk shape, applied verbatim; chunks
+  preserve item order and workers join in spawn order, so failure reports
+  read identically to the serial loops'. Measured: docs 16.78 s → 3.73 s
+  (531 % CPU), interpreter 15.09 s → 2.78 s (674 % CPU) — 25.4 s off the
+  serial floor. Both gates plant-proven red under parallelism (a broken
+  README fence; db.vl unexcluded), each failure named and attributable.
 - **E28 — share the LSP's analyzed fixtures**: the unit binary's 29.9 s is
   ~81 `Document::analyze` fixture sites; a `OnceLock`-shared analysis per
   distinct SOURCE keeps every assertion while paying each analysis once.
@@ -127,9 +133,9 @@ Two corrections propagate:
   not attribution).
 
 Sequencing after the correction: **E27 → E25 → (E28/E30/E29 as E25's
-outcome dictates)**. E27 takes the serial floor to ~100 s; E25's real
-ceiling wants re-estimating from CPU sums; E30 is the only lever left on
-inference and it needs the analyzer-arc decision first.
+outcome dictates)**. E27 (shipped: −25.4 s) takes the serial floor to
+~105 s; E25's real ceiling wants re-estimating from CPU sums; E30 is the
+only lever left on inference and it needs the analyzer-arc decision first.
 
 ## 3. What was NOT found
 

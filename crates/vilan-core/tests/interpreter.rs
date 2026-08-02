@@ -177,40 +177,72 @@ fn every_admitted_corpus_program_is_equivalent_interpreted() {
     paths.sort();
     assert!(!paths.is_empty(), "no corpus programs found");
 
-    let mut failures = Vec::new();
-    let mut checked = 0;
-    for path in &paths {
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if EXCLUDED.iter().any(|(excluded, _)| *excluded == name) {
-            continue;
-        }
-        let source = std::fs::read_to_string(path).expect("read corpus file");
-        match both_ways(source, 50_000_000) {
-            Ok((node_stdout, node_exit, Ok((interp_stdout, interp_exit)))) => {
-                checked += 1;
-                if node_stdout != interp_stdout || node_exit != interp_exit {
-                    let first_diff = node_stdout
-                        .lines()
-                        .zip(interp_stdout.lines())
-                        .enumerate()
-                        .find(|(_, (a, b))| a != b)
-                        .map(|(line, (a, b))| format!("line {}: node {a:?} vs interp {b:?}", line + 1))
-                        .unwrap_or_else(|| {
-                            format!(
-                                "lengths/exits differ (node {} lines exit {node_exit}, interp {} lines exit {interp_exit})",
-                                node_stdout.lines().count(),
-                                interp_stdout.lines().count()
-                            )
-                        });
-                    failures.push(format!("{name}: {first_diff}"));
-                }
-            }
-            Ok((_, _, Err((kind, message)))) => {
-                failures.push(format!("{name}: interpreter failed ({kind:?}): {message}"));
-            }
-            Err(error) => failures.push(format!("{name}: {error}")),
-        }
-    }
+    let admitted: Vec<(String, &PathBuf)> = paths
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+            )
+        })
+        .filter(|(name, _)| !EXCLUDED.iter().any(|(excluded, _)| *excluded == name))
+        .collect();
+
+    // Each admitted program is an independent compile-and-compare, so run
+    // them in parallel chunks (corpus.rs's shape). Chunks preserve the sorted
+    // order and workers join in spawn order, so the failure report reads the
+    // same as the serial loop's did.
+    let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = admitted
+            .chunks(admitted.len().div_ceil(8).max(1))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut failures = Vec::new();
+                    let mut checked = 0;
+                    for (name, path) in chunk {
+                        let source = std::fs::read_to_string(path).expect("read corpus file");
+                        match both_ways(source, 50_000_000) {
+                            Ok((node_stdout, node_exit, Ok((interp_stdout, interp_exit)))) => {
+                                checked += 1;
+                                if node_stdout != interp_stdout || node_exit != interp_exit {
+                                    let first_diff = node_stdout
+                                        .lines()
+                                        .zip(interp_stdout.lines())
+                                        .enumerate()
+                                        .find(|(_, (a, b))| a != b)
+                                        .map(|(line, (a, b))| format!("line {}: node {a:?} vs interp {b:?}", line + 1))
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "lengths/exits differ (node {} lines exit {node_exit}, interp {} lines exit {interp_exit})",
+                                                node_stdout.lines().count(),
+                                                interp_stdout.lines().count()
+                                            )
+                                        });
+                                    failures.push(format!("{name}: {first_diff}"));
+                                }
+                            }
+                            Ok((_, _, Err((kind, message)))) => {
+                                failures.push(format!(
+                                    "{name}: interpreter failed ({kind:?}): {message}"
+                                ));
+                            }
+                            Err(error) => failures.push(format!("{name}: {error}")),
+                        }
+                    }
+                    (checked, failures)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("equivalence worker panicked"))
+            .collect()
+    });
+    let checked: usize = results.iter().map(|(checked, _)| checked).sum();
+    let failures: Vec<String> = results
+        .into_iter()
+        .flat_map(|(_, failures)| failures)
+        .collect();
     assert!(
         failures.is_empty(),
         "{} of {} corpus programs diverged:\n{}",
