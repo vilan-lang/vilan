@@ -1263,6 +1263,25 @@ impl Document {
         self.text != self.analyzed_text()
     }
 
+    /// Whether this document's LAST analysis loaded `path` — the dependency
+    /// edge reanalysis gating asks about (backlog B39): an edit to a file
+    /// this document never loaded cannot change its diagnostics, so its
+    /// dependents-sweep can skip it. The set is `Program.canonical_sources`
+    /// (the entry, every imported package module, and std), compared through
+    /// `same_file` so path spelling cannot fake a miss. A document with no
+    /// program answers TRUE: with no recorded set, re-analysis is the
+    /// conservative direction — the old always-sweep behavior, kept exactly
+    /// where its reason still holds.
+    pub fn depends_on(&self, path: &Path) -> bool {
+        let Some(program) = &self.program else {
+            return true;
+        };
+        program
+            .canonical_sources
+            .iter()
+            .any(|source| same_file(source, path))
+    }
+
     /// Land a completed analysis of this document (`analysis` is a fresh
     /// [`Document::analyze`] result for the same file).
     ///
@@ -6330,6 +6349,62 @@ pub(crate) mod tests {
             !document.is_stale(),
             "reverting heals without needing an analysis to land",
         );
+    }
+
+    // --- B39a: the dependents sweep is gated on the dependency edge ---
+    //
+    // `depends_on` is the whole decision `reanalyze_dependents` filters by,
+    // so these pin the recorded behavior directly: an importer IS a
+    // dependent, a stranger is NOT (one analysis per pause, not two), path
+    // spelling cannot fake a miss, and a document with no program stays on
+    // the conservative always-sweep arm.
+
+    #[test]
+    fn a_document_depends_on_the_files_its_analysis_loaded() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\nfun main() { greet(); }\n",
+            ),
+            ("helper.vl", "fun greet() {}\n"),
+        ]);
+        assert!(
+            document.depends_on(&dir.join("helper.vl")),
+            "the imported module is a dependency edge"
+        );
+        assert!(
+            document.depends_on(&dir.join("./helper.vl")),
+            "path spelling must not fake a miss"
+        );
+        assert!(
+            document.depends_on(&dir.join("main.vl")),
+            "a document depends on its own file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_does_not_depend_on_an_unrelated_open_file() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {}\n"),
+            ("other.vl", "fun elsewhere() {}\n"),
+        ]);
+        assert!(
+            !document.depends_on(&dir.join("other.vl")),
+            "no import edge means no reanalysis - one analysis per pause, not two"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_without_a_program_is_conservatively_a_dependent() {
+        let (dir, mut document) = analyze_workspace(&[("main.vl", "fun main() {}\n")]);
+        document.program = None;
+        assert!(
+            document.depends_on(&dir.join("anything.vl")),
+            "with no recorded source set, re-analysis is the conservative direction"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -1132,10 +1132,17 @@ async fn publish_document(
     }
 }
 
-/// Re-analyze every OTHER open document: an edit (or save) of one file changes
-/// what its dependents see, so their diagnostics must be recomputed — the
-/// stale-diagnostics half of backlog E1. Their buffers didn't change, so this
-/// bypasses the unchanged-text short-circuit deliberately. Returns whether any
+/// Re-analyze the open documents that DEPEND on the changed file: an edit (or
+/// save) of one file changes what its dependents see, so their diagnostics
+/// must be recomputed — the stale-diagnostics half of backlog E1, now gated
+/// on the real dependency edge (backlog B39a): a document whose last analysis
+/// never loaded the changed file cannot see the edit, and re-analyzing every
+/// open file anyway was the request path's largest fixed cost per typing
+/// pause. Dependents' buffers didn't change, so this bypasses the
+/// unchanged-text short-circuit deliberately. Conservative arms stay
+/// conservative: a document with no program is swept (no recorded set), and
+/// a changed URL that is not a file path sweeps everyone — both are the old
+/// behavior, kept exactly where its reason still holds. Returns whether any
 /// of them landed an analysis.
 async fn reanalyze_dependents(
     documents: &DashMap<Url, Document>,
@@ -1143,13 +1150,18 @@ async fn reanalyze_dependents(
     publish_state: &std::sync::Mutex<PublishState>,
     changed: &Url,
 ) -> bool {
-    let others: Vec<(Url, String)> = documents
+    let changed_path = changed.to_file_path().ok();
+    let dependents: Vec<(Url, String)> = documents
         .iter()
         .filter(|entry| entry.key() != changed)
+        .filter(|entry| match &changed_path {
+            Some(path) => entry.value().depends_on(path),
+            None => true,
+        })
         .map(|entry| (entry.key().clone(), entry.value().text.clone()))
         .collect();
     let mut landed = false;
-    for (uri, text) in others {
+    for (uri, text) in dependents {
         landed |= analyze_and_publish(documents, client, publish_state, uri, text).await;
     }
     landed

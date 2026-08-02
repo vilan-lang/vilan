@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Typing in one file no longer re-analyzes every other open file.** On each typing pause the language server swept every other open document through a full analysis, serially, whether or not it could possibly care — with a handful of files open, most of the per-keystroke cost was other files' re-analyses. The sweep is now gated on the real dependency edge: a document re-analyzes only when its last analysis actually loaded the changed file (its imports, transitively, plus std). The conservative arms stay conservative — a document that failed to analyze has no recorded set and is swept as before.
+
 ## v0.21.0 — 2026-08-01
 
 **The language server learns markup.** Tags — opening and closing — paint as their own semantic token, attribute and event names as properties, and the desugar's scaffolding no longer bleeds through: the `<div`-as-function token and the child-position method tokens are gone, so a hole's contents paint as themselves, deterministically. Editing a tag name renames its pair — the server implements linked editing ranges over a raw parse, the same cheap per-request pass keyword hover uses. (The closing tag's span now rides the AST for this; the parser had been dropping it after the match check.)
