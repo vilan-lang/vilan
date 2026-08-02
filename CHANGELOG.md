@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.22.1 — 2026-08-02
 
 **Two holes in the owner fence are closed.** Both were found by the requirement-polymorphism design recon and proven with red probes. First: a trait-bound method called on a generic value *inside a closure* contributed no coverage edges at all — a `Signal` slot placed through such a call compiled with no boundary anywhere and registered against an undefined owner at runtime (a v0.21.1 regression; v0.20.0's blanket conservatism fenced it). Second, and much older: one covered caller laundered any number of uncovered top-level calls to the same function — `covered(); needy();` at top level compiled whenever `covered` provided a boundary somewhere else, and the top-level path read an undefined value. An uncovered entry now fences regardless of what other callers provide.
 
