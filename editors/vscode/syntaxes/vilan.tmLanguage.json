@@ -1,276 +1,392 @@
 {
-  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-  "name": "Vilan",
-  "scopeName": "source.vilan",
-  "patterns": [
-    { "include": "#comments" },
-    { "include": "#strings" },
-    { "include": "#numbers" },
-    { "include": "#attributes" },
-    { "include": "#function-definition" },
-    { "include": "#keywords" },
-    { "include": "#types" },
-    { "include": "#function-call" },
-    { "include": "#operators" }
-  ],
-  "repository": {
-    "comments": {
-      "patterns": [
-        {
-          "name": "comment.line.double-slash.vilan",
-          "match": "//.*$"
-        }
-      ]
-    },
-    "strings": {
-      "patterns": [
-        {
-          "comment": "Interpolated triple-quoted string `i\"\"\"...{expr}...\"\"\"` (H7) — the triple-quoted form with holes: RAW but for the two brace escapes `\\{` and `\\}`. First of all the string rules: the triple rule below does not match at the `i`, and the `i\"` rule would end at the very next quote (the second of the three).",
-          "name": "string.quoted.triple.vilan",
-          "begin": "\\b(i)(\"\"\")",
-          "beginCaptures": {
-            "1": { "name": "storage.type.string.vilan" },
-            "2": { "name": "punctuation.definition.string.begin.vilan" }
-          },
-          "end": "(\"\"\")",
-          "endCaptures": {
-            "1": { "name": "punctuation.definition.string.end.vilan" }
-          },
-          "patterns": [
-            {
-              "comment": "Exactly two escapes exist here; a backslash before anything else is a literal backslash.",
-              "name": "constant.character.escape.vilan",
-              "match": "\\\\[{}]"
-            },
-            {
-              "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"\"\"`, so a hole can never swallow the closing delimiter — an unclosed `{` while typing corrupts at most the rest of the literal. A lone `\"` is ordinary content here, so — unlike the single-quoted form — the hole does not stop at one.",
-              "name": "meta.template.expression.vilan",
-              "begin": "\\{",
-              "end": "\\}|(?=\"\"\")",
-              "beginCaptures": {
-                "0": { "name": "punctuation.definition.template-expression.begin.vilan" }
-              },
-              "endCaptures": {
-                "0": { "name": "punctuation.definition.template-expression.end.vilan" }
-              },
-              "patterns": [{ "include": "$self" }]
-            }
-          ]
-        },
-        {
-          "comment": "Triple-quoted string `\"\"\"...\"\"\"` — RAW and multi-line: no escapes, no interpolation; content runs to the first `\"\"\"`. Must be tried before the plain rule, or `\"\"\"` reads as an empty string plus a quote.",
-          "name": "string.quoted.triple.vilan",
-          "begin": "(\"\"\")",
-          "beginCaptures": {
-            "1": { "name": "punctuation.definition.string.begin.vilan" }
-          },
-          "end": "(\"\"\")",
-          "endCaptures": {
-            "1": { "name": "punctuation.definition.string.end.vilan" }
-          }
-        },
-        {
-          "comment": "Interpolated string `i\"...{expr}...\"` — ONLY `i\"` strings have holes; a `{` in a plain string is literal. `\\b` keeps a trailing `i` of an identifier (`hi\"..\"`) from reading as the prefix.",
-          "name": "string.quoted.double.vilan",
-          "begin": "\\b(i)(\")",
-          "beginCaptures": {
-            "1": { "name": "storage.type.string.vilan" },
-            "2": { "name": "punctuation.definition.string.begin.vilan" }
-          },
-          "end": "(\")|$",
-          "endCaptures": {
-            "1": { "name": "punctuation.definition.string.end.vilan" }
-          },
-          "patterns": [
-            {
-              "name": "constant.character.escape.vilan",
-              "match": "\\\\."
-            },
-            {
-              "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"`, so a hole can never swallow the string's closing quote — an unclosed `{` while typing corrupts at most its own line. The trade: a string literal NESTED in a hole ends the hole early; rare, and the damage stays local.",
-              "name": "meta.template.expression.vilan",
-              "begin": "\\{",
-              "end": "\\}|(?=\")|$",
-              "beginCaptures": {
-                "0": { "name": "punctuation.definition.template-expression.begin.vilan" }
-              },
-              "endCaptures": {
-                "0": { "name": "punctuation.definition.template-expression.end.vilan" }
-              },
-              "patterns": [{ "include": "$self" }]
-            }
-          ]
-        },
-        {
-          "comment": "Plain string — `{`/`}` are literal characters, never interpolation.",
-          "name": "string.quoted.double.vilan",
-          "begin": "(\")",
-          "beginCaptures": {
-            "1": { "name": "punctuation.definition.string.begin.vilan" }
-          },
-          "end": "(\")|$",
-          "endCaptures": {
-            "1": { "name": "punctuation.definition.string.end.vilan" }
-          },
-          "patterns": [
-            {
-              "name": "constant.character.escape.vilan",
-              "match": "\\\\."
-            }
-          ]
-        }
-      ]
-    },
-    "numbers": {
-      "patterns": [
-        {
-          "comment": "Hex literal with an optional type suffix (`0xFF`, `0x80000000u32`, `0xDEADn`) — before the decimal rule, like the lexer.",
-          "name": "constant.numeric.hex.vilan",
-          "match": "\\b0x[0-9a-fA-F]+([A-Za-z_][A-Za-z0-9_]*)?\\b"
-        },
-        {
-          "comment": "Decimal literal with an optional type suffix (`42u32`, `3.5f`, `0n`). The suffix admits digits after its first letter — `[A-Za-z_]*` alone can never satisfy the trailing `\\b` inside `u32`, which left every digit-bearing suffix uncolored.",
-          "name": "constant.numeric.vilan",
-          "match": "\\b[0-9]+(\\.[0-9]+)?([A-Za-z_][A-Za-z0-9_]*)?\\b"
-        }
-      ]
-    },
-    "attributes": {
-      "patterns": [
-        {
-          "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
-          "name": "meta.attribute.vilan",
-          "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
-          "beginCaptures": {
-            "1": { "name": "punctuation.definition.attribute.begin.vilan" },
-            "3": { "name": "punctuation.definition.attribute.begin.vilan" }
-          },
-          "end": "(\\])",
-          "endCaptures": {
-            "1": { "name": "punctuation.definition.attribute.end.vilan" }
-          },
-          "patterns": [
-            {
-              "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b",
-              "name": "keyword.other.attribute.vilan"
-            },
-            {
-              "comment": "The `method`/`get`/`set` words inside `[extern(..)]`.",
-              "match": "\\b(method|get|set)\\b",
-              "name": "support.constant.attribute.vilan"
-            },
-            { "include": "#strings" },
-            { "include": "#types" },
-            {
-              "comment": "A macro name — the attribute itself, or a lowercase derive name like `[derive(derive_display)]` (capitalized ones color as types above).",
-              "match": "\\b[a-z_][A-Za-z0-9_]*\\b",
-              "name": "entity.name.function.macro.vilan"
-            }
-          ]
-        }
-      ]
-    },
-    "function-definition": {
-      "patterns": [
-        {
-          "comment": "`macro fun name` — a macro definition (macro-engine.md §3).",
-          "match": "\\b(macro)\\s+(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
-            "1": { "name": "storage.type.macro.vilan" },
-            "2": { "name": "storage.type.function.vilan" },
-            "3": { "name": "entity.name.function.macro.vilan" }
-          }
-        },
-        {
-          "comment": "`macro name(..)` — a macro invocation (splice site).",
-          "match": "\\b(macro)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
-          "captures": {
-            "1": { "name": "keyword.control.macro.vilan" },
-            "2": { "name": "entity.name.function.macro.vilan" }
-          }
-        },
-        {
-          "comment": "`fun name` — the name in a function/method declaration.",
-          "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-          "captures": {
-            "1": { "name": "storage.type.function.vilan" },
-            "2": { "name": "entity.name.function.vilan" }
-          }
-        }
-      ]
-    },
-    "keywords": {
-      "patterns": [
-        {
-          "name": "keyword.control.vilan",
-          "match": "\\b(if|else|match|for|in|is|jump|ret|await)\\b"
-        },
-        {
-          "name": "keyword.control.import.vilan",
-          "match": "\\b(import|use)\\b"
-        },
-        {
-          "comment": "Declaration keywords that introduce a named item.",
-          "name": "storage.type.vilan",
-          "match": "\\b(fun|struct|enum|impl|trait|type|mod|macro)\\b"
-        },
-        {
-          "name": "storage.modifier.vilan",
-          "match": "\\b(let|mut|own|external|export|async|const|resource)\\b"
-        },
-        {
-          "comment": "`with` (trait impl / bound) and the `borrows` return clause.",
-          "name": "keyword.other.vilan",
-          "match": "\\b(with|borrows)\\b"
-        },
-        {
-          "comment": "The `context` CLAUSE on a closure type — `(|| void) context owner_scope`, multi `context (a, b)`. It is a contextual keyword (a value or module may be NAMED `context`), and the clause only ever follows a parenthesized closure type — so the guard is: keyword only right after a `)`.",
-          "match": "(?<=\\))\\s+(context)\\b",
-          "captures": {
-            "1": { "name": "keyword.other.vilan" }
-          }
-        },
-        {
-          "name": "constant.language.vilan",
-          "match": "\\b(true|false|null)\\b"
-        },
-        {
-          "name": "variable.language.self.vilan",
-          "match": "\\b(self)\\b"
-        }
-      ]
-    },
-    "types": {
-      "patterns": [
-        {
-          "comment": "Primitive types.",
-          "name": "support.type.primitive.vilan",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|str|bool|void|any)\\b"
-        },
-        {
-          "comment": "User types / variants — PascalCase identifiers (and `Self`).",
-          "name": "entity.name.type.vilan",
-          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
-        }
-      ]
-    },
-    "function-call": {
-      "patterns": [
-        {
-          "comment": "A lowercase identifier immediately followed by `(` is a call.",
-          "name": "entity.name.function.vilan",
-          "match": "[a-z_][A-Za-z0-9_]*(?=\\s*\\()"
-        }
-      ]
-    },
-    "operators": {
-      "patterns": [
-        {
-          "comment": "Multi-char operators first (`&mut`, `||`, `::`, `=>`, `?.`, compound assigns, comparisons), then single-char (incl. `^` bitwise-xor and postfix `?`/`!`).",
-          "name": "keyword.operator.vilan",
-          "match": "&mut|\\|\\||&&|::|=>|==|!=|<=|>=|\\+=|-=|\\*=|/=|%=|\\?\\.|[-+*/=<>!&|^?%]"
-        }
-      ]
-    }
+ "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+ "name": "Vilan",
+ "scopeName": "source.vilan",
+ "patterns": [
+  {
+   "include": "#comments"
+  },
+  {
+   "include": "#strings"
+  },
+  {
+   "include": "#numbers"
+  },
+  {
+   "include": "#attributes"
+  },
+  {
+   "include": "#elements"
+  },
+  {
+   "include": "#function-definition"
+  },
+  {
+   "include": "#keywords"
+  },
+  {
+   "include": "#types"
+  },
+  {
+   "include": "#function-call"
+  },
+  {
+   "include": "#operators"
   }
+ ],
+ "repository": {
+  "comments": {
+   "patterns": [
+    {
+     "name": "comment.line.double-slash.vilan",
+     "match": "//.*$"
+    }
+   ]
+  },
+  "strings": {
+   "patterns": [
+    {
+     "comment": "Interpolated triple-quoted string `i\"\"\"...{expr}...\"\"\"` (H7) \u2014 the triple-quoted form with holes: RAW but for the two brace escapes `\\{` and `\\}`. First of all the string rules: the triple rule below does not match at the `i`, and the `i\"` rule would end at the very next quote (the second of the three).",
+     "name": "string.quoted.triple.vilan",
+     "begin": "\\b(i)(\"\"\")",
+     "beginCaptures": {
+      "1": {
+       "name": "storage.type.string.vilan"
+      },
+      "2": {
+       "name": "punctuation.definition.string.begin.vilan"
+      }
+     },
+     "end": "(\"\"\")",
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "comment": "Exactly two escapes exist here; a backslash before anything else is a literal backslash.",
+       "name": "constant.character.escape.vilan",
+       "match": "\\\\[{}]"
+      },
+      {
+       "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"\"\"`, so a hole can never swallow the closing delimiter \u2014 an unclosed `{` while typing corrupts at most the rest of the literal. A lone `\"` is ordinary content here, so \u2014 unlike the single-quoted form \u2014 the hole does not stop at one.",
+       "name": "meta.template.expression.vilan",
+       "begin": "\\{",
+       "end": "\\}|(?=\"\"\")",
+       "beginCaptures": {
+        "0": {
+         "name": "punctuation.definition.template-expression.begin.vilan"
+        }
+       },
+       "endCaptures": {
+        "0": {
+         "name": "punctuation.definition.template-expression.end.vilan"
+        }
+       },
+       "patterns": [
+        {
+         "include": "$self"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "comment": "Triple-quoted string `\"\"\"...\"\"\"` \u2014 RAW and multi-line: no escapes, no interpolation; content runs to the first `\"\"\"`. Must be tried before the plain rule, or `\"\"\"` reads as an empty string plus a quote.",
+     "name": "string.quoted.triple.vilan",
+     "begin": "(\"\"\")",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.begin.vilan"
+      }
+     },
+     "end": "(\"\"\")",
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.end.vilan"
+      }
+     }
+    },
+    {
+     "comment": "Interpolated string `i\"...{expr}...\"` \u2014 ONLY `i\"` strings have holes; a `{` in a plain string is literal. `\\b` keeps a trailing `i` of an identifier (`hi\"..\"`) from reading as the prefix.",
+     "name": "string.quoted.double.vilan",
+     "begin": "\\b(i)(\")",
+     "beginCaptures": {
+      "1": {
+       "name": "storage.type.string.vilan"
+      },
+      "2": {
+       "name": "punctuation.definition.string.begin.vilan"
+      }
+     },
+     "end": "(\")|$",
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "name": "constant.character.escape.vilan",
+       "match": "\\\\."
+      },
+      {
+       "comment": "An interpolation hole. Its end also stops (without consuming) at a `\"`, so a hole can never swallow the string's closing quote \u2014 an unclosed `{` while typing corrupts at most its own line. The trade: a string literal NESTED in a hole ends the hole early; rare, and the damage stays local.",
+       "name": "meta.template.expression.vilan",
+       "begin": "\\{",
+       "end": "\\}|(?=\")|$",
+       "beginCaptures": {
+        "0": {
+         "name": "punctuation.definition.template-expression.begin.vilan"
+        }
+       },
+       "endCaptures": {
+        "0": {
+         "name": "punctuation.definition.template-expression.end.vilan"
+        }
+       },
+       "patterns": [
+        {
+         "include": "$self"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "comment": "Plain string \u2014 `{`/`}` are literal characters, never interpolation.",
+     "name": "string.quoted.double.vilan",
+     "begin": "(\")",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.begin.vilan"
+      }
+     },
+     "end": "(\")|$",
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.string.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "name": "constant.character.escape.vilan",
+       "match": "\\\\."
+      }
+     ]
+    }
+   ]
+  },
+  "numbers": {
+   "patterns": [
+    {
+     "comment": "Hex literal with an optional type suffix (`0xFF`, `0x80000000u32`, `0xDEADn`) \u2014 before the decimal rule, like the lexer.",
+     "name": "constant.numeric.hex.vilan",
+     "match": "\\b0x[0-9a-fA-F]+([A-Za-z_][A-Za-z0-9_]*)?\\b"
+    },
+    {
+     "comment": "Decimal literal with an optional type suffix (`42u32`, `3.5f`, `0n`). The suffix admits digits after its first letter \u2014 `[A-Za-z_]*` alone can never satisfy the trailing `\\b` inside `u32`, which left every digit-bearing suffix uncolored.",
+     "name": "constant.numeric.vilan",
+     "match": "\\b[0-9]+(\\.[0-9]+)?([A-Za-z_][A-Za-z0-9_]*)?\\b"
+    }
+   ]
+  },
+  "attributes": {
+   "patterns": [
+    {
+     "comment": "Bracket attributes: the built-in markers anywhere, plus GENERIC macro attributes `[name]` / `[name(args)]` at the start of a line (an expression's list literal never opens an item line, which keeps `[1, 2]` and `[x]` out).",
+     "name": "meta.attribute.vilan",
+     "begin": "(\\[)(?=\\s*(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b)|^\\s*(\\[)(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*[\\(\\]])",
+     "beginCaptures": {
+      "1": {
+       "name": "punctuation.definition.attribute.begin.vilan"
+      },
+      "3": {
+       "name": "punctuation.definition.attribute.begin.vilan"
+      }
+     },
+     "end": "(\\])",
+     "endCaptures": {
+      "1": {
+       "name": "punctuation.definition.attribute.end.vilan"
+      }
+     },
+     "patterns": [
+      {
+       "match": "\\b(extern|derive|must_use|service|rpc|expose|trait_only|doc)\\b",
+       "name": "keyword.other.attribute.vilan"
+      },
+      {
+       "comment": "The `method`/`get`/`set` words inside `[extern(..)]`.",
+       "match": "\\b(method|get|set)\\b",
+       "name": "support.constant.attribute.vilan"
+      },
+      {
+       "include": "#strings"
+      },
+      {
+       "include": "#types"
+      },
+      {
+       "comment": "A macro name \u2014 the attribute itself, or a lowercase derive name like `[derive(derive_display)]` (capitalized ones color as types above).",
+       "match": "\\b[a-z_][A-Za-z0-9_]*\\b",
+       "name": "entity.name.function.macro.vilan"
+      }
+     ]
+    }
+   ]
+  },
+  "function-definition": {
+   "patterns": [
+    {
+     "comment": "`macro fun name` \u2014 a macro definition (macro-engine.md \u00a73).",
+     "match": "\\b(macro)\\s+(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+     "captures": {
+      "1": {
+       "name": "storage.type.macro.vilan"
+      },
+      "2": {
+       "name": "storage.type.function.vilan"
+      },
+      "3": {
+       "name": "entity.name.function.macro.vilan"
+      }
+     }
+    },
+    {
+     "comment": "`macro name(..)` \u2014 a macro invocation (splice site).",
+     "match": "\\b(macro)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+     "captures": {
+      "1": {
+       "name": "keyword.control.macro.vilan"
+      },
+      "2": {
+       "name": "entity.name.function.macro.vilan"
+      }
+     }
+    },
+    {
+     "comment": "`fun name` \u2014 the name in a function/method declaration.",
+     "match": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+     "captures": {
+      "1": {
+       "name": "storage.type.function.vilan"
+      },
+      "2": {
+       "name": "entity.name.function.vilan"
+      }
+     }
+    }
+   ]
+  },
+  "keywords": {
+   "patterns": [
+    {
+     "name": "keyword.control.vilan",
+     "match": "\\b(if|else|match|for|in|is|jump|ret|await)\\b"
+    },
+    {
+     "name": "keyword.control.import.vilan",
+     "match": "\\b(import|use)\\b"
+    },
+    {
+     "comment": "Declaration keywords that introduce a named item.",
+     "name": "storage.type.vilan",
+     "match": "\\b(fun|struct|enum|impl|trait|type|mod|macro)\\b"
+    },
+    {
+     "name": "storage.modifier.vilan",
+     "match": "\\b(let|mut|own|external|export|async|const|resource)\\b"
+    },
+    {
+     "comment": "`with` (trait impl / bound) and the `borrows` return clause.",
+     "name": "keyword.other.vilan",
+     "match": "\\b(with|borrows)\\b"
+    },
+    {
+     "comment": "The `context` CLAUSE on a closure type \u2014 `(|| void) context owner_scope`, multi `context (a, b)`. It is a contextual keyword (a value or module may be NAMED `context`), and the clause only ever follows a parenthesized closure type \u2014 so the guard is: keyword only right after a `)`.",
+     "match": "(?<=\\))\\s+(context)\\b",
+     "captures": {
+      "1": {
+       "name": "keyword.other.vilan"
+      }
+     }
+    },
+    {
+     "name": "constant.language.vilan",
+     "match": "\\b(true|false|null)\\b"
+    },
+    {
+     "name": "variable.language.self.vilan",
+     "match": "\\b(self)\\b"
+    }
+   ]
+  },
+  "types": {
+   "patterns": [
+    {
+     "comment": "Primitive types.",
+     "name": "support.type.primitive.vilan",
+     "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|str|bool|void|any)\\b"
+    },
+    {
+     "comment": "User types / variants \u2014 PascalCase identifiers (and `Self`).",
+     "name": "entity.name.type.vilan",
+     "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    }
+   ]
+  },
+  "function-call": {
+   "patterns": [
+    {
+     "comment": "A lowercase identifier immediately followed by `(` is a call.",
+     "name": "entity.name.function.vilan",
+     "match": "[a-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    }
+   ]
+  },
+  "operators": {
+   "patterns": [
+    {
+     "comment": "Multi-char operators first (`&mut`, `||`, `::`, `=>`, `?.`, compound assigns, comparisons), then single-char (incl. `^` bitwise-xor and postfix `?`/`!`).",
+     "name": "keyword.operator.vilan",
+     "match": "&mut|\\|\\||&&|::|=>|==|!=|<=|>=|\\+=|-=|\\*=|/=|%=|\\?\\.|[-+*/=<>!&|^?%]"
+    }
+   ]
+  },
+  "elements": {
+   "patterns": [
+    {
+     "comment": "Element syntax (element-syntax S2): a tag name glued to `<` or `</` \u2014 the grammar's own atom-position rule; a spaced comparison never matches.",
+     "match": "(</?)([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(/?>)?",
+     "captures": {
+      "1": {
+       "name": "punctuation.definition.tag.vilan"
+      },
+      "2": {
+       "name": "entity.name.tag.vilan"
+      },
+      "3": {
+       "name": "punctuation.definition.tag.vilan"
+      }
+     }
+    },
+    {
+     "comment": "The event form `on:click(\u2026)`.",
+     "match": "\\bon:([a-z][a-zA-Z0-9_]*)",
+     "captures": {
+      "1": {
+       "name": "entity.other.attribute-name.vilan"
+      }
+     }
+    },
+    {
+     "comment": "A hyphenated attribute name in a head (`aria-label(`, `data-id(`).",
+     "match": "\\b([a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)+)(?=\\()",
+     "name": "entity.other.attribute-name.vilan"
+    }
+   ]
+  }
+ }
 }

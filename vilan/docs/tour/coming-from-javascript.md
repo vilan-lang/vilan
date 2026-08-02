@@ -67,6 +67,9 @@ for the explicit keywords when you *don't* want to wait. The
 | `await fetchThing()`            | `fetch_thing()` (awaiting is implicit)          |
 | `class` with methods            | `struct` + `impl` block                         |
 | interfaces / duck typing        | `trait`s, checked at compile time               |
+| JSX: `<div className="x">`      | `<div class("x")>` — text children are quoted   |
+| JSX: `onClick={handler}`        | `on:click(handler)`                             |
+| JSX: `<TodoRow todo={t} />`     | a function call in a hole: `{todo_row(t)}`      |
 
 ## Things that look the same and mostly are
 

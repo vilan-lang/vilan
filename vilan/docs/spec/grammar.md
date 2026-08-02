@@ -210,10 +210,20 @@ postfix = "." member
 
 atom    = literal | IDENT | IDENT generic-args
         | "(" expression ")" | tuple | list
-        | tuple-comprehension | macro-invocation | macro-block ;
+        | tuple-comprehension | macro-invocation | macro-block
+        | element ;
 tuple   = "(" expression "," expression { "," expression } [ "," ] ")" ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
+
+element      = "<" element-name { head-item }
+               ( "/>" | ">" { child } "</" element-name ">" ) ;
+head-item    = "." member                          (* a chain link, verbatim *)
+             | "on" ":" IDENT "(" expression ")"   (* event form *)
+             | element-name [ "(" expression ")" ] ;
+                                          (* attribute; bare name = boolean *)
+element-name = NAME { "-" NAME } ;   (* NAME: an identifier or any keyword *)
+child        = element | STRING | ISTRING | "{" expression "}" ;
 ```
 
 `Name<Args>` is read as a generic path head only when `::` immediately
@@ -224,6 +234,21 @@ chain's result, calling a closure-typed value
 through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
 result (§5.10).
+
+An **element** appears only in atom position, where `<` begins no other
+expression; after an operand, `<` remains a comparison (`x < <div/>` is
+a comparison whose right operand is an element). `/>`, the closing
+marker `</`, the `on:` joint, and the `-` joints of a hyphenated name
+are **span-adjacent** token pairs, the shift-operator discipline
+(lexical spec §2.4). The closing tag's name must match the opening
+tag's token for token. In a head item, an undotted name is an attribute
+(a bare name is a boolean attribute) and a leading `.` is an ordinary
+chain member — the grammar never consults any method list. Text
+children are quoted strings; bare text is a parse error. An element is
+an ordinary expression: it desugars before analysis to the `std::ui`
+view chain (`view("tag")` with one method call per head item and a
+`.child(…)` per child), and postfix suffixes apply to it
+(`<div />.show(flag)`).
 
 ## 3.7 Operator precedence
 

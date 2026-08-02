@@ -77,6 +77,18 @@
 			className: "title",
 			begin: "(?<=\\bfun\\s)[a-z_][a-zA-Z0-9_]*",
 		};
+		// Element syntax: tag names after `<`/`</` and the `on:` event form.
+		// Regex-level like the rest — `<` glued to a name reads as markup,
+		// which is the grammar's own atom-position rule; a spaced comparison
+		// (`a < b`) never matches.
+		const ELEMENT_TAG = {
+			className: "name",
+			begin: "(?<=</?)[a-z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*",
+		};
+		const ELEMENT_EVENT = {
+			className: "attr",
+			begin: "\\bon:[a-z][a-zA-Z0-9_]*",
+		};
 		return {
 			name: "vilan",
 			keywords: KEYWORDS,
@@ -88,6 +100,8 @@
 				INTERPOLATED,
 				PLAIN_STRING,
 				NUMBER,
+				ELEMENT_TAG,
+				ELEMENT_EVENT,
 				FUNCTION,
 				TYPE,
 			],

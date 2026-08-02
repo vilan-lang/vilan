@@ -26599,7 +26599,8 @@ fn ssr_element_renders_mixed_content() {
 #[test]
 fn an_element_without_view_in_scope_fails_at_the_element_head() {
     // No auto-import: the desugared `view` accessor spans `<tag`, so the
-    // unresolved-name diagnostic underlines the element head the user wrote.
+    // unresolved-name diagnostic underlines the element head the user wrote —
+    // and carries the import steer as a note (element-syntax S4).
     assert_fails_spanning(
         r#"
         fun main() {
@@ -26608,6 +26609,54 @@ fn an_element_without_view_in_scope_fails_at_the_element_head() {
         "#,
         "<div",
         "cannot find 'view' in this scope",
+    );
+    assert_fails_noting(
+        r#"
+        fun main() {
+            let _x = <div/>;
+        }
+        "#,
+        "cannot find 'view' in this scope",
+        "<div",
+        "element syntax lowers to std::ui::view",
+    );
+}
+
+#[test]
+fn an_element_text_attribute_warns_toward_the_content_method() {
+    // Element-syntax S4: `text(…)` undotted in a head is an attribute — the
+    // one str-typed method name the type system cannot catch. The warning
+    // fires on the element form only (the lowered name argument's span is the
+    // UNQUOTED attribute name).
+    let messages = warnings(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = <div text("hi") />;
+        }
+        "#,
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("`text(…)` in an element head is an attribute")),
+        "expected the element text-attribute warning, got {messages:?}"
+    );
+}
+
+#[test]
+fn a_hand_written_text_attr_does_not_warn() {
+    let messages = warnings(
+        r#"
+        import std::ui::{ View, view };
+        fun main() {
+            let _x = view("div").attr("text", "hi");
+        }
+        "#,
+    );
+    assert!(
+        messages.is_empty(),
+        "expected no warnings, got {messages:?}"
     );
 }
 
