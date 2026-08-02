@@ -26061,21 +26061,15 @@ fn browser_view_routes_svg_tags_through_create_element_ns() {
     // B37's browser half, pinned at the codegen level: an svg-family tag
     // creates through `createElementNS` (an HTML-namespace `<svg>` renders
     // nothing), a plain tag through `createElement`, and the ambiguous tags
-    // (`a`, `title`, `style`, `script`) stay HTML. Built under an owner:
-    // since element-syntax S1 widened `child`/`attr` over `Slot`/`AttrValue`,
-    // the browser twin's methods sit behind the `owner_scope` fence even for
-    // static slots (a trait-dispatched call carries the union of its impls'
-    // context needs), so the test uses the sanctioned boundary escape hatch.
+    // (`a`, `title`, `style`, `script`) stay HTML. Boundary-less on purpose:
+    // static slots resolve to impls that read no context, so no owner is
+    // demanded (the H8 per-instantiation coverage fix restored this shape).
     let js = compile_browser(
         r#"
-        import std::reactive::{ Owner, run_with_owner };
         import std::ui::{ view, View };
         fun main() {
-            let owner = Owner::new();
-            let _built = run_with_owner(owner, || {
-                let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
-                view("div").child(view("a").attr("href", "/"))
-            });
+            let _icon = view("svg").child(view("path").attr("d", "M5 12h14"));
+            let _link = view("div").child(view("a").attr("href", "/"));
         }
         main();
         "#,
@@ -26874,23 +26868,87 @@ fn a_generic_free_function_dispatches_a_bound_on_a_closure_parameter() {
 }
 
 #[test]
-fn browser_static_child_outside_a_boundary_is_fenced() {
-    // The S1 widening's sharpened edge, pinned deliberately: a trait-dispatched
-    // call carries the union of its impls' context needs, so the browser twin's
-    // `child`/`attr` sit behind the `owner_scope` fence even for static slots.
-    // The documented model always said build UI under a root; the fence now
-    // reaches these two methods. (Per-instantiation context precision is the
-    // recorded follow-up — proposal/element-syntax.md §6.)
-    let errors = compile_browser(
+fn browser_static_child_outside_a_boundary_compiles() {
+    // The H8 residual, closed: context coverage follows the RESOLVED
+    // instantiation where a call records one. `C = View`/`str` select impls
+    // that read no context, so the attach-only `mount()` pattern — the
+    // playground's styles.vl shape, the v0.21.0 deploy casualty — works
+    // again. The Signal arms keep the fence (the guards below).
+    compile_browser(
         r#"
-        import std::ui::{ view, View };
+        import std::ui::{ mount, view, View };
         fun main() {
-            let _x = view("div").child(view("span"));
+            let content = view("div")
+                .attr("id", "card")
+                .child(view("h2").text("Styled"))
+                .child("static text");
+            mount("app", content);
         }
         main();
         "#,
     )
-    .expect_err("the browser twin fences static child outside a boundary");
+    .expect("static slots need no boundary");
+}
+
+#[test]
+fn a_signal_child_outside_a_boundary_stays_fenced() {
+    // The reactive arm subscribes — `C = Signal<str>` selects the impl whose
+    // `place` reaches the strict owner read, so the fence must hold.
+    let errors = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ mount, view, View };
+        fun main() {
+            mount("app", view("p").child(Signal::new("live")));
+        }
+        main();
+        "#,
+    )
+    .expect_err("the Signal child arm must stay fenced");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_signal_attr_outside_a_boundary_stays_fenced() {
+    let errors = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        import std::ui::{ mount, view, View };
+        fun main() {
+            mount("app", view("p").attr("data-live", Signal::new("v")));
+        }
+        main();
+        "#,
+    )
+    .expect_err("the Signal attr arm must stay fenced");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_generic_slot_forwarder_keeps_the_conservative_fence() {
+    // A forwarding wrapper binds `C` to its own generic — no concrete
+    // instantiation at the inner call, so coverage falls back to the union
+    // and the fence holds. Requirement polymorphism is the recorded
+    // follow-up refactor, not this fix.
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T): View {
+            view("p").child(content)
+        }
+        fun main() {
+            mount("app", wrap("static"));
+        }
+        main();
+        "#,
+    )
+    .expect_err("generic forwarding keeps the conservative fence");
     assert!(
         errors.iter().any(|error| error.contains("owner_scope")),
         "the fence must name owner_scope:\n{errors:?}"

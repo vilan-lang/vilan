@@ -506,6 +506,149 @@ fn analyze(
         })
         .collect();
 
+    // --- Coverage-only dispatch refinement (element-syntax H8 residual):
+    // the union edges above stay for needs/strict/threading — sound, and the
+    // hidden value physically flows caller → generic body → impl either way —
+    // but COVERAGE follows the resolved instantiation where a call records
+    // one. `view("a").child(view("b"))` binds `child`'s `C` to `View`, whose
+    // `place` reads nothing; the Signal arm's owner fence must not reach that
+    // caller. Per `OnConstraint` site in a body F: each incoming direct call
+    // into F draws coverage edges from ITS caller to only the impl members
+    // its recorded binding selects (a top-level incoming call marks them
+    // outside-entered instead — always uncovered); a generic or missing
+    // binding, a value-taken F, or an F itself reachable through dispatch
+    // falls back to the union edge, so a generic forwarding wrapper keeps the
+    // conservative fence. `OnType` sites keep the union: this residual is the
+    // bounded-generic shape, and narrowing concrete-receiver dispatch is a
+    // separate tightening.
+    let impl_members_for = |resolved: &Type, member: &str| -> Vec<Id> {
+        let matches_subject = |subject: &Type| match (subject, resolved) {
+            (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => {
+                a == b
+            }
+            (a, b) => a == b,
+        };
+        let matching: Vec<&crate::analyzer::Implementation> = program
+            .implementations
+            .iter()
+            .filter(|implementation| {
+                program
+                    .type_id_to_type_map
+                    .get(&implementation.subject)
+                    .is_some_and(matches_subject)
+            })
+            .collect();
+        // A declared member wins outright; else the trait defaults the
+        // matching impls inherit (the `dispatch_candidates_for` shape,
+        // widened to primitive subjects — `impl str with Slot` is real here).
+        let declared: Vec<Id> = matching
+            .iter()
+            .filter_map(|implementation| implementation.declarations.get(member).copied())
+            .collect();
+        if !declared.is_empty() {
+            return declared;
+        }
+        matching
+            .iter()
+            .flat_map(|implementation| implementation.trait_ids.iter())
+            .filter_map(|trait_id| {
+                program
+                    .traits
+                    .get(trait_id)
+                    .and_then(|trait_| trait_.declarations.get(member).copied())
+            })
+            .collect()
+    };
+    let refined_for_call =
+        |incoming_call: Id, constraint: crate::type_::TypeId, member: &str| -> Option<Vec<Id>> {
+            let substitution = program.method_call_substitution.get(&incoming_call)?;
+            let mut resolved = *substitution.get(&constraint)?;
+            for _ in 0..16 {
+                match program.type_id_to_type_map.get(&resolved) {
+                    Some(Type::Generic(inner)) => match substitution.get(inner) {
+                        Some(bound) if *bound != resolved => resolved = *bound,
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+            let resolved = program.type_id_to_type_map.get(&resolved)?;
+            if matches!(
+                resolved,
+                Type::Generic(_) | Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)
+            ) {
+                return None;
+            }
+            let members = impl_members_for(resolved, member);
+            if members.is_empty() {
+                None
+            } else {
+                Some(members)
+            }
+        };
+    // Incoming direct calls per function, and top-level incoming calls.
+    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::new();
+    for node in graph.nodes() {
+        for call in graph.calls_of(node.id()) {
+            if let CallTarget::Function(target) = call.target {
+                incoming_calls
+                    .entry(target)
+                    .or_default()
+                    .push((node.id(), call.call_id));
+            }
+        }
+    }
+    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::new();
+    for (call_id, call) in &program.function_calls {
+        if owned_call_ids.contains(call_id) {
+            continue;
+        }
+        if let Some(target) = local_target(program, call.subject_id) {
+            top_level_incoming.entry(target).or_default().push(*call_id);
+        }
+    }
+    let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut coverage_outside: HashSet<Id> = HashSet::new();
+    for (owner, site_call, candidates) in &dispatch_sites {
+        let union_fallback = |map: &mut HashMap<Id, Vec<Id>>| {
+            for &candidate in candidates {
+                map.entry(candidate).or_default().push(*owner);
+            }
+        };
+        let (constraint, member) = match crate::async_infer::dispatch_at(program, *site_call) {
+            Some(crate::analyzer::GenericDispatch::OnConstraint(constraint, member)) => {
+                (constraint, member)
+            }
+            _ => {
+                union_fallback(&mut coverage_dispatch_callers);
+                continue;
+            }
+        };
+        if value_taken.contains(owner) || dispatch_callers.contains_key(owner) {
+            union_fallback(&mut coverage_dispatch_callers);
+            continue;
+        }
+        for (caller, incoming_call) in incoming_calls.get(owner).into_iter().flatten() {
+            match refined_for_call(*incoming_call, constraint, member) {
+                Some(selected) => {
+                    for candidate in selected {
+                        coverage_dispatch_callers
+                            .entry(candidate)
+                            .or_default()
+                            .push(*caller);
+                    }
+                }
+                None => union_fallback(&mut coverage_dispatch_callers),
+            }
+        }
+        for incoming_call in top_level_incoming.get(owner).into_iter().flatten() {
+            match refined_for_call(*incoming_call, constraint, member) {
+                Some(selected) => coverage_outside.extend(selected),
+                None => union_fallback(&mut coverage_dispatch_callers),
+            }
+        }
+    }
+
     // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5. ---
     // A clause on a parameter's closure type defers that closure's context
     // binding to its CALL sites: the literal passed in takes its own hidden
@@ -849,11 +992,18 @@ fn analyze(
                     continue;
                 }
                 let covered = if is_function(id) {
+                    // Coverage reads the REFINED dispatch edges: a candidate
+                    // no recorded instantiation selects has no coverage
+                    // caller (and, with no other edges, is exempt — it cannot
+                    // run); one selected from a top-level call is entered
+                    // from outside the graph — uncovered.
                     let callers = graph.callers_of(id);
-                    let through_dispatch = dispatch_callers.get(&id);
+                    let through_dispatch = coverage_dispatch_callers.get(&id);
                     let no_edges =
                         callers.is_empty() && through_dispatch.is_none_or(|list| list.is_empty());
-                    if no_edges {
+                    if coverage_outside.contains(&id) {
+                        false
+                    } else if no_edges {
                         // No caller edges: dead code is exempt (it cannot
                         // run); a top-level-called or value-taken function is
                         // entered from outside the graph — uncovered.

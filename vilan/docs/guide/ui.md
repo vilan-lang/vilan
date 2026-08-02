@@ -182,9 +182,12 @@ why you never think about cleanup: every binding you create, at any
 depth of function calls, registers with the nearest owner automatically
 (the [reactive guide](reactive.md) explains owners).
 
-If you build UI outside any root you'll get a compile error mentioning
-`owner_scope`. It means "wrap this in `mount_root`" (or
-`run_with_owner` in a test).
+If you create a reactive binding — a `bind_*`, a `Signal` in a slot, a
+`when`/`swap`/`bind_each` — outside any root, you'll get a compile
+error mentioning `owner_scope`. It means "wrap this in `mount_root`"
+(or `run_with_owner` in a test). Purely static structure needs no
+boundary: `mount("app", view("div").child(view("p").text("hi")))` is
+fine, because nothing in it subscribes.
 
 ## Events run in turns
 
