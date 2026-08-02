@@ -1,12 +1,17 @@
 # Web playground — the compiler in the visitor's browser (D11)
 
-> **Status: LIVE AND COMPLETE THROUGH S4+ (2026-08-01)** —
+> **Status: LIVE AND COMPLETE — NOTHING REMAINS BY CHOICE (2026-08-02)** —
 > vilan-lang.org/playground serves the whole arc: S0–S3, share-via-fragment,
 > Format, auto-run + persistence + keybindings, the template picker, the
 > full-color highlighter, versioned wasm delivery, live diagnostics (§7c
-> superseded), and the server check mode (§9, live with v0.20.0). Remaining
-> by choice: badge placement (the status line carries the version) and the
-> version-selector UI (delivery groundwork in place). §7 calls SETTLED
+> superseded), the server check mode (§9, live with v0.20.0), the book's
+> Open-in-playground links, and the VERSION SELECTOR (website `c409854`):
+> the manifest's `versions` inventory is the pages repo's own directories,
+> a pin recycles the worker under `?v=` and re-checks, capabilities
+> re-evaluate per version, and a pinned share carries `&v` so a repro stays
+> a repro — the selector doubles as the version badge, closing that call
+> too. What §9 still records as deliberately unplanned: multi-file/tabs,
+> LSP-in-the-browser, storage-backed sharing. §7 calls SETTLED
 > 2026-07-28 — the user took every recommendation: (a) vendored CodeMirror 6,
 > (b) toolchain rides the site build's source, (c) compile on Run only in v1
 > (since superseded, §7c), (d) the path is `/playground`; promotion timing
