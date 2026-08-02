@@ -1,11 +1,13 @@
 # Suite speed — the measured profile (E21)
 
-> **Status: AUDIT DONE 2026-08-03.** Every number below was measured on the
-> dev machine (16 cores, WSL2, warm tree, v0.22.0-era `next`); the levers are
-> filed as backlog E25–E29, each its own suite-gated slice. The constraint
-> from E21's charter is restated because it binds every slice: **no gate
-> weakens** — no pins dropped, no cases sampled, no goldens loosened;
-> anything that changes what is *tested* is out of scope by definition.
+> **Status: AUDIT DONE 2026-08-02; E26 measured and CLOSED NEGATIVE the same
+> day (§2.1) — its outcome corrects the inference attribution below.** Every
+> number was measured on the dev machine (16 cores, WSL2, warm tree,
+> v0.22.0-era `next`); the levers are filed as backlog E25–E30, each its own
+> suite-gated slice. The constraint from E21's charter is restated because it
+> binds every slice: **no gate weakens** — no pins dropped, no cases sampled,
+> no goldens loosened; anything that changes what is *tested* is out of scope
+> by definition.
 
 ## 1. Where the time goes
 
@@ -30,7 +32,7 @@ The serial 130.7 s decomposes (per-binary `finished in`, top of 51 sets):
 | seconds | tests | binary                     | what dominates it (verified in source) |
 |---------|-------|----------------------------|----------------------------------------|
 | 29.9    | 241   | vilan-lsp unit tests       | ~81 fixture sites each running a real `Document::analyze` against on-disk std (~150 ms apiece) |
-| 18.7    | 1205  | tests/inference.rs         | **534 `assert_compiles_and_runs` node spawns** ≈ 35 ms each — the binary is node-startup, nearly wall-to-wall |
+| 18.7    | 1205  | tests/inference.rs         | ~1400 full-pipeline `compile()` calls burning ~276 CPU-seconds across all 16 cores — **compile-bound**, at ~90 % parallel efficiency already. (First attributed to its 534 node spawns; §2.1's measurement corrected that.) |
 | 16.7    | 8     | tests/docs.rs              | every book fence compiled **serially** inside 8 tests; runnable fences also spawn node |
 | 14.9    | 9     | tests/interpreter.rs       | per-case `CARGO_BIN_EXE_vilan` spawns, serial |
 | 8.1     | 2     | tests/examples.rs          | 9 examples staged via `git ls-files` and built through the debug binary |
@@ -42,7 +44,7 @@ The serial 130.7 s decomposes (per-binary `finished in`, top of 51 sets):
 stack — that is what the 16 s edit tax buys, every arc, before a single test
 runs.
 
-## 2. The levers (filed as E25–E29)
+## 2. The levers (filed as E25–E30)
 
 Ordered by measured payoff; estimates assume the others have not landed.
 
@@ -55,13 +57,12 @@ Ordered by measured payoff; estimates assume the others have not landed.
   clear per-binary: stdout-parsing e2e legs, node-spawn storms under load
   (the E20 flake history marks where timing pressure bites), and CI parity.
   Est: 131 s → ~35–45 s.
-- **E26 — batch inference's node runs**: 534 spawns × ~35 ms of node startup
-  IS the 18.7 s. One (or a few) node processes executing the emitted
-  programs in sequence with per-program output markers keeps every assertion
-  byte-identical while paying startup once. The backlog named this lever at
-  filing; the measurement confirms it is nearly the whole binary. Est:
-  18.7 s → ~3–4 s. (Interacts with E25: land this first — under nextest's
-  per-test processes the spawn count cannot be amortized across tests.)
+- **E26 — batch inference's node runs — CLOSED NEGATIVE, see §2.1**: the
+  filed premise (534 spawns × ~35 ms IS the 18.7 s) was arithmetic derived
+  from the wall, not an independent measurement. Built, measured, and
+  withdrawn 2026-08-02: removing every spawn moved the wall from 19.39 s to
+  19.20 s — noise. The binary is compile-bound (§2.1); the real lever is
+  E30.
 - **E27 — parallelize the docs gate and interpreter cases**: both are
   serial loops over independent compiles; corpus.rs already demonstrates
   the safe 8-way chunk shape in this very suite. Est: 16.7 s → ~4 s and
@@ -79,9 +80,56 @@ Ordered by measured payoff; estimates assume the others have not landed.
   isolation, and worth less if E25 lands via nextest (which prefers many
   binaries). Evidence first: `cargo build --timings` on the relink.
 
-Sequencing that respects the interactions: **E26 → E27 → E25 → (E28/E29 as
-E25's outcome dictates)**. E26+E27 alone take the serial floor to ~95 s;
-E25 on top of them lands the suite near the longest remaining binary.
+- **E30 — inference's repeated std analysis** (filed by E26's measurement,
+  §2.1): a single ~10-line `assert_compiles` case costs ~170 ms of
+  single-threaded pipeline, so the binary's ~1400 `compile()` calls burn the
+  ~276 CPU-seconds that ARE its wall — the program under test is ten lines;
+  the cost must be dominated by re-resolving and re-analyzing std from disk
+  per call. The lever is sharing the analyzed std across compiles (each case
+  still runs its own program through the real pipeline; only the std prefix
+  is shared) — the same shape as E28, and it carries the same nextest
+  interaction: in-process sharing evaporates under per-test processes, and
+  only a disk-cached std snapshot would survive both, which is an analyzer
+  arc, not a test tweak. Profile first (how much of the 170 ms IS std),
+  and decide together with E25/E28.
+
+## 2.1 E26's measurement (2026-08-02): the negative result, recorded
+
+The batching was fully built before it was judged: a persistent `node`
+child shared by the whole binary, each program run in a `worker_threads`
+worker — a fresh isolate whose event loop drains before exit — with
+stdio-multiplexed framing, probe-validated byte-identical against
+standalone `node file.js` on every shape the suite asserts (ESM entries,
+thrown strings, exit codes, zero-exit stderr, timer-scheduled output,
+concurrent isolation; worker startup amortizes to ~2.6 ms at width 16).
+All 1205 cases plus 8 runner pins passed. And the wall did not move:
+
+| variant                      | harness wall | user CPU |
+|------------------------------|--------------|----------|
+| per-program spawns (baseline)| 19.39 s      | 291 s    |
+| persistent runner            | 19.20 s      | 276 s    |
+
+The spawns were never the bound. The binary burns ~276 CPU-seconds of
+analyzer work across 16 threads (floor 276/16 ≈ 17.3 s; it runs at ~90 %
+parallel efficiency), and the node runs always overlapped that, costing
+only ~15 CPU-seconds aggregate. The runner would also *regress* under
+E25's per-test processes — runner startup per process exceeds one plain
+spawn — so it has negative expected value and was withdrawn unlanded.
+
+Two corrections propagate:
+- **E25's ceiling is total CPU ÷ 16, not the longest binary**: inference
+  already saturates the machine while it runs, so overlapping other
+  binaries with it buys little during those seconds. Re-estimate from
+  summed per-binary user time before promising ~4.4×.
+- **E28 must start with the same user-time check** that caught this —
+  attribute a binary's wall to a mechanism only after the CPU accounting
+  confirms it (blocked-time arithmetic that happens to match the wall is
+  not attribution).
+
+Sequencing after the correction: **E27 → E25 → (E28/E30/E29 as E25's
+outcome dictates)**. E27 takes the serial floor to ~100 s; E25's real
+ceiling wants re-estimating from CPU sums; E30 is the only lever left on
+inference and it needs the analyzer-arc decision first.
 
 ## 3. What was NOT found
 
