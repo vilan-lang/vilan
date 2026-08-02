@@ -284,6 +284,42 @@ fn encode_semantic_tokens(
     data
 }
 
+/// The delta between two encoded token streams, as ONE minimal edit: trim
+/// the common prefix and suffix (in whole tokens), replace the middle. The
+/// wire counts RAW INTEGERS, five per token (`SemanticTokensEdit.start` /
+/// `delete_count` index the flat data array the tokens serialize into), so
+/// the token counts convert at the edge. Identical streams are zero edits —
+/// the cheapest possible answer to an unchanged refresh (backlog B39b).
+fn token_delta(previous: &[SemanticToken], current: &[SemanticToken]) -> Vec<SemanticTokensEdit> {
+    let prefix = previous
+        .iter()
+        .zip(current.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = previous[prefix..]
+        .iter()
+        .rev()
+        .zip(current[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if prefix == previous.len() && previous.len() == current.len() {
+        return Vec::new();
+    }
+    vec![SemanticTokensEdit {
+        start: (prefix * 5) as u32,
+        delete_count: ((previous.len() - prefix - suffix) * 5) as u32,
+        data: Some(current[prefix..current.len() - suffix].to_vec()),
+    }]
+}
+
+/// A fresh `result_id` for a semantic-token response — process-unique is all
+/// the protocol asks (a client echoes it verbatim on the next delta request).
+fn fresh_result_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
 /// Convert a Vilan outline node to an LSP `DocumentSymbol`.
 #[allow(deprecated)]
 fn to_lsp_symbol(symbol: Symbol, line_index: &LineIndex) -> DocumentSymbol {
@@ -405,6 +441,11 @@ fn is_manifest(uri: &Url) -> bool {
 struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
+    /// What `semanticTokens/full` (or a delta response) last SENT per
+    /// document, keyed by its `result_id` — the delta path's baseline
+    /// (backlog B39b). Evicted on close; a stale or unknown id simply
+    /// answers full again.
+    semantic_token_cache: Arc<DashMap<Url, (String, Vec<SemanticToken>)>>,
     /// Open `vilan.toml` buffers (F5 S5). A manifest is TOML, not vilan: it is
     /// kept HERE rather than in `documents` so nothing ever hands it to
     /// `Document::analyze`, which would publish a wall of lexer errors on a
@@ -878,7 +919,7 @@ mod code_action_tests {
 
 #[cfg(test)]
 mod semantic_token_encoding_tests {
-    use super::encode_semantic_tokens;
+    use super::{encode_semantic_tokens, token_delta};
     use crate::document::TokenKind;
     use crate::line_index::LineIndex;
     use vilan_core::Span;
@@ -993,6 +1034,73 @@ mod semantic_token_encoding_tests {
         );
         assert_eq!(data.len(), 2, "the straddling span is dropped");
         assert_eq!((data[1].delta_line, data[1].delta_start), (1, 0));
+    }
+
+    // --- B39b: the delta between two encoded streams ---
+    //
+    // One minimal edit, flat-integer units (five per token). Each case pins
+    // a distinct shape: unchanged, middle replacement, append, truncation,
+    // and both directions of empty.
+
+    fn stream(widths: &[u32]) -> Vec<tower_lsp::lsp_types::SemanticToken> {
+        widths
+            .iter()
+            .map(|width| tower_lsp::lsp_types::SemanticToken {
+                delta_line: 1,
+                delta_start: 0,
+                length: *width,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unchanged_stream_deltas_to_zero_edits() {
+        let tokens = stream(&[3, 4, 5]);
+        assert!(token_delta(&tokens, &tokens).is_empty());
+    }
+
+    #[test]
+    fn a_middle_change_replaces_only_the_middle() {
+        let previous = stream(&[3, 4, 5]);
+        let current = stream(&[3, 9, 5]);
+        let edits = token_delta(&previous, &current);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start, 5, "one common token = five flat integers");
+        assert_eq!(edits[0].delete_count, 5, "one replaced token");
+        assert_eq!(edits[0].data.as_ref().unwrap(), &stream(&[9]));
+    }
+
+    #[test]
+    fn an_append_deletes_nothing() {
+        let previous = stream(&[3, 4]);
+        let current = stream(&[3, 4, 5]);
+        let edits = token_delta(&previous, &current);
+        assert_eq!(edits.len(), 1);
+        assert_eq!((edits[0].start, edits[0].delete_count), (10, 0));
+        assert_eq!(edits[0].data.as_ref().unwrap(), &stream(&[5]));
+    }
+
+    #[test]
+    fn a_truncation_inserts_nothing() {
+        let previous = stream(&[3, 4, 5]);
+        let current = stream(&[3]);
+        let edits = token_delta(&previous, &current);
+        assert_eq!(edits.len(), 1);
+        assert_eq!((edits[0].start, edits[0].delete_count), (5, 10));
+        assert_eq!(edits[0].data.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn empty_streams_delta_in_both_directions() {
+        let some = stream(&[3, 4]);
+        let growing = token_delta(&[], &some);
+        assert_eq!((growing[0].start, growing[0].delete_count), (0, 0));
+        assert_eq!(growing[0].data.as_ref().unwrap(), &some);
+        let shrinking = token_delta(&some, &[]);
+        assert_eq!((shrinking[0].start, shrinking[0].delete_count), (0, 10));
+        assert_eq!(shrinking[0].data.as_ref().unwrap().len(), 0);
     }
 }
 
@@ -1433,8 +1541,8 @@ impl LanguageServer for Backend {
                                         .map(|name| SemanticTokenModifier::new(name))
                                         .collect(),
                                 },
-                                full: Some(SemanticTokensFullOptions::Bool(true)),
-                                range: None,
+                                full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                                range: Some(true),
                                 ..Default::default()
                             },
                         ),
@@ -1591,6 +1699,7 @@ impl LanguageServer for Backend {
             vilan_core::analyzer::set_document_overlay(&path, None);
         }
         self.documents.remove(&uri);
+        self.semantic_token_cache.remove(&uri);
         // Drop the edit generation so any in-flight debounced analysis bails.
         self.pending.remove(&uri);
         // Clear this document's diagnostics AND the ones it published onto
@@ -1677,7 +1786,101 @@ impl LanguageServer for Backend {
             };
             let data =
                 encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            drop(document);
+            let id = fresh_result_id();
+            self.semantic_token_cache
+                .insert(uri, (id.clone(), data.clone()));
             Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: Some(id),
+                data,
+            })))
+        })
+    }
+
+    async fn semantic_tokens_full_delta(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        self.fenced("semantic_tokens_full_delta", Ok(None), || {
+            if !self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .semantic_tokens_enabled
+            {
+                return Ok(None);
+            }
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let data =
+                encode_semantic_tokens(&document.semantic_tokens(), document.analyzed_index());
+            drop(document);
+            let id = fresh_result_id();
+            // Swap the baseline for the new stream in one motion; the OLD
+            // entry decides whether a delta is even possible.
+            let previous = self
+                .semantic_token_cache
+                .insert(uri, (id.clone(), data.clone()));
+            match previous {
+                // The client's baseline is the one we remember: answer the
+                // difference — zero edits when nothing moved.
+                Some((previous_id, previous_data)) if previous_id == params.previous_result_id => {
+                    Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                        SemanticTokensDelta {
+                            result_id: Some(id),
+                            edits: token_delta(&previous_data, &data),
+                        },
+                    )))
+                }
+                // An unknown baseline (restart, eviction, a response the
+                // client never saw): a full stream re-synchronizes.
+                _ => Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                    SemanticTokens {
+                        result_id: Some(id),
+                        data,
+                    },
+                ))),
+            }
+        })
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        self.fenced("semantic_tokens_range", Ok(None), || {
+            if !self
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .semantic_tokens_enabled
+            {
+                return Ok(None);
+            }
+            let uri = params.text_document.uri;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            // Filter the ABSOLUTE tokens to the requested lines, then encode:
+            // the first kept token's delta is from the document start, which
+            // is exactly the encoding a range response specifies. Line
+            // granularity is what editors ask with (a viewport), and a token
+            // never spans lines (the encoder drops any that would).
+            let index = document.analyzed_index();
+            let start_line = params.range.start.line;
+            let end_line = params.range.end.line;
+            let tokens: Vec<_> = document
+                .semantic_tokens()
+                .into_iter()
+                .filter(|(span, _, _)| {
+                    let line = index.range(span).start.line;
+                    line >= start_line && line <= end_line
+                })
+                .collect();
+            let data = encode_semantic_tokens(&tokens, index);
+            Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
             })))
@@ -2057,6 +2260,7 @@ mod snapshot_consistency_tests {
         LspService::new(|client| Backend {
             client,
             documents: Arc::new(DashMap::new()),
+            semantic_token_cache: Arc::new(DashMap::new()),
             manifests: Arc::new(DashMap::new()),
             publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
             pending: Arc::new(DashMap::new()),
@@ -2216,15 +2420,19 @@ mod snapshot_consistency_tests {
             .semantic_tokens_full(params)
             .await
             .expect("tokens while typing");
+        // The DATA holds still; the `result_id` is fresh per response by
+        // design (B39b's delta chain), so the comparison names the claim.
+        let data_of = |answer: Option<SemanticTokensResult>| match answer {
+            Some(SemanticTokensResult::Tokens(tokens)) => tokens.data,
+            other => panic!("the full provider returns tokens, got {other:?}"),
+        };
+        let baseline = data_of(baseline);
         assert_eq!(
-            format!("{baseline:?}"),
-            format!("{mid_edit:?}"),
+            baseline,
+            data_of(mid_edit),
             "the answer holds still until the analysis lands",
         );
-        let SemanticTokensResult::Tokens(tokens) = baseline.expect("some") else {
-            panic!("the full provider returns tokens");
-        };
-        assert!(!tokens.data.is_empty(), "the fixture must produce tokens");
+        assert!(!baseline.is_empty(), "the fixture must produce tokens");
     }
 
     // S1: inlay hints, same property — and the viewport filter is what made
@@ -2520,6 +2728,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         documents: Arc::new(DashMap::new()),
+        semantic_token_cache: Arc::new(DashMap::new()),
         manifests: Arc::new(DashMap::new()),
         publish_state: Arc::new(std::sync::Mutex::new(PublishState::new())),
         pending: Arc::new(DashMap::new()),
@@ -2528,4 +2737,128 @@ async fn main() {
         snippet_support: Arc::new(AtomicBool::new(false)),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+/// B39b: the delta path's protocol contract — a full answer carries a
+/// `result_id`, a delta request echoing it gets EDITS (zero for an unchanged
+/// document), and an unknown baseline re-synchronizes with a full stream.
+#[cfg(test)]
+mod semantic_token_delta_protocol_tests {
+    use super::snapshot_consistency_tests::{SOURCE, backend, open_with_live_edit};
+    use super::*;
+
+    fn full_params(uri: &Url) -> SemanticTokensParams {
+        SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn delta_params(uri: &Url, previous: &str) -> SemanticTokensDeltaParams {
+        SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            previous_result_id: previous.to_string(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_answer_carries_an_id_and_its_delta_is_empty_when_nothing_moved() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+
+        let full = backend
+            .semantic_tokens_full(full_params(&uri))
+            .await
+            .unwrap()
+            .expect("tokens for an analyzed document");
+        let SemanticTokensResult::Tokens(tokens) = full else {
+            panic!("expected a token stream");
+        };
+        assert!(!tokens.data.is_empty(), "the fixture has names to paint");
+        let id = tokens.result_id.expect("full now carries a result id");
+
+        let delta = backend
+            .semantic_tokens_full_delta(delta_params(&uri, &id))
+            .await
+            .unwrap()
+            .expect("a delta answer");
+        match delta {
+            SemanticTokensFullDeltaResult::TokensDelta(delta) => {
+                assert!(delta.edits.is_empty(), "nothing moved, nothing shipped");
+                assert!(delta.result_id.is_some(), "the chain continues");
+            }
+            other => panic!("expected a delta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_baseline_resynchronizes_with_a_full_stream() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+
+        let answer = backend
+            .semantic_tokens_full_delta(delta_params(&uri, "never-issued"))
+            .await
+            .unwrap()
+            .expect("an answer either way");
+        match answer {
+            SemanticTokensFullDeltaResult::Tokens(tokens) => {
+                assert!(!tokens.data.is_empty());
+                assert!(tokens.result_id.is_some(), "the resync starts a chain");
+            }
+            other => panic!("expected a full resync, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_range_request_answers_only_its_lines() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, SOURCE);
+
+        let whole = backend
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 0), Position::new(99, 0)),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("tokens");
+        let SemanticTokensRangeResult::Tokens(whole) = whole else {
+            panic!("expected tokens");
+        };
+        let first_line_only = backend
+            .semantic_tokens_range(SemanticTokensRangeParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 0), Position::new(0, 99)),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap()
+            .expect("tokens");
+        let SemanticTokensRangeResult::Tokens(first_line_only) = first_line_only else {
+            panic!("expected tokens");
+        };
+        assert!(
+            first_line_only.data.len() < whole.data.len(),
+            "a one-line window must answer fewer tokens than the document ({} vs {})",
+            first_line_only.data.len(),
+            whole.data.len()
+        );
+        assert!(
+            first_line_only
+                .data
+                .iter()
+                .all(|token| token.delta_line == 0),
+            "everything answered sits on the requested line"
+        );
+    }
 }
