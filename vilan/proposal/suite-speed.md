@@ -176,7 +176,10 @@ E25's outcome settles the dependents:
   disk-cached std/fixture snapshot (an analyzer arc, not a test tweak) or
   cutting the per-analysis cost itself — and the payoff shrank: the leak
   plateaus and the CPU floor (~915 s ÷ 16), not fixture repetition, now
-  bound the wall.
+  bound the wall. **RESOLVED 2026-08-02**: both measured to the same root —
+  a fixed ~115 ms per-analysis std tax — and folded into the std-tax arc,
+  `analysis-reuse.md` §6 (E3 Phase 3 reopened; `VILAN_PHASE_TIMING`
+  shipped as its S0).
 - **E29's consolidation sub-lever is dead** (nextest prefers many
   binaries); the faster-linker sub-lever looked up-weighted here, but
   E29's own measurement then closed the item entirely — the tax is ~3 s

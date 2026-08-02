@@ -23880,6 +23880,11 @@ pub fn analyze<'src>(
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
+    // The std-tax arc's instrument (proposal/analysis-reuse.md §6): wall-clock
+    // marks at the phase boundaries, printed at the end when
+    // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
+    // `Instant::now()` calls are noise next to an analysis.
+    let phase_analyze_start = std::time::Instant::now();
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
     // `source_hashes` runs parallel to `sources`: the content hash of the text
@@ -25056,7 +25061,11 @@ pub fn analyze<'src>(
     // Constraint resolution and the post-passes attribute their diagnostics per
     // anchor; anything unattributed defaults to the entry file.
     analyzer.set_current_source(SourceId(0));
+    let phase_load_walk = phase_analyze_start.elapsed();
+    let phase_build_start = std::time::Instant::now();
     analyzer.build();
+    let phase_build = phase_build_start.elapsed();
+    let phase_checks_start = std::time::Instant::now();
     // Infer the `borrows` effect before any check reads it (readonly-mutation
     // and the scalar-view lowering both consult `Function.borrows`).
     analyzer.infer_borrows();
@@ -25654,6 +25663,19 @@ pub fn analyze<'src>(
     // warnings are: it must never corrupt `build --stdout`'s JavaScript.
     if !crate::macros::in_macro_world() && crate::leak_report_enabled() {
         eprintln!("[vilan leak] {}", crate::leak_tally::report());
+    }
+
+    // The phase split, one line per top-level analysis (macro worlds are
+    // nested analyses; their line would be noise inside the outer one).
+    // Stderr for the same reason the leak line is: `build --stdout`'s
+    // JavaScript must stay clean.
+    if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
+        eprintln!(
+            "[vilan phase] load+walk {:.1}ms build {:.1}ms checks {:.1}ms",
+            phase_load_walk.as_secs_f64() * 1000.0,
+            phase_build.as_secs_f64() * 1000.0,
+            phase_checks_start.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 
     Program {

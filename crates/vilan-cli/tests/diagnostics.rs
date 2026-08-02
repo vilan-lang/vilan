@@ -538,3 +538,45 @@ fn leak_report_env_var_prints_the_per_site_split() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The std-tax arc's instrument (proposal/analysis-reuse.md §6): with
+/// `VILAN_PHASE_TIMING` set, every top-level analysis prints one stderr line
+/// splitting the wall between loading+walking, `build()`, and the
+/// whole-program checks — the split every reuse slice is measured against.
+/// Off by default, stderr-only, like the leak report beside it.
+#[test]
+fn phase_timing_env_var_prints_the_phase_split() {
+    let dir = temp_package(
+        "phasetiming",
+        "import std::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_PHASE_TIMING", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[vilan phase]"),
+        "VILAN_PHASE_TIMING=1 printed no phase line; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("load+walk") && stderr.contains("build") && stderr.contains("checks"),
+        "the phase line must carry the three-phase split the arc measures \
+         against; stderr was: {stderr}"
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env_remove("VILAN_PHASE_TIMING");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("[vilan phase]"),
+        "the phase line must be off by default; stderr was: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

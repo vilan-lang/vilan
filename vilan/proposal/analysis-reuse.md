@@ -5,6 +5,12 @@
 > 2026-08-01: a Phase-1 residual (macro-DEFINING buffers) is filed as backlog
 > E23 — recorded in the residual block below.**
 >
+> **2026-08-02: Phase 3 is REOPENED as the std-tax arc (§6)** — the
+> suite-speed audit's E28+E30 fold in here; the fixed ~115 ms per-analysis
+> std tax is re-measured and re-decomposed on the v0.22.1 tree, the
+> `VILAN_PHASE_TIMING` instrument is shipped (§6.3 S0), and the slice plan
+> S1–S4 stands where "recorded, not planned" stood.
+>
 > **The Phase 2 stop (implementation step 1, no code shipped):** the §3
 > premise — "snapshot after prelude/dependency loading, analyze only the
 > entry on top" — assumed build/checks over the entry were cheap. Measured
@@ -177,3 +183,116 @@ Phase 2 lands behind a differential guard in the spirit of the house rule:
 a test that analyzes a corpus of programs both ways (fresh vs
 checkpoint-cloned) and asserts identical diagnostics + identical emitted JS —
 the "no downstream stage can tell" claim, pinned rather than argued.
+
+## 6. The std-tax arc (2026-08-02): E28+E30 fold into Phase 3
+
+The suite-speed audit's last two levers (backlog E28, the LSP fixture
+repetition; E30, inference's repeated std analysis) turned out to be this
+document's subject wearing test-suite clothes, and E25's nextest landing
+(per-test processes) forecloses every in-process amortization for the
+suite. What remains — for the suite, the LSP keystroke, the CLI build, and
+the playground alike — is cutting the absolute per-analysis cost. That is
+Phase 3. E28 and E30 are closed as separate items; this section is their
+continuation and the arc's design surface.
+
+### 6.1 The 2026-08-02 measurements (v0.22.1-era tree, 16-core WSL2)
+
+The tax is FIXED and it is everything:
+
+| entry program                  | per-analysis wall |
+|--------------------------------|-------------------|
+| `fun main() {}` vs EMPTY std   | **0.5 ms**        |
+| `fun main() {}` vs real std    | **~115 ms**       |
+| one `import std::print`        | ~120 ms           |
+| several imports (shared, time) | ~160 ms           |
+| 30-line struct/impl program    | ~115 ms           |
+
+User-program size is free at this scale; 100% of a trivial compile is std
+processing (54 files / 11,875 lines on disk; the always-loaded core set's
+closure is ~21 files / ~4,900 lines). First-touch of a deeper module adds a
+one-time process spike (+50–350 ms) from the parse cache filling.
+
+The phase split (`VILAN_PHASE_TIMING`, landed with this section — one
+stderr line per analysis, pinned in diagnostics.rs beside the leak line),
+trivial entry:
+
+| phase                              | ms  | share |
+|------------------------------------|-----|-------|
+| load + walk (std module bodies)    | ~19 | 16 %  |
+| `build()` fixpoint (std+entry)     | ~44 | 38 %  |
+| in-analyze whole-program checks    | ~30 | 26 %  |
+| post-passes (contexts, async, …)   | ~22 | 19 %  |
+
+Phase 2's stop-measurement (§0) is thereby reconfirmed on today's tree:
+~84 % of every compile re-solves and re-checks unchanged std. Parsing is
+already content-cached process-wide (`parse_clean_cached`) and was 3.7 % of
+a compile when measured; disk reads, hashing, module probes, scope minting,
+name resolution, macro registry rebuild, `build()`, and every check repeat
+per call.
+
+Suite accounting: ~2,000+ analyses per full run × ~110 ms ≈ a third of the
+suite's ~915 CPU-seconds under nextest. Production accounting: the same
+~115 ms floors every LSP keystroke re-analysis, playground compile, and CLI
+build.
+
+### 6.2 What is REJECTED, with reasons
+
+- **In-process sharing for the suite** (E28/E30 as filed): dead under
+  nextest's per-test processes. In-process reuse remains valuable for the
+  LSP/watch/wasm (S4 below) but cannot move the suite.
+- **A disk-serialized analyzed-std snapshot**: `Program` is ~90 interleaved
+  id-keyed tables full of `&'static str` leaked references; a faithful
+  serializer is its own XL with a worse correctness profile than
+  generation-scoped reuse, and it duplicates what S1–S3 buy in-process.
+  Revisit only if the suite still hurts after S3 (each nextest process
+  would deserialize instead of analyze std).
+- **Shrinking the always-loaded core set**: the ~21-file closure is the
+  language's ambient surface (List, operators, ranges, option/result,
+  string methods); gating it is a semantics change, not an optimization.
+
+### 6.3 The slice plan
+
+- **S0 — instrument (SHIPPED with this section)**: `VILAN_PHASE_TIMING`
+  phase line at the `analyze` chokepoint + the `analyze_source` post-pass
+  line; default-off; pinned red-first in diagnostics.rs.
+- **S1 — entry-scoped whole-program checks** (~30 ms in-analyze + part of
+  the ~22 ms post-passes): classify each of the ~25 checks by iteration
+  direction — *definition-site* (iterates entities, diagnoses the iterated
+  entity: skippable for std-sourced entities, since shipped std is clean —
+  pin that invariant), *use-site-driven* (iterates std definitions to find
+  entry uses: NOT skippable), *instantiation-driven* (diagnoses per
+  entry-forced instantiation: NOT skippable). The classification table is
+  the slice's first deliverable; only the provably definition-site checks
+  gain the `source_ranges` filter. Gate: the §5 differential guard,
+  promoted from Phase 2's plan to a permanent suite test — a corpus
+  analyzed both ways asserting identical diagnostics + identical emitted
+  JS. Stop-bar: if fewer than half the checks classify as definition-site,
+  reweigh before landing complexity.
+- **S2 — resolution idempotence** (blocker 1, groundwork): `build()` drains
+  or idempotently re-resolves `prepped_imports`/`prepped_locals`/
+  `prepped_type_locals`; `reference_count` survives a second `build()`
+  unchanged. Behavior-neutral alone; pinned by a double-build unit test.
+- **S3 — the frozen std base** (blockers 2+3, the XL core): std loads,
+  walks, and `build()`s ONCE per process into a generation-0 base;
+  per-analysis work is an entry-delta fixpoint over it (generation-scoped
+  type/entity ids so new ids never renumber frozen ones) plus the S1
+  entry-scoped checks. In-process only — which under nextest still pays
+  the base once per test process, so the SUITE'S win from S3 is bounded;
+  the LSP keystroke, watch loop, wasm playground, and any multi-compile
+  process get the full collapse toward entry-proportional cost. Take S3
+  only with S1+S2 landed and measured; its design doc extends this file.
+- **S4 — wire the consumers**: content-keyed base invalidation (std
+  sources + manifest + platform + compiler version), LSP/watch/wasm reuse,
+  and the differential guard running over the corpus in CI.
+
+### 6.4 Honest expectations
+
+S1 alone: ~25–35 ms off the ~113 ms trivial floor (suite CPU −5–8 %; LSP
+keystroke ~115 → ~85 ms). S3: the floor approaches load+walk+entry
+(~20–25 ms warm, less if S3 also freezes the walk) for every multi-analysis
+process, and the suite's per-test cost approaches one base build per
+process. The suite's remaining bound after S3 is the leak-plateau critical
+path (52 s under load), which no analyzer work moves — the suite case for
+this arc is real but secondary; the LSP/playground/CLI latency case is the
+primary one, exactly as §4 recorded ("take it only when the warm floor
+demonstrably hurts").
