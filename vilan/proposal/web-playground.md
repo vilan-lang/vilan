@@ -473,9 +473,9 @@ it, diagnostics beneath the editor.
 
 ## 9. Recorded future work (not planned)
 
-~~Process-leg check-only mode~~ **SHIPPED 2026-08-01** (vilan `ceb317f` +
-website `32e9f1e`; dormant in production until the next release ships a wasm
-with `compile_for`): a mode select beside Run — Browser compiles and runs,
+~~Process-leg check-only mode~~ **SHIPPED 2026-08-01, LIVE with v0.20.0**
+(vilan `ceb317f` + website `32e9f1e`; the v0.20.0 release lit it up in
+production the same day): a mode select beside Run — Browser compiles and runs,
 Server routes the buffer through `compile_for("node")` and CHECKS it (the
 Run button reads Check; results never touch the mounted program). The
 platform-coloring showcase both ways: the seeded server example (a typed
