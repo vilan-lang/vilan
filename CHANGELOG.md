@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.21.0 — 2026-08-01
 
 **The language server learns markup.** Tags — opening and closing — paint as their own semantic token, attribute and event names as properties, and the desugar's scaffolding no longer bleeds through: the `<div`-as-function token and the child-position method tokens are gone, so a hole's contents paint as themselves, deterministically. Editing a tag name renames its pair — the server implements linked editing ranges over a raw parse, the same cheap per-request pass keyword hover uses. (The closing tag's span now rides the AST for this; the parser had been dropping it after the match check.)
 
