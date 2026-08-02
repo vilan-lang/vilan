@@ -66,7 +66,11 @@ Ordered by measured payoff; estimates assume the others have not landed.
   (915/16), not 33 s. CLAUDE.md's suite section now names nextest as the
   gate; `cargo test --workspace --no-fail-fast` remains a correct, slower
   equivalent; release.yml's tag-time gate stays on plain cargo test,
-  unchanged.
+  unchanged. CI outcome (run 30771883241, both legs green): ubuntu
+  6m37s → 6m13s, windows 8m21s → 10m02s — the per-test process tax is
+  steepest on Windows CreateProcess, and that leg is now CI's long pole.
+  Accepted for instrument parity; reverting the windows leg to cargo test
+  is a one-line change if the price stops being worth it.
 - **E26 — batch inference's node runs — CLOSED NEGATIVE, see §2.1**: the
   filed premise (534 spawns × ~35 ms IS the 18.7 s) was arithmetic derived
   from the wall, not an independent measurement. Built, measured, and
