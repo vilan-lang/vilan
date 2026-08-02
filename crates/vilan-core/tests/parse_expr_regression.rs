@@ -221,7 +221,7 @@ fn element_atoms_are_pinned() {
     snapshot("<p class(\"x\")>\"hi\"</p>", SNAP_ELEMENT);
 }
 
-const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [(String(\"hi\"), 28..32)] }), 14..36)";
+const SNAP_ELEMENT: &str = "(Element(ElementBody { tag: 15..16, head: [Attribute(17..22, Some((String(\"x\"), 23..26)))], children: [Bare((String(\"hi\"), 28..32))], self_closing: false }), 14..36)";
 
 #[test]
 fn the_is_tier_and_condition_heads_are_pinned() {

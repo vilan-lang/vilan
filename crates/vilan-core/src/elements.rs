@@ -79,7 +79,7 @@ fn desugar_interior<'src>(mut body: ElementBody<'src>, source: &'src str) -> Ele
         }
     }
     for child in body.children.iter_mut() {
-        take_and_desugar(child, source);
+        take_and_desugar(child.node_mut(), source);
     }
     body
 }
@@ -95,6 +95,7 @@ fn build_chain<'src>(
         tag,
         head,
         children,
+        self_closing: _,
     } = body;
     let tag_text = &source[tag.into_range()];
     // The generated `view` accessor spans `<tag` — an unresolved `view` (the
@@ -154,6 +155,7 @@ fn build_chain<'src>(
         chain = attach(chain, member);
     }
     for child in children {
+        let child = child.into_node();
         let child_span = child.1;
         let member = (
             Node::Call(

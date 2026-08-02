@@ -153,7 +153,46 @@ pub struct ElementBody<'src> {
     /// slices the text where the source is in scope.
     pub tag: Span,
     pub head: Vec<ElementHeadItem<'src>>,
-    pub children: NodeList<'src>,
+    pub children: Vec<ElementChild<'src>>,
+    /// Whether the element was written self-closing (`<div />`). `<div></div>`
+    /// parses to the same empty children but different TOKENS, and the
+    /// formatter's re-lex net compares tokens — a reprint must keep the form.
+    pub self_closing: bool,
+}
+
+/// One child of an element. The distinction is TOKEN-carrying, not semantic —
+/// both lower to `.child(…)` — but a reprint must know whether braces were
+/// written: `{"x"}` and `"x"` parse to the same inner node and differ in
+/// tokens, and the formatter's re-lex net compares tokens.
+#[derive(Debug)]
+pub enum ElementChild<'src> {
+    /// `{expression}` — a braced hole.
+    Hole(Spanned<Node<'src>>),
+    /// A bare child: a nested element, a quoted string, or an i-string group.
+    Bare(Spanned<Node<'src>>),
+}
+
+impl<'src> ElementChild<'src> {
+    /// The child's expression, whichever form carried it.
+    pub fn node(&self) -> &Spanned<Node<'src>> {
+        match self {
+            ElementChild::Hole(node) | ElementChild::Bare(node) => node,
+        }
+    }
+
+    /// The child's expression, owned.
+    pub fn into_node(self) -> Spanned<Node<'src>> {
+        match self {
+            ElementChild::Hole(node) | ElementChild::Bare(node) => node,
+        }
+    }
+
+    /// The child's expression, mutably.
+    pub fn node_mut(&mut self) -> &mut Spanned<Node<'src>> {
+        match self {
+            ElementChild::Hole(node) | ElementChild::Bare(node) => node,
+        }
+    }
 }
 
 /// One item in an element's head (proposal/element-syntax.md §2): undotted
@@ -599,7 +638,7 @@ impl<'src> Node<'src> {
                     }
                 }
                 for child in &body.children {
-                    visit(child);
+                    visit(child.node());
                 }
             }
             Node::Async(inner)

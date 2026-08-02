@@ -43,9 +43,9 @@
 
 use crate::lexing;
 use crate::node::{
-    BinaryOp, Closure, Convention, ElementBody, ElementHeadItem, EnumVariant, ExternBinding, Func,
-    GenericArguments, GenericParameter, GenericParameters, If, ImportBranch, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
+    BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
+    ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
+    MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -1797,10 +1797,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             if self.peek_is_op("/") && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1) {
                 self.bump();
                 self.bump();
-                break Vec::new();
+                break (Vec::new(), true);
             }
             if self.eat_ctrl('>') {
-                break self.parse_element_children(&tag_tokens)?;
+                break (self.parse_element_children(&tag_tokens)?, false);
             }
             if self.at_end() {
                 self.note_expected("`>` or `/>`");
@@ -1808,10 +1808,12 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             head.push(self.parse_element_head_item()?);
         };
+        let (children, self_closing) = children;
         let body = ElementBody {
             tag,
             head,
             children,
+            self_closing,
         };
         Some((Node::Element(body), self.span_from(start)))
     }
@@ -1874,8 +1876,8 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_element_children(
         &mut self,
         open_tokens: &std::ops::Range<usize>,
-    ) -> Option<NodeList<'src>> {
-        let mut children: NodeList<'src> = Vec::new();
+    ) -> Option<Vec<ElementChild<'src>>> {
+        let mut children: Vec<ElementChild<'src>> = Vec::new();
         loop {
             // `</tag>` — the close (span-adjacent `</`), name-matched against
             // the opener token-by-token.
@@ -1905,7 +1907,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             // A nested element.
             if self.peek_is_ctrl('<') && self.peek_at_is_name(1) {
-                children.push(self.parse_element()?);
+                children.push(ElementChild::Bare(self.parse_element()?));
                 continue;
             }
             // A quoted string child.
@@ -1913,28 +1915,28 @@ impl<'a, 'src> Parser<'a, 'src> {
                 let node = Node::String(text);
                 let span = self.here_span();
                 self.bump();
-                children.push((node, span));
+                children.push(ElementChild::Bare((node, span)));
                 continue;
             }
             if let Some(Token::MultilineString(text)) = self.peek() {
                 let node = Node::MultilineString(text);
                 let span = self.here_span();
                 self.bump();
-                children.push((node, span));
+                children.push(ElementChild::Bare((node, span)));
                 continue;
             }
             // An i-string child — the lexer already turned it into a paren
             // group, so it arrives as `(`; a literal parenthesized expression
             // parses identically (the recorded wrinkle).
             if self.peek_is_ctrl('(') {
-                children.push(self.parse_paren_atom()?);
+                children.push(ElementChild::Bare(self.parse_paren_atom()?));
                 continue;
             }
             // A `{expression}` hole.
             if self.eat_ctrl('{') {
                 let child = self.parse_expression()?;
                 self.expect_ctrl('}')?;
-                children.push(child);
+                children.push(ElementChild::Hole(child));
                 continue;
             }
             self.note_expected("a child: an element, a quoted string, or a `{expression}` hole");

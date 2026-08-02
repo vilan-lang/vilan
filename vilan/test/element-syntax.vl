@@ -33,9 +33,11 @@ fun main() {
 	</ul>));
 
 	// The SVG rules are view()'s: the root serializes with its namespace.
-	print(render(<svg viewBox("0 0 24 24")><path d("M5 12h14") /></svg>));
+	print(render(<svg viewBox("0 0 24 24")>
+		<path d("M5 12h14") />
+	</svg>));
 
 	// An element is an expression: postfix chains hang off it.
-	print(render(<div/>.child(<span>"chained"</span>)));
+	print(render(<div />.child(<span>"chained"</span>)));
 }
 main();
