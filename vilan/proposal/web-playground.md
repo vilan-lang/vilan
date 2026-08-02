@@ -473,8 +473,18 @@ it, diagnostics beneath the editor.
 
 ## 9. Recorded future work (not planned)
 
-Process-leg check-only mode (one toggle, `Some(Platform::Node)`, the
-platform-coloring showcase); live diagnostics (§7c); multi-file/tabs and
+~~Process-leg check-only mode~~ **SHIPPED 2026-08-01** (vilan `ceb317f` +
+website `32e9f1e`; dormant in production until the next release ships a wasm
+with `compile_for`): a mode select beside Run — Browser compiles and runs,
+Server routes the buffer through `compile_for("node")` and CHECKS it (the
+Run button reads Check; results never touch the mounted program). The
+platform-coloring showcase both ways: the seeded server example (a typed
+HTTP service) checks clean under node and, flipped to Browser, refuses
+`std::http` with the call-chain diagnostic; a DOM program under node is
+refused by NAME resolution (the process twin never declares `mount`), which
+the wasm pin records as the real mechanism. Feature-detected like Format;
+the smoke gate pins the browser rejection in the old-wasm era. Still not
+planned: live diagnostics (~~§7c~~ shipped, see §7c); multi-file/tabs and
 manifest editing; LSP-in-the-browser; snippet sharing beyond the fragment
 (anything with storage reopens the no-server stance deliberately, not by
 drift); prerendered playground embeds in the book's "Try it" blocks (D6's
