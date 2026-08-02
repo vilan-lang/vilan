@@ -1,6 +1,11 @@
 # Comment attachment inside split constructs
 
 **Status:** implemented 2026-08-01 (backlog 41). Semantics settled below.
+**Extended same day:** element expressions (`element-syntax.md`) are the sixth
+construct — a comment between a markup head's items or children attaches and
+forces the split, through the same `flush_element_comments` /
+`comment_between_elements` pair; a comment after the last child relocates,
+list parity. Pinned in `element_layout`.
 
 ## Why
 

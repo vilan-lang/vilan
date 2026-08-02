@@ -2190,12 +2190,39 @@ impl<'src> Printer<'src> {
     /// indent. A head too wide for the tag line breaks one item per line with
     /// `>` / `/>` at the element's indent (the signature-layout shape).
     /// Self-closing tags space before the slash: `<div />`, never `<div/>`.
+    /// The source spans a split element lays out one per line — the tag, each
+    /// head item, each child. The gaps between them are where a markup comment
+    /// sits (`proposal/split-comment-attachment.md`, extended to elements).
+    fn element_item_spans(body: &crate::node::ElementBody<'src>) -> Vec<Span> {
+        let mut spans = vec![body.tag];
+        for item in &body.head {
+            spans.push(match item {
+                crate::node::ElementHeadItem::Chain(link) => link.1,
+                crate::node::ElementHeadItem::Event((_, name_span), handler) => {
+                    (name_span.start..handler.1.end).into()
+                }
+                crate::node::ElementHeadItem::Attribute(name, value) => {
+                    let end = value.as_ref().map(|value| value.1.end).unwrap_or(name.end);
+                    (name.start..end).into()
+                }
+            });
+        }
+        for child in &body.children {
+            spans.push(child.node().1);
+        }
+        spans
+    }
+
     fn print_element(&mut self, body: &crate::node::ElementBody<'src>) {
+        // A comment between the element's items forces the split — collapsed,
+        // there is no line to keep it on — and the split loops below attach it
+        // to the item it precedes, like every other splittable construct.
         let must_split = body.children.len() > 1
             || body
                 .children
                 .first()
-                .is_some_and(|child| matches!(child.node().0, Node::Element(_)));
+                .is_some_and(|child| matches!(child.node().0, Node::Element(_)))
+            || self.comment_between_elements(&Self::element_item_spans(body));
         if !must_split {
             let element_start = self.out.len();
             let comment_cursor = self.cursor;
@@ -2233,6 +2260,14 @@ impl<'src> Printer<'src> {
     }
 
     fn print_element_split(&mut self, body: &crate::node::ElementBody<'src>) {
+        // Head-item source spans, for comment attachment between items.
+        let head_spans: Vec<Span> = {
+            let all = Self::element_item_spans(body);
+            all[..1 + body.head.len()].to_vec()
+        };
+        // A comment between head items forces the item-per-line head — inline,
+        // it has no line of its own.
+        let comment_in_head = self.comment_between_elements(&head_spans);
         // The head: on the tag line while it fits; one item per line otherwise,
         // measured by rendering it and looking, like every width decision.
         let head_start = self.out.len();
@@ -2243,27 +2278,31 @@ impl<'src> Printer<'src> {
             self.out.push(' ');
             self.print_element_head_item(item);
         }
-        let head_spans = self.out[head_start..].contains('\n') || self.current_line_over_budget();
-        let split_head = head_spans && !body.head.is_empty();
+        let head_wide = self.out[head_start..].contains('\n') || self.current_line_over_budget();
+        let split_head = (head_wide || comment_in_head) && !body.head.is_empty();
         if split_head {
             self.out.truncate(head_start);
             self.cursor = comment_cursor;
             self.out.push('<');
             self.out.push_str(&self.source[body.tag.into_range()]);
             self.indent += 1;
-            for item in &body.head {
+            let mut prev_end = body.tag.end;
+            for (item, item_span) in body.head.iter().zip(head_spans[1..].iter()) {
                 let item_start = self.out.len();
                 let item_cursor = self.cursor;
+                self.flush_element_comments(item_span.start, prev_end);
                 self.line();
                 let line_start = self.out.len();
                 self.print_element_head_item(item);
                 if self.over_line_budget(line_start) {
                     self.out.truncate(item_start);
                     self.cursor = item_cursor;
+                    self.flush_element_comments(item_span.start, prev_end);
                     self.line();
                     self.split = Split::Tail;
                     self.print_element_head_item(item);
                 }
+                prev_end = item_span.end;
             }
             self.indent -= 1;
             self.line();
@@ -2278,19 +2317,24 @@ impl<'src> Printer<'src> {
         }
         self.out.push('>');
         self.indent += 1;
+        let mut prev_end = head_spans.last().map(|span| span.end).unwrap_or(0);
         for child in &body.children {
+            let child_span = child.node().1;
             let child_start = self.out.len();
             let child_cursor = self.cursor;
+            self.flush_element_comments(child_span.start, prev_end);
             self.line();
             let line_start = self.out.len();
             self.print_element_child(child);
             if self.over_line_budget(line_start) {
                 self.out.truncate(child_start);
                 self.cursor = child_cursor;
+                self.flush_element_comments(child_span.start, prev_end);
                 self.line();
                 self.split = Split::Tail;
                 self.print_element_child(child);
             }
+            prev_end = child_span.end;
         }
         self.indent -= 1;
         self.line();
@@ -6130,12 +6174,40 @@ mod element_layout {
     }
 
     #[test]
-    fn a_comment_inside_an_element_moves_below_the_statement() {
-        // The chain/list/struct precedent: comments flush at statement
-        // boundaries, so one written inside markup relocates below.
+    fn a_comment_inside_an_element_attaches_to_the_child_it_precedes() {
+        // `proposal/split-comment-attachment.md`, extended to markup: the
+        // comment stays on its own line above the child it explains.
         assert_construct(
             "fun demo(): View {\n\t<div>\n\t\t// a note\n\t\t<span/>\n\t</div>\n}\n",
-            "fun demo(): View {\n\t<div>\n\t\t<span />\n\t</div>\n\t// a note\n}\n",
+            "fun demo(): View {\n\t<div>\n\t\t// a note\n\t\t<span />\n\t</div>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_keeps_an_inlineable_element_split() {
+        // Collapsed, `<h2>"Todos"</h2>` has no line for the comment — the
+        // comment forces the split and rides above the child.
+        assert_construct(
+            "fun demo(): View {\n\t<h2>\n\t\t// heading note\n\t\t\"Todos\"\n\t</h2>\n}\n",
+            "fun demo(): View {\n\t<h2>\n\t\t// heading note\n\t\t\"Todos\"\n\t</h2>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_between_head_items_splits_the_head() {
+        assert_construct(
+            "fun demo(): View {\n\t<input placeholder(\"x\")\n\t\t// boolean\n\t\tdisabled />\n}\n",
+            "fun demo(): View {\n\t<input\n\t\tplaceholder(\"x\")\n\t\t// boolean\n\t\tdisabled\n\t/>\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_after_the_last_child_relocates_below() {
+        // List parity: attachment covers the gaps BETWEEN items; a trailing
+        // comment has no following item and falls out below the statement.
+        assert_construct(
+            "fun demo(): View {\n\t<div>\n\t\t<span/>\n\t\t// trailing\n\t</div>\n}\n",
+            "fun demo(): View {\n\t<div>\n\t\t<span />\n\t</div>\n\t// trailing\n}\n",
         );
     }
 
