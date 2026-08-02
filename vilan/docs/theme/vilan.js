@@ -98,10 +98,89 @@
 	// additional-js loads, so re-highlight every vilan-tagged block with the
 	// grammar registered above. (mdBook bundles highlight.js v10, whose
 	// entry point is highlightBlock; prefer highlightElement when a newer
-	// bundle provides it.)
+	// bundle provides it.) The harness tag is stashed on the element first:
+	// normalizing destroys it, and the playground-link pass below reads it.
 	var highlight = hljs.highlightElement || hljs.highlightBlock;
 	document.querySelectorAll("code[class*='language-vilan']").forEach(function (block) {
+		var tagged = block.className.match(/language-(vilan[^\s]*)/);
+		if (tagged) {
+			block.dataset.vilanTag = tagged[1];
+		}
 		block.className = "language-vilan";
 		highlight.call(hljs, block);
+	});
+})();
+
+// "Open in the vilan playground" links (the D11 book tie-in): every fence
+// that is a complete program gets one, putting the code itself in the URL
+// fragment - deflate-raw, base64url, the SAME codec the playground's Share
+// writes (playground/editor-src/editor.mjs in the website repo; resync both
+// when either moves). A process-leg example carries `&mode=node`, so it
+// opens straight into the server check and the platform story shows itself.
+// Fragments and mainless blocks are skipped; a browser without
+// CompressionStream simply sees no links.
+(function () {
+	if (!("CompressionStream" in window)) {
+		return;
+	}
+
+	var PLAYGROUND = "https://vilan-lang.org/playground/";
+	// The docs harness compiles untagged fences on the process leg, but most
+	// are platform-neutral and RUN in the browser; only these imports mark a
+	// program as genuinely process-bound. A wrong guess is self-correcting:
+	// the reader lands on a diagnostic and the mode select is right there.
+	var PROCESS_HINT = /\bstd::(http|fs|db|process|rpc_server|ws)\b/;
+
+	function encodeBase64Url(bytes) {
+		var binary = "";
+		for (var i = 0; i < bytes.length; i++) {
+			binary += String.fromCharCode(bytes[i]);
+		}
+		return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+	}
+
+	function deflate(text) {
+		var stream = new Blob([new TextEncoder().encode(text)])
+			.stream()
+			.pipeThrough(new CompressionStream("deflate-raw"));
+		return new Response(stream).arrayBuffer();
+	}
+
+	var style = document.createElement("style");
+	style.textContent =
+		"pre .buttons a.vilan-playground-link { text-decoration: none; cursor: pointer; }";
+	document.head.appendChild(style);
+
+	document.querySelectorAll("code[data-vilan-tag]").forEach(function (block) {
+		var tag = block.dataset.vilanTag;
+		if (tag.indexOf("fragment") !== -1) {
+			return;
+		}
+		var source = block.textContent;
+		if (!/\bfun main\b/.test(source)) {
+			return;
+		}
+		var node = tag.indexOf("browser") === -1 && PROCESS_HINT.test(source);
+		deflate(source).then(function (buffer) {
+			var link = document.createElement("a");
+			link.className = "vilan-playground-link";
+			link.href =
+				PLAYGROUND + "#code=" + encodeBase64Url(new Uint8Array(buffer)) + (node ? "&mode=node" : "");
+			link.target = "_blank";
+			link.rel = "noopener";
+			link.title = node
+				? "Check in the vilan playground (server leg)"
+				: "Run in the vilan playground";
+			link.setAttribute("aria-label", link.title);
+			link.textContent = "▶";
+			var pre = block.parentElement;
+			var buttons = pre.querySelector(".buttons");
+			if (!buttons) {
+				buttons = document.createElement("div");
+				buttons.className = "buttons";
+				pre.insertBefore(buttons, pre.firstChild);
+			}
+			buttons.insertBefore(link, buttons.firstChild);
+		});
 	});
 })();
