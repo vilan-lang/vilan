@@ -27,6 +27,16 @@ nowhere near saturating the machine. A no-op check is 0.1 s. The per-arc
 suite cost is therefore ≈ **2.5 minutes**: 16 s of relinking plus 131 s of
 strictly serial test execution.
 
+> **CORRECTED by E29's measurement (2026-08-02, §2):** the 16.0 s figure
+> does not reproduce — the same probe measures **~3–4 s** (49 dirty units;
+> vilan-core's no-op incremental recompile ~1.7 s is the critical path,
+> each binary links in well under a second). The audit's number most
+> likely conflated real recompile work or stale incremental caches with
+> the relink itself. And the "link jobs" framing missed that the links
+> were already fast: **rust-lld has been the default linker on
+> x86_64-linux since Rust 1.90** — the toolchain this machine ran
+> throughout, audit included.
+
 The serial 130.7 s decomposes (per-binary `finished in`, top of 51 sets):
 
 | seconds | tests | binary                     | what dominates it (verified in source) |
@@ -92,13 +102,23 @@ Ordered by measured payoff; estimates assume the others have not landed.
   distinct SOURCE keeps every assertion while paying each analysis once.
   Est: 29.9 s → ~10 s. (Counter-interacts with E25's per-test processes —
   decide the runner first; under nextest this lever mostly evaporates.)
-- **E29 — cut the edit tax**: 16 s to relink 43+ binaries at 490 % CPU.
-  Two independent sub-levers: a faster linker (neither mold nor lld is
-  installed today; either typically halves link-heavy rebuilds), and
-  consolidating integration binaries that share a subject (the five-plus
-  parse_* files, the hmr trio) to cut link JOBS — weighed against per-binary
-  isolation, and worth less if E25 lands via nextest (which prefers many
-  binaries). Evidence first: `cargo build --timings` on the relink.
+- **E29 — cut the edit tax — CLOSED 2026-08-02, overtaken by events**:
+  evidence-first, as filed, and the evidence dissolved the item. (1) The
+  16 s tax does not reproduce: the identical probe measures ~3–4 s wall /
+  ~20 CPU-s (49 dirty units, `--timings`-verified; vilan-core's ~1.7 s
+  no-op incremental recompile is the critical path, links well under a
+  second each). (2) The "no fast linker installed" premise was stale at
+  filing: `readelf -p .comment` on any test binary says `Linker: LLD
+  20.1.8` — **rust-lld is rustc's default on x86_64-linux since 1.90**,
+  so the linker win was banked before the audit measured. (3) mold was
+  installed and probed anyway; a first pass appeared to save ~1 s until
+  the .comment check showed the flag never took effect (rustc's
+  self-contained lld won the link line) — the "saving" was
+  rebuild-freshness, a measurement trap worth remembering. mold-over-lld's
+  real ceiling here is a fraction of a second per cycle: not worth a
+  toolchain dependency. The consolidation sub-lever was already dead
+  under E25's nextest. Residual truth: the per-arc edit tax is ~3 s and
+  it is recompile-bound, not link-bound.
 
 - **E30 — inference's repeated std analysis** (filed by E26's measurement,
   §2.1): a single ~10-line `assert_compiles` case costs ~170 ms of
@@ -158,9 +178,9 @@ E25's outcome settles the dependents:
   plateaus and the CPU floor (~915 s ÷ 16), not fixture repetition, now
   bound the wall.
 - **E29's consolidation sub-lever is dead** (nextest prefers many
-  binaries); the faster-linker sub-lever (mold/lld) stands, and the 16 s
-  relink tax is now a QUARTER of a suite run rather than an eighth —
-  relatively more worth cutting. Evidence first, as filed.
+  binaries); the faster-linker sub-lever looked up-weighted here, but
+  E29's own measurement then closed the item entirely — the tax is ~3 s
+  and lld was already the linker (see the E29 entry above).
 
 ## 3. What was NOT found
 
