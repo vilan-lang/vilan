@@ -26956,6 +26956,117 @@ fn a_generic_slot_forwarder_keeps_the_conservative_fence() {
 }
 
 #[test]
+fn a_signal_through_a_closure_owned_dispatch_site_stays_fenced() {
+    // 8d6980e regression (shipped in v0.21.1): an `OnConstraint` site owned
+    // by a CLOSURE has no `incoming_calls` entry and no fallback arm covered
+    // it, so the site contributed no coverage edges at all and the Signal
+    // arm slipped the fence (requirement-polymorphism.md §1b). v0.20.0's
+    // union edges fenced this shape.
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        import std::reactive::Signal;
+        fun wrap<T: Slot>(content: T): View {
+            let holder = view("p");
+            let attach = || content.place(holder);
+            attach();
+            holder
+        }
+        fun main() {
+            mount("app", wrap(Signal::new("live")));
+        }
+        main();
+        "#,
+    )
+    .expect_err("a closure-owned dispatch site must keep the fence");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_static_slot_through_a_closure_owned_dispatch_site_stays_fenced() {
+    // The conservative half of the §1b fix: a closure-owned site unions, so
+    // even a static instantiation fences. S2 (the resolution walk) flips
+    // this pin — the closure resolves through its parent chain.
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T): View {
+            let holder = view("p");
+            let attach = || content.place(holder);
+            attach();
+            holder
+        }
+        fun main() {
+            mount("app", wrap("static"));
+        }
+        main();
+        "#,
+    )
+    .expect_err("S1 keeps the closure-owned site conservative");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_top_level_entry_alongside_a_covered_caller_stays_fenced() {
+    // Pre-existing hole (the arm is verbatim in v0.20.0): with caller edges
+    // present, coverage never consulted the top-level entries, so one
+    // covered caller laundered any number of uncovered top-level calls —
+    // the hidden bare parameter arrived as `undefined` at runtime
+    // (requirement-polymorphism.md §1c).
+    let errors = compile_browser(
+        r#"
+        import std::reactive::{ Signal, run_with_owner, Owner };
+        fun needy() {
+            let s = Signal::new(1);
+            s.effect(|v| {});
+        }
+        fun covered() {
+            run_with_owner(Owner::new(), || needy());
+        }
+        fun main() {
+            covered();
+        }
+        main();
+        needy();
+        "#,
+    )
+    .expect_err("an uncovered top-level entry fences regardless of covered callers");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_covered_caller_alone_keeps_compiling() {
+    // The §1c hoist must not over-tighten: the same program minus the
+    // top-level entry has only covered callers and compiles.
+    compile_browser(
+        r#"
+        import std::reactive::{ Signal, run_with_owner, Owner };
+        fun needy() {
+            let s = Signal::new(1);
+            s.effect(|v| {});
+        }
+        fun covered() {
+            run_with_owner(Owner::new(), || needy());
+        }
+        fun main() {
+            covered();
+        }
+        main();
+        "#,
+    )
+    .expect("a strict function with only covered callers compiles");
+}
+
+#[test]
 fn child_of_an_unimplemented_type_names_the_slot_trait() {
     // The widened bound's failure mode: the diagnostic names the trait and
     // points at the bound, not a generic mismatch.

@@ -516,11 +516,13 @@ fn analyze(
     // into F draws coverage edges from ITS caller to only the impl members
     // its recorded binding selects (a top-level incoming call marks them
     // outside-entered instead — always uncovered); a generic or missing
-    // binding, a value-taken F, or an F itself reachable through dispatch
-    // falls back to the union edge, so a generic forwarding wrapper keeps the
-    // conservative fence. `OnType` sites keep the union: this residual is the
-    // bounded-generic shape, and narrowing concrete-receiver dispatch is a
-    // separate tightening.
+    // binding, a value-taken F, an F itself reachable through dispatch, or a
+    // site owned by a CLOSURE (its entries are not `CallTarget::Function`
+    // edges, so they cannot be enumerated here) falls back to the union
+    // edge, so a generic forwarding wrapper keeps the conservative fence.
+    // `OnType` sites keep the union: this residual is the bounded-generic
+    // shape, and narrowing concrete-receiver dispatch is a separate
+    // tightening.
     let impl_members_for = |resolved: &Type, member: &str| -> Vec<Id> {
         let matches_subject = |subject: &Type| match (subject, resolved) {
             (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => {
@@ -624,7 +626,10 @@ fn analyze(
                 continue;
             }
         };
-        if value_taken.contains(owner) || dispatch_callers.contains_key(owner) {
+        if !program.functions.contains_key(owner)
+            || value_taken.contains(owner)
+            || dispatch_callers.contains_key(owner)
+        {
             union_fallback(&mut coverage_dispatch_callers);
             continue;
         }
@@ -1001,13 +1006,19 @@ fn analyze(
                     let through_dispatch = coverage_dispatch_callers.get(&id);
                     let no_edges =
                         callers.is_empty() && through_dispatch.is_none_or(|list| list.is_empty());
-                    if coverage_outside.contains(&id) {
+                    if coverage_outside.contains(&id)
+                        || top_level_targets.contains(&id)
+                        || value_taken.contains(&id)
+                    {
+                        // Entered from outside the graph — uncovered
+                        // regardless of any covered caller edges (one bound
+                        // caller must not launder an uncovered top-level
+                        // entry).
                         false
                     } else if no_edges {
-                        // No caller edges: dead code is exempt (it cannot
-                        // run); a top-level-called or value-taken function is
-                        // entered from outside the graph — uncovered.
-                        !top_level_targets.contains(&id) && !value_taken.contains(&id)
+                        // No caller edges and no outside entry: dead code is
+                        // exempt (it cannot run).
+                        true
                     } else {
                         callers.iter().all(|caller| bound.contains(&caller.id()))
                             && through_dispatch
