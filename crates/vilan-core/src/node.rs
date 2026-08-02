@@ -158,6 +158,10 @@ pub struct ElementBody<'src> {
     /// parses to the same empty children but different TOKENS, and the
     /// formatter's re-lex net compares tokens — a reprint must keep the form.
     pub self_closing: bool,
+    /// The closing tag name's span (`div` in `</div>`), when the element has
+    /// one — the language server's matching-tag features read it. `None` for a
+    /// self-closing element.
+    pub close_tag: Option<Span>,
 }
 
 /// One child of an element. The distinction is TOKEN-carrying, not semantic —

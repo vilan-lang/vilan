@@ -96,6 +96,7 @@ fn build_chain<'src>(
         head,
         children,
         self_closing: _,
+        close_tag: _,
     } = body;
     let tag_text = &source[tag.into_range()];
     // The generated `view` accessor spans `<tag` — an unresolved `view` (the
@@ -127,9 +128,13 @@ fn build_chain<'src>(
                     _ => "on",
                 };
                 let item_span: Span = (event_span.start..handler.1.end).into();
+                // The scaffolding accessor takes a ZERO-WIDTH span: the event
+                // name belongs to the markup (the LSP paints it as an
+                // attribute), not to the generated method reference.
+                let anchor: Span = (event_span.start..event_span.start).into();
                 (
                     Node::Call(
-                        Box::new((Node::Accessor(method), event_span)),
+                        Box::new((Node::Accessor(method), anchor)),
                         None,
                         (vec![(Node::String(event), event_span), handler], item_span),
                     ),
@@ -142,9 +147,12 @@ fn build_chain<'src>(
                 let item_span: Span = (name.start..end).into();
                 // A bare name is a boolean attribute — present, empty value.
                 let value = value.unwrap_or((Node::String(""), name));
+                // Zero-width scaffolding span, as for events: the attribute
+                // name is markup, not a method reference.
+                let anchor: Span = (name.start..name.start).into();
                 (
                     Node::Call(
-                        Box::new((Node::Accessor("attr"), name)),
+                        Box::new((Node::Accessor("attr"), anchor)),
                         None,
                         (vec![(Node::String(name_text), name), value], item_span),
                     ),
@@ -157,9 +165,14 @@ fn build_chain<'src>(
     for child in children {
         let child = child.into_node();
         let child_span = child.1;
+        // Zero-width scaffolding span: a `.child` link generated for a hole
+        // must not shadow the hole expression's own tokens (they share the
+        // wide span otherwise, and the LSP's overlap sweep tie-breaks
+        // nondeterministically).
+        let anchor: Span = (child_span.start..child_span.start).into();
         let member = (
             Node::Call(
-                Box::new((Node::Accessor("child"), child_span)),
+                Box::new((Node::Accessor("child"), anchor)),
                 None,
                 (vec![child], child_span),
             ),

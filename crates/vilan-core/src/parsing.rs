@@ -1797,10 +1797,11 @@ impl<'a, 'src> Parser<'a, 'src> {
             if self.peek_is_op("/") && self.peek_at_is_ctrl(1, '>') && self.tokens_adjacent(0, 1) {
                 self.bump();
                 self.bump();
-                break (Vec::new(), true);
+                break (Vec::new(), true, None);
             }
             if self.eat_ctrl('>') {
-                break (self.parse_element_children(&tag_tokens)?, false);
+                let (children, close_tag) = self.parse_element_children(&tag_tokens)?;
+                break (children, false, Some(close_tag));
             }
             if self.at_end() {
                 self.note_expected("`>` or `/>`");
@@ -1808,12 +1809,13 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             head.push(self.parse_element_head_item()?);
         };
-        let (children, self_closing) = children;
+        let (children, self_closing, close_tag) = children;
         let body = ElementBody {
             tag,
             head,
             children,
             self_closing,
+            close_tag,
         };
         Some((Node::Element(body), self.span_from(start)))
     }
@@ -1876,7 +1878,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_element_children(
         &mut self,
         open_tokens: &std::ops::Range<usize>,
-    ) -> Option<Vec<ElementChild<'src>>> {
+    ) -> Option<(Vec<ElementChild<'src>>, Span)> {
         let mut children: Vec<ElementChild<'src>> = Vec::new();
         loop {
             // `</tag>` — the close (span-adjacent `</`), name-matched against
@@ -1898,7 +1900,8 @@ impl<'a, 'src> Parser<'a, 'src> {
                     return None;
                 }
                 self.expect_ctrl('>')?;
-                return Some(children);
+                let (close_span, _) = close.expect("matched above");
+                return Some((children, close_span));
             }
             if self.at_end() {
                 let open_name = self.element_name_text(open_tokens);

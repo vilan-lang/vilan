@@ -1390,6 +1390,10 @@ impl LanguageServer for Backend {
                         },
                     )),
                     hover_provider: Some(HoverProviderCapability::Simple(true)),
+                    // Element syntax S5: editing one tag name renames its pair.
+                    linked_editing_range_provider: Some(
+                        LinkedEditingRangeServerCapabilities::Simple(true),
+                    ),
                     definition_provider: Some(OneOf::Left(true)),
                     references_provider: Some(OneOf::Left(true)),
                     rename_provider: Some(OneOf::Left(true)),
@@ -1665,6 +1669,31 @@ impl LanguageServer for Backend {
                 result_id: None,
                 data,
             })))
+        })
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        self.fenced("linkedEditingRange", Ok(None), || {
+            let uri = params.text_document_position_params.text_document.uri;
+            let position = params.text_document_position_params.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            // Program-space lookup, like hover: the position converts through
+            // the ANALYZED index (S1).
+            let offset = document.analyzed_offset(position);
+            Ok(document
+                .linked_tag_ranges(offset)
+                .map(|(open, close)| LinkedEditingRanges {
+                    ranges: vec![
+                        document.analyzed_range(&open),
+                        document.analyzed_range(&close),
+                    ],
+                    word_pattern: None,
+                }))
         })
     }
 
