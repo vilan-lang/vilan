@@ -5166,6 +5166,39 @@ pub(crate) mod tests {
         }
     }
 
+    // Every record the editor reads ABOUT this file must index this file's text.
+    // `context` clauses (`|| void context owner_scope`) are resolved in
+    // `build()`, past the import fixpoint, where the ambient source is the
+    // entry's — but a clause's name spans belong to whatever file WROTE it, and
+    // `std::reactive` is full of them. Importing it therefore handed the editor
+    // references at reactive.vl's offsets, labeled as this file's own. A span
+    // past the end of the buffer is that leak's visible half: the language server
+    // clamps it, so in a short file it lands as an invisible zero-width token and
+    // in a long one it lands on unrelated text (a real one drew over a comment 200
+    // lines from anything reactive).
+    #[test]
+    fn entry_records_index_the_entry_text() {
+        let text = "import std::reactive::Signal;\n\nstruct Row {\n\tcell: Signal<i32>,\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let program = document.program.as_ref().expect("the program analyzes");
+        for (source, span, _, label) in &program.type_references {
+            let range = span.into_range();
+            assert!(
+                *source != SourceId(0) || range.end <= text.len(),
+                "a type reference ({label}) spans {range:?}, past the end of this {}-byte file",
+                text.len()
+            );
+        }
+        for (span, kind, _) in document.semantic_tokens() {
+            let range = span.into_range();
+            assert!(
+                range.end <= text.len(),
+                "a {kind:?} token spans {range:?}, past the end of this {}-byte file",
+                text.len()
+            );
+        }
+    }
+
     // A written generic type application highlights as its HEAD name plus its
     // arguments, each a name of its own. The reference used to be recorded at the
     // whole `Name<Args>` span, and since `semantic_tokens` drops overlaps, that

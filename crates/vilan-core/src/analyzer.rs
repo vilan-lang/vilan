@@ -1404,8 +1404,12 @@ pub struct Analyzer<'src> {
     parameter_contexts: HashMap<Id, Vec<Id>>,
     // Clause sites awaiting post-import resolution: the names may be
     // IMPORTED bindings, which only resolve after the import fixpoint —
-    // walk-time lookup sees same-file names only.
-    prepped_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id)>,
+    // walk-time lookup sees same-file names only. The trailing `SourceId` is
+    // the file that WROTE the clause, captured here because resolution happens
+    // in `build()`, where the ambient source is the entry's and the spans
+    // carried along are not (every sibling `prepped_*` list captures it for
+    // the same reason).
+    prepped_context_clauses: Vec<(Id, Vec<(&'src str, Span)>, Id, SourceId)>,
     // Parameters and `let` bindings whose declared closure type carries the
     // `async` marker (J2): calls through them are implicitly awaited.
     async_values: HashSet<Id>,
@@ -13098,6 +13102,7 @@ impl<'src> Analyzer<'src> {
                         id,
                         names.iter().map(|(name, span)| (*name, *span)).collect(),
                         scope_id,
+                        self.current_source_id,
                     ));
                     annotation = Some(inner);
                 }
@@ -13863,6 +13868,7 @@ impl<'src> Analyzer<'src> {
                 parameter_id,
                 names.iter().map(|(name, span)| (*name, *span)).collect(),
                 type_scope_id,
+                self.current_source_id,
             ));
             declared_type = Some(inner);
         }
@@ -20855,8 +20861,15 @@ impl<'src> Analyzer<'src> {
 
         // --- Resolve `context` clauses (ambient-owner.md §5) --- after the
         // import fixpoint, so a clause may name an imported context.
-        for (parameter_id, names, scope_id) in std::mem::take(&mut self.prepped_context_clauses) {
+        for (parameter_id, names, scope_id, source_id) in
+            std::mem::take(&mut self.prepped_context_clauses)
+        {
             let mut context_ids: Vec<Id> = Vec::new();
+            // Both the references and the diagnostics below carry spans into the
+            // file that WROTE the clause, which in `build()` is not the ambient
+            // source: `std::reactive`'s own clauses were arriving as references
+            // belonging to the file being edited, at offsets into reactive.vl.
+            let diagnostics_before = self.diagnostics.len();
             for (name, name_span) in names {
                 let Some(target) = self.try_get_expr_id_by_name(name, scope_id) else {
                     self.diagnostics.push(Error {
@@ -20881,9 +20894,10 @@ impl<'src> Analyzer<'src> {
                     });
                     continue;
                 }
-                self.record_reference(self.current_source_id, name_span, target);
+                self.record_reference(source_id, name_span, target);
                 context_ids.push(target);
             }
+            self.attribute_new_diagnostics(diagnostics_before, source_id);
             if !context_ids.is_empty() {
                 self.parameter_contexts.insert(parameter_id, context_ids);
             }
