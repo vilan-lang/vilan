@@ -491,5 +491,11 @@ the smoke gate pins the browser rejection in the old-wasm era. Still not
 planned: live diagnostics (~~§7c~~ shipped, see §7c); multi-file/tabs and
 manifest editing; LSP-in-the-browser; snippet sharing beyond the fragment
 (anything with storage reopens the no-server stance deliberately, not by
-drift); prerendered playground embeds in the book's "Try it" blocks (D6's
-natural continuation).
+drift); ~~prerendered playground embeds in the book's "Try it" blocks~~
+**SHIPPED 2026-08-01 as links, not embeds** (vilan `e436a10`, live): the
+book's additional-js gives every complete-program fence an
+Open-in-playground link — the code rides the share codec in the URL
+fragment, process-leg examples carry `&mode=node` and open straight into
+the server check. Links beat embeds here: zero weight on the book, and the
+reader gets the whole workbench (live diagnostics, mode, share) instead of
+a widget.
