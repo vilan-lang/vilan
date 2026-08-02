@@ -1,12 +1,16 @@
 # Web playground — the compiler in the visitor's browser (D11)
 
-> **Status: S0–S3 BUILT — S3 DONE 2026-08-01** (website repo, uncommitted
-> pending review; committing + pushing the website deploys the page). S4
-> (share-via-fragment, badge placement, editor niceties) remains, each
-> independently shippable. §7 calls SETTLED 2026-07-28 — the user took
-> every recommendation: (a) vendored CodeMirror 6, (b) toolchain rides the
-> site build's source, (c) compile on Run only in v1, (d) the path is
-> `/playground`; promotion timing stays with D5/D10.
+> **Status: LIVE AND COMPLETE THROUGH S4+ (2026-08-01)** —
+> vilan-lang.org/playground serves the whole arc: S0–S3, share-via-fragment,
+> Format, auto-run + persistence + keybindings, the template picker, the
+> full-color highlighter, versioned wasm delivery, live diagnostics (§7c
+> superseded), and the server check mode (§9, live with v0.20.0). Remaining
+> by choice: badge placement (the status line carries the version) and the
+> version-selector UI (delivery groundwork in place). §7 calls SETTLED
+> 2026-07-28 — the user took every recommendation: (a) vendored CodeMirror 6,
+> (b) toolchain rides the site build's source, (c) compile on Run only in v1
+> (since superseded, §7c), (d) the path is `/playground`; promotion timing
+> stays with D5/D10.
 > Original status: DRAFT 2026-07-28 — for review. Backlog D11 (user request
 > 2026-07-28). Decides the architecture question the backlog poses: **(a)
 > in-browser WASM compile** is proposed; (b) a server-side compile service is
