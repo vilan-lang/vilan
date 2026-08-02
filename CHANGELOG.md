@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.20.0 — 2026-08-01
 
 **The playground compiler can check the server leg.** `vilan-wasm` exports `compile_for(source, platform)`: "node" analyzes the program as a process-leg build — platform coloring, twin resolution and all — so the playground's server mode can typecheck HTTP services in the browser without pretending to run them. The page feature-detects the export; older wasm builds hide the mode toggle.
 
