@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.21.1 — 2026-08-02
 
 **`mount()` plus a static child works again.** v0.21.0's widened owner fence treated a trait-dispatched call as needing every implementation's contexts — so `view("div").child(view("span"))` demanded an owner boundary because the *Signal* arm of `child` subscribes, even though the resolved `View` arm reads nothing. Context coverage now follows the recorded instantiation: a call that binds the slot to a `View`, a `str`, or a `List<View>` needs no boundary, while a `Signal<str>` slot keeps the fence exactly as before, and a generic forwarding wrapper (`fun wrap<T: Slot>(…)`) conservatively keeps it too. The playground's styles example — the deploy casualty that surfaced this — compiles in its original attach-only form again. The value threading itself is unchanged; only the fence got precise.
 
