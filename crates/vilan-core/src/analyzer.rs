@@ -22781,25 +22781,6 @@ pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
 /// STABLE: anything derived from a buffer (a cached line index, say) is only
 /// valid until the next keystroke, while the same derivation over a disk file
 /// can be cached for the session.
-/// Whether any overlaid buffer lies under one of `roots` — the base cache
-/// bypass asks with the std roots (S3c): a dirty std buffer means the world
-/// on disk is not the world in the editor, so the cache stands aside. Other
-/// open buffers are harmless — the ENTRY's text arrives as a parameter and
-/// never through `read_source`, and `pkg::`-sibling entries bypass anyway.
-pub(crate) fn document_overlay_touches(roots: &[&Path]) -> bool {
-    let Some(overlay) = DOCUMENT_OVERLAY.get() else {
-        return false;
-    };
-    let canonical_roots: Vec<PathBuf> = roots
-        .iter()
-        .map(|root| crate::util::canonical_path(root))
-        .collect();
-    overlay
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .any(|path| canonical_roots.iter().any(|root| path.starts_with(root)))
-}
 
 pub fn document_overlay_contains(path: &Path) -> bool {
     let Some(overlay) = DOCUMENT_OVERLAY.get() else {
@@ -24297,13 +24278,15 @@ pub fn analyze<'src>(
         && collect_module_refs(&nodes.0, "pkg").is_empty()
         && !contains_service(&nodes.0)
         && !entry_source.contains("macro")
-        && !entry_source.contains("derive")
-        && !{
-            let roots: Vec<&Path> = std::iter::once(std.base_root.as_path())
-                .chain(std.layers.iter().map(|layer| layer.root.as_path()))
-                .collect();
-            document_overlay_touches(&roots)
-        };
+        && !entry_source.contains("derive");
+    // Overlays need no bypass (S3d): every load AND every per-hit validation
+    // reads through `read_source`, which consults the overlay first — so a
+    // world built from overlay-served std (the wasm playground's boot) hits
+    // as long as the content stands, and an edited std buffer (the LSP) hash-
+    // mismatches and evicts, which is exactly the E12 rule. The one flow this
+    // does not cover is an overlay MINTING a std module that exists nowhere
+    // else mid-process after a world was stored — not a flow any front-end
+    // has; boot registers before the first analysis.
     if base_cacheable
         && let Some(mut world) = base_cache_lookup(platform, &entry_seed_names, entry_path)
     {

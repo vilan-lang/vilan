@@ -144,20 +144,95 @@ fn world_entangling_entries_and_overlays_bypass() {
         "an unrelated overlay must not block the cache"
     );
 
-    // An overlay UNDER a std root means the editor's world differs from
-    // disk: full bypass.
+    // A std overlay is governed by CONTENT, not existence (S3d): identical
+    // text still hits (validation reads through the overlay), while an
+    // EDITED std buffer hash-mismatches and evicts — the LSP-editing-std
+    // case rebuilds honestly instead of serving a stale world.
     let std_file = std_root().join("src/list.vl");
     let std_text = std::fs::read_to_string(&std_file).expect("read list.vl");
-    vilan_core::analyzer::set_document_overlay(&std_file, Some(std_text));
-    let (hits_pre_std, misses_pre_std) = stats();
+    vilan_core::analyzer::set_document_overlay(&std_file, Some(std_text.clone()));
+    let (hits_pre_std, _) = stats();
     let _ = observe(PROGRAM_A);
-    let (hits_std, misses_std) = stats();
-    vilan_core::analyzer::set_document_overlay(&std_file, None);
+    let (hits_same, _) = stats();
     assert_eq!(
-        (hits_std, misses_std),
-        (hits_pre_std, misses_pre_std),
-        "a std overlay must bypass the cache"
+        hits_same,
+        hits_pre_std + 1,
+        "an unchanged std overlay must still hit"
     );
+    vilan_core::analyzer::set_document_overlay(
+        &std_file,
+        Some(format!(
+            "{std_text}
+// s3d dirty probe
+"
+        )),
+    );
+    let (_, misses_pre_dirty) = stats();
+    let dirty = observe(PROGRAM_A);
+    let (_, misses_dirty) = stats();
+    vilan_core::analyzer::set_document_overlay(&std_file, None);
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        misses_dirty,
+        misses_pre_dirty + 1,
+        "an edited std overlay must evict and miss"
+    );
+    assert_eq!(dirty.0, "[]", "the rebuild against the overlay compiles");
+}
+
+/// The wasm playground's shape (S3d): the ENTIRE std served from overlays
+/// registered before the first analysis (boot), never touching disk paths
+/// that exist. Same-import analyses must hit — this is what makes a second
+/// playground Run skip the std re-analysis.
+#[test]
+fn overlay_served_std_hits_like_disk() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    // Mirror boot(): every std file registered as an overlay at a virtual
+    // root; the spec points at the virtual root.
+    let virtual_parent = PathBuf::from("/s3d-virtual-toolchain");
+    let virtual_root = virtual_parent.join("std");
+    let mut registered = Vec::new();
+    fn register(from: &Path, to: &Path, registered: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(from).expect("read std").flatten() {
+            let path = entry.path();
+            let target = to.join(entry.file_name());
+            if path.is_dir() {
+                register(&path, &target, registered);
+            } else {
+                let text = std::fs::read_to_string(&path).expect("read std file");
+                vilan_core::analyzer::set_document_overlay(&target, Some(text));
+                registered.push(target);
+            }
+        }
+    }
+    register(&std_root(), &virtual_root, &mut registered);
+    // Macros resolve `macro_std` beside `std` — the virtual toolchain needs
+    // the sibling too, exactly as boot registers it.
+    register(
+        &std_root().parent().unwrap().join("macro_std"),
+        &virtual_parent.join("macro_std"),
+        &mut registered,
+    );
+    let spec = vilan_core::manifest::resolve_std(&virtual_root);
+
+    let first = observe_with(&spec, PROGRAM_A);
+    let (hits_before, _) = stats();
+    let second = observe_with(&spec, PROGRAM_B);
+    let (hits_after, _) = stats();
+    for path in &registered {
+        vilan_core::analyzer::set_document_overlay(path, None);
+    }
+    vilan_core::analyzer::base_cache_clear();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "overlay-served std must hit on the second analysis"
+    );
+    assert_eq!(first.0, "[]", "the overlay-served world compiles");
+    assert_eq!(second.0, "[]", "the hit-path analysis compiles");
 }
 
 /// The E12 property: a hit revalidates by CONTENT. Editing a loaded std file

@@ -616,3 +616,32 @@ slots (a plant that skips the patch goes red through exactly that),
 distinct-import miss + store, both overlay directions, and the E12
 eviction — a trailing-comment edit to a private std copy evicts and
 rebuilds. All plant-proven live.
+
+### 6.12 S3d SHIPPED (2026-08-03): the consumers are wired, by deletion
+
+The residual bypass was the wrong mental model. Every load and every
+per-hit validation reads through `read_source`, which consults the
+document overlay FIRST — so the E12 content rule already governs overlays
+correctly, and the std-overlay bypass was pure lost coverage. It is
+removed:
+
+- **The wasm playground caches now.** Boot registers the embedded std as
+  overlays before the first analysis; validation re-reads the same
+  overlay text, hashes match, the second Run hits. Pinned by
+  `overlay_served_std_hits_like_disk` — the entire std served from a
+  virtual overlay root (macro_std sibling included), second analysis
+  must hit.
+- **The LSP editing std itself is now governed by content**: an
+  unchanged std buffer still hits; an EDITED one hash-mismatches,
+  evicts, and rebuilds against the buffer — pinned in both directions.
+- The one flow deliberately out of contract: an overlay MINTING a std
+  module that exists nowhere else, mid-process, after a world was
+  stored. No front-end has that flow; boot registers before the first
+  analysis.
+
+The LSP leak harness runs green over the cache with RSS retention
+stable at +0 KiB across its analysis loops and every counter unchanged —
+the cloned worlds drop normally; only the stored bases and the interned
+seed names are retained, once each. Remaining §6.10 residual: the
+derive/macro entry widening (the per-file expansion hoist), recorded,
+unscheduled.
