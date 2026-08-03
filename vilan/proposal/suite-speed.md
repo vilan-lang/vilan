@@ -195,3 +195,26 @@ E25's outcome settles the dependents:
 - The Linux leak harness (`leak_measurement`, 200-analysis loops) hides
   inside the vilan-lsp unit binary's 29.9 s rather than standing alone —
   E28's fixture work should measure it separately before touching it.
+
+## 4. Post-cache re-measurement (2026-08-03, v0.23.2 tree)
+
+The std-tax arc landed under the E27 gates; re-measured warm, second
+samples:
+
+| gate                | E27-era | post-cache | Δ    |
+|---------------------|---------|------------|------|
+| docs                | 3.73 s  | 2.95 s     | −21 % |
+| interpreter         | 2.78 s  | 2.33 s     | −16 % |
+| inference           | 19.38 s | 12.83 s    | −34 % |
+
+CPU tells the same story (inference 277 → 176 CPU-s). The residual in
+docs/interpreter is node/exec cost and per-program compile work with
+DISTINCT import sets — the cache amortizes only repeated worlds, and both
+binaries were already 8-way parallel. A single-shot CLI process is
+unchanged (~140 ms; the cache is per-process, so a lone `vilan check` is
+one miss + store) — the wins live where analyses repeat: the LSP session,
+the playground instance, the watch loop, and the in-process test
+harnesses. The suite wall now runs ~74 s against the 63.5 s E25-era
+measurement — the difference is six new suite-gate files the arc added
+(the differential, idempotence, and base-cache gates, two of which copy
+whole std trees), not a regression in the measured binaries.
