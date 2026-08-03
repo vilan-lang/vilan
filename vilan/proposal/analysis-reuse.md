@@ -475,3 +475,37 @@ it; it must be fixed regardless of S3.
   (`VILAN_EARLY_STD_BUILD=1`) becomes the standing differential, the
   scope-memo bug fix lands, and the LSP/watch/wasm consumers adopt the
   base.
+
+### 6.8 S3b progress (2026-08-02): the stall is localized; the kernel is
+### pinned open
+
+The freshen-not-fill hunt narrowed the chained-call stall by systematic
+falsification, each step instrumented and measured on the live repro:
+
+- **Not below-mark type-map writes.** A generation mark at the phase
+  boundary plus tracing on all candidate write sites (slot unification,
+  closure-parameter fill, first-call-site-wins) recorded ZERO
+  cross-generation writes during the entry phase — the design's leading
+  suspect is innocent as charged, at least for this repro.
+- **Not slot machinery.** Std-internal slot fills are byte-identical in
+  both modes (the same two internal slots fill with the same generics).
+- **The actual shape**: map#1's `MethodCall` resolves in both modes and
+  mints a fresh per-call result element (`List<fresh>`); the monolithic
+  build fills that element LATE — observably, the inner `len` call
+  resolves between map#2's retry attempts, i.e. the first closure's
+  return landing `U → str` propagates into the per-call element after
+  call#1 already resolved. Under two-phase, that late fill never fires:
+  map#2 retries against `List<fresh-but-never-filled>` and the whole
+  chain stalls to the residual diagnostics.
+- **Next instrument**: the `ClosureReturns` constraint flow and the
+  method-call result-instance construction — find the event that writes
+  the closure's landed return into the per-call element monolithically,
+  and why its trigger condition never holds when std's fixpoint ran
+  first. The fix lands there, at the root.
+
+The blocker is pinned as
+`two_phase_build_resolves_chained_generic_calls` (`build_idempotence.rs`,
+`#[ignore]`d per the house convention — red when run, un-ignored when the
+kernel lands). All temporary instrumentation is removed; the probe
+switches (`set_early_std_build` + env arm) remain the standing
+instrument.

@@ -141,3 +141,40 @@ fn a_second_build_changes_nothing_observable() {
         );
     }
 }
+
+/// S3b's blocker, pinned (analysis-reuse.md §6.7): under a two-phase build
+/// (std resolved before the entry walks), an immediate-chained generic
+/// method call must still infer — today it stalls. The localization from
+/// the S3b hunt: map#1 resolves and mints a fresh per-call result element,
+/// which the monolithic build fills LATE via the first closure's return
+/// landing (len resolves between map#2's attempts); under two-phase that
+/// late fill never happens. NOT the commit tail, NOT re-entry, NOT deferred
+/// bookkeeping, NOT below-mark type-map writes, NOT slot unification (fills
+/// are byte-identical both modes) — instrument the ClosureReturns flow and
+/// the result-instance fill path next. Un-ignore when the freshen-not-fill
+/// kernel lands.
+#[test]
+#[ignore = "S3b open: chained generic calls stall under the two-phase build"]
+fn two_phase_build_resolves_chained_generic_calls() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_early_std_build(true);
+    let observation = observe(
+        r#"
+import std::print;
+struct Point { x: i32, name: str }
+fun main() {
+    let points = [Point { x = 1, name = "abc" }];
+    let lens = points.map(|p| p.name).map(|s| s.len());
+    print(lens[0]);
+}
+"#,
+    );
+    vilan_core::analyzer::set_early_std_build(false);
+    assert_eq!(
+        observation.0, "[]",
+        "the chained generic call must infer under a two-phase build"
+    );
+    assert!(observation.2.is_some(), "and emit JS");
+}
