@@ -1,8 +1,6 @@
 # todos: the realtime full-stack example
 
-The transport/RPC library's milestone app
-([`proposal/transport-rpc.md`](../../proposal/transport-rpc.md), phase 6):
-a to-do list whose data lives on the server, edited from the browser, with
+A realtime full-stack app: a to-do list whose data lives on the server, edited from the browser, with
 every connected tab kept in sync in realtime. Open the page twice; add a todo in
 one tab and watch it appear in the other. Restart the server; the list is still
 there.
@@ -76,7 +74,7 @@ graph.
 ## Where the seams are (deliberately)
 
 - The connect handshake, the per-connection sessions, and the mirror wiring are
-  all generated/runtime now (§4.2's `Client::connect` + the session registry).
+  all generated/runtime now (`Client::connect` and the session registry).
   This example used to hand-write an `attach` method and a sessions map; apps
   needing custom per-connection state (auth identity, say) still can, via
   `serve_connected` and their own registry.

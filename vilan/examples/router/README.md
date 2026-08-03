@@ -1,7 +1,6 @@
 # Router: `std::router`
 
-A client-side routed app ([`proposal/router.md`](../../proposal/router.md),
-backlog A10). The model in one sentence: **routes are enums**. The URL is a
+A client-side routed app. The model in one sentence: **routes are enums**. The URL is a
 wire format for a typed value, so layouts, params, guards, and links are
 ordinary language (a `match`, a payload, an `if`, a value) instead of a
 pattern-string DSL.

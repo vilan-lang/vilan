@@ -1208,3 +1208,44 @@ cross-references hold):
   (a `?`/try operator), not an RPC-specific decision — the foundation works today with the
   happy path plus an explicit decode-failure reply. Track as a prerequisite; revisit when
   `?`/try lands.
+
+## Appendix: compiler quirks the hand-written example surfaced
+## (moved 2026-08-03 from `examples/rpc/README.md`, where they were
+## design history in a reader-facing document)
+
+The example was worth building partly because it surfaced compiler bugs the
+service generation later leaned on. All were fixed and pinned; the README
+carried their full archaeology until the D7-tail cleanup moved it here (the
+complete text is in git history at `vilan/examples/rpc/README.md`; the
+reader-facing language lesson — parenthesized field-projection receivers and
+struct-level bounds — stayed in the README).
+
+1. **Derives only expanded in the entry file** — imported `[derive(Json)]`
+   types had no `from_json`. Fixed (3592343): expansion runs in every module.
+2. **Parenthesized receiver + struct-level bound** — intended syntax, not a
+   bug; kept in the README as teaching.
+3. **The generic-field object stub miscompiled to the abstract method** —
+   field access now substitutes the receiver's type arguments, and a generic
+   struct initializer no longer publishes an unbound type while deferred
+   (backlog B1, class B; pinned by `generic_field_method_dispatch_runs` and
+   neighbors in inference.rs).
+4. **`from_json` element inference through an indirect return path** lowered
+   to the abstract method — fixed by return-type-driven body inference with
+   `resolve_match` propagating the expected type into each leg (pinned:
+   `from_json_return_type_flows_through_match_arm`).
+5. **A generic element serialized inside a closure** lost its bound AND its
+   call-site derivation — fixed by substituting parameterized bound arguments
+   in the `Type::Generic` resolution arm, deriving bound-only generics from
+   the concrete argument's impl, and deferring calls with unbound own-generics
+   while an argument is unresolved. The closure-capture case that closed the
+   B1 cluster.
+
+What the example validated end-to-end: the data boundary, both transports,
+the codec, both protocols, the capability table, over-the-wire subscription,
+the wire turn, and the per-connection session. The `[service(Client)]`
+generation runs the example byte-identically to the hand-written form it
+mechanized. Still open at the move: the real transports (HTTP + WebSocket)
+with `Client::connect`, contract-hash enforcement on connect, and
+`transport.flush()` for the buffered turn; `param: SomeTrait` as a bound
+remains aspirational syntax; the capability table stores `str` absent trait
+objects.
