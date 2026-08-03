@@ -38,11 +38,20 @@ jobs:
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
-      # --no-fail-fast: one failing target must not hide the rest of the run —
-      # this workflow is the instrument that produces the COMPLETE failure list
-      # per push (the exit code still gates; cargo reports failure regardless).
+      # The suite runs under nextest (E25, proposal/suite-speed.md): every
+      # test in its own process, all binaries interleaved instead of serial.
+      # fail-fast is off via the committed .config/nextest.toml — this
+      # workflow is the instrument that produces the COMPLETE failure list
+      # per push (the exit code still gates).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: The suite is green
-        run: cargo test --workspace --no-fail-fast
+        run: cargo nextest run --workspace
+      # nextest does not run doc-tests. Every doc-test set is empty today;
+      # this leg exists so a future doc-test cannot silently stop running.
+      - name: The doc-tests are green
+        run: cargo test --workspace --doc
 
   # The playground's compiler (D11). Its BEHAVIOUR is covered by the workspace
   # suite above — `vilan-wasm` is an rlib as well as a cdylib precisely so its

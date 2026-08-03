@@ -205,22 +205,40 @@ fn every_doc_example_compiles() {
     if readme.is_file() {
         files.push(readme);
     }
-    let mut failures = Vec::new();
-    let mut compiled = 0;
-    for file in &files {
-        for example in extract_examples(file) {
-            compiled += 1;
-            if let Err(errors) = compile(&example.source, example.platform) {
-                failures.push(format!(
-                    "{}:{} — {} — {:?}",
-                    example.file.display(),
-                    example.line,
-                    example.heading,
-                    errors
-                ));
-            }
-        }
-    }
+    let examples: Vec<Example> = files
+        .iter()
+        .flat_map(|file| extract_examples(file))
+        .collect();
+    let compiled = examples.len();
+    // Every example is an independent compile, so run them in parallel chunks
+    // (corpus.rs's shape). Chunks preserve extraction order and workers join
+    // in spawn order, so a failure report reads the same as the serial loop's.
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = examples
+            .chunks(examples.len().div_ceil(8).max(1))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut failures = Vec::new();
+                    for example in chunk {
+                        if let Err(errors) = compile(&example.source, example.platform) {
+                            failures.push(format!(
+                                "{}:{} — {} — {:?}",
+                                example.file.display(),
+                                example.line,
+                                example.heading,
+                                errors
+                            ));
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("compile worker panicked"))
+            .collect()
+    });
     assert!(
         failures.is_empty(),
         "{} of {} doc examples failed to compile:\n{}",

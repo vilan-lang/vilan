@@ -27,14 +27,24 @@ nowhere near saturating the machine. A no-op check is 0.1 s. The per-arc
 suite cost is therefore ≈ **2.5 minutes**: 16 s of relinking plus 131 s of
 strictly serial test execution.
 
+> **CORRECTED by E29's measurement (2026-08-02, §2):** the 16.0 s figure
+> does not reproduce — the same probe measures **~3–4 s** (49 dirty units;
+> vilan-core's no-op incremental recompile ~1.7 s is the critical path,
+> each binary links in well under a second). The audit's number most
+> likely conflated real recompile work or stale incremental caches with
+> the relink itself. And the "link jobs" framing missed that the links
+> were already fast: **rust-lld has been the default linker on
+> x86_64-linux since Rust 1.90** — the toolchain this machine ran
+> throughout, audit included.
+
 The serial 130.7 s decomposes (per-binary `finished in`, top of 51 sets):
 
 | seconds | tests | binary                     | what dominates it (verified in source) |
 |---------|-------|----------------------------|----------------------------------------|
 | 29.9    | 241   | vilan-lsp unit tests       | ~81 fixture sites each running a real `Document::analyze` against on-disk std (~150 ms apiece) |
 | 18.7    | 1205  | tests/inference.rs         | ~1400 full-pipeline `compile()` calls burning ~276 CPU-seconds across all 16 cores — **compile-bound**, at ~90 % parallel efficiency already. (First attributed to its 534 node spawns; §2.1's measurement corrected that.) |
-| 16.7    | 8     | tests/docs.rs              | every book fence compiled **serially** inside 8 tests; runnable fences also spawn node |
-| 14.9    | 9     | tests/interpreter.rs       | per-case `CARGO_BIN_EXE_vilan` spawns, serial |
+| 16.7    | 8     | tests/docs.rs              | every book fence compiled **serially** inside one test (the audit's "also spawns node" was wrong — the gate only compiles). E27 parallelized it: → 3.7 s |
+| 14.9    | 9     | tests/interpreter.rs       | the equivalence sweep runs each admitted corpus program **serially** (in-process compile + node run + interpreter; no CLI spawns, another audit slip). E27 parallelized it: → 2.8 s |
 | 8.1     | 2     | tests/examples.rs          | 9 examples staged via `git ls-files` and built through the debug binary |
 | 5.4     | 6     | tests/corpus.rs            | already 8-way parallel (`thread::scope`, chunked) — the shape the others should copy |
 | 4.7/4.2/2.8 | — | hmr / rpc_http / transport | e2e legs: ports (post-E19 they bind port 0) + real servers |
@@ -48,37 +58,67 @@ runs.
 
 Ordered by measured payoff; estimates assume the others have not landed.
 
-- **E25 — run the binaries in parallel** (the big one): 130.7 s of serial
-  execution against a longest-single-binary of 29.9 s is a theoretical ~4.4×.
-  `cargo-nextest` is the obvious instrument; note it runs each TEST in its
-  own process, which makes today's in-process serialization (vilan-wasm's
-  mutex, the LSP's overlay locks) unnecessary rather than broken, and the
-  port-binding legs already survived E19's port-0 migration. The risks to
-  clear per-binary: stdout-parsing e2e legs, node-spawn storms under load
-  (the E20 flake history marks where timing pressure bites), and CI parity.
-  Est: 131 s → ~35–45 s.
+- **E25 — run the binaries in parallel — SHIPPED 2026-08-02** via
+  cargo-nextest (0.9.140; local install from get.nexte.st, CI via
+  taiki-e/install-action). Measured on the post-E27 tree: 112 s →
+  **63.5 s** (82.2 s unconfigured; the committed `.config/nextest.toml`
+  turns fail-fast off and priority-starts the Linux leak plateaus, whose
+  longest test — 32 s idle, ~52 s under full load — is the critical path
+  when scheduled last). From the audit baseline: 131 s → 63.5 s. Parity
+  exact: 2270 run + 1 skipped = cargo test's 2271 enumeration, all three
+  doc-test sets empty (CI keeps a `cargo test --workspace --doc` leg so a
+  future doc-test cannot silently stop running). Three full runs green,
+  zero flakes — the stdout-parsing e2e legs and node-storm risks did not
+  bite. Plant-proven red (exit 100, named FAIL with full report). The cost
+  worth recording: user CPU rises ~70 % (530 s → ~915 s) — the per-test
+  process tax under WSL2 exec plus cache contention at full interleave;
+  wall is what the suite gates on, but this is why the floor is ~57 s
+  (915/16), not 33 s. CLAUDE.md's suite section now names nextest as the
+  gate; `cargo test --workspace --no-fail-fast` remains a correct, slower
+  equivalent; release.yml's tag-time gate stays on plain cargo test,
+  unchanged. CI outcome (run 30771883241, both legs green): ubuntu
+  6m37s → 6m13s, windows 8m21s → 10m02s — the per-test process tax is
+  steepest on Windows CreateProcess, and that leg is now CI's long pole.
+  Accepted for instrument parity; reverting the windows leg to cargo test
+  is a one-line change if the price stops being worth it.
 - **E26 — batch inference's node runs — CLOSED NEGATIVE, see §2.1**: the
   filed premise (534 spawns × ~35 ms IS the 18.7 s) was arithmetic derived
   from the wall, not an independent measurement. Built, measured, and
   withdrawn 2026-08-02: removing every spawn moved the wall from 19.39 s to
   19.20 s — noise. The binary is compile-bound (§2.1); the real lever is
   E30.
-- **E27 — parallelize the docs gate and interpreter cases**: both are
-  serial loops over independent compiles; corpus.rs already demonstrates
-  the safe 8-way chunk shape in this very suite. Est: 16.7 s → ~4 s and
-  14.9 s → ~4 s.
+- **E27 — parallelize the docs gate and interpreter cases — SHIPPED
+  2026-08-02**: both were serial loops over independent compiles (verified
+  by the E26-lesson user-time check first: docs 16.6 s user at 99 % CPU,
+  interpreter 14.8 s at 104 % — genuinely single-threaded, real headroom).
+  corpus.rs's 8-way `thread::scope` chunk shape, applied verbatim; chunks
+  preserve item order and workers join in spawn order, so failure reports
+  read identically to the serial loops'. Measured: docs 16.78 s → 3.73 s
+  (531 % CPU), interpreter 15.09 s → 2.78 s (674 % CPU) — 25.4 s off the
+  serial floor. Both gates plant-proven red under parallelism (a broken
+  README fence; db.vl unexcluded), each failure named and attributable.
 - **E28 — share the LSP's analyzed fixtures**: the unit binary's 29.9 s is
   ~81 `Document::analyze` fixture sites; a `OnceLock`-shared analysis per
   distinct SOURCE keeps every assertion while paying each analysis once.
   Est: 29.9 s → ~10 s. (Counter-interacts with E25's per-test processes —
   decide the runner first; under nextest this lever mostly evaporates.)
-- **E29 — cut the edit tax**: 16 s to relink 43+ binaries at 490 % CPU.
-  Two independent sub-levers: a faster linker (neither mold nor lld is
-  installed today; either typically halves link-heavy rebuilds), and
-  consolidating integration binaries that share a subject (the five-plus
-  parse_* files, the hmr trio) to cut link JOBS — weighed against per-binary
-  isolation, and worth less if E25 lands via nextest (which prefers many
-  binaries). Evidence first: `cargo build --timings` on the relink.
+- **E29 — cut the edit tax — CLOSED 2026-08-02, overtaken by events**:
+  evidence-first, as filed, and the evidence dissolved the item. (1) The
+  16 s tax does not reproduce: the identical probe measures ~3–4 s wall /
+  ~20 CPU-s (49 dirty units, `--timings`-verified; vilan-core's ~1.7 s
+  no-op incremental recompile is the critical path, links well under a
+  second each). (2) The "no fast linker installed" premise was stale at
+  filing: `readelf -p .comment` on any test binary says `Linker: LLD
+  20.1.8` — **rust-lld is rustc's default on x86_64-linux since 1.90**,
+  so the linker win was banked before the audit measured. (3) mold was
+  installed and probed anyway; a first pass appeared to save ~1 s until
+  the .comment check showed the flag never took effect (rustc's
+  self-contained lld won the link line) — the "saving" was
+  rebuild-freshness, a measurement trap worth remembering. mold-over-lld's
+  real ceiling here is a fraction of a second per cycle: not worth a
+  toolchain dependency. The consolidation sub-lever was already dead
+  under E25's nextest. Residual truth: the per-arc edit tax is ~3 s and
+  it is recompile-bound, not link-bound.
 
 - **E30 — inference's repeated std analysis** (filed by E26's measurement,
   §2.1): a single ~10-line `assert_compiles` case costs ~170 ms of
@@ -127,9 +167,23 @@ Two corrections propagate:
   not attribution).
 
 Sequencing after the correction: **E27 → E25 → (E28/E30/E29 as E25's
-outcome dictates)**. E27 takes the serial floor to ~100 s; E25's real
-ceiling wants re-estimating from CPU sums; E30 is the only lever left on
-inference and it needs the analyzer-arc decision first.
+outcome dictates)**. Both shipped 2026-08-02: E27 −25.4 s, then E25 landing
+the suite at **63.5 s** (2.1× from the audit's 131 s).
+
+E25's outcome settles the dependents:
+- **E28 and E30 as filed are foreclosed**: nextest's per-test processes
+  cannot share an in-process `OnceLock` analysis. Either lever now means a
+  disk-cached std/fixture snapshot (an analyzer arc, not a test tweak) or
+  cutting the per-analysis cost itself — and the payoff shrank: the leak
+  plateaus and the CPU floor (~915 s ÷ 16), not fixture repetition, now
+  bound the wall. **RESOLVED 2026-08-02**: both measured to the same root —
+  a fixed ~115 ms per-analysis std tax — and folded into the std-tax arc,
+  `analysis-reuse.md` §6 (E3 Phase 3 reopened; `VILAN_PHASE_TIMING`
+  shipped as its S0).
+- **E29's consolidation sub-lever is dead** (nextest prefers many
+  binaries); the faster-linker sub-lever looked up-weighted here, but
+  E29's own measurement then closed the item entirely — the tax is ~3 s
+  and lld was already the linker (see the E29 entry above).
 
 ## 3. What was NOT found
 

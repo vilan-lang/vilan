@@ -427,6 +427,7 @@ fn analyze_source_unfenced(
     let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
+        let phase_post_start = std::time::Instant::now();
         context::thread_contexts(&mut program);
         async_infer::infer(&mut program);
         // `drop` must be synchronous (destruction.md §5): reject an async drop
@@ -454,6 +455,16 @@ fn analyze_source_unfenced(
         // rather than a load-time `ReferenceError`. Runs last: the relation is
         // only meaningful for a program that analyzed cleanly.
         init_order::check_cycles(&mut program);
+        // The post-pass half of the `VILAN_PHASE_TIMING` split. This line
+        // prints only on the `analyze_source` path (LSP, wasm, the test
+        // harnesses) — the CLI calls `analyze` directly and runs its own
+        // post-passes, so a CLI build shows the in-analyze line alone.
+        if phase_timing_enabled() {
+            eprintln!(
+                "[vilan phase] post-passes {:.1}ms",
+                phase_post_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         program
     }));
     match analyzed {
@@ -472,5 +483,18 @@ pub(crate) fn leak_report_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VILAN_LEAK_REPORT").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// Whether `VILAN_PHASE_TIMING` asks for the per-analysis phase line (any
+/// value but empty or `0`) — the std-tax arc's instrument
+/// (proposal/analysis-reuse.md §6): one stderr line per analysis splitting
+/// the wall between module loading+walking, `build()`, and the whole-program
+/// checks, so a reuse slice's effect is measured where it lands. Read once
+/// and cached, like the leak report: the LSP asks on every keystroke.
+pub(crate) fn phase_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VILAN_PHASE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
     })
 }

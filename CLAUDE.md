@@ -37,17 +37,23 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 
 ## Running the suite
 
-`cargo test --workspace` is the gate and it is expensive — ~40 test binaries each
-linking the full crate, a ~100-program corpus built through the debug binary, a
-docs gate compiling every fence, and e2e legs that bind ports and spawn servers.
+`cargo nextest run --workspace` is the gate — ~40 test binaries each linking
+the full crate, a ~100-program corpus built through the debug binary, a docs
+gate compiling every fence, and e2e legs that bind ports and spawn servers.
+nextest interleaves every binary's tests across all cores (fail-fast is off
+via the committed `.config/nextest.toml`), which is what took the suite from
+131 s to ~64 s (E21/E25–E27, `proposal/suite-speed.md`) — still expensive.
 Run it when it is the right instrument, not as a way of finding out what you
-just did.
+just did. Two instrument notes: nextest does not run doc-tests (all empty
+today; CI's `cargo test --workspace --doc` leg guards the gap), and plain
+`cargo test --workspace --no-fail-fast` remains a correct, slower
+equivalent.
 
 - **Never pipe it through `grep`, `head`, or `tail` and read the exit code.**
   The pipeline reports the *filter's* status, so a red suite looks green — this
   has produced real "all green" claims over genuine failures. Redirect and check
-  cargo's own code:
-  `cargo test --workspace --no-fail-fast > suite.log 2>&1; echo $?` — then grep
+  the runner's own code:
+  `cargo nextest run --workspace > suite.log 2>&1; echo $?` — then grep
   the log. Same trap with `cargo build`.
 - **Run it once, at the end, after every edit is done.** A run started
   mid-editing tests a tree that no longer exists, and finishing it teaches you

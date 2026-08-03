@@ -1,0 +1,19 @@
+# Suite parallelism (E25, proposal/suite-speed.md): nextest runs every test
+# in its own process with all binaries interleaved, replacing cargo test's
+# strictly serial binary-by-binary execution. Doc-tests are NOT run by
+# nextest — today every doc-test set is empty, and CI keeps a
+# `cargo test --workspace --doc` leg so a future doc-test cannot silently
+# stop running.
+
+# fail-fast off mirrors the suite discipline's --no-fail-fast: a run is the
+# instrument that produces the COMPLETE failure list (the exit code still
+# gates).
+[profile.default]
+fail-fast = false
+
+# The Linux leak plateaus are the suite's longest single tests (10-32 s of
+# looped analyses each). Scheduled last they ARE the critical path; higher
+# priority starts them first so they overlap the wide middle of the run.
+[[profile.default.overrides]]
+filter = 'test(leak_measurement)'
+priority = 100
