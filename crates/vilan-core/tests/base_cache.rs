@@ -119,12 +119,16 @@ fn world_entangling_entries_and_overlays_bypass() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     vilan_core::analyzer::base_cache_clear();
     let (hits_before, misses_before) = stats();
-    let _ = observe("import std::print;\n// a derive-flavored comment\nfun main() { print(1); }\n");
+    // Macro-DEFINING entries stay bypassed (E23's world key is
+    // entry-entangled); derive USERS cache since the hoist (§6.13).
+    let _ = observe(
+        "import std::print;\nmacro fun m(s: Source): Source { s }\nfun main() { print(1); }\n",
+    );
     let (hits_mid, misses_mid) = stats();
     assert_eq!(
         (hits_mid, misses_mid),
         (hits_before, misses_before),
-        "derive-text entries must bypass, not miss"
+        "macro-defining entries must bypass, not miss"
     );
 
     // An overlay OUTSIDE std is harmless — the entry's text arrives as a
@@ -292,4 +296,39 @@ fn copy_tree(from: &Path, to: &Path) {
             std::fs::copy(&path, &target).expect("copy std file");
         }
     }
+}
+
+/// The derive/macro hoist (§6.13): a derive-USING entry caches, its derived
+/// impls arrive through the hit path, and the sharp edge holds — a struct
+/// WITHOUT the derive still errors identically through a hit.
+#[test]
+fn derive_entries_cache_and_derived_impls_survive_the_hit() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    const WITH_DERIVE: &str = "import std::print;\n[derive(PartialEq)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 } == P { x = 1 }); }\n";
+    const WITHOUT_DERIVE: &str = "import std::print;\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+
+    let first = observe(WITH_DERIVE);
+    let (hits_before, _) = stats();
+    assert_eq!(first.0, "[]", "the derive entry compiles on the miss");
+
+    let second = observe(WITH_DERIVE);
+    let (hits_after, _) = stats();
+    assert_eq!(hits_after, hits_before + 1, "the derive entry must hit");
+    assert_eq!(first.2, second.2, "derived impls must survive the hit (JS)");
+
+    // The sharp edge, through a hit of the same world: no derive, and the
+    // `==` must still error exactly as fresh.
+    let cached_error = observe(WITHOUT_DERIVE);
+    let (hits_final, _) = stats();
+    assert_eq!(hits_final, hits_after + 1, "the error case also hits");
+    vilan_core::analyzer::base_cache_clear();
+    let fresh_error = observe(WITHOUT_DERIVE);
+    assert_eq!(
+        cached_error.0, fresh_error.0,
+        "the missing-derive error must be identical through a hit"
+    );
+    assert_ne!(cached_error.0, "[]", "and it must actually error");
 }

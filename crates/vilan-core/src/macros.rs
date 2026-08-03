@@ -91,7 +91,7 @@ pub(crate) enum ModuleKey {
     DepLib(usize),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct MacroRegistry {
     by_module: HashMap<ModuleKey, HashMap<String, MacroDef>>,
     /// `macro { .. }` blocks per file, keyed by the block NODE's address —
@@ -231,6 +231,7 @@ pub(crate) enum MacroShape {
     Unit,
 }
 
+#[derive(Clone)]
 pub(crate) struct MacroDef {
     /// The macro's declared name (the world's entry lookup key).
     name: String,

@@ -24207,6 +24207,7 @@ fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'
     scrubbed.sources[0] = PathBuf::new();
     scrubbed.source_hashes[0] = 0;
     scrubbed.analyzer.source_texts[0] = (SourceId(0), "");
+    scrubbed.generated_by_source.remove(&SourceId(0));
     // SAFETY: lifetime-only transmute. After the scrub, every reference the
     // world holds is 'static in fact: module/dep texts and ASTs live in
     // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
@@ -24222,6 +24223,99 @@ fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert((platform, seed_names), static_world);
+}
+
+/// Expands the ENTRY over a constructed [`World`] — the derive/macro hoist
+/// (§6.13). Runs identically on a cache hit and a cacheable miss, AFTER the
+/// world exists (and, on a miss, after the scrubbed store), so entry
+/// expansions never entangle a stored base. The entry registers into this
+/// world's own registry copy first (empty rows for a derive-only entry; the
+/// `macro`-text bypass keeps definers out), then expands with a fresh site
+/// counter — the value the load-region path gives the entry, which always
+/// expanded first. Returns `true` when generated code demands a module the
+/// world never loaded (or any `pkg::` sibling): the caller rebuilds fresh.
+fn expand_entry_over_world<'src>(
+    world: &mut World<'src>,
+    nodes: &'src Spanned<NodeList<'src>>,
+    entry_source: &'src str,
+    entry_path: &Path,
+    std: &PackageSpec,
+    workspace: &Workspace,
+) -> bool {
+    if crate::macros::in_macro_world() {
+        return false;
+    }
+    let before = world.analyzer.diagnostics.len();
+    crate::macros::register_file(
+        &mut world.macro_registry,
+        crate::macros::ModuleKey::Entry,
+        &nodes.0,
+        entry_source,
+        entry_path,
+        SourceId(0),
+        std,
+        &mut world.analyzer.diagnostics,
+    );
+    world
+        .analyzer
+        .attribute_new_diagnostics(before, SourceId(0));
+    let scope = crate::macros::scope_for(
+        &world.macro_registry,
+        workspace,
+        &crate::macros::FilePackage::Entry,
+        &crate::macros::ModuleKey::Entry,
+        &nodes.0,
+    );
+    let mut macro_site_counter: u32 = 0;
+    let before = world.analyzer.diagnostics.len();
+    let output = crate::macros::expand_source(
+        &scope,
+        std,
+        workspace.macro_limits,
+        &nodes.0,
+        entry_source,
+        &mut world.analyzer.diagnostics,
+        &mut macro_site_counter,
+        0,
+    );
+    world
+        .analyzer
+        .attribute_new_diagnostics(before, SourceId(0));
+    for (defining_source, error) in output.world_errors {
+        let before = world.analyzer.diagnostics.len();
+        world.analyzer.diagnostics.push(error);
+        world
+            .analyzer
+            .attribute_new_diagnostics(before, defining_source);
+    }
+    for (_, list) in &output.items {
+        for (module, _) in collect_module_refs(list, "std") {
+            if !world.module_scopes.contains_key(module) {
+                return true;
+            }
+        }
+        if !collect_module_refs(list, "pkg").is_empty() {
+            return true;
+        }
+    }
+    world
+        .generated_by_source
+        .entry(SourceId(0))
+        .or_default()
+        .extend(output.items);
+    world
+        .analyzer
+        .macro_item_invocations
+        .extend(output.item_sites);
+    world
+        .analyzer
+        .macro_failed_sites
+        .extend(output.failed_sites);
+    world
+        .analyzer
+        .macro_expression_expansions
+        .extend(output.expressions);
+    false
 }
 
 /// The resolved pre-entry world — everything `analyze` builds before the
@@ -24247,6 +24341,13 @@ struct World<'src> {
     nursery_ambient_id: Option<Id>,
     nursery_fn_id: Option<Id>,
     owned_nursery_struct_id: Option<Id>,
+    // The macro registry the world was built with (S3c residual, §6.13):
+    // for a cacheable entry the Entry rows are empty by construction (no
+    // `macro` text), so the registry is entry-independent and rides the
+    // cache; the per-analysis entry expansion registers the entry into its
+    // own CLONE and expands against it, post-snapshot, on hit and miss
+    // alike.
+    macro_registry: crate::macros::MacroRegistry,
     phase_analyze_start: crate::PhaseClock,
     phase_base: std::time::Duration,
 }
@@ -24259,6 +24360,34 @@ pub fn analyze<'src>(
     entry_path: &Path,
     platform: Platform,
     workspace: &Workspace,
+) -> Program<'src> {
+    analyze_inner(
+        nodes,
+        entry_source,
+        std,
+        pkg_root,
+        entry_path,
+        platform,
+        workspace,
+        true,
+    )
+}
+
+/// `analyze` with the cache switchable: the derive/macro hoist's fallback —
+/// an entry whose GENERATED code demands a module the cached world never
+/// loaded — rebuilds fresh through here with `allow_cache: false`, which
+/// restores the load-region entry expansion so generated references seed
+/// the loader (depth one: the uncached path cannot fall back again).
+#[allow(clippy::too_many_arguments)]
+fn analyze_inner<'src>(
+    nodes: &'src Spanned<NodeList<'src>>,
+    entry_source: &'src str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Platform,
+    workspace: &Workspace,
+    allow_cache: bool,
 ) -> Program<'src> {
     // The std-tax arc's instrument (proposal/analysis-reuse.md §6): wall-clock
     // marks at the phase boundaries, printed at the end when
@@ -24288,12 +24417,15 @@ pub fn analyze<'src>(
             .chain(std.layers.iter().map(|layer| &layer.root))
             .any(|root| crate::util::canonical_path(root) == pkg_root_canonical)
     };
-    let base_cacheable = workspace.packages.is_empty()
+    let base_cacheable = allow_cache
+        && workspace.packages.is_empty()
         && !entry_is_inside_std
         && collect_module_refs(&nodes.0, "pkg").is_empty()
         && !contains_service(&nodes.0)
-        && !entry_source.contains("macro")
-        && !entry_source.contains("derive");
+        // Macro-DEFINING entries stay bypassed (their world compile is
+        // entry-entangled, E23); derive USERS cache — the ambient derive
+        // vocabulary lives in the registry the world carries (§6.13).
+        && !entry_source.contains("macro");
     // Overlays need no bypass (S3d): every load AND every per-hit validation
     // reads through `read_source`, which consults the overlay first — so a
     // world built from overlay-served std (the wasm playground's boot) hits
@@ -24309,6 +24441,20 @@ pub fn analyze<'src>(
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
         world.phase_analyze_start = phase_analyze_start;
+        if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
+            // Generated code demands a module this world never loaded:
+            // rebuild fresh, with the load-region expansion restored.
+            return analyze_inner(
+                nodes,
+                entry_source,
+                std,
+                pkg_root,
+                entry_path,
+                platform,
+                workspace,
+                false,
+            );
+        }
         return analyze_over_world(
             world,
             nodes,
@@ -24740,6 +24886,14 @@ pub fn analyze<'src>(
     // generated code's imports re-enter the load loop.
     let mut macro_registry: Option<crate::macros::MacroRegistry> = None;
     let mut expanded_sources: HashSet<SourceId> = HashSet::new();
+    // The derive/macro hoist (§6.13): a cacheable entry expands AFTER the
+    // world is constructed (and, on a miss, stored) — through
+    // `expand_entry_over_world`, identically on hit and miss — so the stored
+    // world never carries entry expansions. Pre-marking SourceId(0) makes
+    // the loop's entry arm skip it; the entry-as-module arm is unaffected.
+    if base_cacheable {
+        expanded_sources.insert(SourceId(0));
+    }
     // Splice sites are stamped with a per-analysis counter (gensym hygiene, §7).
     let mut macro_site_counter: u32 = 0;
     let mut generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>> =
@@ -25501,8 +25655,9 @@ pub fn analyze<'src>(
         analyzer.resolve_world();
     }
     let phase_base = phase_base_start.elapsed();
-    let world = World {
+    let mut world = World {
         analyzer,
+        macro_registry: macro_registry.unwrap_or_default(),
         sources,
         source_hashes,
         entry_is_module,
@@ -25521,6 +25676,23 @@ pub fn analyze<'src>(
     };
     if base_cacheable && !entry_is_module {
         base_cache_store(platform, entry_seed_names, &world);
+    }
+    // The suppressed entry expansion runs here, symmetric with the hit path
+    // (§6.13); a generated demand for an unloaded module rebuilds fresh.
+    if base_cacheable
+        && !entry_is_module
+        && expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace)
+    {
+        return analyze_inner(
+            nodes,
+            entry_source,
+            std,
+            pkg_root,
+            entry_path,
+            platform,
+            workspace,
+            false,
+        );
     }
     analyze_over_world(
         world,
@@ -25550,6 +25722,7 @@ fn analyze_over_world<'src>(
 ) -> Program<'src> {
     let World {
         mut analyzer,
+        macro_registry: _,
         sources,
         source_hashes,
         entry_is_module,

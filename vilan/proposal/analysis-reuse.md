@@ -681,3 +681,27 @@ entries bypass the cache today. Reconnaissance findings:
   sharp edge — `bind_each` without PartialEq must still error
   identically); the fallback pin (generated import of a non-loaded
   module); E23's leak counters unchanged over the hit path.
+
+### 6.14 The hoist SHIPPED (2026-08-03): derive entries join the cache
+
+The §6.13 measurement came in at **~0.95 ms** for the full registry build
+— low enough that either fork worked, and fork (a) won on simplicity:
+the `World` carries the registry (its Entry rows are empty by
+construction for cacheable entries, so no de-entrying is needed), and
+`expand_entry_over_world` runs the entry's registration + expansion over
+the constructed world — identically on hit and cacheable miss (the
+load-region entry expansion is suppressed via a pre-marked SourceId(0)),
+with a fresh site counter matching the load-region path's entry-first
+ordering. Stored worlds never carry entry expansions; the store scrubs
+`generated_by_source[0]` defensively anyway. Generated code demanding an
+unloaded module (or any `pkg::` sibling) rebuilds fresh through
+`analyze_inner(allow_cache: false)`, depth one. The `derive` substring
+leaves the bypass; `macro` stays (definers are E23-entangled).
+
+Gates: derive entries hit with identical JS; the sharp edge holds (a
+struct without the derive errors identically through a hit); macro
+definers still bypass; plant-proven (skipping the hit-path expansion
+turns exactly the derived-impls assertion red); the corpus differential
+now pushes every derive-using corpus program through the hoist both
+ways. With this, the §6.10 residual list is EMPTY — the std-tax arc has
+no open slices.
