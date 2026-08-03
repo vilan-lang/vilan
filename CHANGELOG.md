@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.23.5 — 2026-08-03
 
 **See what bundle splitting would save, today.** `vilan build --print-chunks` reports the route-chunk plan for each entry: which `View.swap` route matches are splittable, which functions every path needs eagerly, and which pages (with their exclusive helpers, wherever they live — entry or module) would load lazily per route, with estimated sizes. Analysis only — the emitted JavaScript is unchanged. The instrument for the bundle-splitting arc (`proposal/bundle-splitting.md`): emission lands when a real app's report shows meaningful per-route mass.
 
