@@ -587,3 +587,32 @@ MILLISECONDS.
   different programs, identical observations), clone-cost measurement
   against the 61 ms target, the poisoned-patch plant, and the standing
   suites.
+
+### 6.11 S3c part 2 SHIPPED (2026-08-02): the base cache is live
+
+`analyze` splits at the resolved-world boundary over a `World` struct
+(analyzer + boundary state, compiler-enumerated); the cache stores
+scrubbed `World<'static>` clones keyed by (platform, the entry's sorted
+`std::` reference names), re-validated per hit by CONTENT hashes (the
+E12 rule) and entry-patched on clone. The lifetime story holds without
+a leap: std/dep texts live in `parse_clean_cached`'s leaked memory,
+the one entry-derived string reaching the world's maps (a seeded module
+name) is interned, and the three entry slots are scrubbed before store —
+the transmute's invariant is enumerated at the site.
+
+Bypasses (fresh build, no store): workspace dependencies, `pkg::` refs,
+`[service]` blocks, macro/derive text (syntactic, conservative — their
+expansion runs inside the world-building loop), the entry inside std,
+and overlays TOUCHING STD ROOTS only — an unrelated open buffer (the
+LSP's normal state) does not block the cache, which is the arc's primary
+case working as designed. The wasm playground serves std from overlays,
+so it bypasses today — widening it is a recorded residual, as is the
+per-file expansion hoist that would admit derive-bearing entries.
+
+Measured: inference 19.2 → 13.4 s (−30 %, CPU −34 %) purely from
+in-process hits; the S1 differential 5.8 → 4.5 s. Gates
+(`base_cache.rs`): hit-observation identity INCLUDING entry-identity
+slots (a plant that skips the patch goes red through exactly that),
+distinct-import miss + store, both overlay directions, and the E12
+eviction — a trailing-comment edit to a private std copy evicts and
+rebuilds. All plant-proven live.

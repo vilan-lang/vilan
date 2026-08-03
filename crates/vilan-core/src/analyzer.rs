@@ -230,7 +230,7 @@ pub enum ExprPattern {
     Literal(Id),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Function<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -292,7 +292,7 @@ pub struct Function<'src> {
     pub doc_hidden: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExternalFunction<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -333,7 +333,7 @@ pub struct FunctionCall {
     pub arguments_span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Parameter<'src> {
     pub id: Id,
     pub function_id: Id,
@@ -479,7 +479,7 @@ struct R11Instance {
     call_id: Id,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Variable<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -493,7 +493,7 @@ pub struct Variable<'src> {
     pub annotated: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Struct<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -516,7 +516,7 @@ pub struct Field<'src> {
     pub type_id: TypeId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Enum<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -538,7 +538,7 @@ pub struct Enum<'src> {
     pub is_numeric: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EnumVariantDeclaration<'src> {
     pub name: &'src str,
     pub data_type_ids: Vec<TypeId>,
@@ -548,7 +548,7 @@ pub struct EnumVariantDeclaration<'src> {
 }
 
 // A match pattern as walked, with variant names not yet resolved.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum WalkPattern<'src> {
     Wildcard,
     Binding(Id),
@@ -569,7 +569,7 @@ enum WalkPattern<'src> {
 
 // A walked match leg: its patterns (an or-pattern when more than one), optional
 // guard, and body, each scoped to the leg's captures.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WalkLeg<'src> {
     patterns: Vec<WalkPattern<'src>>,
     guard: Option<Id>,
@@ -577,7 +577,7 @@ struct WalkLeg<'src> {
 }
 
 // A match expression awaiting subject and pattern resolution.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreppedMatch<'src> {
     id: Id,
     subject_id: Id,
@@ -589,7 +589,7 @@ struct PreppedMatch<'src> {
 // A `let (a, b) = value` destructuring binding awaiting its value's type, so the
 // pattern's bindings can be typed from the value's (tuple) element types. The
 // bindings are already walked into `scope_id`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DestructureConstraint<'src> {
     id: Id,
     value_id: Id,
@@ -605,7 +605,7 @@ struct DestructureConstraint<'src> {
 
 // An `is` pattern test awaiting subject and pattern resolution. Its captures are
 // already walked into `scope_id`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreppedIs<'src> {
     id: Id,
     subject_id: Id,
@@ -613,7 +613,7 @@ struct PreppedIs<'src> {
     pattern: WalkPattern<'src>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Implementation<'src> {
     pub subject: TypeId,
     pub declarations: IndexMap<&'src str, Id>,
@@ -627,7 +627,7 @@ pub struct Implementation<'src> {
     pub trait_args: Vec<(Id, Vec<TypeId>)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Trait<'src> {
     pub id: Id,
     pub name: &'src str,
@@ -656,7 +656,7 @@ pub struct Trait<'src> {
 
 /// A pending `impl Subject with Trait` conformance check: the subject type
 /// must provide every member the named trait requires.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraitImplCheck<'src> {
     pub subject_type_id: TypeId,
     pub trait_name: &'src str,
@@ -727,14 +727,14 @@ struct MemberSignatureShape {
     generic_constraint_ids: Vec<TypeId>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module<'src> {
     pub id: Id,
     pub name: &'src str,
     pub body: (Vec<Id>, Id),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Closure {
     pub id: Id,
     pub parameters: Vec<Id>,
@@ -762,7 +762,7 @@ pub struct StructInitializerConstraint<'src> {
 
 /// A constraint that a variable's type must unify with its
 /// initial value's type (possibly multiple times for reassignments).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableConstraint {
     pub variable_id: Id,
     pub initial_type_id: TypeId,
@@ -777,7 +777,7 @@ pub struct VariableConstraint {
 /// A constraint that a call subject expression's type must resolve to
 /// a callable type (Function or ExternalFunction) and that each argument
 /// must unify with the corresponding parameter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CallSubjectConstraint {
     pub call_id: Id,
     pub subject_id: Id,
@@ -788,7 +788,7 @@ pub struct CallSubjectConstraint {
 
 /// A constraint that a field accessor's subject type must resolve to
 /// a struct and that a field of that struct is accessible by name.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldAccessorConstraint<'src> {
     pub id: Id,
     pub subject_id: Id,
@@ -801,7 +801,7 @@ pub struct FieldAccessorConstraint<'src> {
 /// order (and, in a later increment, dependency-driven). Variants are migrated
 /// over from the old worklists one kind at a time; `priority` reproduces the
 /// original inter-section order so each migration stays corpus-identical.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Constraint<'src> {
     /// `subject[index]` — resolves to the subject `List`'s element type.
     Subscript {
@@ -1035,7 +1035,7 @@ impl CallSubjectConstraint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scope<'src> {
     pub id: Id,
     pub parent_id: Option<Id>,
@@ -1074,7 +1074,7 @@ type RpcSignatureCheck<'src> = (&'src str, Vec<(String, Option<&'src Node<'src>>
 /// the span to report at (see `check_expose_fields`).
 type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, Span);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Analyzer<'src> {
     assignment_values: IndexMap<Id, Vec<Id>>,
     closures: IndexMap<Id, Closure>,
@@ -22116,7 +22116,7 @@ pub const DERIVED_SOURCE: SourceId = SourceId(u32::MAX);
 /// impl's `verdict`/`from_bad` (the members recorded here), with the receiver's
 /// concrete type for monomorphization.
 /// The innermost callable a `ret`/`!` returns from (proposal/ret-checking.md).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ReturnFrame {
     /// A function with a declared return type — rets check against it. Carries
     /// the function's id so a `ret` site can be attributed to its function
@@ -22781,6 +22781,26 @@ pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
 /// STABLE: anything derived from a buffer (a cached line index, say) is only
 /// valid until the next keystroke, while the same derivation over a disk file
 /// can be cached for the session.
+/// Whether any overlaid buffer lies under one of `roots` — the base cache
+/// bypass asks with the std roots (S3c): a dirty std buffer means the world
+/// on disk is not the world in the editor, so the cache stands aside. Other
+/// open buffers are harmless — the ENTRY's text arrives as a parameter and
+/// never through `read_source`, and `pkg::`-sibling entries bypass anyway.
+pub(crate) fn document_overlay_touches(roots: &[&Path]) -> bool {
+    let Some(overlay) = DOCUMENT_OVERLAY.get() else {
+        return false;
+    };
+    let canonical_roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| crate::util::canonical_path(root))
+        .collect();
+    overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .any(|path| canonical_roots.iter().any(|root| path.starts_with(root)))
+}
+
 pub fn document_overlay_contains(path: &Path) -> bool {
     let Some(overlay) = DOCUMENT_OVERLAY.get() else {
         return false;
@@ -24081,7 +24101,7 @@ pub struct Workspace {
 /// register into (its own `pkg`), and its resolved dependency edges (import name →
 /// the dependency's namespace module id). Used by `resolve_import_root` to resolve
 /// `pkg::` / `<dep>::` relative to the importing package.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LoadedPackage {
     namespace_id: Id,
     namespace_scope_id: Id,
@@ -24107,6 +24127,134 @@ fn interned_display_name(name: String) -> &'static str {
     leaked
 }
 
+/// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
+/// keyed by (platform, the entry's sorted `std::` reference names), each hit
+/// re-validated against the loaded files' CONTENT hashes (the E12 rule) and
+/// then cloned with the three entry slots patched. Worlds are stored
+/// SCRUBBED — entry path, hash, and text emptied — and every reference a
+/// stored world still holds is 'static in fact: std/dep texts live in
+/// `parse_clean_cached`'s leaked cache, and the one entry-derived string
+/// that reaches the world's maps (a seeded module name) is interned above.
+static BASE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(Platform, Vec<String>), World<'static>>>,
+> = std::sync::OnceLock::new();
+static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BASE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (hits, misses) — the test surface.
+#[doc(hidden)]
+pub fn base_cache_stats() -> (u64, u64) {
+    (
+        BASE_CACHE_HITS.load(std::sync::atomic::Ordering::SeqCst),
+        BASE_CACHE_MISSES.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+#[doc(hidden)]
+pub fn base_cache_clear() {
+    if let Some(cache) = BASE_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// A validated, entry-patched clone of the cached world for this key, or
+/// `None` (a miss, counted). Validation re-reads every recorded source and
+/// compares content hashes; a stale world is evicted, not repaired.
+fn base_cache_lookup(
+    platform: Platform,
+    seed_names: &[String],
+    entry_path: &Path,
+) -> Option<World<'static>> {
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (platform, seed_names.to_vec());
+    let stale = if let Some(world) = cache.get(&key) {
+        let entry_canonical = crate::util::canonical_path(entry_path);
+        let entry_is_a_loaded_module = world
+            .sources
+            .iter()
+            .skip(1)
+            .any(|path| crate::util::canonical_path(path) == entry_canonical);
+        let contents_match = !entry_is_a_loaded_module
+            && world
+                .sources
+                .iter()
+                .zip(world.source_hashes.iter())
+                .skip(1)
+                .all(|(path, expected)| {
+                    crate::util::read_source(path)
+                        .is_ok_and(|text| crate::content_hash(&text) == *expected)
+                });
+        if contents_match {
+            BASE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Some(world.clone());
+        }
+        true
+    } else {
+        false
+    };
+    if stale {
+        cache.remove(&key);
+    }
+    BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    None
+}
+
+/// Stores a scrubbed clone of `world` under (platform, seeds).
+fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'_>) {
+    let mut scrubbed = world.clone();
+    scrubbed.sources[0] = PathBuf::new();
+    scrubbed.source_hashes[0] = 0;
+    scrubbed.analyzer.source_texts[0] = (SourceId(0), "");
+    // SAFETY: lifetime-only transmute. After the scrub, every reference the
+    // world holds is 'static in fact: module/dep texts and ASTs live in
+    // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
+    // file through it), seeded module names go through
+    // `interned_display_name`, and the three entry slots — the only places
+    // entry-borrowed data ever lands before the entry walk — were just
+    // emptied. The store path is additionally gated on `base_cacheable`
+    // (no pkg refs, no services, no macro/derive text, no overlays, no
+    // dependencies), so no other entry-derived state exists in the world.
+    let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((platform, seed_names), static_world);
+}
+
+/// The resolved pre-entry world — everything `analyze` builds before the
+/// entry file walks (S3c, analysis-reuse.md §6.10): the analyzer after
+/// `resolve_world`, plus the boundary state the entry tail consumes. The
+/// base cache stores a scrubbed clone of one of these; a hit patches the
+/// three entry slots and runs the tail.
+#[derive(Clone)]
+struct World<'src> {
+    analyzer: Analyzer<'src>,
+    sources: Vec<PathBuf>,
+    source_hashes: Vec<u64>,
+    entry_is_module: bool,
+    global_scope_id: Id,
+    module_scopes: HashMap<&'src str, Id>,
+    generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>>,
+    // The std intrinsics the tail keys passes off (resolved from the loaded
+    // world's scopes; `None` when the module never loaded).
+    list_struct_id: Option<Id>,
+    list_new_fn_id: Option<Id>,
+    list_push_fn_id: Option<Id>,
+    context_struct_id: Option<Id>,
+    nursery_ambient_id: Option<Id>,
+    nursery_fn_id: Option<Id>,
+    owned_nursery_struct_id: Option<Id>,
+    phase_analyze_start: std::time::Instant,
+    phase_base: std::time::Duration,
+}
+
 pub fn analyze<'src>(
     nodes: &'src Spanned<NodeList<'src>>,
     entry_source: &'src str,
@@ -24121,6 +24269,59 @@ pub fn analyze<'src>(
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
     // `Instant::now()` calls are noise next to an analysis.
     let phase_analyze_start = std::time::Instant::now();
+    // The base cache (S3c): a WORLD — everything up to and including the
+    // pre-entry `resolve_world` — is a pure function of (std content,
+    // platform, the entry's std:: reference names) whenever the entry brings
+    // no world-entangling features. The bypass list is conservative and
+    // syntactic where it must be: workspace dependencies, `pkg::` siblings,
+    // `[service]` blocks, and macro/derive text all expand or load inside
+    // the world-building loop, so such entries build fresh and are never
+    // stored. Overlays bypass wholesale: loaded content may not match disk.
+    let entry_seed_names: Vec<String> = {
+        let mut names: Vec<String> = collect_module_refs(&nodes.0, "std")
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let entry_is_inside_std = {
+        let pkg_root_canonical = crate::util::canonical_path(pkg_root);
+        std::iter::once(&std.base_root)
+            .chain(std.layers.iter().map(|layer| &layer.root))
+            .any(|root| crate::util::canonical_path(root) == pkg_root_canonical)
+    };
+    let base_cacheable = workspace.packages.is_empty()
+        && !entry_is_inside_std
+        && collect_module_refs(&nodes.0, "pkg").is_empty()
+        && !contains_service(&nodes.0)
+        && !entry_source.contains("macro")
+        && !entry_source.contains("derive")
+        && !{
+            let roots: Vec<&Path> = std::iter::once(std.base_root.as_path())
+                .chain(std.layers.iter().map(|layer| layer.root.as_path()))
+                .collect();
+            document_overlay_touches(&roots)
+        };
+    if base_cacheable
+        && let Some(mut world) = base_cache_lookup(platform, &entry_seed_names, entry_path)
+    {
+        world.sources[0] = entry_path.to_path_buf();
+        world.source_hashes[0] = crate::content_hash(entry_source);
+        world.analyzer.source_texts[0] = (SourceId(0), entry_source);
+        world.phase_analyze_start = phase_analyze_start;
+        return analyze_over_world(
+            world,
+            nodes,
+            entry_source,
+            std,
+            pkg_root,
+            entry_path,
+            platform,
+            workspace,
+        );
+    }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
     // `source_hashes` runs parallel to `sources`: the content hash of the text
@@ -24170,8 +24371,8 @@ pub fn analyze<'src>(
     // (`list.vl`, an `external struct` with `external fun new`/`push`); the
     // struct id and the `new`/`push` intrinsic ids are captured below after the
     // module loads, and the transformer lowers them to `[]` / `.push`.
-    let mut list_new_fn_id: Option<Id> = None;
-    let mut list_push_fn_id: Option<Id> = None;
+    let list_new_fn_id: Option<Id> = None;
+    let list_push_fn_id: Option<Id> = None;
 
     // --- Load the `std` package from source ---
     // `pkg` aliases this package's sibling modules so `pkg::<module>::item`
@@ -24307,7 +24508,11 @@ pub fn analyze<'src>(
     to_load.extend(
         entry_std_refs
             .into_iter()
-            .map(|(name, _)| (Origin::Std, name)),
+            // Interned: a stored base world must hold no entry-text slices
+            // (S3c) — the module name is the one entry-derived string that
+            // reaches the world's maps, so it becomes 'static here. Leak-once
+            // per distinct name; module names are a tiny closed set.
+            .map(|(name, _)| (Origin::Std, interned_display_name(name.to_string()))),
     );
     // The entry's `pkg::sibling` references pull in its own package's modules from
     // `pkg_root`. When the entry is itself a std file (`compiling_std`) these are
@@ -25298,6 +25503,71 @@ pub fn analyze<'src>(
         analyzer.resolve_world();
     }
     let phase_base = phase_base_start.elapsed();
+    let world = World {
+        analyzer,
+        sources,
+        source_hashes,
+        entry_is_module,
+        global_scope_id,
+        module_scopes,
+        generated_by_source,
+        list_struct_id,
+        list_new_fn_id,
+        list_push_fn_id,
+        context_struct_id,
+        nursery_ambient_id,
+        nursery_fn_id,
+        owned_nursery_struct_id,
+        phase_analyze_start,
+        phase_base,
+    };
+    if base_cacheable && !entry_is_module {
+        base_cache_store(platform, entry_seed_names, &world);
+    }
+    analyze_over_world(
+        world,
+        nodes,
+        entry_source,
+        std,
+        pkg_root,
+        entry_path,
+        platform,
+        workspace,
+    )
+}
+
+/// The entry tail: walks the entry over a resolved [`World`], builds,
+/// checks, and extracts the `Program`. Byte-identical to the former tail
+/// of `analyze` — the destructure below restores its locals.
+#[allow(clippy::too_many_arguments)]
+fn analyze_over_world<'src>(
+    world: World<'src>,
+    nodes: &'src Spanned<NodeList<'src>>,
+    entry_source: &'src str,
+    std: &PackageSpec,
+    pkg_root: &Path,
+    entry_path: &Path,
+    platform: Platform,
+    workspace: &Workspace,
+) -> Program<'src> {
+    let World {
+        mut analyzer,
+        sources,
+        source_hashes,
+        entry_is_module,
+        global_scope_id,
+        module_scopes,
+        generated_by_source,
+        list_struct_id,
+        mut list_new_fn_id,
+        mut list_push_fn_id,
+        context_struct_id,
+        nursery_ambient_id,
+        nursery_fn_id,
+        owned_nursery_struct_id,
+        phase_analyze_start,
+        phase_base,
+    } = world;
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);

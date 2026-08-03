@@ -49,7 +49,7 @@ impl Backend {
 /// A concrete build platform: a host runtime (with version), or `None` — no host,
 /// for type-checking only (a pure library can't be built, only checked). This is
 /// the build's identity that selects which library layers are reachable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Platform {
     /// Node.js, by major version (only [`NODE_LTS`] is supported today).
     Node { version: u32 },
