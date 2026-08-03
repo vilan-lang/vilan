@@ -24251,7 +24251,7 @@ struct World<'src> {
     nursery_ambient_id: Option<Id>,
     nursery_fn_id: Option<Id>,
     owned_nursery_struct_id: Option<Id>,
-    phase_analyze_start: std::time::Instant,
+    phase_analyze_start: crate::PhaseClock,
     phase_base: std::time::Duration,
 }
 
@@ -24268,7 +24268,7 @@ pub fn analyze<'src>(
     // marks at the phase boundaries, printed at the end when
     // `VILAN_PHASE_TIMING` asks. The marks are unconditional — three
     // `Instant::now()` calls are noise next to an analysis.
-    let phase_analyze_start = std::time::Instant::now();
+    let phase_analyze_start = crate::PhaseClock::now();
     // The base cache (S3c): a WORLD — everything up to and including the
     // pre-entry `resolve_world` — is a pure function of (std content,
     // platform, the entry's std:: reference names) whenever the entry brings
@@ -25498,7 +25498,7 @@ pub fn analyze<'src>(
     // vote (S3b's acceptance); this resolved pre-entry world is exactly what
     // the base cache will snapshot. A std file open as the entry keeps the
     // monolithic order — its world IS the entry.
-    let phase_base_start = std::time::Instant::now();
+    let phase_base_start = crate::PhaseClock::now();
     if !entry_is_module {
         analyzer.resolve_world();
     }
@@ -25588,10 +25588,10 @@ fn analyze_over_world<'src>(
     // anchor; anything unattributed defaults to the entry file.
     analyzer.set_current_source(SourceId(0));
     let phase_load_walk = phase_analyze_start.elapsed();
-    let phase_build_start = std::time::Instant::now();
+    let phase_build_start = crate::PhaseClock::now();
     analyzer.build();
     let phase_build = phase_build_start.elapsed();
-    let phase_checks_start = std::time::Instant::now();
+    let phase_checks_start = crate::PhaseClock::now();
     // The S2 pin's switch: a second build over the drained queues must
     // change nothing observable.
     if build_twice_forced() {

@@ -427,7 +427,7 @@ fn analyze_source_unfenced(
     let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
-        let phase_post_start = std::time::Instant::now();
+        let phase_post_start = crate::PhaseClock::now();
         context::thread_contexts(&mut program);
         async_infer::infer(&mut program);
         // `drop` must be synchronous (destruction.md §5): reject an async drop
@@ -492,6 +492,37 @@ pub(crate) fn leak_report_enabled() -> bool {
 /// the wall between module loading+walking, `build()`, and the whole-program
 /// checks, so a reuse slice's effect is measured where it lands. Read once
 /// and cached, like the leak report: the LSP asks on every keystroke.
+/// A wall-clock mark that is a NO-OP on wasm32 — `std::time::Instant::now()`
+/// aborts on `wasm32-unknown-unknown` (no clock without WASI), and the phase
+/// marks run unconditionally on every analysis, so the v0.23.0 playground
+/// crashed on its first compile. The smoke gate caught it pre-publish; this
+/// keeps the instrument for hosts and makes wasm report zeros.
+#[derive(Clone, Copy)]
+pub(crate) struct PhaseClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    started: std::time::Instant,
+}
+
+impl PhaseClock {
+    pub(crate) fn now() -> Self {
+        PhaseClock {
+            #[cfg(not(target_arch = "wasm32"))]
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.started.elapsed()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            std::time::Duration::ZERO
+        }
+    }
+}
+
 pub(crate) fn phase_timing_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {

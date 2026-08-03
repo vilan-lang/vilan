@@ -10,6 +10,8 @@ tracks the latest state.
 
 **A static inherited default is no longer fenced by a stranger's name.** The owner fence's last blanket conservatism: a method call resolving to an inherited trait default was covered by *member name*, unioned across every trait in the program — so `5.verdict()`, whose inherited default reads nothing, was rejected whenever any unrelated impl anywhere spelled a subscribing method the same way. Such a call is now covered by its receiver: only the members the receiver's type actually selects demand a boundary. A `self` call inside a shared default body — whose receiver genuinely varies by impl — keeps the conservative treatment, as does everything the receiver's own type selects: a needy default you actually inherit still fences.
 
+**The v0.23.0 playground crash is fixed.** The phase-timing instrument marked wall-clock times unconditionally, and `Instant::now()` aborts on the browser's wasm target — so the v0.23.0 compiler crashed on its first playground compile. The deploy pipeline's smoke gate caught it before anything went live (the playground kept serving v0.22.0); the marks now no-op on wasm and report zeros.
+
 ## v0.23.0 — 2026-08-03
 
 **The compiler can show where an analysis spends its time.** Set `VILAN_PHASE_TIMING=1` and every analysis prints one stderr line splitting its wall clock between module loading, constraint solving, and the whole-program checks — the companion to `VILAN_LEAK_REPORT`'s what-was-retained line, and the instrument for the analysis-reuse work: on today's compiler, ~84% of a small program's compile is the standard library being re-solved and re-checked, which is the cost that arc exists to remove.
