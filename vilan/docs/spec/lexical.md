@@ -16,7 +16,7 @@ leading U+FEFF byte-order mark is an encoding marker rather than source
 text: it is ignored, and positions are counted from the byte after it. A
 U+FEFF anywhere else is content. Together these make a program's meaning
 independent of how an editor saved it: the same source is the same
-program on every platform. (See `proposal/windows-support.md` §2; the
+program on every platform. (See [the design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/windows-support.md) §2; the
 canonical on-disk form is LF with no BOM, and `vilan fmt` writes it.)
 
 ## 2.1 Comments

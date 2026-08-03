@@ -5,8 +5,8 @@ sharing mechanism (views, projections, `Shared`, `Arena`/`Handle`, and the
 resource class, §6.8) is a *claim* on an owner, and all of them obey the
 one law stated in §6.0. The numbered sections that follow are that law's
 projections: the four rules (design:
-`proposal/memory-management-rev-1.md`), the escape hatches, and resources
-(design: `proposal/claims-and-epochs.md`, `proposal/destruction.md`). Rules
+[the design notes](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/memory-management-rev-1.md)), the escape hatches, and resources
+(design: [claims and epochs](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/claims-and-epochs.md), [destruction](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/destruction.md)). Rules
 1–3 and rule 4's static half are normative and enforced; rule 4's dynamic
 remainder is future work, marked below.
 
@@ -236,7 +236,7 @@ exclusive). See [cells](../std/cells.md).
 
 ## 6.8 Resources and destruction
 
-*(Design: `proposal/destruction.md`.)* Rule 1 copies values, and a
+*(Design: [destruction](https://github.com/vilan-lang/vilan/blob/main/vilan/proposal/destruction.md).)* Rule 1 copies values, and a
 droppable value cannot survive copying: a copied file handle double-closes,
 a copied refcount miscounts. Destruction is therefore not bolted onto the
 data world: the world is partitioned. **Data** is everything above: copied
