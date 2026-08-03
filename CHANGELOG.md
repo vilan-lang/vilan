@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.23.0 — 2026-08-03
 
 **The compiler can show where an analysis spends its time.** Set `VILAN_PHASE_TIMING=1` and every analysis prints one stderr line splitting its wall clock between module loading, constraint solving, and the whole-program checks — the companion to `VILAN_LEAK_REPORT`'s what-was-retained line, and the instrument for the analysis-reuse work: on today's compiler, ~84% of a small program's compile is the standard library being re-solved and re-checked, which is the cost that arc exists to remove.
 
