@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.23.1 — 2026-08-03
 
 **A static inherited default is no longer fenced by a stranger's name.** The owner fence's last blanket conservatism: a method call resolving to an inherited trait default was covered by *member name*, unioned across every trait in the program — so `5.verdict()`, whose inherited default reads nothing, was rejected whenever any unrelated impl anywhere spelled a subscribing method the same way. Such a call is now covered by its receiver: only the members the receiver's type actually selects demand a boundary. A `self` call inside a shared default body — whose receiver genuinely varies by impl — keeps the conservative treatment, as does everything the receiver's own type selects: a needy default you actually inherit still fences.
 
