@@ -390,3 +390,88 @@ neutral across the battery. The re-entrant-build contract S3 needs holds
 today at the observation level; S3's remaining work is the id-space side
 (generation-scoped ids so a second build's minting never renumbers the
 frozen base), not behavioral neutrality.
+
+### 6.7 S3 design (2026-08-02): the frozen base is a CLONE, and the
+### groundwork is landed
+
+Three evidence streams (two read sweeps plus an empirical reorder probe run
+against every gate in the workspace) settle the mechanism and stage the
+work. Landed with this section: the `build()` split into named phases —
+`resolve_world` (queue drains + the constraint fixpoint) and
+`finalize_build` (the commit tail: give-up defaults, iterator/operator
+resolution, end-of-fixpoint diagnostics) — plus the `set_early_std_build`
+probe switch with a `VILAN_EARLY_STD_BUILD` env arm that lets the entire
+suite vote on two-phase neutrality. Default behavior is byte-identical
+(`build()` = the two phases in sequence).
+
+**Mechanism: clone-the-base, not rollback.** The mutation inventory is
+dispositive. Entry-side analysis writes into std-owned state in every
+class: accumulating appends into std IR (`context::thread_contexts`
+PUSHES hidden parameters onto std functions and context arguments onto
+std call sites — a shared base doubles them per analysis), per-use
+`reference_count` accumulation on std definitions (three consumers turn
+drift into emitted-JS changes), in-place fills of std-minted TypeIds
+(slot unification; first-call-site-wins closure-parameter fill), and one
+BACKWARDS write — name-resolution memoization caches entry ids into std
+scopes. A rollback design would need a per-class repair list and would
+still be wrong the first time a class is missed; a per-analysis deep
+clone of the built base retires the entire table. Phase 2's clone-cost
+concern is now a measurement task, not a blocker: the id problem
+disappears under clone (each analysis's ids continue from the base's
+mark; nothing renumbers).
+
+**The big fear is retired.** Trait-dispatch candidate sets are never
+frozen at build time: `generic_dispatch`/`bound_dispatch_traits` record a
+name plus a declaration-local trait, and every candidate ENUMERATION
+(async_infer, the context pass's v0.21.x coverage closure, call_graph,
+init_order, platform_color) recomputes from the finished `Program` after
+the last build. A std-first build cannot freeze a smaller dispatch world.
+
+**The real residual hazards, ranked** (from the constraint sweep):
+1. `Failed`-is-permanent: a std-side constraint that fails in phase 1 is
+   dropped, never retried — and the arms that can fail for want of an
+   ENTRY impl on a std-visible subject are exactly the impl-scanning ones
+   (`MethodCall`, `TryAssert`, `Lift`, `reconcile_type`'s
+   `type_implements_trait` arm). Phase 1 must treat those failures as
+   deferrals (a phase flag suppressing the terminal diagnostic).
+2. `finalize_build` must be structurally once-per-analysis — its
+   whole-map sweeps would double-diagnose on a re-run; today only the
+   call wiring guarantees it.
+3. **The chained-call stall — the first concrete instance of the §4 id
+   blocker, now with a minimal repro.** Under a std-first
+   `resolve_world`, `points.map(|p| p.name).map(|s| s.len())` stalls
+   ("type of variable could not be resolved") while the corpus, the S2
+   battery, the let-split variant of the same chain, and 1215 of 1216
+   inference tests pass. Falsified by experiment: it is NOT the commit
+   tail (persists under the split), NOT re-entry fragility (build_twice
+   is clean), NOT stale deferred-queue bookkeeping (persists when
+   deferred constraints return to the queue at phase end). What remains
+   is the state class both sweeps independently flagged: in-place fills
+   on std-minted signature/slot TypeIds — std's own internal usage fills
+   them in phase 1 where the monolithic build would have let the entry's
+   call participate. The fix class is per-use freshening / copy-on-write
+   of base-minted type ids — precisely the "generation-scoped ids" work
+   §4 predicted, no longer hypothetical.
+
+**Also found, filed independently**: name-resolution memoization plus the
+std-scopes-parent-to-global layout means `std::math::<any entry global>`
+RESOLVES today — an entry-defined function is reachable through any std
+module path (repro in the backlog entry). A generation-aware memo fixes
+it; it must be fixed regardless of S3.
+
+**The slice plan from here:**
+- **S3b — the id boundary**: pin the chained-call repro red-first against
+  a two-phase pin, then make entry-side unification freshen (not fill)
+  base-minted TypeIds. This is the XL kernel; it is also what makes the
+  clone SAFE to reuse across analyses of different entries.
+- **S3c — the base cache**: snapshot the built std+deps world
+  (post-`resolve_world`, pre-entry) behind a content key (std sources +
+  manifest + platform + workspace + compiler version); per analysis:
+  clone, walk entry, `resolve_world`, `finalize_build`, checks. Bypass
+  when the entry IS a std file or any std path is overlaid. Measure the
+  clone; the Phase-2 stop-bar logic applies (clone cost must undercut
+  the ~63 ms it replaces).
+- **S3d — wire and gate**: the reorder probe's whole-suite vote
+  (`VILAN_EARLY_STD_BUILD=1`) becomes the standing differential, the
+  scope-memo bug fix lands, and the LSP/watch/wasm consumers adopt the
+  base.

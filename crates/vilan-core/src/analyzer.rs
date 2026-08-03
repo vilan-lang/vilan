@@ -19985,6 +19985,17 @@ impl<'src> Analyzer<'src> {
     }
 
     fn build(&mut self) {
+        self.resolve_world();
+        self.finalize_build();
+    }
+
+    /// The resolution preamble and the constraint fixpoint — everything
+    /// `build()` does BEFORE the commit tail. The S3 two-phase shape runs
+    /// this alone over the pre-entry world (analysis-reuse.md §6.7): the
+    /// drained queues resolve and the fixpoint settles what it can, but
+    /// nothing is committed, defaulted, or diagnosed — constraints the
+    /// entry may still bind stay open for the final build to finish.
+    fn resolve_world(&mut self) {
         // Resolve imports/re-exports to a fixpoint: a re-export may name an item
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
@@ -20813,7 +20824,15 @@ impl<'src> Analyzer<'src> {
                 break;
             }
         }
+    }
 
+    /// `build()`'s commit tail: the give-up defaults (`for…in` items to
+    /// `any`), iterator-protocol and operator-overload resolution, deferred
+    /// binder-bound inheritance, and the end-of-fixpoint diagnostics. Runs
+    /// exactly once per analysis, after the LAST `resolve_world` — committing
+    /// a pre-entry world would freeze std constraints the entry still binds
+    /// (the chained-`map` failure that pinned this split).
+    fn finalize_build(&mut self) {
         // Hand any still-unresolved constraints back to `self.constraints` so the
         // post-fixpoint passes (the `for…in` commit, the end-of-fixpoint
         // diagnostics) see them where they always have.
@@ -22773,6 +22792,32 @@ pub fn set_build_twice(enabled: bool) {
 
 pub(crate) fn build_twice_forced() -> bool {
     BUILD_TWICE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Runs `build()` once over the loaded modules BEFORE the entry file walks —
+/// the two-phase shape a frozen std base needs (S3, analysis-reuse.md §6):
+/// generation 0 is everything built before the entry existed; the ordinary
+/// post-entry `build()` then drains only the entry's queued work (S2).
+/// Test-only while the design settles; the differential gates vote on
+/// whether a std-first build resolves anything differently.
+static EARLY_STD_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_early_std_build(enabled: bool) {
+    EARLY_STD_BUILD.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn early_std_build_forced() -> bool {
+    // The env arm lets the ENTIRE workspace suite vote on the reorder's
+    // neutrality (`VILAN_EARLY_STD_BUILD=1 cargo nextest run`) — every
+    // front-end, the CLI children included, runs two-phase. Cached like the
+    // other env instruments.
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    EARLY_STD_BUILD.load(std::sync::atomic::Ordering::SeqCst)
+        || *ENV.get_or_init(|| {
+            std::env::var("VILAN_EARLY_STD_BUILD")
+                .is_ok_and(|value| !value.is_empty() && value != "0")
+        })
 }
 
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
@@ -25237,6 +25282,15 @@ pub fn analyze<'src>(
     // A normal entry is walked here in the global scope. When the entry is a std
     // module it was already walked (as its module) in the loop above, so skip
     // this to avoid analyzing it twice.
+    // S3 probe: resolve the loaded modules' world before the entry walks —
+    // the two-phase shape a frozen base needs. Resolution only, no commit
+    // tail: `finalize_build` runs once, in the post-entry `build()`, so
+    // constraints the entry may still bind stay open (the chained-`map`
+    // lesson). The post-entry build then drains only what the entry queued
+    // (S2's contract).
+    if early_std_build_forced() && !entry_is_module {
+        analyzer.resolve_world();
+    }
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);
