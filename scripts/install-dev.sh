@@ -7,8 +7,10 @@
 # Builds `vilan` and `vilan-lsp` in release mode, installs them into
 # ~/.vilan/bin (override with $VILAN_INSTALL_DIR — the same directory and
 # variable install.sh uses, so a dev build and a release install overwrite
-# each other rather than shadowing), and packages the VS Code extension into
-# a `.vsix` beside its sources. Idempotent: re-running it updates in place.
+# each other rather than shadowing), refreshes any older pair already sitting
+# in ~/.cargo/bin (override with $VILAN_MIRROR_DIR, set it to $VILAN_INSTALL_DIR
+# to skip), and packages the VS Code extension into a `.vsix` beside its
+# sources. Idempotent: re-running it updates in place.
 set -eu
 
 BIN_DIR="${VILAN_INSTALL_DIR:-$HOME/.vilan/bin}"
@@ -32,6 +34,22 @@ cp target/release/vilan target/release/vilan-lsp "$BIN_DIR/"
 chmod +x "$BIN_DIR/vilan" "$BIN_DIR/vilan-lsp"
 
 say "installed $("$BIN_DIR/vilan" --version) to $BIN_DIR"
+
+# A `vilan` that predates this script keeps answering from wherever it sits on
+# PATH — most often a `cargo install` copy in ~/.cargo/bin, which rustup's shell
+# setup prepends — and a stale one is indistinguishable from a fresh build until
+# you compare `--version` commit hashes. Worse for `vilan-lsp`, which has no
+# `--version`: an old server squiggles syntax the new compiler accepts. So
+# refresh a copy that is *already* there, and leave a directory without one
+# alone — creating install locations is install.sh's business, not this script's.
+MIRROR_DIR="${VILAN_MIRROR_DIR:-$HOME/.cargo/bin}"
+if [ "$MIRROR_DIR" != "$BIN_DIR" ] &&
+    { [ -e "$MIRROR_DIR/vilan" ] || [ -e "$MIRROR_DIR/vilan-lsp" ]; }; then
+    rm -f "$MIRROR_DIR/vilan" "$MIRROR_DIR/vilan-lsp"
+    cp target/release/vilan target/release/vilan-lsp "$MIRROR_DIR/"
+    chmod +x "$MIRROR_DIR/vilan" "$MIRROR_DIR/vilan-lsp"
+    say "refreshed the older copy in $MIRROR_DIR (it would otherwise shadow)"
+fi
 
 say ""
 say "packaging the VS Code extension ..."
