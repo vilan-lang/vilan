@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.23.2 — 2026-08-03
 
 **A module path no longer reaches names the module never declared.** `math::helper()` compiled whenever the ENTRY file declared a top-level `helper` — any of your own globals resolved through any standard-library module path, in member position and in `import std::math::helper;` alike. The member lookup walked the module's scope chain out to the global scope, where your top-level items live; it now consults the module's own declarations and re-exports only (the rule `use` paths always followed), and a genuinely missing member reports exactly as before.
 
