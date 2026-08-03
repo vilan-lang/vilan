@@ -197,8 +197,10 @@ the post-review form.
 
 ## Out of scope (recorded follow-ups)
 
-- Salvage tail retention for semantic tokens (blank tail below a transient break; needs its own
-  design — retained tokens for changed text is the bug class this proposal removes).
+- Salvage tail retention for semantic tokens — **DONE 2026-08-03** (backlog B38): retention is
+  scoped to the byte-identical line-aligned common suffix and served only when the fresh stream
+  is silent within it, so this proposal's law (no retained tokens for changed text) is preserved
+  by construction.
 - Gating `reanalyze_dependents` on actual dependency (perf; serial full re-analysis of every
   open file per pause).
 - `semanticTokens/range` + delta/`resultId` providers; incremental (non-FULL) sync.

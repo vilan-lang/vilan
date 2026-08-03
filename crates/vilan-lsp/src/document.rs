@@ -786,6 +786,17 @@ pub struct Document {
     /// `(start, end, id)` for every entry-file entity with a real span, used to
     /// find the innermost entity under a cursor.
     entity_spans: Vec<(usize, usize, Id)>,
+    /// Salvage tail retention (B38): the PREVIOUS analysis's semantic tokens
+    /// for the byte-identical, line-aligned common suffix of the old and new
+    /// analyzed texts, already shifted into the new text's coordinates.
+    /// Served only when the fresh stream is entirely silent within the
+    /// suffix — the salvage-truncation signature — so a complete parse
+    /// (including one that legitimately RE-classifies identical tail text;
+    /// semantics flow downward) always wins. Recomputed at every adoption.
+    retained_tail: Vec<(Span, TokenKind, u32)>,
+    /// Where the retained suffix begins in the CURRENT analyzed text;
+    /// `usize::MAX` when nothing is retained.
+    retained_tail_start: usize,
     /// Per-function platform requirements (`platform_color::requirements`),
     /// rendered lines like ``requires the `process` layer of `std` (via `…`)``
     /// — appended to the hover of any function that carries one.
@@ -989,6 +1000,8 @@ impl Document {
             text: text.to_string(),
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
+            retained_tail: Vec::new(),
+            retained_tail_start: usize::MAX,
             platform_requirements: HashMap::new(),
             manifest_problem: None,
         }
@@ -1093,6 +1106,8 @@ impl Document {
             text: text.to_string(),
             text_hash,
             entity_spans,
+            retained_tail: Vec::new(),
+            retained_tail_start: usize::MAX,
             platform_requirements,
             manifest_problem,
         }
@@ -1364,8 +1379,14 @@ impl Document {
     /// during the 80–190 ms analysis). When the two texts are equal the live
     /// side is adopted too, which puts both indices back on one shared `Arc`.
     pub fn adopt_analysis(&mut self, analysis: Document) {
+        // B38: decide what the OUTGOING analysis may keep answering for
+        // before its side is replaced — the byte-identical tail carries over,
+        // the rest dies with it.
+        self.compute_retained_tail(&analysis.text);
         let Document {
             line_index: analyzed_live_index,
+            retained_tail: _,
+            retained_tail_start: _,
             analyzed_index,
             program,
             const_results,
@@ -1403,6 +1424,64 @@ impl Document {
             // edits no longer start from this snapshot.
             self.live_edits = None;
         }
+    }
+
+    /// Computes B38's retained tail: the longest byte-identical common
+    /// suffix of the outgoing analyzed text and `incoming` (the next analyzed
+    /// text), trimmed forward to a line boundary, and the outgoing tokens
+    /// that live entirely inside it, shifted into the incoming text's
+    /// coordinates. Identity of BYTES is the whole honesty argument: the
+    /// suffix is literally the same text, so positions are exact; whether the
+    /// tokens are still semantically current is governed at serve time (a
+    /// fresh stream that reaches the suffix suppresses them). Chains across
+    /// successive truncated analyses, because `semantic_tokens` below folds
+    /// the current retention into what the next adoption captures.
+    fn compute_retained_tail(&mut self, incoming: &str) {
+        let outgoing_tokens = if self.program.is_some() {
+            self.semantic_tokens()
+        } else {
+            Vec::new()
+        };
+        self.retained_tail = Vec::new();
+        self.retained_tail_start = usize::MAX;
+        if outgoing_tokens.is_empty() {
+            return;
+        }
+        let outgoing = self.analyzed_text();
+        let common = outgoing
+            .bytes()
+            .rev()
+            .zip(incoming.bytes().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if common == 0 {
+            return;
+        }
+        // Trim to a line boundary so the shift is a pure offset with no
+        // mid-line seam: the suffix begins at the first character after a
+        // newline (or at 0 when the texts are wholly identical).
+        let mut new_start = incoming.len() - common;
+        if new_start > 0 && incoming.as_bytes()[new_start - 1] != b'\n' {
+            match incoming[new_start..].find('\n') {
+                Some(newline) => new_start += newline + 1,
+                None => return,
+            }
+        }
+        if new_start >= incoming.len() {
+            return;
+        }
+        let old_start = outgoing.len() - (incoming.len() - new_start);
+        let shift = new_start as i64 - old_start as i64;
+        self.retained_tail = outgoing_tokens
+            .into_iter()
+            .filter(|(span, ..)| span.start >= old_start)
+            .map(|(span, kind, modifiers)| {
+                let start = (span.start as i64 + shift) as usize;
+                let end = (span.end as i64 + shift) as usize;
+                (Span { start, end }, kind, modifiers)
+            })
+            .collect();
+        self.retained_tail_start = new_start;
     }
 
     /// The innermost entry-file entity whose span contains `offset`.
@@ -2066,6 +2145,25 @@ impl Document {
                 last_end = range.end;
                 kept.push((span, kind, modifiers));
             }
+        }
+        // B38, the salvage signature: when the fresh stream is entirely
+        // silent within the retained suffix — the shape of a parse break
+        // truncating the file to a prefix — the previous analysis's tokens
+        // for the byte-identical tail fill in, already shifted. A stream
+        // that reaches the suffix suppresses this wholesale, which is what
+        // keeps re-classification of identical text (semantics flow
+        // downward) fresh rather than stale.
+        if !self.retained_tail.is_empty()
+            && kept
+                .iter()
+                .all(|(span, ..)| span.end <= self.retained_tail_start)
+        {
+            kept.extend(
+                self.retained_tail
+                    .iter()
+                    .filter(|(span, ..)| span.start >= self.retained_tail_start)
+                    .cloned(),
+            );
         }
         kept
     }
@@ -6583,6 +6681,83 @@ pub(crate) mod tests {
         let fresh = plain_document("fun main() {}\n");
         broken.adopt_analysis(fresh);
         assert_eq!(broken.live_offset(3), Some(3), "adoption restores identity");
+    }
+
+    // --- B38: salvage tail retention ---------------------------------------
+
+    /// The headline: a parse break that truncates analysis to a prefix (an
+    /// unterminated triple-quoted string) no longer blanks the tail — the
+    /// byte-identical suffix keeps the previous analysis's tokens, shifted.
+    /// The first assertion validates the premise (the break really does
+    /// truncate), so this pin cannot pass vacuously.
+    #[test]
+    fn a_salvage_break_keeps_the_byte_identical_tail_highlighted() {
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        // A stray top-level token: salvage keeps the parsed prefix and drops
+        // everything below — the exact blank-tail shape B38 exists for.
+        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let zeta = offset_at(broken, "zeta", 0);
+
+        // Premise: the broken text's own analysis has no token at `zeta`.
+        let fresh = analyze_text(broken);
+        assert!(
+            !fresh
+                .semantic_tokens()
+                .iter()
+                .any(|(span, ..)| span.start <= zeta && zeta < span.end),
+            "the break no longer truncates the parse — this pin's premise \
+             (and B38 itself) needs a new break shape"
+        );
+
+        let mut document = analyze_text(whole);
+        document.adopt_analysis(fresh);
+        let retained: Vec<_> = document
+            .semantic_tokens()
+            .into_iter()
+            .filter(|(span, ..)| span.start <= zeta && zeta < span.end)
+            .collect();
+        assert!(
+            !retained.is_empty(),
+            "the byte-identical tail below the break must keep its tokens"
+        );
+    }
+
+    /// The honesty half: a tail line the user EDITED is not byte-identical,
+    /// so it gets nothing — retained tokens never cover changed text.
+    #[test]
+    fn an_edited_line_below_the_break_stays_unhighlighted() {
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken_and_edited =
+            "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet quux = 8;\n}\n";
+        let quux = offset_at(broken_and_edited, "quux", 0);
+        let mut document = analyze_text(whole);
+        document.adopt_analysis(analyze_text(broken_and_edited));
+        assert!(
+            !document
+                .semantic_tokens()
+                .iter()
+                .any(|(span, ..)| span.start <= quux && quux < span.end),
+            "an edited tail line must not inherit tokens from text it no \
+             longer matches"
+        );
+    }
+
+    /// A complete analysis suppresses retention wholesale: once the text
+    /// parses again, the stream is exactly the fresh one.
+    #[test]
+    fn a_complete_analysis_suppresses_the_retained_tail() {
+        let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let mut document = analyze_text(whole);
+        document.adopt_analysis(analyze_text(broken));
+        // The user closes the string; the next analysis is whole again.
+        document.adopt_analysis(analyze_text(whole));
+        let expected = analyze_text(whole).semantic_tokens();
+        assert_eq!(
+            document.semantic_tokens().len(),
+            expected.len(),
+            "a complete analysis must serve exactly its own tokens"
+        );
     }
 }
 

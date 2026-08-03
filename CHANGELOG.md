@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Highlighting no longer goes blank below a typo.** When a stray token or an unterminated string at the top level breaks the parse mid-edit, everything below the break used to lose its colors until the text was whole again. The editor now keeps the previous highlighting for the part of the file that hasn't changed — byte-for-byte the same text, just shifted — and drops it the moment a fresh analysis reaches that region, so edited lines and re-analyzed code always show current information.
+
 ## v0.23.3 — 2026-08-03
 
 **Programs with derives join the analysis cache.** The once-per-process standard-library analysis previously stood aside for any file containing a derive — which is most real UI programs, since reactive list rendering requires `[derive(PartialEq)]`. Derive expansion now runs over the cached world per analysis (the derive vocabulary itself rides the cache), so editor keystrokes and playground runs on derive-using files get the same skip everyone else got in v0.23. Files that define their own macros still build fresh.
