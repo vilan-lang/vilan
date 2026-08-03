@@ -142,19 +142,18 @@ fn a_second_build_changes_nothing_observable() {
     }
 }
 
-/// S3b's blocker, pinned (analysis-reuse.md §6.7): under a two-phase build
+/// S3b's kernel, landed (analysis-reuse.md §6.8): under a two-phase build
 /// (std resolved before the entry walks), an immediate-chained generic
-/// method call must still infer — today it stalls. The localization from
-/// the S3b hunt: map#1 resolves and mints a fresh per-call result element,
-/// which the monolithic build fills LATE via the first closure's return
-/// landing (len resolves between map#2's attempts); under two-phase that
-/// late fill never happens. NOT the commit tail, NOT re-entry, NOT deferred
-/// bookkeeping, NOT below-mark type-map writes, NOT slot unification (fills
-/// are byte-identical both modes) — instrument the ClosureReturns flow and
-/// the result-instance fill path next. Un-ignore when the freshen-not-fill
-/// kernel lands.
+/// method call stalled — the constraint fixpoint declared quiescence when a
+/// backstop pass resolved nothing and woke nothing, but a deferred attempt
+/// can WRITE types (a method call types its closure argument's parameters,
+/// then defers at the incomplete-bindings guard) without either signal
+/// firing. Std's unrelated constraint churn masked the early exit
+/// monolithically by granting extra rounds; the two-phase probe unmasked
+/// it. The exit now also requires an untouched type map across the
+/// backstop retry. This test was `#[ignore]`d red while the kernel was
+/// open; it is the standing two-phase inference gate now.
 #[test]
-#[ignore = "S3b open: chained generic calls stall under the two-phase build"]
 fn two_phase_build_resolves_chained_generic_calls() {
     let _guard = OVERRIDE_LOCK
         .lock()

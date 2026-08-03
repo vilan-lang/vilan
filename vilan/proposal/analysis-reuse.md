@@ -509,3 +509,42 @@ The blocker is pinned as
 kernel lands). All temporary instrumentation is removed; the probe
 switches (`set_early_std_build` + env arm) remain the standing
 instrument.
+
+### 6.9 S3b KERNEL LANDED (2026-08-02): the stall was a latent fixpoint
+### bug, and the fix is three lines of exit condition
+
+The §6.7 prediction ("per-use freshening of base-minted TypeIds") was
+WRONG, instructively: the generation-mark tracing had already shown zero
+cross-generation writes, and the final localization run proved every
+piece of resolution state byte-equivalent across modes — same member,
+same generics, complete and CORRECT substitution (`U → str` recorded),
+pristine declared return type, and the subject even inferring `List<str>`
+on its final attempt. The failing ingredient was WHEN that final attempt
+ran: after the fixpoint had already declared quiescence.
+
+**The mechanism**: the fixpoint's exit breaks when a backstop pass
+resolves nothing and wakes nothing — but a deferred attempt can WRITE
+types without either signal firing. A chained `.map().map()`'s second
+call types its closure argument's parameters (via
+`infer_closure_args_against_params`) and then correctly defers at the
+incomplete-bindings guard; those parameter fills are exactly what its
+NEXT attempt needs, and neither the resolution count nor the wake scan
+sees them. Monolithically, std's unrelated constraint churn granted the
+extra rounds by accident; the two-phase probe removed the churn and
+unmasked the early exit. A one-round forced-retry experiment confirmed
+it: `progress=true` on the bonus round, chain clean.
+
+**The fix, at the root**: `type_map_writes` counts every write into
+`type_id_to_type_map` (11 sites, one counter bump each); quiescence now
+additionally requires the counter unchanged across the backstop retry.
+The `max_iterations` outer bound keeps a write-without-progress cycle
+finite. This is a LATENT-BUG FIX for the monolithic compiler too — any
+program whose closure-typing writes landed in the fixpoint's final quiet
+round was at the mercy of constraint-order luck.
+
+**Proof**: the `two_phase_build_resolves_chained_generic_calls` pin is
+un-`#[ignore]`d and green — red-first proven live, and the plant
+(reverting the writes condition) turns exactly it red again. The
+whole-workspace two-phase vote (`VILAN_EARLY_STD_BUILD=1`, every gate)
+is the acceptance instrument. With the kernel landed, S3c (the base
+cache + measured clone) has no known blocker.

@@ -1211,6 +1211,11 @@ pub struct Analyzer<'src> {
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
     std_sources: std::collections::HashSet<SourceId>,
+    // Counts every write into `type_id_to_type_map` — the constraint
+    // fixpoint's third progress signal (S3b): an attempt that writes types
+    // without resolving still moves the world, and the exit condition must
+    // see it.
+    type_map_writes: u64,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -1782,6 +1787,7 @@ impl<'src> Analyzer<'src> {
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: std::collections::HashSet::new(),
+            type_map_writes: 0,
             frozen_ranges: Vec::new(),
             source_texts: Vec::new(),
             type_references: Vec::new(),
@@ -8311,6 +8317,7 @@ impl<'src> Analyzer<'src> {
         // must stay unshared. A correct interner would have to exclude `Unknown` /
         // `Unresolved` (and anything else later mutated) and require `Type: Hash + Eq`.
         let type_id = self.new_type_id();
+        self.type_map_writes += 1;
         self.type_id_to_type_map.insert(type_id, type_);
         type_id
     }
@@ -12989,6 +12996,7 @@ impl<'src> Analyzer<'src> {
                         },
                     );
                     let function_type_id = self.new_type_id();
+                    self.type_map_writes += 1;
                     self.type_id_to_type_map
                         .insert(function_type_id, Type::Function(id));
                     self.expr_id_to_type_id_map.insert(id, function_type_id);
@@ -14812,6 +14820,7 @@ impl<'src> Analyzer<'src> {
         };
 
         if let Some(type_) = type_ {
+            self.type_map_writes += 1;
             self.type_id_to_type_map.insert(type_id, type_);
         }
 
@@ -15141,6 +15150,7 @@ impl<'src> Analyzer<'src> {
                     if let Some(parameter) = self.parameters.get(parameter_id)
                         && matches!(parameter.type_id.get_type(self), Type::Unknown)
                     {
+                        self.type_map_writes += 1;
                         self.type_id_to_type_map
                             .insert(parameter.type_id, filled.clone());
                     }
@@ -17390,6 +17400,7 @@ impl<'src> Analyzer<'src> {
                 if matches!(parameter_type, Type::Unknown)
                     && !matches!(argument_type, Type::Unknown)
                 {
+                    self.type_map_writes += 1;
                     self.type_id_to_type_map
                         .insert(*parameter_type_id, argument_type.clone());
                     // Remember WHO filled the slot: a later conflicting call
@@ -18179,6 +18190,7 @@ impl<'src> Analyzer<'src> {
             return Resolution::Resolved;
         }
         if !matches!(argument_type, Type::Unknown) {
+            self.type_map_writes += 1;
             self.type_id_to_type_map.insert(slot, argument_type);
         }
         Resolution::Resolved
@@ -20288,6 +20300,7 @@ impl<'src> Analyzer<'src> {
                     // hit a not-yet-resolved type id and panic.
                     self.type_references
                         .push((source_id, span, definition_id, type_id));
+                    self.type_map_writes += 1;
                     self.type_id_to_type_map.insert(type_id, subject_type);
                 }
                 None => {
@@ -20308,6 +20321,7 @@ impl<'src> Analyzer<'src> {
                         span,
                         msg: message,
                     });
+                    self.type_map_writes += 1;
                     self.type_id_to_type_map.insert(type_id, Type::Unknown);
                 }
             }
@@ -20325,6 +20339,7 @@ impl<'src> Analyzer<'src> {
                         Some(member_id) => {
                             let member_type =
                                 self.infer_type(member_id, &Type::Unknown, &HashMap::new());
+                            self.type_map_writes += 1;
                             self.type_id_to_type_map.insert(type_id, member_type);
                         }
                         None => {
@@ -20336,6 +20351,7 @@ impl<'src> Analyzer<'src> {
                                     member_name, module_name
                                 ),
                             });
+                            self.type_map_writes += 1;
                             self.type_id_to_type_map.insert(type_id, Type::Unknown);
                         }
                     }
@@ -20357,6 +20373,7 @@ impl<'src> Analyzer<'src> {
                             ),
                         });
                     }
+                    self.type_map_writes += 1;
                     self.type_id_to_type_map.insert(type_id, Type::Unknown);
                 }
             }
@@ -20811,6 +20828,7 @@ impl<'src> Analyzer<'src> {
             if self.deferred.is_empty() {
                 break;
             }
+            let writes_before_backstop = self.type_map_writes;
             self.constraints
                 .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
             let backstop_progress = self.resolve_constraints();
@@ -20820,7 +20838,17 @@ impl<'src> Analyzer<'src> {
             // constraint would be left unrun in `self.constraints` (the cause of a
             // late `match`-capture / inferred-element field access failing).
             let woke = self.wake_ready_constraints();
-            if !backstop_progress && !woke {
+            // A deferred attempt can WRITE types without resolving — a method
+            // call that types its closure argument's parameters and then
+            // defers at the incomplete-bindings guard has made real progress
+            // the resolution count and the wake scan both miss. Breaking here
+            // would strand the next attempt that those writes just unblocked
+            // (the two-phase chained-`map` stall, S3b: std's unrelated
+            // constraint churn masked this monolithically by granting extra
+            // rounds). Quiescence requires a fruitless retry AND an untouched
+            // type map; the `max_iterations` bound above keeps a
+            // write-without-progress cycle finite.
+            if !backstop_progress && !woke && self.type_map_writes == writes_before_backstop {
                 break;
             }
         }
