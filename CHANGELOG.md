@@ -8,6 +8,8 @@ tracks the latest state.
 
 ## Unreleased
 
+**A module path no longer reaches names the module never declared.** `math::helper()` compiled whenever the ENTRY file declared a top-level `helper` — any of your own globals resolved through any standard-library module path, in member position and in `import std::math::helper;` alike. The member lookup walked the module's scope chain out to the global scope, where your top-level items live; it now consults the module's own declarations and re-exports only (the rule `use` paths always followed), and a genuinely missing member reports exactly as before.
+
 **The playground and the editor's std-editing flows join the analysis cache.** v0.23.0's once-per-process standard-library analysis skipped any session with an open buffer under std — which included the browser playground entirely, since it serves the standard library from in-memory buffers. The cache now revalidates buffered files by content exactly like disk files: a second playground Run with the same imports skips the std re-analysis, and editing the standard library itself in the editor evicts and rebuilds against the buffer instead of standing aside.
 
 ## v0.23.1 — 2026-08-03

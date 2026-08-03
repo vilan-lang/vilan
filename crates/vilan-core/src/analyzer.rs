@@ -11944,6 +11944,21 @@ impl<'src> Analyzer<'src> {
     /// returning `None` if it is not in scope (callers turn that into a
     /// user-facing diagnostic). Resolved names are cached into the originating
     /// scope so repeated lookups stay cheap.
+    /// Resolves `name` as a MEMBER of the namespace scope `scope_id` — the
+    /// scope's own declarations and re-exports only, never the enclosing
+    /// chain (the shape the `use` loop always had). `path::name` addresses
+    /// what the namespace DECLARES: walking to the parent — ultimately the
+    /// global scope, where the entry's top-level items live — let any entry
+    /// global resolve through any std module path (B52), and the chain
+    /// lookup's memoization then cached the entry id INTO the std module's
+    /// scope, the one backwards write in the S3 mutation inventory.
+    fn member_in_namespace(&self, name: &str, scope_id: Id) -> Option<Id> {
+        self.scopes
+            .get(&scope_id)
+            .and_then(|scope| scope.name_to_id_map.get(name))
+            .copied()
+    }
+
     fn try_get_expr_id_by_name(&mut self, name: &'src str, scope_id: Id) -> Option<Id> {
         let scope = self.mut_scope_for_scope_id(scope_id);
         let parent_id = scope.parent_id;
@@ -17034,7 +17049,7 @@ impl<'src> Analyzer<'src> {
         let mut target_id = module_id;
         let mut namespace_scope_id = self.modules.get(&module_id).unwrap().body.1;
         for (part, part_span) in segments {
-            match self.try_get_expr_id_by_name(part, namespace_scope_id) {
+            match self.member_in_namespace(part, namespace_scope_id) {
                 Some(id) => {
                     target_id = id;
                     self.record_reference(source_id, part_span, id);
@@ -20335,7 +20350,7 @@ impl<'src> Analyzer<'src> {
                     let module = self.modules.get(&module_id).unwrap();
                     let module_scope_id = module.body.1;
                     let module_name = module.name;
-                    match self.try_get_expr_id_by_name(member_name, module_scope_id) {
+                    match self.member_in_namespace(member_name, module_scope_id) {
                         Some(member_id) => {
                             let member_type =
                                 self.infer_type(member_id, &Type::Unknown, &HashMap::new());
@@ -20514,7 +20529,7 @@ impl<'src> Analyzer<'src> {
                     let module = self.modules.get(&module_id).unwrap();
                     let module_scope_id = module.body.1;
                     let module_name = module.name;
-                    match self.try_get_expr_id_by_name(member_name, module_scope_id) {
+                    match self.member_in_namespace(member_name, module_scope_id) {
                         Some(member_id) => {
                             let rc = self.reference_count.entry(member_id).or_insert(0);
                             *rc += 1;

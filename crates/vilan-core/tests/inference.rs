@@ -29315,3 +29315,32 @@ fn an_async_drop_in_a_module_is_attributed_to_the_module() {
         "the rejection belongs to the module holding the `drop` body: {message}"
     );
 }
+
+#[test]
+fn an_entry_global_does_not_resolve_through_a_std_module_path() {
+    // B52: `path::name` addresses what the namespace DECLARES. The member
+    // lookup used to walk the scope chain out to the global scope — where
+    // the entry's top-level items live — so any entry global resolved
+    // through any std module path (and the chain lookup's memoization then
+    // cached the entry id INTO the std scope).
+    assert_fails(
+        r#"
+        import std::math;
+        fun helper(): i32 { 7 }
+        fun main() { let x = math::helper(); }
+        "#,
+    );
+}
+
+#[test]
+fn an_entry_global_does_not_satisfy_a_std_import_path() {
+    // B52, the import form of the same hole: the segment walk used the same
+    // chain lookup, so `import std::math::<entry global>` resolved.
+    assert_fails(
+        r#"
+        import std::math::helper;
+        fun helper(): i32 { 7 }
+        fun main() { let x = helper(); }
+        "#,
+    );
+}
