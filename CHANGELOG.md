@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.23.4 — 2026-08-03
 
 **Highlighting no longer goes blank below a typo.** When a stray token or an unterminated string at the top level breaks the parse mid-edit, everything below the break used to lose its colors until the text was whole again. The editor now keeps the previous highlighting for the part of the file that hasn't changed — byte-for-byte the same text, just shifted — and drops it the moment a fresh analysis reaches that region, so edited lines and re-analyzed code always show current information.
 
