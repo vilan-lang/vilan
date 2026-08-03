@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A static inherited default is no longer fenced by a stranger's name.** The owner fence's last blanket conservatism: a method call resolving to an inherited trait default was covered by *member name*, unioned across every trait in the program — so `5.verdict()`, whose inherited default reads nothing, was rejected whenever any unrelated impl anywhere spelled a subscribing method the same way. Such a call is now covered by its receiver: only the members the receiver's type actually selects demand a boundary. A `self` call inside a shared default body — whose receiver genuinely varies by impl — keeps the conservative treatment, as does everything the receiver's own type selects: a needy default you actually inherit still fences.
+
 ## v0.22.1 — 2026-08-02
 
 **Two holes in the owner fence are closed.** Both were found by the requirement-polymorphism design recon and proven with red probes. First: a trait-bound method called on a generic value *inside a closure* contributed no coverage edges at all — a `Signal` slot placed through such a call compiled with no boundary anywhere and registered against an undefined owner at runtime (a v0.21.1 regression; v0.20.0's blanket conservatism fenced it). Second, and much older: one covered caller laundered any number of uncovered top-level calls to the same function — `covered(); needy();` at top level compiled whenever `covered` provided a boundary somewhere else, and the top-level path read an undefined value. An uncovered entry now fences regardless of what other callers provide.

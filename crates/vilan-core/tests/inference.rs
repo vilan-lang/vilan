@@ -27118,6 +27118,103 @@ fn explicit_type_arguments_resolve_the_forwarder() {
 }
 
 #[test]
+fn an_inherited_static_default_on_a_concrete_receiver_compiles() {
+    // OnType narrowing (requirement-polymorphism.md §8): the union is
+    // name-keyed across ALL traits, so an unrelated needy impl under the
+    // same member name spuriously fenced a concrete receiver's inherited
+    // STATIC default. The receiver's head cannot change under substitution
+    // — the site narrows to the members its head selects.
+    compile_browser(
+        r#"
+        import std::reactive::Signal;
+        trait Quiet {
+            fun verdict(self): str {
+                "quiet"
+            }
+        }
+        impl i32 with Quiet {}
+        trait Loud {
+            fun verdict(self): str;
+        }
+        impl str with Loud {
+            fun verdict(self): str {
+                let s = Signal::new(1);
+                s.effect(|v| {});
+                "loud"
+            }
+        }
+        fun main() {
+            let d = 5.verdict();
+        }
+        main();
+        "#,
+    )
+    .expect("a static inherited default is not fenced by an unrelated needy impl");
+}
+
+#[test]
+fn a_needy_inherited_default_on_its_own_receiver_stays_fenced() {
+    // The narrowing must not loosen the receiver's own arm: the default the
+    // receiver actually inherits subscribes, and the call is uncovered.
+    let errors = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        trait Loud {
+            fun verdict(self): str {
+                let s = Signal::new(1);
+                s.effect(|v| {});
+                "loud"
+            }
+        }
+        impl i32 with Loud {}
+        fun main() {
+            let d = 5.verdict();
+        }
+        main();
+        "#,
+    )
+    .expect_err("the receiver's own needy default keeps the fence");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
+fn a_default_body_self_call_chain_stays_fenced() {
+    // `self.inner()` inside a trait default records OnType with NO receiver
+    // (the default body is shared across impls) — that arm keeps the union,
+    // and a needy impl reached through it still fences.
+    let errors = compile_browser(
+        r#"
+        import std::reactive::Signal;
+        trait Chain {
+            fun outer(self): str {
+                self.inner()
+            }
+            fun inner(self): str;
+        }
+        impl i32 with Chain {
+            fun inner(self): str {
+                let s = Signal::new(1);
+                s.effect(|v| {});
+                "x"
+            }
+        }
+        fun main() {
+            let d = 5.outer();
+        }
+        main();
+        "#,
+    )
+    .expect_err("a needy impl through a default-body self call keeps the fence");
+    assert!(
+        errors.iter().any(|error| error.contains("owner_scope")),
+        "the fence must name owner_scope:\n{errors:?}"
+    );
+}
+
+#[test]
 fn a_signal_through_a_closure_owned_dispatch_site_stays_fenced() {
     // 8d6980e regression (shipped in v0.21.1): an `OnConstraint` site owned
     // by a CLOSURE has no `incoming_calls` entry and no fallback arm covered

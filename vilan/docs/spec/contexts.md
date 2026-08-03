@@ -104,8 +104,11 @@ unrecorded binding, a function taken as a value or itself reachable
 through dispatch) is covered conservatively: the site is treated as
 reaching every candidate, so a needy candidate demands coverage of the
 caller even if another candidate would have been selected. A call
-dispatched on a **concrete receiver's type** is always covered
-conservatively. Dead code, a function with no callers at all, is
+dispatched on a **concrete receiver's type** (an inherited trait
+default) is covered by that receiver: only the members the receiver's
+type selects demand coverage — except a `self` call inside a shared
+default body, whose receiver is unknowable at the site and which stays
+conservative. Dead code, a function with no callers at all, is
 exempt (it cannot run uncovered); a function called from top level, or
 taken as a value, is entered without the value and is never covered,
 whatever its other callers.

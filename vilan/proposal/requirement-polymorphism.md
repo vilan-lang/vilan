@@ -85,7 +85,8 @@ hole.)
   what it is today: an instantiation that doesn't need the value receives
   `undefined` and never reads it — coverage is what guarantees the never.
 - **`OnType` sites keep the union.** Narrowing concrete-receiver dispatch is
-  the separate tightening already recorded in `context.rs`.
+  the separate tightening already recorded in `context.rs`. *(Superseded —
+  shipped post-arc as §8.)*
 - **The diagnostic text and anchoring are untouched.** Anchoring the fence at
   the uncovered root instead of the std-internal `get()` stays the
   `ambient-owner.md` §4 follow-up.
@@ -210,5 +211,31 @@ existing `8d6980e` pins unchanged.
   explicit-args channel was dropped as dead; per-entry fallback replaced the
   draft's whole-site union for unresolvable bindings (strictly more precise,
   same soundness argument).
-- **Still open**: `OnType` narrowing (the separate tightening); requirement
-  polymorphism for *injected closures* was never in scope (§2).
+- **Still open**: nothing — `OnType` narrowing shipped post-arc (§8);
+  requirement polymorphism for *injected closures* was never in scope (§2).
+
+## 8. OnType narrowing (shipped post-arc, 2026-08-02)
+
+The separate tightening, taken as its own small slice after v0.22.1. An
+`OnType` dispatch record is written at exactly three shapes: a concrete
+receiver whose method resolves to an *inherited trait default* (Gap E), the
+operator twin of the same shape, and a `self` call inside a shared trait
+default body (receiver `None`). The coverage union is *name*-keyed across
+every trait declaring the member, so an unrelated needy impl under the same
+member name spuriously fenced a concrete receiver's static inherited default
+— proven by red probe (`5.verdict()` fenced because `str`'s unrelated
+`verdict` subscribes; the probe's first draft was itself a demonstration,
+colliding with a std member name and pulling in `Serialize` bounds).
+
+The narrowing: a site with a recorded receiver selects
+`impl_members_for(receiver, member)` and draws edges from the site's owner —
+no entry enumeration, because the receiver's **head** cannot change under
+substitution and the head is what selects among candidates (the matcher is
+argument-insensitive by design, which makes `List<T>` receivers narrow
+soundly to List-headed impls). A receiver resolving to a generic or opaque
+type, an empty selection, and every receiver-less site keep the union.
+`needs`/`strict`/threading are untouched, as everywhere in this proposal.
+
+Three pins, one proven red first (the spurious fence), two guards (the
+receiver's own needy default stays fenced; a needy impl reached through a
+default-body `self` call stays fenced).

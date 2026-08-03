@@ -524,8 +524,9 @@ fn analyze(
     // exactly — its edges are a function of the pair alone — so recursion
     // needs no cap. Only a value-taken or dispatch-reachable level, whose
     // entries cannot be enumerated, falls back to the whole-site union.
-    // `OnType` sites keep the union: narrowing concrete-receiver dispatch is
-    // a separate tightening.
+    // `OnType` sites with a recorded receiver narrow by the receiver's HEAD
+    // (substitution cannot change it); a receiver-less `OnType` — a `self`
+    // call inside a shared trait default body — keeps the union.
     let impl_members_for = |resolved: &Type, member: &str| -> Vec<Id> {
         let matches_subject = |subject: &Type| match (subject, resolved) {
             (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => {
@@ -642,6 +643,43 @@ fn analyze(
             Some(crate::analyzer::GenericDispatch::OnConstraint(constraint, member)) => {
                 (constraint, member)
             }
+            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
+                // A concrete-receiver re-dispatch (the Gap-E shape: an
+                // inherited trait default). The receiver's HEAD cannot
+                // change under substitution, and the head is what selects
+                // among candidates, so the site narrows to the members the
+                // head selects — edges from the site's owner, no entry
+                // enumeration. A receiver resolving to a generic or opaque
+                // type keeps the union, as does an empty selection.
+                match program.type_id_to_type_map.get(&receiver) {
+                    Some(resolved)
+                        if !matches!(
+                            resolved,
+                            Type::Generic(_)
+                                | Type::Any
+                                | Type::Unknown
+                                | Type::Unresolved
+                                | Type::Trait(..)
+                        ) =>
+                    {
+                        let selected = impl_members_for(resolved, member);
+                        if selected.is_empty() {
+                            union_fallback(&mut coverage_dispatch_callers);
+                        } else {
+                            for candidate in selected {
+                                coverage_dispatch_callers
+                                    .entry(candidate)
+                                    .or_default()
+                                    .push(*owner);
+                            }
+                        }
+                    }
+                    _ => union_fallback(&mut coverage_dispatch_callers),
+                }
+                continue;
+            }
+            // `OnType(None, _)` — a `self` call inside a shared trait
+            // default body — and unrecorded sites keep the union.
             _ => {
                 union_fallback(&mut coverage_dispatch_callers);
                 continue;
