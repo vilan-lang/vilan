@@ -160,3 +160,40 @@ valuable (the report tells us the real win on real apps before any
 emission work) and is the measure-first gate for the rest: if the router
 example's chunks come out trivially small, the arc stops there and this
 proposal records why.
+
+## 7. S1 shipped — the measurements (2026-08-03)
+
+`vilan build --print-chunks` landed (`crates/vilan-core/src/chunks.rs`
+plus the CLI flag; analysis-only, printed only on a clean analysis, the
+emitted JavaScript untouched). Gates: unit pins over the router shape
+(three arms, near-miss swap not splittable, node program plans nothing),
+e2e pins over the router and walkthrough examples plus flag-off silence,
+each planted red and restored.
+
+The example sweep's plans:
+
+- **router** — 1 match, 3 chunks: `Route::Home` 1 function ~89B,
+  `Route::Items(..)` 3 functions ~716B, `Route::NotFound` 1 function
+  ~86B; 6 entry functions eager, 0 shared.
+- **walkthrough (client)** — 1 match, 3 chunks: `Route::Home` 5
+  functions ~1801B, `Route::Note(..)` 6 functions ~2743B,
+  `Route::NotFound` 1 function ~147B; 17 functions eager, 2 of them
+  shared page helpers correctly kept eager.
+- **every other example** — no splittable route matches (the recognizer
+  does not overfire; the todo/reactive-ui/browser/ssr swaps are not
+  route matches).
+
+Two design corrections the sweep forced, now part of S1's semantics:
+pages resident in a sibling module (`views.vl` — the common real shape)
+chunk exactly like entry pages, with only STD eager by residence (the
+first cut was entry-only and planned "1 match, 0 chunks" on the
+walkthrough); and arm attribution's span nesting is source-aware — span
+offsets are file-local, so containment is only meaningful within the
+arm's own file.
+
+**Measure-first verdict:** the mechanism works and the partitions are
+exactly right, but at example scale the lazy mass is ~0.9KB (router) and
+~4.7KB (walkthrough) of source — modest against the fixed std runtime in
+the eager bundle. The win scales with app code, not with the runtime, so
+S2 (emission) proceeds when a real consumer shows meaningful per-route
+mass; the report is the instrument that will show it.

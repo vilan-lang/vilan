@@ -6,6 +6,12 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**See what bundle splitting would save, today.** `vilan build --print-chunks` reports the route-chunk plan for each entry: which `View.swap` route matches are splittable, which functions every path needs eagerly, and which pages (with their exclusive helpers, wherever they live — entry or module) would load lazily per route, with estimated sizes. Analysis only — the emitted JavaScript is unchanged. The instrument for the bundle-splitting arc (`proposal/bundle-splitting.md`): emission lands when a real app's report shows meaningful per-route mass.
+
+---
+
 ## v0.23.4 — 2026-08-03
 
 **Highlighting no longer goes blank below a typo.** When a stray token or an unterminated string at the top level breaks the parse mid-edit, everything below the break used to lose its colors until the text was whole again. The editor now keeps the previous highlighting for the part of the file that hasn't changed — byte-for-byte the same text, just shifted — and drops it the moment a fresh analysis reaches that region, so edited lines and re-analyzed code always show current information.

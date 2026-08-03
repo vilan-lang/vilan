@@ -59,6 +59,11 @@ enum Command {
         /// Print the JavaScript to stdout instead of writing `<file>.js`.
         #[arg(long)]
         stdout: bool,
+        /// Also report the route-chunk plan — what a split build would load
+        /// lazily per route arm (proposal/bundle-splitting.md). Analysis only;
+        /// the emitted JavaScript is unchanged.
+        #[arg(long)]
+        print_chunks: bool,
         /// The platform to build for: `node` (`node:24`), `deno` (`deno:2`), `bun`
         /// (`bun:1`), `browser`, or `none`. Overrides the package's `target`; defaults
         /// to it, else `node`. `--target` is an accepted alias.
@@ -166,6 +171,7 @@ fn run_cli() -> ExitCode {
         Command::Build {
             file,
             stdout,
+            print_chunks,
             platform,
             backend,
             debug,
@@ -173,6 +179,7 @@ fn run_cli() -> ExitCode {
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
             Ok(_backend) => {
+                PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
                     build_once(file.clone(), stdout, platform.clone(), debug)
@@ -2110,6 +2117,14 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
     }
 }
 
+/// Set once by `build --print-chunks` before any compile, read at the one
+/// place the analyzed `Program` is live (`compile_to_js`). A process-level
+/// flag rather than a parameter because `compile_unit` is shared by `run`,
+/// `check`, and the watch loops — threading a report-only bool through every
+/// signature and call site would touch far more than it informs. Under
+/// `--watch` the flag stays set, so every rebuild re-reports — intended.
+static PRINT_CHUNKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
@@ -2323,6 +2338,14 @@ fn compile_to_js(
         }
 
         if analyzer_errors.is_empty() && noted_errors == 0 {
+            // `--print-chunks` (bundle-splitting.md S1): report what a split
+            // build would chunk. Analysis-only — the emitted JavaScript below
+            // is untouched — and gated on a clean analysis, so a failing build
+            // reports its diagnostics, never a plan over a broken program.
+            if PRINT_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
+                let chunk_plan = vilan_core::chunks::plan(&program);
+                print!("{}", vilan_core::chunks::render(&chunk_plan, &filename));
+            }
             match transform(&program, options) {
                 // The leg's source set — each path paired with the content
                 // hash it was COMPILED from — which the watch loop verifies

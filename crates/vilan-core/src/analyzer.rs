@@ -24455,16 +24455,7 @@ fn analyze_inner<'src>(
                 false,
             );
         }
-        return analyze_over_world(
-            world,
-            nodes,
-            entry_source,
-            std,
-            pkg_root,
-            entry_path,
-            platform,
-            workspace,
-        );
+        return analyze_over_world(world, nodes, std, platform, workspace);
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
     // `source_ranges` records the entity-id span each file's walk produced.
@@ -25694,16 +25685,7 @@ fn analyze_inner<'src>(
             false,
         );
     }
-    analyze_over_world(
-        world,
-        nodes,
-        entry_source,
-        std,
-        pkg_root,
-        entry_path,
-        platform,
-        workspace,
-    )
+    analyze_over_world(world, nodes, std, platform, workspace)
 }
 
 /// The entry tail: walks the entry over a resolved [`World`], builds,
@@ -25713,10 +25695,7 @@ fn analyze_inner<'src>(
 fn analyze_over_world<'src>(
     world: World<'src>,
     nodes: &'src Spanned<NodeList<'src>>,
-    entry_source: &'src str,
     std: &PackageSpec,
-    pkg_root: &Path,
-    entry_path: &Path,
     platform: Platform,
     workspace: &Workspace,
 ) -> Program<'src> {
