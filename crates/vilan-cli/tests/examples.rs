@@ -100,6 +100,105 @@ fn stage(directory: &str) -> PathBuf {
     staged
 }
 
+/// What a built example must additionally prove — E22's decide-at-take-up
+/// answers, recorded here. An example not listed is BUILD-ONLY: a new one is
+/// gated the day it lands and earns richer checks when someone writes them.
+/// `ssr` and `walkthrough` keep their own dedicated suites; `fullstack` stays
+/// build-only deliberately — the fullstack TEMPLATE's spawn-and-fetch e2e
+/// already exercises the served shape, and a second copy here would buy
+/// repetition, not coverage.
+enum PostBuild {
+    /// A terminating node program: run the emitted script, pin exit 0 and the
+    /// exact stdout — the same byte-identical bar the corpus holds.
+    Run {
+        script: &'static str,
+        expected_stdout: &'static str,
+    },
+    /// A browser-family build: the emitted bundle files exist and are
+    /// non-empty at their documented paths.
+    Artifacts(&'static [&'static str]),
+    BuildOnly,
+}
+
+fn post_build(directory: &str) -> PostBuild {
+    match directory.rsplit('/').next().unwrap_or(directory) {
+        "math" => PostBuild::Run {
+            script: "main.js",
+            expected_stdout: "25\n",
+        },
+        "rpc" => PostBuild::Run {
+            script: "src/main.js",
+            expected_stdout: concat!(
+                "ok: found ada (@ada)\n",
+                "ok: no such user\n",
+                "raw error: Remote(\"unknown method: delete_everything\")\n",
+                "--- reactive: a remote Source<i32> ---\n",
+                "count = 0\n",
+                "count = 1\n",
+                "count = 2\n",
+                "count = 10\n",
+                "count = 13\n",
+                "count = 16\n",
+                "rpc add -> 16\n",
+                "--- session: the [service(Client)] paradigm, generated ---\n",
+                "status = offline\n",
+                "whoami -> not logged in\n",
+                "login -> false\n",
+                "status = online\n",
+                "login -> true\n",
+                "whoami -> ada (@ada)\n",
+            ),
+        },
+        "browser" => PostBuild::Artifacts(&["client.js"]),
+        "reactive-ui" => PostBuild::Artifacts(&["app.js", "app.css"]),
+        "router" => PostBuild::Artifacts(&["app.js"]),
+        "todo" => PostBuild::Artifacts(&["dist/server.js", "dist/client.js", "dist/client.css"]),
+        _ => PostBuild::BuildOnly,
+    }
+}
+
+/// Runs the post-build check; a failure message, or `None` when it holds.
+fn check_post_build(directory: &str, staged: &std::path::Path) -> Option<String> {
+    match post_build(directory) {
+        PostBuild::BuildOnly => None,
+        PostBuild::Artifacts(artifacts) => {
+            let missing: Vec<&str> = artifacts
+                .iter()
+                .copied()
+                .filter(|artifact| {
+                    std::fs::metadata(staged.join(artifact))
+                        .map(|meta| meta.len() == 0)
+                        .unwrap_or(true)
+                })
+                .collect();
+            (!missing.is_empty())
+                .then(|| format!("{directory}: emitted bundle files missing or empty: {missing:?}"))
+        }
+        PostBuild::Run {
+            script,
+            expected_stdout,
+        } => {
+            let output = Command::new("node")
+                .arg(script)
+                .current_dir(staged)
+                .output()
+                .expect("run node");
+            if !output.status.success() {
+                return Some(format!(
+                    "{directory}: `node {script}` failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            (stdout != expected_stdout).then(|| {
+                format!(
+                    "{directory}: output drifted\n--- expected\n{expected_stdout}--- got\n{stdout}"
+                )
+            })
+        }
+    }
+}
+
 #[test]
 fn every_example_builds() {
     let mut failures = Vec::new();
@@ -111,6 +210,10 @@ fn every_example_builds() {
             .expect("run vilan");
 
         if output.status.success() {
+            if let Some(failure) = check_post_build(&directory, &staged) {
+                failures.push(failure);
+                continue;
+            }
             let _ = std::fs::remove_dir_all(&staged);
         } else {
             // The staged tree is deliberately left behind for a failure: it is
