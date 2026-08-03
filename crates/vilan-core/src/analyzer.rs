@@ -22822,32 +22822,6 @@ pub(crate) fn build_twice_forced() -> bool {
     BUILD_TWICE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Runs `build()` once over the loaded modules BEFORE the entry file walks —
-/// the two-phase shape a frozen std base needs (S3, analysis-reuse.md §6):
-/// generation 0 is everything built before the entry existed; the ordinary
-/// post-entry `build()` then drains only the entry's queued work (S2).
-/// Test-only while the design settles; the differential gates vote on
-/// whether a std-first build resolves anything differently.
-static EARLY_STD_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub fn set_early_std_build(enabled: bool) {
-    EARLY_STD_BUILD.store(enabled, std::sync::atomic::Ordering::SeqCst);
-}
-
-pub(crate) fn early_std_build_forced() -> bool {
-    // The env arm lets the ENTIRE workspace suite vote on the reorder's
-    // neutrality (`VILAN_EARLY_STD_BUILD=1 cargo nextest run`) — every
-    // front-end, the CLI children included, runs two-phase. Cached like the
-    // other env instruments.
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    EARLY_STD_BUILD.load(std::sync::atomic::Ordering::SeqCst)
-        || *ENV.get_or_init(|| {
-            std::env::var("VILAN_EARLY_STD_BUILD")
-                .is_ok_and(|value| !value.is_empty() && value != "0")
-        })
-}
-
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
@@ -25310,15 +25284,20 @@ pub fn analyze<'src>(
     // A normal entry is walked here in the global scope. When the entry is a std
     // module it was already walked (as its module) in the loop above, so skip
     // this to avoid analyzing it twice.
-    // S3 probe: resolve the loaded modules' world before the entry walks —
-    // the two-phase shape a frozen base needs. Resolution only, no commit
-    // tail: `finalize_build` runs once, in the post-entry `build()`, so
-    // constraints the entry may still bind stay open (the chained-`map`
-    // lesson). The post-entry build then drains only what the entry queued
-    // (S2's contract).
-    if early_std_build_forced() && !entry_is_module {
+    // The two-phase pipeline (S3c, analysis-reuse.md §6.10): the loaded
+    // modules' world resolves BEFORE the entry walks — resolution only, no
+    // commit tail; `finalize_build` runs once, in the post-entry `build()`,
+    // so constraints the entry may still bind stay open (the chained-`map`
+    // lesson, fixed at its root by the fixpoint's third progress signal).
+    // Proven byte-identical to the monolithic order by the whole-workspace
+    // vote (S3b's acceptance); this resolved pre-entry world is exactly what
+    // the base cache will snapshot. A std file open as the entry keeps the
+    // monolithic order — its world IS the entry.
+    let phase_base_start = std::time::Instant::now();
+    if !entry_is_module {
         analyzer.resolve_world();
     }
+    let phase_base = phase_base_start.elapsed();
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
         analyzer.module_scope_ids.insert(global_scope_id);
@@ -25957,8 +25936,9 @@ pub fn analyze<'src>(
     // JavaScript must stay clean.
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
-            "[vilan phase] load+walk {:.1}ms build {:.1}ms checks {:.1}ms",
-            phase_load_walk.as_secs_f64() * 1000.0,
+            "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
+            (phase_load_walk - phase_base).as_secs_f64() * 1000.0,
+            phase_base.as_secs_f64() * 1000.0,
             phase_build.as_secs_f64() * 1000.0,
             phase_checks_start.elapsed().as_secs_f64() * 1000.0,
         );

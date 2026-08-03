@@ -152,13 +152,13 @@ fn a_second_build_changes_nothing_observable() {
 /// monolithically by granting extra rounds; the two-phase probe unmasked
 /// it. The exit now also requires an untouched type map across the
 /// backstop retry. This test was `#[ignore]`d red while the kernel was
-/// open; it is the standing two-phase inference gate now.
+/// open; two-phase is the DEFAULT pipeline now (S3c), and this is its
+/// standing inference gate.
 #[test]
 fn two_phase_build_resolves_chained_generic_calls() {
     let _guard = OVERRIDE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    vilan_core::analyzer::set_early_std_build(true);
     let observation = observe(
         r#"
 import std::print;
@@ -170,7 +170,6 @@ fun main() {
 }
 "#,
     );
-    vilan_core::analyzer::set_early_std_build(false);
     assert_eq!(
         observation.0, "[]",
         "the chained generic call must infer under a two-phase build"

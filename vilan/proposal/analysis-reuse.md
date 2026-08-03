@@ -548,3 +548,42 @@ un-`#[ignore]`d and green — red-first proven live, and the plant
 whole-workspace two-phase vote (`VILAN_EARLY_STD_BUILD=1`, every gate)
 is the acceptance instrument. With the kernel landed, S3c (the base
 cache + measured clone) has no known blocker.
+
+### 6.10 S3c part 1 (2026-08-02): two-phase is the DEFAULT pipeline
+
+With S3b's kernel landed and the whole-workspace vote green, the probe
+switch retires and every analysis now runs two-phase unconditionally:
+load + walk → `resolve_world` over the pre-entry world → entry walk →
+`build()` (drains the entry's queues, retries leftovers, `finalize_build`
+once) → checks. A std file open as the entry keeps the monolithic order.
+The phase line grew a `base` bucket for the pre-entry resolution; the
+measured split on a warm process is ~19 ms load+walk, ~42 ms base, ~3 ms
+entry build, ~23 ms checks — the first two buckets (~61 ms) are exactly
+what the base cache amortizes, and the entry's own build work is THREE
+MILLISECONDS.
+
+**The cache itself (S3c part 2) is fully designed, next to implement:**
+- Split `analyze` at the resolved-world boundary into
+  `build_world(std, pkg_root, platform, workspace, seeds) → World` and
+  the entry tail over a `World` struct (analyzer + the boundary locals:
+  sources, hashes, module_scopes, generated_by_source, scope ids). The
+  compiler enumerates the boundary set during the splice.
+- **Seeds, not the entry**: hoist the load-loop's seed extraction (entry
+  std:: refs; the always-core; lib.vl's refs; the [service] scan) out of
+  `build_world`; intern seed names through a leak-once global so the
+  cached `World<'static>` is 'static BY CONSTRUCTION — no entry slices
+  ever enter the base (the lifetime story needs no transmute).
+- **Key + validation**: (platform, sorted seed names), validated per hit
+  by re-hashing the world's recorded `source_hashes` (the E12 rule:
+  content, never mtime). On hit: clone, patch the three entry slots
+  (`sources[0]`, `source_hashes[0]`, `source_texts[0]`), proceed.
+- **Bypasses (build fresh, don't store)**: workspace dependencies
+  present; `pkg::` refs in the entry; the entry IS a std module; any
+  document overlay active; and — conservative, syntactic — entries
+  containing `macro`/`derive`/`[service]` (their expansion runs in the
+  load loop today and would entangle the base; lifting this needs the
+  per-file expansion callable from the tail, a later widening).
+- **Gates**: cached-vs-fresh differential battery (same import set,
+  different programs, identical observations), clone-cost measurement
+  against the 61 ms target, the poisoned-patch plant, and the standing
+  suites.
