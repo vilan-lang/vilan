@@ -296,3 +296,67 @@ path (52 s under load), which no analyzer work moves — the suite case for
 this arc is real but secondary; the LSP/playground/CLI latency case is the
 primary one, exactly as §4 recorded ("take it only when the warm floor
 demonstrably hurts").
+
+### 6.5 S1 SHIPPED (2026-08-02): the classification, the gate, the numbers
+
+**The classification** (four independent read passes over every check;
+conservative on doubt). Verdicts and, for filtered checks, the skip key:
+
+| pass | verdict | skip key |
+|---|---|---|
+| check_readonly_mutation | definition-site, FILTERED | assignment expr |
+| check_mutable_arguments | definition-site, FILTERED | call site (never callee) |
+| check_mutable_references | definition-site, FILTERED | reference expr |
+| check_view_bindings | definition-site, FILTERED | binding id |
+| check_view_arguments | definition-site, FILTERED | call site |
+| check_view_value_reads | definition-site, FILTERED | expr (fixpoint stays whole-program) |
+| check_must_use | definition-site, FILTERED | function + block (statement's home) |
+| check_element_attribute_shadowing | definition-site, FILTERED | call site (synth nodes file under the writer) |
+| check_view_escape | definition-site, FILTERED | expr / function / closure (3 sweeps) |
+| check_invalidation (+async captures) | definition-site, FILTERED | function / closure (3 sweeps) |
+| check_reseat_escape | definition-site, FILTERED | assignment expr |
+| check_resource_any_coercion | definition-site, FILTERED | site's home (call site / binding / function) |
+| check_trait_conformance | definition-site, FILTERED | the IMPL, never the trait |
+| check_wire/hashable/partialeq_boundary | definition-site, NOT filtered | queues carry no id — widen at collect (S1b, if ever worth it) |
+| check_rpc_signatures, check_expose_fields | definition-site, NOT filtered | same queue shape |
+| check_container_resource_arguments | definition-site, NOT filtered | same queue shape |
+| check_generic_bound_satisfaction | instantiation-driven | — |
+| check_resource_generic_instantiations | instantiation-driven | — |
+| check_hmr_transfer_bounds | use-site-driven | — |
+| check_async_drops / check_context_drops | entry-dependent (async/context inference) | — |
+| platform_color::check | use-site-driven (anchors at deepest USER frame) | — |
+| init_order::check_cycles | whole-graph (mixed cycles can anchor in std; §5(b) over-approx admits std-only components) | — |
+| check_drop_impls | data producer (drop_methods) + rider diagnostic | untouched |
+| plan_resource_drops / build_drop_glue | data producers (emitted JS, call-graph edges) | untouched |
+| check_resource_moves | data producer (resource_value_places → clone_sites) | untouched |
+
+**The mechanism**: std modules loaded from DISK are recorded as frozen
+sources (never the entry — even when the entry IS a std file — and never an
+LSP-overlaid buffer); after `build()` the frozen sources seal into sorted
+entity-id ranges (`seal_frozen_ranges`) and `frozen_entity` is a binary
+search, cheap enough for per-expression asks. The full-scan override
+(`set_full_scan_checks`) seals an empty index. Unattributed and
+derived-source ids are never frozen — conservative by default.
+
+**The gate** (`check_scope_differential.rs`, permanent): (1) the std-clean
+invariant — an import-everything entry per platform (bare module imports;
+`null` is a keyword and rides the always-loaded set), forced full-scan,
+zero diagnostics AND zero warnings; (2) the whole corpus analyzed both
+ways agreeing byte-for-byte on diagnostics, warnings, and emitted JS;
+(3) the frozen-source recording pinned. Both plant directions proven red:
+an inverted filter loses an entry diagnostic (CLI probe), and a mutability
+bug planted inside std trips the invariant (with a cascade through
+compare.vl's PartialEq machinery that shows how load-bearing the
+invariant is).
+
+**The measured outcome, honestly**: warm trivial-entry split went
+19/44/**30**/21 → 19/44/**23**/21 — the checks phase −23 %, the total
+floor ~113 → ~106 ms (−6 %). The §6.3 estimate (25–35 ms) was wrong about
+composition: most of the "checks" window is the UNSKIPPABLE core —
+instantiation-driven passes, the resource data-producers, and
+`infer_borrows`/`infer_bumps` which share the window but are inference,
+not checks. The six queue-based derive checks stay unfiltered (their
+queues are declaration-sized; the win would be noise). S1's lasting value
+is the differential gate and the frozen-source machinery — the safety
+rail S2/S3 run on; the big money stays in `build()` (44 ms) and the
+load+walk (19 ms), which are S3's targets.

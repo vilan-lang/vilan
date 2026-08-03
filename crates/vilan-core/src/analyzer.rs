@@ -1204,6 +1204,19 @@ pub struct Analyzer<'src> {
     // `analyze`) so constraint resolution can attribute its diagnostics via
     // `source_of_id`. Moved into `Program.source_ranges` at the end.
     source_ranges: Vec<SourceRange>,
+    // The sources whose definition-site diagnostics are frozen (S1,
+    // analysis-reuse.md §6): std modules loaded from DISK. Never the entry
+    // (even when the entry IS a std file) and never an LSP-overlaid buffer —
+    // both keep full checking. Definition-site checks skip entities from
+    // these sources via `frozen_entity`; the std-clean invariant that makes
+    // that sound is pinned in `check_scope_differential.rs`.
+    std_sources: std::collections::HashSet<SourceId>,
+    // `std_sources` projected onto entity-id space: the sorted, disjoint
+    // `[start, end)` ranges of frozen entities, sealed once after `build()`
+    // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
+    // definition-site checks ask per expression inside their hottest loops,
+    // where `source_of_id`'s linear scan would cost more than the skip saves.
+    frozen_ranges: Vec<(u32, u32)>,
     // Each analyzed file's text, keyed by its SourceId (element-syntax S4):
     // lets a diagnostic inspect the source its span points into — the
     // element-origin detectors read it. First entry wins; files this never
@@ -1762,6 +1775,8 @@ impl<'src> Analyzer<'src> {
             current_source_id: SourceId(0),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
+            std_sources: std::collections::HashSet::new(),
+            frozen_ranges: Vec::new(),
             source_texts: Vec::new(),
             type_references: Vec::new(),
             external_functions: IndexMap::new(),
@@ -3004,6 +3019,12 @@ impl<'src> Analyzer<'src> {
             .map(|(type_id, name, ..)| (*type_id, *name))
             .collect();
         for check in &checks {
+            // S1: an impl declared in frozen std conforms by std's own pinned
+            // cleanliness; an entry impl of a std trait is entry-defined and
+            // stays. Keyed on the IMPL, never the trait.
+            if self.frozen_entity(check.impl_function_id) {
+                continue;
+            }
             self.check_one_conformance(check, &written_type_names);
         }
     }
@@ -4129,6 +4150,11 @@ impl<'src> Analyzer<'src> {
             let Expr::Call(call_id) = expr else {
                 continue;
             };
+            // S1: keyed on the call site — a std callee with an `any`
+            // parameter called from entry keeps its entry-anchored report.
+            if self.frozen_entity(*call_id) {
+                continue;
+            }
             let Some(function_call) = self.function_calls.get(call_id) else {
                 continue;
             };
@@ -4160,6 +4186,10 @@ impl<'src> Analyzer<'src> {
         //    an unannotated `let x = db` infers the resource type, which R1's
         //    move rules police, not R12).
         for variable in self.variables.values() {
+            // S1: the coercion anchors at the binding's own initializer.
+            if self.frozen_entity(variable.id) {
+                continue;
+            }
             if variable.annotated
                 && matches!(variable.type_id.get_type(self), Type::Any)
                 && let Some(initial) = variable.initial
@@ -4170,6 +4200,11 @@ impl<'src> Analyzer<'src> {
         // 3. A return position whose declared type is `any` (the tail and each
         //    `ret`, recorded as `return_sites`).
         for (function_id, value_id) in &self.return_sites {
+            // S1: the coercion anchors at the returned value in the
+            // function's own body.
+            if self.frozen_entity(*function_id) {
+                continue;
+            }
             if let Some(return_type_id) = self
                 .functions
                 .get(function_id)
@@ -9271,7 +9306,12 @@ impl<'src> Analyzer<'src> {
             .chain(self.transient_wrapped_view_calls())
             .collect();
         let mut escapes: Vec<Id> = Vec::new();
-        for expr in self.expr_id_to_expr_map.values() {
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            // S1: every escape this loop finds anchors inside the iterated
+            // expression; the precomputes above stay whole-program.
+            if self.frozen_entity(*expr_id) {
+                continue;
+            }
             match expr {
                 Expr::FunctionReturn(Some(value_id))
                     if self.escapes_as_view(*value_id, &view_bindings, &capturing) =>
@@ -9315,6 +9355,9 @@ impl<'src> Analyzer<'src> {
         // projection of a (view) parameter, whose target the caller keeps alive;
         // a view of a local still dangles and is rejected.
         for function in self.functions.values() {
+            if self.frozen_entity(function.id) {
+                continue;
+            }
             if function.has_body
                 && self.escapes_as_view(function.body.1, &view_bindings, &capturing)
                 && (function.borrows.is_empty() || !self.derives_from_view_param(function.body.1))
@@ -9322,7 +9365,14 @@ impl<'src> Analyzer<'src> {
                 escapes.push(function.body.1);
             }
         }
-        let closure_returns: Vec<Id> = self.closures.values().map(|c| c.return_).collect();
+        let closure_returns: Vec<Id> = self
+            .closures
+            .iter()
+            // S1: a closure written in entry code keeps its own (entry) id
+            // even when passed into std — only std-written closures skip.
+            .filter(|(closure_id, _)| !self.frozen_entity(**closure_id))
+            .map(|(_, closure)| closure.return_)
+            .collect();
         for return_id in closure_returns {
             if self.escapes_as_view(return_id, &view_bindings, &capturing) {
                 escapes.push(return_id);
@@ -10156,9 +10206,17 @@ impl<'src> Analyzer<'src> {
             .functions
             .iter()
             .filter(|(_, function)| function.has_body)
+            // S1: every violation the scan finds anchors inside the scanned
+            // body; the precomputed view sets above stay whole-program.
+            .filter(|(id, _)| !self.frozen_entity(**id))
             .map(|(id, function)| (*id, function.body.0.clone(), function.body.1))
             .collect();
-        let closure_returns: Vec<Id> = self.closures.values().map(|c| c.return_).collect();
+        let closure_returns: Vec<Id> = self
+            .closures
+            .iter()
+            .filter(|(closure_id, _)| !self.frozen_entity(**closure_id))
+            .map(|(_, closure)| closure.return_)
+            .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
         for (function_id, statements, tail) in &bodies {
             let mut live = HashSet::new();
@@ -10274,7 +10332,13 @@ impl<'src> Analyzer<'src> {
     /// are the body scan's business; nested closures are walked too (a sync
     /// closure inside the async one still holds the capture at its awaits).
     fn check_async_closure_captures(&mut self, view_bindings: &HashSet<Id>) {
-        let closure_ids: Vec<Id> = self.closures.keys().copied().collect();
+        // S1: the capture diagnostic anchors inside the closure's own body.
+        let closure_ids: Vec<Id> = self
+            .closures
+            .keys()
+            .copied()
+            .filter(|closure_id| !self.frozen_entity(*closure_id))
+            .collect();
         let mut errors: Vec<(Id, &'src str)> = Vec::new();
         for closure_id in closure_ids {
             let Some(closure) = self.closures.get(&closure_id) else {
@@ -10708,6 +10772,10 @@ impl<'src> Analyzer<'src> {
             let Expr::Assignment(target_id, value_id) = expr else {
                 continue;
             };
+            // S1: the violation anchors at the assignment itself.
+            if self.frozen_entity(*assignment_id) {
+                continue;
+            }
             // A reseat targets the view binding itself (`view = …`), not `*view`.
             let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id) else {
                 continue;
@@ -11021,6 +11089,9 @@ impl<'src> Analyzer<'src> {
                 Expr::Assignment(target_id, _) => Some(*target_id),
                 _ => None,
             })
+            // S1: a frozen (std) assignment's mutability was judged when std
+            // was pinned clean; the skip keys on the assignment itself.
+            .filter(|target_id| !self.frozen_entity(*target_id))
             .collect();
         for target_id in assignment_targets {
             if let Some((name, fix)) = self.readonly_root(target_id) {
@@ -11052,6 +11123,9 @@ impl<'src> Analyzer<'src> {
                 Expr::Call(call_id) => Some(*call_id),
                 _ => None,
             })
+            // S1: keyed on the CALL SITE, never the callee — an entry call
+            // into a `&mut`-parameter std function must keep its diagnostic.
+            .filter(|call_id| !self.frozen_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -11144,9 +11218,15 @@ impl<'src> Analyzer<'src> {
     /// calls (`subject -> Local(callee)`) resolve their parameters, like
     /// `check_mutable_arguments`; dispatched callees are conservatively skipped.
     fn check_view_value_reads(&mut self) {
+        // The fixpoint stays whole-program: an entry expression can read a
+        // std module-level binding, so narrowing it would change verdicts.
         let view_bindings = self.compute_view_bindings();
         let mut leaks: Vec<Id> = Vec::new();
-        for expr in self.expr_id_to_expr_map.values() {
+        for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
+            // S1: the leak anchors inside the iterated expression.
+            if self.frozen_entity(*expr_id) {
+                continue;
+            }
             match expr {
                 // Both operands of a binary operator are values.
                 Expr::Binary(_, lhs, rhs) => {
@@ -11215,6 +11295,8 @@ impl<'src> Analyzer<'src> {
                 Expr::Reference(operand_id, true) => Some((*reference_id, *operand_id)),
                 _ => None,
             })
+            // S1: the reference expression is its own anchor.
+            .filter(|(reference_id, _)| !self.frozen_entity(*reference_id))
             .collect();
         for (reference_id, operand_id) in references {
             if let Some((name, fix)) = self.readonly_root(operand_id) {
@@ -11259,6 +11341,9 @@ impl<'src> Analyzer<'src> {
                     variable.name_span,
                 )
             })
+            // S1: a binding's diagnostics anchor at its own declaration.
+            // Synthetic and derived bindings have no frozen range and stay.
+            .filter(|(binding_id, ..)| !self.frozen_entity(*binding_id))
             .collect();
         for (binding_id, mutable, initial, name, name_span) in bindings {
             let holds_view = self.binding_or_param_is_view(binding_id);
@@ -11312,6 +11397,9 @@ impl<'src> Analyzer<'src> {
                 Expr::Call(call_id) => Some(*call_id),
                 _ => None,
             })
+            // S1: keyed on the call site, never the callee (as in
+            // `check_mutable_arguments` above).
+            .filter(|call_id| !self.frozen_entity(*call_id))
             .collect();
         for call_id in call_ids {
             let Some(function_call) = self.function_calls.get(&call_id) else {
@@ -11413,6 +11501,9 @@ impl<'src> Analyzer<'src> {
                 // is index 1.
                 Some((call_id, call.argument_ids.get(1).copied()?))
             })
+            // S1: keyed on the call site — the `.attr` node is synthesized
+            // into the writing file's range, so entry calls always survive.
+            .filter(|(call_id, _)| !self.frozen_entity(*call_id))
             .collect();
         for (_, name_argument) in candidates {
             if !matches!(
@@ -11454,11 +11545,20 @@ impl<'src> Analyzer<'src> {
         // (`body.0`; the tail `body.1` is the return value) and of every inner
         // block (`if`/`for`/`match` bodies, explicit `{ }`).
         let mut statements: Vec<Id> = Vec::new();
+        // S1: both sweeps key on the discarding statement's own home — a std
+        // `[must_use]` function discarded in entry code still warns (the
+        // statement is entry-side); std's own discards were pinned clean.
         for function in self.functions.values() {
+            if self.frozen_entity(function.id) {
+                continue;
+            }
             statements.extend(function.body.0.iter().copied());
         }
-        for expr in self.expr_id_to_expr_map.values() {
+        for (block_id, expr) in self.expr_id_to_expr_map.iter() {
             if let Expr::Block((block_statements, _tail)) = expr {
+                if self.frozen_entity(*block_id) {
+                    continue;
+                }
                 statements.extend(block_statements.iter().copied());
             }
         }
@@ -17029,6 +17129,43 @@ impl<'src> Analyzer<'src> {
             .map(|range| range.source)
     }
 
+    /// Projects `std_sources` onto entity-id space for `frozen_entity`'s
+    /// binary search. Called once, after `build()` and before the checks —
+    /// every `source_ranges` push (module ids, body walks, derived runs, the
+    /// entry) has happened by then, and the ranges are disjoint by
+    /// construction (the entity counter only grows). The full-scan override
+    /// is folded in here: forced full scan seals an empty index, and every
+    /// entity reads as unfrozen.
+    fn seal_frozen_ranges(&mut self) {
+        self.frozen_ranges.clear();
+        if self.std_sources.is_empty() || full_scan_checks_forced() {
+            return;
+        }
+        self.frozen_ranges = self
+            .source_ranges
+            .iter()
+            .filter(|range| self.std_sources.contains(&range.source))
+            .map(|range| (range.start, range.end))
+            .collect();
+        self.frozen_ranges.sort_unstable();
+    }
+
+    /// Whether `id` was minted by a frozen source — a std module loaded from
+    /// disk (S1, analysis-reuse.md §6). Definition-site checks skip such
+    /// entities: their diagnostics depend only on std's own content, which is
+    /// pinned clean by the differential gate's invariant test. Use-site and
+    /// instantiation-driven checks must never consult this. Anything the
+    /// ranges do not cover — entities minted during constraint resolution,
+    /// derived entities (`DERIVED_SOURCE` is never in `std_sources`) — stays
+    /// checked: the conservative default for an unattributed id is "not
+    /// frozen".
+    fn frozen_entity(&self, id: Id) -> bool {
+        let index = self
+            .frozen_ranges
+            .partition_point(|(start, _)| *start <= id.0);
+        index > 0 && id.0 < self.frozen_ranges[index - 1].1
+    }
+
     fn resolve_constraints(&mut self) -> bool {
         let mut progress = false;
         // Re-sort each pass so any task a prior pass spawned (e.g. a slot
@@ -22155,6 +22292,11 @@ pub struct Program<'src> {
     // Computed once here because the coloring walk asks per reachable node.
     pub canonical_sources: Vec<PathBuf>,
     pub source_ranges: Vec<SourceRange>,
+    /// The sources whose definition-site diagnostics are frozen (S1,
+    /// analysis-reuse.md §6): std modules loaded from disk — never the entry,
+    /// never an LSP-overlaid buffer. Post-passes consult this the way the
+    /// in-analyze checks consult `Analyzer::frozen_entity`.
+    pub std_sources: std::collections::HashSet<SourceId>,
     /// Where each run of GENERATED entities came from: the entity-id range, the
     /// span of the attribute that generated it, and the file that attribute is
     /// written in. `source_ranges` files those entities under [`DERIVED_SOURCE`]
@@ -22584,6 +22726,21 @@ pub fn document_overlay_contains(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     overlay.contains_key(&crate::util::canonical_path(path))
+}
+
+/// Forces every definition-site check back to full-scan — the S1 differential
+/// gate's switch (analysis-reuse.md §6): the gate analyzes a corpus with and
+/// without the entry-scoped skip and asserts identical diagnostics and JS.
+/// Process-global like the document overlay; not for production use.
+static FULL_SCAN_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_full_scan_checks(enabled: bool) {
+    FULL_SCAN_CHECKS.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn full_scan_checks_forced() -> bool {
+    FULL_SCAN_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
@@ -24396,6 +24553,12 @@ pub fn analyze<'src>(
                         diagnostics_before,
                         SourceId(sources.len() as u32),
                     );
+                    // A std module loaded from DISK carries frozen
+                    // definition-site diagnostics (S1) — an overlaid buffer
+                    // (open in the editor, possibly dirty) does not.
+                    if matches!(origin, Origin::Std) && !document_overlay_contains(&module_path) {
+                        analyzer.std_sources.insert(SourceId(sources.len() as u32));
+                    }
                     sources.push(module_path);
                     source_hashes.push(crate::content_hash(loaded.text));
                     (
@@ -25066,6 +25229,10 @@ pub fn analyze<'src>(
     analyzer.build();
     let phase_build = phase_build_start.elapsed();
     let phase_checks_start = std::time::Instant::now();
+    // Every source range is recorded by now; project the frozen (std) sources
+    // onto entity-id space so the definition-site checks below can skip their
+    // entities with a binary search (S1, analysis-reuse.md §6).
+    analyzer.seal_frozen_ranges();
     // Infer the `borrows` effect before any check reads it (readonly-mutation
     // and the scalar-view lowering both consult `Function.borrows`).
     analyzer.infer_borrows();
@@ -25740,6 +25907,7 @@ pub fn analyze<'src>(
         sources,
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
+        std_sources: std::mem::take(&mut analyzer.std_sources),
         derived_origins: std::mem::take(&mut analyzer.derived_origins),
         layer_platforms,
         diagnostic_sources,
