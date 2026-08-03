@@ -360,3 +360,33 @@ queues are declaration-sized; the win would be noise). S1's lasting value
 is the differential gate and the frozen-source machinery — the safety
 rail S2/S3 run on; the big money stays in `build()` (44 ms) and the
 load+walk (19 ms), which are S3's targets.
+
+### 6.6 S2 SHIPPED (2026-08-02): resolution is drain-once
+
+The Phase-2 record named three cloned queues; the mechanical truth was
+**five** — `prepped_imports`, `prepped_locals`, `prepped_type_locals`,
+`prepped_type_static_accessors`, and `prepped_static_accessors` all
+`.clone()`d at consumption (three sibling queues were already
+`mem::take`n, so the drain-once direction was established practice). All
+five now drain. `prepped_type_locals` was the one with a post-build
+reader — conformance's `= Self` disambiguation reads the written
+spellings — so its drain retains the projection in a new
+`written_type_spellings` field, which ACCUMULATES across builds, matching
+the drain-once contract S3 needs.
+
+The pin (`build_idempotence.rs`): a `set_build_twice` test switch makes
+`analyze` run `build()` twice back-to-back, and a four-program battery —
+use-once alias elision (copy-elision reads `reference_count == 1`, so a
+double-increment changes emitted JS), a failing import (was: reported
+twice), item imports + static accessors (the member-count loops), and an
+unused-import warning — must observe identical diagnostics, warnings, and
+JS both ways. Plant-proven: reverting one drain to `.clone()` turned the
+pin red on exactly the predicted mechanism ("use-once alias elision:
+emitted JS differs").
+
+A finding worth recording: with the queues drained, a full second
+`build()` — constraint fixpoint included — is already observationally
+neutral across the battery. The re-entrant-build contract S3 needs holds
+today at the observation level; S3's remaining work is the id-space side
+(generation-scoped ids so a second build's minting never renumbers the
+frozen base), not behavioral neutrality.

@@ -1488,6 +1488,12 @@ pub struct Analyzer<'src> {
     // nominal type (`Option<i32>` -> `Enum(option_id, [i32])`); empty for a bare
     // name or a generic parameter.
     prepped_type_locals: Vec<(TypeId, &'src str, Id, Span, Vec<TypeId>, SourceId)>,
+    // The written spelling of every type reference `build()` has resolved —
+    // the projection of `prepped_type_locals` that outlives its drain (S2):
+    // conformance checking disambiguates `= Self`-defaulted positions by the
+    // NAME the impl wrote, after the queue itself is consumed. Accumulates
+    // across builds, matching the drain-once contract.
+    written_type_spellings: Vec<(TypeId, &'src str)>,
     prepped_uses: Vec<(Vec<(&'src str, Span)>, &'src str, Id, Span, Span, SourceId)>,
     prepped_type_static_accessors: Vec<(TypeId, TypeId, &'src str, Span)>,
     reference_count: HashMap<Id, u32>,
@@ -1844,6 +1850,7 @@ impl<'src> Analyzer<'src> {
             prepped_trait_impls: Vec::new(),
             conformance_signature_checks: Vec::new(),
             prepped_type_locals: Vec::new(),
+            written_type_spellings: Vec::new(),
             prepped_type_static_accessors: Vec::new(),
             prepped_uses: Vec::new(),
             reference_count: HashMap::new(),
@@ -3014,9 +3021,9 @@ impl<'src> Analyzer<'src> {
         // though they resolve to the same type — which is exactly what lets a
         // conformance check tell those two positions apart.
         let written_type_names: HashMap<TypeId, &'src str> = self
-            .prepped_type_locals
+            .written_type_spellings
             .iter()
-            .map(|(type_id, name, ..)| (*type_id, *name))
+            .map(|(type_id, name)| (*type_id, *name))
             .collect();
         for check in &checks {
             // S1: an impl declared in frozen std conforms by std's own pinned
@@ -19982,7 +19989,11 @@ impl<'src> Analyzer<'src> {
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
         // nothing new, then report whatever genuinely could not be found.
-        let mut remaining = self.prepped_imports.clone();
+        // Drained, not cloned (S2, analysis-reuse.md §6.3): resolution
+        // increments `reference_count` per use, so a second `build()` over a
+        // reused base must not see these again — each queued item resolves
+        // exactly once, in the build that first sees it.
+        let mut remaining = std::mem::take(&mut self.prepped_imports);
         loop {
             let before = remaining.len();
             remaining.retain(|(path, name, scope_id, span, leaf_span, source_id)| {
@@ -20105,7 +20116,7 @@ impl<'src> Analyzer<'src> {
             self.generic_bounds.insert(binder_constraint_id, bounds);
         }
 
-        for (id, name) in self.prepped_locals.clone() {
+        for (id, name) in std::mem::take(&mut self.prepped_locals) {
             let scope_id = self.get_scope_id_for_entity(id);
             // A use resolves at its own byte offset (positional visibility,
             // proposal/local-shadowing.md); a spanless synthesized use sees
@@ -20227,8 +20238,12 @@ impl<'src> Analyzer<'src> {
         }
 
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
-            self.prepped_type_locals.clone()
+            std::mem::take(&mut self.prepped_type_locals)
         {
+            // The written spelling outlives the queue: conformance checking
+            // reads it after build (the `= Self` disambiguation), so the
+            // drain retains the projection it needs.
+            self.written_type_spellings.push((type_id, name));
             // Prefer a type binding (so a value sharing the name doesn't shadow
             // it in type position), falling back to any binding for diagnostics.
             let resolved = self
@@ -20288,7 +20303,7 @@ impl<'src> Analyzer<'src> {
         }
 
         for (type_id, subject_type_id, member_name, span) in
-            self.prepped_type_static_accessors.clone()
+            std::mem::take(&mut self.prepped_type_static_accessors)
         {
             match subject_type_id.get_type(self) {
                 Type::Module(module_id) => {
@@ -20368,7 +20383,8 @@ impl<'src> Analyzer<'src> {
                 .push((source_id, span, Some(trait_id), trait_type_id));
         }
 
-        for (id, subject_type_id, member_name) in self.prepped_static_accessors.clone() {
+        for (id, subject_type_id, member_name) in std::mem::take(&mut self.prepped_static_accessors)
+        {
             let subject_type = subject_type_id.get_type(self);
             match subject_type {
                 // Static access on a nominal type (`Id::new`), a trait
@@ -22741,6 +22757,22 @@ pub fn set_full_scan_checks(enabled: bool) {
 
 pub(crate) fn full_scan_checks_forced() -> bool {
     FULL_SCAN_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Forces `analyze` to run `build()` twice back-to-back — the S2 pin's
+/// switch (analysis-reuse.md §6.3): after the drain-once fix, a second
+/// `build()` must be observationally neutral — identical diagnostics,
+/// warnings, and emitted JS — which is the contract S3's re-entrant builds
+/// over a frozen base stand on. Test-only, like the full-scan override.
+static BUILD_TWICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_build_twice(enabled: bool) {
+    BUILD_TWICE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn build_twice_forced() -> bool {
+    BUILD_TWICE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
@@ -25229,6 +25261,11 @@ pub fn analyze<'src>(
     analyzer.build();
     let phase_build = phase_build_start.elapsed();
     let phase_checks_start = std::time::Instant::now();
+    // The S2 pin's switch: a second build over the drained queues must
+    // change nothing observable.
+    if build_twice_forced() {
+        analyzer.build();
+    }
     // Every source range is recorded by now; project the frozen (std) sources
     // onto entity-id space so the definition-site checks below can skip their
     // entities with a binary search (S1, analysis-reuse.md §6).
