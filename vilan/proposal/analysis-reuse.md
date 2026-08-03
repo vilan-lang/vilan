@@ -645,3 +645,39 @@ the cloned worlds drop normally; only the stored bases and the interned
 seed names are retained, once each. Remaining §6.10 residual: the
 derive/macro entry widening (the per-file expansion hoist), recorded,
 unscheduled.
+
+### 6.13 The derive/macro hoist — reconnaissance and staged design
+### (2026-08-03; implementation not started)
+
+The last §6.10 residual, and the widening that matters for real UI
+programs: `bind_each` requires `[derive(PartialEq)]`, so most kolt-shaped
+entries bypass the cache today. Reconnaissance findings:
+
+- A cache hit CANNOT simply drop the `derive` bypass: the tail walks
+  `generated_by_source[SourceId(0)]` from the world, and a stored world's
+  entry expansions are empty — a derive-bearing entry hitting it would
+  silently lose its derived impls. The hoist is genuinely required.
+- **The macro registry is a load-region LOCAL**, rebuilt per analysis:
+  the ENTRY registers first (`ModuleKey::Entry`), then every loaded
+  file; `expand_one` then runs per file against it, all inside the load
+  region. A cached world does not carry it.
+- The design fork, decided by one measurement (`register_file` cost over
+  the loaded set): **(a)** the `World` carries the registry minus its
+  entry rows, and the hit path re-registers just the entry and expands
+  it — needs the registry's Clone + 'static story (its ASTs are leaked;
+  the Entry rows are the only entry-entangled part); **(b)** the hit
+  path rebuilds the whole registry and expands the entry — trivial and
+  correct if registration is ~1 ms, pointless if it is 10.
+- Either way the hit path must check the expansion's demanded module
+  refs against the world's loaded set — a generated `import std::x` for
+  an unloaded x falls back to a fresh build (rare: the ambient derive
+  vocabulary lives in the always-loaded core).
+- Scope note: only the `derive` bypass lifts. Entries that DEFINE macros
+  (`macro fun`/`macro {`) stay bypassed — their world compile is
+  entry-entangled by content (E23's blanked-source key), a separate
+  problem.
+- Gates when implemented: a derive-bearing entry hits and is
+  observation-identical to fresh (the derived-impl diagnostics are the
+  sharp edge — `bind_each` without PartialEq must still error
+  identically); the fallback pin (generated import of a non-loaded
+  module); E23's leak counters unchanged over the hit path.
