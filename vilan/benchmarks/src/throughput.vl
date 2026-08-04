@@ -61,9 +61,16 @@ fun run(finished: || void) {
 	let local_binary = drive(local_rpc(add_protocol(binary_codec())), binary_codec(), local_calls);
 	print(i"in-process binary: {local_calls} calls in {round(local_binary)} ms -> {rate(local_calls, local_binary)} calls/sec");
 
+	// Port 0 on every bind below: the OS picks a free port (E33 — a fixed
+	// port collides with concurrent e2e legs under nextest), and each
+	// `on_ready`/`on_start` callback reads the real one back off `server`
+	// for its own same-process client to dial. `[port]` lines let the
+	// harness confirm a real port came back, not a stale literal.
 	let http_calls = 200;
-	serve_rpc(48231, add_protocol(json_codec()), |server| {
-		let elapsed = drive(HttpTransport { url = "http://localhost:48231/" }, json_codec(), http_calls);
+	serve_rpc(0, add_protocol(json_codec()), |server| {
+		let port = server.port();
+		print(i"[port] {port}");
+		let elapsed = drive(HttpTransport { url = i"http://localhost:{port}/" }, json_codec(), http_calls);
 		let average_us = round(elapsed * 1000.0 / http_calls);
 		print(i"http json: {http_calls} calls in {round(elapsed)} ms -> {rate(http_calls, elapsed)} calls/sec ({average_us} us avg)");
 		// The binary codec end-to-end over real HTTP rides serve_connected's
@@ -71,23 +78,27 @@ fun run(finished: || void) {
 		// the WebSocket-multiplexed measurement (json — the socket transport
 		// multiplexes text frames).
 		serve_connected(
-			48233,
+			0,
 			add_protocol(binary_codec()),
 			|id, end| {},
 			|id| {},
 			|request| Response::builder().code(404).body("benchmark").build(),
 			|server| {
-				let binary_elapsed = drive(HttpTransport { url = "http://localhost:48233/rpc" }, binary_codec(), http_calls);
+				let binary_port = server.port();
+				print(i"[port] {binary_port}");
+				let binary_elapsed = drive(HttpTransport { url = i"http://localhost:{binary_port}/rpc" }, binary_codec(), http_calls);
 				let binary_average_us = round(binary_elapsed * 1000.0 / http_calls);
 				print(i"http binary: {http_calls} calls in {round(binary_elapsed)} ms -> {rate(http_calls, binary_elapsed)} calls/sec ({binary_average_us} us avg)");
 				serve_connected(
-					48234,
+					0,
 					add_protocol(json_codec()),
 					|id, end| {},
 					|id| {},
 					|request| Response::builder().code(404).body("benchmark").build(),
 					|server| {
-						let socket: SocketDuplex = match connect_socket("ws://localhost:48234") {
+						let ws_port = server.port();
+						print(i"[port] {ws_port}");
+						let socket: SocketDuplex = match connect_socket(i"ws://localhost:{ws_port}") {
 							Ok(let opened) => opened,
 							Err(let reason) => panic(reason),
 						};
