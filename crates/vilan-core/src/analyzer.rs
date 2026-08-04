@@ -3452,6 +3452,38 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether a type mentions `self_trait`'s abstract self type
+    /// (`Type::Trait(self_trait, [])` — how `Self` interns) anywhere in its
+    /// structure. Gates the `Self`-return specialization so a return type with
+    /// no `Self` in it is returned untouched rather than structurally rebuilt.
+    fn mentions_self_trait(&self, type_: &Type, self_trait: Id, depth: usize) -> bool {
+        if depth > 24 {
+            return false;
+        }
+        let mentions = |analyzer: &Self, type_ids: &[TypeId]| {
+            type_ids.iter().any(|type_id| {
+                analyzer.mentions_self_trait(&type_id.get_type(analyzer), self_trait, depth + 1)
+            })
+        };
+        match type_ {
+            Type::Trait(trait_id, arguments) if *trait_id == self_trait && arguments.is_empty() => {
+                true
+            }
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+                mentions(self, arguments)
+            }
+            Type::Tuple(elements) => mentions(self, elements),
+            Type::Array(element, _) => {
+                self.mentions_self_trait(&element.get_type(self), self_trait, depth + 1)
+            }
+            Type::Closure(parameters, return_type) => {
+                mentions(self, parameters)
+                    || self.mentions_self_trait(&return_type.get_type(self), self_trait, depth + 1)
+            }
+            _ => false,
+        }
+    }
+
     /// Substitute a trait member's declared type for comparison against the
     /// impl's: `Self` (the declaring trait's abstract self type,
     /// `Type::Trait(self_trait, [])`) becomes the impl's subject, and every
@@ -16277,33 +16309,56 @@ impl<'src> Analyzer<'src> {
                             }
                         }
                         let return_type = self.freshen_list_element_slots(return_type, id);
-                        // Specialize a `Self` return. When a method's declared
-                        // return type is the same as its `self` parameter's type
-                        // — i.e. it returns `Self` — the call yields the
-                        // receiver's actual type. So a `Self`-returning trait
-                        // default called on a concrete value gives that concrete
-                        // type, not the abstract `Type::Trait` Self stands for.
-                        let returns_self = match (self_parameter_id, return_type_id) {
-                            (Some(self_parameter_id), Some(return_type_id)) => {
-                                let self_type = self
-                                    .parameters
-                                    .get(&self_parameter_id)
-                                    .map(|parameter| parameter.type_id.get_type(self));
-                                self_type == Some(return_type_id.get_type(self))
-                            }
-                            _ => false,
-                        };
-                        if returns_self {
-                            if let Some(receiver_id) = argument_ids.first().copied() {
-                                let receiver_type = self.infer_type_inner(
-                                    receiver_id,
-                                    &Type::Unknown,
-                                    &substitution_context,
-                                    exprs_seen,
-                                );
-                                if matches!(receiver_type, Type::Struct(_, _) | Type::Enum(_, _)) {
-                                    return receiver_type;
+                        // Specialize a `Self` return, STRUCTURALLY. A trait
+                        // member's `self` parameter is typed as the declaring
+                        // trait's abstract self type (`Type::Trait(trait, [])`),
+                        // and its return type may mention that anywhere: bare
+                        // (`Self`) or nested in a type argument (`Taken<Self,
+                        // T>`). Called on a concrete receiver, every such
+                        // position is that receiver's type — so a `Self`-
+                        // returning trait default gives the concrete type, not
+                        // the abstract one Self stands for. Only the BARE case
+                        // was specialized before, by whole-type equality: a
+                        // nested `Self` stayed abstract, and a struct built over
+                        // it (`Taken<Iter, i32>`) bound its own generic to a
+                        // bare trait, so the field call `self.upstream.next()`
+                        // resolved to the trait's EMPTY abstract member — a
+                        // clean compile emitting a body-less function (B55).
+                        let self_trait = self_parameter_id
+                            .and_then(|parameter_id| self.parameters.get(&parameter_id))
+                            .map(|parameter| parameter.type_id)
+                            .and_then(|type_id| match type_id.get_type(self) {
+                                Type::Trait(trait_id, arguments) if arguments.is_empty() => {
+                                    Some(trait_id)
                                 }
+                                _ => None,
+                            });
+                        if let Some(self_trait) = self_trait
+                            && self.mentions_self_trait(&return_type, self_trait, 0)
+                            && let Some(receiver_id) = argument_ids.first().copied()
+                        {
+                            let receiver_type = self.infer_type_inner(
+                                receiver_id,
+                                &Type::Unknown,
+                                &substitution_context,
+                                exprs_seen,
+                            );
+                            // A GENERIC receiver substitutes too: inside
+                            // `relay<T: Marker>(t: T)`, `t.wrapped()` is
+                            // `Wrap<T>` — abstract here, concrete at every
+                            // monomorphization. Leaving it `Wrap<Marker>` made a
+                            // bare trait type the payload, which has no members.
+                            if matches!(
+                                receiver_type,
+                                Type::Struct(_, _) | Type::Enum(_, _) | Type::Generic(_)
+                            ) {
+                                let subject = receiver_type.get_type_id(self);
+                                return self.substitute_member_type(
+                                    &return_type,
+                                    self_trait,
+                                    subject,
+                                    &SubstitutionContext::new(),
+                                );
                             }
                         }
                         return_type
@@ -21401,8 +21456,25 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 };
                 let next_method = self.for_each_next_method(item_id);
-                if let Some(next_id) = self.method_member_in_impls(&iterable_type, next_method) {
+                if let Some((next_id, impl_subject_id)) =
+                    self.method_member_impl_subject(&iterable_type, next_method)
+                {
                     self.for_each_next.insert(for_each_id, next_id);
+                    // Bind the providing impl's generics from the receiver
+                    // (`Passthrough<Counting, i32>` against the impl's
+                    // `Passthrough<U, T>` binds `U = Counting`), keyed by the
+                    // LOOP — the callee is generic exactly as often as the
+                    // iterator is, and emitting it by bare id left `U` unbound,
+                    // so its own `self.upstream.next()` resolved to the
+                    // trait's empty abstract member (B55).
+                    let impl_subject = impl_subject_id.get_type(self);
+                    if let Some((_, bindings)) =
+                        self.reconcile_type(&impl_subject, &iterable_type, &HashMap::new())
+                        && !bindings.is_empty()
+                    {
+                        self.method_call_substitution
+                            .insert(for_each_id, bindings.into_iter().collect());
+                    }
                 }
             }
         }

@@ -30944,3 +30944,279 @@ fn an_unsatisfied_bound_is_reported_as_a_bound_not_as_a_steered_miss() {
         "a loaded module's bounded impl must not read as a missing method; got: {diagnostics:#?}"
     );
 }
+
+// --- B55/B56: bounded-generic dispatch through a re-dispatched callee, and
+// --- `for` over a non-concrete subject (proposal/iterator-adapters.md P2/P3) --
+
+/// The adapter shape: `self.upstream.next()` where `upstream: U, U: Iter<T>`,
+/// driven by the `for`-loop protocol. The loop emitted its `next` callee by
+/// BARE ID — the concrete-function path — so the generic `Passthrough::next`
+/// body was walked with no substitution, `U` never bound, and the inner
+/// bounded call resolved to the trait's abstract member: an EMPTY function
+/// body, exit 0, `TypeError` at runtime.
+#[test]
+fn a_for_loop_over_a_generic_adapter_drives_its_upstream() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::{Option, Some, None};
+
+        trait Iter<T> { fun next(&mut self): Option<T>; }
+
+        struct Counting { at: i32, limit: i32 }
+        impl Counting with Iter<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit { self.at = self.at + 1; Some(self.at) } else { None }
+            }
+        }
+
+        struct Passthrough<U, T> { upstream: U }
+        impl Passthrough<type U: Iter<T>, type T> with Iter<T> {
+            fun next(&mut self): Option<T> { self.upstream.next() }
+        }
+
+        fun main() {
+            mut p = Passthrough { upstream = Counting { at = 0, limit = 3 } };
+            for v in p { print(v); }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+/// The same shape reached through a DIRECT call rather than the loop — the
+/// control that was already correct, pinned so the loop fix does not regress
+/// it.
+#[test]
+fn a_direct_call_on_a_generic_adapter_drives_its_upstream() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::{Option, Some, None};
+
+        trait Iter<T> { fun next(&mut self): Option<T>; }
+
+        struct Counting { at: i32, limit: i32 }
+        impl Counting with Iter<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit { self.at = self.at + 1; Some(self.at) } else { None }
+            }
+        }
+
+        struct Passthrough<U, T> { upstream: U }
+        impl Passthrough<type U: Iter<T>, type T> with Iter<T> {
+            fun next(&mut self): Option<T> { self.upstream.next() }
+        }
+
+        fun main() {
+            mut p = Passthrough { upstream = Counting { at = 0, limit = 3 } };
+            match p.next() { Some(let v) => print(v), None => print(-1) }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// B55's second trigger: an adapter CONSTRUCTED by a trait default. `Self`
+/// nested in the default's return type (`Taken<Self, T>`) was left as the
+/// abstract `Type::Trait`, so `Taken`'s `U` bound to the bare trait and
+/// `self.upstream.next()` resolved to the trait's abstract member.
+#[test]
+fn a_trait_default_constructing_an_adapter_binds_self_to_the_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::{Option, Some, None};
+
+        struct Taken<U, T> { upstream: U, remaining: i32 }
+
+        trait Iter<T> {
+            fun next(&mut self): Option<T>;
+            fun taken(self, count: i32): Taken<Self, T> {
+                Taken { upstream = self, remaining = count }
+            }
+        }
+
+        impl Taken<type U: Iter<T>, type T> with Iter<T> {
+            fun next(&mut self): Option<T> {
+                if self.remaining <= 0 { ret None; }
+                self.remaining = self.remaining - 1;
+                self.upstream.next()
+            }
+        }
+
+        struct Counting { at: i32, limit: i32 }
+        impl Counting with Iter<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit { self.at = self.at + 1; Some(self.at) } else { None }
+            }
+        }
+
+        fun main() {
+            mut t = Counting { at = 0, limit = 5 }.taken(3);
+            match t.next() { Some(let v) => print(v), None => print(-1) }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The same `Self`-in-a-type-argument gap at its smallest: a trait default
+/// returning `Wrap<Self>` must yield `Wrap<Dog>`, so the payload is callable.
+/// It used to yield `Wrap<Marker>` — a bare trait type, which has no methods.
+#[test]
+fn a_trait_default_returning_a_wrapper_of_self_yields_the_concrete_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Wrap<U> { inner: U }
+
+        trait Marker {
+            fun tag(self): i32;
+            fun wrapped(self): Wrap<Self> { Wrap { inner = self } }
+        }
+
+        struct Dog { legs: i32 }
+        impl Dog with Marker { fun tag(self): i32 { self.legs } }
+
+        fun main() { print(Dog { legs = 4 }.wrapped().inner.tag()); }
+        "#,
+        "4\n",
+    );
+}
+
+/// A bare `Self` return keeps working — the exact-equality case the structural
+/// substitution subsumes.
+#[test]
+fn a_trait_default_returning_bare_self_yields_the_concrete_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Marker {
+            fun tag(self): i32;
+            fun itself(self): Self { self }
+        }
+
+        struct Dog { legs: i32 }
+        impl Dog with Marker { fun tag(self): i32 { self.legs } }
+
+        fun main() { print(Dog { legs = 4 }.itself().tag()); }
+        "#,
+        "4\n",
+    );
+}
+
+/// The full adapter pipeline both triggers compose into: a trait-default
+/// constructor feeding a trait-default terminal over a bounded generic.
+#[test]
+fn a_trait_default_adapter_pipeline_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::list::List;
+        import std::option::{Option, Some, None};
+
+        struct Taken<U, T> { upstream: U, remaining: i32 }
+
+        trait Iter<T> {
+            fun next(&mut self): Option<T>;
+            fun taken(self, count: i32): Taken<Self, T> {
+                Taken { upstream = self, remaining = count }
+            }
+            fun to_list(mut self): List<T> {
+                mut out = List::new();
+                for {
+                    match self.next() {
+                        Some(let v) => out.push(v),
+                        None => jump break,
+                    }
+                }
+                out
+            }
+        }
+
+        impl Taken<type U: Iter<T>, type T> with Iter<T> {
+            fun next(&mut self): Option<T> {
+                if self.remaining <= 0 { ret None; }
+                self.remaining = self.remaining - 1;
+                self.upstream.next()
+            }
+        }
+
+        struct Counting { at: i32, limit: i32 }
+        impl Counting with Iter<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit { self.at = self.at + 1; Some(self.at) } else { None }
+            }
+        }
+
+        fun main() { print(Counting { at = 0, limit = 5 }.taken(3).to_list().len()); }
+        "#,
+        "3\n",
+    );
+}
+
+/// `Self` in a return type reaches a GENERIC receiver too: inside
+/// `relay<T: Marker>`, `t.wrapped()` is `Wrap<T>` — abstract here, concrete at
+/// each monomorphization. It used to stay `Wrap<Marker>`, and the payload read
+/// as a bare trait value with no members.
+#[test]
+fn a_self_returning_default_called_on_a_generic_receiver_stays_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Wrap<U> { inner: U }
+
+        trait Marker {
+            fun tag(self): i32;
+            fun wrapped(self): Wrap<Self> { Wrap { inner = self } }
+        }
+
+        struct Dog { legs: i32 }
+        impl Dog with Marker { fun tag(self): i32 { self.legs } }
+
+        fun relay<T: Marker>(t: T): i32 { t.wrapped().inner.tag() }
+
+        fun main() { print(relay(Dog { legs = 4 })); }
+        "#,
+        "4\n",
+    );
+}
+
+/// Nesting: an adapter over an adapter, driven by the loop protocol. The
+/// per-instantiation binding has to COMPOSE — the inner `Passthrough`'s `U` is
+/// bound by the outer one's monomorphization.
+#[test]
+fn a_two_hop_generic_adapter_drives_through_both_layers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::{Option, Some, None};
+
+        trait Iter<T> { fun next(&mut self): Option<T>; }
+
+        struct Counting { at: i32, limit: i32 }
+        impl Counting with Iter<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit { self.at = self.at + 1; Some(self.at) } else { None }
+            }
+        }
+
+        struct Passthrough<U, T> { upstream: U }
+        impl Passthrough<type U: Iter<T>, type T> with Iter<T> {
+            fun next(&mut self): Option<T> { self.upstream.next() }
+        }
+
+        fun main() {
+            mut p = Passthrough {
+                upstream = Passthrough { upstream = Counting { at = 0, limit = 3 } }
+            };
+            for v in p { print(v); }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
