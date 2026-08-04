@@ -1526,11 +1526,10 @@ impl<'src> Transformer<'src> {
                 )
                 .collect::<HashMap<Id, String>>()
         };
-        let reserved = if options.readable_names {
-            collect_reserved_names(program)
-        } else {
-            HashSet::new()
-        };
+        // Seeded in EVERY style, not just the readable one: the obfuscated
+        // sequence walks `a, b, …, aa, ab, …` and so eventually spells `if`,
+        // `in`, `do` — names no style may hand a binding.
+        let reserved = collect_reserved_names(program);
 
         let print_fn_id = {
             let std_module_id = *program
@@ -6334,6 +6333,26 @@ impl Formatter {
         self.sequence(list, ";", 0)
     }
 
+    /// The separator two adjacent output fragments need. Normally that is just
+    /// `space`, but dropping the padding is only sound while it leaves the TOKEN
+    /// STREAM alone, and at an operator junction it does not always: `3 - -(2)`
+    /// printed tight is `3--(2)`, which JavaScript lexes as one postfix `--` and
+    /// rejects. A pair of characters that would fuse into a longer token keeps a
+    /// single space whatever the padding option says — the minimum separation,
+    /// not the configured one.
+    fn between(&self, left: &str, right: &str) -> &'static str {
+        if !self.space.is_empty() {
+            return self.space;
+        }
+        match (left.chars().next_back(), right.chars().next()) {
+            // `+ +…` and `- -…` lex as the increment and decrement operators.
+            (Some('+'), Some('+')) | (Some('-'), Some('-')) => " ",
+            // `/ /…` opens a line comment and `/ *…` a block comment.
+            (Some('/'), Some('/' | '*')) => " ",
+            _ => "",
+        }
+    }
+
     /// Renders a sequence of statements, one per line, each indented to `level`.
     /// The per-statement indent lives here (not in `node`) so `node` can render a
     /// sub-expression inline — without a leading indent — while still passing the
@@ -6510,9 +6529,16 @@ impl Formatter {
                 let parent = Self::js_binary_precedence(*op);
                 let s_lhs = self.operand(lhs, level, |child| child >= parent);
                 let s_rhs = self.operand(rhs, level, |child| child > parent);
+                // The one junction in the printer where two arbitrary fragments
+                // meet across punctuation, so the one that needs `between`.
                 format!(
                     "{}{}{}{}{}{}",
-                    s_lhs, self.space, s_op, self.space, s_rhs, terminator
+                    s_lhs,
+                    self.between(&s_lhs, s_op),
+                    s_op,
+                    self.between(s_op, &s_rhs),
+                    s_rhs,
+                    terminator
                 )
             }
             js::Node::Unary(operator, operand) => {
@@ -7115,9 +7141,18 @@ struct NameGenerator {
     /// Source names by id (functions, variables, parameters) — empty for `Plain`.
     source_names: HashMap<Id, String>,
     style: NameStyle,
-    /// Names already in use (readable mode): the reserved set plus every readable
-    /// name assigned so far, so the next is disambiguated against them.
+    /// Names already in use: the reserved set (keywords, referenced globals,
+    /// `__`-helpers, `[extern]` symbols) plus every name minted so far. Every
+    /// mint consults it, so a generated name is never a reserved word and never
+    /// repeats — the generator's own uniqueness invariant.
     taken: HashSet<String>,
+    /// Every name this generator has MINTED — the ones handed to an `Id` by
+    /// `name_for` and the ones handed to an anonymous temp by `next_name` alike.
+    /// `names` covers only the former, which is what made B69 possible: the
+    /// scope re-allocator needs the CLOSED set, because a minted name it does
+    /// not know about is one it will happily mint again out of its own
+    /// identical alphabet. See `rename_for_scopes`.
+    minted: HashSet<String>,
 }
 
 impl NameGenerator {
@@ -7131,6 +7166,7 @@ impl NameGenerator {
             source_names,
             style,
             taken: reserved,
+            minted: HashSet::new(),
         }
     }
 
@@ -7165,8 +7201,7 @@ impl NameGenerator {
             candidate = format!("{base}{suffix}");
             suffix += 1;
         }
-        self.taken.insert(candidate.clone());
-        candidate
+        self.mint(candidate)
     }
 
     fn next_idx(&mut self) -> u64 {
@@ -7175,15 +7210,32 @@ impl NameGenerator {
         c
     }
 
+    /// The next unused generated name. The obfuscated sequence walks the same
+    /// `[a-zA-Z]` alphabet the scope re-allocator draws from, so it eventually
+    /// spells reserved words (`if`, `in`, `do`, …) — `taken` is consulted so it
+    /// never hands one out.
     fn next_name(&mut self) -> String {
-        let c = self.next_idx();
-        let short = self.name_from_idx(c);
-        // In readable mode, temps are `$`-prefixed so they can't collide with a
-        // readable (source-derived) name, which never contains `$`.
-        match self.style {
-            NameStyle::Readable => format!("${short}"),
-            _ => short,
+        loop {
+            let index = self.next_idx();
+            let short = self.name_from_idx(index);
+            // In readable mode, temps are `$`-prefixed so they can't collide with a
+            // readable (source-derived) name, which never contains `$`.
+            let candidate = match self.style {
+                NameStyle::Readable => format!("${short}"),
+                _ => short,
+            };
+            if !self.taken.contains(&candidate) {
+                return self.mint(candidate);
+            }
         }
+    }
+
+    /// Records a name as handed out: unavailable for a later mint, and a member
+    /// of the closed set `rename_for_scopes` re-allocates over.
+    fn mint(&mut self, name: String) -> String {
+        self.taken.insert(name.clone());
+        self.minted.insert(name.clone());
+        name
     }
 
     fn name_from_idx(&self, n: u64) -> String {
@@ -7405,15 +7457,46 @@ fn collect_if(
 /// not used by an ancestor (no shadowing) or a same-scope sibling; disjoint
 /// scopes (passed the same inherited set) reuse freely. `release` picks the
 /// shortest obfuscated name; otherwise the binding's source name, disambiguated.
+///
+/// `holder` says which BINDING each name in `used` belongs to, for the names
+/// this pass allocated (a reserved name belongs to nobody and is absent). It is
+/// what separates a binding legitimately meeting itself from two bindings
+/// meeting — see the duplicate-emission branch below.
 fn allocate_scope(
     scope: &JsScope,
     inherited: &HashSet<String>,
+    holder: &HashMap<String, String>,
     release: bool,
     source_of: &HashMap<String, String>,
     rename: &mut HashMap<String, String>,
 ) {
     let mut used = inherited.clone();
+    let mut holder = holder.clone();
     for old in &scope.declarations {
+        // One generated name is one binding, even where the emitter writes that
+        // binding out more than once — every instance of a monomorphized generic
+        // repeats its body's names, and a free `fun` nested in a member body is
+        // emitted both nested AND at module level. The rename map is keyed by
+        // NAME, so all of a binding's emission sites must land on one answer:
+        // take the allocation already made rather than minting a second,
+        // disagreeing one, which would rewrite the earlier site to a name chosen
+        // against a scope it is not in.
+        if let Some(allocated) = rename.get(old).cloned() {
+            // Meeting the name again is expected when the binding meets ITSELF:
+            // the nested copy of a hoisted `fun` shadows the module-level one,
+            // and the two are the same function. Two DIFFERENT bindings under
+            // one name is the collision this pass exists to prevent, and there
+            // is no name a name-keyed rename could give them both.
+            debug_assert!(
+                !used.contains(&allocated)
+                    || holder.get(&allocated).map(String::as_str) == Some(old.as_str()),
+                "`{old}` is declared in a scope where `{allocated}`, the name allocated for it \
+                 elsewhere, already belongs to a different binding"
+            );
+            used.insert(allocated.clone());
+            holder.insert(allocated, old.clone());
+            continue;
+        }
         let new = if release {
             shortest_available(&used)
         } else {
@@ -7422,10 +7505,11 @@ fn allocate_scope(
             disambiguated(source_of.get(old).unwrap_or(old), &used)
         };
         rename.insert(old.clone(), new.clone());
-        used.insert(new);
+        used.insert(new.clone());
+        holder.insert(new, old.clone());
     }
     for child in &scope.children {
-        allocate_scope(child, &used, release, source_of, rename);
+        allocate_scope(child, &used, &holder, release, source_of, rename);
     }
 }
 
@@ -7522,6 +7606,17 @@ fn rename_if(branch: &mut js::IfBranch, rename: &HashMap<String, String>) {
 /// Re-allocates the program's binding names over its JS scope tree (see the
 /// machinery above) and rewrites the node tree. A no-op for the annotated style
 /// (its names carry `/*source*/` comments the rename can't cleanly reuse).
+///
+/// **The uniqueness invariant (B69).** This pass hands out names from a pool —
+/// `a, b, c, …` under release, source names under readable — while leaving
+/// alone every name it was not asked to re-allocate. That is sound if and only
+/// if the two sets cannot meet, and there are exactly two ways for a generated
+/// name to end up in the left-alone set: it is not `renameable`, or the collect
+/// walk never reached its declaration. Both are closed here — the first by
+/// re-allocating the generator's whole minted set under release, the second by
+/// RESERVING whatever the walk did not reach. Every generated name is therefore
+/// either re-allocated against a scope's `used` set or reserved in every scope,
+/// and a binding the walk misses can only come out over-long, never colliding.
 fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::Node>) {
     let release = match ng.style {
         NameStyle::Annotated => return,
@@ -7535,10 +7630,14 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
             source_of.insert(name.clone(), source.clone());
         }
     }
-    // Readable reuses only source-named bindings (anonymous temps keep their
-    // unique `$`-name); release reuses every generated name.
+    // Release re-allocates EVERY name the generator minted — including the
+    // anonymous temps (`ng.names` holds only the id-keyed ones), whose names come
+    // out of the very `a, b, c, …` alphabet `shortest_available` draws from.
+    // Readable re-allocates only the source-named bindings, and can leave the
+    // temps alone safely because those are `$`-prefixed and no source-derived
+    // name ever contains a `$`.
     let renameable: HashSet<String> = if release {
-        ng.names.values().cloned().collect()
+        ng.minted.clone()
     } else {
         source_of.keys().cloned().collect()
     };
@@ -7547,7 +7646,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     }
     // The reserved set (keywords, referenced globals, `__`-helpers, the program's
     // `[extern]` symbols) counts as used in every scope, so nothing collides.
-    let reserved = collect_reserved_names(program);
+    let mut reserved = collect_reserved_names(program);
     let mut declarations = Vec::new();
     let mut children = Vec::new();
     collect_declarations(nodes, &renameable, &mut declarations, &mut children);
@@ -7555,14 +7654,86 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         declarations,
         children,
     };
+    // The second half of the invariant. The collect walk is a hand-written walk
+    // over the node tree and may be incomplete; a declaration it misses keeps
+    // the name the generator minted, which is a name this pass can otherwise
+    // mint again. Reserving the unreached names makes the allocator's output
+    // disjoint from the kept names whatever the walk did or did not see.
+    let mut reached = HashSet::new();
+    collect_reached_names(&global, &mut reached);
+    reserved.extend(
+        renameable
+            .iter()
+            .filter(|name| !reached.contains(*name))
+            .cloned(),
+    );
     let mut rename = HashMap::new();
-    allocate_scope(&global, &reserved, release, &source_of, &mut rename);
+    allocate_scope(
+        &global,
+        &reserved,
+        &HashMap::new(),
+        release,
+        &source_of,
+        &mut rename,
+    );
+    debug_assert!(
+        renameable
+            .iter()
+            .all(|name| rename.contains_key(name) || reserved.contains(name)),
+        "a generated name was neither re-allocated nor reserved — it can collide"
+    );
     rename_nodes(nodes, &rename);
+}
+
+/// Every binding name the scope tree accounts for — the walk's reach, which is
+/// what `rename_for_scopes` reserves the complement of.
+fn collect_reached_names(scope: &JsScope, reached: &mut HashSet<String>) {
+    reached.extend(scope.declarations.iter().cloned());
+    for child in &scope.children {
+        collect_reached_names(child, reached);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::unescape_string;
+    use super::{Formatter, unescape_string};
+
+    /// The junctions where dropping the padding would change the token stream.
+    /// Only `- -` is reachable from Vilan source today (`-` is the only
+    /// arithmetic unary the language has), so the rest of the rule is stated
+    /// here or nowhere: the day a `+` unary or a regex literal arrives, the
+    /// printer must already be right rather than newly wrong.
+    #[test]
+    fn tight_printing_separates_only_the_pairs_that_would_fuse() {
+        let tight = Formatter::from_options(false, false);
+        // `3 - -(2)` must not become `3--(2)`, a postfix decrement.
+        assert_eq!(tight.between("3", "-"), "");
+        assert_eq!(tight.between("-", "-(2)"), " ");
+        // The same for the increment operator, and for both comment openers.
+        assert_eq!(tight.between("+", "+(2)"), " ");
+        assert_eq!(tight.between("/", "/(2)"), " ");
+        assert_eq!(tight.between("/", "*(2)"), " ");
+        // Everything else stays tight — a rule that always padded would be
+        // correct and would also stop minifying.
+        assert_eq!(tight.between("7", "-"), "");
+        assert_eq!(tight.between("-", "9"), "");
+        assert_eq!(tight.between("*", "-(2)"), "");
+        assert_eq!(tight.between("-", "(2)"), "");
+        assert_eq!(tight.between("===", "-(2)"), "");
+        // An empty side has no last/first character to fuse with.
+        assert_eq!(tight.between("", "-"), "");
+        assert_eq!(tight.between("-", ""), "");
+    }
+
+    /// Padded output already separates every junction, so the rule costs it
+    /// nothing and must not double a space.
+    #[test]
+    fn padded_printing_is_unchanged_by_the_fusing_rule() {
+        let padded = Formatter::from_options(true, true);
+        assert_eq!(padded.between("-", "-(2)"), " ");
+        assert_eq!(padded.between("7", "-"), " ");
+        assert_eq!(padded.between("", ""), " ");
+    }
 
     /// A string literal's value is built from the NORMALIZED source text
     /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line
