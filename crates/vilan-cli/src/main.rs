@@ -20,7 +20,7 @@ use vilan_core::async_infer;
 use vilan_core::call_graph::CallGraph;
 use vilan_core::context;
 use vilan_core::manifest::Package;
-use vilan_core::transformer::transform;
+use vilan_core::transformer::{EmittedChunk, transform};
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
 
 /// The vilan language toolchain.
@@ -683,6 +683,9 @@ fn hmr_round(
             false,
             matches!(platform, Platform::Browser),
             Some(&mut overlay_text),
+            // Dev builds ignore `split` (`bundle-splitting.md` §4): HMR
+            // classifies and swaps whole bundles.
+            None,
         ) {
             Ok(compiled) => compiled,
             // `compile_unit` has already reported the diagnostics to the
@@ -937,7 +940,7 @@ fn build_and_spawn_run(
                 return None;
             }
             let (javascript, assets, _sources) =
-                compile_unit(&unit, Platform::default(), false, false, None).ok()?;
+                compile_unit(&unit, Platform::default(), false, false, None, None).ok()?;
             // Assets go beside the *canonical* build output — `<entry>.css`, where
             // `build` writes them and the served program reads them — not beside the
             // /tmp watch script Node executes (which nothing serves). Each watch
@@ -1191,6 +1194,9 @@ struct Unit {
     /// The directory holding this unit's `vilan.toml` (from which its dependency
     /// workspace is resolved), or `None` for a bare file with no manifest.
     package_dir: Option<PathBuf>,
+    /// `split = true` on this leg (`bundle-splitting.md` §4): emit route chunks
+    /// beside the bundle. The manifest has already refused it off a browser leg.
+    split: bool,
     options: BuildOptions,
 }
 
@@ -1363,6 +1369,7 @@ fn resolve_project(path: Option<PathBuf>) -> Result<Project, String> {
                 pkg_root: pkg_root_of(&path),
                 entry: path,
                 package_dir: None,
+                split: false,
                 options: BuildOptions::default(),
             },
             platform: None,
@@ -1426,6 +1433,7 @@ fn unit_from_package(directory: &Path, package: &Package, options: BuildOptions)
         entry: pkg_root.join(package.entry()),
         pkg_root,
         package_dir: Some(directory.to_path_buf()),
+        split: package.splits(),
         options,
     }
 }
@@ -1456,6 +1464,7 @@ fn package_units(
                     entry: pkg_root.join(entry.path(name)),
                     pkg_root: pkg_root.clone(),
                     package_dir: Some(directory.to_path_buf()),
+                    split: entry.splits(),
                     options,
                 },
                 entry.resolved_target().unwrap_or_default(),
@@ -1608,6 +1617,14 @@ fn compile_unit(
     emit_debug: bool,
     hmr: bool,
     overlay: Option<&mut String>,
+    // The artifact stem this leg writes under, and where its route chunks land,
+    // when it declared `split = true` (`bundle-splitting.md` S2). The stem comes
+    // from the caller because it is the OUTPUT's name (`dist/<leg>.js`, or the
+    // entry file's own stem for a lone package), not the unit's. A caller that
+    // passes `None` — `check`, `run`'s temp build, every watch round — compiles
+    // the leg as one file, which is what keeps splitting a `build` artifact
+    // decision and nothing else.
+    chunks: Option<(&str, &mut Vec<EmittedChunk>)>,
 ) -> Result<(String, Vec<(String, String)>, Vec<(PathBuf, u64)>), ExitCode> {
     let workspace = match resolve_workspace(unit) {
         Ok(workspace) => workspace,
@@ -1621,6 +1638,7 @@ fn compile_unit(
     // `check` output stays byte-identical.
     let mut options = unit.options;
     options.hmr = hmr;
+    let split = chunks.filter(|_| unit.split);
     compile_to_js(
         &unit.entry,
         &unit.pkg_root,
@@ -1629,22 +1647,42 @@ fn compile_unit(
         &workspace,
         emit_debug,
         overlay,
+        split,
     )
 }
 
 /// Builds a lone package / bare file, writing `<entry>.js` (or printing to stdout).
 fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> ExitCode {
-    let (javascript, assets, _sources) = match compile_unit(unit, platform, emit_debug, false, None)
-    {
+    let mut chunks = Vec::new();
+    // A lone package writes `<entry>.js` beside its source, so the entry file's
+    // own stem is what its chunks are named after.
+    let leg = unit
+        .entry
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (javascript, assets, _sources) = match compile_unit(
+        unit,
+        platform,
+        emit_debug,
+        false,
+        None,
+        Some((leg.as_str(), &mut chunks)),
+    ) {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
     if stdout {
+        // `--stdout` is one stream, so it carries the eager bundle. A split
+        // build's chunks are files by construction; nothing can pipe them.
         print!("{javascript}");
         return ExitCode::SUCCESS;
     }
     let output_path = unit.entry.with_extension("js");
     write_assets(&output_path, &assets);
+    if let Err(code) = write_chunks(&output_path, &chunks) {
+        return code;
+    }
     match fs::write(&output_path, javascript) {
         Ok(()) => {
             println!(
@@ -1668,7 +1706,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
 
 /// Type-checks a lone package / bare file, writing no output.
 fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
-    match compile_unit(unit, platform, emit_debug, false, None) {
+    match compile_unit(unit, platform, emit_debug, false, None, None) {
         Ok(_) => {
             println!(
                 "{}: {}",
@@ -1684,7 +1722,7 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
 fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     let (javascript, assets, _sources) =
-        match compile_unit(unit, Platform::default(), false, false, None) {
+        match compile_unit(unit, Platform::default(), false, false, None, None) {
             Ok(compiled) => compiled,
             Err(code) => return code,
         };
@@ -1726,9 +1764,18 @@ fn build_workspace_artifacts(
         if platform.is_none() {
             continue;
         }
-        let (javascript, assets, _sources) = compile_unit(unit, *platform, debug, false, None)?;
+        let mut chunks = Vec::new();
+        let (javascript, assets, _sources) = compile_unit(
+            unit,
+            *platform,
+            debug,
+            false,
+            None,
+            Some((&unit.name, &mut chunks)),
+        )?;
         let output = dist.join(format!("{}.js", unit.name));
         write_assets(&output, &assets);
+        write_chunks(&output, &chunks)?;
         if let Err(error) = fs::write(&output, javascript) {
             eprintln!(
                 "{} cannot write {}: {error}",
@@ -1752,7 +1799,7 @@ fn build_workspace_artifacts(
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
     let mut ok = true;
     for (unit, platform) in members {
-        ok &= compile_unit(unit, *platform, debug, false, None).is_ok();
+        ok &= compile_unit(unit, *platform, debug, false, None, None).is_ok();
     }
     if ok {
         ExitCode::SUCCESS
@@ -2010,6 +2057,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         &workspace,
         false,
         None,
+        None,
     )
     .map_err(|_| String::new())?;
     let script = env::temp_dir().join(format!("vilan-test-{}.js", std::process::id()));
@@ -2117,6 +2165,94 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
     }
 }
 
+/// Writes a split leg's route chunks beside its bundle, plus the
+/// `<leg>.chunks.json` sidecar listing every artifact — the manifest a
+/// hand-written server iterates instead of hard-coding one route per file
+/// (`bundle-splitting.md` §3; the SSR/todo examples adopt it in S4).
+///
+/// Chunk names are `<leg>.<arm>.js`, and a leg name is a manifest-checked
+/// identifier (no `.`), so a chunk can never collide with another leg's
+/// `dist/<leg>.js` — which is why `reject_output_collisions` needs no chunk
+/// pass of its own.
+fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<(), ExitCode> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
+    for chunk in chunks {
+        let path = directory.join(&chunk.file);
+        if let Err(error) = fs::write(&path, &chunk.source) {
+            eprintln!(
+                "{} cannot write {}: {error}",
+                paint::error_prefix(),
+                path.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+        println!(
+            "{}    {} ({})",
+            paint::out(paint::Style::GREEN, "Chunk"),
+            paint::out(paint::Style::BOLD, &path.display().to_string()),
+            chunk.arm
+        );
+    }
+    let entry = output_js
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let listing = chunks
+        .iter()
+        .map(|chunk| {
+            format!(
+                "\t\t{{ \"arm\": {}, \"tag\": {}, \"file\": {} }}",
+                json_string(&chunk.arm),
+                chunk.tag,
+                json_string(&chunk.file)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let manifest = format!(
+        "{{\n\t\"entry\": {},\n\t\"chunks\": [\n{listing}\n\t]\n}}\n",
+        json_string(&entry)
+    );
+    let manifest_path = output_js.with_extension("chunks.json");
+    if let Err(error) = fs::write(&manifest_path, manifest) {
+        eprintln!(
+            "{} cannot write {}: {error}",
+            paint::error_prefix(),
+            manifest_path.display()
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    println!(
+        "{}    {}",
+        paint::out(paint::Style::GREEN, "Chunk"),
+        paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
+    );
+    Ok(())
+}
+
+/// A JSON string literal. Chunk arms and file names come from vilan identifiers
+/// and the emitter's own sanitizer, so this only has to be correct, not clever.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            character if (character as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", character as u32))
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Set once by `build --print-chunks` before any compile, read at the one
 /// place the analyzed `Program` is live (`compile_to_js`). A process-level
 /// flag rather than a parameter because `compile_unit` is shared by `run`,
@@ -2138,6 +2274,10 @@ fn compile_to_js(
     // additive pass over the SAME messages, never a redirect. Every other caller
     // passes `None` and pays nothing.
     overlay: Option<&mut String>,
+    // `Some((leg, sink))` emits route chunks for a `split = true` browser leg:
+    // the returned JavaScript is then the EAGER bundle and `sink` receives one
+    // entry per chunk file (`bundle-splitting.md` §3).
+    split: Option<(&str, &mut Vec<EmittedChunk>)>,
 ) -> Result<(String, Vec<(String, String)>, Vec<(PathBuf, u64)>), ExitCode> {
     // `read_source` drops a leading BOM so spans — and the ariadne rendering
     // below, which indexes this same text — address the source proper
@@ -2346,7 +2486,19 @@ fn compile_to_js(
                 let chunk_plan = vilan_core::chunks::plan(&program);
                 print!("{}", vilan_core::chunks::render(&chunk_plan, &filename));
             }
-            match transform(&program, options) {
+            // A `split = true` leg emits through the same walk and the same
+            // rename; `transform_split` returns the eager bundle where
+            // `transform` returns the whole one, plus the chunk files.
+            let emitted = match split {
+                Some((leg, sink)) => {
+                    vilan_core::transform_split(&program, options, leg).map(|split_program| {
+                        sink.extend(split_program.chunks);
+                        split_program.main
+                    })
+                }
+                None => transform(&program, options),
+            };
+            match emitted {
                 // The leg's source set — each path paired with the content
                 // hash it was COMPILED from — which the watch loop verifies
                 // (by re-hashing, never by mtime) to skip a leg whose sources
@@ -2814,6 +2966,7 @@ mod tests {
                 entry: PathBuf::from(format!("src/{name}.vl")),
                 pkg_root: PathBuf::from("src"),
                 package_dir: None,
+                split: false,
                 options: BuildOptions::default(),
             },
             platform,
