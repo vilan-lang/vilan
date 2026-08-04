@@ -857,6 +857,17 @@ the sweep does not cause the bug but can move which programs trip it. Filed as a
 finding, not patched: it is a codegen-renaming arc of its own, and folding it
 into an inference change would bury both.
 
+**FIXED 2026-08-04 by that arc** (B69/E36). The root cause was the one this
+section suspected — the renamer — and precisely this: the scope re-allocation
+was told about only the id-keyed names, so every name `NameGenerator::next_name`
+minted for itself was invisible to it while being drawn from the identical
+alphabet it allocates from. Readable output was safe only because its temps are
+`$`-prefixed. The release path now has the corpus-wide differential this section
+wanted (`vilan-core/tests/release_differential.rs`), which found a SECOND
+release-only defect on its first run: tight printing fused `3 - -2` into `3--(2)`
+and no release build of `unary-minus.vl` had ever parsed. The table above stands
+as the record of what v0.27.0 emitted.
+
 That is why the differential compares two DEBUG builds, one with the sweep
 forced on — and the reason is stronger than "less noise". Observational
 neutrality is a property of folding, not of the printer, but note what the
