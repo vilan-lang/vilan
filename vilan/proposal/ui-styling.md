@@ -699,7 +699,15 @@ reason these sites were left behind.
 | a whole `clamp()`/`min()` value | 3 | **`Length::css(str)`** | `.left(Length::css("clamp(120px, 30%, 185px)"))`, `.width(Length::css(hero_scale))` | identical |
 
 **60 of the 107 surviving `raw` calls**, of which 23 convert byte-identically
-and 37 computed-identically. Three sites stay `raw` by design. The remaining 44
+and 37 computed-identically. Three sites stay `raw` by design.
+
+The row this slice was chartered from speaks of "the website's 26 byte-diff
+conversions", and **that number could not be reconciled**: no list of the 26
+is recorded in the backlog, in this file, or in any commit message, so there is
+nothing to check it against. The table above is a fresh measurement of the 107
+sites that are actually in the tree, taken site by site, and supersedes the
+figure rather than reproducing it. If the 26 was a count of sites the previous
+conversion attempted and reverted, it is a subset of the 37 here. The remaining 44
 are the properties still below the line — `clip-path` (4), `text-transform`
 (4), `pointer-events` (3), `animation` (3), `align-self` (3), the mask
 family (5), and a scatter of ones and twos — plus `Color::hex` being used to
