@@ -13,12 +13,17 @@ tour docs. **Wrap-up 2026-07-16 (same day):** match-subject regions pinned
 legal (`match a? * 2 { … }` — the legs match the lifted value); a bare-`?`
 iterable (`for x in items?`) pinned as the identity error; B28 shipped the
 GENERAL condition `bool` check the §2 rejection was a patch over.
-**Recorded remainders:** the trait path (a user `Lift` container at a bare
-`?` errors cleanly toward `?.` for now); the `!`-after-split rejection could
-be RELAXED for std containers someday (the statement lowering makes an
-early-return from a guard branch sound — it is rejected uniformly in v1 so
-the rule doesn't fork by container); marks in positions the rewrite doesn't
-cover get a clean "not supported in this position" error by construction.
+**Trait path SHIPPED 2026-08-04** (closing B11's one settled remainder): a
+user `Lift` container lifts a whole expression through its own members, built
+as §4 specifies — nested `and_then` calls ending in `map`, dispatch recorded
+per SPLIT (under its binder id) since a region is a nest where a chain was
+one call, `LiftDispatch::TraitRegion` marking the path. 8 pins (7 red-first),
+corpus rows, docs. Record: `try-and-lift.md` §11.
+**Recorded remainders:** the `!`-after-split rejection could be RELAXED for
+std containers someday (the statement lowering makes an early-return from a
+guard branch sound — it is rejected uniformly in v1 so the rule doesn't fork
+by container); marks in positions the rewrite doesn't cover get a clean "not
+supported in this position" error by construction.
 
 The §0.3 deferral of `try-and-lift.md`, designed. Everything here
 layers on the shipped `?.`/`!` machinery; nothing changes for existing
@@ -162,7 +167,9 @@ No new runtime, and for std containers no closures:
 - **trait path** (user `Lift` types): nested `and_then` calls ending in
   `map`, each continuation an IR-level closure over the remaining region —
   the user-`Lift` chain lowering, nested. Left-to-right, so effects order as
-  written.
+  written. *(Shipped 2026-08-04 exactly as written; the one thing this
+  paragraph did not anticipate is that "nested" makes dispatch per-SPLIT
+  rather than per-region — `try-and-lift.md` §11.)*
 - **Analyzer shape**: the parser gains one postfix — a bare `?` (not
   followed by `.`) marks its operand `Node::Lifted`; parens containing a
   mark seal as a group. A pure Node→Node **region rewrite** runs once per
