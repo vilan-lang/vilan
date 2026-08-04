@@ -114,6 +114,35 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "chunk_preload",
+        Side::BrowserOnly,
+        "With `chunk_arm`: the S3 initial-route preload. Emitter-planted \
+         before the swap mount — never written by user code — and a server \
+         render has nothing to prefetch.",
+    ),
+    (
+        "ui",
+        "chunk_preload_arm",
+        Side::BrowserOnly,
+        "With `chunk_preload`: its per-arm half, same emitter-selected \
+         reasoning.",
+    ),
+    (
+        "ui",
+        "clear_chunk_error",
+        Side::BrowserOnly,
+        "With `chunk_load`: lowers the S3 error signal on the next \
+         navigation. The error state only exists where fetches do.",
+    ),
+    (
+        "ui",
+        "set_chunk_pending",
+        Side::BrowserOnly,
+        "With `chunk_load`: the S3 generation guard's write half for the \
+         pending signal. Same fetch-side-only reasoning.",
+    ),
+    (
+        "ui",
         "chunk_ready",
         Side::BrowserOnly,
         "With `chunk_arm`: a browser-only chunk-presence test. A server render \
