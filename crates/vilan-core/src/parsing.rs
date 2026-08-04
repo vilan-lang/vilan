@@ -2231,14 +2231,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// A closure literal: `|param, …| : return_type? body` or `|| : return_type?
-    /// body`. Parameters are `binder (: type)?` with the bare view convention.
+    /// body`. Parameters take the SAME grammar as a function's — `(mut | own |
+    /// & mut?)? binder (: type)?` — so a callback can receive a writable view
+    /// (`|&mut list| { list.push(..) }`, backlog A18). A closure literal is
+    /// parsed speculatively, and `attempt` rewinds both the position and any
+    /// rule errors, so admitting the prefixes cannot turn a non-closure into a
+    /// diagnostic: only an expression *starting* with `|` reaches here, and no
+    /// binary operator can start one.
     fn parse_closure(&mut self) -> Option<Spanned<Node<'src>>> {
         self.attempt(|parser| {
             let start = parser.position;
             let parameters = if parser.eat_op("||") {
                 Vec::new()
             } else if parser.eat_op("|") {
-                let parameters = parser.comma_list(Self::parse_closure_parameter, |parser| {
+                let parameters = parser.comma_list(Self::parse_function_parameter, |parser| {
                     parser.peek_is_op("|")
                 })?;
                 parser.expect_op("|")?;
@@ -2261,27 +2267,6 @@ impl<'a, 'src> Parser<'a, 'src> {
                 }),
                 parser.span_from(start),
             ))
-        })
-    }
-
-    /// One closure parameter: `mut? binder (: type)?`, carrying the bare
-    /// convention and the binder's span. `mut` is binder mutability, the same
-    /// as on a function parameter (proposal/mut-parameters.md).
-    fn parse_closure_parameter(&mut self) -> Option<Parameter<'src>> {
-        let mutable = self.eat(&Token::Mut);
-        let (pattern, pattern_span) = self.parse_binder()?;
-        let parameter_type = if self.eat_op(":") {
-            Some(Box::new(self.parse_type()?))
-        } else {
-            None
-        };
-        self.reject_mut_destructure(mutable, &pattern, pattern_span);
-        Some(Parameter {
-            pattern,
-            declared_type: parameter_type,
-            convention: Convention::Bare,
-            mutable,
-            span: pattern_span,
         })
     }
 
