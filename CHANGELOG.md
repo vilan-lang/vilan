@@ -6,6 +6,14 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A generic wrapper over an iterator no longer compiles to an empty function.** Writing the adapter shape — a struct holding an upstream behind a bound (`upstream: U` where `U: Iter<T>`) and pulling from it with `self.upstream.next()` — produced a program that compiled cleanly, reported nothing, and threw `TypeError` on the first element. The upstream's `next` was emitted with an **empty body**: reaching the adapter through a `for` loop, or constructing it from a trait default whose return type mentions `Self` inside a type argument (`Taken<Self, T>`), lost the binding for `U`, and the call fell back to the trait's signature-only `next` — which has no body to emit. Both paths now carry the binding, so the adapter dispatches to the concrete upstream. The compiler also refuses, loudly, to emit a body-less function as a call target at all: whatever fails to resolve, it can no longer leave as silently wrong JavaScript.
+
+**`for v in self` inside a generic drives the iterator protocol.** A `for` loop whose subject was a trait-bounded generic (`it: I` where `I: Iter<T>`), or `self` inside a trait default, skipped the protocol entirely and emitted a native `for…of` over the receiver's **field array** — so a three-element source yielded the struct's two fields, with no diagnostic. Such a loop now calls `next()` and re-dispatches to the concrete type at each instantiation, exactly as a method call on the same value does. A `for` over a generic whose bounds provide no iterator is now a compile error naming the missing bound, rather than a native loop that throws at runtime.
+
+---
+
 ## v0.24.0 — 2026-08-03
 
 **Mutate a signal's collection in place.** `signal.update(|&mut list| { list.push(item); })` hands the closure a writable view of the *stored* value, so growing a `Signal<List<T>>` no longer means the copy-transform-return dance `set_with` required (`|mut list| { list.push(x); list }` — a whole-list copy per push, written as a transformation when you meant a mutation). Subscribers are notified once, after the closure returns, whatever it did; inside a `batch` that notification defers and coalesces like any other write. It is one method for every container — `List`, `Map`, `Set`, a struct's fields, anything a closure can mutate through a view — rather than a per-collection twin. `set_with` is unchanged and remains the right form when you are computing a new value rather than editing one.
