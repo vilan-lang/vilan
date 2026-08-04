@@ -20,7 +20,8 @@ import pkg::todo::Todo;
 // The styles (proposal/ui-styling.md): typed values built inside `const`, so
 // every rule below lands in `dist/client.css` at BUILD time — app.html's old
 // handwritten <style> block is gone. Atomic classes dedup across components;
-// `raw(..)` is the escape hatch for the long tail (font-family, list-style).
+// `raw(..)` is the escape hatch for what the typed surface still lacks —
+// `list-style` here, and nothing else since the value types landed.
 
 let shell = const style()
 	.max_width(Length::rem(32))
@@ -29,7 +30,7 @@ let shell = const style()
 	.padding_y(space(8))
 	.font_size(Length::px(16))
 	.line_height(1.5)
-	.raw("font-family", "system-ui, sans-serif");
+	.font_family("system-ui, sans-serif");
 
 let row = const style().display(Display::Flex).gap(space(2));
 
@@ -41,7 +42,7 @@ let item = const style()
 	.align_items(AlignItems::Center)
 	.padding_y(space(1));
 
-let done_label = const style().opacity(0.5).raw("text-decoration", "line-through");
+let done_label = const style().opacity(0.5).text_decoration("line-through");
 
 let button = const style()
 	.padding_x(space(2))
@@ -52,7 +53,7 @@ let button = const style()
 	.cursor(Cursor::Pointer)
 	.hover(style().background(Color::gray(100)));
 
-let remove_button = const button + style().raw("margin-left", "auto");
+let remove_button = const button + style().margin_left(Length::auto());
 
 let empty_note = const style().opacity(0.6);
 
