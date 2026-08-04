@@ -394,7 +394,14 @@ changes no ownership and is policed by rule 4.
   T` passes; a body that reads its parameter twice fails **at the instantiation
   site**, not inside std. For an `own T` parameter the rule tightens to
   *exactly* once (a generic body is emitted once and so cannot run an
-  instantiation-conditional destructor; zero moves would leak).
+  instantiation-conditional destructor; zero moves would leak). The tightening
+  is not about parameters but about **destruction**: since a generic body can
+  destroy nothing, *no* `T`-typed value in it may still own at the end of its
+  scope — not a parameter, not a `let` local, and not a pattern capture that
+  took a consumed subject's payload (R6). Each is the same leak and is rejected
+  at the instantiation site. The consequence worth stating: a combinator that
+  hands a payload to a closure and then discards it — the closure only *loans*
+  it — cannot be resource-clean, whatever its receiver convention.
 - **R12: no coercion to `any`.** A resource passed where `any` is expected
   is an error (`print(db)` included): `any` is a data sink, and the
   discipline must not launder away. Debug-print the fields instead.
@@ -440,7 +447,9 @@ continue` (out of the scopes they leave), and panic unwinding, because a
 resource-owning scope lowers to a `try`/`finally` and every exit flows
 through the `finally`. Concrete `own` resource *parameters* drop at scope
 end like locals (a generic `own T` is required to move out instead, per
-R11).
+R11) — and the same split holds for pattern captures: a concrete one drops
+at its arm's end, while inside a generic body no `T`-typed capture may be
+left owning at all.
 
 - **Module-level resources never drop.** A top-level `let` resource has
   process lifetime (the serve-forever server's `Database`). It is

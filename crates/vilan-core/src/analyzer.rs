@@ -408,6 +408,19 @@ struct PlanArm {
     tail: Id,
 }
 
+/// Which value a generic body would have to destroy and cannot (R11,
+/// destruction.md §6). One rule — "a generic body cannot destroy a `T`" — read
+/// at the two places the drop planner can report it.
+enum GenericLeak {
+    /// An `own T` parameter still owned at the body's fall-through end: never
+    /// moved out, so the caller's value has no destroyer.
+    OwnParameter,
+    /// B66: any other binding the planner scheduled a scope-end teardown for —
+    /// a pattern capture that took a consumed subject's payload (B62), or a
+    /// `let` local of delta-resource type.
+    ScopeEndDrop,
+}
+
 /// A resource binding's move state on the path currently being scanned
 /// (destruction.md §4). Absence from the flow map = still owned. The span
 /// locates a representative move site — the use-after-move note points here.
@@ -7345,8 +7358,9 @@ impl<'src> Analyzer<'src> {
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
+            let body_is_move_clean = violations.is_empty();
             self.emit_r11_violations(instance.callee, instance.call_id, violations);
-            self.check_own_generic_exactly_once(&instance, &resource_bindings);
+            self.check_own_generic_exactly_once(&instance, &resource_bindings, body_is_move_clean);
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
 
             // Propagate: the callee's own calls, now under ITS resource
@@ -7376,10 +7390,24 @@ impl<'src> Analyzer<'src> {
     /// ownership walk with the delta resource set: a parameter still owned at the
     /// fall-through end was never moved out. (A move on some paths but not others
     /// is R7's conditional-move, already reported by the affine scan.)
+    ///
+    /// B66 widens this from `own` PARAMETERS to every value the body would have
+    /// to destroy: `plan_scope`'s `dropped` set — a pattern capture that took a
+    /// consumed subject's payload (B62), or a `let` local of delta-resource
+    /// type. One rule, asked everywhere it applies.
+    ///
+    /// `body_is_move_clean` gates that widening (B5 — one diagnostic per root
+    /// cause). The drop plan assumes an affine-valid body; when the move scan
+    /// already reported a violation the plan is garbage-in, and its leftover
+    /// ownership is a *consequence* of the reported failure, not a second
+    /// problem. `fun use_twice<T>(own x: T): T { let keep = x; x }` is the
+    /// case: `keep` still owns only because `x` was used twice, which is
+    /// already the error.
     fn check_own_generic_exactly_once(
         &mut self,
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
+        body_is_move_clean: bool,
     ) {
         if Some(instance.callee) == self.drop_fn_id {
             return;
@@ -7418,29 +7446,64 @@ impl<'src> Analyzer<'src> {
         );
         for parameter in &own_params {
             if owned.contains(parameter) {
-                self.emit_own_generic_leak(instance, *parameter);
+                self.emit_generic_leak(instance, *parameter, GenericLeak::OwnParameter);
             }
+        }
+        // B66: the SAME question, asked of every other value the body would have
+        // to destroy. `plan_scope`'s `dropped` is exactly the set of scope-end
+        // teardowns it planned — a pattern capture that owns a consumed
+        // subject's payload (B62), or a `let` local of delta-resource type —
+        // and a generic body can run none of them. Asking only about `own`
+        // parameters left `fun peek<T>(own o: Option<T>)` clean: the match
+        // consumes `o`, so the parameter passes, and the capture leaks.
+        //
+        if !body_is_move_clean {
+            return;
+        }
+        // Sorted by span (C1: deterministic order; `dropped` is a HashSet).
+        let mut leaked: Vec<Id> = dropped.into_iter().collect();
+        leaked.sort_by_key(|binding| {
+            let span = **self.span_map.get(binding).unwrap_or(&&EMPTY_SPAN);
+            (span.start, span.end)
+        });
+        for binding in leaked {
+            self.emit_generic_leak(instance, binding, GenericLeak::ScopeEndDrop);
         }
     }
 
     /// The R11 exactly-once diagnostic: primary at the instantiation site, note at
-    /// the offending parameter — a generic `own T` never moved out (destruction.md
-    /// §6/§11). Shares the "not move-clean when instantiated with a resource"
-    /// framing so it reads as one R11 family, with the specific steer.
-    fn emit_own_generic_leak(&mut self, instance: &R11Instance, parameter: Id) {
+    /// the offending binding — a delta-resource value the generic body would have
+    /// to destroy and cannot (destruction.md §6/§11). Shares the "not move-clean
+    /// when instantiated with a resource" framing so it reads as one R11 family,
+    /// with the specific steer. Two kinds, one rule: an `own T` parameter never
+    /// moved out, and (B66) any other value still owning at a scope's end.
+    fn emit_generic_leak(&mut self, instance: &R11Instance, binding: Id, leak: GenericLeak) {
         let name = self
             .functions
             .get(&instance.callee)
             .map(|function| function.name)
             .unwrap_or("this generic");
-        let parameter_name = self.binding_name(parameter);
+        let binding_name = self.binding_name(binding);
+        let (summary, detail) = match leak {
+            GenericLeak::OwnParameter => (
+                "an `own` parameter of resource type is never moved out".to_string(),
+                format!("in `{name}`, the `own` parameter `{binding_name}` is never moved out"),
+            ),
+            GenericLeak::ScopeEndDrop => (
+                "a resource-typed value still owns its payload where its scope ends".to_string(),
+                format!(
+                    "in `{name}`, `{binding_name}` still owns a value where its scope ends, so \
+                     that scope would have to destroy it"
+                ),
+            ),
+        };
         let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
         let call_source = self.source_of_id(instance.call_id);
-        let note_span = **self.span_map.get(&parameter).unwrap_or(&&EMPTY_SPAN);
-        let note_source = self.source_of_id(parameter);
+        let note_span = **self.span_map.get(&binding).unwrap_or(&&EMPTY_SPAN);
+        let note_source = self.source_of_id(binding);
         let note = crate::error::Note {
             span: note_span,
-            msg: format!("in `{name}`, the `own` parameter `{parameter_name}` is never moved out"),
+            msg: detail,
             source: if note_source.is_some() && note_source != call_source {
                 note_source
             } else {
@@ -7450,9 +7513,9 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             span: site,
             msg: format!(
-                "`{name}` is not move-clean when instantiated with a resource: an `own` \
-                 parameter of resource type is never moved out, and a generic body cannot destroy \
-                 a `T`; move it out on every path, or take a concrete type"
+                "`{name}` is not move-clean when instantiated with a resource: {summary}, and a \
+                 generic body cannot destroy a `T`; move it out on every path, or take a concrete \
+                 type"
             ),
             note: Some(note),
         });
