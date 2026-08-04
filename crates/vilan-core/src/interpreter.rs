@@ -68,21 +68,33 @@ pub enum FailureKind {
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
+    /// The named frames the failure unwound through, INNERMOST FIRST — the
+    /// only provenance available, since the tree being interpreted is the
+    /// transformer's `js::Node` output and carries no spans (const-eval.md
+    /// §8.2). Anonymous frames (closures) contribute nothing, so the trace is
+    /// the named call chain, not the full stack. Empty on the success path:
+    /// `call_value` appends only while returning an error.
+    pub trace: Vec<String>,
 }
 
 impl Failure {
-    fn unsupported(what: impl Into<String>) -> Self {
+    fn new(kind: FailureKind, message: impl Into<String>) -> Self {
         Self {
-            kind: FailureKind::Unsupported,
-            message: format!("{} is not available at expansion time", what.into()),
+            kind,
+            message: message.into(),
+            trace: Vec::new(),
         }
     }
 
+    fn unsupported(what: impl Into<String>) -> Self {
+        Self::new(
+            FailureKind::Unsupported,
+            format!("{} is not available at expansion time", what.into()),
+        )
+    }
+
     fn internal(message: impl Into<String>) -> Self {
-        Self {
-            kind: FailureKind::Internal,
-            message: message.into(),
-        }
+        Self::new(FailureKind::Internal, message)
     }
 }
 
@@ -170,9 +182,11 @@ pub fn eval_const<'a>(
             "the const result binding was not emitted",
         ));
     };
-    let value = value_to_const(&result).map_err(|what| Failure {
-        kind: FailureKind::Unsupported,
-        message: format!("a `const` result must be plain data; this evaluates to {what}"),
+    let value = value_to_const(&result).map_err(|what| {
+        Failure::new(
+            FailureKind::Unsupported,
+            format!("a `const` result must be plain data; this evaluates to {what}"),
+        )
     })?;
     Ok((value, interpreter.assets))
 }
@@ -279,11 +293,10 @@ pub fn run_entry<'a>(
             return Ok(text.to_string());
         }
     }
-    Err(Failure {
-        kind: FailureKind::Thrown,
-        message: "the macro did not return a `Source` (build one with `macro_std::source(..)`)"
-            .to_string(),
-    })
+    Err(Failure::new(
+        FailureKind::Thrown,
+        "the macro did not return a `Source` (build one with `macro_std::source(..)`)".to_string(),
+    ))
 }
 
 // --- Values ---
@@ -440,10 +453,10 @@ struct Interpreter {
 impl Interpreter {
     fn charge(&mut self) -> Result<(), Failure> {
         if self.fuel == 0 {
-            return Err(Failure {
-                kind: FailureKind::Fuel,
-                message: "the fuel budget was exhausted".to_string(),
-            });
+            return Err(Failure::new(
+                FailureKind::Fuel,
+                "the fuel budget was exhausted".to_string(),
+            ));
         }
         self.fuel -= 1;
         Ok(())
@@ -505,10 +518,10 @@ impl Interpreter {
             js::Node::Continue => Ok(Flow::Continue),
             js::Node::Throw(value) => {
                 let value = self.eval(value, env)?;
-                Err(Failure {
-                    kind: FailureKind::Thrown,
-                    message: self.to_js_string(&value)?,
-                })
+                Err(Failure::new(
+                    FailureKind::Thrown,
+                    self.to_js_string(&value)?,
+                ))
             }
             js::Node::If(branch) => self.exec_if(branch, env),
             // `try { <body> } finally { <finally> }` — scope-end destruction
@@ -802,10 +815,10 @@ impl Interpreter {
             )));
         };
         if self.depth_left == 0 {
-            return Err(Failure {
-                kind: FailureKind::Depth,
-                message: "the call-depth cap was exceeded".to_string(),
-            });
+            return Err(Failure::new(
+                FailureKind::Depth,
+                "the call-depth cap was exceeded".to_string(),
+            ));
         }
         self.depth_left -= 1;
         let scope = Scope::child(&closure.env);
@@ -818,7 +831,19 @@ impl Interpreter {
         }
         let result = self.exec_body(closure.body, &scope);
         self.depth_left += 1;
-        match result? {
+        // The frame trace is built on the way OUT: each named callee the error
+        // unwinds through appends itself, so the vector reads innermost first
+        // and the success path pays nothing (const-eval.md §8.2).
+        let flow = match result {
+            Ok(flow) => flow,
+            Err(mut failure) => {
+                if let Some(name) = closure.name {
+                    failure.trace.push(name.to_string());
+                }
+                return Err(failure);
+            }
+        };
+        match flow {
             Flow::Return(value) => Ok(value),
             Flow::Normal => Ok(Value::Undefined),
             Flow::Break | Flow::Continue => {
@@ -1225,10 +1250,7 @@ impl Interpreter {
             }
             "JSON.parse" => {
                 let text = expect_str(&take(0))?;
-                json_parse(&text).map_err(|message| Failure {
-                    kind: FailureKind::Thrown,
-                    message,
-                })
+                json_parse(&text).map_err(|message| Failure::new(FailureKind::Thrown, message))
             }
             "String" => Ok(Value::Str(Rc::from(self.to_js_string(&take(0))?.as_str()))),
             "Boolean" => Ok(Value::Bool(truthy(&take(0)))),
@@ -1554,10 +1576,10 @@ impl Interpreter {
             "repeat" => {
                 let count = expect_number(&argument(0))?;
                 if count < 0.0 || !count.is_finite() {
-                    return Err(Failure {
-                        kind: FailureKind::Thrown,
-                        message: "Invalid count value".to_string(),
-                    });
+                    return Err(Failure::new(
+                        FailureKind::Thrown,
+                        "Invalid count value".to_string(),
+                    ));
                 }
                 str_result(s.repeat(count as usize))
             }
@@ -1782,10 +1804,10 @@ impl Interpreter {
                             BinaryOp::Mul => a.checked_mul(*b),
                             _ => {
                                 if *b == 0 {
-                                    return Err(Failure {
-                                        kind: FailureKind::Thrown,
-                                        message: "Division by zero".to_string(),
-                                    });
+                                    return Err(Failure::new(
+                                        FailureKind::Thrown,
+                                        "Division by zero".to_string(),
+                                    ));
                                 }
                                 if matches!(op, BinaryOp::Rem) {
                                     a.checked_rem(*b)
@@ -2110,10 +2132,10 @@ fn expect_number(value: &Value) -> Result<f64, Failure> {
 /// as the emitted helpers throw it. `Thrown`, not `Internal`: an out-of-bounds
 /// subscript is the macro's own bug, like a `panic` in its body.
 fn index_out_of_bounds(length: usize, index: f64) -> Failure {
-    Failure {
-        kind: FailureKind::Thrown,
-        message: format!("index out of bounds: the length is {length} but the index is {index}"),
-    }
+    Failure::new(
+        FailureKind::Thrown,
+        format!("index out of bounds: the length is {length} but the index is {index}"),
+    )
 }
 
 fn expect_str(value: &Value) -> Result<Rc<str>, Failure> {
@@ -2356,10 +2378,10 @@ fn json_stringify(value: &Value, out: &mut String) -> Result<bool, Failure> {
             }
             Ok(true)
         }
-        Value::BigInt(_) => Err(Failure {
-            kind: FailureKind::Thrown,
-            message: "Do not know how to serialize a BigInt".to_string(),
-        }),
+        Value::BigInt(_) => Err(Failure::new(
+            FailureKind::Thrown,
+            "Do not know how to serialize a BigInt".to_string(),
+        )),
         Value::Str(s) => {
             json_escape(s, out);
             Ok(true)

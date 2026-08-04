@@ -58,10 +58,17 @@ not.
 Const evaluation is total by construction of the budget: each run is
 bounded by the interpreter's **fuel** (steps) and **depth** (nesting).
 Exhausting either, or panicking during evaluation, is a compile error
-carrying the const expression's span; a budget failure names the cap it
-hit. A runaway `const` fails the build; it cannot hang it. The budgets
-are the interpreter's own defaults — the manifest's `[macro]` section
-(§11.4) sizes macro *expansion* only, and does not size `const`.
+carrying the const expression's span; a budget failure says so, rather
+than reading as a program error. A runaway `const` fails the build; it
+cannot hang it. The budgets are the interpreter's own defaults — the
+manifest's `[macro]` section (§11.4) sizes macro *expansion* only, and
+does not size `const`.
+
+The primary span is the `const` expression itself, always: the tree the
+interpreter evaluates is compiled output and carries no source
+positions, so there is no inner expression to anchor to. The diagnostic
+instead names the **function** the failure occurred in and notes that
+function's declaration, with the call chain that reached it.
 
 ## 9.4 Results
 

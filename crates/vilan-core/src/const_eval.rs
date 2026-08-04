@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget, Node};
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::id::Id;
-use crate::interpreter::{self, ConstValue, Limits};
+use crate::interpreter::{self, ConstValue, FailureKind, Limits};
 use crate::options::BuildOptions;
 use crate::span::Span;
 use crate::transformer;
@@ -99,6 +99,25 @@ fn media_min_width(line: &str) -> Option<f64> {
         "px" => Some(number),
         "em" | "rem" => Some(number * 16.0),
         _ => None,
+    }
+}
+
+/// The frame trace, outermost of the shown frames first. A depth failure
+/// unwinds hundreds of identical frames, so only the innermost few are shown;
+/// `…` marks the ones dropped.
+fn render_call_chain(trace: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let chain = trace
+        .iter()
+        .take(SHOWN)
+        .rev()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" → ");
+    if trace.len() > SHOWN {
+        format!("… → {chain}")
+    } else {
+        chain
     }
 }
 
@@ -238,14 +257,8 @@ impl<'p, 'src> State<'p, 'src> {
                     true
                 }
                 Err(failure) => {
-                    self.errors.push((
-                        Error {
-                            note: None,
-                            span: self.span_of(expr_id),
-                            msg: format!("const evaluation failed: {}", failure.message),
-                        },
-                        self.source_of(expr_id),
-                    ));
+                    let error = self.failure_error(expr_id, failure);
+                    self.errors.push((error, self.source_of(expr_id)));
                     false
                 }
             };
@@ -456,6 +469,84 @@ impl<'p, 'src> State<'p, 'src> {
             .get(&callee)
             .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
             .unwrap_or_else(|| "this closure (it reaches `asset::emit`)".to_string())
+    }
+
+    /// An interpreter failure as a diagnostic. The primary span stays the
+    /// `const` expression — the interpreted tree carries no positions, so
+    /// there is no inner span to move to (const-eval.md §8.2) — but the frame
+    /// trace names the function the failure happened in, and a secondary note
+    /// anchors at that function's declaration so the editor can reach it.
+    /// A std frame is legal in a note and would not be legal as the primary
+    /// span (diagnostics-standard A2, C3).
+    fn failure_error(&self, expr_id: Id, failure: interpreter::Failure) -> Error {
+        // The kind stops at the const boundary: a budget miss is not a program
+        // error, and §4 promised it says so.
+        let headline = match failure.kind {
+            FailureKind::Fuel | FailureKind::Depth => {
+                "const evaluation did not finish within the compile-time budget"
+            }
+            _ => "const evaluation failed",
+        };
+        let innermost = failure
+            .trace
+            .first()
+            .filter(|name| self.functions_named(name) > 0);
+        let (subject, note) = match innermost {
+            None => (String::new(), None),
+            Some(name) => {
+                let subject = format!(" in `{name}`");
+                let note = self.unique_function_named(name).map(|function_id| {
+                    let source = self.source_of(function_id);
+                    Note {
+                        // The name, not the whole declaration (A1) — and the
+                        // file only when it differs from the primary span's.
+                        span: self.program.functions[&function_id].name_span,
+                        msg: if failure.trace.len() > 1 {
+                            format!(
+                                "the compile-time call chain: {}",
+                                render_call_chain(&failure.trace)
+                            )
+                        } else {
+                            format!("`{name}` is declared here")
+                        },
+                        source: (source != self.source_of(expr_id)).then_some(source),
+                    }
+                });
+                (subject, note)
+            }
+        };
+        Error {
+            note,
+            span: self.span_of(expr_id),
+            msg: format!("{headline}{subject}: {}", failure.message),
+        }
+    }
+
+    /// How many declared functions carry a name — the guard against printing a
+    /// synthetic or monomorphized frame name at the user (B1).
+    fn functions_named(&self, name: &str) -> usize {
+        self.program
+            .functions
+            .values()
+            .filter(|function| function.name == name)
+            .count()
+    }
+
+    /// The one function with this name, or `None` when the name is ambiguous —
+    /// a note pointing at an arbitrary one of several would not be
+    /// deterministic (C1).
+    fn unique_function_named(&self, name: &str) -> Option<Id> {
+        let mut found = None;
+        for (id, function) in &self.program.functions {
+            if function.name != name {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*id);
+        }
+        found
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic

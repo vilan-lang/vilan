@@ -468,6 +468,22 @@ The `const` expression produced something that can't be baked into the
 output (a closure, a host object). Fold values, not behavior.
 → [Macros & const](../tour/macros-and-const.md)
 
+**"const evaluation failed in `f`: …"**
+The computation ran and something inside it went wrong — a panic, a
+subscript past the end. The squiggle is on the `const` expression,
+because that is the expression the compiler is refusing to fold; the
+message names the function it failed *in*, and the note points at that
+function's declaration with the call chain that reached it. (The
+compiler cannot point inside the callee: the tree it evaluates is the
+compiled output, which carries no source positions.)
+
+**"const evaluation did not finish within the compile-time budget in
+`f`: …"**
+The same thing, but the computation never finished rather than failing:
+it exhausted the interpreter's step budget (an unbounded `for`) or its
+call-depth cap (unbounded recursion). The build fails rather than
+hangs. Fix the termination condition, or move the work to runtime.
+
 ## Syntax
 
 **A struct literal in a condition parses as the block**
