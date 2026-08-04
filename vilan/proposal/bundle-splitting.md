@@ -300,5 +300,14 @@ against prose.
   bundle and leaves the previous build's chunk files beside it. They are
   inert (a whole bundle names no chunk), but they are strays.
 
+One find worth carrying past this arc: **a surface added to the browser
+`std::ui` must be added to the process twin too.** `std::router::pending`
+re-exports `ui::chunk_pending`, and `std::router` is analyzed in process
+builds as well (the SSR shadow, and the layer-requirement machinery), so
+the browser-only version left `std::router` uncompilable there. The
+existing layer-requirement and SSR-import pins caught it — but nothing
+structurally holds the two `ui` layers' surfaces against each other, which
+is a standing gap this arc noticed rather than closed.
+
 S4 (the consumer sweep) is untouched: `chunks.json` is emitted and
 documented, and no example serves it yet.
