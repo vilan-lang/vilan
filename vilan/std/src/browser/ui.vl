@@ -440,6 +440,77 @@ impl View {
 		});
 		self
 	}
+
+	/// `swap`, with the route's own code fetched before the view advances
+	/// (proposal/bundle-splitting.md §2). A split build's emitter retargets a
+	/// splittable route match's `swap` to this; nothing else selects it.
+	///
+	/// `render` is `sync` and cannot await, so the wait happens UPSTREAM of the
+	/// swap: this holds a gated signal the underlying `swap` watches, and
+	/// advances it only once the arm's chunk has landed. While a chunk is in
+	/// flight the previous view simply stays — the signal has not moved — and
+	/// `chunk_pending()` reads true. The first arm is the same story with an
+	/// empty previous view: the swap is not wired until its chunk arrives.
+	///
+	/// In a build with no chunk map — every single-file build, which is every
+	/// build that did not ask to split — `chunk_ready` is true for every arm
+	/// and this is `swap`, one derived signal deeper.
+	fun swap_split<T: PartialEq>(
+		self,
+		source: Signal<T>,
+		render: (sync |T| View) context owner_scope,
+	): View {
+		let gated: Signal<T> = Signal::new(source.get());
+		let wired: Shared<bool> = Shared::new(false);
+		let advance = |value: T| {
+			gated.set(value);
+			if !wired.read() {
+				wired.write() = true;
+				let _mounted = self.swap(gated, render);
+			}
+		};
+		source.effect(|value: T| {
+			let arm = chunk_arm(value);
+			if chunk_ready(arm) {
+				advance(value);
+			} else {
+				chunk_pending_signal.set(true);
+				// The continuation lands outside every turn, so it opens its
+				// own — the navigation's DOM work settles as one wave, exactly
+				// as an event handler's would.
+				chunk_load(arm, || turn(FlushPolicy::AtSuspension, || {
+					chunk_pending_signal.set(false);
+					advance(value);
+				}));
+			}
+		});
+		self
+	}
+}
+
+/// True while a route chunk is in flight (proposal/bundle-splitting.md §2) —
+/// the one hook a loading indicator needs. Re-exported as
+/// `std::router::pending`, which is where an app reads it.
+let chunk_pending_signal: Signal<bool> = Signal::new(false);
+
+/// The route arm a value selects. See `swap_split`.
+[extern("__chunk_arm")]
+external fun chunk_arm<T>(value: T): i32;
+
+/// Whether `arm`'s code is already present — true for every arm of a build
+/// that emitted no chunk map.
+[extern("__chunk_ready")]
+external fun chunk_ready(arm: i32): bool;
+
+/// Fetches `arm`'s chunk and then calls `then`. A failed fetch reports to the
+/// console and never calls back, so the navigation does not happen and the
+/// previous view stays.
+[extern("__chunk_load")]
+external fun chunk_load(arm: i32, then: || void): void;
+
+/// True while a route chunk is being fetched.
+fun chunk_pending(): Signal<bool> {
+	chunk_pending_signal
 }
 
 /// Something that can fill a child position (proposal/element-syntax.md §5) —

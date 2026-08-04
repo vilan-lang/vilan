@@ -355,7 +355,7 @@ pub fn infer(program: &mut Program) {
     // with no user `main` (a library, a fragment) every binding is checked,
     // since each runs in some dependent program.
     let running_bindings = crate::platform_color::entry_function(program)
-        .map(|entry| crate::platform_color::reachable_bindings(program, &graph, entry));
+        .map(|entry| crate::platform_color::reachable_bindings(program, &graph, entry, &[]));
     let initializer_adaptive = adaptive_params_of(program);
     let mut initializer_awaits: Vec<(crate::error::Error, SourceId)> = Vec::new();
     for binding in program.module_level_bindings() {

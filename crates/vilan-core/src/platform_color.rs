@@ -157,9 +157,23 @@ enum Origin {
 /// `entry`, under the SAME per-instantiation reachability the admission walk
 /// uses — emission and the async-initializer gate consume this, so
 /// emitted ⊆ admitted holds by construction even under the refinement.
-pub(crate) fn reachable_bindings(program: &Program, graph: &CallGraph, entry: Id) -> HashSet<Id> {
+///
+/// `extra_roots` covers a root the call graph cannot see: a split build's route
+/// gate is selected by the EMITTER at a recognized `swap` call, so nothing in
+/// source calls `View.swap_split` and the bindings its body reads (the pending
+/// signal) would otherwise be shaken out from under it
+/// (`bundle-splitting.md` §2).
+pub(crate) fn reachable_bindings(
+    program: &Program,
+    graph: &CallGraph,
+    entry: Id,
+    extra_roots: &[Id],
+) -> HashSet<Id> {
     let mut traversal = Traversal::new(program, graph, None);
     traversal.walk(entry, &SubstitutionContext::new(), None);
+    for root in extra_roots {
+        traversal.walk(*root, &SubstitutionContext::new(), None);
+    }
     traversal.reached_bindings
 }
 

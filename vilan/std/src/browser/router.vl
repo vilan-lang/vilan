@@ -15,7 +15,7 @@
 import pkg::dom::Event;
 import pkg::reactive::{ FlushPolicy, Signal, turn };
 import pkg::shared::Shared;
-import pkg::ui::{ View, view };
+import pkg::ui::{ View, chunk_pending, view };
 
 /// `history.pushState(state, title, path)` — state and title are unused ("").
 [extern("history.pushState")]
@@ -101,4 +101,13 @@ fun link<R: Routable>(label: str, route: R): View {
 fun plain_left_click(event: Event): bool {
 	let no_modifiers = !event.meta_key() && !event.ctrl_key() && !event.shift_key() && !event.alt_key();
 	event.button() == 0 && no_modifiers
+}
+
+/// True while a route chunk is being fetched — the loading hook of a split
+/// build (proposal/bundle-splitting.md §2). The route signal does not advance
+/// until the chunk lands, so the previous page stays on screen; bind this to
+/// show a spinner over it. Always false in a single-file build, which has no
+/// chunk to wait for.
+fun pending(): Signal<bool> {
+	chunk_pending()
 }
