@@ -82,8 +82,17 @@ fun main() {
 
 A loan changes no ownership, so `g` is still yours after each call: the
 program prints `inspecting g` twice, then `done`, then `dropped g` when
-`main` ends. Method calls (`&self`, `&mut self`) are loans too; that is how
-a resource's own methods reach it without consuming it.
+`main` ends. Method calls are loans too — a bare `self` receiver, like
+`&self` and `&mut self`, borrows — and that is how a resource's own methods
+reach it without consuming it.
+
+The exception is a method that declares **`own self`**: it takes the
+receiver by value, so the call is a *move*. `Option::unwrap(own self)` is
+the one you will meet first — `option.unwrap()` hands you the payload and
+ends `option`'s ownership, so reading `option` afterwards is a
+use-after-move error and `option` is not torn down at scope end. That
+symmetry is the whole rule: a body may only consume what it owns, so a
+function that moves its parameter out has to say `own`.
 
 ## Teardown happens on every exit
 

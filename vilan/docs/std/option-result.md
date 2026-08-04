@@ -25,12 +25,12 @@ impl Option<type T> {
 	fun is_some(self): bool
 	fun is_some_and(self, fn: |T| bool): bool
 	fun is_none(self): bool
-	fun is_none_or(self, fn: |T| bool): bool
+	fun is_none_or(own self, fn: |T| bool): bool
 
 	// extraction
-	fun unwrap(self): T                      // panics on None
+	fun unwrap(own self): T                  // panics on None
 	fun unwrap_or(self, fallback: T): T
-	fun unwrap_or_else(self, fn: || T): T
+	fun unwrap_or_else(own self, fn: || T): T
 
 	// in-place partial move — read/replace the slot through `&mut self`,
 	// always leaving a valid Option behind
@@ -38,30 +38,45 @@ impl Option<type T> {
 	fun replace(&mut self, value: T): Option<T>  // value in, old contents out
 
 	// transformation
-	fun map<U>(self, fn: |T| U): Option<U>
-	fun map_or<U>(self, fn: |T| U, fallback: U): U
-	fun map_or_else<U>(self, fn: |T| U, fallback: || U): U
-	fun map_or_default<U: Default>(self, fn: |T| U): U
+	fun map<U>(own self, fn: |T| U): Option<U>
+	fun map_or<U>(own self, fn: |T| U, fallback: U): U
+	fun map_or_else<U>(own self, fn: |T| U, fallback: || U): U
+	fun map_or_default<U: Default>(own self, fn: |T| U): U
 	fun inspect(self, fn: |T| void): Self    // peek, pass through
-	fun filter(self, predicate: |T| bool): Option<T>
+	fun filter(own self, predicate: |T| bool): Option<T>
 
 	// combination
-	fun and<U>(self, b: Option<U>): Option<U>
-	fun and_then<U>(self, fn: |T| Option<U>): Option<U>
+	fun and<U>(own self, own b: Option<U>): Option<U>
+	fun and_then<U>(own self, fn: |T| Option<U>): Option<U>
 	fun or(self, b: Option<T>): Option<T>
 	fun or_else(self, fn: || Option<T>): Option<T>
 	fun xor(self, b: Option<T>): Option<T>
-	fun zip<U>(self, peer: Option<U>): Option<(T, U)>
+	fun zip<U>(own self, own peer: Option<U>): Option<(T, U)>
 
 	// bridging
 	fun ok_or<E>(self, err: E): Result<T, E>
-	fun ok_or_else<E>(self, err: || E): Result<T, E>
+	fun ok_or_else<E>(own self, err: || E): Result<T, E>
 }
-impl Option<type T: Default> { fun unwrap_or_default(self): T }
+impl Option<type T: Default> { fun unwrap_or_default(own self): T }
 impl Option<(type T, type U)> { fun unzip(self): (Option<T>, Option<U>) }
 ```
 
 `str.parse_i32(): Option<i32>` (declared here) is the string→number path.
+
+The combinators that hand the payload onward take **`own self`**: they move
+the value out of the `Option`, so they must own it (`docs/spec/memory.md` R3).
+For plain data that is invisible — `own` copies, and `opt.unwrap()` leaves
+`opt` perfectly readable. For an `Option<SomeResource>` it is the affine rule
+biting: `opt.unwrap()` *moves* `opt`, a later use of `opt` is a
+use-after-move error, and `opt` is not torn down at scope end (the payload
+you now hold is). The pure predicates — `is_some`, `is_none` — keep a
+borrowing `self` and never consume, so they stay free on a resource.
+
+Reaching a resource payload is a `match`, not a guarded `unwrap`: `match opt
+{ Some(let value) => .., None => .. }` consumes `opt` on *every* path, which
+is what R7 requires. `if (opt.is_some()) { opt.unwrap() }` moves `opt` on one
+path only and is rejected as a conditional move (before this was checked it
+compiled and destroyed the payload twice).
 
 `take` and `replace` mutate the `Option` in place through `&mut self`: `take`
 swaps `None` in and hands the old contents back, `replace` swaps a new value in

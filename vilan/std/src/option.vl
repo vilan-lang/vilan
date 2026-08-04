@@ -60,14 +60,14 @@ impl Option<type T> {
 		self is None
 	}
 
-	fun is_none_or(self, fn: |T| bool): bool {
+	fun is_none_or(own self, fn: |T| bool): bool {
 		match self {
 			Some(let x) => fn(x),
 			_ => true,
 		}
 	}
 
-	fun unwrap(self): T {
+	fun unwrap(own self): T {
 		match self {
 			Some(let x) => x,
 			_ => panic("expected Some but got None"),
@@ -81,35 +81,35 @@ impl Option<type T> {
 		}
 	}
 
-	fun unwrap_or_else(self, fn: || T): T {
+	fun unwrap_or_else(own self, fn: || T): T {
 		match self {
 			Some(let x) => x,
 			_ => fn(),
 		}
 	}
 
-	fun map<U>(self, fn: |T| U): Option<U> {
+	fun map<U>(own self, fn: |T| U): Option<U> {
 		match self {
 			Some(let x) => Some(fn(x)),
 			None => None,
 		}
 	}
 
-	fun map_or<U>(self, fn: |T| U, fallback: U): U {
+	fun map_or<U>(own self, fn: |T| U, fallback: U): U {
 		match self {
 			Some(let x) => fn(x),
 			_ => fallback,
 		}
 	}
 
-	fun map_or_else<U>(self, fn: |T| U, fallback: || U): U {
+	fun map_or_else<U>(own self, fn: |T| U, fallback: || U): U {
 		match self {
 			Some(let x) => fn(x),
 			_ => fallback(),
 		}
 	}
 
-	fun map_or_default<U: Default>(self, fn: |T| U): U {
+	fun map_or_default<U: Default>(own self, fn: |T| U): U {
 		match self {
 			Some(let x) => fn(x),
 			_ => U::default(),
@@ -131,28 +131,28 @@ impl Option<type T> {
 		}
 	}
 
-	fun ok_or_else<E>(self, err: || E): Result<T, E> {
+	fun ok_or_else<E>(own self, err: || E): Result<T, E> {
 		match self {
 			Some(let x) => Ok(x),
 			_ => Err(err()),
 		}
 	}
 
-	fun and<U>(self, b: Option<U>): Option<U> {
+	fun and<U>(own self, own b: Option<U>): Option<U> {
 		match self {
 			Some(_) => b,
 			_ => None,
 		}
 	}
 
-	fun and_then<U>(self, fn: |T| Option<U>): Option<U> {
+	fun and_then<U>(own self, fn: |T| Option<U>): Option<U> {
 		match self {
 			Some(let x) => fn(x),
 			_ => None,
 		}
 	}
 
-	fun filter(self, predicate: |T| bool): Option<T> {
+	fun filter(own self, predicate: |T| bool): Option<T> {
 		self.and_then(|x| predicate(x).then_some(x))
 	}
 
@@ -178,7 +178,7 @@ impl Option<type T> {
 		}
 	}
 
-	fun zip<U>(self, peer: Option<U>): Option<(T, U)> {
+	fun zip<U>(own self, own peer: Option<U>): Option<(T, U)> {
 		match (self, peer) {
 			(Some(let x), Some(let y)) => Some((x, y)),
 			_ => None,
@@ -187,7 +187,7 @@ impl Option<type T> {
 }
 
 impl Option<type T: Default> {
-	fun unwrap_or_default(self): T {
+	fun unwrap_or_default(own self): T {
 		match self {
 			Some(let x) => x,
 			_ => T::default(),
@@ -205,7 +205,7 @@ impl Option<(type T, type U)> {
 }
 
 impl Option<Result<type T, type E>> {
-	fun transpose(self): Result<Option<T>, E> {
+	fun transpose(own self): Result<Option<T>, E> {
 		match self {
 			Some(Ok(let x)) => Ok(Some(x)),
 			Some(Err(let x)) => Err(x),
@@ -215,7 +215,7 @@ impl Option<Result<type T, type E>> {
 }
 
 impl Option<Option<type T>> {
-	fun flatten(self): Option<T> {
+	fun flatten(own self): Option<T> {
 		match self {
 			Some(let x) => x,
 			_ => None,
@@ -244,7 +244,7 @@ impl Option<type T: PartialEq> with PartialEq {
 // `Option`). An `impl` block does not need to share a module with the type it
 // extends.
 impl bool {
-	fun then_some<T>(self, value: T): Option<T> {
+	fun then_some<T>(self, own value: T): Option<T> {
 		if self {
 			Some(value)
 		} else {

@@ -2754,9 +2754,15 @@ fn a_generic_capture_moves_a_resource_instantiation() {
     // B53 finding 2, R11 (`docs/spec/memory.md`): a capture typed by a bare
     // generic parameter copied conservatively in EVERY monomorphization, so
     // `Option::unwrap`'s `Some(let x) => x` deep-copied a resource — two
-    // owners with divergent state, where the spec names `unwrap(self): T` as
-    // the case that must pass with no copies. This printed 7/1 (the option
-    // still holding an unmutated twin); it must be one resource, so 7/7.
+    // owners with divergent state, where the spec names `unwrap(own self): T`
+    // as the case that must pass with no copies.
+    //
+    // B60 then made the call a MOVE, so the source cannot be read afterwards
+    // to compare the two (that is this test's rejection half, below); the
+    // copy-vs-move evidence now runs through the destructor instead — a copy
+    // would destroy two values with divergent fields, and
+    // `a_moved_resource_instantiation_destroys_one_value` pins the single
+    // `drop a n=7` that proves the caller holds THE resource, not a twin.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -2769,13 +2775,9 @@ fn a_generic_capture_moves_a_resource_instantiation() {
             mut r = o.unwrap();
             r.n = 7;
             print(r.n);
-            match o {
-                Some(let inner) => print(inner.n),
-                None => print(0),
-            }
         }
         "#,
-        "7\n7\n",
+        "7\n",
     );
 }
 
@@ -2785,12 +2787,11 @@ fn a_moved_resource_instantiation_destroys_one_value() {
     // and ran `drop` on each with divergent fields (`n=7` then `n=1`); the
     // move makes one, so both runs report the same value.
     //
-    // That it drops TWICE is a separate, pre-existing hole, recorded in
-    // `proposal/capture-clones.md` §5: a `self`-by-value method call
-    // (`o.unwrap()`) does not mark `o` moved, so the option's scope-end
-    // teardown still fires. Pinning the honest output keeps the hole visible
-    // rather than papered over — when the affine checker learns the move,
-    // this expectation is the thing that changes.
+    // It used to drop TWICE (`...done\ndrop a n=7`) — B60: `unwrap` took a
+    // LOANED `self`, so the call marked no move and `o`'s scope-end teardown
+    // still fired over the payload the caller now owned. `unwrap(own self)`
+    // plus the loan-consumption rule closes it: the call is a move, so `o` is
+    // not owned at scope end and the value is destroyed exactly once.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -2814,7 +2815,7 @@ fn a_moved_resource_instantiation_destroys_one_value() {
             print("done");
         }
         "#,
-        "r.n=7\ndrop a n=7\ndone\ndrop a n=7\n",
+        "r.n=7\ndrop a n=7\ndone\n",
     );
 }
 
@@ -2825,16 +2826,29 @@ fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
     // IS a resource, and the copy made two (7/1). The analyzer records which
     // constraints can turn the capture into a resource; the transformer asks
     // what this instance bound them to.
+    //
+    // `first_of` takes `own pair` (B60: a body may only consume what it owns —
+    // it used to take the loan `pair: (Wrap<T>, i32)` and move a piece of it
+    // out, which is what let `main` read `pair.0` afterwards and see the SAME
+    // value through two owners). With the move enforced, the copy-vs-move
+    // question is answered through the destructor: one `drop n=7` is the
+    // single mutated resource; a copy would add a second at `n=1`.
     assert_compiles_and_runs(
         r#"
         import std::print;
+        import std::drop::Drop;
         resource struct Res {
             n: i32,
+        }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop n={self.n}");
+            }
         }
         struct Wrap<T> {
             value: T,
         }
-        fun first_of<T>(pair: (Wrap<T>, i32)): Wrap<T> {
+        fun first_of<T>(own pair: (Wrap<T>, i32)): Wrap<T> {
             let (a, b) = pair;
             a
         }
@@ -2843,10 +2857,9 @@ fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
             mut w = first_of(pair);
             w.value.n = 7;
             print(w.value.n);
-            print(pair.0.value.n);
         }
         "#,
-        "7\n7\n",
+        "7\ndrop n=7\n",
     );
 }
 
@@ -22818,6 +22831,272 @@ fn r3_method_loan_after_a_later_use_compiles() {
     );
 }
 
+#[test]
+fn r3_own_self_receiver_moves_the_subject() {
+    // The receiver is parameter 0, so `own self` reaches the SAME accounting an
+    // `own` argument does: the call is a move and a later use is use-after-move,
+    // with the note at the call.
+    assert_use_after_move_noting(
+        r#"
+        resource struct Db { handle: i32 }
+        impl Db {
+            fun close(own self) {}
+            fun ping(&self) {}
+        }
+        fun main() {
+            let database = Db { handle = 1 };
+            database.close();
+            database.ping();
+        }
+        "#,
+        "database",
+        1,
+    );
+}
+
+#[test]
+fn r3_bare_self_receiver_stays_a_loan() {
+    // The 973-method case: a bare `self` receiver is a LOAN (R3), not a
+    // by-value take. B60 must not widen to it — every `Database` call site in
+    // std and the corpus depends on this.
+    assert_compiles(
+        r#"
+        resource struct Db { handle: i32 }
+        impl Db { fun ping(self) {} }
+        fun sink(own d: Db) {}
+        fun main() {
+            let a = Db { handle = 1 };
+            a.ping();
+            a.ping();
+            sink(a);
+        }
+        "#,
+    );
+}
+
+// --- R3, the loan-consumption half: a body may only consume what it OWNS ------
+//
+// B60's root cause. A loan changes no ownership, so a body that moves its
+// loaned parameter out hands the caller a second owner while the caller's
+// binding stays live and still drops at scope end — one value destroyed twice.
+// `own` is the only convention a body may consume.
+
+#[test]
+fn r3_consuming_a_loaned_receiver_is_rejected() {
+    // The `Option::unwrap(self)` shape, concrete: `match self` consumes the
+    // subject (R6), but `self` is only loaned.
+    assert_fails_with(
+        r#"
+        import std::io::panic;
+        resource struct Db { handle: i32 }
+        resource enum Slot { Full(Db), Empty }
+        impl Slot {
+            fun into_inner(self): Db {
+                match self {
+                    Slot::Full(let inner) => inner,
+                    _ => panic("empty"),
+                }
+            }
+        }
+        fun sink(own d: Db) {}
+        fun main() {
+            let slot = Slot::Full(Db { handle = 1 });
+            sink(slot.into_inner());
+        }
+        "#,
+        "a loan changes no ownership",
+    );
+}
+
+#[test]
+fn r3_consuming_a_loaned_parameter_is_rejected() {
+    // Not a receiver question: a bare (non-`self`) resource parameter is a loan
+    // too, so returning it moves it out of a loan.
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        fun steal(d: Db): Db { d }
+        fun sink(own d: Db) {}
+        fun main() {
+            let a = Db { handle = 1 };
+            sink(steal(a));
+        }
+        "#,
+        "a loan changes no ownership",
+    );
+}
+
+#[test]
+fn r3_consuming_a_ref_parameter_is_rejected() {
+    // The `&`/`&mut` view conventions are loans by the same rule; the fix hint
+    // names the parameter's own spelling.
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        resource struct Wrap { inner: Db }
+        impl Wrap {
+            fun leak(&self): Wrap { self }
+        }
+        fun main() {
+            let w = Wrap { inner = Db { handle = 1 } };
+            let stolen = w.leak();
+        }
+        "#,
+        "a loan changes no ownership",
+    );
+}
+
+#[test]
+fn r3_an_own_parameter_may_be_consumed() {
+    // The accept half: `own` is exactly the convention that may be moved out.
+    assert_compiles(
+        r#"
+        resource struct Db { handle: i32 }
+        fun forward(own d: Db): Db { d }
+        fun sink(own d: Db) {}
+        fun main() {
+            let a = Db { handle = 1 };
+            sink(forward(a));
+        }
+        "#,
+    );
+}
+
+// --- B60: a consuming call routes into the existing move accounting ------------
+//
+// `Option::unwrap(own self)` is the spec's R11 example. Every edge shape below
+// is decided by the rule that ALREADY governs `own` arguments — this arc adds
+// no branch/loop/field/re-init logic of its own, it only makes the call a move.
+
+#[test]
+fn b60_a_consuming_call_kills_the_source_binding() {
+    // The B60 headline: `o.is_some()` after `o.unwrap()` used to compile clean.
+    assert_use_after_move_noting(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { n: i32 }
+        fun main() {
+            let slot: Option<Res> = Some(Res { n = 1 });
+            let taken = slot.unwrap();
+            print(taken.n);
+            print(slot.is_some());
+        }
+        "#,
+        "slot",
+        1,
+    );
+}
+
+#[test]
+fn b60_a_consuming_call_in_one_branch_is_a_conditional_move() {
+    // R7's precedent, unchanged: moved on one path and not another is an error,
+    // because end-of-scope ownership must be static (no runtime drop flags).
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { n: i32 }
+        fun main() {
+            let slot: Option<Res> = Some(Res { n = 1 });
+            if (true) {
+                print(slot.unwrap().n);
+            }
+        }
+        "#,
+        "moved on one path",
+    );
+}
+
+#[test]
+fn b60_a_consuming_call_in_a_loop_is_rejected() {
+    // R8's precedent: the move would repeat on the next iteration.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { n: i32 }
+        fun main() {
+            let slot: Option<Res> = Some(Res { n = 1 });
+            mut index = 0;
+            for index < 2 {
+                print(slot.unwrap().n);
+                index = index + 1;
+            }
+        }
+        "#,
+        "declared outside this loop",
+    );
+}
+
+#[test]
+fn b60_a_consuming_call_on_a_field_is_a_partial_move() {
+    // R5's precedent: v1 has no partial moves, so `holder.slot.unwrap()` is
+    // rejected exactly like `own`-passing the field. `Option::take` is the
+    // sanctioned way out of a live aggregate.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { n: i32 }
+        struct Holder { slot: Option<Res> }
+        fun main() {
+            let holder = Holder { slot = Some(Res { n = 1 }) };
+            print(holder.slot.unwrap().n);
+        }
+        "#,
+        "no partial moves",
+    );
+}
+
+#[test]
+fn b60_reinitialization_after_a_consuming_call_compiles() {
+    // The binding-move precedent for a `mut` binding (`scan_move`'s assignment
+    // arm re-owns unconditionally): re-initializing after the move is legal,
+    // and the drop planner emits no overwrite-drop for the moved-out value —
+    // so each resource is destroyed exactly once, in reverse declaration order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+        fun main() {
+            mut slot: Option<Res> = Some(Res { tag = "first" });
+            let taken = slot.unwrap();
+            print(i"got {taken.tag}");
+            slot = Some(Res { tag = "second" });
+            print("end");
+        }
+        "#,
+        "got first\nend\ndrop first\ndrop second\n",
+    );
+}
+
+#[test]
+fn b60_a_data_option_is_unaffected_by_the_consuming_call() {
+    // Rule 1's half: `Option<i32>` is not a resource, so `own self` COPIES and
+    // the source stays readable and correct. B60 must not touch the data world.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<i32> = Some(5);
+            print(slot.unwrap());
+            print(slot.is_some());
+            print(slot.unwrap());
+        }
+        "#,
+        "5\ntrue\n5\n",
+    );
+}
+
 // --- R4: returns move out, through `if`/`match` tails; a diverging leg exempt ---
 
 #[test]
@@ -23982,10 +24261,12 @@ fn r11_same_generic_at_a_data_type_compiles() {
 #[test]
 fn r11_dirty_generic_stays_usable_at_data_even_when_used_at_a_resource() {
     // The same dirty `use_twice` is instantiated at BOTH `i32` (fine) and `Db`
-    // (rejected) — only the resource instantiation reports.
+    // (rejected) — only the resource instantiation reports. `own x`, so the
+    // rejection is the use-twice one this test is about and not B60's
+    // loan-consumption rule (a bare `x: T` may not be moved out at all).
     let source = r#"
         resource struct Db { handle: i32 }
-        fun use_twice<T>(x: T): T {
+        fun use_twice<T>(own x: T): T {
             let keep = x;
             x
         }
