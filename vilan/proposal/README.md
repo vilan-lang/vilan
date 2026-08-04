@@ -94,4 +94,5 @@ is the historical record everything shipped gets moved into.
 | `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4). |
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
 | `capture-clones.md` | shipped arc | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
+| `affine-moves.md` | shipped arc | A consuming call is a move — the B60 completion record: a body may only consume what it OWNS, and `Option`'s combinators take `own self`. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
