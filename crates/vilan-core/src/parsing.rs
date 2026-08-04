@@ -4190,6 +4190,52 @@ mod tests {
         }
     }
 
+    /// `..e` is a spread only where an ELEMENT BEGINS — a tuple construction's
+    /// entry and a call argument (variadic-generics.md §T.1). Position, not
+    /// adjacency, is the disambiguator, and the leading `..` also settles the
+    /// tuple/group fork, which is what makes the lone `(..a)` a construction.
+    #[test]
+    fn a_leading_dot_dot_marks_a_spread_element() {
+        let spread_at = |node: &Node, index: usize| match node {
+            Node::Tuple(items) => matches!(items[index].0, Node::Spread(_)),
+            other => panic!("expected a Tuple, got {other:?}"),
+        };
+        assert!(spread_at(&expr("(..a, b)").0, 0), "leading");
+        assert!(spread_at(&expr("(b, ..a)").0, 1), "trailing");
+        assert!(spread_at(&expr("(b, ..a, c)").0, 1), "interleaved");
+        let twice = expr("(..a, ..b)");
+        assert!(spread_at(&twice.0, 0) && spread_at(&twice.0, 1), "two");
+        // A lone spread is a Tuple, not the group `(e)` would have dissolved to.
+        assert!(spread_at(&expr("(..a)").0, 0), "lone");
+        match &expr("f(..a)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(arguments.0[0].0, Node::Spread(_)));
+            }
+            other => panic!("expected a Call, got {other:?}"),
+        }
+    }
+
+    /// The ruling's whole value is what it leaves ALONE. `..` after an
+    /// expression is still the member-access dots it has always been: `(1..3,
+    /// x)` parses — silently, as it did before the spread existed — into a
+    /// member chain over `1` whose first link is an error node, and reaches no
+    /// spread branch because its element does not begin with `..`. Vilan has no
+    /// range operator; if one ever lands, this is the shape it must not break.
+    #[test]
+    fn dots_after_an_expression_are_still_member_access() {
+        match &expr("(1..3, x)").0 {
+            Node::Tuple(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(
+                    !matches!(items[0].0, Node::Spread(_)),
+                    "`1..3` is not a spread — the element does not begin with `..`"
+                );
+                assert!(matches!(items[0].0, Node::MemberAccessor(_, _)));
+            }
+            other => panic!("expected a Tuple, got {other:?}"),
+        }
+    }
+
     #[test]
     fn direct_call_folds_onto_a_method_result() {
         // `self.hook.read()(a)` — the trailing `(a)` is a DirectCall on the member

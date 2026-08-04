@@ -1,0 +1,59 @@
+// B3 §T (proposal/variadic-generics.md): tuple-value spread — `(..a, b)` is the
+// CONCATENATION of its parts, and emits the flat construction the tuple form
+// already emitted (`[ ...inner, 12 ]`). The two differ only in type, which is
+// what `nested.0.1` and `flat.1` reaching the same slot shows.
+import std::io::print;
+
+fun make(): (i32, i32) {
+	(4, 5)
+}
+
+fun pack<T: (..)>(...items: T): T {
+	items
+}
+
+fun need2<T: (2..)>(...items: T): i32 {
+	1
+}
+
+// The §S.4 payoff: forwarding a pack to another SPREAD function. `inner(items)`
+// would collect to the one-element pack `((T))`; `inner(..items)` is the pack.
+fun width<U: (..)>(...xs: U): i32 {
+	1
+}
+
+fun forward<T: (..)>(...items: T): i32 {
+	width(..items)
+}
+
+fun main() {
+	let pair = (1, 2);
+	// Every position the rule admits.
+	let lead = (..pair, 3);
+	let trail = (0, ..pair);
+	let mid = (0, ..pair, 9);
+	let twice = (..pair, ..pair);
+	let lone = (..pair);
+	print(lead.2);
+	print(trail.2);
+	print(mid.3);
+	print(twice.3);
+	print(lone.1);
+	// Concatenation is ONE level: a spread operand's own nesting survives.
+	let outer = (pair, 3);
+	let kept = (..outer, 4);
+	print(kept.0.1);
+	print(kept.2);
+	// The empty tuple contributes no slots; `()` is an arity source syntax
+	// cannot write, which the spread parameter made reachable.
+	let none = pack();
+	print((..none, 7).0);
+	// An operand whose expression caches no type still splices, because the
+	// splice comes from the mark rather than a type lookup.
+	print((..make(), 6).2);
+	// At a call site: `f(..pair)` is `f((..pair))`, bound-checked on the
+	// concatenated arity.
+	print(need2(..pair));
+	print(need2(..pair, 7));
+	print(forward(1, 2, 3));
+}

@@ -24051,21 +24051,24 @@ fn an_external_fun_refuses_a_spread_parameter() {
     );
 }
 
-/// §S.4 — the OTHER direction is deferred, not quietly accepted: spreading a
-/// tuple INTO a spread parameter needs the tuple-value spread `(..a, b)`,
-/// which the variadic arc designed and never built.
+/// §S.4 — the OTHER direction, SHIPPED one slice later by the tuple-value
+/// spread (§T.6). It needed no new call-site machinery: the collection already
+/// builds an `Expr::Tuple` from the arguments, so a spread argument lands
+/// inside it and the call proceeds as `pair_up((..pair))`.
 #[test]
-fn spreading_a_tuple_at_the_call_site_is_not_a_thing_yet() {
-    assert_fails(
+fn spreading_a_tuple_at_the_call_site_forwards_the_pack() {
+    assert_compiles_and_runs(
         r#"
+        import std::print;
         fun pair_up<T: (2..)>(...items: T): i32 {
             1
         }
         fun main() {
             let pair = (1, 2);
-            pair_up(..pair);
+            print(pair_up(..pair));
         }
         "#,
+        "1\n",
     );
 }
 
@@ -24198,6 +24201,406 @@ fn a_comprehension_over_a_bare_pack_still_needs_a_mapped_source() {
         }
         "#,
         "a tuple comprehension's source must be a mapped tuple",
+    );
+}
+
+// --- Tuple-value spread (`(..a, b)`; backlog B3,
+// --- proposal/variadic-generics.md §T). ONE type rule: a tuple construction's
+// --- type is the CONCATENATION of its parts, a spread contributing its
+// --- operand's elements. Every pin below reads off that rule.
+
+/// The basic construction, in all four positions the rule admits (§T.3),
+/// read back positionally.
+#[test]
+fn a_spread_concatenates_its_operands_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (1, 2);
+            let lead = (..pair, 3);
+            let trail = (0, ..pair);
+            let mid = (0, ..pair, 9);
+            let twice = (..pair, ..pair);
+            print(lead.0);
+            print(lead.2);
+            print(trail.2);
+            print(mid.3);
+            print(twice.3);
+        }
+        "#,
+        "1\n3\n2\n9\n2\n",
+    );
+}
+
+/// §T.5 — emission reuses the tuple form's splice, so a spread produces the
+/// SAME bytes as the nested element it replaces. The two differ only in type.
+#[test]
+fn a_spread_emits_the_flat_tuple_construction() {
+    assert_emits_containing(
+        r#"
+        import std::print;
+        fun main() {
+            let inner = (10, 11);
+            let flat = (..inner, 12);
+            print(flat.0);
+        }
+        "#,
+        "[ ...inner, 12 ]",
+    );
+}
+
+/// The same bytes the NESTED element emits — the two constructions differ only
+/// in type. Pinned as a pair so a divergence shows up here rather than as a
+/// golden churn.
+#[test]
+fn a_spread_and_a_nested_element_emit_the_same_construction() {
+    let nested = r#"
+        import std::print;
+        fun main() {
+            let inner = (10, 11);
+            let nested = (inner, 12);
+            print(nested.0.0);
+        }
+        "#;
+    assert_emits_containing(nested, "[ ...inner, 12 ]");
+}
+
+/// §T.3 — a construction whose ONLY entry is a spread is a tuple, not a group:
+/// the ≥2 minimum exists only to keep `(e)` a grouping, and `..e` is not an
+/// expression outside element position. Its type is the operand's, unchanged
+/// (the concatenation of one).
+#[test]
+fn a_lone_spread_is_a_construction_not_a_group() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (1, 2);
+            let copy = (..pair);
+            print(copy.0);
+            print(copy.1);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+/// §T.3 — the EMPTY tuple concatenates like any other. `()` is an arity source
+/// syntax cannot write as a value; §S made it reachable, and spreading one
+/// contributes zero slots.
+#[test]
+fn an_empty_tuple_spreads_to_nothing() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pack<T: (..)>(...items: T): T {
+            items
+        }
+        fun main() {
+            let none = pack();
+            let one = (..none, 7);
+            print(one.0);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// §T.2 — the operand must be a tuple, and the refusal names the type.
+#[test]
+fn spreading_a_non_tuple_is_refused_naming_the_type() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let n = 5;
+            let t = (..n, 1);
+            print(t.0);
+        }
+        "#,
+        "cannot spread 'i32'",
+    );
+}
+
+/// §T.2 — concatenation is ONE level: spreading a tuple whose own elements are
+/// tuples keeps their nesting, because a spread contributes its operand's
+/// elements, not its slots. This is the "types stay distinct" invariant under
+/// flat storage — the runtime layout is identical, the type is not.
+#[test]
+fn concatenation_does_not_deep_flatten() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let inner = (1, 2);
+            let outer = (inner, 3);
+            let t = (..outer, 4);
+            print(t.0.1);
+            print(t.2);
+        }
+        "#,
+        "2\n4\n",
+    );
+}
+
+/// §T.2 — bidirectional inference survives the widening: the expected tuple is
+/// sliced by the count of SLOTS produced so far, not by the entry's index, so
+/// an annotation still reaches the entries after a spread (here typing an
+/// unannotated closure's parameter).
+#[test]
+fn an_annotation_reaches_the_entries_after_a_spread() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (1, 2);
+            let t: (i32, i32, |i32| i32) = (..pair, |n| n + 1);
+            print(t.2(9));
+        }
+        "#,
+        "10\n",
+    );
+}
+
+/// §T.2 — the concatenation is a tuple like any other, so it destructures.
+#[test]
+fn a_concatenation_destructures() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (1, 2);
+            let (a, b, c) = (..pair, 3);
+            print(a + b + c);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.5 — the splice comes from the MARK, so an operand whose expression caches
+/// no type of its own (a call, an `if`) still splices. The nested tuple form
+/// does not, and that PRE-EXISTING bug is pinned below.
+#[test]
+fn a_spread_of_a_call_result_still_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (4, 5)
+        }
+        fun main() {
+            let t = (..make(), 6);
+            print(t.0);
+            print(t.2);
+        }
+        "#,
+        "4\n6\n",
+    );
+}
+
+/// The same, through an `if` — the other expression shape the type cache
+/// misses.
+#[test]
+fn a_spread_of_a_conditional_still_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let t = (..if true { (1, 2) } else { (3, 4) }, 9);
+            print(t.2);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+/// §T.6 — `f(..pair, x)` mixes a spread with ordinary arguments at a spread
+/// call site: the collection builds one tuple out of both.
+#[test]
+fn a_spread_call_site_mixes_spreads_and_ordinary_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pack<T: (..)>(...items: T): T {
+            items
+        }
+        fun main() {
+            let pair = (1, 2);
+            let trio = pack(..pair, 7);
+            print(trio.2);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// §T.6 — the bound is checked on the CONCATENATED arity, with the shipped
+/// bound error, not a new one: nothing about bound checking changed.
+#[test]
+fn a_spread_argument_is_bound_checked_on_the_concatenation() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun need3<T: (3..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            let pair = (1, 2);
+            print(need3(..pair));
+        }
+        "#,
+        "'(i32, i32)' has 2 elements: the bound '(3..)' requires at least 3",
+    );
+}
+
+/// §T.6 — a spread argument to a function with NO spread parameter builds no
+/// tuple, so it is refused with the tuple form as the steer.
+#[test]
+fn a_spread_at_a_non_spread_call_is_refused_with_the_tuple_form() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun forward(items: (i32, i32)): i32 {
+            items.0
+        }
+        fun main() {
+            let pair = (1, 2);
+            print(forward(..pair));
+        }
+        "#,
+        "Write `f((..pair))` to pass the concatenation as a single tuple argument",
+    );
+}
+
+/// §T.6 — and at a CLOSURE call, which resolves down its own road. This is what
+/// the one post-solve sweep buys over a check at each call path: a road the
+/// collection never runs on still refuses.
+#[test]
+fn a_spread_at_a_closure_call_is_refused_too() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let f = |items: (i32, i32)| items.0;
+            let pair = (1, 2);
+            print(f(..pair));
+        }
+        "#,
+        "`..` splices a tuple's elements into a tuple construction",
+    );
+}
+
+/// §T.4 — an ABSTRACT pack may be spread ALONE: the concatenation of one is
+/// identity, so its type is `T` unchanged and no symbolic concatenation is
+/// needed. This is the §S.4 payoff — forwarding a pack to another SPREAD
+/// function, which `inner(items)` cannot do (it collects to `((T))`, §S.8).
+#[test]
+fn an_abstract_pack_may_be_spread_alone() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun inner<U: (..)>(...xs: U): i32 {
+            1
+        }
+        fun outer<T: (..)>(...items: T): i32 {
+            inner(..items)
+        }
+        fun main() {
+            print(outer(1, 2, 3));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// §T.4 — and is refused MIXED, with the reason: the body is checked once,
+/// before any call fixes the arity, so there is no element sequence to
+/// concatenate with. Not a carved exception — the lone case is well-typed
+/// because there is nothing to concatenate, and this one is not because there
+/// is.
+#[test]
+fn an_abstract_pack_may_not_be_concatenated_with_anything() {
+    assert_fails_with(
+        r#"
+        fun inner<U: (..)>(...xs: U): i32 {
+            1
+        }
+        fun outer<T: (..)>(...items: T): i32 {
+            inner(..items, 9)
+        }
+        fun main() {
+            outer(1, 2);
+        }
+        "#,
+        "is a tuple of unknown arity here, so its elements cannot be concatenated",
+    );
+}
+
+/// §T.2 — a MAPPED pack is a tuple once its source is concrete, so it is
+/// expanded before the operand is judged and spreads like any other.
+#[test]
+fn a_mapped_pack_spreads_like_any_tuple() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): i32 {
+            1
+        }
+        fun main() {
+            let a = Signal::new(1);
+            let b = Signal::new("x");
+            let both = (a, b);
+            print(gather(..both));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// §T.1 — `...` written where a VALUE spread belongs gets its own steer, not a
+/// `..` followed by a broken expression. The two markers are one dot apart and
+/// one is the sibling feature.
+#[test]
+fn three_dots_in_a_value_position_steers_to_two() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (1, 2);
+            let t = (...pair, 3);
+            print(t.0);
+        }
+        "#,
+        "`...` marks a spread PARAMETER, on a declaration; a tuple-value spread is `..`",
+    );
+}
+
+/// §T.8 — a PRE-EXISTING bug, in the TUPLE form and not the spread: a
+/// tuple-typed element whose expression caches no type of its own loses its
+/// splice, so the construction silently nests and the read past it (at the flat
+/// offset the type says) is `undefined`. Reproduces on the released v0.28.0
+/// binary; needs no `..`. Un-ignore when the type cache covers every
+/// expression. The spread form is NOT affected — `a_spread_of_a_call_result_
+/// still_splices` above is the same program with a `..`, and it passes — which
+/// is why §T.5 drives the spread's splice from the mark.
+#[test]
+#[ignore = "pre-existing: a call-valued tuple element loses its splice (§T.8)"]
+fn a_nested_tuple_element_that_is_a_call_should_still_splice() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (4, 5)
+        }
+        fun main() {
+            let n = (make(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
     );
 }
 
