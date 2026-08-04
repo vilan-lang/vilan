@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.28.0 — 2026-08-04
 
 **The phase-timing switch no longer kills warm analyses.** `VILAN_PHASE_TIMING=1` panicked on every base-cache hit (a refreshed start instant subtracted against a kept cold duration), and because the marks run inside the analysis fence, the panic surfaced as every analysis after a process's first silently producing no program. The instrument now reports honest per-phase numbers on cold and warm paths alike.
 
