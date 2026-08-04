@@ -7450,28 +7450,44 @@ fn collect_if(
 /// not used by an ancestor (no shadowing) or a same-scope sibling; disjoint
 /// scopes (passed the same inherited set) reuse freely. `release` picks the
 /// shortest obfuscated name; otherwise the binding's source name, disambiguated.
+///
+/// `holder` says which BINDING each name in `used` belongs to, for the names
+/// this pass allocated (a reserved name belongs to nobody and is absent). It is
+/// what separates a binding legitimately meeting itself from two bindings
+/// meeting — see the duplicate-emission branch below.
 fn allocate_scope(
     scope: &JsScope,
     inherited: &HashSet<String>,
+    holder: &HashMap<String, String>,
     release: bool,
     source_of: &HashMap<String, String>,
     rename: &mut HashMap<String, String>,
 ) {
     let mut used = inherited.clone();
+    let mut holder = holder.clone();
     for old in &scope.declarations {
         // One generated name is one binding, even where the emitter writes that
-        // binding out more than once: every instance of a monomorphized generic
-        // repeats its body's names, so `table` is declared inside each
-        // `Map::new` instance. The rename map is keyed by NAME, so all of a
-        // binding's emission sites must land on one answer — take the allocation
-        // already made rather than minting a second, disagreeing one.
+        // binding out more than once — every instance of a monomorphized generic
+        // repeats its body's names, and a free `fun` nested in a member body is
+        // emitted both nested AND at module level. The rename map is keyed by
+        // NAME, so all of a binding's emission sites must land on one answer:
+        // take the allocation already made rather than minting a second,
+        // disagreeing one, which would rewrite the earlier site to a name chosen
+        // against a scope it is not in.
         if let Some(allocated) = rename.get(old).cloned() {
+            // Meeting the name again is expected when the binding meets ITSELF:
+            // the nested copy of a hoisted `fun` shadows the module-level one,
+            // and the two are the same function. Two DIFFERENT bindings under
+            // one name is the collision this pass exists to prevent, and there
+            // is no name a name-keyed rename could give them both.
             debug_assert!(
-                !used.contains(&allocated),
-                "`{old}` is declared in two scopes and `{allocated}`, the name allocated at the \
-                 first, is already taken at the second — a name-keyed rename cannot serve both"
+                !used.contains(&allocated)
+                    || holder.get(&allocated).map(String::as_str) == Some(old.as_str()),
+                "`{old}` is declared in a scope where `{allocated}`, the name allocated for it \
+                 elsewhere, already belongs to a different binding"
             );
-            used.insert(allocated);
+            used.insert(allocated.clone());
+            holder.insert(allocated, old.clone());
             continue;
         }
         let new = if release {
@@ -7482,10 +7498,11 @@ fn allocate_scope(
             disambiguated(source_of.get(old).unwrap_or(old), &used)
         };
         rename.insert(old.clone(), new.clone());
-        used.insert(new);
+        used.insert(new.clone());
+        holder.insert(new, old.clone());
     }
     for child in &scope.children {
-        allocate_scope(child, &used, release, source_of, rename);
+        allocate_scope(child, &used, &holder, release, source_of, rename);
     }
 }
 
@@ -7644,7 +7661,14 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
             .cloned(),
     );
     let mut rename = HashMap::new();
-    allocate_scope(&global, &reserved, release, &source_of, &mut rename);
+    allocate_scope(
+        &global,
+        &reserved,
+        &HashMap::new(),
+        release,
+        &source_of,
+        &mut rename,
+    );
     debug_assert!(
         renameable
             .iter()
