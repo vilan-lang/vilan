@@ -395,12 +395,18 @@ impl Signal<type T> {
 
 	fun set(self, value: T) {
 		self.value.write() = value;
+		self.notify();
+	}
 
-		// Under an ambient turn, defer the notification to ITS settle — writes
-		// coalesce glitch-free, and only this extent's flush fires them. With
-		// no ambient turn, join the currently DRAINING one if a settle is in
-		// progress (a derived recomputing mid-drain — see `draining_turns`),
-		// else notify inline (eager, depth-first) — unchanged.
+	/// Publish this signal's current value to its observers — the notification
+	/// half of a write, shared by `set` and `update`.
+	///
+	/// Under an ambient turn, defer the notification to ITS settle — writes
+	/// coalesce glitch-free, and only this extent's flush fires them. With no
+	/// ambient turn, join the currently DRAINING one if a settle is in progress
+	/// (a derived recomputing mid-drain — see `draining_turns`), else notify
+	/// inline (eager, depth-first).
+	fun notify(self) {
 		match turn_scope.get_safe() {
 			Some(let turn) => enqueue(turn, self.subscribers.read()),
 			None => {
@@ -418,6 +424,24 @@ impl Signal<type T> {
 
 	fun set_with(self, transform: sync |T| T) {
 		self.set(transform(self.get()));
+	}
+
+	/// Mutate the stored value IN PLACE, then notify once (backlog A18,
+	/// `proposal/signal-update.md`). `mutate` receives a writable view of the
+	/// storage, so a collection grows without the copy-transform-return dance
+	/// `set_with` requires:
+	///
+	///     todos.update(|&mut list| { list.push(todo); });
+	///
+	/// The notification is UNCONDITIONAL — exactly like `set`, which never
+	/// compares either. A `mutate` that writes nothing still publishes; that
+	/// is cheap and predictable, and it keeps `update` and `set` one rule.
+	/// Under a `batch`/`turn` the notification defers and coalesces like any
+	/// other write. `mutate` is `sync`: the view may not be live across an
+	/// `await` (spec §6.6), so an async closure is refused rather than adapted.
+	fun update(self, mutate: sync |&mut T| void) {
+		mutate(self.value.write());
+		self.notify();
 	}
 
 	fun map<U>(self, transform: sync |T| U): Signal<U> {
