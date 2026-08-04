@@ -1599,8 +1599,13 @@ pub struct Analyzer<'src> {
     // A call to a spread-parameter function, keyed by call id, mapped to its
     // COLLECTED argument list — the fixed arguments plus one synthesized
     // `Expr::Tuple` holding the pack (variadic-generics.md §S.1). Memoized
-    // because the call-subject constraint defers and retries: a fresh pack
-    // entity per attempt would strand the earlier ones mid-inference.
+    // because the call-subject constraint defers and retries, so the pack keeps
+    // one identity across attempts instead of minting a fresh entity per pass.
+    // A HYGIENE guard, honestly: the fixpoint reads the pack only through the
+    // list it wires, so dropping the memo orphans entities rather than
+    // miscompiling (verified — the whole suite stays green without it). It
+    // stays because the LSP re-analyzes per keystroke and an unbounded entity
+    // per deferral is a real cost.
     spread_packs: HashMap<Id, Vec<Id>>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
     // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
@@ -19060,9 +19065,10 @@ impl<'src> Analyzer<'src> {
     /// path of their own. `...` is a call convention, and this is the only
     /// place that knows it.
     ///
-    /// Memoized per call id — the call-subject constraint defers and retries,
-    /// and a fresh pack entity per attempt would strand the earlier ones
-    /// half-inferred.
+    /// Memoized per call id — the call-subject constraint defers and retries
+    /// (an unannotated closure argument is the ordinary way), so the pack keeps
+    /// one identity instead of a fresh entity per pass. See the field's comment
+    /// for why that is hygiene rather than correctness.
     ///
     /// Returns `None` when the callee takes no spread parameter (the caller
     /// keeps the arguments as written), and `Err` for "fewer arguments than

@@ -498,3 +498,23 @@ The one position audited and deliberately left alone: **`Type::Closure`** — a
 spread function's value type is the tuple one (§S.8), which is what the closure
 path already produced and why the call-site collection lives on the
 declaration-resolving branch only.
+
+One mechanism is honestly labelled rather than over-claimed. The collection is
+**memoized per call**, because the constraint defers and retries (an
+unannotated closure argument is the ordinary way in), and the pack should keep
+one identity across attempts. That is **hygiene, not correctness**: dropping
+the memo was planted and the whole suite stayed green, because the fixpoint
+reaches the pack only through the argument list the call finally wires — a
+second attempt orphans the first entity rather than miscompiling. It stays
+because the language server re-analyzes per keystroke, and an unbounded entity
+per deferral is a real cost there.
+
+Two bugs the work found and fixed on the way:
+
+- **A free `fun` declared inside an `impl` method's body was refused a
+  spread**, because the in-member-body flag stayed set through a body it had
+  already finished checking. Memberhood belongs to the impl/trait *item list*,
+  not to everything lexically inside it. Pinned.
+- The parser's spread refusals needed the **inferred** convention, not just the
+  written prefix: `...items: &T` takes its `Ref` from the type. Pinned
+  separately from the prefix cases.

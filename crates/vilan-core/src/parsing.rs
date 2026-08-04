@@ -289,10 +289,11 @@ struct Parser<'a, 'src> {
     /// (see [`parse_preserving_groups`]). Read at exactly one site,
     /// [`Parser::parse_paren_atom`]; false everywhere the compiler proper parses.
     preserve_paren_groups: bool,
-    /// Inside a `trait` body or an `impl` body — so the function being parsed is
-    /// a MEMBER, reached by dispatch rather than named directly. Read at exactly
-    /// one site, [`Parser::parse_function`], to refuse a spread parameter there
-    /// (variadic-generics.md §S.7).
+    /// Inside a `trait` body or an `impl` ITEM LIST — so the function being
+    /// parsed is a MEMBER, reached by dispatch rather than named directly.
+    /// [`Parser::parse_function`] reads it to refuse a spread parameter there
+    /// (variadic-generics.md §S.7), and clears it for the body it then parses:
+    /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
 }
 

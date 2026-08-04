@@ -23906,6 +23906,48 @@ fn a_pack_forwards_to_a_tuple_parameter() {
     );
 }
 
+/// An unannotated closure argument makes the call-subject constraint DEFER and
+/// retry, so this is the collection running more than once for one call: each
+/// closure takes its type from the pack's declared slot, and the pack that
+/// finally wires is the one the arguments were typed against.
+#[test]
+fn unannotated_closures_in_a_pack_type_from_their_slots() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply_both(...items: (|i32| i32, |i32| i32)): i32 {
+            items.0(1) + items.1(2)
+        }
+        fun main() {
+            print(apply_both(|n| n + 10, |n| n * 3));
+        }
+        "#,
+        "17\n",
+    );
+}
+
+/// A spread call inside a GENERIC function: the pack is collected once per
+/// instantiation, so `T` is a different tuple in each.
+#[test]
+fn a_spread_call_inside_a_generic_collects_per_instantiation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun width<T: (..)>(...items: T): i32 {
+            1
+        }
+        fun through<A>(value: A): i32 {
+            width(value, 5)
+        }
+        fun main() {
+            print(through("s"));
+            print(through(7));
+        }
+        "#,
+        "1\n1\n",
+    );
+}
+
 /// A PRE-EXISTING limit the pack inherits, pinned here so it is on the record
 /// rather than mistaken for a spread bug: positional access on a pack that is
 /// still an abstract tuple-bounded `T` is refused, because the body
