@@ -18,7 +18,7 @@ is the historical record everything shipped gets moved into.
 
 | File | Status | Description |
 |---|---|---|
-| `affine-moves.md` | shipped arc (2026-08-04) | A body may only consume what it owns — the B60 loan-consumption rule; §6 holds the B62/B63 finds. |
+| `affine-moves.md` | shipped arc (2026-08-04) | A body may only consume what it owns — the B60 loan-consumption rule; §6 holds the B63 find, §7 closes B62 (a pattern capture that owns a resource payload is destroyed). |
 | `ambient-owner.md` | shipped arc (2026-07-07) | The ambient owner / `comp` ergonomic layer over `std::reactive`. |
 | `analysis-reuse.md` | shipped arc (std-tax arc complete 2026-08-03) | The E3 arc: per-analysis leak closure, then incremental analysis via a cached, frozen std base. |
 | `analyzer-refactor.md` | design record (partially actioned) | A punch list of analyzer structural weaknesses behind a class of generic-inference bugs; several items done, the queue-v2/interning items unscheduled. |

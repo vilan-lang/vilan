@@ -330,8 +330,14 @@ changes no ownership and is policed by rule 4.
   live aggregate is rejected; v1 has no partial moves. The sanctioned
   partial move is `Option` (below).
 - **R6: match consumes.** Matching a resource *by value* consumes the
-  subject; pattern captures move the payloads into the arm. Matching a loan
-  (`match &self.state`) inspects without consuming.
+  subject; pattern captures move the payloads into the arm, and each capture
+  **owns** what it took — it is destroyed at the end of the arm that bound
+  it, in reverse capture order, unless it is moved onward first. The same
+  holds for a `let` pattern (`let (handle, count) = pair`), whose captures
+  drop at the declaring scope's end. Matching a loan (`match &self.state`,
+  and the `x is Some(let v)` test) inspects without consuming: the subject
+  keeps ownership and destroys the payload itself, so its captures own
+  nothing.
 - **R7: no conditional moves.** A binding must be moved on every path
   through a scope or on none; moving it on one path only is an error. This
   keeps end-of-scope ownership static: there are no runtime drop flags in
@@ -401,7 +407,9 @@ resource mechanism).
 ### Drop timing and order
 
 At the owner's scope end, still-owned resource locals drop in **reverse
-declaration order**. A value's own `drop` body runs **before its fields**,
+declaration order** — a pattern capture (R6) counts as a local of the arm
+that bound it, declared before that arm's own statements and so destroyed
+after them. A value's own `drop` body runs **before its fields**,
 and the fields drop in reverse field order; an enum's payload drops with the
 value. **Every exit runs drops**: fall-through, `ret`, `jump break`, `jump
 continue` (out of the scopes they leave), and panic unwinding, because a

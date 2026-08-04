@@ -78,6 +78,13 @@ is what R7 requires. `if (opt.is_some()) { opt.unwrap() }` moves `opt` on one
 path only and is rejected as a conditional move (before this was checked it
 compiled and destroyed the payload twice).
 
+The capture *owns* the payload it took, so it is torn down at the end of its
+leg unless you move it on — into `drop`, into a return, into an `own`
+argument, into a struct field. Either way the payload is destroyed exactly
+once. A capture taken from a loan (`match &opt`, or `opt is Some(let value)`)
+consumes nothing and owns nothing: `opt` stays the owner and tears the
+payload down itself.
+
 `take` and `replace` mutate the `Option` in place through `&mut self`: `take`
 swaps `None` in and hands the old contents back, `replace` swaps a new value in
 and hands the old back. Both leave a valid `Option` behind, which is what makes

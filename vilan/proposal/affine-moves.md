@@ -1,7 +1,8 @@
 # A consuming call is a move — closing B60
 
 > **Status: SHIPPED 2026-08-04** (backlog B60, found by the B53 follow-up arc
-> and recorded in `capture-clones.md` §5). `o.unwrap()` consumed the option's
+> and recorded in `capture-clones.md` §5; §7 adds B62, the residual §6 filed).
+> `o.unwrap()` consumed the option's
 > payload but the affine checker recorded no move, so `o.is_some()` afterwards
 > compiled clean and `o`'s scope-end teardown still fired: one resource value
 > destroyed twice. This is the record — what the bug actually was, the rule
@@ -185,5 +186,150 @@ the same elision on data paths that no resource program pays for.
   Verified **pre-existing** against the v0.24.0 release, unrelated to this
   arc — the drop planner does not seed match-arm captures as owned. Found
   while checking the idiom §3 steers users toward, which makes it the more
-  urgent for being the recommended path. Not fixed here; it needs its own
-  item.
+  urgent for being the recommended path. **CLOSED 2026-08-04 (B62); §7 is
+  the record.**
+
+## 7. A pattern capture that owns a payload is destroyed — closing B62
+
+> **Status: SHIPPED 2026-08-04** (backlog B62, the §6 residual). The bug is
+> a *leak*, not a double-drop, and it sits on the path §3 steers every
+> resource user onto — which is what made it urgent rather than merely
+> filed.
+
+### 7.1 The bug, and why the subject's side was already right
+
+R6: matching by value CONSUMES the subject. The drop planner implements
+that half correctly — `plan_match` walks the subject as consuming, so
+`plan_expr`'s `Local` arm removes it from `owned` and its scope-end
+teardown never fires. What it never implemented is the other half of the
+same sentence, *"pattern captures move the payloads into the arm"*: the
+capture was bound as a JS `const` and enrolled nowhere.
+
+So the sum was **zero** drops, not two:
+
+```js
+const o = [ 0, [ "payload" ] ];
+if ($a[0] === 0) { const r = $a[1]; console.log("leg " + r[0]); }
+// nothing destroys r, and nothing destroys o either
+```
+
+`plan_expr`'s `Destructure` arm carried the same hole with a comment
+recording it (*"a captured resource that is never re-moved leaks in v1"*),
+so `let (r, n) = pair` leaked identically. Both are one root cause and are
+fixed together; a symptom-level patch to `match` alone would have left the
+twin.
+
+### 7.2 The rule: who enrolls, and who must not
+
+**A capture of a CONSUMED subject owns its payload and joins the scope's
+owned set, exactly like a `let`.** It drops at that scope's end unless
+moved onward. Nothing else is new — every downstream question is answered
+by the machinery `let` bindings already ride.
+
+**A capture of a LOANED subject enrolls nothing.** This is the half that
+had to be got exactly right, because enrolling here destroys one value
+twice:
+
+| shape | subject | capture | why |
+|---|---|---|---|
+| `match o { Some(let r) => … }` | consumed (R6) | **owns** | the subject's teardown is suppressed; the capture is the only owner |
+| `match &o { Some(let r) => … }` | loaned (R6) | loans | the subject still owns and still drops |
+| `o is Some(let r)` | loaned | loans | a *test*, not a consuming match — `is_some`'s body is exactly this, and B60 left it free on a resource |
+| `let (r, n) = pair` | consumed | **owns** | a full destructure, not R5's partial move |
+| `let (r, n) = &pair` | loaned | loans | as `match &o` |
+| any data capture | either | n/a | not in the resource set; the planner never sees it |
+
+The B53 SHARE elision is **not** a hazard here and cannot become one:
+`compute_capture_clone_sites` phase 2 filters `type_is_resource` *before*
+the share check, so a concrete resource capture is never in the shared set.
+It is never copied either (R1), so it is always a plain alias into a
+subject that the match consumed — one owner, by construction.
+
+Generic captures are out of scope for the same reason `plan_resource_drops`
+does not seed a generic `own T` parameter: `Generic(T)` is not a resource in
+the base classification, a generic body is emitted once, and R11 requires the
+value to be moved out instead. §7.5 records that R11 does not actually check
+captures yet.
+
+### 7.3 One drop per value, on every path
+
+The argument is short because every piece is an existing precedent:
+
+- **The subject cannot also drop.** Consuming it removes it from `owned`
+  before any leg is planned (`plan_expr`'s `Local` arm) — the same
+  suppression B60 relies on for `o.unwrap()`.
+- **A moved-on capture cannot also drop at the leg.** The leg's tail is
+  walked as consuming, so a returned/`own`-passed/stored capture leaves
+  `owned` and the sweep skips it. `drop(c)` is an `own` argument, so the
+  conditional-teardown idiom is untouched.
+- **A capture cannot drop on one path and not another.** R7 already
+  governed captures — `scan_move_match` seeds them into the affine flow —
+  so `if flag { sink(r) }` inside a leg is rejected, and end-of-scope
+  ownership stays static. No runtime drop flags.
+- **A rejecting guard destroys nothing.** The teardown wraps the leg BODY,
+  which a rejected guard never enters — B59's ordering decision (*a guard is
+  a decision procedure; a rejected leg must leave no trace*) read for
+  destruction, and it falls out of the emission site rather than needing a
+  rule.
+- **A leg that never runs destroys nothing**, for the same reason.
+- **R2 still fires.** Overwriting a `mut` capture that still owns drops the
+  old value at the assignment; the leg drops the new one.
+
+### 7.4 Where the code lives
+
+| piece | site |
+|---|---|
+| a scope's entry-owned captures | `analyzer.rs::plan_scope` (`captures` parameter) |
+| a leg's captures, gated on the subject | `analyzer.rs::plan_match` + `pattern_subject_is_loan` |
+| a destructure's captures | `analyzer.rs::plan_expr`'s `Destructure` arm |
+| the arm carrier | `analyzer.rs::PlanArm` (replaces the `(statements, tail)` pair) |
+| the leg's `try`/`finally` | `transformer.rs::Expr::Match`, via `capture_drop_nodes` |
+| a destructure statement's | `transformer.rs::ScopeTeardown` + `walk_scope_body` |
+
+Two emission details worth stating. A **guarded** leg's capture is still an
+accessor (`$z[1]`), because B53's `materialize_capture_clones` only
+materializes captures that *copy* and a resource never copies — so the
+teardown destroys through the accessor, which names a slot the match
+already consumed. And a leg or scope owing **nothing** splices its body in
+unchanged, which is what keeps every data pattern and every resource-free
+program byte-identical.
+
+### 7.5 Pins, compat, and what is left open
+
+Twenty-three pins in `inference.rs`, twelve of them red against the
+pre-fix tree (proven by planting `droppable_pattern_captures` back out);
+the other eleven pin what must not change and are correctly insensitive to
+that plant. `vilan/test/resource_take.vl` gains four functions pinning the
+emitted SHAPES in bytes — the leg teardown, two captures in reverse order,
+a guarded leg called both ways, and the destructure — because the fix
+otherwise left every golden in the tree byte-identical.
+
+**Compat: no existing source changes behaviour.** The whole tree contains
+exactly three resource captures — `resource_take.vl:49,55` (`Some(let c)
+=> drop(c)`), `resource_take.vl:77` (`Holder::Full(let inner) => inner`),
+and `docs/tour/resources.md:150` (`Some(let g) => drop(g)`) — and every
+one of them moves its capture onward, so none was leaking and none now
+drops twice. The `Database`/`Row` captures across std, the examples, and
+the docs bind `Row`/`str`, which are not resources. The corpus golden diff
+is purely additive.
+
+Three residuals, each a **different rule** from this one, pinned
+`#[ignore]`d and verified pre-existing:
+
+- **Consuming a loaned capture double-destroys.** `if o is Some(let r) {
+  sink(r) }` prints `sink ic / drop ic / after / drop ic`; `match &o {
+  Some(let r) => sink(r) }` does the same. This is B60's rule (a body may
+  only consume what it owns) in the *capture* position rather than the
+  parameter position — `scan_move_touch`'s `binding_is_loaned_parameter`
+  has no capture twin. It wants its own diagnostic and steer ("match by
+  value, or `take`"), which is why it is not folded in here.
+  `b62_an_is_capture_consumed_by_an_own_call_is_rejected`,
+  `b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected`.
+- **A generic body's capture leaks at a resource instantiation.**
+  `fun peek<type T>(own o: Option<T>) { match o { Some(let v) => …, None
+  => … } }` at `T := Res` prints no drop. `check_own_generic_exactly_once`
+  asks only about `own` parameters, and the match consumes `o`, so the
+  parameter passes and the capture is never asked about. The fix is to
+  treat a still-owned capture at the fall-through end the way that check
+  treats a still-owned parameter.
+  `b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation`.
