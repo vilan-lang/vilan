@@ -10,12 +10,9 @@ built), **deferred** (designed, deliberately not built, with a trigger),
 tracked as an open backlog item), **historical / superseded** (stale,
 kept for context only).
 
-**In flight 2026-08-03**: five proposals are landing concurrently this
-cycle from parallel sessions and are not yet present in this checkout —
-`std-surface.md`, `signal-update.md`, `iterator-adapters.md`,
-`bindgen.md`, `canvas.md`. Listed here as placeholders so this index
-doesn't claim completeness it doesn't have; the orchestrator finalizes
-their real status/description lines at merge.
+**In flight 2026-08-03**: `std-surface.md` (the I4 implementation arc is
+still landing; its line below is finalized when it merges). The other four
+proposals from this cycle are merged and carry real status lines below.
 
 The open-work tracker is [`backlog-2026-07-18.md`](backlog-2026-07-18.md)
 (status convention documented in its own header); [`backlog.md`](backlog.md)
@@ -94,7 +91,7 @@ is the historical record everything shipped gets moved into.
 | `web-playground.md` | shipped arc (live and complete 2026-08-02) | The compiler running in the visitor's browser (D11). |
 | `windows-support.md` | shipped arc (ratified + complete 2026-07-24) | First-class native Windows support for the toolchain. |
 | `std-surface.md` | *in flight 2026-08-03* | Std API surface audit — the missing basics (List/Map/Set/str), tracked as backlog I4. |
-| `signal-update.md` | *in flight 2026-08-03* | Mutate-in-place for `Signal<Collection>`, tracked as backlog A18. |
-| `iterator-adapters.md` | *in flight 2026-08-03* | Iterator adapter layer + pipeline ergonomics over `Iterable`, tracked as backlog I3. |
-| `bindgen.md` | *in flight 2026-08-03* | Generate `external` bindings from TypeScript `.d.ts` headers, tracked as backlog E31. |
-| `canvas.md` | *in flight 2026-08-03* | `std::browser::canvas` — a typed 2D canvas layer, tracked as backlog A17. |
+| `signal-update.md` | shipped arc | `Signal::update` — mutate in place, notify once (A18); design record + ship record, landed 2026-08-03. |
+| `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4). |
+| `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
+| `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
