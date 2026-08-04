@@ -240,100 +240,36 @@ pub fn infer(program: &mut Program) {
     // into a plain closure field (struct literal or field assignment) with a
     // non-void return — every later read-and-call would hand back a promise
     // typed `T`. Declared `async || T` fields are exempt (that is the fix).
-    let mut field_stores: Vec<(Id, usize, Id)> = Vec::new();
-    for expr in program.entity_map.values() {
-        match expr {
-            // The initializer expr carries its OWN id; the struct def resolves
-            // through `struct_initializer_to_def`.
-            Expr::StructInitializer(initializer_id, field_values) => {
-                let Some(struct_id) = program.struct_initializer_to_def.get(initializer_id) else {
-                    continue;
-                };
-                for (field_index, value_id) in field_values {
-                    field_stores.push((*struct_id, *field_index, *value_id));
-                }
-            }
-            Expr::Assignment(target_id, value_id) => {
-                if let Some(Expr::Field(_, struct_id, field_index)) =
-                    program.entity_map.get(target_id)
-                {
-                    field_stores.push((*struct_id, *field_index, *value_id));
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut field_divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    for (struct_id, field_index, value_id) in field_stores {
-        if program.async_fields.contains(&(struct_id, field_index)) {
-            continue;
-        }
-        let Some(struct_) = program.structs.get(&struct_id) else {
-            continue;
-        };
-        let Some(field) = struct_.fields.get(field_index) else {
-            continue;
-        };
-        let Some(Type::Closure(_, return_type)) =
-            program.type_id_to_type_map.get(&field.type_id).cloned()
-        else {
-            continue;
-        };
-        if matches!(
-            program.type_id_to_type_map.get(&return_type),
-            Some(Type::Void) | Some(Type::Unknown) | Some(Type::Unresolved) | None
-        ) {
-            continue;
-        }
-        if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
-            continue;
-        }
-        field_divergences.push(anchored(
+    for escape in plain_closure_field_stores(program) {
+        if !value_async_in(
             program,
-            value_id,
-            format!(
-                "field `{}` of `{}` receives an async closure, but its type awaits nothing; declare it `async || T` (or return void for spawn semantics)",
-                field.name, struct_.name
-            ),
-            None,
-        ));
-    }
-    divergences.extend(field_divergences);
-
-    // And through the RETURN channel: a function whose declared return type
-    // is a plain closure (non-void) returning an async closure. The declared
-    // `async || T` return marker is the fix.
-    for (function_id, value_id) in &program.return_sites {
-        if program.async_returning.contains(function_id) {
-            continue;
-        }
-        let Some(function) = program.functions.get(function_id) else {
-            continue;
-        };
-        let Some(declared) = function.return_type_id else {
-            continue;
-        };
-        let Some(Type::Closure(_, return_type)) =
-            program.type_id_to_type_map.get(&declared).cloned()
-        else {
-            continue;
-        };
-        if matches!(
-            program.type_id_to_type_map.get(&return_type),
-            Some(Type::Void) | Some(Type::Unknown) | Some(Type::Unresolved) | None
+            &held_values,
+            &async_set,
+            &no_flags,
+            &[],
+            escape.value_id,
         ) {
-            continue;
-        }
-        if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *value_id) {
             continue;
         }
         divergences.push(anchored(
             program,
-            *value_id,
-            format!(
-                "`{}` returns an async closure, but its declared return type awaits nothing; declare it `async || T` (or return void for spawn semantics)",
-                function.name
-            ),
+            escape.value_id,
+            field_escape_message(program, &escape),
+            None,
+        ));
+    }
+
+    // And through the RETURN channel: a function whose declared return type
+    // is a plain closure (non-void) returning an async closure. The declared
+    // `async || T` return marker is the fix.
+    for (function_id, value_id) in plain_closure_return_sites(program) {
+        if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
+            continue;
+        }
+        divergences.push(anchored(
+            program,
+            value_id,
+            return_escape_message(program, function_id),
             None,
         ));
     }
@@ -870,6 +806,13 @@ fn compute_adaptation(
     let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::new();
     let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
     let mut reported: HashSet<(Id, Id)> = HashSet::new();
+    // A.4's escape positions, collected once — the same positions the global
+    // divergence checks refuse, asked again per instance (`escape_violations_in`).
+    // Deduplicated by value expression, so one escaping store reports once
+    // however many instances reach it.
+    let field_stores = plain_closure_field_stores(program);
+    let return_sites = plain_closure_return_sites(program);
+    let mut reported_escapes: HashSet<Id> = HashSet::new();
     let keys: Vec<InstanceKey> = instance_async.keys().cloned().collect();
     for key in keys {
         let (root, ref bits) = key;
@@ -1021,6 +964,24 @@ fn compute_adaptation(
                 }
             }
         }
+        // A.4's adapted-instance escape: a value async only through THESE bits
+        // leaving the instance through a plain field or a plain declared
+        // return. A base instance carries no bits and so can escape nothing
+        // the global checks did not already see.
+        if !bits.is_empty() {
+            escape_violations_in(
+                program,
+                held_values,
+                async_set,
+                &flags,
+                bits,
+                &field_stores,
+                &return_sites,
+                origins.get(&key).copied(),
+                &mut reported_escapes,
+                &mut diagnostics,
+            );
+        }
         // Base instances only earn an entry when they carry emission data;
         // adapted instances always do (the caller emits them by key).
         if !bits.is_empty()
@@ -1105,6 +1066,135 @@ fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
 /// and is published to — the file it is about, not the entry it was reached
 /// from; and generated code re-anchors at the attribute that generated it
 /// (`Program::anchored`), which is the only location a reader can act on.
+/// One store into a closure-typed struct field: which field, and the value
+/// expression that lands in it.
+#[derive(Clone, Copy)]
+struct FieldStore {
+    struct_id: Id,
+    field_index: usize,
+    value_id: Id,
+}
+
+/// Whether a type is a closure whose return awaits something worth lying
+/// about — i.e. NOT void (A.3: void positions keep spawn semantics) and not
+/// still unresolved.
+fn plain_closure_position(program: &Program, type_id: TypeId) -> bool {
+    let Some(Type::Closure(_, return_type)) = program.type_id_to_type_map.get(&type_id) else {
+        return false;
+    };
+    !matches!(
+        program.type_id_to_type_map.get(return_type),
+        Some(Type::Void) | Some(Type::Unknown) | Some(Type::Unresolved) | None
+    )
+}
+
+/// Every store — struct literal or field assignment — whose target is a PLAIN
+/// (non-`async`) closure-typed field with a non-void return: the positions
+/// where an async value would lie about what a later call through the field
+/// hands back. Collected in one place because two checks ask the same question
+/// of the same positions: the global divergence check, and its per-instance
+/// twin (A.4's adapted-instance escape, closed 2026-08-04).
+fn plain_closure_field_stores(program: &Program) -> Vec<FieldStore> {
+    let mut stores: Vec<FieldStore> = Vec::new();
+    for expr in program.entity_map.values() {
+        match expr {
+            // The initializer expr carries its OWN id; the struct def resolves
+            // through `struct_initializer_to_def`.
+            Expr::StructInitializer(initializer_id, field_values) => {
+                let Some(struct_id) = program.struct_initializer_to_def.get(initializer_id) else {
+                    continue;
+                };
+                for (field_index, value_id) in field_values {
+                    stores.push(FieldStore {
+                        struct_id: *struct_id,
+                        field_index: *field_index,
+                        value_id: *value_id,
+                    });
+                }
+            }
+            Expr::Assignment(target_id, value_id) => {
+                if let Some(Expr::Field(_, struct_id, field_index)) =
+                    program.entity_map.get(target_id)
+                {
+                    stores.push(FieldStore {
+                        struct_id: *struct_id,
+                        field_index: *field_index,
+                        value_id: *value_id,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    stores.retain(|store| {
+        !program
+            .async_fields
+            .contains(&(store.struct_id, store.field_index))
+            && field_of(program, store)
+                .is_some_and(|field| plain_closure_position(program, field.type_id))
+    });
+    stores
+}
+
+/// The field a store targets.
+fn field_of<'program>(
+    program: &'program Program,
+    store: &FieldStore,
+) -> Option<&'program crate::analyzer::Field<'program>> {
+    program
+        .structs
+        .get(&store.struct_id)?
+        .fields
+        .get(store.field_index)
+}
+
+/// Every return site whose function declares a PLAIN (non-`async`)
+/// closure-typed return with a non-void result — the return-position twin of
+/// [`plain_closure_field_stores`].
+fn plain_closure_return_sites(program: &Program) -> Vec<(Id, Id)> {
+    program
+        .return_sites
+        .iter()
+        .copied()
+        .filter(|(function_id, _)| {
+            !program.async_returning.contains(function_id)
+                && program
+                    .functions
+                    .get(function_id)
+                    .and_then(|function| function.return_type_id)
+                    .is_some_and(|declared| plain_closure_position(program, declared))
+        })
+        .collect()
+}
+
+/// The field-escape wording, shared by the global check and its per-instance
+/// twin so both name the same fix.
+fn field_escape_message(program: &Program, store: &FieldStore) -> String {
+    let struct_name = program
+        .structs
+        .get(&store.struct_id)
+        .map(|struct_| struct_.name)
+        .unwrap_or("the struct");
+    let field_name = field_of(program, store)
+        .map(|field| field.name)
+        .unwrap_or("the field");
+    format!(
+        "field `{field_name}` of `{struct_name}` receives an async closure, but its type awaits nothing; declare it `async || T` (or return void for spawn semantics)"
+    )
+}
+
+/// The return-escape wording, likewise shared.
+fn return_escape_message(program: &Program, function_id: Id) -> String {
+    let name = program
+        .functions
+        .get(&function_id)
+        .map(|function| function.name)
+        .unwrap_or("this function");
+    format!(
+        "`{name}` returns an async closure, but its declared return type awaits nothing; declare it `async || T` (or return void for spawn semantics)"
+    )
+}
+
 fn anchored(
     program: &Program,
     id: Id,
@@ -1316,6 +1406,96 @@ fn dispatch_refusals_at(
             "an async closure cannot adapt a trait/generic-dispatched call (the concrete callee varies per instantiation); bind the callee concretely, or declare the trait parameter `async || T`".to_string(),
             None,
         ));
+    }
+}
+
+/// A.4's **adapted-instance escape**, closed 2026-08-04: a value that is async
+/// ONLY through this instance's bits, escaping into a plain closure-typed field
+/// or through a plain declared return.
+///
+/// A.4 recorded that adaptation covers the closures a body CALLS, and asserted
+/// that a body which stores or returns one instead "uses the existing rules
+/// (the field/return divergence checks catch lies)". Those checks run outside
+/// any instance context — `no_flags`, empty bits — so they only ever saw the
+/// GLOBAL async channels. A plain parameter that went async at one call site
+/// was invisible to them, and the value escaped with its asyncness stripped: a
+/// `|| i32` field holding a promise, and a later call through it typed `i32`.
+///
+/// This is the same two checks with the context they were missing, not a new
+/// check class, so it inherits their exemptions verbatim — a void position
+/// keeps spawn semantics (A.3), a declared `async || T` position is the fix.
+/// The conservative ruling stands where A.4 put it: the escape is an ERROR
+/// naming the adaptation, not a per-instance asyncness for the field or the
+/// return, which is the whole-program effect-row problem A.4 declined.
+///
+/// Scanning every store/return per instance is sound because the report is
+/// gated on "async THROUGH the bits and not without them": the bits are this
+/// callee's own parameter ids and the flags are this component's own members,
+/// so a position outside the instance cannot pass both halves. The direct case
+/// is the global check's, exactly as `sync_violations_at` leaves it.
+#[allow(clippy::too_many_arguments)]
+fn escape_violations_in(
+    program: &Program,
+    held_values: &HashMap<Id, Vec<Id>>,
+    async_set: &HashSet<Id>,
+    flags: &HashMap<Id, bool>,
+    bits: &[Id],
+    field_stores: &[FieldStore],
+    return_sites: &[(Id, Id)],
+    origin: Option<Id>,
+    reported: &mut HashSet<Id>,
+    diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
+) {
+    let empty_flags = HashMap::new();
+    let escapes_here = |value_id: Id| {
+        value_async_in(program, held_values, async_set, flags, bits, value_id)
+            && !value_async_in(program, held_values, async_set, &empty_flags, &[], value_id)
+    };
+    let mut report = |value_id: Id, message: String, note_msg: String| {
+        let primary = origin.unwrap_or(value_id);
+        let note = (primary != value_id).then(|| crate::error::Note {
+            span: span_of(program, value_id),
+            msg: note_msg,
+            source: program.note_source_of(value_id),
+        });
+        diagnostics.push(anchored(program, primary, message, note));
+    };
+    for store in field_stores {
+        if !escapes_here(store.value_id) || !reported.insert(store.value_id) {
+            continue;
+        }
+        let field_name = field_of(program, store)
+            .map(|field| field.name)
+            .unwrap_or("the field");
+        let struct_name = program
+            .structs
+            .get(&store.struct_id)
+            .map(|struct_| struct_.name)
+            .unwrap_or("the struct");
+        report(
+            store.value_id,
+            format!(
+                "this call passes an async closure that reaches `{struct_name}`'s field `{field_name}`, which awaits nothing — a later call through the field would hand back a promise; declare the field `async || T` (or return void for spawn semantics)"
+            ),
+            format!("stored into the plain field `{field_name}` here"),
+        );
+    }
+    for (function_id, value_id) in return_sites {
+        if !escapes_here(*value_id) || !reported.insert(*value_id) {
+            continue;
+        }
+        let name = program
+            .functions
+            .get(function_id)
+            .map(|function| function.name)
+            .unwrap_or("this function");
+        report(
+            *value_id,
+            format!(
+                "this call passes an async closure that reaches `{name}`'s declared return type, which awaits nothing — the caller would hold a promise typed as a plain closure; declare it `async || T` (or return void for spawn semantics)"
+            ),
+            format!("returned from `{name}` here"),
+        );
     }
 }
 

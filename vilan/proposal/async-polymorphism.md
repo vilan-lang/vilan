@@ -151,6 +151,12 @@ declared; the newly-legal programs are exactly the ones that were refused.
   an error at the return — the returned closure's asyncness *depends on* the
   parameter's, which is an effect variable connecting two positions (the
   full effect-row problem). v2 horizon at most; `compose` is rare.
+
+  > **Corrected 2026-08-04 — the parenthesis was false, and `compose`
+  > compiled.** See A.4b: the field/return divergence checks ran outside any
+  > instance context, so they never saw a plain parameter that went async at
+  > one call site. The *exclusion* stands and is now enforced; what was wrong
+  > was the claim that the existing checks already enforced it.
 - **Transitive adaptation is NOT excluded**: passing the parameter onward as
   an argument to another adaptive function is a call-position flow —
   `fun helper<T,U>(xs: List<T>, f: |T| U) { xs.map(f) }` instantiates
@@ -161,6 +167,134 @@ declared; the newly-legal programs are exactly the ones that were refused.
   (a `setTimeout` handler that awaits is a spawn, as today).
 - **Container elements**: `List<|| T>` element types accept no markers (J2
   record) and calls through elements do not adapt; unchanged, future work.
+
+### A.4b The adapted-instance escape — enforced 2026-08-04
+
+**Status: SHIPPED.** A.4's first bullet excluded *escape* from adaptation and
+justified leaving it unenforced with a parenthesis: "the field/return
+divergence checks catch lies". They did not. This is what was actually true,
+and what now is.
+
+#### The exclusion's original reason, and the ruling on it
+
+Two reasons are on the record, and they are not the same kind of claim:
+
+1. **A scope-cutting reason, about `compose`.** The returned closure's
+   asyncness *depends on* the parameter's — an effect variable connecting two
+   positions, the full effect-row problem. **This still holds.** Nothing here
+   attempts an effect row, and `compose` stays refused, which is exactly what
+   A.4 said would happen.
+2. **A factual claim, about everything else**: that a body storing or
+   returning a parameter closure "uses the existing rules", because the
+   field/return divergence checks catch it. **This was false**, and it was the
+   whole load-bearing half — it is why nothing was built.
+
+Both divergence checks call the value oracle with `no_flags` and empty bits:
+
+```rust
+if !value_async_in(program, &held_values, &async_set, &no_flags, &[], value_id) {
+    continue;
+}
+```
+
+That is deliberately *outside* any instance context, so the oracle can only
+answer from the **global** channels — a declared `async` parameter, an `async`
+field, an async closure literal, an adopted binding. A PLAIN parameter is
+async only *in an instance*, and there is no instance here. The existing
+laundering pins (`an_async_parameter_cannot_launder_into_a_plain_field` and
+its neighbours) all source their async value from a **declared** `async`
+parameter, which lands in `async_values` — a global channel. The plain
+adaptive twin had no pin and no diagnostic.
+
+#### What actually went wrong — measured, not predicted
+
+Three programs, each compiling clean before this change:
+
+| shape | before |
+|---|---|
+| `fun install(f: \|\| i32): Holder { Holder { hook = f } }`, called with an async closure, then `(holder.hook)()` | prints `Promise { <pending> }` |
+| the same via field assignment (`h.hook = f`) | prints `Promise { <pending> }` |
+| `fun pass(f: \|\| i32): \|\| i32 { f }`, then `got()` | prints `Promise { <pending> }` |
+| A.4's own `compose` example | prints `Promise { <pending> }` — **not** the error A.4 claimed |
+
+It is worse than a wrong print. The store leaves a promise in a slot typed
+`i32`, and the type is what everything downstream trusts:
+
+```
+let n = (holder.hook)();   // n: i32, actually a Promise
+print(n + 1);              // "[object Promise]1"
+```
+
+Integer addition became string concatenation, silently, from a clean compile.
+The emitted JS says it plainly: the body is `async function $e(f) { … return [
+f ]; }` — the instance IS adapted, its own `f()` is awaited — and the later
+call is bare `holder[0]()`, unawaited, because the field's type is plain.
+
+#### The fix: the same checks, given the context they were missing
+
+Not a new check class. The two divergence checks now also run **per adapted
+instance**, with that instance's bits, in the worklist's final pass beside
+`sync_violations_at` / `extern_violations_at` / `dispatch_refusals_at` — the
+established family for "async only through this instance's bits". The
+positions they refuse are collected once, by two shared helpers
+(`plain_closure_field_stores`, `plain_closure_return_sites`) that the global
+checks now use too, so the global and per-instance halves cannot drift about
+what a refusable position is.
+
+Every exemption is inherited verbatim rather than restated:
+
+- a declared `async || T` field or return is the fix, and is skipped;
+- a **void** position keeps spawn semantics (A.3) — and in the per-instance
+  path it cannot arise at all, since a void-returning parameter is not
+  adaptive and never carries a bit;
+- the **direct** case (async without the bits) belongs to the global check and
+  is skipped here, exactly as `sync_violations_at` leaves it.
+
+The diagnostic follows the family's voice: primary at the **call that made the
+parameter async** (the instance's recorded origin), with a note at the escape:
+
+> this call passes an async closure that reaches `Holder`'s field `hook`,
+> which awaits nothing — a later call through the field would hand back a
+> promise; declare the field `async || T` (or return void for spawn semantics)
+>
+> *note, at the store:* stored into the plain field `hook` here
+
+Scanning every escape position per instance is sound because the report is
+gated on "async **through** these bits and not without them": the bits are the
+callee's own parameter ids and the flags are the component's own members, so a
+position outside the instance cannot pass both halves.
+
+#### The precision residual, named
+
+This is the **conservative sound** ruling, and it is the one A.4 already
+chose: a now-async value reaching a plain field or a plain declared return is
+an **error naming the adaptation**, not a per-instance asyncness for the field
+or the return. Making the escape *work* means the value's asyncness travels
+into a struct field — i.e. monomorphizing the STRUCT (and every read of it,
+program-wide) by asyncness, which is the whole-program effect-row problem A.4
+declined and this does not attempt.
+
+So a program that would be perfectly sound under an effect row is refused
+here, and the steer is a real one: declare the field or the return
+`async || T`. That is a *precision* residual, never a soundness one — the
+refusal is conservative in the safe direction. `compose` is the named member
+of the refused set, and A.4 already ruled it rare and v2-horizon.
+
+#### Compat, and the pins
+
+**Nothing in tree relied on the escape.** `--test inference` (1509),
+`--test docs` (every fenced example), `-p vilan-cli --test corpus` (byte-identical
+goldens, none regenerated) and `--test examples` are all green. std's closure
+fields are either void (`Server.on_start`), declared `async`
+(`Server.request_handler`), or not bare closure types (`upgrade_handler:
+Option<..>`), so none is a refusable position.
+
+Eight pins, **four verified red against the pre-fix tree**: the struct-literal
+store, the field assignment, the plain declared return, and A.4's own
+`compose`. The four controls — a void field store, the `async || T` fix, the
+same function at a SYNC instance, and transitive adaptation through a
+store-free body — were green before and after, which is what says the check is
+per instance and did not widen the rule.
 
 ### A.5 Snapshot semantics for adapted receivers
 
