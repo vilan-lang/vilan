@@ -77,9 +77,18 @@ than through trait bounds.*
 A trait declares required methods (signature-only) and defaults (with
 bodies). `trait X with Y` makes `Y` a supertrait: implementing `X`
 requires `Y`. A trait's generic parameters may carry defaults
-(`trait PartialEq<B = Self>`); `Self` in a trait body denotes the
-implementing type. Traits are used as **bounds**; a trait is not a type:
-`let x: Display` is a compile error (no trait objects).
+(`trait PartialEq<B = Self>`) and **bounds** (`trait Holder<T: Bound>`);
+`Self` in a trait body denotes the implementing type. Traits are used as
+**bounds**; a trait is not a type: `let x: Display` is a compile error
+(no trait objects).
+
+A trait parameter's bound is in scope inside the trait's own default
+bodies, exactly as a function's or impl's is inside theirs (§5.6): a
+default may call the bound trait's members on a value of that parameter's
+type. Each impl supplies the parameter's argument (`impl DogBox with
+Holder<Dog>`), whose conformance is checked there, and the default
+monomorphizes per implementing type — so the call reaches that type's
+argument's implementation, never the bound trait's abstract member.
 
 Trait members resolve on a value when exactly one visible impl provides
 the name; a trait default is inherited by impls that don't override it.
@@ -98,13 +107,23 @@ For a call `f(a₁ … aₙ)` where `f` has generic parameters:
    **binds** it. Bindings are per-call.
 2. A generic mentioned only in the return type is bound by unifying the
    declared return type against the call's expected type
-   (`let c: Cell<i32> = Cell::fresh()` binds `T := i32`). Only the
-   **callee's own** binders participate; a caller-side generic
-   introduced by substitution is never re-bound against the expectation.
+   (`let c: Cell<i32> = Cell::fresh()` binds `T := i32`). Only binders
+   that are **free at this call** participate: neither a caller-side
+   generic introduced by substitution, nor a binder of a declaration
+   enclosing the call — the latter is fixed by the enclosing
+   instantiation, and callee and caller can share one outright (a trait's
+   parameter, in a call between two of its own members).
 3. After binding, every bound's satisfaction is checked; an unsatisfied
    bound is an error naming the parameter and bound.
 4. A call whose generics cannot all be grounded (no argument or
    expectation determines them) is an error at the call.
+
+Bounds cut both ways. At a call they are an **obligation** (3 above); at
+a declaration they are an **assumption**: inside the body of whatever
+declares the parameter — a function, an impl, or a trait — the bound
+trait's members are in scope on that parameter's type, and a call to one
+resolves through the bound and dispatches at monomorphization to the
+implementation the parameter is bound to there.
 
 Method calls additionally bind the receiver's impl binders from the
 receiver's type before the parameters are considered. Closure arguments

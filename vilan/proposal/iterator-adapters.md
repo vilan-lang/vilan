@@ -261,6 +261,52 @@ runs correctly. So this is a bound-propagation gap in trait default bodies,
 not a design limit — and it is the difference between "adapters on
 `Iterable` work in v1" and "blocked on associated types".
 
+> **Correction, 2026-08-04 (B58 slice).** Fixed, and **§3's unproven piece
+> is now proven**: the `Iterable<T, I: Iter<T>>` program above — the
+> constructor default (`taken`) *and* terminals written over `self.iter()`
+> — compiles and runs, with the adapter driven by a `for` loop afterwards.
+> The section's diagnosis ("a bound-propagation gap") named the right area
+> but the wrong mechanism, and the backlog entry's probe steer
+> (`satisfies_trait_bound` / `generic_bounds` registration) was wrong on
+> both counts. Neither is at fault: the bound IS registered for a trait's
+> own parameters, the analyzer always resolved the member through it, and
+> `satisfies_trait_bound`'s bound-to-bound arm always accepted it. TWO root
+> causes, in the two halves this proposal's other prerequisites already
+> taught us to check separately:
+>
+> 1. **Codegen could not GROUND the dispatch.** `emit_default_instance`
+>    (`transformer.rs`) specialized every trait default under an EMPTY
+>    substitution, so the `GenericDispatch::OnConstraint(T, ..)` the
+>    analyzer had recorded found no binding for `T` and fell through to the
+>    trait's abstract member. It now runs under the trait's own parameters
+>    bound to each impl's `with`-clause arguments, plus the impl's binders
+>    from the concrete receiver — so a trait argument in the impl's own
+>    terms (`impl Bag<type E: Bound> with Holder<E>`) grounds in two hops.
+>    This is P2's world, and P2's own repair is what surfaced it: pre-B55
+>    this emitted `function $a(self) {\n}` and threw at runtime; the
+>    never-silent guard made it a hard compile error, which is how the
+>    symptom presents on v0.25.0 for the *direct* shape (a bound member
+>    called on a `T` value, which this section never showed).
+> 2. **The quoted repro above failed in the ANALYZER, before any of that.**
+>    The return-type-only inference re-bound a call's declared return
+>    generic to the call's expected type. Its guard against re-binding
+>    CALLER generics filters by the declared type — which cannot help when
+>    callee and caller are members of the SAME trait and literally share the
+>    parameter id. Inside `Iterable<T, I: Iter<T>>`'s default,
+>    `self.iter()`'s declared return `I` *is* the enclosing `I`, so it bound
+>    to `Taken`'s `U`, lost its bound, and produced the diagnostic verbatim
+>    — the compiler reporting the *expectation* as the parameter missing the
+>    bound, which is why the message names a `U` the source never mentions.
+>    A binder owned by an enclosing declaration is now excluded: it is fixed
+>    by the enclosing instantiation, not free for a call site to infer.
+>
+> Nine pins in `inference.rs`, seven proven red first (six on cause 1, one
+> on cause 2). Unchanged and pinned as such: an unbounded trait parameter
+> still refuses member access (`cannot call method 'label' on T`), and an
+> impl overriding a bound-using default still wins. The bound-list
+> break-on-first-hit scan B57 flags is untouched — the multi-bound pin
+> (`T: A + B`, both members reached) passes on today's scan.
+
 ### P0 — `List` has no iterator
 
 Independent of the above and needed for the headline chain: a concrete
@@ -331,6 +377,14 @@ is exposed in the trait's parameter list, so the impl reads `impl List<type
 T> with Iterable<T, ListIterator<T>>`. That is the price of having no
 associated types, and it is paid once per container, by std. It is also
 **the one piece of this section that is not proven** — it needs P4.
+
+> **Correction, 2026-08-04 (B58 slice).** Now proven. With P4 fixed, an
+> `Iterable<T, I: Iter<T>>` carrying both a constructor default (`taken`)
+> and terminals over `self.iter()` compiles and runs, and the adapter it
+> returns drives a `for` loop. The unproven-feasibility caveat on S6 (§9)
+> and open question (b)'s "blocked on a bound-propagation gap whose fix is
+> unscoped" are both discharged; the *ergonomic* call in (b) — whether
+> blanket reachability gates v1 — stands on its own merits, unblocked.
 
 **Not in v1**, recorded: `flat_map`/`flatten` (nested adapter types with no
 associated-type relief), `peekable` (needs a one-slot buffer and a

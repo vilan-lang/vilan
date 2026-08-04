@@ -33080,3 +33080,300 @@ fn a_trait_default_loop_specialized_for_a_generic_adapter_counts_elements() {
         "4\n",
     );
 }
+
+// --- B58: a bound on a trait's OWN generic parameter reaches its default ---
+// --- bodies (proposal/iterator-adapters.md P4) -----------------------------
+
+/// The headline shape: `trait Holder<T: Bound>`'s default calls one of
+/// `Bound`'s members on a `T`-typed value. The analyzer always resolved the
+/// member through the bound; codegen could not GROUND it — a trait default was
+/// specialized under an EMPTY substitution, so the recorded
+/// `GenericDispatch::OnConstraint(T, ..)` found no binding for `T` and fell
+/// through to the trait's abstract member. (Pre-B55 that emitted an empty body
+/// and threw at runtime; since B55's never-silent guard it is a hard error.)
+#[test]
+fn a_trait_default_calls_a_bound_member_on_its_own_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun describe(self): str { self.item().label() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+
+        fun main() { print(DogBox {}.describe()); }
+        "#,
+        "dog\n",
+    );
+}
+
+/// The dispatch must follow the INSTANTIATING type, not merely compile: two
+/// impls of the same trait at different parameters, each producing its own
+/// implementation's output from the one shared default body.
+#[test]
+fn a_trait_default_bound_call_dispatches_per_implementing_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+        struct Cat {}
+        impl Cat with Bound { fun label(self): str { "cat" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun describe(self): str { self.item().label() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        struct CatBox {}
+        impl CatBox with Holder<Cat> { fun item(self): Cat { Cat {} } }
+
+        fun main() { print(DogBox {}.describe()); print(CatBox {}.describe()); }
+        "#,
+        "dog\ncat\n",
+    );
+}
+
+/// The guard rail, unchanged: an UNBOUNDED trait parameter still refuses
+/// member access in a default body, with the same clean diagnostic it always
+/// gave. The fix grounds a bound that was declared — it does not invent one.
+#[test]
+fn a_trait_default_cannot_call_a_member_on_an_unbounded_parameter() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+
+        trait Holder<T> {
+            fun item(self): T;
+            fun describe(self): str { self.item().label() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+
+        fun main() { print(DogBox {}.describe()); }
+        "#,
+        "cannot call method 'label' on T",
+    );
+}
+
+/// A multi-bound parameter (`T: A + B`) reaches the members of BOTH bounds
+/// from the same default body — the bound list is scanned, not just its head.
+#[test]
+fn a_trait_default_reaches_the_members_of_every_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Speaks { fun speak(self): str; }
+        trait Named { fun name(self): str; }
+
+        struct Dog {}
+        impl Dog with Speaks { fun speak(self): str { "woof" } }
+        impl Dog with Named { fun name(self): str { "rex" } }
+
+        trait Holder<T: Speaks + Named> {
+            fun item(self): T;
+            fun both(self): str { self.item().name() + " says " + self.item().speak() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+
+        fun main() { print(DogBox {}.both()); }
+        "#,
+        "rex says woof\n",
+    );
+}
+
+/// The bound call nested inside a CLOSURE in the default body — the closure is
+/// emitted within the specialized instance, so it inherits its substitution.
+/// Two instantiations, so a stale binding cannot pass this.
+#[test]
+fn a_trait_default_bound_call_inside_a_closure_dispatches_per_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+        struct Cat {}
+        impl Cat with Bound { fun label(self): str { "cat" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun shout(self): str { let render = || self.item().label(); render() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+        struct CatBox {}
+        impl CatBox with Holder<Cat> { fun item(self): Cat { Cat {} } }
+
+        fun main() { print(DogBox {}.shout()); print(CatBox {}.shout()); }
+        "#,
+        "dog\ncat\n",
+    );
+}
+
+/// An impl that OVERRIDES the bound-using default is unaffected: the override
+/// wins, including for a sibling default that calls it on `self`.
+#[test]
+fn an_impl_overriding_a_bound_using_default_still_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun describe(self): str { self.item().label() }
+            fun twice(self): str { self.describe() + self.describe() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> {
+            fun item(self): Dog { Dog {} }
+            fun describe(self): str { "OVERRIDE" }
+        }
+
+        fun main() { print(DogBox {}.twice()); }
+        "#,
+        "OVERRIDEOVERRIDE\n",
+    );
+}
+
+/// Regression guard for B55's root cause B: `Self`-typed values in the SAME
+/// body as parameter-typed ones. The default body seeds `T` now, and that must
+/// not disturb the `Self` re-dispatch — `self.me()` still returns the concrete
+/// receiver, and the round trip keeps both halves per instantiation.
+#[test]
+fn a_trait_default_mixes_self_typed_and_parameter_typed_values() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+        struct Cat {}
+        impl Cat with Bound { fun label(self): str { "cat" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun tag(self): str;
+            fun mixed(self): str { self.tag() + ":" + self.item().label() }
+            fun me(self): Self { self }
+            fun round(self): str { self.me().mixed() }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> {
+            fun item(self): Dog { Dog {} }
+            fun tag(self): str { "D" }
+        }
+        struct CatBox {}
+        impl CatBox with Holder<Cat> {
+            fun item(self): Cat { Cat {} }
+            fun tag(self): str { "C" }
+        }
+
+        fun main() { print(DogBox {}.round()); print(CatBox {}.round()); }
+        "#,
+        "D:dog\nC:cat\n",
+    );
+}
+
+/// The bound-to-bound leg — P4's own quoted repro. The default hands its `T`
+/// to a binder that requires the SAME bound (`impl Wrap<type U: Bound>`).
+/// This failed in the analyzer, not codegen: the return-type-only inference
+/// re-bound the call's declared return `T` — which, `item` being a member of
+/// the very trait whose default this is, IS the enclosing parameter — to the
+/// expectation, dropping its bound and reporting "generic parameter 'U' is
+/// missing the bound ': Bound'".
+#[test]
+fn a_trait_default_passes_its_parameter_to_a_binder_requiring_the_same_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Wrap<U> { inner: U }
+        impl Wrap<type U: Bound> { fun show(self): str { self.inner.label() } }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun wrapped(self): Wrap<T> { Wrap { inner = self.item() } }
+        }
+
+        struct DogBox {}
+        impl DogBox with Holder<Dog> { fun item(self): Dog { Dog {} } }
+
+        fun main() { print(DogBox {}.wrapped().show()); }
+        "#,
+        "dog\n",
+    );
+}
+
+/// A GENERIC impl: the trait argument is written in the impl's own terms
+/// (`impl Bag<type E: Bound> with Holder<E>`), so grounding `T` takes two hops
+/// — the impl's binder from the concrete receiver, then the trait's parameter
+/// through it. Two element types, so the hop cannot be a constant.
+#[test]
+fn a_generic_impl_grounds_the_traits_parameter_through_its_own_binder() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Bound { fun label(self): str; }
+
+        struct Dog {}
+        impl Dog with Bound { fun label(self): str { "dog" } }
+        struct Cat {}
+        impl Cat with Bound { fun label(self): str { "cat" } }
+
+        struct Bag<E> { element: E }
+        trait Holder<T: Bound> {
+            fun item(self): T;
+            fun describe(self): str { self.item().label() }
+        }
+        impl Bag<type E: Bound> with Holder<E> { fun item(self): E { self.element } }
+
+        fun main() {
+            print(Bag { element = Dog {} }.describe());
+            print(Bag { element = Cat {} }.describe());
+        }
+        "#,
+        "dog\ncat\n",
+    );
+}
