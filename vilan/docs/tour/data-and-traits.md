@@ -173,6 +173,58 @@ fun main() {
 }
 ```
 
+A trait can take type parameters, and they can carry bounds of their own.
+The bound is in scope inside the trait's default bodies — the same way a
+bound on a function or an impl is inside theirs — so a default can call
+the bound's methods on a value of that type:
+
+```vilan
+import std::print;
+
+trait Label {
+	fun label(self): str;
+}
+
+// `T: Label` — the bound is usable by the defaults below.
+trait Holder<T: Label> {
+	fun item(self): T;
+
+	fun describe(self): str {
+		"holding " + self.item().label()
+	}
+}
+
+struct Dog {}
+impl Dog with Label {
+	fun label(self): str { "a dog" }
+}
+
+struct Cat {}
+impl Cat with Label {
+	fun label(self): str { "a cat" }
+}
+
+struct DogBox {}
+impl DogBox with Holder<Dog> {
+	fun item(self): Dog { Dog {} }
+}
+
+struct CatBox {}
+impl CatBox with Holder<Cat> {
+	fun item(self): Cat { Cat {} }
+}
+
+fun main() {
+	print(DogBox {}.describe());
+	print(CatBox {}.describe());
+}
+```
+
+Each impl picks the argument (`Holder<Dog>`, `Holder<Cat>`) and is checked
+against the bound there. The one `describe` body is then specialized per
+implementing type, so `self.item().label()` reaches `Dog`'s `label` in one
+and `Cat`'s in the other.
+
 Traits are like interfaces, with two differences. They're implemented
 explicitly (`impl Robot with Greet`), never structurally. And they
 appear as *bounds* on generics (`T: Greet`) rather than as standalone
