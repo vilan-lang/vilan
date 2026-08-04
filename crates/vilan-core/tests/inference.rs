@@ -25701,13 +25701,23 @@ fn b60_a_data_option_is_unaffected_by_the_consuming_call() {
 
 #[test]
 fn b63_is_some_and_at_a_resource_instantiation() {
-    // Accepted now, rejected before. The payload goes to the predicate and
-    // nothing survives the call. NOTE the absent `drop a`: a match-arm capture
-    // of a resource payload is never destroyed — B62, pre-existing on v0.24.0
-    // and shared with every combinator B60 already converted (`is_none_or`,
-    // `map_or`, `filter`, …). This pin asserts what the arc changed; B62 owns
-    // the missing line.
-    assert_compiles_and_runs(
+    // CORRECTED by B66, and this is the arc's headline compat finding.
+    //
+    // B63 §8.2 converted `is_some_and` to `own self` and pinned it ACCEPTED at
+    // a resource, noting an absent `drop a` that it attributed to B62. The
+    // attribution was wrong: B62 destroys a *concrete* capture, and this body
+    // is generic, where nothing can. The absent drop was never B62's missing
+    // line — it was §8.3's own rule going unenforced.
+    //
+    // `is_some_and` HANDS THE PAYLOAD TO A CLOSURE AND DISCARDS IT: a
+    // closure-valued callee loans every argument (`callee_conventions` answers
+    // `None`), so `fn(x)` does not move `x` in, and `x` dies with the arm. That
+    // is exactly §8.3's "a combinator with a path that discards a resource
+    // value it was handed is impossible at a resource instantiation", the rule
+    // that already rejects `or` / `xor` / `unwrap_or` — so this rejects too,
+    // and for the same reason. The conservative error is the honest state; the
+    // alternative is the silent leak this pin used to assert.
+    assert_fails_spanning(
         r#"
         import std::print;
         import std::drop::Drop;
@@ -25720,7 +25730,28 @@ fn b63_is_some_and_at_a_resource_instantiation() {
             print("end");
         }
         "#,
-        "true\nend\n",
+        "slot.is_some_and(|r| r.n == 7)",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn b63_is_some_and_at_data_is_untouched_by_the_b66_rejection() {
+    // The other half of the ruling: a data instantiation is never enqueued for
+    // an R11 check, so `is_some_and` is exactly as it was for every non-resource
+    // caller — which is all of them, in std, the corpus and the examples.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<i32> = Some(7);
+            print(slot.is_some_and(|n| n == 7));
+            let empty: Option<i32> = None;
+            print(empty.is_some_and(|n| n == 7));
+        }
+        "#,
+        "true\nfalse\n",
     );
 }
 
@@ -27075,10 +27106,16 @@ fn r11_map_shape_closure_free_accept() {
 }
 
 #[test]
-fn r11_std_option_map_at_a_resource_accept() {
-    // `Option::map` moves the payload into the transform once (`Some(fn(x))`) —
-    // clean at `Option<Db>` (the map-shape, via std).
-    assert_compiles(
+fn r11_std_option_map_at_a_resource_rejects() {
+    // CORRECTED by B66. This pin used to assert ACCEPT on the premise that
+    // "`Option::map` moves the payload into the transform once (`Some(fn(x))`)".
+    // The premise is false: a closure-valued callee LOANS every argument, so
+    // `fn(x)` reads `x` and hands back a `U` — the payload `x` is never moved
+    // anywhere and dies with the arm.
+    //
+    // Verified against the pre-B66 tree, which compiled the program below and
+    // printed `1 / end` with NO `drop 1`. `map` at a resource was a silent leak.
+    assert_fails_spanning(
         r#"
         import std::option::Option::{ self, Some };
         resource struct Db { handle: i32 }
@@ -27088,6 +27125,45 @@ fn r11_std_option_map_at_a_resource_accept() {
             let n = opt.map(|d| d.handle);
         }
         "#,
+        "opt.map(|d| d.handle)",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn r11_std_option_map_at_data_is_untouched() {
+    // Data instantiations are never enqueued, so `map` is unchanged for them.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let opt: Option<i32> = Some(2);
+            print(opt.map(|n| n * 3).unwrap_or(0));
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn r11_the_map_shaped_leak_is_a_family_not_one_combinator() {
+    // The rule is structural, so it catches every combinator with the same
+    // shape — payload handed to a closure, then discarded. `and_then` is
+    // pinned as the second member (and is what `filter` is built on), so a
+    // future narrowing of the rule to `map` alone would redden here.
+    assert_fails_spanning(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        resource struct Db { handle: i32 }
+        fun main() {
+            let db = Db { handle = 1 };
+            let opt: Option<Db> = Some(db);
+            let n = opt.and_then(|d| Some(d.handle));
+        }
+        "#,
+        "opt.and_then(|d| Some(d.handle))",
+        "a resource-typed value still owns its payload where its scope ends",
     );
 }
 
@@ -28486,30 +28562,32 @@ fn a_generic_own_t_moved_out_on_every_branch_is_accepted() {
 }
 
 #[test]
-#[ignore = "OPEN: two own parameters moved on DIFFERENT branches pass the every-path check; the un-moved one leaks (found by the B63 arc, pre-existing on v0.25.0)"]
 fn two_own_generics_moved_on_different_branches_is_not_every_path() {
-    // The rule says "moved out on EVERY path". `check_own_generic_exactly_once`
-    // implements it as "still owned after `plan_scope`", and `plan_branches`
-    // merges by INTERSECTION — a binding survives owned only if owned in every
-    // arm — which is the right merge for planning drops but the wrong one for
-    // finding leaks. `first` is moved in the `then` arm, `second` in the `else`,
-    // so the intersection is empty and both look moved. Neither is, on the path
-    // the other took: `pick(true, Some(a), Some(b))` returns `a` and destroys
-    // NOTHING — `b` is a resource that is simply never torn down. R7 does not
-    // cover it either, because branch TAILS are R4 move-outs, not a rejoin
-    // (`r4_return_through_if_tails_moves_each_branch`).
+    // The rule says "moved out on EVERY path". `first` is moved in the `then`
+    // arm, `second` in the `else`, so `pick(true, Some(a), Some(b))` returned
+    // `a` and destroyed NOTHING — `b` was a resource simply never torn down.
     //
-    // Not fixed here, and not exploitable: `Option::or` keeps its alternative a
-    // LOAN precisely so it rejects rather than riding this (`affine-moves.md`
-    // §6). The fix is a union merge for the leak question — a second walk, or a
-    // merge mode threaded through `plan_*`.
+    // CLOSED by B67, and the diagnosis in the original filing was half wrong, so
+    // it is corrected here. The merge was NOT the defect: `plan_branches`'
+    // intersection is exact GIVEN R7, which makes ownership single-valued at
+    // every program point. What was broken is that R7's reach had been cut short
+    // by an over-broad R4 exemption in `scan_move_branches` — each arm's tail
+    // place was stripped from the cross-arm comparison, which correctly permits
+    // `if flag { x } else { x }` and wrongly permits this. Removing the
+    // exemption restores R7 and the existing merge becomes correct again; no
+    // union merge and no second walk were needed (`affine-moves.md` §9.3).
     //
-    // It also needs `is`-refinement, or it will reject correct code: `or_else`'s
-    // `if self is Some(_) { self } else { fn() }` leaves `self` un-moved on the
-    // else path, and that is SOUND because a `self` reaching it is `None` and
-    // has no payload to destroy (`b63_or_else_at_a_resource_instantiation`
-    // pins that it works). A path-sensitive check that cannot see the refinement
-    // would break it.
+    // The `is`-refinement the filing demanded is real and is what replaced the
+    // exemption: `or_else`'s `if self is Some(_) { self } else { fn() }` leaves
+    // `self` un-moved on the else path, which is SOUND because a `self` reaching
+    // it is `None` and has no payload (`b63_or_else_at_a_resource_instantiation`
+    // is the load-bearing guard).
+    //
+    // The diagnostic is R7's OWN, reused verbatim — a branch-divergent move IS a
+    // conditional move, not a new rule, and R7's precedent is an error rather
+    // than a synthesized drop ("there are no runtime drop flags in v1"). This
+    // pin's message fragment was a guess by the filing arc that the R11 leak
+    // diagnostic would fire; the ruling says otherwise, so it names the R7 one.
     assert_fails_spanning(
         r#"
         import std::print;
@@ -28523,7 +28601,167 @@ fn two_own_generics_moved_on_different_branches_is_not_every_path() {
         }
         "#,
         "pick(true, Some(Res { tag = \"kept\" }), Some(Res { tag = \"tossed\" }))",
-        "move it out on every path, or take a concrete type",
+        "a resource-typed value is moved on one path but not all",
+    );
+}
+
+#[test]
+fn b67_the_concrete_twin_of_pick_is_rejected_too() {
+    // The bug was never generic-only, and fixing it in `scan_move_branches`
+    // rather than in the R11 leak check is what closes both. At a CONCRETE
+    // resource the same shape leaked the same way: `plan_branches` saw both
+    // parameters moved, planned no teardown, and `second` was never destroyed.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun pick(flag: bool, own first: Option<Res>, own second: Option<Res>): Option<Res> {
+            if flag { first } else { second }
+        }
+        fun main() {
+            let kept = pick(true, Some(Res { tag = "kept" }), Some(Res { tag = "tossed" }));
+        }
+        "#,
+        "if flag { first } else { second }",
+        "is moved on one path through this branch but not another",
+    );
+}
+
+#[test]
+fn b67_both_divergent_parameters_are_reported() {
+    // Two values, each leaking on a different path — two diagnostics, and that
+    // is not a B5 violation: fixing `first` does not fix `second`. Pinned so a
+    // later "report once per branch" tidy-up cannot silently halve the report.
+    let source = r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
+            if flag { first } else { second }
+        }
+        fun main() {
+            let kept = pick(true, Some(Res { tag = "kept" }), Some(Res { tag = "tossed" }));
+        }
+        "#;
+    let rejections = r11_rejections(source);
+    assert_eq!(
+        rejections.len(),
+        2,
+        "one per divergently-moved parameter; got: {rejections:#?}"
+    );
+}
+
+#[test]
+fn b67_the_same_binding_returned_from_every_branch_stays_accepted() {
+    // The case the removed R4 exemption was written for, and the reason removing
+    // it is safe: when EVERY arm moves the tail binding, R7's counts already
+    // match and no exemption is needed. This is `pick`'s shape with one value
+    // instead of two, and it must stay legal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun choose<T>(own x: T, flag: bool): T {
+            if flag { x } else { x }
+        }
+        fun main() {
+            // Bound, then dropped: `drop(choose(..))` on the call result direct
+            // destroys nothing, which is a SEPARATE pre-existing hole (it
+            // reproduces with no branch at all — `drop(identity(Db{..}))`), not
+            // B67's, and not what this pin is about.
+            let out = choose(Db { tag = "one" }, true);
+            drop(out);
+            print("end");
+        }
+        "#,
+        "drop one\nend\n",
+    );
+}
+
+#[test]
+fn b67_an_is_refined_branch_may_leave_the_none_side_un_moved() {
+    // The `is`-refinement in user code, not just in std: `held` is moved on the
+    // `Some` path and left alone on the other — sound, because the other path is
+    // reached only when `held is Some(_)` is FALSE, so `held` is `None` and
+    // carries nothing to destroy. This is `or_else`'s shape, written by hand.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun pick_or<T>(own held: Option<T>, own fallback: || Option<T>): Option<T> {
+            if held is Some(_) { held } else { fallback() }
+        }
+        fun main() {
+            let empty: Option<Res> = None;
+            let filled = pick_or(empty, || Some(Res { tag = "made" }));
+            print("end");
+        }
+        "#,
+        "end\ndrop made\n",
+    );
+}
+
+#[test]
+fn b67_the_refinement_does_not_excuse_a_payload_carrying_complement() {
+    // The refinement's boundary, and the reason it is a payload question rather
+    // than a "there is an `is` test here" question. `Pair` has no data-less
+    // variant, so the complement of `First(_)` still carries a resource — the
+    // else arm is NOT exempt and the divergent move is still an error. A
+    // refinement that keyed off the `is` alone would wrongly accept this.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        enum Pair<T> { First(T), Second(T) }
+        fun take_one<T>(own slot: Pair<T>, own spare: Pair<T>): Pair<T> {
+            if slot is Pair::First(_) { slot } else { spare }
+        }
+        fun main() {
+            let out = take_one(Pair::First(Res { tag = "a" }), Pair::Second(Res { tag = "b" }));
+        }
+        "#,
+        "take_one(Pair::First(Res { tag = \"a\" }), Pair::Second(Res { tag = \"b\" }))",
+        "a resource-typed value is moved on one path but not all",
+    );
+}
+
+#[test]
+fn b67_a_loop_divergent_move_is_still_r8_not_r7() {
+    // The loop variant. R8 owns a move of an outer binding from inside a
+    // repeatable interior, and it fires SYNTACTICALLY on the first pass — so
+    // B67's branch reasoning never gets to reinterpret it, and the diagnostic
+    // stays the loop one. Pinned because the branch inside the loop body is
+    // exactly the shape B67 now inspects.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun sink(own r: Option<Res>) {}
+        fun main() {
+            let held: Option<Res> = Some(Res { tag = "looped" });
+            mut n = 0;
+            for n < 3 {
+                if n == 1 {
+                    sink(held);
+                }
+                n = n + 1;
+            }
+        }
+        "#,
+        "is declared outside this loop and moved inside it",
     );
 }
 
@@ -35601,18 +35839,17 @@ fn b62_a_conditionally_moved_capture_is_an_r7_error() {
 // --- B62's residuals: found while pinning the split, each a DIFFERENT rule ----
 
 #[test]
-#[ignore = "B62 residual: consuming a loaned capture is not yet an error, and double-destroys"]
 fn b62_an_is_capture_consumed_by_an_own_call_is_rejected() {
     // `is` loans its subject, so the capture is a view into a value the subject
     // still owns. `own`-passing it hands a second owner the payload while the
-    // subject's scope-end teardown still fires: the program below prints
+    // subject's scope-end teardown still fires: the program below printed
     // `sink ic / drop ic / after / drop ic` — one value, TWO destructions.
     //
     // This is B60's rule (a body may only consume what it owns) in the capture
-    // position rather than the parameter position, and needs its own diagnostic
-    // and steer ("match by value, or `take`"), so it is not this arc's. The
-    // ownership split B62 pins is what makes it a bug: a loaned capture owns
-    // nothing, so it may not be consumed.
+    // position rather than the parameter position, with its own diagnostic and
+    // steer ("match by value, or `take`"). CLOSED by B65; the ownership split
+    // B62 pins is what makes it a bug: a loaned capture owns nothing, so it may
+    // not be consumed.
     assert_fails(&b62_program(
         r#"
             fun sink(own r: Res) {
@@ -35630,10 +35867,9 @@ fn b62_an_is_capture_consumed_by_an_own_call_is_rejected() {
 }
 
 #[test]
-#[ignore = "B62 residual: consuming a capture of a loaned match subject is not yet an error"]
 fn b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected() {
     // The same hole through `match &x`, which R6 defines as inspecting without
-    // consuming. Prints `sink lc / drop lc / after / drop lc` today.
+    // consuming. Printed `sink lc / drop lc / after / drop lc` before B65.
     assert_fails(&b62_program(
         r#"
             fun sink(own r: Res) {
@@ -35652,20 +35888,18 @@ fn b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected() {
 }
 
 #[test]
-#[ignore = "B62 residual: R11's exactly-once check does not see a generic body's pattern captures"]
 fn b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation() {
     // R11 requires an `own T` parameter to be moved out on every path, because
     // a generic body is emitted once and cannot destroy a `T`. A pattern
-    // capture of generic type is the same situation and is not checked: the
+    // capture of generic type is the same situation and was not checked: the
     // match consumes `o` (so the parameter passes the exactly-once test), the
-    // capture `v` is never moved out, and the payload leaks — this prints
+    // capture `v` is never moved out, and the payload leaked — this printed
     // `some / after` with no destruction.
     //
-    // The fix belongs to `check_own_generic_exactly_once`, which would have to
-    // treat a still-owned CAPTURE at the fall-through end the way it treats a
-    // still-owned parameter. Concrete resource captures are unaffected: they
-    // are enrolled and destroyed (B62), which is why this is a residual and not
-    // a hole in the enrollment.
+    // CLOSED by B66, which widened `check_own_generic_exactly_once` from `own`
+    // parameters to every value the body would have to destroy. Concrete
+    // resource captures are unaffected: they are enrolled and destroyed (B62),
+    // which is why this was a residual and not a hole in the enrollment.
     assert_fails(&b62_program(
         r#"
             fun peek<type T>(own o: Option<T>) {
@@ -36015,5 +36249,409 @@ fn an_async_function_returning_a_task_should_type_as_the_value() {
 
         fun main() { let result: i32 = make(); }
         "#,
+    );
+}
+
+// --- B66: a generic body cannot destroy a `T`, so no delta-resource value may
+// reach a scope-end drop (`vilan/proposal/affine-moves.md` §9.2) ---------------
+
+#[test]
+fn b66_the_generic_capture_leak_names_the_capture_at_the_instantiation() {
+    // C2 for the widened check: primary at the INSTANTIATION (A2 — user code
+    // only, never inside the generic), note into the body at the capture.
+    assert_fails_spanning(
+        &b62_program(
+            r#"
+            fun peek<type T>(own o: Option<T>) {
+                match o {
+                    Some(let v) => print("some"),
+                    None => print("none"),
+                }
+            }
+            fun main() {
+                peek(Some(Res { tag = "gc" }));
+            }
+            "#,
+        ),
+        "peek(Some(Res { tag = \"gc\" }))",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn b66_a_generic_capture_moved_on_is_clean() {
+    // The load-bearing negative: the rule is about values the body would have to
+    // DESTROY, not about captures. Move the capture onward — here into the
+    // returned `Some` — and the same generic is accepted and runs, with the
+    // caller destroying the payload exactly once.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun repack<type T>(own o: Option<T>): Option<T> {
+                match o {
+                    Some(let v) => Some(v),
+                    None => None,
+                }
+            }
+            fun main() {
+                let back = repack(Some(Res { tag = "moved" }));
+                print("after");
+            }
+            "#,
+        ),
+        "after\ndrop moved\n",
+    );
+}
+
+#[test]
+fn b66_a_concrete_capture_that_drops_at_its_scope_end_is_untouched() {
+    // The regression guard the widening most needs: B62's enrollment is for
+    // CONCRETE resource captures, which a monomorphic body destroys perfectly
+    // well. This is the same program as the rejected generic, written at a
+    // concrete type — it must still compile AND still print the drop. Only a
+    // generic body is unable to destroy, so only a generic body is asked.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun peek(own o: Option<Res>) {
+                match o {
+                    Some(let v) => print(i"some {v.tag}"),
+                    None => print("none"),
+                }
+            }
+            fun main() {
+                peek(Some(Res { tag = "concrete" }));
+                print("after");
+            }
+            "#,
+        ),
+        "some concrete\ndrop concrete\nafter\n",
+    );
+}
+
+#[test]
+fn b66_a_generic_local_that_would_drop_at_its_scope_end_is_rejected() {
+    // The widening is to `plan_scope`'s whole `dropped` set, not to captures
+    // specially — the honest reading of "a generic body cannot destroy a `T`".
+    // A `let` local of delta-resource type is the same leak with no pattern in
+    // sight, and would have stayed open under a capture-only fix.
+    let source = b62_program(
+        r#"
+            fun stash<type T>(own value: T) {
+                let held = value;
+            }
+            fun main() {
+                stash(Res { tag = "local" });
+            }
+            "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "stash(Res { tag = \"local\" })",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+    // The note names the offending binding and points into the generic body.
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, _, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("`held` still owns a value where its scope ends"),
+        "the note names the local; got: {note_msg:?}"
+    );
+}
+
+#[test]
+fn b66_a_generic_overwrite_that_would_drop_the_old_value_is_rejected() {
+    // The THIRD and last place the drop planner schedules a destruction: R2's
+    // overwrite drop. `mut held = a; held = b;` must destroy `a` at the
+    // assignment, which a generic body cannot do — before this, `swap` compiled
+    // and printed only `drop second`, silently leaking `first`.
+    //
+    // Found while auditing whether the widening was complete, and closed here
+    // rather than filed: the whole point of this arc is that a rule enforced at
+    // one position and stated at all of them is how these holes are made.
+    let source = r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun swap<T>(own a: T, own b: T): T {
+            mut held = a;
+            held = b;
+            held
+        }
+        fun main() {
+            let out = swap(Db { tag = "first" }, Db { tag = "second" });
+            drop(out);
+        }
+        "#;
+    assert_fails_spanning(
+        source,
+        "swap(Db { tag = \"first\" }, Db { tag = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    // The note lands on the ASSIGNMENT, not on the binding — that is the line
+    // the user has to change, and R2 is named so the rule is findable.
+    let rejections = r11_rejections(source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `held`'s previous value (R2)"),
+        "the note names the overwritten binding and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("held = b").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "held = b".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b66_a_concrete_overwrite_still_drops_the_old_value() {
+    // The guard: R2's overwrite drop is correct and stays correct at a concrete
+    // type, where the body CAN destroy. Only a generic body is asked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            mut held = Db { tag = "first" };
+            held = Db { tag = "second" };
+            print("end");
+        }
+        "#,
+        "drop first\nend\ndrop second\n",
+    );
+}
+
+#[test]
+fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
+    // B5 — one diagnostic per root cause. The drop plan assumes an affine-valid
+    // body; when the move scan already reported, the leftover ownership is a
+    // CONSEQUENCE of that failure, not a second problem. `keep` still owns only
+    // because `x` was used twice, which is already the error.
+    let source = r#"
+        resource struct Db { handle: i32 }
+        fun use_twice<T>(own x: T): T {
+            let keep = x;
+            x
+        }
+        fun sink(own d: Db) {}
+        fun main() {
+            let db = Db { handle = 1 };
+            let out = use_twice(db);
+            sink(out);
+        }
+        "#;
+    let rejections = r11_rejections(source);
+    assert_eq!(
+        rejections.len(),
+        1,
+        "the double use is the one root cause; got: {rejections:#?}"
+    );
+    assert!(
+        rejections[0].0.contains("used more than once"),
+        "and it is the move violation, not the drop-plan consequence; got: {rejections:#?}"
+    );
+}
+
+// --- B65: a capture of a LOANED subject is a loan, and may not be consumed
+// (`vilan/proposal/affine-moves.md` §9.1) -------------------------------------
+
+#[test]
+fn b65_the_is_capture_diagnostic_names_the_subject_and_the_by_value_steer() {
+    // C2: the diagnostic class carries its span + message pin. The steer is
+    // deliberately NOT `LoanConsumed`'s "declare it `own x`" — a capture has no
+    // convention to redeclare, so the fix is to consume the SUBJECT. It also
+    // offers no copy: vilan has no user-facing copy spelling, and R1 forbids
+    // copying a resource at all, so "clone the payload" would name an
+    // impossible fix (diagnostics-standard B4).
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "ic" });
+                if o is Some(let held) {
+                    sink(held);
+                }
+            }
+            "#,
+        ),
+        // Occurrence 0 binds the capture; the diagnostic anchors the CONSUMING
+        // use (A1 — the narrowest span that identifies the problem).
+        "held",
+        1,
+        "cannot move the resource `held` out of this pattern: it captures from `o`, \
+         which is matched by loan",
+    );
+}
+
+#[test]
+fn b65_the_loaned_match_capture_diagnostic_steers_to_the_by_value_match() {
+    // The `match &o` form reaches the same rule through the same subject name:
+    // `pattern_subject_name` looks through the `&`, so the steer says `match o`,
+    // the spelling that actually fixes it.
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "lc" });
+                match &o {
+                    Some(let held) => sink(held),
+                    None => {}
+                }
+            }
+            "#,
+        ),
+        "held",
+        1,
+        "match `o` by value to move the payload into the capture, or restructure \
+         with `Option` + `take`",
+    );
+}
+
+#[test]
+fn b65_a_loaned_capture_that_is_only_read_stays_legal() {
+    // The load-bearing half: B65 rejects CONSUMING a loaned capture, never
+    // reading one. `is`-testing and reading the payload through the capture is
+    // the idiom `is_some_and` / `inspect` are built on (B63 §8.3), and the
+    // subject keeps ownership and drops exactly once at its own scope end.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun peek(r: &Res) {
+                print(i"peek {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "read" });
+                if o is Some(let r) {
+                    print(i"is {r.tag}");
+                    peek(&r);
+                }
+                match &o {
+                    Some(let r) => print(i"leg {r.tag}"),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "is read\npeek read\nleg read\nafter\ndrop read\n",
+    );
+}
+
+#[test]
+fn b65_the_consuming_match_form_still_moves_its_capture_onward() {
+    // The steer's own target must keep working: `match o` by value consumes the
+    // subject, so the capture OWNS the payload (B62) and `own`-passing it is a
+    // legal move, not a second owner. One `sink`, one `drop`, and no teardown
+    // of `o` — this is what B65 steers users toward, so it is pinned beside it.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "owned" });
+                match o {
+                    Some(let r) => sink(r),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "sink owned\ndrop owned\nafter\n",
+    );
+}
+
+#[test]
+fn b65_a_loaned_destructure_capture_consumed_is_rejected() {
+    // The third loan form in §7.2's table, and the twin B62 fixed on the
+    // enrollment side: `let (a, b) = &pair` loans, so its captures own nothing.
+    // Pinned because a fix aimed only at `match`/`is` would leave it open.
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let pair = (Res { tag = "d0" }, 1);
+                let (held, n) = &pair;
+                sink(held);
+            }
+            "#,
+        ),
+        "held",
+        1,
+        "cannot move the resource `held` out of this pattern: it captures from \
+         `pair`, which is matched by loan",
+    );
+}
+
+#[test]
+fn b65_a_consuming_destructure_capture_is_still_movable() {
+    // The consuming twin of the above — `let (r, n) = pair` consumes `pair`, so
+    // `r` owns and may be moved on. Guards the destructure half against an
+    // over-wide fix that treated every destructure capture as a loan.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let pair = (Res { tag = "d1" }, 1);
+                let (r, n) = pair;
+                sink(r);
+                print("after");
+            }
+            "#,
+        ),
+        "sink d1\ndrop d1\nafter\n",
+    );
+}
+
+#[test]
+fn b65_a_loaned_capture_consumed_inside_a_generic_reports_at_the_instantiation() {
+    // B65 rides R11's per-instantiation scan unchanged, like every other rule in
+    // `scan_move` — the same predicate, the same `MoveScan`, no new plumbing.
+    // The report lands at the INSTANTIATION site (A2: user code only), with the
+    // note pointing into the generic body.
+    //
+    // `keep` is what makes the consuming use real: a closure-valued callee loans
+    // every argument (`callee_conventions` answers `None`), so only a resolvable
+    // `own` callee consumes. `steal` returns `o`, so R11's exactly-once check is
+    // satisfied and this is the ONE diagnostic.
+    assert_fails_spanning(
+        &b62_program(
+            r#"
+            fun keep<type T>(own v: T): T {
+                v
+            }
+            fun steal<type T>(own o: Option<T>): Option<T> {
+                if o is Some(let held) {
+                    keep(held);
+                }
+                o
+            }
+            fun main() {
+                let kept = steal(Some(Res { tag = "gi" }));
+            }
+            "#,
+        ),
+        "steal(Some(Res { tag = \"gi\" }))",
+        "a capture of a loaned resource-typed subject is moved out",
     );
 }

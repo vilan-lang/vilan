@@ -456,3 +456,324 @@ and gains bare `x` in its list; the table's note spells out the consequence
 the "a copy" reading hid — a body may not move a bare resource parameter out.
 `mut own x` being a parse error is stated where `mut` is introduced, since
 §8.1 turns on it.
+
+## 9. B65 / B66 / B67 — the accounting holes closed, 2026-08-04
+
+> **Status: all three SHIPPED 2026-08-04** (§9.4 is the ship record). Three
+> residuals filed by the B62 and B63 arcs, each a *different* rule from the one
+> that filed it, each pinned `#[ignore]`d and verified pre-existing. They are
+> taken as one arc because they are one story: B60's "a body may only consume
+> what it owns" and R11's "a generic body cannot destroy a `T`" had each been
+> implemented at one position and stated at all of them.
+
+### 9.1 B65 — the capture position of "consume only what you own"
+
+B60 shipped the rule as a predicate over PARAMETERS
+(`binding_is_loaned_parameter`). §7.2 then established the ownership split for
+captures — a capture of a CONSUMED subject owns, a capture of a LOANED subject
+owns nothing — and enforced only the first half. The second half was a premise
+with no prohibition attached, so `if o is Some(let r) { sink(r) }` and `match
+&o { Some(let r) => sink(r) }` both compiled and destroyed one payload twice.
+
+The fix is the twin predicate, not a special case. `collect_loaned_pattern_captures`
+maps every capture bound by a loaned subject to that subject, covering all
+three loan forms in §7.2's table verbatim:
+
+| form | why it loans |
+|---|---|
+| `x is Some(let r)` | a *test*, never a consuming match — always a loan, whatever the subject's own form |
+| `match &x { Some(let r) => … }` | R6's inspect-without-consuming |
+| `let (r, n) = &pair` | the destructure twin of the same |
+
+It rides `MoveScan`, so the concrete scan and R11's per-instantiation scan
+share one set and B65 reached generic bodies with no new plumbing — the same
+property that made B60(a) cheap.
+
+**The diagnostic is its own, and the steer is where the two rules genuinely
+differ.** `LoanConsumed` says "declare it `own x`". A capture carries no
+convention, so that advice names a fix that does not exist; the fix is to
+consume the SUBJECT. The steer therefore names the subject (`match o` by
+value, with `pattern_subject_name` looking through the `&` so it prints the
+place the user would actually edit) plus `Option` + `take`.
+
+**It deliberately offers no copy.** The backlog's draft said "consume the
+subject, or clone". There is no user-facing copy spelling in vilan to name:
+no `Clone`/`Copy` trait, no `derive`, and the one `.clone()` in std is
+`Shared::clone`, a refcount handle — the opposite of a payload copy. Copying
+is implicit for data (§6.1: binding a value copies it) and *forbidden* for a
+resource (R1: "no copies ever fire for a resource"). So "copy the payload"
+would be a speculative steer naming an impossible fix, which
+`diagnostics-standard.md` B4 rules out — "no steer is better than a
+speculative one".
+
+### 9.2 B66 — the destruction question, asked of every value
+
+`check_own_generic_exactly_once` implemented "a generic body cannot destroy a
+`T`" (destruction.md §6) as one question about `own` PARAMETERS. Everything
+else a body can end up holding went unasked, so `fun peek<T>(own o: Option<T>)`
+whose match consumes `o` passed — the parameter genuinely IS moved out, into
+the capture — and the capture leaked at `T := Res`.
+
+The widening is to the honest reading. `plan_scope`'s `dropped` set is exactly
+the scope-end teardowns the body would have to run, and a generic body can run
+none of them, so **no delta-resource binding may reach a scope-end drop**.
+That subsumes the filed case (a capture holding a consumed subject's payload)
+and the twin a capture-only fix would have left open (a `let` local of
+delta-resource type, pinned separately).
+
+Two gates, each a standing rule rather than a patch:
+
+- **B5, one diagnostic per root cause.** The drop plan assumes an
+  affine-valid body. When the move scan already reported, the leftover
+  ownership is a *consequence* — `fun use_twice<T>(own x: T): T { let keep =
+  x; x }` leaves `keep` owning only because `x` was used twice, which is
+  already the error. The widening is gated on the body being move-clean.
+- **C1, determinism.** `dropped` is a `HashSet`, so reports are span-sorted.
+
+#### The compat finding: `map` and `is_some_and` were leaking
+
+Two pins asserted the bug. Both are corrected, and the correction is the most
+consequential thing in this arc.
+
+§8.2 converted `is_some_and`, `ok_or`, `unzip` to `own self` and pinned all
+three ACCEPTED at a resource. For `is_some_and` it recorded an absent `drop a`
+and attributed it to B62 — "B62 owns the missing line". **The attribution was
+wrong.** B62 destroys a *concrete* capture; that body is generic, where
+nothing can. The absent drop was never a missing enrollment: it was §8.3's own
+rule going unenforced.
+
+The shape is general, and it is the one §8.3 already stated:
+
+> A generic body cannot destroy a `T`. Any combinator with a path that
+> *discards* a resource value it was handed is therefore impossible at a
+> resource instantiation, whatever its receiver convention.
+
+A **closure-valued callee loans every argument** — `callee_conventions`
+answers `None` for one, so `plan_expr` treats each argument as a loan. So
+`fn(x)` does not move the payload into the transform; it borrows it, returns a
+`U`, and `x` dies with the arm. Verified by running the pre-B66 tree:
+`Some(Db{handle=1}).map(|d| d.handle)` compiled and printed `1 / end` with **no
+drop**. `r11_std_option_map_at_a_resource_accept`'s stated premise ("moves the
+payload into the transform once") was simply false.
+
+So `map`, `and_then`, `filter` (built on `and_then`), `is_some_and`,
+`is_none_or`, `map_or`, `map_or_else`, `map_or_default` all leak at a resource
+instantiation and now reject. The combinators that survive are exactly those
+that move the payload somewhere real — `unwrap`, `ok_or`, `ok_or_else`,
+`unzip`, `transpose` (into the returned value), `inspect` and `or_else` (which
+loan via `is` and hand the receiver straight back), `unwrap_or_else` and
+`unwrap_or_default` (payload is the tail). Data instantiations are never
+enqueued, so every non-resource caller — which is all of them, in std, the
+corpus and the examples — is untouched, and that is pinned beside each
+correction.
+
+**§8.3's rulings are not disturbed**: `or`, `xor`, `unwrap_or` still reject,
+for the reasons §8.3 gives, and their pins are the tripwire.
+
+### 9.3 B67 — restore R7's reach; the merge was never the problem
+
+#### The shape
+
+```vilan,fragment
+fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
+    if flag { first } else { second }
+}
+```
+
+`pick(true, Some(a), Some(b))` compiled, returned `a`, and destroyed
+**nothing**.
+
+#### Where the defect actually is
+
+§8.4 diagnosed it as the merge: `plan_branches` keeps a binding owned only if
+every arm still owns it (INTERSECTION), so two parameters moved on different
+arms both look moved; and it proposed "a union merge for the leak question".
+
+That reading is half right and its fix is wrong, which matters because the
+proposed fix is a second walk through the whole planner.
+
+**Intersection is not merely "correct for planning drops" — it is correct
+full stop, GIVEN R7.** R7 says a binding is moved on every path or none, which
+makes ownership single-valued at every program point; when that holds, the
+intersection and the union of the arm states are the *same set*, and the merge
+is exact for both questions. The merge only diverges from the truth on
+programs R7 should have rejected and did not. So the defect is not the merge:
+it is that **R7's reach was cut short**, and repairing R7 makes the existing
+merge correct again — no second merge mode, no second walk, no new rule.
+
+The cut is one line in `scan_move_branches`:
+
+```rust
+let tail_place = if consuming && terminal {
+    self.direct_place_binding(*tail, scan)
+} else {
+    None
+};
+…
+if let Some(binding) = tail_place { r7_state.remove(&binding); }
+```
+
+Each arm's tail place is stripped from the state R7 compares across arms. It
+was written for R4 — a branch tail is the branch's produced value, not a
+rejoin — and it is over-broad: it permits "each arm produces its own value",
+which is right, and equally permits "each arm produces a DIFFERENT value and
+abandons the other", which is the bug.
+
+#### What the exemption actually protects, measured
+
+Removed outright, the inference binary reports **1440 passed, exactly two
+failed**:
+
+- `b63_or_else_at_a_resource_instantiation`
+- `b63_or_at_a_resource_rejects_the_discarded_alternative`
+
+Nothing else in 1445 pins depends on it. In particular
+`r4_return_through_if_tails_moves_each_branch` and
+`a_generic_own_t_moved_out_on_every_branch_is_accepted` (`if flag { x } else {
+x }`) survive without it — when EVERY arm moves the tail binding, R7's count
+already matches and no exemption is needed. Both survivors are the *same*
+case, and it is the case §8.4 named as the constraint.
+
+#### `or_else`, worked through — before implementing
+
+```vilan,fragment
+fun or_else(own self, fn: || Option<T>): Option<T> {
+    if self is Some(_) {
+        self
+    } else {
+        fn()
+    }
+}
+```
+
+| arm | tail | `self` |
+|---|---|---|
+| then | `self` | moved (R4 move-out) |
+| else | `fn()` — a value PRODUCED here | **not moved** |
+
+With the exemption gone and nothing put in its place, that is a
+branch-divergent move and `or_else` is rejected. It must not be: **the else arm
+is reached only when `self is Some(_)` is false, so `self` is `None`, and
+`None` carries no payload.** There is nothing to destroy, so leaving it
+un-moved leaks nothing. The exemption must therefore be *replaced by that
+reasoning*, not deleted.
+
+#### The refinement rule
+
+At an `if` whose condition is `x is P`, arm *i* is entered only when condition
+*i* holds and conditions `0..i` do not; the trailing `else` only when no
+condition holds. A binding is **exempt from the every-path move requirement on
+an arm when, on that arm's path, every variant it can still hold carries no
+resource payload.**
+
+For `or_else`: on the else arm `self` cannot be `Some`, leaving only `None`,
+whose payload list is empty — exempt.
+
+The exemption only ever asserts *"this value has nothing to destroy on this
+path"*. It is a statement about the value, not about the code, and it is
+conservative by construction: unless every reachable variant is provably
+payload-free the binding is not exempt, so the failure mode is an
+over-report (a false rejection the user can see and work around), never a
+missed leak.
+
+#### The B63 rulings under the new rule — they hold verbatim
+
+| combinator | what happens | ruling |
+|---|---|---|
+| `or_else` | `self` divergent, **exempt** on the else arm (`None`) | WORKS, unchanged |
+| `or` | `self` divergent but exempt (same shape); `b` is a LOAN and the else tail consumes it | **REJECTS**, one error, naming `b` — unchanged |
+| `xor` | the two-`Some` path discards both; neither is exempt there (both are `Some`) | **REJECTS** — unchanged |
+| `unwrap_or` | `match self` consumes on every path; the `_` arm consumes the loaned `fallback` | **REJECTS**, naming the fallback — unchanged |
+| `inspect` | the `if` has no `else` and is not in tail position; `self` is moved at the body tail on the one path there is | WORKS, unchanged |
+
+`or`'s pin asserts **exactly one** diagnostic, so it is the sharpest tripwire
+in the set: without the refinement the divergent `self` becomes a second error
+and the pin reddens. That is the intended guard and it is planted below.
+
+#### The diagnostic ruling: an ERROR, and specifically R7's existing one
+
+The question the record left open was whether a branch-divergent move should
+be an error or whether the merge should synthesize a drop on the non-moving
+path. **It is an error**, and R7's own sentence is normative:
+
+> **R7: no conditional moves.** A binding must be moved on every path through
+> a scope or on none; moving it on one path only is an error. This keeps
+> end-of-scope ownership static: there are no runtime drop flags in v1.
+
+A merge that synthesized a drop on the non-moving path is precisely the
+per-path teardown v1 ratified out; and in the program that filed the bug the
+body is GENERIC, where no drop can be synthesized at all (§9.2's rule). So
+B67 reuses `ResourceMoveViolation::ConditionalMove` **verbatim** — no new
+variant, no new message, no new steer, no ledger row. This follows R7's
+existing precedent for conditional moves of bindings by *being* it: B67 is not
+a new rule, it is R7 reaching the cases it always described, and the diagnostic
+it produces is the one users already see for `if flag { sink(r) }`.
+
+One consequence worth stating: `pick` reports **two** errors, one per
+parameter. That is not a B5 violation — `first` and `second` are two values,
+each leaking on a different path, and fixing one does not fix the other.
+
+### 9.4 Ship record — pins, compat, and whether the story is complete
+
+**Status: all three SHIPPED 2026-08-04.** The three filed `#[ignore]`d pins are
+un-ignored, each verified red against the pre-fix tree first:
+
+| item | filed pin(s) | new pins | proved by planting |
+|---|---|---|---|
+| B65 | `b62_an_is_capture_consumed_by_an_own_call_is_rejected`, `b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected` | 7 | dropping the check reddens 4 of 7 + both filed pins; the 3 guards correctly survive |
+| B66 | `b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation` | 8 | dropping the widening reddens 6; dropping the B5 gate reddens 5; the 4 negatives survive both |
+| B67 | `two_own_generics_moved_on_different_branches_is_not_every_path` | 6 | breaking the refinement reddens `or_else` + `or` + the user-code guard; restoring the exemption reddens all 4 B67 pins + R7's existing family |
+
+**Compat: nothing in the tree changed behaviour.** `cargo test -p vilan-cli
+--test corpus` (~100 programs, byte-identical goldens), `--test examples`,
+`-p vilan-core --test docs` (every fenced example) all green with no golden
+regenerated and no fence touched. The reason is the resource footprint: the
+whole tree's resources are `Database`, `OwnedNursery` and four corpus files,
+and none of them is ever handed to an `Option` combinator or matched by loan
+and then consumed. The newly-flagged code is std's generic combinators *at a
+resource instantiation*, which nothing in tree instantiates that way.
+
+**The B63 combinator rulings hold verbatim.** `or`, `xor`, `unwrap_or` still
+reject, for the reasons §8.3 gives; `or`'s pin asserts exactly one diagnostic
+and is the sharpest tripwire in the set, since without B67's refinement the
+divergent `self` becomes a second error.
+
+**Two diagnostics changed, and both were asserting a bug** (§9.2): `map` and
+`is_some_and` at a resource instantiation. Corrected, not weakened, with the
+data instantiation pinned unchanged beside each.
+
+#### Is the B60-lineage accounting story complete?
+
+**For the two rules the lineage is about, yes — and "complete" now has a
+concrete meaning rather than being a judgement call.** Both rules were
+implemented at one syntactic position and stated at all of them, which is the
+single mistake B65/B66/B67 each are:
+
+- **"A body may only consume what it owns"** (B60) is now enforced at both
+  positions a loan can appear in: the PARAMETER (B60) and the CAPTURE (B65).
+  Those are the only two — a local owns by construction, and a module-level
+  resource has its own §5 corollary.
+- **"A generic body cannot destroy a `T`"** (R11) is now asked at every place
+  the drop planner can schedule a destruction, which is an exhaustive list of
+  three: an `own` parameter still owned at the fall-through end (the original
+  check), a scope-end teardown (B66 — captures and locals), and R2's overwrite
+  drop (§9.4's own find, closed here rather than filed for exactly the reason
+  this arc exists). There is no fourth: `plan_scope` writes `dropped` and
+  `overwrites` and nothing else.
+- **"Moved on every path or none"** (R7) now reads branch tails, which was the
+  one path-shape it did not (B67).
+
+**What remains, named.** One new find, out of this lineage and filed rather
+than fixed because it belongs to a different mechanism:
+
+- **`drop(f(x))` on a call RESULT destroys nothing.** `drop(identity(Db{tag =
+  "direct"}))` prints no drop, while `let bound = identity(..); drop(bound)`
+  prints it. Verified to reproduce with no branch, no capture and no generic
+  capture, so it is neither B65's, B66's nor B67's — it is the `drop` sink's
+  rewrite not recognising a non-place argument. It is a leak of the same
+  severity as the three closed here and wants its own item.
+
+Also still open from earlier arcs, unchanged by this one:
+`r11_nested_closure_internal_double_move_is_rejected` and
+`generic_field_method_dispatch_runs` remain the two `#[ignore]`d pins in
+`inference.rs`.

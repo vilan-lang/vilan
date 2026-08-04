@@ -343,7 +343,9 @@ changes no ownership and is policed by rule 4.
   use-after-move and `o` is not torn down at scope end. A bare `self`
   receiver stays a loan (`db.exec(..)` never consumes `db`).
 - **R4: returns move out**, including through `if` / `match` tails (a
-  diverging leg is exempt).
+  diverging leg is exempt). A tail move-out is still a move on *that* path
+  only — R7 reads the arms against each other, so producing a different
+  binding from each arm is a conditional move, not two independent returns.
 - **R5: fields.** A struct literal moves resources in. A resource field is
   read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
   live aggregate is rejected; v1 has no partial moves. The sanctioned
@@ -356,11 +358,24 @@ changes no ownership and is policed by rule 4.
   drop at the declaring scope's end. Matching a loan (`match &self.state`,
   and the `x is Some(let v)` test) inspects without consuming: the subject
   keeps ownership and destroys the payload itself, so its captures own
-  nothing.
+  nothing — and, owning nothing, they may not be **consumed**. This is R3's
+  "a loan changes no ownership" read in the capture position: `own`-passing
+  a loaned capture, returning it, or matching it by value would hand a
+  second owner the payload the subject still destroys at its own scope end.
+  The fix is to consume the *subject* (`match x` without the `&`), not to
+  redeclare the capture — a capture carries no convention to change.
 - **R7: no conditional moves.** A binding must be moved on every path
   through a scope or on none; moving it on one path only is an error. This
   keeps end-of-scope ownership static: there are no runtime drop flags in
-  v1.
+  v1. **Branch tails are paths too.** R4 makes each arm's tail a move-out,
+  and the arms are alternatives, not a rejoin — so `if flag { x } else { x }`
+  is moved on every path and fine, while `if flag { first } else { second }`
+  moves each binding on one path and abandons it on the other, and is the
+  same error. The one exemption is a binding that, on the path in question,
+  provably carries **no resource payload**: after a failed `x is Some(_)`
+  test `x` can only be `None`, which has nothing to destroy, so leaving it
+  un-moved there leaks nothing. The exemption is granted only on proof — an
+  enum whose every variant carries a payload gets none.
 - **R8: no moves in repeatable interiors.** Moving a binding declared
   outside a loop from inside its body is an error (the move would repeat).
 - **R9: closures and spawns cannot capture resources.** Capturing one would
@@ -389,7 +404,14 @@ changes no ownership and is policed by rule 4.
   T` passes; a body that reads its parameter twice fails **at the instantiation
   site**, not inside std. For an `own T` parameter the rule tightens to
   *exactly* once (a generic body is emitted once and so cannot run an
-  instantiation-conditional destructor; zero moves would leak).
+  instantiation-conditional destructor; zero moves would leak). The tightening
+  is not about parameters but about **destruction**: since a generic body can
+  destroy nothing, *no* `T`-typed value in it may still own at the end of its
+  scope — not a parameter, not a `let` local, and not a pattern capture that
+  took a consumed subject's payload (R6). Each is the same leak and is rejected
+  at the instantiation site. The consequence worth stating: a combinator that
+  hands a payload to a closure and then discards it — the closure only *loans*
+  it — cannot be resource-clean, whatever its receiver convention.
 - **R12: no coercion to `any`.** A resource passed where `any` is expected
   is an error (`print(db)` included): `any` is a data sink, and the
   discipline must not launder away. Debug-print the fields instead.
@@ -435,7 +457,9 @@ continue` (out of the scopes they leave), and panic unwinding, because a
 resource-owning scope lowers to a `try`/`finally` and every exit flows
 through the `finally`. Concrete `own` resource *parameters* drop at scope
 end like locals (a generic `own T` is required to move out instead, per
-R11).
+R11) — and the same split holds for pattern captures: a concrete one drops
+at its arm's end, while inside a generic body no `T`-typed capture may be
+left owning at all.
 
 - **Module-level resources never drop.** A top-level `let` resource has
   process lifetime (the serve-forever server's `Database`). It is
