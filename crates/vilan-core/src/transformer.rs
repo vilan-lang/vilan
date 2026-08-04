@@ -1416,6 +1416,13 @@ struct Transformer<'src> {
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
     bodyless_emissions: Vec<Id>,
+    // Never-silent guard (B68, affine-moves.md §9.4): `drop(x)` sink calls whose
+    // argument type did not resolve at the rewrite. Such a call lowers to the
+    // bare argument — indistinguishable from the legitimate data no-op — so a
+    // resource handed to it is destroyed nowhere, from a compile that reported
+    // nothing. Collected here and turned into a hard compile error at assembly,
+    // so the class cannot recur silently.
+    unresolved_drop_sinks: Vec<Id>,
     // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
     // index, plus how many chunks there are. Empty for every build that did not
     // ask to split, which is what keeps single-file emission byte-identical —
@@ -1567,6 +1574,7 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            unresolved_drop_sinks: Vec::new(),
             chunk_members: HashMap::new(),
             chunk_count: 0,
             chunk_gate: None,
@@ -1849,6 +1857,28 @@ impl<'src> Transformer<'src> {
                      concrete implementation at this call; please report this \
                      program"
                 ),
+            });
+        }
+
+        // Never-silent (B68, affine-moves.md §9.4): refuse to ship a program with
+        // a `drop(x)` whose argument type did not resolve. The rewrite decides
+        // between a destructor and the data no-op purely by that type, so an
+        // unresolved one silently picks the no-op — and a resource handed to the
+        // sink is destroyed nowhere, from a compile that reported nothing. This
+        // is the class `drop(f(x))` belonged to; it must not leave here quietly.
+        if let Some(&call_id) = self.unresolved_drop_sinks.first() {
+            return Err(Error {
+                note: None,
+                span: self
+                    .program
+                    .span_map
+                    .get(&call_id)
+                    .map(|span| **span)
+                    .unwrap_or_default(),
+                msg: "internal: the type of this `drop` argument could not be \
+                      resolved, so the sink cannot tell a resource from data and \
+                      would tear nothing down; please report this program"
+                    .to_string(),
             });
         }
 
@@ -2856,18 +2886,42 @@ impl<'src> Transformer<'src> {
                         // sink body cannot drop instantiation-conditionally.
                         if Some(target_id) == self.drop_fn_id {
                             let arg_node = args.into_iter().next().unwrap_or(js::Node::Void);
-                            if let Some(argument_id) = function_call.argument_ids.first().copied()
-                                && let Some(type_id) = self
-                                    .drop_argument_type_id(argument_id)
-                                    .map(|t| self.resolve_type_id(t))
-                                && let Some(helper) = self.ensure_drop_helper(type_id)
-                            {
-                                return Some(js::Node::Call(
-                                    Box::new(js::Node::Local(helper)),
-                                    vec![arg_node],
-                                ));
+                            let argument_type =
+                                function_call
+                                    .argument_ids
+                                    .first()
+                                    .copied()
+                                    .map(|argument_id| {
+                                        self.drop_argument_type_id(argument_id)
+                                            .map(|type_id| self.resolve_type_id(type_id))
+                                    });
+                            match argument_type {
+                                // A resource: its `__drop` helper. Data (no glue
+                                // for the type): the no-op consume, which still
+                                // evaluates the argument for its effects.
+                                Some(Some(type_id)) => match self.ensure_drop_helper(type_id) {
+                                    Some(helper) => {
+                                        return Some(js::Node::Call(
+                                            Box::new(js::Node::Local(helper)),
+                                            vec![arg_node],
+                                        ));
+                                    }
+                                    None => return Some(arg_node),
+                                },
+                                // Never-silent (B55's pattern, applied to the sink
+                                // by B68): an argument whose type did not resolve
+                                // cannot be told apart from data here, so emitting
+                                // the bare argument is a leak from a clean compile
+                                // — exactly how `drop(f(x))` destroyed nothing for
+                                // as long as it did. Report it instead.
+                                Some(None) => {
+                                    self.unresolved_drop_sinks.push(*id);
+                                    return Some(arg_node);
+                                }
+                                // `drop()` with no argument: an arity error the
+                                // analyzer already reported.
+                                None => return Some(arg_node),
                             }
-                            return Some(arg_node);
                         }
                         // A call to a generic function/method is compiled to a
                         // specialized instance chosen by its concrete type arguments
@@ -5981,14 +6035,18 @@ impl<'src> Transformer<'src> {
     /// The type of a `drop(x)` argument, for the early-teardown rewrite. Like
     /// `expr_type_id` but a bare `Expr::Local` of a PARAMETER id also resolves (a
     /// plain `drop(param)` would otherwise read as untyped and no-op, leaking the
-    /// parameter). Kept separate from `expr_type_id` so the tuple/set layout
-    /// decisions that read it stay byte-identical.
+    /// parameter), and a VALUE argument — a call result, which stores no type on
+    /// its own id and names no binding — resolves through the analyzer's B68
+    /// recording (`drop_sink_value_types`, affine-moves.md §9.4). Kept separate
+    /// from `expr_type_id` so the tuple/set layout decisions that read it stay
+    /// byte-identical.
     fn drop_argument_type_id(&self, expr_id: Id) -> Option<TypeId> {
         self.expr_type_id(expr_id)
             .or_else(|| match self.program.entity_map.get(&expr_id)? {
                 Expr::Local(binding) => self.program.parameters.get(binding).map(|p| p.type_id),
                 _ => None,
             })
+            .or_else(|| self.program.drop_sink_value_types.get(&expr_id).copied())
     }
 
     /// Whether an expression's (monomorphized) type is a tuple — its value is a

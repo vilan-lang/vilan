@@ -147,6 +147,12 @@ fun main() {
 	print("passthrough returned");
 	drop(back);
 	print("--");
+	// B68 (affine-moves.md §9.4): the sink's argument is `own`, so an UNBOUND
+	// value — a call result — is owned by the `drop` expression and destroyed
+	// there, exactly as the `let`-then-`drop` above destroys `back`.
+	drop(passthrough(Res { tag = "unbound" }));
+	print("unbound dropped");
+	print("--");
 	match_move();
 	print("--");
 	match_leg_drop();

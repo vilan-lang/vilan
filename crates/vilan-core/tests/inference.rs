@@ -28324,6 +28324,165 @@ fn drop_of_data_is_a_no_op() {
     );
 }
 
+// --- B68: a VALUE argument to the sink (affine-moves.md §9.4) ---------------
+//
+// `drop` takes its argument `own`, so a non-place argument — a call result, a
+// construction — is owned by the `drop` expression itself and must be destroyed
+// there. Nothing else can destroy it: the value is never bound, so no scope-end
+// teardown and no overwrite drop can reach it. The rewrite therefore has to
+// resolve the type of ANY expression in argument position, not just the forms
+// that happen to carry a stored type.
+
+#[test]
+fn b68_drop_of_a_call_result_destroys_it() {
+    // The §9.4 repro. `drop(identity(Db{..}))` must destroy exactly what
+    // `let bound = identity(Db{..}); drop(bound)` destroys — the binding is not
+    // what makes the value droppable, the `own` sink is.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun identity(own value: Db): Db { value }
+        fun main() {
+            let bound = identity(Db { tag = "bound" });
+            drop(bound);
+            print("--");
+            drop(identity(Db { tag = "direct" }));
+            print("done");
+        }
+        "#,
+        "drop bound\n--\ndrop direct\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_construction_destroys_it() {
+    // The other non-place form: a construction handed straight to the sink. This
+    // one already worked (a struct initializer records its own type), and stays
+    // pinned so the B68 widening cannot regress it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            drop(Db { tag = "literal" });
+            print("done");
+        }
+        "#,
+        "drop literal\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_method_call_result_destroys_it() {
+    // The receiver-substituted form: the sink argument's type comes from a
+    // method's declared return type, which is only known through the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        struct Factory { tag: str }
+        impl Factory { fun open(self): Db { Db { tag = self.tag } } }
+        fun main() {
+            let factory = Factory { tag = "made" };
+            drop(factory.open());
+            print("done");
+        }
+        "#,
+        "drop made\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_nested_call_result_destroys_it() {
+    // Nesting is not a new case, but it is the one that proves the rewrite reads
+    // the OUTER call's result type rather than pattern-matching one call shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun identity(own value: Db): Db { value }
+        fun main() {
+            drop(identity(identity(Db { tag = "nested" })));
+            print("done");
+        }
+        "#,
+        "drop nested\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_data_call_result_is_a_no_op() {
+    // The data control: an i32-returning call in argument position stays the
+    // no-op consume that still evaluates its argument for effects. Widening the
+    // type query must not conjure a destructor where there is none.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::drop;
+        fun sum(a: i32, b: i32): i32 { print("called"); a + b }
+        fun main() {
+            drop(sum(1, 2));
+            print("ok");
+        }
+        "#,
+        "called\nok\n",
+    );
+}
+
+#[test]
+fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_rejected_at_a_resource() {
+    // The B66/R11 interplay. `drop(t)` in an erased generic body is dirt at a
+    // resource instantiation (`a_generic_forwarding_own_t_to_the_drop_sink_is_
+    // rejected_at_a_resource`), for the reason that the erased body has no
+    // concrete destructor. Routing the same `T` through a call first changes
+    // nothing about that, so the call-result form joins the place form rather
+    // than slipping past the check untyped.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
+        fun identity<T>(own value: T): T { value }
+        fun consume<T>(own x: T) { drop(identity(x)); }
+        fun main() {
+            let db = Db { tag = "one" };
+            consume(db);
+        }
+        "#,
+        "consume(db)",
+        "pass a resource to `drop<T>`, whose erased body has no concrete destructor",
+    );
+}
+
+#[test]
+fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_accepted_at_data() {
+    // The control for the pin above: the same generic instantiated only at data
+    // stays accepted — `drop` on data is the correct no-op consume.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::drop;
+        fun identity<T>(own value: T): T { value }
+        fun consume<T>(own x: T) { drop(identity(x)); }
+        fun main() {
+            consume(5);
+            print("ok");
+        }
+        "#,
+        "ok\n",
+    );
+}
+
 #[test]
 fn the_conditional_teardown_idiom_tears_down_in_both_arms() {
     // The idiom R7 pushes toward (destruction.md §6): `match opt.take() { Some(let

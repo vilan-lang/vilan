@@ -766,14 +766,134 @@ single mistake B65/B66/B67 each are:
 **What remains, named.** One new find, out of this lineage and filed rather
 than fixed because it belongs to a different mechanism:
 
-- **`drop(f(x))` on a call RESULT destroys nothing.** `drop(identity(Db{tag =
-  "direct"}))` prints no drop, while `let bound = identity(..); drop(bound)`
-  prints it. Verified to reproduce with no branch, no capture and no generic
-  capture, so it is neither B65's, B66's nor B67's — it is the `drop` sink's
-  rewrite not recognising a non-place argument. It is a leak of the same
-  severity as the three closed here and wants its own item.
+- **`drop(f(x))` on a call RESULT destroys nothing** — **B68, SHIPPED
+  2026-08-04, see §9.5.** `drop(identity(Db{tag = "direct"}))` prints no drop,
+  while `let bound = identity(..); drop(bound)` prints it. Verified to
+  reproduce with no branch, no capture and no generic capture, so it is neither
+  B65's, B66's nor B67's — it is the `drop` sink's rewrite not recognising a
+  non-place argument. It is a leak of the same severity as the three closed
+  here and wants its own item.
 
 Also still open from earlier arcs, unchanged by this one:
 `r11_nested_closure_internal_double_move_is_rejected` and
 `generic_field_method_dispatch_runs` remain the two `#[ignore]`d pins in
 `inference.rs`.
+
+## 9.5 B68 — a VALUE argument to the `drop` sink, closed 2026-08-04
+
+**Status: SHIPPED.** §9.4's filed find is closed. `drop(identity(Db{tag =
+"direct"}))` destroys what it is handed, exactly as `let bound = identity(..);
+drop(bound)` does.
+
+### The root cause is not "non-place" — it is "untyped, then silent"
+
+§9.4 filed this as "the rewrite not recognising a non-place argument", which is
+one case narrower than the defect. `drop(Db{..})` — also a non-place — always
+worked. What separates the two is where the type comes from:
+
+| argument form | type read from | worked before |
+|---|---|---|
+| `drop(local)` / `drop(param)` | the binding's own `type_id` | yes |
+| `drop(Db{..})` | `resolved_types` (a struct initializer records its own) | yes |
+| `drop(f(x))` | nowhere — a call's result type is computed lazily and never stored | **no** |
+
+So the rewrite asked "what type is this argument?" of two tables that happen to
+hold entries for some expression forms, and a call result is not one of them.
+That is half the defect. The other half is what it did with the answer:
+
+```rust
+if let Some(type_id) = self.drop_argument_type_id(argument_id) …
+    && let Some(helper) = self.ensure_drop_helper(type_id) { … }
+return Some(arg_node);   // both "data" and "no idea" land here
+```
+
+The fall-through conflates two different situations — *the type resolved and has
+no destructor* (data: the correct no-op consume) and *the type did not resolve*
+(unknown) — into one emission. The second is a leak from a clean compile, and it
+is silent by construction: the output is a bare, correctly-evaluated argument, so
+nothing downstream can tell it went wrong. `drop(f(x))` was that path for as long
+as it existed.
+
+### The fix, at both halves
+
+1. **Type every sink argument.** A new analyzer pass,
+   `record_drop_sink_argument_types`, runs after constraint solving and before
+   R11's per-instantiation checks: for each `drop(x)` whose argument carries no
+   type on its own expr id, it infers one and records it in
+   `drop_sink_value_types`. The map rides the `Program`, so the analyzer's glue
+   seeding, the §8 coloring edges, R11's forwarding check and the transformer's
+   rewrite all read *one* answer rather than four hand-mirrored lookups. (Those
+   four sites also now share one `drop_sink_argument_of` recognizer; the sink was
+   being re-identified by hand in each.)
+2. **Never-silent (B55's pattern).** An argument whose type still does not
+   resolve is collected in `unresolved_drop_sinks` and turned into a hard compile
+   error at assembly, spanned at the `drop` call. The *class* cannot recur
+   quietly: any future argument form the type query misses reports instead of
+   leaking.
+
+Recording only where the existing lookup was silent is what keeps every
+already-working form byte-identical.
+
+### No temp binding, and no elision question
+
+The rewrite emits `$h(<argument>)` — the argument is an ordinary JS call
+argument, so the value passes into the destructor helper by parameter and no
+temporary binding is needed. The elision family (`clone_sites` / `is_elidable_copy`)
+is not consulted and must not be: a copy decision only applies to a *place*, and
+a call result is not one. The value moves into the drop by construction, which is
+what a dead temp should do.
+
+### Where the code lives
+
+- `analyzer.rs`: `drop_sink_argument_of`, `record_drop_sink_argument_types`,
+  `drop_sink_value_types` (field + `Program`), the `drop_sink_argument_type_id`
+  fallback, and the seeding/coloring/R11 sites rewritten onto the shared
+  recognizer.
+- `transformer.rs`: `drop_argument_type_id`'s third fallback, the sink rewrite's
+  three-way match, `unresolved_drop_sinks` and its assembly-time guard.
+
+### Pins
+
+Seven, in `inference.rs` beside the existing sink family; **four verified red
+against the pre-fix tree** (the other three are the controls that were already
+green and must stay so):
+
+| pin | red first | what it holds |
+|---|---|---|
+| `b68_drop_of_a_call_result_destroys_it` | **red** | §9.4's repro, beside the `let`-then-`drop` it must match |
+| `b68_drop_of_a_method_call_result_destroys_it` | **red** | the receiver-substituted return type |
+| `b68_drop_of_a_nested_call_result_destroys_it` | **red** | the OUTER call's type, not one matched call shape |
+| `b68_a_generic_forwarding_a_call_result_to_the_sink_is_rejected_at_a_resource` | **red** | the R11 interplay (below) |
+| `b68_drop_of_a_construction_destroys_it` | green | the non-place form that already worked |
+| `b68_drop_of_a_data_call_result_is_a_no_op` | green | data is still the no-op consume, effects still evaluated |
+| `b68_a_generic_forwarding_a_call_result_to_the_sink_is_accepted_at_data` | green | the data control for the R11 pin |
+
+Corpus: `resource_take.vl` gains `drop(passthrough(Res{tag = "unbound"}))`
+beside its existing `let back = passthrough(..); drop(back)`, so the emission is
+pinned at the byte (`$h(passthrough([ "unbound" ]))` — the same helper the bound
+form uses) and rides the interpreter-equivalence gate. That is the **only**
+golden byte that moved: the whole corpus is otherwise byte-identical, which is
+the proof that no place-argument form changed.
+
+The never-silent guard was proved non-vacuous by planting: with
+`record_drop_sink_argument_types` disabled, `drop(identity(Db{..}))` reports
+"the type of this `drop` argument could not be resolved …" at the call instead
+of compiling to a silent leak.
+
+### The R11 interplay, and a §9.4 correction
+
+`drop` is **not** an unconditional escape hatch for a generic body. §9.4's
+lineage summary is right that the sink is exempt from R11's exactly-once rule
+(it *is* the drop site), but `check_generic_drop_forwarding` separately refuses
+`fun consume<T>(own x: T) { drop(x) }` **at a resource instantiation**: the
+erased body has no concrete destructor, so the rewrite would lower to the data
+no-op and leak. That ruling (destruction.md §6, 2026-07-19) is unchanged. What
+B68 changes is that routing the same `T` through a call — `drop(identity(x))` —
+no longer evades it: the argument now carries the abstract type it always had,
+so the delta rule sees it and the call-result form joins the place form under
+one diagnostic. At a *data* instantiation both stay accepted, which is the
+no-op `drop` is for.
+
+So the honest statement is: `drop` is how a generic body consumes a `T` **at a
+data instantiation**, and how a *concrete* body destroys a resource. A generic
+body still cannot destroy a resource `T` by any spelling.
