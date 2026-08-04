@@ -15017,9 +15017,13 @@ fn a_style_emits_atomic_rules_and_theme_vars() {
         "#,
     );
     assert!(
+        // `*.` rather than `.`: `padding` is a family shorthand, and the
+        // marker is what sorts it ahead of its edges (§0bis.4). The CLASS is
+        // unchanged — the hash is over `key|declaration`, which the marker
+        // never enters.
         assets.contains(&(
             "css".to_string(),
-            ".s1ufvr2{padding:var(--space-4)}".to_string()
+            "*.s1ufvr2{padding:var(--space-4)}".to_string()
         )),
         "{assets:?}"
     );
@@ -15132,7 +15136,10 @@ fn breakpoints_wrap_media_and_stack_with_pseudo() {
     assert!(
         assets
             .iter()
-            .any(|(_, line)| line.starts_with("@media (min-width: 768px){.")
+            // `{*.` — `padding` is a family shorthand, so its rule carries the
+            // sort marker inside the media block (§0bis.4). The class and the
+            // declaration are unchanged.
+            .any(|(_, line)| line.starts_with("@media (min-width: 768px){*.")
                 && line.contains(":hover{padding:var(--space-6)}")),
         "{assets:?}"
     );
@@ -15200,7 +15207,10 @@ fn a_breakpoint_wraps_dark_over_a_pseudo_class() {
     );
     assert!(
         assets.iter().any(|(_, line)| line
-            == "@media (min-width: 768px){:root[data-theme=\"dark\"] .s19fbteb:hover{padding:var(--space-6)}}"),
+            // The class name `s19fbteb` is byte-identical to what this rule
+            // minted before A22: the marker lives in `render_rule`, and the
+            // hash is over `key|declaration`.
+            == "@media (min-width: 768px){:root[data-theme=\"dark\"] *.s19fbteb:hover{padding:var(--space-6)}}"),
         "{assets:?}"
     );
 }
@@ -15979,6 +15989,445 @@ fn identical_rules_deduplicate_across_styles() {
         css.matches(".s1ufvr2{padding:var(--space-4)}").count(),
         1,
         "{css}"
+    );
+}
+
+// --- A22: same-family override order (ui-styling.md §0bis.4) ------------------
+// An atomic shorthand rule and an atomic longhand rule of one family carry
+// EQUAL specificity, so the cascade fell through to stylesheet order — the
+// lexical sort over content-hashed class names, i.e. arbitrary. Two rules fix
+// it, and they meet exactly: a shorthand set later DROPS every slot it covers
+// under the same condition, and a shorthand's rule renders `*.sX{..}` so the
+// existing lexical sort puts it ahead of its family's longhands. So two slots
+// of one family survive together only when the longhand came last — which is
+// the case where the longhand should win — and a family resolves by AUTHORING
+// order, never by the hash.
+//
+// The pins read the rendered CSS and the class LIST; none of them reads the
+// order of classes within a list, which is not what decides the cascade.
+
+/// The assembled stylesheet's rule for one declaration: the whole line, so a
+/// pin can read the selector, and its byte offset, so a pin can read the
+/// cascade order.
+fn rule_for<'a>(css: &'a str, declaration: &str) -> (&'a str, usize) {
+    let needle = format!("{{{declaration}}}");
+    let offset = css
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no rule for {declaration} in:\n{css}"));
+    let line_start = css[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = css[offset..]
+        .find('\n')
+        .map_or(css.len(), |index| offset + index);
+    (&css[line_start..line_end], offset)
+}
+
+fn style_css(source: &str) -> String {
+    let assets = collected_assets(source);
+    vilan_core::const_eval::assemble_assets(&assets)
+        .get("css")
+        .expect("a css asset")
+        .clone()
+}
+
+#[test]
+fn a_longhand_after_a_shorthand_wins_by_emission_order() {
+    // THE RECORD'S REPRO (§0bis.3's hazard note): `padding(4).padding_top(0)`
+    // must compute `padding-top: 0`. Both rules are (0,1,0) and both classes
+    // are on the element, so the guarantee is that the shorthand's rule sits
+    // EARLIER in the stylesheet — which the `*` marker makes true by ASCII,
+    // '*' (0x2A) sorting before '.' (0x2E).
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().padding(space(4)).padding_top(space(0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let (shorthand, shorthand_at) = rule_for(&css, "padding:var(--space-4)");
+    let (longhand, longhand_at) = rule_for(&css, "padding-top:var(--space-0)");
+    assert!(
+        shorthand.starts_with("*."),
+        "the shorthand rule must carry the sort marker: {shorthand}"
+    );
+    assert!(
+        longhand.starts_with('.'),
+        "a longhand rule must NOT carry the marker: {longhand}"
+    );
+    assert!(
+        shorthand_at < longhand_at,
+        "padding must precede padding-top so the edge wins:\n{css}"
+    );
+}
+
+#[test]
+fn a_longhand_after_a_shorthand_keeps_both_classes() {
+    // The other half of the repro: the shorthand is still live for the three
+    // edges it still owns, so its class stays on the element.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Style };
+        fun main() {
+            let boxed = const style().padding(space(4)).padding_top(space(0));
+            print(boxed.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_shorthand_after_a_longhand_clears_the_whole_family() {
+    // The reverse order: the later shorthand resets the whole box, so every
+    // edge it covers leaves the style. One class, and the same class a bare
+    // `padding(4)` mints — the family is gone, not merely outranked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Style };
+        fun main() {
+            let boxed = const style().padding_top(space(0)).padding(space(4));
+            let plain = const style().padding(space(4));
+            print(boxed.class_list() == plain.class_list());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn the_axis_methods_resolve_against_the_shorthand_too() {
+    // `padding` + `padding_x` is the instance of the hazard that predates the
+    // per-edge methods entirely (§0bis.3). The axis writes the same two edge
+    // slots the edge methods do, so it resolves identically.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().padding(space(4)).padding_x(space(6))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let (_, shorthand_at) = rule_for(&css, "padding:var(--space-4)");
+    let (_, left_at) = rule_for(&css, "padding-left:var(--space-6)");
+    let (_, right_at) = rule_for(&css, "padding-right:var(--space-6)");
+    assert!(
+        shorthand_at < left_at && shorthand_at < right_at,
+        "the axis must outrank the box it narrows:\n{css}"
+    );
+}
+
+#[test]
+fn border_and_border_colour_resolve_by_authoring_order() {
+    // The second live family. `border` covers `border-color`, so the colour
+    // set after it wins on order, and a `border` set after a colour clears it.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style().border(Length::px(1), Color::gray(300)).border_color(Color::blue(600))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let (shorthand, shorthand_at) = rule_for(&css, "border:1px solid var(--gray-300)");
+    let (_, colour_at) = rule_for(&css, "border-color:var(--blue-600)");
+    assert!(
+        shorthand.starts_with("*."),
+        "the border shorthand must carry the marker: {shorthand}"
+    );
+    assert!(
+        shorthand_at < colour_at,
+        "border must precede border-color:\n{css}"
+    );
+
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color, Length };
+        fun main() {
+            let framed = const style()
+                .border_color(Color::blue(600))
+                .border(Length::px(1), Color::gray(300));
+            let plain = const style().border(Length::px(1), Color::gray(300));
+            print(framed.class_list() == plain.class_list());
+        }
+        main();
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn a_merge_resolves_a_family_the_way_a_chain_does() {
+    // The live `+` instance from the website (`df_node + border_color`). `+`
+    // is runtime-legal and so cannot emit, which is why the fix is a drop plus
+    // an order and not a shorthand SPLIT: the drop is a map removal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color, Length };
+        fun main() {
+            let base = const style().border(Length::px(1), Color::gray(300));
+            // Right side narrows the family: both survive, the colour outranks.
+            let lit = const base + style().border_color(Color::blue(600));
+            print(lit.class_list().split(" ").len());
+            // Right side resets the family: the colour goes.
+            let reset = const style().border_color(Color::blue(600)) + base;
+            print(reset.class_list() == base.class_list());
+        }
+        main();
+        "#,
+        "2\ntrue\n",
+    );
+}
+
+#[test]
+fn a_condition_never_clears_the_base_family() {
+    // Cross-condition: the drop is keyed on media AND condition, so a dark or
+    // hover variant of one family leaves the base slots alone — and the marker
+    // changes no specificity, so the base/condition cascade is exactly what it
+    // was (a dark rule is (0,2,0) over a base rule's (0,1,0), either way round).
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun shorthand_under_dark(): Style {
+            style().padding_top(space(0)).dark(style().padding(space(4)))
+        }
+        fun longhand_under_hover(): Style {
+            style().padding(space(6)).hover(style().padding_top(space(2)))
+        }
+        let _a = const shorthand_under_dark();
+        let _b = const longhand_under_hover();
+        fun main() {}
+        main();
+        "#,
+    );
+    // The dark shorthand did not clear the base edge — the base edge rule is
+    // still there, unmarked and outside the dark band.
+    let (base_edge, _) = rule_for(&css, "padding-top:var(--space-0)");
+    assert!(
+        base_edge.starts_with('.') && !base_edge.contains("dark"),
+        "the base edge must survive a dark shorthand: {base_edge}"
+    );
+    // The dark shorthand keeps the dark band (':' first, B35) and gains the
+    // marker inside it. (Its inner chain's own base rule is also in the
+    // stylesheet — the recorded over-approximation — so the pin names the
+    // selector rather than taking the first match.)
+    assert!(
+        css.lines()
+            .any(|line| line.starts_with(r#":root[data-theme="dark"] *."#)
+                && line.ends_with("{padding:var(--space-4)}")),
+        "no marked dark shorthand:\n{css}"
+    );
+    // The base shorthand is neither cleared by nor clears the hover edge.
+    let (base_shorthand, _) = rule_for(&css, "padding:var(--space-6)");
+    assert!(
+        base_shorthand.starts_with("*."),
+        "the base shorthand survives a hover edge: {base_shorthand}"
+    );
+    assert!(
+        css.lines()
+            .any(|line| line.ends_with(":hover{padding-top:var(--space-2)}")),
+        "no hover edge rule:\n{css}"
+    );
+
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Style };
+        fun main() {
+            let themed = const style().padding_top(space(0)).dark(style().padding(space(4)));
+            print(themed.class_list().split(" ").len());
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn the_marker_keeps_the_media_bands_intact() {
+    // B35, unchanged: the media sort reads a `@media (min-width: ` prefix the
+    // marker never appears in, and the marker orders rules INSIDE a block.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().sm(style().padding(space(2))).lg(style().padding(space(3)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    // Each breakpoint's inner chain also emits its own base rule, so the pin
+    // names the media selector rather than taking the first match.
+    let small_at = css
+        .find("@media (min-width: 640px){*.")
+        .expect("a marked sm block");
+    let large_at = css
+        .find("@media (min-width: 1024px){*.")
+        .expect("a marked lg block");
+    assert!(
+        small_at < large_at,
+        "the ascending min-width sort must survive the marker:\n{css}"
+    );
+    assert!(
+        css.contains("{padding:var(--space-2)}") && css.contains("{padding:var(--space-3)}"),
+        "both breakpoint declarations must be present:\n{css}"
+    );
+}
+
+#[test]
+fn raw_belongs_to_its_property_s_family() {
+    // `raw` writes slots like any other method, so its property places it —
+    // the family relation is a fact about CSS, not about which method wrote
+    // the slot. (`border_none()` IS `raw("border", "none")`, and both live
+    // instances of this hazard had `raw` on one side.) This is the website's
+    // `status_line`: a zeroed box with one edge pushed to `auto`.
+    let css = style_css(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().margin(space(0)).raw("margin-left", "auto")
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let (shorthand, shorthand_at) = rule_for(&css, "margin:var(--space-0)");
+    let (_, edge_at) = rule_for(&css, "margin-left:auto");
+    assert!(
+        shorthand.starts_with("*."),
+        "a raw-written shorthand is marked too: {shorthand}"
+    );
+    assert!(
+        shorthand_at < edge_at,
+        "margin must precede margin-left:\n{css}"
+    );
+
+    // And a raw-written shorthand clears the family, exactly as the typed one
+    // does — which is what `border_none()` has always relied on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Style };
+        fun main() {
+            let pushed = const style().raw("margin-left", "auto").raw("margin", "0");
+            print(pushed.class_list().contains(" "));
+        }
+        main();
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn every_family_in_the_table_is_marked_and_its_longhands_are_not() {
+    // The six rows, each earned by a real site in the demand sweep. `inset`
+    // over the placement methods, `background` over the typed colour and
+    // gradient slots and `flex` over `flex-shrink` are the three the record's
+    // note had missed.
+    let css = style_css(
+        r##"
+        import std::style::{ style, space, Style, Color, Length };
+        fun boxes(): Style {
+            style().padding(space(4)).margin(space(6)).inset(space(0))
+        }
+        fun edges(): Style {
+            style().padding_top(space(1)).margin_left(Length::auto()).top(Length::px(3))
+        }
+        fun rest(): Style {
+            style().raw("flex", "1 1 auto").raw("background", "#ffffff")
+        }
+        fun rest_longhands(): Style {
+            style().raw("flex-shrink", "0").background(Color::gray(50))
+        }
+        let _a = const boxes();
+        let _b = const edges();
+        let _c = const rest();
+        let _d = const rest_longhands();
+        fun main() {}
+        main();
+        "##,
+    );
+    for declaration in [
+        "padding:var(--space-4)",
+        "margin:var(--space-6)",
+        "inset:var(--space-0)",
+        "flex:1 1 auto",
+        "background:#ffffff",
+    ] {
+        let (rule, _) = rule_for(&css, declaration);
+        assert!(
+            rule.starts_with("*."),
+            "{declaration} must be marked: {rule}"
+        );
+    }
+    for declaration in [
+        "padding-top:var(--space-1)",
+        "margin-left:auto",
+        "top:3px",
+        "flex-shrink:0",
+        "background-color:var(--gray-50)",
+    ] {
+        let (rule, _) = rule_for(&css, declaration);
+        assert!(
+            rule.starts_with('.'),
+            "{declaration} must NOT be marked: {rule}"
+        );
+    }
+}
+
+#[test]
+fn a_border_edge_survives_the_family_it_narrows() {
+    // `border` covers `border-top`, so the edge set after it wins on order and
+    // a `border` set after it clears it — the same pair of rules one level in.
+    let css = style_css(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style().border(Length::px(1), Color::gray(300)).border_top(Length::px(2), Color::blue(600))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let (_, box_at) = rule_for(&css, "border:1px solid var(--gray-300)");
+    let (edge, edge_at) = rule_for(&css, "border-top:2px solid var(--blue-600)");
+    assert!(
+        edge.starts_with('.'),
+        "an edge is a longhand of the box, so it is not marked: {edge}"
+    );
+    assert!(box_at < edge_at, "border must precede border-top:\n{css}");
+
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color, Length };
+        fun main() {
+            let framed = const style()
+                .border_top(Length::px(2), Color::blue(600))
+                .border(Length::px(1), Color::gray(300));
+            print(framed.class_list().contains(" "));
+        }
+        main();
+        "#,
+        "false\n",
     );
 }
 

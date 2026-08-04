@@ -1,3 +1,7 @@
+function __at(list, index) {
+	if (index >= 0 && index < list.length) return list[index];
+	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+}
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
@@ -15,6 +19,50 @@ function __map_values(map) {
 }
 function hash(self) {
 	return __hash(self);
+}
+function family_longhands(property) {
+	const $i = property;
+	let $j = null;
+	if ($i === "padding") {
+		$j = ";padding-top;padding-right;padding-bottom;padding-left;";
+	} else if ($i === "margin") {
+		$j = ";margin-top;margin-right;margin-bottom;margin-left;";
+	} else if ($i === "inset") {
+		$j = ";top;right;bottom;left;";
+	} else if ($i === "flex") {
+		$j = ";flex-grow;flex-shrink;flex-basis;";
+	} else if ($i === "background") {
+		$j = ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;";
+	} else if ($i === "border") {
+		$j = border_longhands();
+	} else {
+		$j = "";
+	}
+	return $j;
+}
+function border_longhands() {
+	let out = ";border-width;border-style;border-color;";
+	for (const edge of [ "top", "right", "bottom", "left" ]) {
+		out = out + ("border-" + edge + ";");
+		for (const part of [ "width", "style", "color" ]) {
+			out = out + ("border-" + edge + "-" + part + ";");
+		}
+	}
+	return out;
+}
+function without_covered(rules, media, condition, property) {
+	const longhands = family_longhands(property);
+	if (longhands === "") {
+		return __clone(rules);
+	}
+	let out = __clone(rules);
+	for (const key of $k(rules)) {
+		const parts = key.split(":");
+		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
+			$l(out, key);
+		}
+	}
+	return out;
 }
 function class_list(self) {
 	let out = "";
@@ -37,7 +85,10 @@ function add(self, b) {
 		let $h = null;
 		if ($g[0] === 0) {
 			const entry = $g[1];
-			$h = $i(rules, key, entry);
+			const parts = key.split(":");
+			rules = without_covered(rules, __at(parts, 0), __at(parts, 1), __at(parts, 2));
+			$m(rules, key, entry);
+			$h = undefined;
 		} else {
 			$h = undefined;
 		}
@@ -70,7 +121,17 @@ function $d(self, key) {
 	}
 	return $f;
 }
-function $i(self, key, value) {
+function $k(self) {
+	let result = [  ];
+	for (const entry of __map_values(self[0])) {
+		result.push(__clone(entry[0]));
+	}
+	return result;
+}
+function $l(self, key) {
+	self[0].delete(hash(key));
+}
+function $m(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
 const card = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
