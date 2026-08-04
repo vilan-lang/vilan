@@ -2,7 +2,10 @@
 
 One line per file in this directory: name, status, one-clause description.
 Status is derived from each file's own header/status block (read, not the
-whole file), as of 2026-08-03. Statuses in play: **shipped arc** (built,
+whole file), as of 2026-08-03, last re-verified 2026-08-04 (records-polish
+sweep: every file rechecked against disk, one duplicate row merged, ten
+stale lines refreshed — see the file's own history for detail). Statuses
+in play: **shipped arc** (built,
 closed, the file is now a design record), **active** (a living reference,
 edited as the project evolves), **draft** (proposed, not yet ratified or
 built), **deferred** (designed, deliberately not built, with a trigger),
@@ -18,22 +21,22 @@ is the historical record everything shipped gets moved into.
 
 | File | Status | Description |
 |---|---|---|
-| `affine-moves.md` | shipped arc (2026-08-04) | A body may only consume what it owns — the B60 loan-consumption rule; §6 holds the B63 find, §7 closes B62 (a pattern capture that owns a resource payload is destroyed). |
+| `affine-moves.md` | shipped arc (2026-08-04) | A consuming call is a move — the B60 loan-consumption rule (a body may only consume what it owns); §7 closes B62, §8 closes the B63 residuals, §9/§9.5 close the B65–B68 accounting holes. |
 | `ambient-owner.md` | shipped arc (2026-07-07) | The ambient owner / `comp` ergonomic layer over `std::reactive`. |
 | `analysis-reuse.md` | shipped arc (std-tax arc complete 2026-08-03) | The E3 arc: per-analysis leak closure, then incremental analysis via a cached, frozen std base. |
 | `analyzer-refactor.md` | design record (partially actioned) | A punch list of analyzer structural weaknesses behind a class of generic-inference bugs; several items done, the queue-v2/interning items unscheduled. |
 | `argument-tail-descent.md` | shipped arc (2026-08-01, backlog B43) | A statement's split descends through a call's last argument, matching `Split::Tail`. |
-| `async-polymorphism.md` | shipped arc (Parts A–B; Part C open, see backlog J1/J3) | Async polymorphism: `sync` contracts, adaptation by monomorphized asyncness, structured-concurrency scopes. |
+| `async-polymorphism.md` | shipped arc (Part A 2026-07-17, Part B 2026-07-18) | Async polymorphism: `sync` contracts, adaptation by monomorphized asyncness, structured-concurrency scopes; Part C (the parallelism spine) is a design record, deferred (backlog §J.1) with no driver application yet. |
 | `b33-emission-order.md` | shipped arc (2026-07-25) | Module-level binding emission in dependency order, cycles diagnosed. |
 | `backlog-2026-07-18.md` | active | The distilled open-work tracker — read this, not `backlog.md`, for what's outstanding. |
 | `backlog.md` | historical record | Superseded planning surface; every shipped item's full body lives here, including everything moved out of the distilled file. |
 | `bits-and-bytes.md` | shipped arc (2026-07-02) | The binary floor: hex literals, bitwise/shift operators, `std::bytes`. |
-| `bundle-splitting.md` | draft (2026-08-03) | Route-chunk splitting from whole-program reachability; S1 (measure-first) shipped as backlog A16, S2+ drafted here. |
+| `bundle-splitting.md` | shipped arc (2026-08-04) | Route-chunk splitting from whole-program reachability (A16); S1 (measure-first), S2 (emission + gate), S3 (loading), S4 (consumer sweep) all shipped — §5's v1 non-goals stand, §11 scopes a v2. |
 | `chain-seam-split.md` | shipped arc (2026-08-01, backlog B48) | A chain splits when a non-final link renders across lines, not just on width. |
 | `claims-and-epochs.md` | shipped / foundational (ratified 2026-07-18) | The one law behind the memory model (claim validity via epochs); frames C4 as the model's last major change. |
 | `compiler-bindings.md` | design record (idea sketch, unscheduled) | Unshaped idea for compiler-hosted bindings; not designed to the project's proposal bar. |
 | `composite-spanning-split.md` | shipped arc (2026-08-01, backlog B49) | A list/struct literal holding a spanning element splits regardless of width. |
-| `const-eval.md` | shipped arc (2026-07-10; tail tracked as backlog G2) | `const` as a compile-time-evaluation language feature, plus the asset-emission channel. |
+| `const-eval.md` | shipped arc (2026-07-10; G2 tail mostly shipped 2026-08-04; G3 shipped 2026-08-04) | `const` as a compile-time-evaluation language feature, the asset-emission channel, and inferred `const` folding (backlog G3, §9); G2's deep-failure spans and full LSP memoization remain open (§8). |
 | `destruction-impl-plan.md` | shipped arc (2026-07-19) | The C4 implementation ledger: all five Tier-1 destruction slices. |
 | `destruction.md` | shipped arc (Tier 1, 2026-07-19; Tier 2 tracked as backlog C1/F4) | Deterministic destruction — the owned-resource class, scope-end `Drop`. |
 | `diagnostics-ledger.md` | active (living ledger) | Every `diagnostics.push` site with its audit verdict; updated per audit batch. |
@@ -79,23 +82,29 @@ is the historical record everything shipped gets moved into.
 | `specification.md` | shipped (design record; the spec itself now lives in `vilan/docs/spec/`) | D1b, the language specification plan. |
 | `split-comment-attachment.md` | shipped arc (2026-08-01, backlog B41) | Mid-construct comments attach to the split element they precede instead of orphaning below the statement. |
 | `ssr.md` | shipped arc (v1, 2026-07-23); open tail, see backlog A7 | Server-side rendering — render and replace, not hydration. |
-| `suite-speed.md` | shipped arc (audit + slices, 2026-08-02) | The measured test-suite speed profile and the slice list that reclaimed it (E21/E25–E30). |
+| `suite-speed.md` | shipped arc (audit + slices, 2026-08-02; two flakes closed 2026-08-04) | The measured test-suite speed profile and the slice list that reclaimed it (E21/E25–E30); §5 closes two load-dependent flakes, harness clocks and a fixed port (E32/E33). |
 | `transparent-references.md` | shipped arc (2026-06-21) | Implicit place / explicit value semantics for references. |
 | `transport-robustness.md` | shipped arc (2026-07-11) | Reconnect, backoff, and re-subscription for the transport layer (K6). |
 | `transport-rpc.md` | shipped arc (implemented, the whole arc) | The transport/RPC library's model and philosophy (roadmap P6). |
-| `try-and-lift.md` | shipped arc (2026-07-04); tail tracked as backlog B11 | `!` and `?` — early return and lifted chains. |
+| `try-and-lift.md` | shipped arc (2026-07-04; B11 tail partly closed 2026-08-04) | `!` and `?` — early return and lifted chains; the bare-`?` trait path (§11) shipped 2026-08-04, closure `!` and `Signal`/`Promise` `Lift` opt-ins (§12) remain open, design-gated. |
 | `type-solver.md` | shipped / closed (design record) | Type-solver capability characterization (backlog B1) — analysis complete. |
-| `ui-styling.md` | shipped (core, 2026-07-10); tail tracked as backlog A8 | Typed atomic styles, compiled (`std::style`). |
+| `ui-styling.md` | shipped (core 2026-07-10; tail shipped 2026-08-04) | Typed atomic styles, compiled (`std::style`); the property tail (backlog A8), including value types, shipped 2026-08-04 — only the A7 (critical CSS) / G2 (dead-style elimination) pieces remain open. |
 | `validating-from-json.md` | shipped arc (2026-07-14); tail in backlog trailer | Per-type `from_json` returning `Result`, never garbage. |
-| `variadic-generics.md` | shipped (core); tail tracked as backlog B3 | Variadic generics via mapped tuples over flat storage. |
+| `variadic-generics.md` | shipped (core + spread parameters, 2026-08-04); tail tracked as backlog B3 | Variadic generics via mapped tuples over flat storage; §S spread parameters (`...items: T`) shipped 2026-08-04 (§S.9 ship record), `keyof`/elision remain deferred. |
 | `view-invalidation.md` | shipped arc (2026-07-09) | Views and invalidating events — rule 4 completed, `await` included (C3 + C2's static half). |
 | `watch-mode.md` | shipped arc (2026-07-02) | `--watch` mode across `build`/`check`/`test`/`run`. |
 | `web-playground.md` | shipped arc (live and complete 2026-08-02) | The compiler running in the visitor's browser (D11). |
 | `windows-support.md` | shipped arc (ratified + complete 2026-07-24) | First-class native Windows support for the toolchain. |
 | `std-surface.md` | shipped arc (v1 cut landed 2026-08-03; flagged tail open) | Std surface audit + the missing basics — List batch, clamp, the import steer (I4). |
-| `signal-update.md` | shipped arc | `Signal::update` — mutate in place, notify once (A18); design record + ship record, landed 2026-08-03. |
-| `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4). |
+| `signal-update.md` | shipped arc (2026-08-03) | `Signal::update` — mutate in place, notify once (A18); design record + ship record; two of §8's residuals (B61, A19) closed 2026-08-04. |
+| `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4) — P2/P3/P4 now fixed (B55/B56/B58), P1 and the adapter slices themselves (S1–S7) still unbuilt. |
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
-| `capture-clones.md` | shipped arc | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
-| `affine-moves.md` | shipped arc | A consuming call is a move — the B60 completion record: a body may only consume what it OWNS, and `Option`'s combinators take `own self`. |
+| `capture-clones.md` | shipped arc (2026-08-03) | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
+
+**Not yet in this directory, in flight:** `optimistic-lifecycle.md` (A14's
+remaining "optimistic-write → reconcile lifecycle" bullet) is drafted on the
+concurrent `optimistic-lifecycle` branch (476 lines, not yet merged as of
+this sweep) — no row above because there is no file on disk here yet; add
+one when it lands. The backlog's A14 entry (`backlog-2026-07-18.md`) still
+correctly shows that bullet as open.
