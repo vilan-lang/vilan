@@ -6,6 +6,14 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`List` grows the methods everyone was hand-rolling.** `join` (reinvented at six separate sites, three of them inside the standard library itself), `find` (the predicate search four call sites wrote out longhand, now short-circuiting), `contains` and `index_of` for value search, `reverse`, `sort` and `sort_by`, and positional `insert`/`remove`. `sort`/`sort_by` are **stable** — elements the comparator calls equal keep their input order — and, like `map`/`filter`, every one of the pure methods returns a new list and leaves the receiver alone. `insert`/`remove` panic on an out-of-range index in exactly the words `list[i]` already uses: a bad index is a caller bug, and `get` remains the total, `Option`-returning way to ask. `f64` and `f32` also gain `clamp`, which the integers have always had from `Ord` and the floats — deliberately not `Ord`, because NaN — had not.
+
+**"`i32` has no method `to_string`" now says what to import.** The standard library loads lazily, so an `impl` only registers once something pulls its file in — which made `42.to_string()` fail with a flat "no method" even though `std::display::Display` implements it. That error now names the fix: ``i32 has no method 'to_string'; import std::display::Display to use it (`import std::display::Display;`)``. It works for any method a std trait provides on the type you called it on, and stays silent when the method genuinely does not exist. `List.join` is the one new method with a bound that strands it outside the always-loaded core, so it gets the same steer.
+
+---
+
 ## v0.23.6 — 2026-08-03
 
 **Destructure and `match` captures are now true copies.** Binding a piece of a value — `let (xs, n) = pair`, `Some(let inner) => …` — used to share the underlying storage with the source: growing `pair.0` showed through `xs`, mutating a `mut` capture wrote back into the source, and a returned capture (`option.unwrap()`) handed the caller a live alias into the option's payload. All three now copy, per the value-semantics rule every other binding already followed. Two elisions keep the cost where it belongs: a read-only capture from an immutable source still shares (recursive walkers like SSR rendering stay linear), and destructuring a temporary that dies on the spot moves instead of copying.

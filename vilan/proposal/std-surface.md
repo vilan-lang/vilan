@@ -1,13 +1,19 @@
 # The std surface audit — the ranked gap list (I4)
 
-> **Status: AUDIT, drafted 2026-08-03** (user request 2026-08-03,
-> `backlog-2026-07-18.md` §I.4). Audit slice only — nothing here is
-> implemented. Every method count below was read from
-> `vilan/std/src/*.vl` today, not carried over from the backlog entry
-> (which drifted on one point — see §1.1). Every demand citation is a
-> `file:line` in the current tree; the diagnostic repro in §5 was run
-> against a debug build of this worktree, not assumed from the bug
-> report.
+> **Status: v1 SHIPPED, 2026-08-03** (audit drafted 2026-08-03; user
+> request 2026-08-03, `backlog-2026-07-18.md` §I.4). Every row §3's table
+> marks v1 — rows 1–9 — is implemented, pinned, and documented. §7 below
+> records what shipped where, what the implementation decided that the
+> audit left open, and the two findings the implementation turned up.
+> The audit body (§0–§6) is left as written: it is the record of what was
+> true before the change, and §7 states every place the implementation
+> diverged from it.
+>
+> Every method count in §1 was read from `vilan/std/src/*.vl` at audit
+> time, not carried over from the backlog entry (which drifted on one
+> point — see §1.1). Every demand citation is a `file:line` in the tree
+> as of the audit; the diagnostic repro in §5 was run against a debug
+> build of this worktree, not assumed from the bug report.
 
 ## 0. The thesis
 
@@ -641,3 +647,131 @@ Each slice ships suite-gated per `CLAUDE.md` (docs-fence test for any
 std change, corpus test for anything touching codegen, a pinned
 regression per new method, the ledger update in the same commit as the
 diagnostic).
+
+## 7. What shipped (implementation record, 2026-08-03)
+
+### 7.1 Placement — the visibility story, asserted
+
+Placement was treated as part of the contract, not an afterthought: §1.1's
+lesson is that a method's discoverability is an accident of which file it
+lives in, so each method went into the module that makes the common case
+visible from a plain `List` import, and the resulting behaviour is
+pinned rather than assumed.
+
+| Method | File | Block | Visible without an import? |
+|---|---|---|---|
+| `reverse`, `insert`, `remove` | `std/src/list.vl` | the main `impl List<type T>` | yes (always-loaded core) |
+| `find` | `std/src/option.vl` | the existing second `impl List<type T>` | yes (reached transitively via `list.vl`'s own `import pkg::option::Option`) |
+| `sort_by` | `std/src/compare.vl` | new `impl List<type T>` (`external`) | yes (`compare` is always loaded) |
+| `sort` | `std/src/compare.vl` | new `impl List<type T: Ord>` | yes |
+| `contains`, `index_of` | `std/src/compare.vl` | new `impl List<type T: PartialEq>` | yes |
+| `join` | `std/src/display.vl` | new `impl List<type T: Display>` | **no** — the `Display` bound strands it |
+| `clamp` | `std/src/number.vl` | the existing `impl f64` and `impl f32` | yes |
+
+`compare.vl` was chosen over `list.vl` for the four bounded/ordering
+methods for the reason §1.1 gives: `list.vl` must stay off the chains its
+neighbours would drag in, and an `impl` block does not need to share a
+module with the type it extends (the precedent `then_some`/`parse_i32`/
+`get` already set). `compare` is in the always-loaded core set, so the
+placement costs nothing in visibility.
+
+`join` is the one exception, and it is the exception the audit predicted:
+its bound is `Display`, `display.vl` is outside the always-loaded set, and
+moving `Display` into that set (by importing it from `list.vl`) would make
+the whole steering diagnostic below unreachable while permanently widening
+the always-loaded core. The steer is the mitigation, and
+`the_join_miss_steers_to_the_display_import` pins that a `List`-only
+program calling `.join(..)` gets told exactly what to import.
+
+`the_std_surface_batch_needs_no_import` pins the other half: a program
+whose only import is `print` reaches `reverse`, `sort`, `sort_by`,
+`contains`, `index_of`, `find`, `insert`, `remove` and `clamp`.
+
+### 7.2 Decisions the audit left open
+
+- **`insert`/`remove` are pure `.vl`, not a `splice` intrinsic** (§3.2
+  left this to "the implementation slice … with a benchmark"). They shift
+  the tail through the existing subscript, guarding the index and calling
+  `io::panic` with `[]`'s exact wording. Rationale: §2.4 found **zero**
+  corpus demand for either, so an O(n) shuffle is not on any hot path
+  worth widening the intrinsic surface for; the sanctioned compiler work
+  for this slice was the `sort_by` intrinsic and the diagnostic, and
+  spending more of it on an unmeasured cost would be speculative. Should a
+  profile ever show it, the swap is local: an `external` declaration plus
+  a `__list_splice` helper, with the pins unchanged.
+- **`sort_by` IS an intrinsic**, as §3.1 specified: `Intrinsic::ListSortBy`
+  → `__list_sort_by(list, compare)` → `list.slice().sort(compare)`.
+  Stability comes free from ECMA-262 (stable since ES2019) and is pinned
+  independently (`list_sort_by_is_stable`, `vilan/test/list-sort.vl`).
+  `Ordering` is a numeric enum lowering to `-1`/`0`/`1`, which is already
+  the host comparator contract, so the vilan closure passes straight
+  through with no adapter. The tree-walking interpreter cannot host the
+  comparator in `Vec::sort_by` (it needs `&mut self` and can fail), so it
+  implements the same helper as an explicit **bottom-up merge sort**,
+  stable by construction — and the corpus interpreter differential
+  (`list-sort.vl`) is what keeps the two agreeing.
+- **The steer needs no "is that module already loaded?" guard.** One was
+  written and then removed as unreachable: once the providing module is
+  loaded its `impl` blocks are registered, so the call either resolves or
+  — when the impl is bounded and the bound fails — reports the *bound*, at
+  the bound's own site, never reaching the `NoMethod` arm. Pinned by
+  `an_unsatisfied_bound_is_reported_as_a_bound_not_as_a_steered_miss`. The
+  guard was also actively wrong for a *user* module that happens to share a
+  std module's name, which would have silenced a legitimate steer.
+- **The steer's index keys on trait names AND inherent bounds.** §5.3
+  proposed indexing `impl X with Trait` only. That is not enough: `join`
+  is an *inherent* `impl List<type T: Display>` with no `with` clause, and
+  it is precisely the method that needs the steer. The walk therefore
+  offers the impl's trait names first and falls back to the bounds on the
+  subject's own `type X` binders — and, either way, only names something
+  the containing module actually declares, so the steer can never suggest
+  importing a name from a module that merely mentions it. Blanket
+  (`impl type T`) subjects are skipped: they have no nominal head and
+  would match every type in the program.
+
+### 7.3 The hygiene nit (§1.1), cleaned
+
+`pop` was declared twice, identically, in `list.vl:17` and `option.vl:277`.
+The `option.vl` copy is gone; `list.vl`'s — the one carrying the doc
+comment that explains the intrinsic — stays. Harmless as predicted: the
+intrinsic table keys on the declaration id found in *any* `impl List` block,
+so one declaration is enough, and the corpus goldens (including
+`list-get-pop.js`, which exercises `pop` directly) are byte-identical
+across the change.
+
+### 7.4 Two findings
+
+- **`sort_by` inherits `map`/`filter`'s element aliasing.** A struct
+  element of the list `sort_by` returns is the *same* runtime value as the
+  corresponding element of the receiver, so writing through one shows in
+  the other. This is **not new**, and not specific to `sort_by`: `map` and
+  `filter` behave identically today (verified on the pre-change tree —
+  `xs.filter(|c| true)` then writing to the result's element 0 changes
+  `xs[0]`). `sort_by` was left consistent with them rather than made
+  unilaterally stricter, since the root cause is one shared hole in how
+  `List`'s pure methods handle value semantics, and fixing it belongs in
+  that arc, not in I4. (The new `reverse` happens *not* to alias, because
+  it rebuilds through `push`.) **Recorded as a real gap, deferred with
+  this note** — it wants its own slice.
+- **`docs/std/collections.md` had never documented `get`/`first`/`last`.**
+  §1.1 corrected the backlog on their existence; the docs page had the same
+  blind spot. They are in the fragment now, alongside the new methods.
+
+### 7.5 Deferred, unchanged
+
+`enumerate`/`zip`, `take`/`skip`, `List: Iterable<T>` and slicing are all
+exactly where §4 left them — out of I4, flagged for I3 (or I2, for
+slicing). Nothing in this implementation touched or pre-empted any of
+their names. The `Map`/`Set` parity gaps of §1.2 remain unranked: the
+sweep found no demand, and none appeared while implementing.
+
+### 7.6 Coverage
+
+New pins: 24 in `crates/vilan-core/tests/inference.rs` (byte-exact stdout
+via `assert_compiles_and_runs`, panic text via `assert_run_panics`, span +
+message via `assert_fails_spanning`), plus four corpus fixtures with
+goldens — `vilan/test/list-search.vl`, `list-sort.vl`, `list-splice.vl`,
+`list-join.vl` — and `clamp` appended to `vilan/test/number-math.vl`. The
+corpus fixtures also carry the intrinsic through the interpreter
+differential. Docs: `docs/std/collections.md` (four new compiled examples)
+and `docs/std/numbers.md` (one). Ledger: row 212.
