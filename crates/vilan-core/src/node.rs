@@ -112,8 +112,8 @@ pub struct Func<'src> {
 }
 
 /// A parsed parameter: binder, optional declared type, how it receives its
-/// argument (rule 3 conventions), binder mutability, and the binder's span
-/// (for go-to-definition / hover in the language server).
+/// argument (rule 3 conventions), binder mutability, spread-ness, and the
+/// binder's span (for go-to-definition / hover in the language server).
 #[derive(Debug)]
 pub struct Parameter<'src> {
     /// The binder: a plain name (`x`) or a tuple destructure (`(a, b)`).
@@ -124,6 +124,14 @@ pub struct Parameter<'src> {
     /// (proposal/mut-parameters.md). Exclusive with `own`/`&`/`&mut`,
     /// never part of the signature.
     pub mutable: bool,
+    /// `...items: T` — a SPREAD parameter (proposal/variadic-generics.md §S):
+    /// the call site writes the pack's elements out flat and they are collected
+    /// into this one tuple argument. `fun f(...items: T) {b}` is
+    /// `fun f(items: T) {b}` with `f(a, b)` meaning `f((a, b))`, so the callee
+    /// side is an ORDINARY tuple parameter — `...` is a call convention. Last
+    /// parameter only, at most one, must declare its type, plain name binder,
+    /// no rule-3 convention. Unlike `mut`, it IS part of the signature.
+    pub spread: bool,
     pub span: Span,
 }
 

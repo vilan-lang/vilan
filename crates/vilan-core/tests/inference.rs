@@ -23552,6 +23552,655 @@ fn a_struct_construction_checks_its_tuple_bound() {
     );
 }
 
+// --- Spread parameters (`fun log(...items: T)`; backlog B3,
+// --- proposal/variadic-generics.md §S). `...` is a CALL CONVENTION over an
+// --- ordinary tuple parameter: `fun f(...items: T) {b}` is `fun f(items: T)
+// --- {b}` with `f(a, b)` meaning `f((a, b))`. Every pin below is the desugar
+// --- plus something that already held of tuples — which is the point.
+
+/// The collected arguments land in the pack's slots IN ORDER — read back
+/// positionally at a concrete pack type. (A pack that is still an abstract
+/// `T` cannot be indexed; see the note at the end of this block.)
+#[test]
+fn a_spread_call_collects_its_arguments_into_the_pack() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun middle(...items: (i32, i32, i32)): i32 {
+            items.1
+        }
+        fun main() {
+            print(middle(4, 5, 6));
+        }
+        "#,
+        "5\n",
+    );
+}
+
+/// One monomorphization per arity, including the two arities SOURCE SYNTAX
+/// cannot write as a value: the empty pack `()` and the one-tuple `(x)`. A
+/// spread parameter is the first thing in the language that can produce them.
+#[test]
+fn a_spread_parameter_accepts_every_arity_its_bound_admits() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun width<T: (..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            print(width());
+            print(width(1));
+            print(width(1, 2));
+            print(width("a", true, 3, 4));
+        }
+        "#,
+        "1\n1\n1\n1\n",
+    );
+}
+
+/// The empty pack emits the empty tuple, and the one-element pack a
+/// one-element one — the flat storage the tuple form already uses.
+#[test]
+fn the_empty_and_one_element_packs_emit_their_tuples() {
+    let source = r#"
+        import std::print;
+        fun width<T: (..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            print(width());
+            print(width(9));
+        }
+        "#;
+    assert_emits_containing(source, "([  ])");
+    assert_emits_containing(source, "([ 9 ])");
+}
+
+/// Fixed parameters are matched positionally first; the spread takes the rest.
+#[test]
+fn a_spread_follows_the_fixed_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun after<T: (..)>(head: i32, ...rest: T): i32 {
+            head
+        }
+        fun main() {
+            print(after(1));
+            print(after(2, 3, 4));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+/// Fewer arguments than there are FIXED parameters says "at least" — a
+/// variadic signature has no exact count to name.
+#[test]
+fn too_few_arguments_for_the_fixed_parameters_says_at_least() {
+    assert_fails_with(
+        r#"
+        fun after<T: (..)>(head: i32, ...rest: T): i32 {
+            head
+        }
+        fun main() {
+            after();
+        }
+        "#,
+        "Expected at least 1 argument, but got 0 instead.",
+    );
+}
+
+/// Arity is INHERITED from the tuple bound, not reinvented: the shipped check
+/// fires on the collected pack, note and all.
+#[test]
+fn a_spread_call_below_the_arity_bound_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun pair_up<T: (2..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            pair_up(1);
+        }
+        "#,
+        "'(i32)' has 1 element: the bound '(2..)' requires at least 2",
+    );
+}
+
+#[test]
+fn a_spread_call_above_the_arity_bound_is_rejected() {
+    assert_fails_with(
+        r#"
+        fun at_most_two<T: (..2)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            at_most_two(1, 2, 3);
+        }
+        "#,
+        "has 3 elements: the bound '(..2)' allows at most 2",
+    );
+}
+
+/// Inference THROUGH the pack: each collected argument's type unifies into
+/// `T`'s elements, and the element bound is checked per element.
+#[test]
+fn a_spread_pack_unifies_its_elements_against_the_element_bound() {
+    assert_fails_with(
+        r#"
+        trait Label {
+            fun label(self): str;
+        }
+        struct Tag {}
+        impl Tag with Label {
+            fun label(self): str {
+                "tag"
+            }
+        }
+        struct Plain {}
+        fun labelled<T: (..: Label)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            labelled(Tag {}, Plain {});
+        }
+        "#,
+        "does not implement trait 'Label'",
+    );
+}
+
+#[test]
+fn conforming_elements_pass_a_spread_element_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Label {
+            fun label(self): str;
+        }
+        struct Tag {}
+        impl Tag with Label {
+            fun label(self): str {
+                "tag"
+            }
+        }
+        fun labelled<T: (..: Label)>(...items: T): i32 {
+            7
+        }
+        fun main() {
+            print(labelled(Tag {}, Tag {}));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The payoff: a MAPPED pack. `gather(a, b)` inverts `(U in T: Signal<U>)`
+/// against the collected `(Signal<i32>, Signal<str>)` to recover
+/// `T = (i32, str)` — the shipped inversion, reached through the spread.
+#[test]
+fn a_mapped_spread_pack_inverts_to_its_source_tuple() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {
+            let snapshot = || (source in sources => source.get());
+            let derived = Signal::new(snapshot());
+            let subscriptions = (source in sources => source.sub(|_| {
+                derived.set(snapshot());
+            }));
+            derived
+        }
+        fun main() {
+            let count = Signal::new(10);
+            let name = Signal::new("hi");
+            let both = gather(count, name);
+            print(both.get().0);
+            count.set(11);
+            print(both.get().0);
+            print(both.get().1);
+        }
+        "#,
+        "10\n11\nhi\n",
+    );
+}
+
+/// Emission has no spread path of its own: a call emits the flat tuple
+/// construction the tuple form already emitted, and a TUPLE-TYPED argument
+/// splices its slots in rather than nesting.
+#[test]
+fn a_spread_call_emits_the_flat_tuple_construction() {
+    assert_emits_containing(
+        r#"
+        import std::print;
+        fun width<T: (..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            let inner = (4, 5);
+            print(width(inner, 6));
+        }
+        "#,
+        "([ ...inner, 6 ])",
+    );
+}
+
+/// `mut` is binder mutability, not a convention, and the collected tuple is
+/// the callee's own value — so the desugar carries it through (§S.5).
+#[test]
+fn a_spread_parameter_may_be_declared_mut() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun rebind<T: (..)>(mut items: T, n: i32): i32 {
+            n
+        }
+        fun swap_pack(mut ...items: (i32, i32)): i32 {
+            items = (8, 9);
+            items.0
+        }
+        fun main() {
+            print(rebind((1, 2), 3));
+            print(swap_pack(1, 2));
+        }
+        "#,
+        "3\n8\n",
+    );
+}
+
+/// §S.8: the convention lives on the DECLARATION, so a spread function used as
+/// a VALUE has its tuple type — and the callback calls it with a tuple.
+#[test]
+fn a_spread_function_passed_as_a_value_has_the_tuple_form() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun count(...items: (i32, i32)): i32 {
+            items.0
+        }
+        fun apply(f: sync |(i32, i32)| i32): i32 {
+            f((4, 5))
+        }
+        fun main() {
+            print(count(1, 2));
+            print(apply(count));
+        }
+        "#,
+        "1\n4\n",
+    );
+}
+
+/// §S.8: choosing `...` chooses the convention. A tuple written at a spread
+/// call site is collected like every argument — into a ONE-element pack.
+#[test]
+fn a_tuple_written_at_a_spread_call_becomes_a_one_element_pack() {
+    assert_fails_with(
+        r#"
+        fun pair_up<T: (2..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            let pair = (1, 2);
+            pair_up(pair);
+        }
+        "#,
+        "'((i32, i32))' has 1 element: the bound '(2..)' requires at least 2",
+    );
+}
+
+// --- The refusals (§S.3, §S.5, §S.6, §S.7). Each carries its own steer;
+// --- pinning the message keeps the steer from rotting into a bare rejection.
+
+#[test]
+fn a_spread_must_be_the_last_parameter() {
+    assert_fails_with(
+        r#"
+        fun misplaced<T: (..)>(...items: T, extra: i32): i32 {
+            extra
+        }
+        fun main() {
+            misplaced(1, 2);
+        }
+        "#,
+        "must be the last parameter (and there can be only one)",
+    );
+}
+
+#[test]
+fn two_spread_parameters_are_rejected() {
+    assert_fails_with(
+        r#"
+        fun twice<A: (..), B: (..)>(...first: A, ...second: B): i32 {
+            1
+        }
+        fun main() {
+            twice(1, 2);
+        }
+        "#,
+        "must be the last parameter (and there can be only one)",
+    );
+}
+
+#[test]
+fn a_spread_parameter_refuses_a_convention() {
+    for prefix in ["own ", "&", "&mut "] {
+        assert_fails_with(
+            &format!(
+                r#"
+                fun taken<T: (..)>({prefix}...items: T): i32 {{
+                    1
+                }}
+                fun main() {{
+                    taken(1);
+                }}
+                "#
+            ),
+            "so there is nothing for `own` or a view (`&`, `&mut`) to transfer or alias",
+        );
+    }
+}
+
+/// The convention may also arrive from the TYPE (`...items: &T`), which is the
+/// arm that would otherwise slip past a prefix-only check.
+#[test]
+fn a_spread_parameter_refuses_a_view_type() {
+    assert_fails_with(
+        r#"
+        fun viewed(...items: &(i32, i32)): i32 {
+            1
+        }
+        fun main() {
+            viewed(1, 2);
+        }
+        "#,
+        "so there is nothing for `own` or a view (`&`, `&mut`) to transfer or alias",
+    );
+}
+
+#[test]
+fn a_spread_parameter_must_declare_its_pack_type() {
+    assert_fails_with(
+        r#"
+        fun untyped(...items): i32 {
+            1
+        }
+        fun main() {
+            untyped(1);
+        }
+        "#,
+        "a spread parameter must declare its pack type",
+    );
+}
+
+#[test]
+fn a_spread_parameter_refuses_a_destructuring_binder() {
+    assert_fails_with(
+        r#"
+        fun split(...(head, tail): (i32, i32)): i32 {
+            head
+        }
+        fun main() {
+            split(1, 2);
+        }
+        "#,
+        "binds the whole pack to a plain name; destructure it in the body",
+    );
+}
+
+/// §S.6 — decided, not silent. A closure TYPE has no variadic form, so a
+/// variadic closure could not be annotated, stored, or passed anywhere.
+#[test]
+fn a_closure_refuses_a_spread_parameter() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let log = |...items: (i32, i32)| items.0;
+        }
+        "#,
+        "a closure cannot take a spread parameter",
+    );
+}
+
+/// §S.7 — unlike `mut`, `...` IS part of the signature, so conformance may not
+/// see a trait declaration and its impl disagree about it. Refused at BOTH.
+#[test]
+fn a_trait_method_declaration_refuses_a_spread_parameter() {
+    assert_fails_with(
+        r#"
+        trait Log {
+            fun emit<T: (..)>(self, ...items: T): i32;
+        }
+        fun main() {}
+        "#,
+        "a spread parameter is only available on a free `fun`",
+    );
+}
+
+#[test]
+fn a_trait_impl_method_refuses_a_spread_parameter() {
+    assert_fails_with(
+        r#"
+        trait Log {
+            fun emit(self, items: (i32, i32)): i32;
+        }
+        struct Console {}
+        impl Console with Log {
+            fun emit(self, ...items: (i32, i32)): i32 {
+                items.0
+            }
+        }
+        fun main() {}
+        "#,
+        "a spread parameter is only available on a free `fun`",
+    );
+}
+
+#[test]
+fn an_inherent_method_refuses_a_spread_parameter() {
+    assert_fails_with(
+        r#"
+        struct Console {}
+        impl Console {
+            fun emit<T: (..)>(self, ...items: T): i32 {
+                1
+            }
+        }
+        fun main() {}
+        "#,
+        "a spread parameter is only available on a free `fun`",
+    );
+}
+
+/// Memberhood belongs to the impl/trait ITEM LIST, not to everything
+/// lexically inside it: a free `fun` declared in a member's body is still a
+/// free `fun`, and takes a spread like any other.
+#[test]
+fn a_function_nested_in_a_member_body_still_takes_a_spread() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point {
+            x: i32,
+        }
+        impl Point {
+            fun go(self): i32 {
+                fun helper(...items: (i32, i32)): i32 {
+                    items.1
+                }
+                helper(1, 2)
+            }
+        }
+        fun main() {
+            print(Point { x = 0 }.go());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn an_external_fun_refuses_a_spread_parameter() {
+    assert_fails_with(
+        r#"
+        external fun host_log(...items: (i32, i32)): i32;
+        fun main() {}
+        "#,
+        "an `external fun` binds a host function, whose calling convention is the host's",
+    );
+}
+
+/// §S.4 — the OTHER direction is deferred, not quietly accepted: spreading a
+/// tuple INTO a spread parameter needs the tuple-value spread `(..a, b)`,
+/// which the variadic arc designed and never built.
+#[test]
+fn spreading_a_tuple_at_the_call_site_is_not_a_thing_yet() {
+    assert_fails(
+        r#"
+        fun pair_up<T: (2..)>(...items: T): i32 {
+            1
+        }
+        fun main() {
+            let pair = (1, 2);
+            pair_up(..pair);
+        }
+        "#,
+    );
+}
+
+/// A spread parameter is a plain tuple parameter from the inside, so
+/// forwarding the pack to a tuple-parameter callee just works — which is also
+/// how a pack is forwarded at all, the caller direction being deferred (§S.4).
+#[test]
+fn a_pack_forwards_to_a_tuple_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun inner(items: (i32, i32)): i32 {
+            items.0
+        }
+        fun outer(...items: (i32, i32)): i32 {
+            inner(items)
+        }
+        fun main() {
+            print(outer(3, 4));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// An unannotated closure argument makes the call-subject constraint DEFER and
+/// retry, so this is the collection running more than once for one call: each
+/// closure takes its type from the pack's declared slot, and the pack that
+/// finally wires is the one the arguments were typed against.
+#[test]
+fn unannotated_closures_in_a_pack_type_from_their_slots() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply_both(...items: (|i32| i32, |i32| i32)): i32 {
+            items.0(1) + items.1(2)
+        }
+        fun main() {
+            print(apply_both(|n| n + 10, |n| n * 3));
+        }
+        "#,
+        "17\n",
+    );
+}
+
+/// A spread call inside a GENERIC function: the pack is collected once per
+/// instantiation, so `T` is a different tuple in each.
+#[test]
+fn a_spread_call_inside_a_generic_collects_per_instantiation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun width<T: (..)>(...items: T): i32 {
+            1
+        }
+        fun through<A>(value: A): i32 {
+            width(value, 5)
+        }
+        fun main() {
+            print(through("s"));
+            print(through(7));
+        }
+        "#,
+        "1\n1\n",
+    );
+}
+
+/// A PRE-EXISTING limit the pack inherits, pinned here so it is on the record
+/// rather than mistaken for a spread bug: positional access on a pack that is
+/// still an abstract tuple-bounded `T` is refused, because the body
+/// type-checks once before any arity is known. It fails identically on the
+/// tuple form (`fun first<T: (2..)>(items: T) { items.0 }`), so the desugar
+/// reproduces today's behaviour faithfully. A concrete pack type indexes
+/// fine; a mapped pack is reached with a comprehension.
+#[test]
+fn positional_access_on_an_abstract_pack_is_refused_as_it_is_on_a_tuple() {
+    assert_fails_with(
+        r#"
+        fun first<T: (2..)>(...items: T): i32 {
+            items.0
+        }
+        fun main() {
+            first(1, 2);
+        }
+        "#,
+        "cannot access field '0' on type T",
+    );
+    assert_fails_with(
+        r#"
+        fun first<T: (2..)>(items: T): i32 {
+            items.0
+        }
+        fun main() {
+            first((1, 2));
+        }
+        "#,
+        "cannot access field '0' on type T",
+    );
+}
+
+/// The second PRE-EXISTING limit, likewise pinned beside its tuple-form twin: a
+/// comprehension's source must be a MAPPED tuple, so a bare element-bounded
+/// pack has no way to iterate its elements and the element bound has no
+/// consumer of its own. Unchanged by the spread — the mapped form (`gather`
+/// above) is what a comprehension reaches.
+#[test]
+fn a_comprehension_over_a_bare_pack_still_needs_a_mapped_source() {
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        fun render<T: (..: Display)>(...items: T): i32 {
+            let rendered = (item in items => item.to_string());
+            1
+        }
+        fun main() {
+            render(1, 2);
+        }
+        "#,
+        "a tuple comprehension's source must be a mapped tuple",
+    );
+    assert_fails_with(
+        r#"
+        import std::display::Display;
+        fun render<T: (..: Display)>(items: T): i32 {
+            let rendered = (item in items => item.to_string());
+            1
+        }
+        fun main() {
+            render((1, 2));
+        }
+        "#,
+        "a tuple comprehension's source must be a mapped tuple",
+    );
+}
+
 // --- J2 value-flow asyncness: the marker on fields and return types,
 // --- adoption for unannotated bindings, and the divergence refusals
 // --- (backlog J2 "REMAINING" channels — closing the static-type/runtime-

@@ -1814,6 +1814,12 @@ impl<'src> Printer<'src> {
                 Convention::RefMut if !type_is_reference => self.out.push_str("&mut "),
                 _ => {}
             }
+            // `...items` — the spread marker binds to the binder, after any
+            // prefix (variadic-generics.md §S). Refused alongside a convention,
+            // so only `mut` can precede it.
+            if parameter.spread {
+                self.out.push_str("...");
+            }
             self.print_binder(binder);
             if let Some(parameter_type) = parameter_type {
                 self.out.push_str(": ");
@@ -4124,6 +4130,30 @@ mod bailing_constructs {
         assert_construct(
             "fun bounds<A: (..10), B: (..: Display), C: (2..4: Display)>() {\n\tbody()\n}\n",
             "fun bounds<A: (..10), B: (..: Display), C: (2..4: Display)>() {\n\tbody()\n}\n",
+        );
+    }
+
+    /// `...items: T` — a spread parameter (variadic-generics.md §S). The marker
+    /// is three `.` control tokens with no node of its own, so a dropped one is
+    /// silent token drift; `mut` may precede it, and the pack type is mandatory
+    /// so it always reprints too.
+    #[test]
+    fn spread_parameters() {
+        assert_construct(
+            "fun log<T: (..: Display)>(...items: T): i32 {\n\t0\n}\n",
+            "fun log<T: (..: Display)>(...items: T): i32 {\n\t0\n}\n",
+        );
+        assert_construct(
+            "fun tail<T: (2..)>(sep: str, mut ...rest: T): i32 {\n\t0\n}\n",
+            "fun tail<T: (2..)>(sep: str, mut ...rest: T): i32 {\n\t0\n}\n",
+        );
+        assert_construct(
+            "fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {\n\
+             \tSignal::new(sources)\n\
+             }\n",
+            "fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {\n\
+             \tSignal::new(sources)\n\
+             }\n",
         );
     }
 

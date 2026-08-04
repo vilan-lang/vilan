@@ -236,7 +236,9 @@ with the binders that already shipped.
   recompute form and needs none of this.
 - **Spread parameters — `fun f(...items: T)` / `f(1, "hi", true)`** — a second,
   varargs call convention alongside the single-tuple `combine((a, b, c))` form.
-  Orthogonal; the core ships only the tuple-argument form.
+  Orthogonal; the core ships only the tuple-argument form. **Designed and
+  SHIPPED — §S below.** This entry was a two-sentence sketch: it named the
+  surface and nothing else. §S settles it.
 - **Copy elision on flatten** — reuse a dead source operand in place
   (`const b = [a[0], a[1], 3]` without copying `a`). Needs liveness/move analysis;
   correctness holds without it (it just copies).
@@ -289,3 +291,230 @@ types + inference → comprehensions + tuple `for` → `combine` in std. Defer
 `keyof`/indexed-write, spread parameters, and copy elision until a second caller
 or a measured need justifies them. See `variadic-generics-plan.md` for the staged
 plan.
+
+---
+
+# §S Spread parameters
+
+Status: SHIPPED 2026-08-04 (backlog B3's implementable slice). §Deferred named
+the surface (`fun f(...items: T)` / `f(1, "hi", true)`) and stopped; this
+section settles it. Semantics are settled **by desugar**, as `mut` parameters
+were (`mut-parameters.md` §2) — every ruling below is read off the desugar
+rather than chosen separately. §S.9 records the implementation.
+
+## S.1 The desugar
+
+```vilan
+fun f(...items: T) { body }    ≡    fun f(items: T) { body }
+f(a, b, c)                     ≡    f((a, b, c))
+```
+
+**`...` is a call convention, not a type.** The callee is untouched: a spread
+parameter *is* a tuple parameter, with the same declared type, the same binding,
+the same storage, the same emitted JavaScript. All `...` says is that the call
+site writes the tuple's elements out flat instead of writing the tuple. Under
+the desugar the core's whole existing pack machinery — arity bounds, element
+bounds, mapped types, comprehensions, flat storage, inverted inference — applies
+unchanged, because it is applying to the very same tuple parameter it always
+was.
+
+This is the one design decision everything else follows from, and it is what
+makes the feature affordable: no sibling mechanism to the pack, no second arity
+system, no new type.
+
+## S.2 What `T` is: the pack, not the element
+
+In `fun log<T: (..: Display)>(...items: T)`, **`T` is the pack** — the tuple of
+all the collected arguments' types — exactly as `combine`'s `T` is. It is *not*
+each element's type and there is no homogeneous-varargs form:
+
+```vilan
+log(1, "hi", true)      //  T = (i32, str, bool)   — heterogeneous, by construction
+```
+
+The element bound is where a *uniform* requirement is spelled (`(..: Display)`),
+which is the same place the tuple form spells it. A "`T` is the element type"
+reading would have been a different feature — a homogeneous `List<T>` varargs —
+and it is deliberately not this one: it would not lower to the pack, so it would
+be a sibling mechanism rather than sugar.
+
+The declared type may be anything the pack machinery already accepts:
+
+```vilan
+fun log<T: (..: Display)>(...items: T)                  // a bounded pack
+fun combine<T: (2..)>(...sources: (U in T: Signal<U>))  // a mapped pack
+fun pair(...xy: (i32, str))                             // a concrete tuple
+```
+
+The mapped form is the payoff: `combine(a, b)` instead of `combine((a, b))`,
+with `T` recovered by the shipped inversion (§Inference) and no change to
+`combine`'s body.
+
+## S.3 Arity: inherited, not invented
+
+Nothing here is a new rule; each is the desugar plus something that already
+holds of tuples.
+
+- **The spread parameter must be last**, and there is therefore at most one per
+  signature. Collection has no other end. (*Parse-adjacent error.*)
+- **It must declare its type.** The pack is what the collection produces, so it
+  cannot be inferred from the collection. (*Parse-adjacent error.*)
+- **Its binder is a plain name.** `...(a, b): T` is refused: destructuring the
+  pack in the signature hides the arity rule the call site has to satisfy.
+  Destructure in the body. (*Parse-adjacent error.*)
+- **The legal call arities are exactly the arities the parameter's type
+  admits** — decided by the shipped tuple-bound check, not by anything new.
+  `T: (2..)` refuses `f(x)`; `T: (..10)` refuses an eleventh argument;
+  `T: (..)` accepts `f()`, the **empty pack** `()`; a concrete `(i32, str)`
+  accepts exactly two. A spread parameter is what makes 0- and 1-arity tuples
+  reachable at all — source syntax cannot write `()` or `(x)` as a value — and
+  they behave as the type system already says they do (§S.9 records the probe).
+- **The fixed parameters ahead of it are matched positionally first.** Fewer
+  arguments than there are fixed parameters is an arity error in its own right,
+  and says `at least`, because there is no upper bound to name.
+
+## S.4 The other direction — spreading a tuple INTO a spread parameter
+
+**Deferred, refused with a steer, not silently mis-parsed.**
+
+`f(..existing)` is the natural companion — forward a pack you already hold — and
+under the desugar it is exactly `f((..existing))`. That is a **tuple-value
+spread**, which §Surface syntax describes (`(..a, b)`) and which *was never
+built*: there is no spread node in the AST, no parser production, no type rule
+for it. Shipping the caller direction therefore means shipping tuple-value
+spread first — its own slice, with its own type rule (the concatenation of two
+tuple types) and its own independent uses (`combine((..pair, extra))`).
+
+So v1 ships the **callee** direction only. Forwarding a pack works through the
+tuple form (`inner(items)` against a tuple parameter); forwarding it to another
+*spread* function waits for the tuple-value spread.
+
+## S.5 Conventions — refused, and for a reason that outlives v1
+
+`own ...items`, `&...items`, `&mut ...items` are refused.
+
+The argument a spread parameter receives is **a value the call site
+constructs**. There is no caller-side tuple to transfer ownership of, and none
+to alias — so `own` has nothing to move and a view has nothing to point at.
+This is a different reason from `mut`'s exclusion (`mut-parameters.md` §2, where
+the question "which thing is mutable" stops being one question), and unlike a
+scoping decision it does not expire: even once §S.4 lands, `f(..existing)` still
+*builds* a fresh tuple, so there is still nothing for a convention to name.
+Conventions on the individual arguments are unaffected — they are ordinary
+expressions.
+
+**`mut` is permitted**: `mut ...items: T`. `mut` is binder mutability, not a
+convention (H9's distinction), and the collected tuple is the callee's own value
+— so the desugar carries it through untouched, and `items` is a writable local
+copy like any other `mut` parameter.
+
+## S.6 Closures — refused v1, decided rather than silent
+
+`|...items| …` is refused with its own message.
+
+A closure is reached through its **type** far more often than a function is —
+annotated, stored in a field, passed as a callback — and a closure type
+(`sync |A, B| C`) has no variadic form. A variadic closure could therefore not
+be named, stored, or passed anywhere; it would be callable only at its literal.
+That is not a feature, it is a trap. Revisit if closure types grow a pack form.
+
+The parser admits `...` in closure position precisely so the refusal can be a
+sentence rather than a syntax error.
+
+## S.7 Methods and trait signatures — refused v1
+
+A `fun` inside an `impl` or a `trait` body may not declare a spread parameter.
+
+Unlike `mut`, **`...` is part of the signature**: it changes how a call is
+written, so it is not something a trait declaration and its impl may disagree
+about (which is exactly the freedom `mut` has). And a method is reached by
+member dispatch on three routes — inherent, through a trait, and through a
+generic bound — so a convention that regroups arguments has to hold identically
+on all of them, including a conformance check that today compares receiver
+convention, arity and per-position conventions only.
+
+v1 keeps `...` where the callee is named directly, and one rule covers trait
+declarations, trait impls and inherent impls alike. The steer is the tuple
+form: declare `fun m(items: T)` and call `m((a, b))`.
+
+`external fun` is refused for the neighbouring reason (and the same one H9
+gave): an external binds a host function whose calling convention is the host's,
+and the pack has no host form.
+
+## S.8 Two consequences worth stating out loud
+
+- **The convention lives on the declaration, so a function *value* has the tuple
+  form.** Passed where a `sync |(i32, i32)| i32` is wanted, `fun count(...items:
+  (i32, i32))` goes through — and the callback calls it `f((4, 5))`, not
+  `f(4, 5)`. A value's type is the parameter's; the desugar's left-hand side is a
+  *declaration*, and a value has none. Pinned. (Calling a function through a
+  `let`-bound name — `let f = count; f(…)` — does not work today for *any*
+  function, spread or not; that is a separate, pre-existing hole.)
+- **A spread declaration is not also callable in the tuple form.**
+  `log((1, 2))` collects, as every call does, to the one-element pack
+  `((i32, str))` — and then fails its own `(2..)` bound. Choosing `...` chooses
+  the convention. Pinned.
+
+## S.9 Ship record (2026-08-04)
+
+The desugar is realized at **one** point: when the solver resolves a call whose
+subject is a function whose last parameter is a spread, it replaces the
+argument tail with a single synthesized `Expr::Tuple` entity — the very entity
+a written tuple literal lowers to — and the call proceeds as the tuple form
+through typing, bound checking, the rule-1/3/4 scans and emission. The
+collection is memoized per call, because the constraint may defer and retry.
+Emission has **no** spread-specific path at all: the flat tuple construction
+(with its `...` splice for a tuple-typed element) is the one the tuple form
+already emitted, and the callee's JavaScript parameter stays a plain
+identifier.
+
+Probed and confirmed rather than assumed: **0- and 1-arity packs work.** Tuple
+*types* already admit `()` and `(A)` (`parse_tuple_type` has no minimum, unlike
+the ≥2 value syntax), and a spread parameter is the first thing that can
+produce such a value. `f()` under `T: (..)` binds `T = ()` and emits `f([])`;
+`f(x)` binds `T = (i32)` and emits `f([x])`. Both are pinned, including their
+emitted bytes.
+
+Two **pre-existing** limits the pack inherits, each pinned beside its tuple-form
+twin so it is on the record rather than mistaken for a spread bug — both fail
+*identically* on `fun f<T: (2..)>(items: T)`, so the desugar reproduces today's
+behaviour faithfully:
+
+- **A pack that is still an abstract `T` cannot be indexed positionally.**
+  `items.0` inside the generic body is "cannot access field '0' on type T" —
+  the body type-checks once, before any arity is known. A concrete pack type
+  (`...items: (i32, i32, i32)`) indexes fine.
+- **A comprehension's source must be a MAPPED tuple**, so a bare
+  element-bounded pack (`T: (..: Display)`) has no way to walk its elements and
+  the element bound has no consumer of its own. The mapped form is what a
+  comprehension reaches — which is why `gather` is the worked example.
+
+Together these say the useful shapes today are the **mapped** pack and the
+**concrete** pack; a bare `T: (..)` pack can be passed on but not taken apart.
+Both are squarely in the `keyof`/tuple-`for` tail this proposal already defers,
+and neither is made worse by the spread.
+
+The one position audited and deliberately left alone: **`Type::Closure`** — a
+spread function's value type is the tuple one (§S.8), which is what the closure
+path already produced and why the call-site collection lives on the
+declaration-resolving branch only.
+
+One mechanism is honestly labelled rather than over-claimed. The collection is
+**memoized per call**, because the constraint defers and retries (an
+unannotated closure argument is the ordinary way in), and the pack should keep
+one identity across attempts. That is **hygiene, not correctness**: dropping
+the memo was planted and the whole suite stayed green, because the fixpoint
+reaches the pack only through the argument list the call finally wires — a
+second attempt orphans the first entity rather than miscompiling. It stays
+because the language server re-analyzes per keystroke, and an unbounded entity
+per deferral is a real cost there.
+
+Two bugs the work found and fixed on the way:
+
+- **A free `fun` declared inside an `impl` method's body was refused a
+  spread**, because the in-member-body flag stayed set through a body it had
+  already finished checking. Memberhood belongs to the impl/trait *item list*,
+  not to everything lexically inside it. Pinned.
+- The parser's spread refusals needed the **inferred** convention, not just the
+  written prefix: `...items: &T` takes its `Ref` from the type. Pinned
+  separately from the prefix cases.

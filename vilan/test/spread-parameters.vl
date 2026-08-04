@@ -1,0 +1,62 @@
+// B3 §S (proposal/variadic-generics.md): spread parameters — `...items: T` is a
+// CALL CONVENTION over an ordinary tuple parameter, so `f(a, b)` means
+// `f((a, b))` and emission is the tuple form's flat construction. One variant
+// per arity, including the two source syntax cannot write as a value: the empty
+// pack `()` and the one-element pack `(x)`.
+import std::io::print;
+import std::reactive::Signal;
+
+fun middle(...items: (i32, i32, i32)): i32 {
+	items.1
+}
+
+fun width<T: (..)>(...items: T): i32 {
+	1
+}
+
+fun after<T: (..)>(head: i32, ...rest: T): i32 {
+	head
+}
+
+fun swap_pack(mut ...items: (i32, i32)): i32 {
+	items = (8, 9);
+	items.0
+}
+
+fun forward(items: (i32, i32)): i32 {
+	items.0
+}
+
+fun outer(...items: (i32, i32)): i32 {
+	forward(items)
+}
+
+// The payoff: a mapped pack. `gather(a, b)` inverts `(U in T: Signal<U>)`
+// against the collected argument tuple to recover `T = (i32, str)`.
+fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> {
+	let snapshot = || (source in sources => source.get());
+	let derived = Signal::new(snapshot());
+	let subscriptions = (source in sources => source.sub(|_| {
+		derived.set(snapshot());
+	}));
+	derived
+}
+
+fun main() {
+	print(middle(4, 5, 6));
+	print(width());
+	print(width(1));
+	print(after(2, 3, 4));
+	print(swap_pack(1, 2));
+	print(outer(3, 4));
+	// A tuple-typed argument splices its slots in rather than nesting.
+	let inner = (10, 11);
+	print(width(inner, 12));
+	let count = Signal::new(20);
+	let name = Signal::new("hi");
+	let both = gather(count, name);
+	print(both.get().0);
+	count.set(21);
+	print(both.get().0);
+	print(both.get().1);
+}
