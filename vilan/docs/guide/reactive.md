@@ -40,11 +40,13 @@ Signal::new(value: T): Signal<T>       // a fresh signal
 signal.get(): T                        // current value
 signal.set(value: T)                   // write + notify subscribers
 signal.set_with(transform: sync |T| T) // read-modify-write in one step
+signal.update(mutate: sync |&mut T| void) // mutate in place + notify once
 ```
 
 Signals hold **values**. Vilan copies, so `get` hands you a copy, and the
-only way to change what subscribers see is `set` or `set_with`. To update
-a list inside a signal, transform it:
+only way to change what subscribers see is a write through the signal
+itself. For a collection, `update` is the one you want: the closure gets a
+**writable view of the stored value**, so you mutate it directly.
 
 ```vilan
 import std::print;
@@ -52,12 +54,33 @@ import std::reactive::Signal;
 
 fun main() {
 	let items: Signal<List<str>> = Signal::new([]);
-	items.set_with(|list| {
-		mut updated = list;
-		updated.push("first");
-		updated
+	items.update(|&mut list| {
+		list.push("first");
 	});
 	print(items.get().len());
+}
+```
+
+The `&mut` in `|&mut list|` is the same view convention a function
+parameter takes — it says *this closure mutates the caller's value*, which
+is exactly what makes the push land in the signal rather than in a copy.
+Subscribers are notified **once**, after the closure returns, whatever it
+did (a closure that writes nothing still notifies — `update` is a write,
+like `set`). Inside a `batch`, that notification defers and coalesces like
+any other write. `update` works for any `T` a closure can mutate: `Map`,
+`Set`, a struct's fields, a nested aggregate.
+
+`set_with` remains the read-**transform**-write form, and it still reads
+better when you're computing a new value rather than editing one:
+
+```vilan
+import std::print;
+import std::reactive::Signal;
+
+fun main() {
+	let count = Signal::new(1);
+	count.set_with(|n| n + 4);
+	print(count.get());
 }
 ```
 

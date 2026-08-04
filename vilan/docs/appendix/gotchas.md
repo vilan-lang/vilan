@@ -20,8 +20,10 @@ organized by message instead of by topic.
 
 - **`shared.read()` is a copy.** `shared.read().push(x)` is lost; write
   through the cell: `shared.write().push(x)`.
-- **Mutate signal lists with `set_with`**, never by mutating a `get()`
-  result (also a copy).
+- **Mutate signal collections with `update`** — `signal.update(|&mut list|
+  { list.push(x); })` writes the stored value through a view and notifies
+  once. Never mutate a `get()` result (also a copy). `set_with` stays the
+  read-*transform*-write form.
 - **`bind_value` fights remote updates.** For server-backed fields use
   `bind_draft`.
 - **`show` keeps bindings live** while hidden; use `when` to drop state and
