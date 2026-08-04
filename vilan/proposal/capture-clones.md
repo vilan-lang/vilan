@@ -200,6 +200,20 @@ copies everything" each turns the golden red.
 
 ## 5. Two holes left open, on purpose
 
+> **Update 2026-08-04 (B59):** the second one below is closed. `Expr::Match`
+> now compiles each leg into its pieces (pattern test, prelude, guard test,
+> body) and picks the shape once every guard has been walked: a match where no
+> leg needs a prelude keeps the else-if chain byte for byte, and one where any
+> leg does is emitted as a flat sequence of tests with a `matched` flag standing
+> in for the `else`s, each leg's slot the body of its own pattern test. A guarded
+> leg's copies are materialized into that slot AHEAD of the guard whenever the
+> guard hoists anything or reads a copy — so the guard and the body see the same
+> binding — and stay at body entry otherwise, which is what keeps the plain-guard
+> goldens (`guarded_width`, `first_or_guarded`) unchanged. Five pins, four of
+> them red against the pre-fix tree; the fifth
+> (`a_guard_that_reads_a_copied_capture_reads_the_copy`) guards the new
+> reads-a-copy condition and is proven by planting it out.
+
 - **A moved-from `Option` is still readable, and still destroyed.**
   `o.unwrap()` consumes `self`, but the affine checker does not treat a
   `self`-by-value method call as a move of `o` — `o.is_some()` afterwards

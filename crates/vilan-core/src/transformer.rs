@@ -711,6 +711,22 @@ enum Dispatch<'src> {
     Call(String, bool),
 }
 
+/// One lowered `match` leg, kept in pieces until the whole match is compiled:
+/// the shape it is emitted in depends on whether ANY leg needs a statement slot
+/// (see `Expr::Match`), which is only known once every guard has been walked.
+struct MatchLeg<'src> {
+    /// The variant/shape test, `None` for an irrefutable pattern.
+    pattern_condition: Option<js::Node<'src>>,
+    /// Statements that must run after the pattern test and before the guard:
+    /// the guard's own temporaries and the copies its captures owe. Empty
+    /// unless the guard needs them — an empty prelude is what keeps a plain
+    /// guard in the else-if chain, byte for byte.
+    prelude: Vec<js::Node<'src>>,
+    /// The guard test, `None` for an unguarded leg.
+    guard_condition: Option<js::Node<'src>>,
+    body: Vec<js::Node<'src>>,
+}
+
 struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
@@ -762,6 +778,11 @@ struct Transformer<'src> {
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
     is_bindings: HashMap<Id, js::Node<'src>>,
+    // While `Some`, every `is_bindings` lookup records the capture it resolved.
+    // A match guard is walked with this on, so the leg's lowering can tell
+    // whether the guard READS a capture whose copy has to be declared ahead of
+    // it (B59) — the guard's reference is to the copy, not the subject's slot.
+    is_binding_reads: Option<HashSet<Id>>,
     // Runtime helper functions (`__scan`, `__parse_i32`, `__random_int`) an
     // intrinsic call needs; emitted as a prelude only when used.
     used_helpers: BTreeSet<&'static str>,
@@ -869,6 +890,7 @@ impl<'src> Transformer<'src> {
             drop_helpers: HashMap::new(),
             monomorphized: Vec::new(),
             is_bindings: HashMap::new(),
+            is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
@@ -1702,7 +1724,11 @@ impl<'src> Transformer<'src> {
                 self.referenced_globals.insert(*id);
                 // A capture from an `is` test aliases the subject's payload slot.
                 if let Some(accessor) = self.is_bindings.get(id) {
-                    return Some(accessor.clone());
+                    let accessor = accessor.clone();
+                    if let Some(reads) = self.is_binding_reads.as_mut() {
+                        reads.insert(*id);
+                    }
+                    return Some(accessor);
                 }
                 // A reference to a data-less variant (e.g. `None`) is the
                 // variant value itself, not a named binding.
@@ -3024,83 +3050,98 @@ impl<'src> Transformer<'src> {
                 }));
                 // Each leg becomes an optional variant test plus a body that
                 // declares its captures and assigns the leg's value.
-                let mut compiled_legs: Vec<(Option<js::Node<'src>>, Vec<js::Node<'src>>)> =
-                    Vec::new();
+                let mut compiled_legs: Vec<MatchLeg<'src>> = Vec::new();
                 for leg in legs {
-                    let mut leg_body = Vec::new();
+                    let mut body = Vec::new();
+                    let mut prelude = Vec::new();
+                    let mut guard_condition = None;
                     let subject = js::Node::Local(subject_name.clone());
-                    let condition = if leg.guard.is_none() {
+                    let mut conditions = Vec::new();
+                    match leg.guard {
                         // No guard: captures are declared as `const`s in the body.
-                        let mut conditions = Vec::new();
-                        self.compile_pattern(&leg.pattern, subject, &mut conditions, &mut leg_body);
-                        conditions.into_iter().reduce(|a, b| {
-                            js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b))
-                        })
-                    } else {
+                        None => {
+                            self.compile_pattern(&leg.pattern, subject, &mut conditions, &mut body)
+                        }
                         // Guarded: the guard reads the pattern's captures, so they
                         // can't be `const`s declared inside the matched body — alias
                         // them to the subject's slots (like an `is` test) for the
                         // guard and body, then clear the aliases after this leg.
-                        let captures = Self::pattern_capture_ids(&leg.pattern);
-                        let mut conditions = Vec::new();
-                        self.compile_is_pattern(&leg.pattern, subject, &mut conditions);
-                        let mut guard_block = Vec::new();
-                        if let Some(guard) = self.walk_entity(leg.guard.unwrap(), &mut guard_block)
-                        {
-                            conditions.push(guard);
+                        Some(guard_id) => {
+                            self.compile_is_pattern(&leg.pattern, subject, &mut conditions);
+                            // B53: a capture that owes a copy becomes a real
+                            // declaration. WHERE it lands is decided below,
+                            // once the guard has been walked.
+                            let mut copies = Vec::new();
+                            self.materialize_capture_clones(&leg.pattern, &mut copies);
+                            let mut guard_prelude = Vec::new();
+                            let outer_reads = self.is_binding_reads.replace(HashSet::new());
+                            guard_condition = self.walk_entity(guard_id, &mut guard_prelude);
+                            let guard_reads =
+                                std::mem::replace(&mut self.is_binding_reads, outer_reads)
+                                    .unwrap_or_default();
+                            // A guard nested inside another guard's expression
+                            // still reads for the outer one.
+                            if let Some(outer) = self.is_binding_reads.as_mut() {
+                                outer.extend(guard_reads.iter().copied());
+                            }
+                            // B59: an else-if chain has no statement slot before a
+                            // leg's condition, so a guard that needs statements —
+                            // its own temporaries (an `is` test, a `?` lift, a
+                            // nested `match`), or a capture's copy it reads — gets
+                            // the leg its own slot instead (see the emission below).
+                            let reads_a_copy = Self::pattern_capture_ids(&leg.pattern)
+                                .into_iter()
+                                .any(|capture| {
+                                    guard_reads.contains(&capture) && self.capture_copies(capture)
+                                });
+                            if guard_prelude.is_empty() && !reads_a_copy {
+                                // A plain guard stays an expression in the chain's
+                                // condition, and its copies are made on ENTRY to
+                                // the body, after the guard has already decided —
+                                // a guard that rejects has copied nothing and left
+                                // the subject exactly as it found it.
+                                body = copies;
+                            } else {
+                                prelude = copies;
+                                prelude.append(&mut guard_prelude);
+                            }
                         }
-                        let condition = conditions.into_iter().reduce(|a, b| {
-                            js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b))
-                        });
-                        // B53: the leg's copies are made on ENTRY to the body,
-                        // after the guard has already decided — a guard that
-                        // rejects must leave the subject exactly as it found
-                        // it, having copied and consumed nothing. The guard
-                        // itself reads the subject's slots directly, which is
-                        // the same values the copy would hold.
-                        self.materialize_capture_clones(&leg.pattern, &mut leg_body);
-                        let value = self.walk_entity(leg.body, &mut leg_body);
-                        let value = value.unwrap_or(js::Node::Null);
-                        self.push_result_or_divergence(&result_name, value, &mut leg_body);
-                        for capture in captures {
+                    }
+                    let pattern_condition = conditions
+                        .into_iter()
+                        .reduce(|a, b| js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b)));
+                    let value = self.walk_entity(leg.body, &mut body);
+                    let value = value.unwrap_or(js::Node::Null);
+                    self.push_result_or_divergence(&result_name, value, &mut body);
+                    if leg.guard.is_some() {
+                        for capture in Self::pattern_capture_ids(&leg.pattern) {
                             self.is_bindings.remove(&capture);
                         }
-                        let is_catch_all = condition.is_none();
-                        compiled_legs.push((condition, leg_body));
-                        if is_catch_all {
-                            break;
-                        }
-                        continue;
-                    };
-                    let value = self.walk_entity(leg.body, &mut leg_body);
-                    let value = value.unwrap_or(js::Node::Null);
-                    self.push_result_or_divergence(&result_name, value, &mut leg_body);
-                    let is_catch_all = condition.is_none();
-                    compiled_legs.push((condition, leg_body));
+                    }
+                    let is_catch_all = pattern_condition.is_none() && guard_condition.is_none();
+                    compiled_legs.push(MatchLeg {
+                        pattern_condition,
+                        prelude,
+                        guard_condition,
+                        body,
+                    });
                     if is_catch_all {
                         // Later legs are unreachable.
                         break;
                     }
                 }
                 // The analyzer verified exhaustiveness, so the final leg can
-                // always be the `else` branch.
+                // always be the `else` branch — its whole test, guard and
+                // guard prelude included, is dropped.
                 if let Some(last_leg) = compiled_legs.last_mut() {
-                    last_leg.0 = None;
+                    last_leg.pattern_condition = None;
+                    last_leg.guard_condition = None;
+                    last_leg.prelude.clear();
                 }
-                let mut chain: Option<js::IfBranch<'src>> = None;
-                for (condition, leg_body) in compiled_legs.into_iter().rev() {
-                    chain = Some(match condition {
-                        None => js::IfBranch::Else(leg_body),
-                        Some(condition) => {
-                            js::IfBranch::If(Box::new(condition), leg_body, chain.map(Box::new))
-                        }
-                    });
-                }
-                match chain {
-                    // A lone catch-all needs no branching at all.
-                    Some(js::IfBranch::Else(leg_body)) => block.extend(leg_body),
-                    Some(chain) => block.push(js::Node::If(chain)),
-                    None => {}
+                if compiled_legs.iter().all(|leg| leg.prelude.is_empty()) {
+                    self.emit_match_chain(compiled_legs, block);
+                } else {
+                    self.emit_match_sequence(compiled_legs, block);
                 }
                 js::Node::Local(result_name)
             }
@@ -3270,6 +3311,95 @@ impl<'src> Transformer<'src> {
     /// `__clone(undefined)`, so a failing test pays nothing), for a guarded leg
     /// the leg BODY — so a guard that rejects has copied nothing and left the
     /// subject exactly as it found it.
+    /// Emits a match as an else-if chain, each leg's test the conjunction of its
+    /// pattern and its guard. The shape every match had before B59, and the one
+    /// every match without a statement slot still has.
+    fn emit_match_chain(&mut self, legs: Vec<MatchLeg<'src>>, block: &mut Vec<js::Node<'src>>) {
+        let mut chain: Option<js::IfBranch<'src>> = None;
+        for leg in legs.into_iter().rev() {
+            let condition = match (leg.pattern_condition, leg.guard_condition) {
+                (Some(pattern), Some(guard)) => Some(js::Node::Binary(
+                    BinaryOp::And,
+                    Box::new(pattern),
+                    Box::new(guard),
+                )),
+                (Some(condition), None) | (None, Some(condition)) => Some(condition),
+                (None, None) => None,
+            };
+            chain = Some(match condition {
+                None => js::IfBranch::Else(leg.body),
+                Some(condition) => {
+                    js::IfBranch::If(Box::new(condition), leg.body, chain.map(Box::new))
+                }
+            });
+        }
+        match chain {
+            // A lone catch-all needs no branching at all.
+            Some(js::IfBranch::Else(body)) => block.extend(body),
+            Some(chain) => block.push(js::Node::If(chain)),
+            None => {}
+        }
+    }
+
+    /// Emits a match whose legs need statement slots (B59): an else-if chain has
+    /// nowhere to put the statements a guard hoists — an `is` test, a `?` lift, a
+    /// nested `match` — so the guard's temporaries were walked and dropped, and
+    /// the emitted condition referenced a name that was never declared.
+    ///
+    /// The legs become a flat statement sequence instead. Each leg's slot is the
+    /// body of its own pattern test, so its prelude runs only once the pattern
+    /// has matched (a guard's temporary may read a payload slot that only exists
+    /// on the matched variant), and a `matched` flag stands in for the `else`s.
+    fn emit_match_sequence(&mut self, legs: Vec<MatchLeg<'src>>, block: &mut Vec<js::Node<'src>>) {
+        let matched_name = self.ng.next_name();
+        block.push(js::Node::LetVariable(js::Variable {
+            name: matched_name.clone(),
+            value: Box::new(js::Node::Bool(false)),
+        }));
+        let leg_count = legs.len();
+        for (index, leg) in legs.into_iter().enumerate() {
+            let mut body = leg.body;
+            // The final leg is the `else`: nothing follows it to fall through to.
+            if index + 1 < leg_count {
+                // Record the match BEFORE the body runs, so a body that returns,
+                // breaks, or continues cannot leave the flag behind.
+                body.insert(
+                    0,
+                    js::Node::Assignment(
+                        Box::new(js::Node::Local(matched_name.clone())),
+                        Box::new(js::Node::Bool(true)),
+                    ),
+                );
+            }
+            let mut slot = leg.prelude;
+            match leg.guard_condition {
+                Some(guard) => {
+                    slot.push(js::Node::If(js::IfBranch::If(Box::new(guard), body, None)))
+                }
+                None => slot.extend(body),
+            }
+            // Every leg but the first falls through only while nothing has
+            // matched; the first has nothing before it to fall through from.
+            let unmatched =
+                || js::Node::Unary('!', Box::new(js::Node::Local(matched_name.clone())));
+            let test = match (index == 0, leg.pattern_condition) {
+                (true, pattern) => pattern,
+                (false, None) => Some(unmatched()),
+                (false, Some(pattern)) => Some(js::Node::Binary(
+                    BinaryOp::And,
+                    Box::new(unmatched()),
+                    Box::new(pattern),
+                )),
+            };
+            match test {
+                None => block.extend(slot),
+                Some(test) => {
+                    block.push(js::Node::If(js::IfBranch::If(Box::new(test), slot, None)))
+                }
+            }
+        }
+    }
+
     fn materialize_capture_clones(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
         for capture_id in Self::pattern_capture_ids(pattern) {
             if !self.capture_copies(capture_id) {

@@ -2923,14 +2923,13 @@ fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
 }
 
 #[test]
-#[ignore = "pre-existing hole found while closing B53's findings: a match GUARD \
-whose expression needs hoisted statements (any `is` test, a `?` lift, a nested \
-match) drops them — `compile_is_pattern`'s guarded-leg arm walks the guard into \
-a `guard_block` that is never emitted, because an else-if chain has no statement \
-slot before a leg's condition. The reference dangles: `if ($c[0] === 0)` with no \
-`$c`. Un-ignore when guarded legs emit as nested ifs. See \
-proposal/capture-clones.md §5."]
 fn a_guard_that_needs_a_temporary_emits_it() {
+    // B59: a guard whose expression needs hoisted statements (an `is` test, a
+    // `?` lift, a nested `match`) used to drop them — an else-if chain has no
+    // statement slot before a leg's condition — and the emitted condition
+    // referenced a temporary that was never declared. Such a leg is now emitted
+    // with its own slot, and the copies its captures owe are declared ahead of
+    // the guard, so the guard's `pop` takes from the copy, not the subject.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -2947,6 +2946,104 @@ fn a_guard_that_needs_a_temporary_emits_it() {
         }
         "#,
         "1\n2\n",
+    );
+}
+
+#[test]
+fn a_guard_that_lifts_emits_its_temporary() {
+    // B59, the `?` shape: the lift compiles to a temp plus an `if` over the
+    // container's variant, all of which the else-if chain used to drop.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if (held?.len()).unwrap_or(0) > 2 => print(inner.len()),
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guard_that_matches_emits_its_temporary() {
+    // B59, the nested-`match` shape: an inner match is a subject temp, a result
+    // temp and an if-chain — three statements with nowhere to go.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if match inner.len() { 0 => false, _ => true } => {
+                    print(inner.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_later_guarded_leg_gets_its_own_slot() {
+    // B59, ordering: the leg that needs the slot is not the first, so its
+    // statements have to run only after the earlier leg has declined — a slot
+    // hoisted to the top of the match would pop before the first guard is
+    // even asked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if inner.len() > 5 => print(1),
+                Some(mut inner) if inner.pop() is Some(let last) => {
+                    print(last);
+                    print(inner.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_guard_that_reads_a_copied_capture_reads_the_copy() {
+    // B59: the copy a capture owes is declared ahead of a guard that READS it —
+    // the guard and the body must see the same binding. `inner` is returned (the
+    // value seam), so it copies; the guard's `len` is the copy's.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun keep(held: Option<List<i32>>): List<i32> {
+            match held {
+                Some(let inner) if inner.len() > 1 => inner,
+                _ => List::new(),
+            }
+        }
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2]);
+            mut got = keep(held);
+            got.push(9);
+            print(got.len());
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
     );
 }
 

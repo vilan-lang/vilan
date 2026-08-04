@@ -6,6 +6,12 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A `match` guard may need a temporary, and now gets one.** A guard containing an `is` test, a `?` lift, or a nested `match` compiles to statements as well as an expression — and an `else if` chain has no room for a statement before a leg's condition, so those statements were built and thrown away. The emitted condition then read a variable nothing had declared, and a program that type-checked cleanly died at startup with `ReferenceError`. A match with such a guard is now emitted as a sequence of tests instead of a chain, each leg holding a slot for what its guard needs; the copies a guarded leg's captures owe are made there too, ahead of the guard, so `Some(mut xs) if xs.pop() is Some(_)` pops from the capture rather than from the value being matched. A guard that needs nothing keeps the chain, byte for byte.
+
+---
+
 ## v0.24.0 — 2026-08-03
 
 **Mutate a signal's collection in place.** `signal.update(|&mut list| { list.push(item); })` hands the closure a writable view of the *stored* value, so growing a `Signal<List<T>>` no longer means the copy-transform-return dance `set_with` required (`|mut list| { list.push(x); list }` — a whole-list copy per push, written as a transformation when you meant a mutation). Subscribers are notified once, after the closure returns, whatever it did; inside a `batch` that notification defers and coalesces like any other write. It is one method for every container — `List`, `Map`, `Set`, a struct's fields, anything a closure can mutate through a view — rather than a per-collection twin. `set_with` is unchanged and remains the right form when you are computing a new value rather than editing one.
