@@ -4427,7 +4427,10 @@ impl<'src> Transformer<'src> {
     /// Emits a trait default method specialized for a concrete type, keyed by
     /// (default, type) so each pairing is emitted once. While walking the body,
     /// `current_self_type` is the concrete type so its `self.method()` calls
-    /// re-dispatch there.
+    /// re-dispatch there, and `current_substitution` binds the TRAIT's own
+    /// generic parameters to the arguments this type implements it at (B58) —
+    /// so a `T`-typed value's bound-member call grounds the same way it does
+    /// in a generic function's body.
     fn emit_default_instance(&mut self, default_id: Id, type_id: TypeId) -> String {
         let key = (default_id, self.type_key(type_id));
         if let Some(name) = self.default_instances.get(&key) {
@@ -4436,14 +4439,85 @@ impl<'src> Transformer<'src> {
         let name = self.ng.next_name();
         self.default_instances.insert(key, name.clone());
         if let Some(function) = self.program.functions.get(&default_id) {
+            let substitution = self.trait_parameter_substitution(default_id, type_id);
             let saved_self = std::mem::replace(&mut self.current_self_type, Some(type_id));
-            let saved_substitution = std::mem::take(&mut self.current_substitution);
+            let saved_substitution =
+                std::mem::replace(&mut self.current_substitution, substitution);
             let js_function = self.function_with_name(function, name.clone());
             self.current_self_type = saved_self;
             self.current_substitution = saved_substitution;
             self.monomorphized.push(js_function);
         }
         name
+    }
+
+    /// B58: the substitution a trait default body is specialized under — the
+    /// trait's own generic parameters bound to the arguments `type_id`
+    /// implements the trait at (`impl Box with Holder<Dog>` binds `T = Dog`),
+    /// plus the providing impl's own binders bound from the concrete receiver
+    /// (`impl Bag<type E> with Holder<E>` against `Bag<Dog>` binds `E = Dog`,
+    /// which is what grounds a trait argument written in the impl's terms).
+    ///
+    /// Without this the body ran under an EMPTY substitution, so a call the
+    /// analyzer resolved through `T`'s declared bound
+    /// (`GenericDispatch::OnConstraint`) had nothing to ground `T` to and fell
+    /// through to the trait's abstract member — which the never-silent guard
+    /// (B55) now reports rather than emitting an empty body.
+    fn trait_parameter_substitution(
+        &self,
+        default_id: Id,
+        type_id: TypeId,
+    ) -> HashMap<TypeId, TypeId> {
+        let mut substitution = HashMap::new();
+        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
+            return substitution;
+        };
+        // The default's own trait — the one whose declarations hold it. A
+        // supertrait's default reached through a subtrait's impl keeps its own
+        // parameters, so key on the declaring trait, not the implemented one.
+        let Some((trait_id, trait_)) = self
+            .program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
+        else {
+            return substitution;
+        };
+        if trait_.generic_parameter_constraint_ids.is_empty() {
+            return substitution;
+        }
+        // The impl of THAT trait for this type, matched nominally like every
+        // other dispatch lookup here (the impl subject is in its own generic
+        // terms, the receiver in concrete ones).
+        let Some(implementation) = self.program.implementations.iter().find(|implementation| {
+            implementation.trait_ids.contains(trait_id)
+                && self
+                    .program
+                    .type_id_to_type_map
+                    .get(&implementation.subject)
+                    .is_some_and(|subject| nominal_matches(subject, type_))
+        }) else {
+            return substitution;
+        };
+        self.bind_generics(implementation.subject, type_id, &mut substitution);
+        let Some((_, arguments)) = implementation
+            .trait_args
+            .iter()
+            .find(|(provided, _)| provided == trait_id)
+        else {
+            return substitution;
+        };
+        // A trait argument written in the impl's terms (`with Holder<E>`)
+        // stays keyed to the binder above, so `resolve_type_id` composes the
+        // two hops within this same map.
+        for (parameter_id, argument_id) in trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .zip(arguments)
+        {
+            substitution.insert(*parameter_id, *argument_id);
+        }
+        substitution
     }
 
     /// Whether a scope needs `try`/`finally` teardown: some direct statement

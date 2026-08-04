@@ -2055,6 +2055,36 @@ impl<'src> Analyzer<'src> {
         false
     }
 
+    /// Whether `constraint_id` is a generic parameter of a binder ENCLOSING
+    /// `id` — the trait's own parameter inside its default bodies, a
+    /// function's or impl's own inside its body. Such a parameter is fixed by
+    /// the enclosing instantiation, so a call site may not re-infer it from
+    /// its expected type: it stays abstract through analysis and grounds at
+    /// monomorphization.
+    ///
+    /// Resolved by NAME up the call's scope chain, so the first binder of that
+    /// name decides (shadowing-correct) and a same-named parameter of some
+    /// *other* declaration — a distinct constraint id — never matches.
+    fn generic_is_enclosing_binder(&self, constraint_id: TypeId, id: Id) -> bool {
+        let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
+            return false;
+        };
+        let mut scope_id = self.expr_id_to_scope_id_map.get(&id).copied();
+        while let Some(current) = scope_id {
+            let Some(scope) = self.scopes.get(&current) else {
+                return false;
+            };
+            if let Some(entity_id) = scope.name_to_id_map.get(name).copied() {
+                return matches!(
+                    self.expr_id_to_expr_map.get(&entity_id),
+                    Some(Expr::Generic(found)) if *found == constraint_id
+                );
+            }
+            scope_id = scope.parent_id;
+        }
+        false
+    }
+
     /// Whether `value_type` satisfies a `: Trait` generic bound. A concrete
     /// type satisfies it through an `impl .. with` naming the trait or any
     /// subtrait of it (implementing `Ord` satisfies a `PartialEq` bound); a
@@ -16758,7 +16788,18 @@ impl<'src> Analyzer<'src> {
                                 )
                             {
                                 for (constraint_id, type_id) in bindings {
-                                    if return_generics.contains(&constraint_id) {
+                                    // B58: a parameter the ENCLOSING binder owns is
+                                    // fixed, not free to infer here — and the
+                                    // declared-type filter above cannot see that,
+                                    // because a trait's members share the trait's
+                                    // parameter ids: inside `Holder<T: Bound>`'s
+                                    // default, `self.item()`'s declared return `T`
+                                    // IS the enclosing `T`. Binding it to the
+                                    // expectation dropped its bound (and reported
+                                    // the expectation as "missing the bound").
+                                    if return_generics.contains(&constraint_id)
+                                        && !self.generic_is_enclosing_binder(constraint_id, id)
+                                    {
                                         self.method_call_substitution
                                             .entry(id)
                                             .or_default()
