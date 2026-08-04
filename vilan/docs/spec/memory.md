@@ -96,6 +96,30 @@ fun main() {
 }
 ```
 
+"Field initialization" is the whole of a **construction**: a place read into a
+list element, a tuple element, a struct field, or a variant payload is stored
+in a slot of a new aggregate that outlives the literal, so it copies there too.
+The same holds for a place handed to a parameter declared `own` — a signature's
+way of saying the callee keeps it, which is how `List::push` is written — and
+for a place a body **returns** that it does not own, i.e. one reached through a
+by-value parameter. Together these are what make "a call owns its result" true,
+which is the premise every elision below rests on:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut xs = [1, 2];
+	mut rows = [xs];        // a copy: the element is not xs's storage
+	rows[0].push(9);
+	print(xs.len());        // 2
+}
+```
+
+A consequence worth naming: the list a pure `List` method returns never shares
+element storage with its receiver. Writing through an element of `xs.map(f)`,
+`xs.filter(p)`, `xs.sort_by(c)`, or `xs.reverse()` cannot show up in `xs`.
+
 ## 6.2 Rule 2 — elision is an optimization, never observable
 
 An implementation may skip a copy (reuse the storage) when no conforming

@@ -6,6 +6,18 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A list built from another list no longer shares its elements.** `xs.map(f)`, `xs.filter(p)`, `xs.sort_by(c)` and `xs.reverse()` copied the spine but handed back the *same* element values, so writing through `xs.map(f)[0]` showed up in `xs[0]`. All four are independent now. The rule underneath is one line — a value stored in a slot that outlives the expression is copied, which is what value semantics has always said — and the standard library now declares it where it means it: `List::push` takes `own item`, `sort_by` takes `own self`. Passing something freshly built still costs nothing; only a value that has another owner is copied.
+
+**Building a list, tuple, struct, or variant from an existing value copies it.** `[xs]`, `(xs, 1)`, `Holder { items = xs }`, and `Some(xs)` all filed the original's storage into the new value, so growing it through the new value grew the old one. Each of those positions is an initialization, and initializations copy. Constructing from a value that dies on the spot still moves rather than copies, so building a value up and handing it off is as cheap as it was.
+
+**Returning something you were given hands back a copy.** `fun first(c: List<i32>): List<i32> { c }` returned the *caller's* storage, so the caller's own list grew when the result did — the same leak that made `map` share elements, since `|c| c` is that function written inline. A returned value reached through a by-value parameter now copies. A function's own local still moves out for free, as does an `own` parameter — which is how a fluent builder (`fun with(own self, …): Self`) stays copy-free — and a `&`/`&mut` projection is still a view by design.
+
+**A `Shared<T>` is no longer copied when it is stored.** `Shared` is a cell, and sharing it is the point; the compiler nevertheless emitted a copy that copied nothing. Programs that build values out of `Shared` fields — every UI view — lose a pointless call per construction.
+
+---
+
 ## v0.24.0 — 2026-08-03
 
 **Mutate a signal's collection in place.** `signal.update(|&mut list| { list.push(item); })` hands the closure a writable view of the *stored* value, so growing a `Signal<List<T>>` no longer means the copy-transform-return dance `set_with` required (`|mut list| { list.push(x); list }` — a whole-list copy per push, written as a transformation when you meant a mutation). Subscribers are notified once, after the closure returns, whatever it did; inside a `batch` that notification defers and coalesces like any other write. It is one method for every container — `List`, `Map`, `Set`, a struct's fields, anything a closure can mutate through a view — rather than a per-collection twin. `set_with` is unchanged and remains the right form when you are computing a new value rather than editing one.
