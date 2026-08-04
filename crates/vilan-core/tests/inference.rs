@@ -16887,6 +16887,420 @@ fn a_border_edge_survives_the_family_it_narrows() {
     );
 }
 
+// --- A23: the website's measured remainder (ui-styling.md §0bis.5) -----------
+// The third value-type slice. Its charter's headline — 36 `raw("background")`
+// sites — turned out to be a CONVERSION backlog rather than a supply hole: the
+// value types §0bis.3 shipped already hold 33 of them. So the pins here split
+// in two. The first group asserts the five surfaces this slice DID add; the
+// second is the evidence for the reversal, pinning that each shape the website
+// actually writes is expressible with what already exists — which is what the
+// next cycle's conversion will lean on.
+
+/// The five additions, table-shaped like every property pin here: the exact
+/// declaration each emits, so a wrong CSS property name is a named failure.
+#[test]
+fn the_a23_value_surfaces_emit_their_declarations() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style()
+                .inset(Length::zero())
+                .min_width(Length::zero())
+                .left(Length::css("clamp(120px, 30%, 185px)"))
+                .width(Length::css("min(400px, 70%)"))
+                .line_height_length(Length::px(24))
+                .background_image("url(data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)")
+                .background_size("120px 120px")
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        // Bare `0`, not `0px` and not `var(--space-0)`: the spelling the
+        // `inset:0` and `min-width:0` idioms are written in.
+        "{inset:0}",
+        "{min-width:0}",
+        // `css` is verbatim — no `calc(..)` wrapper, unlike `calc`.
+        "{left:clamp(120px, 30%, 185px)}",
+        "{width:min(400px, 70%)}",
+        "{line-height:24px}",
+        "{background-image:url(data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=)}",
+        "{background-size:120px 120px}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// `calc` is now sugar over `css` and must stay byte-identical: it wraps, `css`
+/// does not, and the same text through both differs by exactly the wrapper.
+#[test]
+fn calc_still_wraps_and_css_does_not() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        fun s(): Style {
+            style()
+                .width(Length::calc("100% - 2rem"))
+                .height(Length::css("calc(100% - 2rem)"))
+                .max_width(Length::css("100% - 2rem"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{width:calc(100% - 2rem)}",
+        // Spelling the wrapper by hand through `css` reaches the same value.
+        "{height:calc(100% - 2rem)}",
+        // And `css` adds nothing of its own.
+        "{max-width:100% - 2rem}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// `line_height_length` is a SIBLING on the same slot, not a second property:
+/// the two forms override each other last-wins and the style carries one class,
+/// where two slots would have raced in the cascade at equal specificity.
+#[test]
+fn line_height_length_shares_the_line_height_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Length };
+        fun main() {
+            let unitless_last = const style().line_height_length(Length::px(24)).line_height(1.5);
+            let length_last = const style().line_height(1.5).line_height_length(Length::px(24));
+            print(unitless_last.class_list().contains(" "));
+            print(length_last.class_list().contains(" "));
+        }
+        main();
+        "#,
+        "false\nfalse\n",
+    );
+}
+
+/// `background_image` writes the slot `background_gradient` writes — the
+/// `border`/`border_none` shape. One slot, so the later call REPLACES the
+/// earlier one instead of emitting a second rule to race it.
+#[test]
+fn background_image_and_background_gradient_share_one_slot() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        fun main() {
+            let painted = const style()
+                .background_gradient(
+                    Gradient::radial(RadialExtent::ClosestSide)
+                        .stop(Color::rgba(235, 104, 46, 0.4), 0.0)
+                        .stop(Color::transparent(), 100.0),
+                )
+                .background_image("url(tile.png)");
+            print(painted.class_list().contains(" "));
+        }
+        main();
+        "#,
+        "false\n",
+    );
+}
+
+/// The new slots take their place in the `background` family: both are
+/// LONGHANDS under the `background` shorthand, so neither is marked and a
+/// `background` set after either clears it. (A22's own table pin is untouched;
+/// this asserts the two methods A23 adds land on the rows already written for
+/// them.)
+#[test]
+fn the_new_background_slots_are_longhands_of_their_family() {
+    let css = style_css(
+        r##"
+        import std::style::{ style, Style };
+        fun s(): Style {
+            style().raw("background", "#180509").background_image("url(a.png)").background_size("cover")
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "##,
+    );
+    let (shorthand, shorthand_at) = rule_for(&css, "background:#180509");
+    let (image, image_at) = rule_for(&css, "background-image:url(a.png)");
+    let (size, size_at) = rule_for(&css, "background-size:cover");
+    assert!(
+        shorthand.starts_with("*."),
+        "the background shorthand is marked: {shorthand}"
+    );
+    assert!(
+        image.starts_with('.') && size.starts_with('.'),
+        "the new slots are longhands and must NOT be marked: {image} / {size}"
+    );
+    assert!(
+        shorthand_at < image_at && shorthand_at < size_at,
+        "background must precede its longhands:\n{css}"
+    );
+
+    // And the shorthand written LAST clears them, the ordinary family drop.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::style::{ style };
+        fun main() {
+            let reset = const style()
+                .background_image("url(a.png)")
+                .background_size("cover")
+                .raw("background", "#180509");
+            print(reset.class_list().contains(" "));
+        }
+        main();
+        "##,
+        "false\n",
+    );
+}
+
+/// §0bis.3's precedent, extended to the CSS-text escapes: the one malformation
+/// they can detect is an EMPTY value, whose realistic source is an
+/// interpolation whose variable was never set. A build error naming the value,
+/// not a `property:` declaration the browser drops in silence.
+#[test]
+fn a_blank_css_escape_fails_the_build() {
+    for (source, expected) in [
+        (
+            r#"
+            import std::style::{ style, Style, Length };
+            fun s(): Style { style().width(Length::css("")) }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "Length::css was given an empty value",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style, Length };
+            fun s(): Style { style().width(Length::calc("   ")) }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "Length::calc was given an empty value",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style };
+            fun s(): Style { style().background_image("") }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "background_image was given an empty value",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style };
+            fun s(): Style { style().background_size("") }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "background_size was given an empty value",
+        ),
+    ] {
+        let diagnostics = failure_diagnostics(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains(expected)),
+            "missing {expected}: {diagnostics:#?}"
+        );
+    }
+}
+
+/// The reversal, pinned as evidence rather than asserted in prose: every shape
+/// the website's 36 `raw("background", ..)` sites write is already expressible
+/// with the value types §0bis.3 shipped. Each arm is a real site, quoted.
+#[test]
+fn the_website_background_sites_convert_with_the_shipped_value_types() {
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        // art.vl:92 — `background: #EB682E`, 8 of the 20 solid sites.
+        fun literal_hex(): Style { style().background(Color::hex("#EB682E")) }
+        // art.vl:55 — `background: rgba(27, 6, 13, 0.88)`, the other 12.
+        fun literal_rgba(): Style { style().background(Color::rgba(27, 6, 13, 0.88)) }
+        // art.vl:117 and ten more — the closest-side glow, the single most
+        // repeated shape in the sweep. Positions default to 0/100 in CSS, so
+        // stating them is computed-identical.
+        fun glow(): Style {
+            style().background_gradient(
+                Gradient::radial(RadialExtent::ClosestSide)
+                    .stop(Color::rgba(178, 48, 86, 0.5), 0.0)
+                    .stop(Color::transparent(), 100.0),
+            )
+        }
+        // art.vl:151 — `linear-gradient(to left, #B23056, #672283)`. The side
+        // keywords ARE angles: `to left` is 270deg, `to right` is 90deg.
+        fun to_left(): Style {
+            style().background_gradient(
+                Gradient::linear(270.0)
+                    .stop(Color::hex("#B23056"), 0.0)
+                    .stop(Color::hex("#672283"), 100.0),
+            )
+        }
+        // art.vl:578 — an 8-digit hex with a mid stop; `hex` is unvalidated
+        // text, so the alpha rides along.
+        fun eight_digit(): Style {
+            style().background_gradient(
+                Gradient::radial(RadialExtent::ClosestSide)
+                    .stop(Color::hex("#120004d6"), 35.0)
+                    .stop(Color::transparent(), 100.0),
+            )
+        }
+        let _a = const literal_hex();
+        let _b = const literal_rgba();
+        let _c = const glow();
+        let _d = const to_left();
+        let _e = const eight_digit();
+        fun main() {}
+        main();
+        "##,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:#EB682E}",
+        "{background-color:rgba(27, 6, 13, 0.88)}",
+        "{background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)}",
+        "{background-image:linear-gradient(270deg, #B23056 0%, #672283 100%)}",
+        "{background-image:radial-gradient(closest-side, #120004d6 35%, transparent 100%)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The conversion hazard §0bis.5 records for the next cycle, pinned in both
+/// directions: converting `raw("background", v)` to a typed method moves the
+/// slot from the family SHORTHAND to a longhand, so the shorthand's reset of
+/// the rest of the family stops happening. It is safe at every website site
+/// (none pairs a colour with an image), and a half-converted style still
+/// resolves by AUTHORING order through A22's marker — which is what makes the
+/// conversion safe to do incrementally, in any order.
+#[test]
+fn converting_a_background_shorthand_to_a_longhand_keeps_authoring_order() {
+    let css = style_css(
+        r##"
+        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        // An UNconverted base under a converted override: the raw shorthand is
+        // marked and sorts first, so the gradient still wins.
+        fun half_converted(): Style {
+            style().raw("background", "#180509").background_gradient(
+                Gradient::radial(RadialExtent::ClosestSide)
+                    .stop(Color::rgba(235, 104, 46, 0.4), 0.0)
+                    .stop(Color::transparent(), 100.0),
+            )
+        }
+        let _s = const half_converted();
+        fun main() {}
+        main();
+        "##,
+    );
+    let (_, shorthand_at) = rule_for(&css, "background:#180509");
+    let (_, image_at) = rule_for(
+        &css,
+        "background-image:radial-gradient(closest-side, rgba(235, 104, 46, 0.4) 0%, transparent 100%)",
+    );
+    assert!(
+        shorthand_at < image_at,
+        "the unconverted shorthand must still sort ahead of the converted longhand:\n{css}"
+    );
+
+    // Fully converted, the colour and the image occupy DIFFERENT slots and both
+    // survive — CSS paints the image over the colour, which is the whole reason
+    // `background_gradient` was given its own slot in §0bis.3.
+    assert_compiles_and_runs(
+        r##"
+        import std::print;
+        import std::style::{ style, Color, Gradient, RadialExtent };
+        fun main() {
+            let converted = const style()
+                .background(Color::hex("#180509"))
+                .background_gradient(
+                    Gradient::radial(RadialExtent::ClosestSide)
+                        .stop(Color::rgba(235, 104, 46, 0.4), 0.0)
+                        .stop(Color::transparent(), 100.0),
+                );
+            print(converted.class_list().contains(" "));
+        }
+        main();
+        "##,
+        "true\n",
+    );
+}
+
+/// Decision 2, pinned: `padding_xy` is not minted because the axis methods
+/// already write EXACTLY the shorthand's four slots. All four two-value sites
+/// in the sweep are the `y x` form, and this is what they compose to — plus the
+/// A22 resolution in both directions, which is what confirmed §0bis.3's cut
+/// rather than reopening it.
+#[test]
+fn the_two_value_padding_sites_compose_from_the_axis_methods() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Length };
+        // playground_page.vl:147 — `padding: 8px 20px`.
+        fun s(): Style {
+            style().padding_y(Length::px(8)).padding_x(Length::px(20))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{padding-top:8px}",
+        "{padding-bottom:8px}",
+        "{padding-left:20px}",
+        "{padding-right:20px}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+
+    // The axes cover the whole box, so a `padding` set AFTER them drops all
+    // four — one class, exactly as it would have replaced a raw shorthand.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ style, space, Length };
+        fun main() {
+            let boxed = const style()
+                .padding_y(Length::px(8))
+                .padding_x(Length::px(20))
+                .padding(space(4));
+            print(boxed.class_list().contains(" "));
+        }
+        main();
+        "#,
+        "false\n",
+    );
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the
