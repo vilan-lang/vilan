@@ -102,10 +102,16 @@ font stack, a transform list). Reach for them the same way you reach for
 For anything the typed surface doesn't cover, escape hatches:
 
 ```vilan,fragment
-.raw("font-family", "system-ui, sans-serif")
+.raw("clip-path", "polygon(0 0, 100% 0, 100% 80%)")
 .with_length("scroll-margin-top", space(4))
 .with_color("outline-color", Color::blue(300))
 ```
+
+`raw` takes any property; `with_length` and `with_color` take an
+untyped property with a *typed* value, so a token still emits its
+`:root` declaration. The typed surface grows by demand — if you find
+yourself reaching for `raw` on the same property repeatedly, that is the
+evidence a method should exist.
 
 ## States and breakpoints
 
