@@ -2552,6 +2552,405 @@ fn a_nested_variant_capture_does_not_alias() {
 }
 
 #[test]
+fn an_is_capture_does_not_alias_the_subject() {
+    // B53 finding 1: `is` captures compile through the ALIAS path
+    // (`compile_is_pattern` records an accessor into the subject and
+    // substitutes it at every reference), which the first pass never taught
+    // to copy — so this printed 3, the source's growth showing through.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            if pair is (let xs, let n) {
+                pair.0.push(9);
+                print(xs.len());
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_mut_is_capture_does_not_write_back_to_the_subject() {
+    // The write direction of the same hole: `mut v` aliased the option's
+    // payload, so growing it grew what the option still holds (3/3).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held: Option<List<i32>> = Some([1, 2]);
+            if held is Some(mut v) {
+                v.push(9);
+                print(v.len());
+            }
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_guarded_match_capture_does_not_alias_the_subject() {
+    // A GUARD moves the leg onto the alias path too (the guard reads the
+    // captures, so they cannot be `const`s inside the body) — the same
+    // program as `a_mut_match_capture_does_not_alias_the_subject` printed
+    // 3/3 with `if n > 0` added.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            match pair {
+                (mut xs, let n) if n > 0 => {
+                    xs.push(9);
+                    print(xs.len());
+                    print(pair.0.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_rejecting_guard_leaves_the_subject_untouched() {
+    // The copy is made on ENTRY to the leg body, not when the pattern
+    // matches: the first leg's guard rejects, so it has copied nothing and
+    // consumed nothing and the SECOND guarded leg finds the subject exactly
+    // as it was — and that leg's own capture is still a copy (3/3 before).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            match pair {
+                (mut xs, let n) if n > 100 => {
+                    xs.push(9);
+                    print(0);
+                }
+                (mut xs, let n) if n > 0 => {
+                    xs.push(7);
+                    print(xs.len());
+                    print(pair.0.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_braced_leg_capture_does_not_leak_an_alias() {
+    // B53 finding 4: the value-seam scan only saw seams that were
+    // syntactically a place, so BRACING the leg body — `Some(let inner) => {
+    // inner }` — hid the seam and restored the `unwrap` leak (3/3). The scan
+    // now looks through the forms that forward a value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun take_it(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
+            match held {
+                Some(let inner) => { inner }
+                None => fallback,
+            }
+        }
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2]);
+            mut got = take_it(held, List::new());
+            got.push(9);
+            print(got.len());
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_conditionally_returned_capture_does_not_leak_an_alias() {
+    // The same hole through an `if` tail: neither `a` nor `b` is the
+    // function's tail EXPRESSION, so neither rooted a seam and both shared
+    // the caller's tuple (3/3).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pick(pair: (List<i32>, List<i32>), first: bool): List<i32> {
+            let (a, b) = pair;
+            if first { a } else { b }
+        }
+        fun main() {
+            let pair = ([1, 2], [5]);
+            mut got = pick(pair, true);
+            got.push(9);
+            print(got.len());
+            print(pair.0.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_shared_capture_is_not_an_elidable_move_source() {
+    // B53 finding 3: the share elision and rule 2's move elision are each
+    // sound alone and composed unsoundly — `xs` shared `pair.0` (immutable
+    // capture, immutable subject, no seam) and was then read exactly once,
+    // which made it an elidable-copy source, handing the shared storage to a
+    // `mut` binding. `const xs = $a[0]; let ys = xs;` with no copy anywhere:
+    // this printed 3. Only an OWNER may donate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = ([1, 2], 3);
+            let (xs, n) = pair;
+            mut ys = xs;
+            ys.push(9);
+            print(pair.0.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_mut_capture_from_an_immutable_subject_copies() {
+    // The share elision's other guard, on an IMMUTABLE subject (where the
+    // elision is otherwise live — the sibling pins all use `mut pair`, which
+    // disables it before this configuration is reached): a `mut` capture is
+    // never shareable, because it can write.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = ([1, 2], 3);
+            mut (xs, n) = pair;
+            xs.push(9);
+            print(xs.len());
+            print(pair.0.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_generic_capture_moves_a_resource_instantiation() {
+    // B53 finding 2, R11 (`docs/spec/memory.md`): a capture typed by a bare
+    // generic parameter copied conservatively in EVERY monomorphization, so
+    // `Option::unwrap`'s `Some(let x) => x` deep-copied a resource — two
+    // owners with divergent state, where the spec names `unwrap(self): T` as
+    // the case that must pass with no copies. This printed 7/1 (the option
+    // still holding an unmutated twin); it must be one resource, so 7/7.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res {
+            n: i32,
+        }
+        fun main() {
+            mut o: Option<Res> = Some(Res { n = 1 });
+            mut r = o.unwrap();
+            r.n = 7;
+            print(r.n);
+            match o {
+                Some(let inner) => print(inner.n),
+                None => print(0),
+            }
+        }
+        "#,
+        "7\n7\n",
+    );
+}
+
+#[test]
+fn a_moved_resource_instantiation_destroys_one_value() {
+    // The same fix seen through the destructor. The copy made TWO resources
+    // and ran `drop` on each with divergent fields (`n=7` then `n=1`); the
+    // move makes one, so both runs report the same value.
+    //
+    // That it drops TWICE is a separate, pre-existing hole, recorded in
+    // `proposal/capture-clones.md` §5: a `self`-by-value method call
+    // (`o.unwrap()`) does not mark `o` moved, so the option's scope-end
+    // teardown still fires. Pinning the honest output keeps the hole visible
+    // rather than papered over — when the affine checker learns the move,
+    // this expectation is the thing that changes.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        import std::drop::{ Drop, drop };
+        resource struct Res {
+            tag: str,
+            n: i32,
+        }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag} n={self.n}");
+            }
+        }
+        fun main() {
+            mut o: Option<Res> = Some(Res { tag = "a", n = 1 });
+            mut r = o.unwrap();
+            r.n = 7;
+            print(i"r.n={r.n}");
+            drop(r);
+            print("done");
+        }
+        "#,
+        "r.n=7\ndrop a n=7\ndone\ndrop a n=7\n",
+    );
+}
+
+#[test]
+fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
+    // The same decision one level up: the capture is typed `Wrap<T>`, an
+    // aggregate whatever `T` is, so it is not a bare generic — but `Wrap<Res>`
+    // IS a resource, and the copy made two (7/1). The analyzer records which
+    // constraints can turn the capture into a resource; the transformer asks
+    // what this instance bound them to.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Res {
+            n: i32,
+        }
+        struct Wrap<T> {
+            value: T,
+        }
+        fun first_of<T>(pair: (Wrap<T>, i32)): Wrap<T> {
+            let (a, b) = pair;
+            a
+        }
+        fun main() {
+            let pair = (Wrap { value = Res { n = 1 } }, 5);
+            mut w = first_of(pair);
+            w.value.n = 7;
+            print(w.value.n);
+            print(pair.0.value.n);
+        }
+        "#,
+        "7\n7\n",
+    );
+}
+
+#[test]
+fn a_generic_aggregate_capture_copies_a_data_instantiation() {
+    // The other half of the same gate: `Wrap<List<i32>>` is no resource, so
+    // the same capture in the same function still copies. The carve-out is for
+    // resources only — it is not a licence to alias.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Wrap<T> {
+            value: T,
+        }
+        fun first_of<T>(pair: (Wrap<T>, i32)): Wrap<T> {
+            let (a, b) = pair;
+            a
+        }
+        fun main() {
+            let pair = (Wrap { value = [1, 2] }, 5);
+            mut w = first_of(pair);
+            w.value.push(9);
+            print(w.value.len());
+            print(pair.0.value.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_mut_array_binder_in_a_match_stamps_its_elements() {
+    // B53 finding 5: `mut` at a binder applies to every binding under it, and
+    // the match/`is` grammar recursed tuples but not arrays — so `mut [a, b]`
+    // in a match bound `a`/`b` IMMUTABLE ("cannot mutate immutable 'a'") while
+    // the identical `mut [a, b] = arr` bound them mutable. One keyword, two
+    // meanings.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let arr: [List<i32>; 2] = [[1, 2], [3]];
+            match arr {
+                mut [a, b] => {
+                    a.push(9);
+                    print(a.len());
+                    print(arr[0].len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
+    // The `is` half of the same grammar arm.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let arr: [List<i32>; 2] = [[1, 2], [3]];
+            if arr is mut [a, b] {
+                a.push(9);
+                print(a.len());
+                print(arr[0].len());
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing hole found while closing B53's findings: a match GUARD \
+whose expression needs hoisted statements (any `is` test, a `?` lift, a nested \
+match) drops them — `compile_is_pattern`'s guarded-leg arm walks the guard into \
+a `guard_block` that is never emitted, because an else-if chain has no statement \
+slot before a leg's condition. The reference dangles: `if ($c[0] === 0)` with no \
+`$c`. Un-ignore when guarded legs emit as nested ifs. See \
+proposal/capture-clones.md §5."]
+fn a_guard_that_needs_a_temporary_emits_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut pair = ([1, 2], 3);
+            match pair {
+                (mut xs, let n) if xs.pop() is Some(_) => {
+                    print(xs.len());
+                    print(pair.0.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
 fn trait_conformance_ignores_parameter_mut() {
     // `mut` is the impl's local business — a trait signature without it is
     // satisfied by an impl with it (and the receiver likewise).
