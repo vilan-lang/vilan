@@ -10,8 +10,9 @@
 > SSR under v1**, since their views read the live rpc client at build time,
 > handlers capture it, and browser-layer imports come with it. That factoring
 > is filed nowhere else; take it up when an app demands SSR.
-> *Stale text below, flagged 2026-07-29: §S2 still describes `examples/ssr`
-> as a 3-package workspace — D7 converted it to one package, two entries.*
+> *Flagged 2026-07-29, corrected 2026-08-03: §S2 below described
+> `examples/ssr` as a 3-package workspace — D7 converted it to one package,
+> two entries; the §S2 text now reads that way.*
 >
 > Prior status: RATIFIED 2026-07-22 — implementation starts 2026-07-23 (user
 > call: too large for end of day). The §6 calls landed per recommendation:
@@ -143,8 +144,10 @@ tree:
 2. **S2 — SHIPPED 2026-07-23**: `mount` clears before appending
    (`mount_root` inherits; the HMR teardown clear composes untouched; no
    golden churned — every existing container was empty). New
-   `examples/ssr` (3-package workspace, `common` holds `fun app(): View`,
-   the server splices `render(app())` at the `<!--ssr-->` marker); the
+   `examples/ssr` (one package, two entries as of D7 — 2026-08-03
+   correction, was a 3-package workspace at S2's own ship date; `fun
+   app(): View` is shared between them, the server entry splices
+   `render(app())` at the `<!--ssr-->` marker); the
    full-stack e2e asserts the served HTML carries the rendered content
    **before any JS** (escaped text, signal-fed list, the `when` branch)
    and that the client boot **replaces** — one live root, server nodes

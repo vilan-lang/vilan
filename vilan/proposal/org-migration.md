@@ -55,8 +55,11 @@
 >   pseudonym the work is published under, and the line is an attestation that
 >   a human wrote the document without AI tooling — a claim whose whole force
 >   comes from a named person standing behind it. Stripping the name would
->   leave a document vouching for itself. The bare profile URL is a separate,
->   still-open question the user may yet remove; the name is not.
+>   leave a document vouching for itself. The bare profile URL was a
+>   separate, still-open question the user might yet remove; the name was
+>   not. **RESOLVED 2026-08-03** — owner's call: the personal-account link
+>   (`github.com/ReedSyllas`) is intended, same as the name it sits beside,
+>   and stays. Nothing to fix; backlog D10 carries the same note.
 >
 > Worth recording because it is the reason this was never urgent: removing
 > these strings would not have bought anonymity anyway. The tombstone below
