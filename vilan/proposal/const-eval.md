@@ -17,12 +17,17 @@ non-const call sites join R, roots (`main`, top-level initializers) never
 join — a root's call into R errors AT THAT call site, the outermost runtime
 crossing, while `emit` inside R-functions called from `const` chains stays
 legal (the styling property-function shape, pinned). Recorded refinements:
-indirect/closure-value paths into `emit` are the conservative gap;
 `run`/`--watch` write assets beside the canonical output each round (SHIPPED
 2026-07-20, hmr.md §11 S0 — single-package `run` and the `--watch` single arm
 now call `write_assets`; the workspace paths already did via
-`build_workspace_artifacts`); liveness-tied emission (dead-style
-elimination), Tier-2 LSP memoization, and deep failure spans as before. Implementation notes that
+`build_workspace_artifacts`). **The rest of the tail was verified piece by
+piece on 2026-08-04 and is now §8** — the indirect-call "conservative
+rejection" turned out to be a silent hole and is CLOSED (§8.1); deep failure
+attribution ships and expression-level spans are deferred with the question
+that blocks them (§8.2); the LSP's duplicate const pass is deleted and true
+Tier-2 memoization is deferred with its cache-key question (§8.3);
+liveness-tied emission (dead-style elimination) stays OUT, entangled with
+A7/A8. Implementation notes that
 amended the design: the JS-refugee hint lives in the ANALYZER, not the
 parser — `const x = 3` parses fine (assignment is an expression, so it is
 `const (x = 3)`), and the forwarding arm catches the `Assign` shape with
@@ -110,7 +115,9 @@ let narrowed = (const f()) + g();    // parenthesize to narrow the capture
   the checked-subscript message), the depth cap (`Depth`), an unavailable
   capability (`Unsupported`), or a non-data result — all report at the
   `const` expression with the failure message. Deep-span fidelity (pointing
-  inside the callee) is a recorded refinement shared with macro diagnostics.
+  inside the callee) is a recorded refinement shared with macro diagnostics —
+  DEFERRED with its blocker stated in §8.2; the failing *function* is named
+  and noted since 2026-08-04.
 - **Dependencies**: const expressions form a value dependency graph through
   the const-known bindings they read (imports included); evaluation follows
   it in deterministic order (module topological order, then binding order,
@@ -131,9 +138,11 @@ site with what it means ("styles are compile-time values — build them in a
 `const` expression", worded per API). v1 keeps the bit **std-internal** (users cannot
 declare const-only functions) and requires direct call chains — a const-only
 function passed indirectly (through a closure value) is conservatively
-rejected. This is one capability bit on a handful of internals, not function
-coloring: ordinary functions remain callable from both worlds with no
-annotation.
+rejected — enforced since 2026-08-04 at the point the VALUE is made, which is
+the only place the call graph can see it (§8.1); before that the sentence was
+aspirational and the escape was silent. This is one capability bit on a
+handful of internals, not function coloring: ordinary functions remain
+callable from both worlds with no annotation.
 
 ## 3. The asset channel — compile-time emission
 
@@ -277,3 +286,135 @@ keep it sound:
   with its own capability story, non-composable with the module graph, and
   invisible to the type checker. The asset channel gives the useful half
   (emission) inside the language.
+
+
+## 8. The G2 tail — verification, 2026-08-04
+
+Every remaining G2 claim re-checked against the tree at `f4a51e3` (v0.26.0)
+with probes before a line was implemented, the A8 pattern. Two of the four
+recorded pieces did not survive contact with the code.
+
+| Piece | Verdict | Evidence |
+| --- | --- | --- |
+| Deep failure spans | **OPEN, as recorded** — but the cause is deeper than "not done yet" | All three failure shapes anchor at the `const` expression, never inside the callee. Probed: a 3-level call tree ending in `xs[9]` (`Thrown`), unbounded recursion (`Depth`), a bare `for { }` (`Fuel`) — spans `level_one()`, `recurse(0)`, `spin()` respectively. `Failure` (`interpreter.rs:67`) carries a kind and a flat `String`, no location; the interpreter walks `js::Node` (`transformer.rs:6468`), which has no span on any variant, and `transform_const_program` returns no provenance side table. Macro expansion is identically shallow (`macros.rs:1363`, `span: site`). |
+| Indirect-call gap | **OPEN, and MIS-RECORDED — it was a silent hole, not a refusal** | §2 said an indirectly-passed const-only function "is conservatively rejected". It was not rejected: `fun styled() { emit(..); 1 }` + `fun apply(f: \|\| i32) { f() }` + `apply(styled)` from `main` compiled clean, emitted `__emit_asset("css", …)` into the JS, and died at run time with `ReferenceError: __emit_asset is not defined`. Same for a closure literal that emits, and for a closure that merely wraps an R-member call. The fixpoint propagates only through `callers_of`, which is built for resolved `Function`/`Closure` targets alone (`call_graph.rs:81`) — a call through a value is `Indirect(Value)` and contributes no edge. No test, passing or `#[ignore]`d, covered any of it. **FIXED below.** |
+| Tier-2 LSP memoization | **OPEN with a measured cost — NOT made moot by E3, but half of it is redundancy, not caching** | The base cache stores the pre-entry *world*; const evaluation runs strictly AFTER `analyze()` returns (`lib.rs:449`), so no const value ever rides it. Moot for std today — the embedded std contains **zero** `const` expressions (4 grep hits, all comments) — but not for entries. Measured (`analyze_source`, warm, 5 rounds, 16-core WSL2): 7 consts = **12.0 ms** of a 136 ms analysis (8.8 %); a 3-const styling entry = **17.0 ms** of 181 ms (9.4 %); a 1-const styling entry = **12.0 ms** of 163 ms (7.4 %); a 2000-element table = 3.5 ms. The cost is dominated by fixed overhead, not const count: `check_const_only` rebuilds a whole `CallGraph` per pass (~9.5 ms for a styling program, by the 1-vs-3-const delta), and each expression pays a fresh `transform_const_program` plus a full `entity_map` scan in `free_locals`. **And the LSP ran the entire pass twice per analysis** (`lib.rs:449`, then again at `document.rs:1087` discarding the identical map already in `program.const_results`) — so ~24–34 ms of every keystroke. **Half FIXED below (the duplicate); true memoization deferred with a question.** |
+| Liveness-tied emission | **OUT** — A7/G2-entangled, untouched here (backlog A8's dead-style elimination). | |
+
+**Sweep for recorded sub-items the backlog entry does not carry** (the entry
+has drifted before). Four, none of them previously listed:
+
+1. **Const-expression hoisting with a read-only proof** (§1, "hoisting-with-
+   read-only-proof is a recorded optimization, not v1") — still open, still an
+   optimization, unscheduled.
+2. **`const NAME = expr` sugar** (§1, "deliberately not shipped … recorded as a
+   later nicety if the corpus begs") — the corpus has not begged.
+3. **The budget-failure wording** (§4 promised "did not finish within the
+   compile-time budget"). That string exists nowhere in the tree; users saw the
+   raw interpreter wording under a const prefix. **FIXED below.**
+4. **The manifest budget claim is false.** `docs/spec/const.md` §9.3 said const
+   fuel/depth are "configured by the manifest's `[macro]` section". They are
+   not: `const_eval.rs` hardcodes `Limits::default()` (fuel 1 000 000, depth
+   512), while `[macro]` feeds `MacroLimits` (depth **16**) to macro expansion
+   only. Doc corrected to match the code. *Question, deferred: should `const`
+   get its own `[const]` budget knob, or join `[macro]`'s? Joining it silently
+   drops the const depth cap 512 → 16, which is a behaviour change, so it is
+   not a doc-fix-shaped decision.*
+
+### 8.1 The value escape — SHIPPED 2026-08-04
+
+§2's rule is now enforced where the value is MADE, which is the only place the
+call graph can see it. `check_value_escapes` (`const_eval.rs`) refuses two
+shapes outside every `const` subtree:
+
+- an R-member named as a function value — read off the call graph's existing
+  `function_references`, which already separates coercion sites from call
+  subjects (`call_graph.rs:491`), and is keyed by every function node, every
+  closure node, and every module-level initializer;
+- an R closure that is never immediately applied — it joins R through its own
+  body but nothing calls it by identity, so no boundary error could fire.
+
+Inside a `const` subtree nothing changes: the interpreter calls through the
+value happily, and the asset still flows (pinned both ways). The diagnostic
+anchors at the reference or the closure literal (A1) and states the rule (B6):
+"`styled` (it reaches `asset::emit`) is compile-time-only; call it directly
+inside a `const` expression — a compile-time-only function has no runtime value
+form". The `asset::emit` case gained its missing backticks in passing.
+
+Not covered, and correctly so: `emit` ITSELF as a value is already refused
+upstream by fn-coercion rule 1 (externs have no value form,
+`fn-coercion.md` §1). Still uncovered by design — the recorded conservative
+line stands: `Indirect(GenericMember)` and `Indirect(TraitDispatch)` into an
+emit-reaching method. `check_const_only` never calls `successors()`, which is
+where `dispatch_candidates` would over-approximate them. *Question, deferred:
+is trait/generic dispatch into R reachable at all today given that methods have
+no value form, or is it a live second hole?*
+
+Five pins (`inference.rs`), four proven red before the fix and one green
+throughout as the positive control.
+
+### 8.2 Deep failure attribution — SHIPPED 2026-08-04, spans DEFERRED
+
+True expression-level spans are blocked on provenance the tree does not have:
+`js::Node` carries no position on any variant, and the const mini-program is
+built by the general transformer, so threading one means either a field on
+every emitted node or a parallel side table out of `transform_const_program`.
+The nearest in-repo precedent is `derived_origins` (an id-range → span table in
+`analyzer.rs`). *Question, deferred: is per-node provenance worth its cost for
+a compile-time-only interpreter, or should the const pass instead evaluate a
+SPANNED IR — which would mean the interpreter no longer runs the same tree
+codegen emits, forfeiting the equivalence gate that is its whole safety story?
+That trade is the real decision, and it is bigger than G2.*
+
+What ships instead is the attribution the trace can carry without provenance.
+`Failure` gains a `trace: Vec<String>` that `call_value` appends to as the
+error unwinds — one push per named frame, innermost first, nothing on the
+success path (anonymous closures contribute no frame, so it is the named call
+chain, not the stack). The const pass names the innermost frame in the message
+and anchors a secondary note (C3) at that function's NAME span (A1), carrying
+the chain elided to the innermost four — a depth miss unwinds hundreds of
+identical frames, and `… → recurse → recurse → recurse → recurse` says what
+512 repetitions would not. A std frame is legal in a note and would not be
+legal as a primary span (A2), which is exactly the shape C3 exists for. The
+frame name is printed only when it matches a declared function, so a
+monomorphized or synthetic name never reaches the user (B1); the note needs a
+UNIQUE match, since pointing at an arbitrary one of several would not be
+deterministic (C1).
+
+`failure.kind` stops being discarded: `Fuel` and `Depth` now render §4's
+promised "did not finish within the compile-time budget", with the specific cap
+named after the colon. That wording existed nowhere in the tree — users saw the
+macro engine's internal phrasing under a const prefix.
+
+Four pins, both halves plant-proven independently: dropping the trace push
+reddens all four; dropping the kind branch reddens exactly the two budget pins.
+En route the fourteen `Failure { .. }` literals became `Failure::new`, which is
+what let the struct grow a field without touching every site twice.
+
+### 8.3 The LSP's duplicate pass — SHIPPED 2026-08-04; memoization deferred
+
+`document.rs` re-ran `const_eval::evaluate` purely to get hover values, while
+`analyze_source` had already stored the identical map in `program.const_results`
+and no one read it. Reading the field deletes a full pass — 12–17 ms of every
+keystroke on a const-using entry, measured above — with no design and no
+behaviour change (the second run's errors were being discarded anyway, and on a
+program with const errors it returned an empty map regardless). The
+`Document::const_results` field went with it: `const_value_label` already had
+the `Program` in hand. Pinned by the invariant the deletion rests on — analysis
+leaves the folded values on the program — plant-proven by blanking the store;
+the two existing hover-value tests are the behaviour net.
+
+That leaves the *first* pass uncached, which is the Tier-2 item proper.
+*Question, deferred: what is a const expression's cache key?* Entity ids are
+regenerated per analysis, so the key must be source-derived — the dependency
+closure's text, as §4 sketches. Two things make that harder than the world
+cache: the closure includes every function transitively reached (the
+mini-program is built by a fixpoint, not a syntactic walk), and the result must
+be invalidated by a std edit as well as an entry edit, so the key composes with
+the base cache's content hashes rather than replacing them. The cheaper
+structural win found while measuring, and not taken here: `check_const_only`
+builds a whole `CallGraph` per pass (~9.5 ms on a styling entry) and
+`free_locals` scans the entire `entity_map` per const expression — both are
+per-analysis waste independent of any cross-analysis memo, and `platform_color`
+and `init_order` build their own call graphs too. A shared per-analysis call
+graph is the obvious next slice and is not const-specific.

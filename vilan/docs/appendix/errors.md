@@ -449,10 +449,40 @@ the `Style` in a `const` (`let card = const style()…`); select and merge
 already-built styles at runtime.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
 
+**"… is compile-time-only; evaluate this call inside a `const` expression"**
+The same rule, caught statically: some function on this call path reaches
+`asset::emit`, and the call itself sits in runtime code. The span is the
+outermost runtime crossing — the call that leaves ordinary code and enters
+style-building territory — so wrap *that* call in a `const`.
+
+**"… is compile-time-only; call it directly inside a `const` expression — a
+compile-time-only function has no runtime value form"**
+A compile-time-only function (or a closure that reaches one) was used as a
+*value* — passed to a higher-order function, stored in a binding, built as a
+closure literal — rather than called. The compiler cannot follow a call made
+through a value, so it refuses the value instead. Call it directly inside the
+`const`: `const apply(styled)` is fine, `apply(styled)` at runtime is not.
+
 **"a `const` result must be plain data; this evaluates to …"**
 The `const` expression produced something that can't be baked into the
 output (a closure, a host object). Fold values, not behavior.
 → [Macros & const](../tour/macros-and-const.md)
+
+**"const evaluation failed in `f`: …"**
+The computation ran and something inside it went wrong — a panic, a
+subscript past the end. The squiggle is on the `const` expression,
+because that is the expression the compiler is refusing to fold; the
+message names the function it failed *in*, and the note points at that
+function's declaration with the call chain that reached it. (The
+compiler cannot point inside the callee: the tree it evaluates is the
+compiled output, which carries no source positions.)
+
+**"const evaluation did not finish within the compile-time budget in
+`f`: …"**
+The same thing, but the computation never finished rather than failing:
+it exhausted the interpreter's step budget (an unbounded `for`) or its
+call-depth cap (unbounded recursion). The build fails rather than
+hangs. Fix the termination condition, or move the work to runtime.
 
 ## Syntax
 

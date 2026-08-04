@@ -41,14 +41,34 @@ callable **only** during const evaluation: it declares a build asset
 (the styling system's CSS, for example) that the build writes beside
 the output. Asset emission is deterministic: same inputs, same files.
 
+A function that reaches `emit` is **compile-time-only**, transitively,
+and the compiler enforces that statically. A call from runtime code
+into compile-time-only territory is an error at the outermost crossing
+— the call that leaves ordinary code. Because a call made *through a
+value* has no statically known callee, a compile-time-only function
+also has **no runtime value form**: naming one as a value (passing it
+to a higher-order function, binding it, or writing a closure literal
+that reaches `emit`) is an error at that reference, outside a `const`.
+Inside a `const` the restriction lifts entirely — the interpreter makes
+the call, so `const apply(styled)` is legal where `apply(styled)` is
+not.
+
 ## 9.3 Failure and resource limits
 
 Const evaluation is total by construction of the budget: each run is
-bounded by the interpreter's **fuel** (steps) and **depth** (nesting),
-shared with macro expansion and configured by the manifest's `[macro]`
-section (§11.4). Exhausting either, or panicking during evaluation, is
-a compile error carrying the const expression's span. A runaway
-`const` fails the build; it cannot hang it.
+bounded by the interpreter's **fuel** (steps) and **depth** (nesting).
+Exhausting either, or panicking during evaluation, is a compile error
+carrying the const expression's span; a budget failure says so, rather
+than reading as a program error. A runaway `const` fails the build; it
+cannot hang it. The budgets are the interpreter's own defaults — the
+manifest's `[macro]` section (§11.4) sizes macro *expansion* only, and
+does not size `const`.
+
+The primary span is the `const` expression itself, always: the tree the
+interpreter evaluates is compiled output and carries no source
+positions, so there is no inner expression to anchor to. The diagnostic
+instead names the **function** the failure occurred in and notes that
+function's declaration, with the call chain that reached it.
 
 ## 9.4 Results
 

@@ -9,10 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::analyzer::{Expr, Program, SourceId};
-use crate::call_graph::{Call, CallGraph, CallTarget};
-use crate::error::Error;
+use crate::call_graph::{Call, CallGraph, CallTarget, Node};
+use crate::error::{Error, Note};
 use crate::id::Id;
-use crate::interpreter::{self, ConstValue, Limits};
+use crate::interpreter::{self, ConstValue, FailureKind, Limits};
 use crate::options::BuildOptions;
 use crate::span::Span;
 use crate::transformer;
@@ -99,6 +99,25 @@ fn media_min_width(line: &str) -> Option<f64> {
         "px" => Some(number),
         "em" | "rem" => Some(number * 16.0),
         _ => None,
+    }
+}
+
+/// The frame trace, outermost of the shown frames first. A depth failure
+/// unwinds hundreds of identical frames, so only the innermost few are shown;
+/// `…` marks the ones dropped.
+fn render_call_chain(trace: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let chain = trace
+        .iter()
+        .take(SHOWN)
+        .rev()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" → ");
+    if trace.len() > SHOWN {
+        format!("… → {chain}")
+    } else {
+        chain
     }
 }
 
@@ -238,14 +257,8 @@ impl<'p, 'src> State<'p, 'src> {
                     true
                 }
                 Err(failure) => {
-                    self.errors.push((
-                        Error {
-                            note: None,
-                            span: self.span_of(expr_id),
-                            msg: format!("const evaluation failed: {}", failure.message),
-                        },
-                        self.source_of(expr_id),
-                    ));
+                    let error = self.failure_error(expr_id, failure);
+                    self.errors.push((error, self.source_of(expr_id)));
                     false
                 }
             };
@@ -256,8 +269,14 @@ impl<'p, 'src> State<'p, 'src> {
     /// path may reach `asset::emit`. R = the functions/closures that reach it
     /// through call sites OUTSIDE `const` subtrees; roots (`main`, top-level
     /// initializers) never join R — a root's call into R is the offending
-    /// boundary, reported at that call site. Indirect calls (closure values)
-    /// are the recorded conservative gap.
+    /// boundary, reported at that call site.
+    ///
+    /// A call THROUGH a value resolves to `CallTarget::Indirect(Value)`, which
+    /// carries no caller edge, so the fixpoint cannot follow it. §2's rule is
+    /// therefore a refusal at the point the value is MADE: an R-member
+    /// referenced as a function value, or an escaping R closure, outside every
+    /// `const` subtree. Without it the escape is silent and the emitted JS
+    /// carries a live `__emit_asset` call with no runtime binding.
     fn check_const_only(&mut self) {
         let Some(emit_id) = self.program.asset_emit_fn_id else {
             return;
@@ -337,15 +356,7 @@ impl<'p, 'src> State<'p, 'src> {
         boundary_errors.sort_by_key(|(site, _)| self.span_of(*site).start);
         boundary_errors.dedup();
         for (site, callee) in boundary_errors {
-            let name = if callee == emit_id {
-                "asset::emit".to_string()
-            } else {
-                self.program
-                    .functions
-                    .get(&callee)
-                    .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
-                    .unwrap_or_else(|| "this call".to_string())
-            };
+            let name = self.const_only_name(callee, emit_id);
             self.errors.push((
                 Error {
                     note: None,
@@ -358,6 +369,184 @@ impl<'p, 'src> State<'p, 'src> {
                 self.source_of(site),
             ));
         }
+
+        self.check_value_escapes(&graph, &in_r, emit_id);
+    }
+
+    /// The value-escape half of §2's rule. Two shapes make a runtime function
+    /// value out of R, and both bypass the call-graph fixpoint:
+    ///
+    /// - an R-member NAMED as a value (fn-to-closure coercion) — the call graph
+    ///   already separates these from call subjects in `function_references`;
+    /// - an R closure that is never immediately applied — it joined R through
+    ///   its own body, but nothing calls it by identity, so no boundary error
+    ///   can fire for it.
+    ///
+    /// Both are refused at the site the value is made, which is also the
+    /// narrowest span that identifies the problem (diagnostics-standard A1).
+    /// A reference inside a `const` subtree is untouched: there the interpreter
+    /// makes the call, which is the whole styling shape.
+    fn check_value_escapes(&mut self, graph: &CallGraph, in_r: &HashSet<Id>, emit_id: Id) {
+        let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
+
+        // `function_references` is keyed by every function node, every closure
+        // node, and every module-level binding's initializer — the same key set
+        // the graph itself walks. A `const`-marked initializer is skipped at
+        // build time, so module-level const chains never appear here at all.
+        let reference_owners = graph
+            .nodes()
+            .iter()
+            .map(|node| node.id())
+            .chain(self.program.module_level_bindings());
+        for owner in reference_owners {
+            for &(reference_id, function_id) in graph.function_references_of(owner) {
+                if !in_r.contains(&function_id) || self.in_const_subtree(reference_id) {
+                    continue;
+                }
+                escapes.push((reference_id, Some(function_id)));
+            }
+        }
+
+        // An immediately-applied closure literal is `CallTarget::Closure`; any
+        // R closure that is NOT one of those exists only as a value.
+        let mut applied: HashSet<Id> = HashSet::new();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                if let CallTarget::Closure(target) = call.target {
+                    applied.insert(target);
+                }
+            }
+        }
+        for binding in self.program.module_level_bindings() {
+            for call in graph.initializer_calls_of(binding) {
+                if let CallTarget::Closure(target) = call.target {
+                    applied.insert(target);
+                }
+            }
+        }
+        for node in graph.nodes() {
+            let Node::Closure(closure_id) = *node else {
+                continue;
+            };
+            if !in_r.contains(&closure_id)
+                || applied.contains(&closure_id)
+                || self.in_const_subtree(closure_id)
+            {
+                continue;
+            }
+            escapes.push((closure_id, None));
+        }
+
+        escapes.sort_by_key(|(site, _)| self.span_of(*site).start);
+        escapes.dedup();
+        for (site, function_id) in escapes {
+            let subject = match function_id {
+                Some(function_id) => self.const_only_name(function_id, emit_id),
+                None => "this closure (it reaches `asset::emit`)".to_string(),
+            };
+            self.errors.push((
+                Error {
+                    note: None,
+                    span: self.span_of(site),
+                    msg: format!(
+                        "{subject} is compile-time-only; call it directly inside a `const` \
+                         expression — a compile-time-only function has no runtime value form"
+                    ),
+                },
+                self.source_of(site),
+            ));
+        }
+    }
+
+    /// How a const-only callee names itself in a diagnostic: `asset::emit`
+    /// itself, or the R-member that reaches it.
+    fn const_only_name(&self, callee: Id, emit_id: Id) -> String {
+        if callee == emit_id {
+            return "`asset::emit`".to_string();
+        }
+        self.program
+            .functions
+            .get(&callee)
+            .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
+            .unwrap_or_else(|| "this closure (it reaches `asset::emit`)".to_string())
+    }
+
+    /// An interpreter failure as a diagnostic. The primary span stays the
+    /// `const` expression — the interpreted tree carries no positions, so
+    /// there is no inner span to move to (const-eval.md §8.2) — but the frame
+    /// trace names the function the failure happened in, and a secondary note
+    /// anchors at that function's declaration so the editor can reach it.
+    /// A std frame is legal in a note and would not be legal as the primary
+    /// span (diagnostics-standard A2, C3).
+    fn failure_error(&self, expr_id: Id, failure: interpreter::Failure) -> Error {
+        // The kind stops at the const boundary: a budget miss is not a program
+        // error, and §4 promised it says so.
+        let headline = match failure.kind {
+            FailureKind::Fuel | FailureKind::Depth => {
+                "const evaluation did not finish within the compile-time budget"
+            }
+            _ => "const evaluation failed",
+        };
+        let innermost = failure
+            .trace
+            .first()
+            .filter(|name| self.functions_named(name) > 0);
+        let (subject, note) = match innermost {
+            None => (String::new(), None),
+            Some(name) => {
+                let subject = format!(" in `{name}`");
+                let note = self.unique_function_named(name).map(|function_id| {
+                    let source = self.source_of(function_id);
+                    Note {
+                        // The name, not the whole declaration (A1) — and the
+                        // file only when it differs from the primary span's.
+                        span: self.program.functions[&function_id].name_span,
+                        msg: if failure.trace.len() > 1 {
+                            format!(
+                                "the compile-time call chain: {}",
+                                render_call_chain(&failure.trace)
+                            )
+                        } else {
+                            format!("`{name}` is declared here")
+                        },
+                        source: (source != self.source_of(expr_id)).then_some(source),
+                    }
+                });
+                (subject, note)
+            }
+        };
+        Error {
+            note,
+            span: self.span_of(expr_id),
+            msg: format!("{headline}{subject}: {}", failure.message),
+        }
+    }
+
+    /// How many declared functions carry a name — the guard against printing a
+    /// synthetic or monomorphized frame name at the user (B1).
+    fn functions_named(&self, name: &str) -> usize {
+        self.program
+            .functions
+            .values()
+            .filter(|function| function.name == name)
+            .count()
+    }
+
+    /// The one function with this name, or `None` when the name is ambiguous —
+    /// a note pointing at an arbitrary one of several would not be
+    /// deterministic (C1).
+    fn unique_function_named(&self, name: &str) -> Option<Id> {
+        let mut found = None;
+        for (id, function) in &self.program.functions {
+            if function.name != name {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*id);
+        }
+        found
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic

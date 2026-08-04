@@ -14594,8 +14594,10 @@ fn a_call_initialized_binding_is_not_const_known() {
 
 #[test]
 fn a_panic_at_const_time_is_a_compile_error() {
-    // The diagnostic spans the whole const expression (deep spans into the
-    // failing subexpression are the recorded refinement).
+    // The diagnostic spans the whole const expression. Expression-level spans
+    // INSIDE the callee stay the recorded refinement (const-eval.md §8.2 —
+    // the interpreted tree carries no positions); the failing FUNCTION is
+    // named, which the deep-failure pins below cover.
     let diagnostics = failure_diagnostics(
         r#"
         fun main() {
@@ -14995,6 +14997,275 @@ fn reaching_functions_inside_const_are_fine() {
         "#,
         "8\n",
     );
+}
+
+#[test]
+fn analysis_leaves_the_const_results_on_the_program() {
+    // The invariant the LSP relies on (const-eval.md §8.3): `analyze_source`
+    // already evaluated every `const`, so no consumer needs a second pass to
+    // read the values — hover reads `program.const_results` directly.
+    let source = r#"
+        fun square(n: i32): i32 { n * n }
+        fun main() {
+            let _folded = const square(7);
+        }
+        main();
+        "#
+    .to_string();
+    let values = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            program
+                .map(|program| program.const_results.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Number(49.0)],
+        "the folded value must survive on the program"
+    );
+}
+
+// Deep failure attribution (const-eval.md §8.2): the primary span stays the
+// `const` expression — there is no inner span to move to — but the frame trace
+// names the function the failure happened in and notes its declaration.
+
+#[test]
+fn a_deep_const_failure_names_the_failing_function() {
+    assert_fails_noting(
+        r#"
+        fun level_three(xs: List<i32>): i32 {
+            xs[9]
+        }
+        fun level_two(xs: List<i32>): i32 {
+            level_three(xs) + 1
+        }
+        fun level_one(): i32 {
+            mut xs: List<i32> = List::new();
+            xs.push(1);
+            level_two(xs)
+        }
+        fun main() {
+            let _value = const level_one();
+        }
+        main();
+        "#,
+        "const evaluation failed in `level_three`: index out of bounds",
+        "level_three",
+        "the compile-time call chain: level_one → level_two → level_three",
+    );
+}
+
+#[test]
+fn a_single_frame_const_failure_notes_the_declaration_without_a_chain() {
+    assert_fails_noting(
+        r#"
+        import std::io::panic;
+        fun only(): i32 {
+            panic("no");
+            1
+        }
+        fun main() {
+            let _value = const only();
+        }
+        main();
+        "#,
+        "const evaluation failed in `only`: no",
+        "only",
+        "`only` is declared here",
+    );
+}
+
+#[test]
+fn a_const_fuel_miss_reports_a_budget_not_a_failure() {
+    // §4's promised wording, which the raw interpreter message never carried.
+    assert_fails_with(
+        r#"
+        fun spin(): i32 {
+            mut i = 0;
+            for {
+                i = i + 1;
+            }
+            i
+        }
+        fun main() {
+            let _value = const spin();
+        }
+        main();
+        "#,
+        "const evaluation did not finish within the compile-time budget in `spin`: the fuel \
+         budget was exhausted",
+    );
+}
+
+#[test]
+fn a_const_depth_miss_reports_a_budget_and_elides_the_repeated_frames() {
+    assert_fails_noting(
+        r#"
+        fun recurse(n: i32): i32 {
+            recurse(n + 1)
+        }
+        fun main() {
+            let _value = const recurse(0);
+        }
+        main();
+        "#,
+        "const evaluation did not finish within the compile-time budget in `recurse`: the \
+         call-depth cap was exceeded",
+        "recurse",
+        "the compile-time call chain: … → recurse → recurse → recurse → recurse",
+    );
+}
+
+// The value escape (const-eval.md §2): a call THROUGH a function or closure
+// value resolves to `Indirect(Value)`, which carries no caller edge, so the
+// R-fixpoint cannot follow it. v1 refuses at the reference — without which the
+// emitted JS carries a live `__emit_asset` call that has no runtime binding.
+
+#[test]
+fn a_function_reaching_emit_cannot_escape_as_a_value() {
+    let source = r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(styled);
+        }
+        main();
+        "#;
+    let reference = source.rfind("styled").unwrap();
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only")
+                && *range == (reference..reference + "styled".len())),
+        "no value-escape diagnostic at the reference: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_module_level_value_reference_to_an_emit_reaching_function_is_rejected() {
+    let source = r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        let HANDLER = styled;
+        fun main() {}
+        main();
+        "#;
+    let reference = source.rfind("styled").unwrap();
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only")
+                && *range == (reference..reference + "styled".len())),
+        "no value-escape diagnostic at the module-level reference: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_closure_reaching_emit_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(|| {
+                emit("css", ".a{}");
+                1
+            });
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_closure_wrapping_an_emit_reaching_call_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(|| styled());
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn an_indirect_call_rooted_in_const_stays_legal() {
+    // The refusal is about RUNTIME escape only: inside a `const` expression the
+    // interpreter calls through the value happily, and the asset still flows.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            print(const apply(styled));
+        }
+        main();
+        "#,
+        "1\n",
+    );
+    let assets = collected_assets(
+        r#"
+        import std::print;
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            print(const apply(styled));
+        }
+        main();
+        "#,
+    );
+    assert_eq!(assets, vec![("css".to_string(), ".a{}".to_string())]);
 }
 
 // --- A8: std::style — typed atomic styles, compiled ---------------------------
