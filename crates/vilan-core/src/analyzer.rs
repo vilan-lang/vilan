@@ -346,6 +346,13 @@ pub struct Parameter<'src> {
     /// field-write its by-value copy. Never part of the signature —
     /// conformance checking compares conventions only.
     pub mutable: bool,
+    /// `...items: T` (proposal/variadic-generics.md §S): a SPREAD parameter.
+    /// The callee side is an ordinary tuple parameter; `...` says the call
+    /// site writes the pack's elements out flat, and the solver collects them
+    /// into one synthesized tuple argument here (`collect_spread_arguments`).
+    /// Only ever the LAST parameter of a free function (the parser refuses it
+    /// elsewhere), so a call needs to inspect only that one.
+    pub spread: bool,
 }
 
 /// The precomputed view sets the rule-4 scan matches against: origins for
@@ -1589,6 +1596,12 @@ pub struct Analyzer<'src> {
     // own generics positionally — the analyzer binds the TRAIT method's ids,
     // which differ from each impl's, so a map can't cross that boundary.
     own_generic_call_bindings: HashMap<Id, Vec<TypeId>>,
+    // A call to a spread-parameter function, keyed by call id, mapped to its
+    // COLLECTED argument list — the fixed arguments plus one synthesized
+    // `Expr::Tuple` holding the pack (variadic-generics.md §S.1). Memoized
+    // because the call-subject constraint defers and retries: a fresh pack
+    // entity per attempt would strand the earlier ones mid-inference.
+    spread_packs: HashMap<Id, Vec<Id>>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
     // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
     // dispatches on THAT trait's surface — override, else default — so an
@@ -2038,6 +2051,7 @@ impl<'src> Analyzer<'src> {
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::new(),
             own_generic_call_bindings: HashMap::new(),
+            spread_packs: HashMap::new(),
             bound_dispatch_traits: HashMap::new(),
             prepped_trait_impls: Vec::new(),
             conformance_signature_checks: Vec::new(),
@@ -15631,6 +15645,7 @@ impl<'src> Analyzer<'src> {
             declared_type: parameter_type,
             convention,
             mutable,
+            spread,
             span,
         } = parameter;
         let parameter_id = self.new_entity_id();
@@ -15726,6 +15741,7 @@ impl<'src> Analyzer<'src> {
                 type_id,
                 convention: *convention,
                 mutable: *mutable,
+                spread: *spread,
             },
         );
         self.expr_id_to_expr_map
@@ -19028,6 +19044,80 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The call half of the spread desugar (variadic-generics.md §S.1):
+    /// `f(a, b, c)` against `fun f(...items: T)` *is* `f((a, b, c))`.
+    ///
+    /// When the callee's last parameter is a spread, the arguments from its
+    /// position onward are replaced by ONE synthesized `Expr::Tuple` — the very
+    /// entity a written tuple literal lowers to. From here on the call is the
+    /// tuple form: typing, the tuple-bound check, the rule-1/3/4 scans and
+    /// emission all see a single tuple argument and need no spread-specific
+    /// path of their own. `...` is a call convention, and this is the only
+    /// place that knows it.
+    ///
+    /// Memoized per call id — the call-subject constraint defers and retries,
+    /// and a fresh pack entity per attempt would strand the earlier ones
+    /// half-inferred.
+    ///
+    /// Returns `None` when the callee takes no spread parameter (the caller
+    /// keeps the arguments as written), and `Err` for "fewer arguments than
+    /// there are FIXED parameters" — an arity failure reported here because the
+    /// ordinary equality check would name an exact count a variadic signature
+    /// does not have.
+    fn collect_spread_arguments(
+        &mut self,
+        call_id: Id,
+        parameters: &[Id],
+        argument_ids: &[Id],
+        arguments_span: Span,
+    ) -> Result<Option<Vec<Id>>, ()> {
+        let takes_spread = parameters.last().is_some_and(|parameter_id| {
+            self.parameters
+                .get(parameter_id)
+                .is_some_and(|parameter| parameter.spread)
+        });
+        if !takes_spread {
+            return Ok(None);
+        }
+        if let Some(collected) = self.spread_packs.get(&call_id) {
+            return Ok(Some(collected.clone()));
+        }
+        let fixed = parameters.len() - 1;
+        if argument_ids.len() < fixed {
+            self.diagnostics.push(Error {
+                note: None,
+                span: arguments_span,
+                msg: format!(
+                    "Expected at least {} {}, but got {} instead.",
+                    fixed,
+                    plural(fixed, "argument", "arguments"),
+                    argument_ids.len()
+                ),
+            });
+            return Err(());
+        }
+        let pack_element_ids = argument_ids[fixed..].to_vec();
+        let pack_id = self.new_entity_id();
+        // The pack's diagnostic span is the first collected argument's, so a
+        // pack that fails its bound points at what was written; an EMPTY pack
+        // has no argument to point at and borrows the call's own span.
+        let pack_span = pack_element_ids
+            .first()
+            .and_then(|first| self.span_map.get(first).copied())
+            .or_else(|| self.span_map.get(&call_id).copied())
+            .unwrap_or(&EMPTY_SPAN);
+        self.expr_id_to_expr_map
+            .insert(pack_id, Expr::Tuple(pack_element_ids));
+        self.span_map.insert(pack_id, pack_span);
+        if let Some(scope_id) = self.expr_id_to_scope_id_map.get(&call_id).copied() {
+            self.expr_id_to_scope_id_map.insert(pack_id, scope_id);
+        }
+        let mut collected = argument_ids[..fixed].to_vec();
+        collected.push(pack_id);
+        self.spread_packs.insert(call_id, collected.clone());
+        Ok(Some(collected))
+    }
+
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
     fn wire_call(
         &mut self,
@@ -19244,6 +19334,22 @@ impl<'src> Analyzer<'src> {
                 };
 
                 if let Some((parameters, generic_parameter_constraint_ids)) = function_data {
+                    // `...` is a call convention over an ordinary tuple
+                    // parameter: collect the pack here and the rest of this
+                    // function — and every pass after it — sees the tuple form.
+                    let collected = match self.collect_spread_arguments(
+                        call_id,
+                        &parameters,
+                        argument_ids,
+                        arguments_span,
+                    ) {
+                        Ok(collected) => collected,
+                        Err(()) => return Resolution::Failed,
+                    };
+                    let argument_ids: &[Id] = match &collected {
+                        Some(collected) => collected,
+                        None => argument_ids,
+                    };
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
                             note: None,

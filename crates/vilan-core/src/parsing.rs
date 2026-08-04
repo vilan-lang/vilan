@@ -289,6 +289,11 @@ struct Parser<'a, 'src> {
     /// (see [`parse_preserving_groups`]). Read at exactly one site,
     /// [`Parser::parse_paren_atom`]; false everywhere the compiler proper parses.
     preserve_paren_groups: bool,
+    /// Inside a `trait` body or an `impl` body — so the function being parsed is
+    /// a MEMBER, reached by dispatch rather than named directly. Read at exactly
+    /// one site, [`Parser::parse_function`], to refuse a spread parameter there
+    /// (variadic-generics.md §S.7).
+    in_member_body: bool,
 }
 
 /// A recorded farthest failure (see [`Parser::farthest_failure`]).
@@ -419,6 +424,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             farthest_failure: None,
             context_stack: Vec::new(),
             preserve_paren_groups,
+            in_member_body: false,
         }
     }
 
@@ -2263,6 +2269,13 @@ impl<'a, 'src> Parser<'a, 'src> {
             } else {
                 return None;
             };
+            parser.reject_spread_position(
+                &parameters,
+                "a closure cannot take a spread parameter: a closure TYPE \
+                 (`sync |A, B| C`) has no variadic form, so such a closure could not \
+                 be annotated, stored, or passed anywhere. Take a tuple parameter \
+                 (`|items: T|`) and call it with one",
+            );
             let parameters = (parameters, parser.span_from(start));
             let return_type = if parser.eat_op(":") {
                 Some(Box::new(parser.parse_type()?))
@@ -2862,7 +2875,22 @@ impl<'a, 'src> Parser<'a, 'src> {
                     });
                 }
             }
+            self.reject_spread_position(
+                &parameters.0,
+                "an `external fun` binds a host function, whose calling convention is \
+                 the host's; declare a tuple parameter (`items: T`) instead",
+            );
         }
+        if self.in_member_body {
+            self.reject_spread_position(
+                &parameters.0,
+                "a spread parameter is only available on a free `fun`: it is part of \
+                 the signature, and a method is reached by dispatch (inherent, through \
+                 a trait, through a generic bound). Declare a tuple parameter \
+                 (`items: T`) and call it `m((a, b))`",
+            );
+        }
+        self.reject_misplaced_spread(&parameters.0);
         let return_type = if self.eat_op(":") {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
@@ -2916,11 +2944,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((parameters, self.span_from(start)))
     }
 
-    /// One function parameter: `(mut | own | & mut?)? binder (: type)?`. The
-    /// convention is the explicit prefix, else inferred from a `&T` / `&mut T`
-    /// type, else `Bare`. A leading `mut` is binder mutability, not a
+    /// One function parameter: `(mut | own | & mut?)? "..."? binder (: type)?`.
+    /// The convention is the explicit prefix, else inferred from a `&T` /
+    /// `&mut T` type, else `Bare`. A leading `mut` is binder mutability, not a
     /// convention (proposal/mut-parameters.md): the body may rebind and
-    /// field-write its by-value copy, invisibly to the caller.
+    /// field-write its by-value copy, invisibly to the caller. A `...` marks a
+    /// SPREAD parameter (proposal/variadic-generics.md §S) — a call convention
+    /// over an ordinary tuple parameter.
     fn parse_function_parameter(&mut self) -> Option<Parameter<'src>> {
         let start = self.position;
         let mutable = self.eat(&Token::Mut);
@@ -2938,6 +2968,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         // `own mut x` / `&mut mut x` — a stray `mut` after the convention,
         // consumed here so the binder still parses and the rule below fires.
         let misplaced_mut = prefix.is_some() && self.eat(&Token::Mut);
+        let spread = self.eat_spread();
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
             Some(Box::new(
@@ -2972,13 +3003,73 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
         }
         self.reject_mut_destructure(mutable, &pattern, pattern_span);
+        if spread {
+            // A spread parameter's argument is a value the CALL SITE builds out
+            // of the collected arguments — there is no caller-side tuple to
+            // transfer or to alias, so a rule-3 convention has nothing to name
+            // (variadic-generics.md §S.5). The inferred-convention arm catches
+            // `...items: &T` too.
+            if convention != Convention::Bare {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter receives a tuple the call site builds from \
+                         the collected arguments, so there is nothing for `own` or a \
+                         view (`&`, `&mut`) to transfer or alias",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // The pack is what the collection PRODUCES, so it cannot be
+            // inferred from the collection whose shape it defines (§S.3).
+            if parameter_type.is_none() {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter must declare its pack type \
+                         (`...items: T` with `T: (..)`, a mapped tuple, or a tuple type)",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // Destructuring the pack in the signature would hide the arity rule
+            // the call site has to satisfy; destructure in the body (§S.3).
+            if !matches!(pattern, Pattern::Binding(..)) {
+                self.errors.push(ParseError {
+                    span: pattern_span,
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter binds the whole pack to a plain name; \
+                         destructure it in the body",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         Some(Parameter {
             pattern,
             declared_type: parameter_type,
             convention,
             mutable,
+            spread,
             span: pattern_span,
         })
+    }
+
+    /// `...` — the spread-parameter marker, three `.` control tokens (the lexer
+    /// has no `...`, exactly as the tuple bound's `..` is two; there is no
+    /// adjacency check, matching `parse_tuple_bound`). Consumes nothing unless
+    /// all three are present.
+    fn eat_spread(&mut self) -> bool {
+        if self.peek_is_ctrl('.') && self.peek_at_is_ctrl(1, '.') && self.peek_at_is_ctrl(2, '.') {
+            self.bump();
+            self.bump();
+            self.bump();
+            return true;
+        }
+        false
     }
 
     /// `mut` on a parameter applies to a plain name binder; a destructure gets
@@ -2991,6 +3082,46 @@ impl<'a, 'src> Parser<'a, 'src> {
                     "`mut` on a parameter applies to a plain name; destructure in \
                      the body (`mut (a, b) = pair;`) for mutable pieces",
                 ),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+    }
+
+    /// A spread parameter collects the arguments from its position onward, so
+    /// it can only be the LAST parameter — and therefore there is at most one
+    /// per signature (variadic-generics.md §S.3). Both readings of a misplaced
+    /// one are the same error, reported at the offending parameter.
+    fn reject_misplaced_spread(&mut self, parameters: &[Parameter<'src>]) {
+        let last = parameters.len().saturating_sub(1);
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameter.spread && index != last {
+                self.errors.push(ParseError {
+                    span: parameter.span,
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter collects every argument from its position \
+                         onward, so it must be the last parameter (and there can be \
+                         only one)",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
+    }
+
+    /// A spread parameter is refused wherever the desugar's left-hand side is
+    /// not a free `fun` declaration (variadic-generics.md §S.6/§S.7): a closure
+    /// literal (a closure TYPE has no variadic form, so such a closure could
+    /// never be named, stored, or passed), a trait declaration or any `impl`
+    /// member (`...` IS part of the signature, unlike `mut`, and a method is
+    /// reached by dispatch on three routes), and an `external fun` (the host's
+    /// calling convention has no pack form).
+    fn reject_spread_position(&mut self, parameters: &[Parameter<'src>], position: &'static str) {
+        for parameter in parameters.iter().filter(|parameter| parameter.spread) {
+            self.errors.push(ParseError {
+                span: parameter.span,
+                reason: ParseErrorReason::Rule(position),
                 context: Vec::new(),
                 hint: None,
             });
@@ -3133,11 +3264,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body = self.parse_item_body("implementation body")?;
+        let body = self.in_member_body(|parser| parser.parse_item_body("implementation body"))?;
         Some((
             Node::Impl(Box::new(subject), traits, body),
             self.span_from(start),
         ))
+    }
+
+    /// Parses `body` with [`Parser::in_member_body`] set, restoring the previous
+    /// value afterwards (impls nest inside modules, and a closure body inside a
+    /// member is still inside the member).
+    fn in_member_body<T>(&mut self, body: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        let outer = std::mem::replace(&mut self.in_member_body, true);
+        let result = body(self);
+        self.in_member_body = outer;
+        result
     }
 
     /// `trait name generics? (with A + B)? { functions }`. The body is a list of
@@ -3154,7 +3295,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body = self.parse_trait_body()?;
+        let body = self.in_member_body(Self::parse_trait_body)?;
         Some((
             Node::Trait(name, generic_parameters, supertraits, body),
             self.span_from(start),
