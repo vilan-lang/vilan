@@ -69,6 +69,93 @@ fn a_browser_layer_import_resolves() {
     );
 }
 
+/// The playground's stance on bundle splitting (`bundle-splitting.md` §S4,
+/// item 8): `split` cannot reach here, and a program the SPLITTER would
+/// recognize must still compile to one string.
+///
+/// There is nowhere for the flag to be written — the playground hand-builds its
+/// package spec and has no `vilan.toml`, so no `[entry.<name>]` table exists —
+/// and `compile_program` calls the single-file emitter, never `transform_split`.
+/// That is not an accident to be tidied up later but the shape the split was
+/// designed around: the playground runs its output in an opaque-origin `srcdoc`
+/// iframe where a relative `import()` cannot resolve, which is why cross-chunk
+/// references ride a runtime registry rather than ESM in the first place.
+///
+/// So the pin is on the OUTPUT: a router-shaped program — a `swap` over a route
+/// enum's `match`, exactly the shape `chunks::plan` recognizes — comes back as
+/// one `js` string with no chunk machinery in it. Recognizing a split point can
+/// never start changing what the playground emits.
+#[test]
+fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
+    let output = compile(
+        "import std::reactive::Signal;\n\
+         import std::ui::{ View, mount_root, view };\n\
+         \n\
+         [derive(PartialEq)]\n\
+         enum Route {\n\
+         \tHome,\n\
+         \tAway,\n\
+         }\n\
+         \n\
+         fun home_page(): View {\n\
+         \tview(\"h1\").text(\"home\")\n\
+         }\n\
+         \n\
+         fun away_page(): View {\n\
+         \tview(\"h1\").text(\"away\")\n\
+         }\n\
+         \n\
+         fun main() {\n\
+         \tlet route: Signal<Route> = Signal::new(Route::Home);\n\
+         \tlet _root = mount_root(\"app\", || view(\"main\").swap(route, |current| match current {\n\
+         \t\tRoute::Home => home_page(),\n\
+         \t\tRoute::Away => away_page(),\n\
+         \t}));\n\
+         }\n",
+    );
+    assert!(
+        output.diagnostics.is_empty(),
+        "the router shape must compile in the playground, got: {:#?}",
+        output.diagnostics
+    );
+    let js = output.js.expect("expected emitted JavaScript");
+    // One string, whole: both pages are declared in it…
+    assert!(
+        js.contains("function home_page(") && js.contains("function away_page("),
+        "a playground bundle carries every route: {js}"
+    );
+    // …and none of the split's machinery is anywhere near it.
+    for machinery in ["__vilan_chunks", "__chunk_registry", "__chunk_load"] {
+        assert!(
+            !js.contains(machinery),
+            "the playground must never emit {machinery}"
+        );
+    }
+}
+
+/// The stance above, guarded at its cause rather than at its symptom: the
+/// playground's compile path must never reach the split emitter.
+///
+/// The output pin alone cannot see this. `chunks::plan` recognizes nothing in
+/// the playground anyway — `embedded_std_spec` hand-builds its package spec and
+/// leaves `Program::std_sources` EMPTY, so `View` does not read as std-resident
+/// and the `swap` recognizer finds no site — which means swapping `transform`
+/// for `transform_split` here would today produce the same single string and
+/// pass unnoticed. It would also be a trap: the residence rules in `chunks.rs`
+/// ("std is never chunked") all read the other way under an empty
+/// `std_sources`, so the day that spec learns to mark std, a playground wired
+/// to the split emitter would start chunking the standard library.
+#[test]
+fn the_playground_compile_path_never_calls_the_split_emitter() {
+    let source = include_str!("../src/lib.rs");
+    assert!(
+        !source.contains("transform_split"),
+        "`split` is a `vilan build` decision: the playground has no manifest to \
+         declare it in, a single-string `CompileResult` to carry it, and an \
+         opaque-origin srcdoc frame that cannot resolve a chunk's relative import"
+    );
+}
+
 /// The diagnostics are the pitch, so their shape is pinned: a real message, a
 /// position in the visitor's own file, and a file name that does not leak the
 /// synthetic root.

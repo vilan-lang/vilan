@@ -224,24 +224,36 @@ split = true
 
 Now `vilan build` writes an eager `dist/client.js` plus one
 `dist/client.<Route>.js` per arm of your route `match`, and a
-`dist/client.chunks.json` listing them (serve the whole directory and you
-are done). No keyword, no `lazy()` wrapper, nothing to forget: the router
-`match` already marks the seams, so the split is inferred from the code you
-wrote. A function only one arm can reach rides that arm's file; anything
-two arms share, and every module-level binding, stays eager.
+`dist/client.chunks.json` listing them. No keyword, no `lazy()` wrapper,
+nothing to forget: the router `match` already marks the seams, so the split
+is inferred from the code you wrote. A function only one arm can reach rides
+that arm's file; anything two arms share, and every module-level binding,
+stays eager.
 
 **What the user sees while a chunk loads: the page they were on.** The
 route signal doesn't advance until the code arrives, so there is no blank
 frame and no placeholder tree to design — the previous page simply stays,
-then swaps. First visit to a route pays one fetch; every later visit is
-instant. If the fetch fails, the navigation doesn't happen (and the console
-says why). For a progress indicator, bind `router::pending()` — it's an
-ordinary `Signal<bool>`, so `show` (or `bind_text`, or a class) is all it
+then swaps. The boot route's chunk starts downloading before the shell is
+even built, so first paint waits on the network and not on your own
+JavaScript. First visit to a route pays one fetch; every later visit is
+instant, and a route nobody visits is never downloaded.
+
+Navigating away from a page whose chunk is still in flight is safe: the
+LATEST navigation wins, whatever order the fetches finish in, so a slow
+chunk can never land on top of the page you moved to.
+
+Two signals are the whole surface. `router::pending()` is true while a chunk
+is in flight; `router::chunk_error()` is `Some(reason)` when the last fetch
+failed. A failed fetch means the navigation simply did not happen — the page
+you were on is still there — and nothing is remembered as in flight, so
+**clicking the link again retries**. There is no retry API because a link is
+one. Both are ordinary signals, so `show`, `bind_text` or a class is all it
 takes:
 
 ```vilan,browser
+import std::option::Option::{ None, Some, self };
 import std::reactive::Signal;
-import std::router::{ current_path, pending, segments };
+import std::router::{ chunk_error, current_path, pending, segments };
 import std::ui::{ View, mount_root, view };
 
 [derive(PartialEq)]
@@ -269,6 +281,11 @@ fun main() {
 			// Visible only while a route chunk is in flight; the page behind
 			// it is the one you were already on.
 			.child(view("div").class("spinner").text("Loading…").show(pending()))
+			// …and if it never arrives, say so. The next click retries.
+			.child(view("div").class("error").bind_text(chunk_error().map(|failure| match failure {
+				Some(let reason) => "Could not load that page: " + reason,
+				None => "",
+			})))
 			.swap(route, |current| match current {
 				Route::Home => home_page(),
 				Route::NotFound => missing_page(),
@@ -277,15 +294,58 @@ fun main() {
 }
 ```
 
-Two things to know. `split` is a `browser` leg's key — a Node entry has no
-navigation to gate, and the build says so rather than ignoring the line.
-And `--watch` builds ignore it: HMR swaps whole bundles, so the dev loop
-keeps working on one file. Single-file emission stays the default and is
-not going anywhere; `split` is opt-in, per leg.
+### Serving the chunks
 
-`vilan build --print-chunks` reports what *would* split without emitting
-anything, which is the way to find out whether a leg has enough per-route
-code to be worth it.
+A chunk is fetched from the same directory the bundle was served from, so a
+static host needs nothing: serve `dist/` and you are done. A hand-written
+server iterates `dist/client.chunks.json` instead of hard-coding a route per
+file — it lists every artifact the build wrote, so adding, renaming or
+removing a route arm needs no server change:
+
+```json
+{
+	"entry": "client.js",
+	"chunks": [
+		{ "arm": "Route::Home", "tag": 0, "file": "client.Route_Home.js" },
+		{ "arm": "Route::Docs(..)", "tag": 1, "file": "client.Route_Docs.js" }
+	]
+}
+```
+
+`examples/fullstack`'s server does exactly that: it reads the manifest at
+boot, keeps each named file in memory beside `client.js`, and serves them by
+path. A leg that does not split writes no manifest, and that code path is
+then simply empty — so the same server works either way.
+
+### Is it worth it?
+
+Splitting is not free. The route gate, the per-chunk forwarders and the
+embedded chunk map are a fixed cost paid once per split leg — on the order
+of 6 KB — so a leg whose pages are small ships MORE on first load than it
+would whole. The build measures this rather than leaving you to guess: it
+emits your entry both ways and, when splitting came out no smaller, warns
+with your leg's own numbers.
+
+```text
+warning: `split` on `client`: splitting adds 1720 bytes to the first load
+and defers only 6802 — the route gate, the forwarders and the chunk map cost
+more than this leg's per-route code saves. Consider dropping it…
+```
+
+`vilan build --print-chunks` prints the same verdict without opting in, so
+you can measure a leg before you split it.
+
+### The rest of the rules
+
+`split` is a `browser` leg's key — a Node entry has no navigation to gate,
+and the build says so rather than ignoring the line. `vilan run` ignores it,
+watched or not: the dev loop hot-swaps whole bundles, so it emits one file
+per leg and says so once. (It also clears any chunk files a previous
+`vilan build` left, so `dist/` never describes a build that is no longer
+there — the same sweep runs on every build, so a renamed route arm never
+leaves its old chunk behind either.) Single-file emission stays the default
+and is not going anywhere; `split` is opt-in, per leg, and a `vilan build`
+decision.
 
 ## Cleaning up strays
 

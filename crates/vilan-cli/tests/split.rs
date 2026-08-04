@@ -23,6 +23,8 @@
 //! after reading the diff.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -778,6 +780,156 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
         cleared,
         "a watch round emits the leg whole, so the previous build's chunks must go: {left:?}"
     );
+}
+
+/// Bind an ephemeral port and release it — a free port for the served pin (the
+/// standard small TOCTOU window this suite's server tests all take).
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read the bound address")
+        .port()
+}
+
+fn wait_for_port(port: u16, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// A plain HTTP GET, returning the response body bytes.
+fn http_get(port: u16, path: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set a read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send GET");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let separator = b"\r\n\r\n";
+    match response
+        .windows(separator.len())
+        .position(|window| window == separator)
+    {
+        Some(index) => response[index + separator.len()..].to_vec(),
+        None => response,
+    }
+}
+
+#[test]
+fn a_split_builds_chunks_are_servable_through_the_manifest() {
+    // `bundle-splitting.md` §S4, item 7. `chunks.json` exists so a hand-written
+    // server can serve the chunk files without hard-coding a route per file —
+    // the shape `examples/fullstack`'s server now carries and the docs teach.
+    // This is that shape, over a leg that really did split, actually served.
+    let port = free_port();
+    let staged = stage_workspace("served");
+    std::fs::write(
+        staged.join("src/server.vl"),
+        format!(
+            "import std::fs;\n\
+             import std::http::{{ Request, Response, Server }};\n\
+             import std::json::{{ coerce_str, parse_json_value }};\n\
+             import std::option::Option::{{ None, Some, self }};\n\
+             import std::io::print;\n\
+             \n\
+             struct ChunkFile {{\n\
+             \tpath: str,\n\
+             \tsource: str,\n\
+             }}\n\
+             \n\
+             async fun main() {{\n\
+             \tlet client_js = fs::read_file_to_str(\"dist/client.js\");\n\
+             \tlet chunks = route_chunks(\"client\");\n\
+             \tServer::builder()\n\
+             \t\t.port({port})\n\
+             \t\t.on_request(|request| match request.path() {{\n\
+             \t\t\t\"/client.js\" => Response::builder().set_header(\"Content-Type\", \"text/javascript\").body(client_js).build(),\n\
+             \t\t\t_ => match find_chunk(chunks, request.path()) {{\n\
+             \t\t\t\tSome(let source) => Response::builder().set_header(\"Content-Type\", \"text/javascript\").body(source).build(),\n\
+             \t\t\t\tNone => Response::builder().set_header(\"Content-Type\", \"text/html\").body(\"<div id=\\\"app\\\"></div>\").build(),\n\
+             \t\t\t}},\n\
+             \t\t}})\n\
+             \t\t.on_start(|server| print(\"listening\"))\n\
+             \t\t.build()\n\
+             \t\t.start();\n\
+             }}\n\
+             \n\
+             fun route_chunks(leg: str): List<ChunkFile> {{\n\
+             \tmut files: List<ChunkFile> = [];\n\
+             \tlet manifest_path = i\"dist/{{leg}}.chunks.json\";\n\
+             \tif !fs::exists(manifest_path) {{\n\
+             \t\tret files;\n\
+             \t}}\n\
+             \tlet manifest = parse_json_value(fs::read_file_to_str(manifest_path));\n\
+             \tfor chunk in manifest.field(\"chunks\").elements() {{\n\
+             \t\tlet name = coerce_str(chunk.field(\"file\"));\n\
+             \t\tfiles.push(ChunkFile {{ path = i\"/{{name}}\", source = fs::read_file_to_str(i\"dist/{{name}}\") }});\n\
+             \t}}\n\
+             \tfiles\n\
+             }}\n\
+             \n\
+             fun find_chunk(chunks: List<ChunkFile>, path: str): Option<str> {{\n\
+             \tfor chunk in chunks {{\n\
+             \t\tif chunk.path == path {{\n\
+             \t\t\tret Some(chunk.source);\n\
+             \t\t}}\n\
+             \t}}\n\
+             \tNone\n\
+             }}\n"
+        ),
+    )
+    .expect("write the manifest-driven server");
+    build(&staged, &[]);
+
+    let dist = staged.join("dist");
+    let mut server = Command::new("node")
+        .arg(Path::new("dist").join("server.js"))
+        .current_dir(&staged)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the server");
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            wait_for_port(port, Duration::from_secs(30)),
+            "the server should listen on {port}"
+        );
+        // Every chunk the build wrote is served, byte for byte, at the path the
+        // embedded map will ask for — and the server was told none of their
+        // names.
+        for arm in ["Route_Home", "Route_Docs", "Route_NotFound"] {
+            let file = format!("client.{arm}.js");
+            let on_disk = std::fs::read(dist.join(&file)).expect("the chunk on disk");
+            let served = http_get(port, &format!("/{file}"));
+            assert_eq!(
+                served, on_disk,
+                "GET /{file} must serve the chunk the build wrote"
+            );
+        }
+        // …and an ordinary path still gets the app shell, not a chunk.
+        let shell = http_get(port, "/docs/3");
+        assert!(
+            String::from_utf8_lossy(&shell).contains("id=\"app\""),
+            "a route path still serves the shell"
+        );
+    }));
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&staged);
+    outcome.unwrap();
 }
 
 #[test]

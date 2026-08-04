@@ -49,15 +49,20 @@ compile time (the styling system's CSS) land beside the output.
   `.callgraph.out` dumps, for poking at the compiler's view of your code.
 - `--print-chunks`: report the route-chunk plan — what a `split = true`
   browser leg would load lazily per route, with function counts and a byte
-  estimate. Analysis only; the emitted JavaScript is unchanged, so this is
-  how to measure a leg before opting it in
+  estimate, plus a `verdict:` line measuring what splitting would actually
+  cost the first load (the entry is emitted both ways and compared).
+  Analysis only; the emitted JavaScript is unchanged, so this is how to
+  measure a leg before opting it in
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
 - `--backend js`: the only backend today; the flag exists so a future
   one has somewhere to live.
 
 A `browser` entry with `[entry.<name>] split = true` writes an eager
 bundle plus one file per route arm and a `<name>.chunks.json` listing
-them.
+them, and warns when the split cost the first load more than it deferred.
+The leg's chunk files belong to its last build: a build that writes none
+removes any a previous one left. `vilan run` ignores `split` — the dev
+loop swaps whole bundles — and emits the leg as one file.
 
 ## `vilan check [file]`
 

@@ -1,16 +1,32 @@
 // The server — a Node program. It reads the compiled client bundle once at
 // startup, then serves the HTML shell on every path and the bundle at
 // `/client.js`. It shares `common::greeting` with the client.
+//
+// It also serves whatever ROUTE CHUNKS the build wrote, read from the
+// `dist/client.chunks.json` manifest a `split = true` client emits
+// (proposal/bundle-splitting.md §3). Nothing here names a route: the manifest
+// lists the files, so adding, renaming or removing a route arm needs no server
+// change — and a client that does not split writes no manifest, which is the
+// empty list and costs nothing.
 
-import std::fs::read_file_to_str;
+import std::fs;
 import std::http::{ Request, Response, Server };
+import std::json::{ coerce_str, parse_json_value };
+import std::option::Option::{ None, Some, self };
 import std::print;
 import common::greeting;
+
+/// One route chunk on disk, as a URL and the JavaScript to serve for it.
+struct ChunkFile {
+	path: str,
+	source: str,
+}
 
 async fun main() {
 	// Read the browser bundle once (async — `vilan build`/`run` writes it to
 	// `dist/client.js`, and the server runs from the project root).
-	let client_js = read_file_to_str("dist/client.js");
+	let client_js = fs::read_file_to_str("dist/client.js");
+	let chunks = route_chunks("client");
 
 	let server = Server::builder()
 		.port(3000)
@@ -20,7 +36,10 @@ async fun main() {
 				// An API route the client calls with `fetch`. Its body uses the
 				// same shared `greeting` the client does.
 				"/api/hello" => Response::builder().set_header("Content-Type", "text/plain").body(greeting("the API")).build(),
-				_ => Response::builder().set_header("Content-Type", "text/html").body(page()).build(),
+				_ => match find_chunk(chunks, request.path()) {
+					Some(let source) => Response::builder().set_header("Content-Type", "text/javascript").body(source).build(),
+					None => Response::builder().set_header("Content-Type", "text/html").body(page()).build(),
+				},
 			}
 		})
 		.on_start(|server| {
@@ -30,6 +49,33 @@ async fun main() {
 		.build();
 
 	server.start();
+}
+
+/// Every route chunk `leg` emitted, read once at boot from its manifest. A leg
+/// that did not split has no manifest, so this is empty and the chunk arm below
+/// never matches.
+fun route_chunks(leg: str): List<ChunkFile> {
+	mut files: List<ChunkFile> = [];
+	let manifest_path = i"dist/{leg}.chunks.json";
+	if !fs::exists(manifest_path) {
+		ret files;
+	}
+	let manifest = parse_json_value(fs::read_file_to_str(manifest_path));
+	for chunk in manifest.field("chunks").elements() {
+		let name = coerce_str(chunk.field("file"));
+		files.push(ChunkFile { path = i"/{name}", source = fs::read_file_to_str(i"dist/{name}") });
+	}
+	files
+}
+
+/// The chunk served at `path`, if any.
+fun find_chunk(chunks: List<ChunkFile>, path: str): Option<str> {
+	for chunk in chunks {
+		if chunk.path == path {
+			ret Some(chunk.source);
+		}
+	}
+	None
 }
 
 fun page(): str {
