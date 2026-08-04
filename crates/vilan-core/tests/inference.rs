@@ -19918,6 +19918,89 @@ fn draft_generation_guard_discards_superseded_pushes() {
     );
 }
 
+#[test]
+fn draft_push_publishes_one_coherent_wave() {
+    // A lifecycle transition writes TWO signals (`local` and `state`), so an
+    // observer of both must never see half of one
+    // (`proposal/optimistic-lifecycle.md` §5). Under a UI boundary turn they
+    // coalesced already — `View.on` wraps every dispatch — but with NO ambient
+    // turn (a node program, SSR, a test) `push` published the new text still
+    // claiming `Synced` before publishing `Dirty`. `batch` joins the ambient
+    // turn when there is one and creates one when there is not, so the middle
+    // is unobservable either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState, combine };
+        import std::option::Option::{ self, Some, None };
+        import std::time::{ sleep_for, Duration };
+
+        fun label(state: DraftState): str {
+            match state {
+                DraftState::Synced => "synced",
+                DraftState::Dirty => "dirty",
+                DraftState::Failed(let reason) => reason,
+            }
+        }
+
+        fun main() {
+            let cell = draft("A", |value: str| {
+                let _sent = value;
+                sleep_for(Duration::millis(5));
+                let outcome: Option<str> = None;
+                outcome
+            });
+            let both = combine((cell.local, cell.state));
+            let _watch = both.sub(|pair| {
+                let (text, state) = pair;
+                print(i"{text}/{label(state)}");
+            });
+            cell.push("B");
+            sleep_for(Duration::millis(20));
+        }
+        main();
+        "#,
+        "A/synced\nB/dirty\nB/synced\n",
+    );
+}
+
+#[test]
+fn draft_adoption_publishes_one_coherent_wave() {
+    // The same rule on the other two-signal transition: `adopt`'s clean
+    // branch writes `local` and `state`, and must publish them together.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState, combine };
+        import std::option::Option::{ self, Some, None };
+
+        fun label(state: DraftState): str {
+            match state {
+                DraftState::Synced => "synced",
+                DraftState::Dirty => "dirty",
+                DraftState::Failed(let reason) => reason,
+            }
+        }
+
+        fun main() {
+            let cell = draft("A", |value: str| {
+                let _sent = value;
+                let outcome: Option<str> = None;
+                outcome
+            });
+            let both = combine((cell.local, cell.state));
+            let _watch = both.sub(|pair| {
+                let (text, state) = pair;
+                print(i"{text}/{label(state)}");
+            });
+            cell.adopt("remote");
+        }
+        main();
+        "#,
+        "A/synced\nremote/synced\n",
+    );
+}
+
 // --- Draft re-push on reconnect (A14, proposal/draft-reconnect.md) ----------
 //
 // `repush()` re-sends edits the remote never accepted — `local != synced`,

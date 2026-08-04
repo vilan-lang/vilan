@@ -632,8 +632,16 @@ impl Draft<type T: PartialEq> {
 	/// only the commit waits out the window, coalescing a burst of pushes
 	/// into one.
 	fun push(self, value: T) {
-		self.local.set(value);
-		self.state.set(DraftState::Dirty);
+		// ONE wave: a lifecycle transition writes two signals, and an
+		// observer of both must never see half of it
+		// (`proposal/optimistic-lifecycle.md` §5). `batch` joins the ambient
+		// turn when there is one — under a UI boundary turn nothing changes —
+		// and creates one when there is not, which is the case that used to
+		// publish the new text still claiming `Synced`.
+		batch(|| {
+			self.local.set(value);
+			self.state.set(DraftState::Dirty);
+		});
 		if self.debounce_millis.read() > 0 {
 			self.arm();
 		} else {
@@ -767,10 +775,12 @@ impl Draft<type T: PartialEq> {
 		if remote == self.synced.read() {
 			// Our own edit reflected back (or nothing changed).
 		} else if self.local.get() == self.synced.read() {
-			// Clean local: take the remote edit.
+			// Clean local: take the remote edit — again as ONE wave.
 			self.synced.write() = remote;
-			self.local.set(remote);
-			self.state.set(DraftState::Synced);
+			batch(|| {
+				self.local.set(remote);
+				self.state.set(DraftState::Synced);
+			});
 		} else {
 			// Dirty local: the user's text wins for now; remember the
 			// remote so the eventual push knowingly overwrites it.
@@ -778,3 +788,4 @@ impl Draft<type T: PartialEq> {
 		}
 	}
 }
+
