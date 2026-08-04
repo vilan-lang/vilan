@@ -39,7 +39,9 @@ pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
 pub use span::{Span, Spanned};
 pub use target::{Backend, Platform, PlatformPattern};
-pub use transformer::{JsProgram, transform, transform_to_ast};
+pub use transformer::{
+    EmittedChunk, JsProgram, SplitProgram, transform, transform_split, transform_to_ast,
+};
 
 use std::path::Path;
 
