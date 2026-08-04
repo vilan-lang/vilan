@@ -17,31 +17,90 @@ function sum_over(entries2) {
 	}
 	return total;
 }
-function first_or(held2, fallback) {
-	const $c = held2;
-	let $d = null;
-	if ($c[0] === 0) {
-		const inner2 = __clone($c[1]);
-		$d = inner2;
-	} else {
-		$d = fallback;
+function total_width(rows2) {
+	let total = 0;
+	for (const row of rows2) {
+		const $c = row;
+		let $d = null;
+		const cells = $c[0];
+		const weight = $c[1];
+		total = total + cells.length * weight;
+		$d = undefined;
+		$d;
 	}
-	return $d;
+	return total;
+}
+function guarded_width(rows2) {
+	let total = 0;
+	for (const row of rows2) {
+		const $e = row;
+		let $f = null;
+		if ($e[1] > 1) {
+			total = total + $e[0].length;
+			$f = undefined;
+		} else {
+			$f = undefined;
+		}
+		$f;
+	}
+	return total;
+}
+function first_or(held2, fallback) {
+	const $g = held2;
+	let $h = null;
+	if ($g[0] === 0) {
+		const inner2 = __clone($g[1]);
+		$h = inner2;
+	} else {
+		$h = fallback;
+	}
+	return $h;
+}
+function first_or_guarded(held2, limit, fallback) {
+	const $i = held2;
+	let $j = null;
+	if ($i[0] === 0 && limit > 0) {
+		const inner2 = __clone($i[1]);
+		$j = inner2;
+	} else {
+		$j = fallback;
+	}
+	return $j;
+}
+function grow_first(pair2) {
+	const $m = pair2;
+	let cells = __clone($m[0]);
+	if (true) {
+		cells.push($m[1]);
+		return cells.length;
+	}
+	return 0;
 }
 let entries = [  ];
 entries.push([ 1, 2 ]);
 entries.push([ 10, 20 ]);
 console.log(sum_over(entries));
+let rows = [  ];
+rows.push([ [ 1, 2 ], 3 ]);
+rows.push([ [ 4 ], 1 ]);
+console.log(total_width(rows));
+console.log(guarded_width(rows));
 const held = [ 0, [ 1, 2 ] ];
 let got = first_or(held, [  ]);
 got.push(9);
 console.log(got.length);
-const $e = held;
-let $f = null;
-if ($e[0] === 0) {
-	const inner = $e[1];
-	$f = console.log(inner.length);
+let guarded = first_or_guarded(held, 1, [  ]);
+guarded.push(9);
+console.log(guarded.length);
+const $k = held;
+let $l = null;
+if ($k[0] === 0) {
+	const inner = $k[1];
+	$l = console.log(inner.length);
 } else {
-	$f = console.log(0);
+	$l = console.log(0);
 }
-process.exit($f);
+$l;
+const pair = [ [ 1, 2 ], 3 ];
+console.log(grow_first(pair));
+console.log(pair[0].length);

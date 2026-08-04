@@ -11722,7 +11722,7 @@ impl<'src> Analyzer<'src> {
     /// values (constructors, literals, calls) own their result and are left
     /// alone. Rule 2 (elision) then removes the copies whose source is dead (see
     /// `is_elidable_copy`).
-    fn compute_clone_sites(&self) -> HashSet<Id> {
+    fn compute_clone_sites(&self, shared_captures: &HashSet<Id>) -> HashSet<Id> {
         let repeatable = self.collect_repeatable_interiors();
         let mut sites = HashSet::new();
         for expr in self.expr_id_to_expr_map.values() {
@@ -11743,7 +11743,7 @@ impl<'src> Analyzer<'src> {
             if self.is_place_expr(value_id)
                 && self.is_cloneable_aggregate(&value_type)
                 && !self.resource_value_places.contains(&value_id)
-                && !self.is_elidable_copy(value_id, &repeatable)
+                && !self.is_elidable_copy(value_id, &repeatable, shared_captures)
             {
                 sites.insert(value_id);
             }
@@ -11786,7 +11786,7 @@ impl<'src> Analyzer<'src> {
                     && self
                         .place_value_type(*argument_id)
                         .is_some_and(|value_type| self.is_cloneable_aggregate(&value_type))
-                    && !self.is_elidable_copy(*argument_id, &repeatable)
+                    && !self.is_elidable_copy(*argument_id, &repeatable, shared_captures)
                 {
                     sites.insert(*argument_id);
                 }
@@ -11807,7 +11807,13 @@ impl<'src> Analyzer<'src> {
     /// call's tuple, a constructed variant) binds without copying: its
     /// elements have no other owner. Fixed-array patterns keep their
     /// existing unconditional per-element clone.
-    fn compute_capture_clone_sites(&mut self) -> HashSet<Id> {
+    ///
+    /// Returns the copy sites (keyed by how the copy is decided — see
+    /// [`CaptureCopy`]) and the SHARED captures, the ones the share elision
+    /// left aliasing their subject. The second set is not codegen's business:
+    /// it is what rule 2's move elision must refuse to move out of, so this
+    /// pass runs BEFORE `compute_clone_sites`.
+    fn compute_capture_clone_sites(&mut self) -> (HashMap<Id, CaptureCopy>, HashSet<Id>) {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -11827,9 +11833,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Expr::Match(subject_id, legs) => {
                     for leg in legs {
-                        if let Some(root) = self.place_root(leg.body) {
-                            seam_roots.insert(root);
-                        }
+                        self.insert_seam_roots(leg.body, &mut seam_roots);
                         if self.is_place_expr(*subject_id) {
                             let mut captures = HashSet::new();
                             Self::collect_pattern_captures(&leg.pattern, &mut captures);
@@ -11848,9 +11852,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for function in self.functions.values() {
-            if let Some(root) = self.place_root(function.body.1) {
-                seam_roots.insert(root);
-            }
+            self.insert_seam_roots(function.body.1, &mut seam_roots);
         }
         let closure_tails: Vec<Id> = self
             .closures
@@ -11858,30 +11860,29 @@ impl<'src> Analyzer<'src> {
             .map(|closure| closure.return_)
             .collect();
         for tail in closure_tails {
-            if let Some(root) = self.place_root(tail) {
-                seam_roots.insert(root);
-            }
+            self.insert_seam_roots(tail, &mut seam_roots);
         }
         for (_, value_id) in &self.return_sites {
-            if let Some(root) = self.place_root(*value_id) {
-                seam_roots.insert(root);
-            }
+            self.insert_seam_roots(*value_id, &mut seam_roots);
         }
         // Phase 2 — the type filter (second because `type_is_resource`
-        // memoizes, `&mut`), then the elision: an IMMUTABLE capture from a
-        // READONLY-rooted subject that never roots a value seam shares
-        // soundly — nobody can mutate either side of the alias, and it
-        // cannot leak out. Everything else clones. The elision is what keeps
+        // memoizes, `&mut`), then the SHARE elision: an IMMUTABLE capture
+        // from a READONLY-rooted subject that never roots a value seam
+        // shares soundly — nobody can mutate either side of the alias, and it
+        // cannot leak out. Everything else copies. The elision is what keeps
         // read-only walkers (the SSR `render` recursion over a view tree)
         // from deep-copying at every level; the seam check is what keeps
         // `unwrap` honest.
         //
-        // A GENERIC capture clones like an aggregate: std's `unwrap` binds
-        // `Some(let v)` at type `T`, and aggregate-ness is only known per
-        // instantiation — after this pass. `__clone` is identity on scalars
-        // (the `Array` arm's precedent), so the conservative wrap is safe.
-        let repeatable = self.collect_repeatable_interiors();
-        let mut sites = HashSet::new();
+        // A GENERIC-DEPENDENT capture is decided per instantiation
+        // ([`CaptureCopy::UnlessResource`]): std's `unwrap` binds
+        // `Some(let v)` at type `T`, and both aggregate-ness AND
+        // resource-ness are only known once `T` is bound — after this pass.
+        //
+        // The SHARE decision consults no elision, so it is complete before
+        // phase 3 needs it.
+        let mut classified: Vec<(Id, Id, CaptureCopy)> = Vec::new();
+        let mut shared: HashSet<Id> = HashSet::new();
         for (capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
                 .variables
@@ -11891,28 +11892,104 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let capture_type = type_id.get_type(self);
-            if self.type_is_resource(type_id)
-                || !(self.is_cloneable_aggregate(&capture_type)
-                    || matches!(capture_type, Type::Generic(_)))
+            // A bare `T` is admitted without knowing whether it is an
+            // aggregate — `__clone` is identity on scalars, so the
+            // conservative wrap costs nothing and the `unwrap` seam stays
+            // honest.
+            if !(self.is_cloneable_aggregate(&capture_type)
+                || matches!(capture_type, Type::Generic(_)))
             {
                 continue;
             }
-            let shareable = !capture_is_mutable
+            // R1: a resource never copies. A capture that is a resource
+            // whatever its generics are bound to is decided here; one that is
+            // a resource only under some binding rides `UnlessResource`.
+            if self.type_is_resource(type_id) {
+                continue;
+            }
+            let copy = match self.resource_triggering_constraints(type_id, &capture_type) {
+                triggers if triggers.is_empty() => CaptureCopy::Always,
+                triggers => CaptureCopy::UnlessResource(triggers),
+            };
+            if !capture_is_mutable
                 && self.readonly_root(subject_id).is_some()
-                && !seam_roots.contains(&capture_id);
-            // The MOVE elision, rule 2's dead-source form: a subject that is
-            // a local read exactly once (a `?`-lift temp holding a fresh call
-            // result, say) donates its elements — the captures take
-            // ownership of a corpse, no copy needed. `is_elidable_copy`
-            // already refuses parameters (they alias the caller's value,
-            // which outlives the call — the `unwrap` leak) and loop/closure
-            // repeats.
-            let moves = self.is_elidable_copy(subject_id, &repeatable);
-            if !shareable && !moves {
-                sites.insert(capture_id);
+                && !seam_roots.contains(&capture_id)
+            {
+                shared.insert(capture_id);
+                continue;
+            }
+            classified.push((capture_id, subject_id, copy));
+        }
+        // Phase 3 — the MOVE elision, rule 2's dead-source form: a subject
+        // that is a local read exactly once (a `?`-lift temp holding a fresh
+        // call result, say) donates its elements — the captures take
+        // ownership of a corpse, no copy needed. `is_elidable_copy` already
+        // refuses parameters (they alias the caller's value, which outlives
+        // the call — the `unwrap` leak), loop/closure repeats, and — with
+        // phase 2's set in hand — a SHARED capture, which owns nothing to
+        // donate.
+        let repeatable = self.collect_repeatable_interiors();
+        let mut sites = HashMap::new();
+        for (capture_id, subject_id, copy) in classified {
+            if !self.is_elidable_copy(subject_id, &repeatable, &shared) {
+                sites.insert(capture_id, copy);
             }
         }
-        sites
+        (sites, shared)
+    }
+
+    /// The generic constraints whose binding to a resource type would make
+    /// `type_id` a resource — B53's per-instantiation half. Empty when no
+    /// binding can (a concrete aggregate, or a generic one over parameters that
+    /// reach no member: `struct Tagged<T> { name: str }`).
+    ///
+    /// Each constraint is asked ALONE, which is exact rather than conservative:
+    /// resource-ness by containment is a union over members, so an aggregate is
+    /// a resource under a set of bindings exactly when it is a resource under
+    /// one of them. `type_is_resource_with`'s memo is valid for a single
+    /// constraint set, so each query gets its own.
+    fn resource_triggering_constraints(&mut self, type_id: TypeId, type_: &Type) -> Vec<TypeId> {
+        let mut constraints = Vec::new();
+        self.collect_generics(type_, 0, &mut constraints);
+        constraints
+            .into_iter()
+            .filter(|constraint_id| {
+                let resources = HashSet::from([*constraint_id]);
+                let mut memo = HashMap::new();
+                self.type_is_resource_with(type_id, &resources, &mut memo)
+            })
+            .collect()
+    }
+
+    /// Every interned type id that is a RESOURCE. The classification is a
+    /// per-instantiation question the analyzer answers (`Option<Database>` is a
+    /// resource, `Option<i32>` is not), and the transformer needs the same
+    /// answer for a type it only learns while monomorphizing — so the whole
+    /// interned table is classified once here rather than exposing the
+    /// (`&mut`, memoizing) classifier. Linear in the table: every query is
+    /// memoized and structural.
+    fn compute_resource_types(&mut self) -> HashSet<TypeId> {
+        let type_ids: Vec<TypeId> = self.type_id_to_type_map.keys().copied().collect();
+        type_ids
+            .into_iter()
+            .filter(|type_id| self.type_is_resource(*type_id))
+            .collect()
+    }
+
+    /// Record every place ROOT a seam expression can hand out. The scan has to
+    /// look THROUGH the forms that forward a value without being places
+    /// themselves — a braced match leg (`Some(let inner) => { inner }`), an
+    /// `if`/`match` in tail position — or a returned capture slips out
+    /// un-copied and the alias leaks anyway. `collect_tail_leaves` is the same
+    /// shape the view-escape checks walk with.
+    fn insert_seam_roots(&self, expr_id: Id, seam_roots: &mut HashSet<Id>) {
+        let mut leaves = Vec::new();
+        self.collect_tail_leaves(expr_id, &mut leaves);
+        for leaf in leaves {
+            if let Some(root) = self.place_root(leaf) {
+                seam_roots.insert(root);
+            }
+        }
     }
 
     /// Every `Binding` capture id in a pattern tree — the candidates rule 1
@@ -11994,7 +12071,19 @@ impl<'src> Analyzer<'src> {
     /// and that read is not inside a loop or closure, where it could repeat and
     /// the alias would persist into the next iteration. A parameter is never
     /// elided: it aliases the caller's value, which outlives the call.
-    fn is_elidable_copy(&self, value_id: Id, repeatable: &HashSet<Id>) -> bool {
+    ///
+    /// Nor is a SHARED pattern capture (B53): the share elision left it
+    /// aliasing its subject's element, so it has no storage of its own to
+    /// donate — `let (xs, n) = pair; mut ys = xs; ys.push(9)` would grow
+    /// `pair.0` through two elisions that are each sound alone. Refusing here
+    /// makes the second binding copy, which restores the invariant every other
+    /// elision rests on: only an OWNER moves.
+    fn is_elidable_copy(
+        &self,
+        value_id: Id,
+        repeatable: &HashSet<Id>,
+        shared_captures: &HashSet<Id>,
+    ) -> bool {
         if repeatable.contains(&value_id) {
             return false;
         }
@@ -12003,6 +12092,9 @@ impl<'src> Analyzer<'src> {
             // (`mut b = a.field`) is conservatively always copied.
             return false;
         };
+        if shared_captures.contains(binding_id) {
+            return false;
+        }
         self.variables.contains_key(binding_id)
             && self.reference_count.get(binding_id).copied() == Some(1)
     }
@@ -22597,6 +22689,31 @@ pub struct DropGlue {
     pub members: DropMembers,
 }
 
+/// B53 (rule 1): how a pattern capture's copy is decided. The analyzer settles
+/// it from the capture's DECLARED type, which inside a generic body is only
+/// half the answer — `Option::unwrap`'s `Some(let x)` is typed `T`, and whether
+/// a `T` copies depends on what `T` is bound to at each instantiation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureCopy {
+    /// A cloneable aggregate whose copy-ness no instantiation can change:
+    /// `__clone` at every emission.
+    Always,
+    /// A generic-dependent capture — a bare `T`, or an aggregate over one
+    /// (`Wrap<T>`, `(T, i32)`) — with the generic constraints whose binding to
+    /// a resource type makes the WHOLE capture a resource. Resource-ness by
+    /// containment is a union over members, so "any one of these is bound to a
+    /// resource" is exact, not conservative.
+    ///
+    /// `__clone` is identity on scalars and correct on aggregates, so the
+    /// conservative wrap stays for every other binding — but a resource one
+    /// must MOVE: copying it mints a second owner with divergent state and a
+    /// second destructor run, where R11 (`docs/spec/memory.md`) names
+    /// `Option::unwrap(self): T` as the case that passes with no copies. The
+    /// transformer reads the active substitution and consults
+    /// `Program::resource_types`.
+    UnlessResource(Vec<TypeId>),
+}
+
 /// How a resource type's members are reached at runtime for destruction.
 #[derive(Debug, Clone)]
 pub enum DropMembers {
@@ -22852,10 +22969,18 @@ pub struct Program<'src> {
     /// `compute_parameter_entry_clones`; scalar `mut` parameters with views
     /// ride `boxed_locals` instead).
     pub parameter_entry_clones: HashSet<Id>,
-    /// B53 (rule 1): pattern captures of aggregate type from a PLACE
-    /// subject — `compile_pattern` wraps each one's slot read in `__clone`.
-    /// Filled by `compute_capture_clone_sites`.
-    pub capture_clone_sites: HashSet<Id>,
+    /// B53 (rule 1): pattern captures that copy the element they bind out of a
+    /// PLACE subject — `compile_pattern` / `compile_is_pattern` wrap each one's
+    /// slot read in `__clone`. Filled by `compute_capture_clone_sites`; the
+    /// value says whether the copy is unconditional or re-decided per
+    /// monomorphization (see [`CaptureCopy`]).
+    pub capture_clone_sites: HashMap<Id, CaptureCopy>,
+    /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
+    /// so the transformer can re-ask the question about a type it only learns
+    /// per monomorphization — a generic capture bound at `T` copies for a
+    /// scalar or aggregate `T` and MOVES for a resource one (R11).
+    /// Filled by `compute_resource_types`.
+    pub resource_types: HashSet<TypeId>,
     /// Destruction (destruction.md §5/§7): resource-typed locals still owned at
     /// their declaring scope's fall-through end. The transformer wraps the owning
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
@@ -26550,9 +26675,13 @@ fn analyze_over_world<'src>(
     // Transparent references (R5): rewrite bare assignments to a view into the
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
-    let clone_sites = analyzer.compute_clone_sites();
+    // B53: the capture pass runs FIRST — its share elision decides which
+    // captures own nothing, and rule 2's move elision (inside
+    // `compute_clone_sites`) must refuse to move out of those.
+    let (capture_clone_sites, shared_captures) = analyzer.compute_capture_clone_sites();
+    let resource_types = analyzer.compute_resource_types();
+    let clone_sites = analyzer.compute_clone_sites(&shared_captures);
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
-    let capture_clone_sites = analyzer.compute_capture_clone_sites();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
@@ -26850,6 +26979,7 @@ fn analyze_over_world<'src>(
         clone_sites,
         parameter_entry_clones,
         capture_clone_sites,
+        resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),

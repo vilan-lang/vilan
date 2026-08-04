@@ -18,6 +18,14 @@ tracks the latest state.
 
 **"`i32` has no method `to_string`" now says what to import.** The standard library loads lazily, so an `impl` only registers once something pulls its file in — which made `42.to_string()` fail with a flat "no method" even though `std::display::Display` implements it. That error now names the fix: ``i32 has no method 'to_string'; import std::display::Display to use it (`import std::display::Display;`)``. It works for any method a std trait provides on the type you called it on, and stays silent when the method genuinely does not exist. `List.join` is the one new method with a bound that strands it outside the always-loaded core, so it gets the same steer.
 
+**`is` tests and guarded `match` legs copy their captures too.** v0.23.6 made destructure and `match` captures true copies, but only along one of the two paths the compiler uses: a capture in an `if x is (let a, let b)` test, or in a `match` leg that carries a guard, still shared storage with the subject. Growing the source showed through the capture, and a `mut` capture wrote back into it. Both now copy, on the same rules — and the copy for a guarded leg is made when the leg is entered, so a guard that rejects leaves the subject exactly as it found it.
+
+**A resource is never copied out of a generic.** `Option::unwrap` and its neighbours are written once and compiled per type they are used at. The capture inside them copied unconditionally, which for a resource meant two of them: independent state, and a destructor run for each. Resources now move out of a generic capture, as the memory rules always said they must, while every other type — numbers, lists, structs — keeps its copy. The same rule reaches through generic containers (`Wrap<T>`), not just a bare `T`.
+
+**Two copies that cancelled out.** Sharing a read-only capture is free, and moving out of a value that dies immediately is free — but a value that was shared has nothing of its own to give away, and the two together handed a `mut` binding the original's storage: `let (xs, n) = pair; mut ys = xs; ys.push(9)` grew `pair.0`. Separately, a capture returned through a braced arm (`Some(let inner) => { inner }`) or a conditional tail (`if first { a } else { b }`) escaped the check that catches a returned capture, and leaked the alias out of the function. Both now copy.
+
+**`mut [a, b]` means the same thing everywhere.** `mut` on an array binder marked its elements mutable in a `let`, but not in a `match` leg or an `is` test — where writing through them reported `cannot mutate immutable 'a'`. One keyword, one meaning: both forms now bind mutably.
+
 ---
 
 ## v0.23.6 — 2026-08-03
