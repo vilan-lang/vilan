@@ -3397,18 +3397,6 @@ impl<'src> Transformer<'src> {
         self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
-    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
-    /// leg) owes. That path binds nothing — each capture is recorded as an
-    /// accessor into the subject and substituted at every reference — so a
-    /// capture that must copy gets a real declaration here, and its alias
-    /// re-points at the declared name. Captures that share or move keep their
-    /// accessor, which is what keeps the elisions free.
-    ///
-    /// WHERE `out` goes decides WHEN the copy happens: for an `is` test the
-    /// statements before it (a copy of an unmatched payload is
-    /// `__clone(undefined)`, so a failing test pays nothing), for a guarded leg
-    /// the leg BODY — so a guard that rejects has copied nothing and left the
-    /// subject exactly as it found it.
     /// Emits a match as an else-if chain, each leg's test the conjunction of its
     /// pattern and its guard. The shape every match had before B59, and the one
     /// every match without a statement slot still has.
@@ -3498,6 +3486,20 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
+    /// leg) owes. That path binds nothing — each capture is recorded as an
+    /// accessor into the subject and substituted at every reference — so a
+    /// capture that must copy gets a real declaration here, and its alias
+    /// re-points at the declared name. Captures that share or move keep their
+    /// accessor, which is what keeps the elisions free — and a RESOURCE capture
+    /// never copies (R1), so it stays an accessor, which is what B62's leg
+    /// teardown destroys through.
+    ///
+    /// WHERE `out` goes decides WHEN the copy happens, and the callers answer
+    /// differently: an `is` test emits into the statements before it (a copy of
+    /// an unmatched payload is `__clone(undefined)`, so a failing test pays
+    /// nothing), while a guarded leg picks between its prelude and its body once
+    /// the guard has been walked (see `Expr::Match`).
     fn materialize_capture_clones(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
         for capture_id in Self::pattern_capture_ids(pattern) {
             if !self.capture_copies(capture_id) {
