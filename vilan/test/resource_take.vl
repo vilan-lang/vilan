@@ -1,6 +1,8 @@
 // Deterministic destruction (destruction.md §5/§6, C4 S3): `Option.take`/`replace`,
 // the `drop<T>(own)` sink, `own`-parameter drops, the conditional-teardown idiom,
-// and the resource match-move — every teardown prints so the ORDER is visible.
+// the resource match-move, and B62's pattern-capture teardown (a leg / destructure
+// capture that is NOT moved onward owns the payload and drops at its scope end) —
+// every teardown prints so the ORDER is visible.
 // Synchronous + host-free, so the interpreter equivalence gate checks it against
 // `node` too (exercising the new `__option_take`/`__option_replace` helper arms).
 import std::print;
@@ -19,6 +21,11 @@ impl Res with Drop {
 resource enum Holder {
 	Full(Res),
 	Empty,
+}
+
+resource enum Couple {
+	Two(Res, Res),
+	Neither,
 }
 
 // `take`/`replace` on data: they are ordinary std surface, useful for data too.
@@ -81,6 +88,52 @@ fun match_move() {
 	drop(extracted);
 }
 
+// B62: a capture that is NOT moved onward owns the payload, so it drops at the
+// leg's end — the leg body lowers to its own `try`/`finally`. The `None` leg
+// captures nothing and stays a bare branch.
+fun match_leg_drop() {
+	let held: Option<Res> = Some(Res { tag = "leg" });
+	match held {
+		Some(let r) => print(i"leg {r.tag}"),
+		None => print("leg none"),
+	}
+	print("leg after");
+}
+
+// Two captures in one leg drop in reverse declaration order, and a leg that is
+// never taken destroys nothing.
+fun match_leg_pair() {
+	let both = Couple::Two(Res { tag = "left" }, Res { tag = "right" });
+	match both {
+		Couple::Two(let first, let second) => print(i"pair {first.tag} {second.tag}"),
+		Couple::Neither => print("pair none"),
+	}
+	print("pair after");
+}
+
+// A GUARDED leg binds no locals — its captures are accessors into the subject —
+// so the teardown destroys through the accessor, and only once the guard has
+// ACCEPTED. Called both ways: an accepting guard drops in its own leg, and a
+// rejecting one destroys nothing and leaves the payload for the next leg.
+fun match_leg_guard(want: str) {
+	let held: Option<Res> = Some(Res { tag = "kept" });
+	match held {
+		Some(let r) if r.tag == want => print(i"guard-yes {r.tag}"),
+		Some(let r) => print(i"guard-no {r.tag}"),
+		None => print("guard none"),
+	}
+	print("guard after");
+}
+
+// The same enrollment in the `let`-pattern position: the destructure consumes
+// the tuple, so the capture drops at the enclosing scope's end like any `let`.
+fun destructure_drop() {
+	let pair = (Res { tag = "destructured" }, 3);
+	let (r, n) = pair;
+	print(i"destructure {r.tag} {n}");
+	print("destructure after");
+}
+
 fun main() {
 	data_take_replace();
 	print("--");
@@ -95,6 +148,16 @@ fun main() {
 	drop(back);
 	print("--");
 	match_move();
+	print("--");
+	match_leg_drop();
+	print("--");
+	match_leg_pair();
+	print("--");
+	match_leg_guard("kept");
+	print("--");
+	match_leg_guard("other");
+	print("--");
+	destructure_drop();
 	print("--");
 	let db = Res { tag = "immediate" };
 	print("before drop");

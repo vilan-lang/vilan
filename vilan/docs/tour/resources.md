@@ -101,6 +101,38 @@ ends: falling off the bottom, an early `ret`, a `jump` out of a loop,
 even a panic unwinding through. There are no drop flags and nothing to remember:
 if a binding still owns a resource when control leaves the scope, it drops.
 
+A **pattern capture is a binding like any other**. Matching by value
+consumes what you matched, so the capture becomes the payload's owner —
+and it drops at the end of the arm that bound it:
+
+```vilan
+import std::print;
+import std::drop::Drop;
+import std::option::Option::{ self, Some, None };
+
+resource struct Guard { label: str }
+impl Guard with Drop {
+	fun drop(&mut self) { print(i"dropped {self.label}"); }
+}
+
+fun main() {
+	let slot: Option<Guard> = Some(Guard { label = "held" });
+	match slot {
+		Some(let g) => print(i"using {g.label}"),
+		None => print("empty"),
+	}
+	print("after match");
+}
+```
+
+This prints `using held`, `dropped held`, `after match` — the payload dies
+at the end of the leg, not at the end of `main`, because that leg is where
+it was bound. Move it somewhere else inside the leg (return it, pass it by
+`own`, put it in a struct) and the destination owns it instead; it is
+destroyed exactly once either way. A capture from a *loan* — `match &slot`,
+or `slot is Some(let g)` — owns nothing, because nothing was consumed:
+`slot` is still the owner and drops the payload itself.
+
 ## Tearing down early: `drop(x)`
 
 Sometimes you want a resource gone *before* its scope ends. Move it into

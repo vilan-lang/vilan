@@ -98,6 +98,77 @@ function match_move() {
 	console.log("match extracted " + extracted[0]);
 	$h(extracted);
 }
+function match_leg_drop() {
+	const held = [ 0, [ "leg" ] ];
+	const $v = held;
+	let $w = null;
+	if ($v[0] === 0) {
+		const r = $v[1];
+		try {
+			$w = console.log("leg " + r[0]);
+		} finally {
+			$h(r);
+		}
+	} else {
+		$w = console.log("leg none");
+	}
+	$w;
+	console.log("leg after");
+}
+function match_leg_pair() {
+	const both = [ 0, [ "left" ], [ "right" ] ];
+	const $x = both;
+	let $y = null;
+	if ($x[0] === 0) {
+		const first = $x[1];
+		const second = $x[2];
+		try {
+			$y = console.log("pair " + first[0] + " " + second[0]);
+		} finally {
+			$h(second);
+			$h(first);
+		}
+	} else {
+		$y = console.log("pair none");
+	}
+	$y;
+	console.log("pair after");
+}
+function match_leg_guard(want) {
+	const held = [ 0, [ "kept" ] ];
+	const $z = held;
+	let $A = null;
+	if ($z[0] === 0 && $z[1][0] === want) {
+		try {
+			$A = console.log("guard-yes " + $z[1][0]);
+		} finally {
+			$h($z[1]);
+		}
+	} else if ($z[0] === 0) {
+		const r = $z[1];
+		try {
+			$A = console.log("guard-no " + r[0]);
+		} finally {
+			$h(r);
+		}
+	} else {
+		$A = console.log("guard none");
+	}
+	$A;
+	console.log("guard after");
+}
+function destructure_drop() {
+	const pair = [ [ "destructured" ], 3 ];
+	const $B = pair;
+	const r = $B[0];
+	const n = $B[1];
+	try {
+		console.log("destructure " + r[0] + " " + n);
+		console.log("destructure after");
+	} finally {
+		$h(r);
+	}
+}
 function $a(self, fallback) {
 	const $b = self;
 	let $c = null;
@@ -149,6 +220,16 @@ console.log("passthrough returned");
 $h(back);
 console.log("--");
 match_move();
+console.log("--");
+match_leg_drop();
+console.log("--");
+match_leg_pair();
+console.log("--");
+match_leg_guard("kept");
+console.log("--");
+match_leg_guard("other");
+console.log("--");
+destructure_drop();
 console.log("--");
 const db = [ "immediate" ];
 console.log("before drop");

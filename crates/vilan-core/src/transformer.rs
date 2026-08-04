@@ -818,6 +818,18 @@ enum TailDisposition {
     ResultOrDivergence(String),
 }
 
+/// What a direct statement of a scope owes at the scope's end (destruction.md
+/// §7). Classified with `&self` so the (`&mut self`) emission can borrow freely.
+enum ScopeTeardown {
+    /// Nothing — the statement declares no resource this scope destroys.
+    None,
+    /// A resource `let` still owned at the scope's end.
+    Binding(Id),
+    /// B62: the resource payloads a `let`-pattern captured out of a consumed
+    /// subject, in declaration order.
+    Captures(Vec<Id>),
+}
+
 impl<'src> Transformer<'src> {
     fn new(program: &'src Program<'src>, options: &BuildOptions) -> Self {
         let style = if options.readable_names {
@@ -3190,9 +3202,27 @@ impl<'src> Transformer<'src> {
                     let pattern_condition = conditions
                         .into_iter()
                         .reduce(|a, b| js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b)));
-                    let value = self.walk_entity(leg.body, &mut body);
+                    // B62: the resource payloads this leg captured are destroyed
+                    // at its end. Read AFTER the pattern has been compiled, so a
+                    // guarded leg's accessors (and any copy `materialize_capture_clones`
+                    // re-pointed) are final. The teardown wraps the leg BODY only:
+                    // a guard that rejects never enters it, so it destroys nothing
+                    // and the next leg finds the subject exactly as it was.
+                    let capture_drops = {
+                        let captures = self.droppable_pattern_captures(&leg.pattern);
+                        self.capture_drop_nodes(captures)
+                    };
+                    let mut leg_body = Vec::new();
+                    let value = self.walk_entity(leg.body, &mut leg_body);
                     let value = value.unwrap_or(js::Node::Null);
-                    self.push_result_or_divergence(&result_name, value, &mut body);
+                    self.push_result_or_divergence(&result_name, value, &mut leg_body);
+                    // A leg owing nothing splices its body in unchanged, which is
+                    // what keeps every data match byte-identical.
+                    if capture_drops.is_empty() {
+                        body.append(&mut leg_body);
+                    } else {
+                        body.push(js::Node::Try(leg_body, capture_drops));
+                    }
                     if leg.guard.is_some() {
                         for capture in Self::pattern_capture_ids(&leg.pattern) {
                             self.is_bindings.remove(&capture);
@@ -3367,18 +3397,6 @@ impl<'src> Transformer<'src> {
         self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
-    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
-    /// leg) owes. That path binds nothing — each capture is recorded as an
-    /// accessor into the subject and substituted at every reference — so a
-    /// capture that must copy gets a real declaration here, and its alias
-    /// re-points at the declared name. Captures that share or move keep their
-    /// accessor, which is what keeps the elisions free.
-    ///
-    /// WHERE `out` goes decides WHEN the copy happens: for an `is` test the
-    /// statements before it (a copy of an unmatched payload is
-    /// `__clone(undefined)`, so a failing test pays nothing), for a guarded leg
-    /// the leg BODY — so a guard that rejects has copied nothing and left the
-    /// subject exactly as it found it.
     /// Emits a match as an else-if chain, each leg's test the conjunction of its
     /// pattern and its guard. The shape every match had before B59, and the one
     /// every match without a statement slot still has.
@@ -3468,6 +3486,20 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
+    /// leg) owes. That path binds nothing — each capture is recorded as an
+    /// accessor into the subject and substituted at every reference — so a
+    /// capture that must copy gets a real declaration here, and its alias
+    /// re-points at the declared name. Captures that share or move keep their
+    /// accessor, which is what keeps the elisions free — and a RESOURCE capture
+    /// never copies (R1), so it stays an accessor, which is what B62's leg
+    /// teardown destroys through.
+    ///
+    /// WHERE `out` goes decides WHEN the copy happens, and the callers answer
+    /// differently: an `is` test emits into the statements before it (a copy of
+    /// an unmatched payload is `__clone(undefined)`, so a failing test pays
+    /// nothing), while a guarded leg picks between its prelude and its body once
+    /// the guard has been walked (see `Expr::Match`).
     fn materialize_capture_clones(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
         for capture_id in Self::pattern_capture_ids(pattern) {
             if !self.capture_copies(capture_id) {
@@ -4521,18 +4553,73 @@ impl<'src> Transformer<'src> {
     }
 
     /// Whether a scope needs `try`/`finally` teardown: some direct statement
-    /// declares a resource local that is dropped here (destruction.md §7) and
-    /// whose destruction is not a complete no-op. A resource-free program never
-    /// hits this (empty `dropped_bindings`), so its output stays byte-identical.
+    /// declares a resource this scope drops (destruction.md §7) whose destruction
+    /// is not a complete no-op. A resource-free program never hits this (empty
+    /// `dropped_bindings`), so its output stays byte-identical.
     fn scope_needs_drops(&self, statements: &[Id]) -> bool {
-        statements.iter().any(|statement| {
-            matches!(
-                self.program.entity_map.get(statement),
-                Some(Expr::Variable(variable_id))
-                    if self.program.dropped_bindings.contains(variable_id)
-                        && self.binding_drops_nontrivially(*variable_id)
-            )
-        })
+        statements
+            .iter()
+            .any(|statement| !matches!(self.statement_teardown(*statement), ScopeTeardown::None))
+    }
+
+    /// What a direct statement of a scope owes at the scope's end: a resource
+    /// `let`'s teardown, or — B62 — the resource payloads a `let`-pattern
+    /// captured out of a consumed subject. Nothing for every other statement.
+    fn statement_teardown(&self, statement: Id) -> ScopeTeardown {
+        match self.program.entity_map.get(&statement) {
+            Some(Expr::Variable(variable_id))
+                if self.program.dropped_bindings.contains(variable_id)
+                    && self.binding_drops_nontrivially(*variable_id) =>
+            {
+                ScopeTeardown::Binding(*variable_id)
+            }
+            Some(Expr::Destructure(_, pattern)) => match self.droppable_pattern_captures(pattern) {
+                captures if captures.is_empty() => ScopeTeardown::None,
+                captures => ScopeTeardown::Captures(captures),
+            },
+            _ => ScopeTeardown::None,
+        }
+    }
+
+    /// The pattern's captures this scope must destroy, in declaration order: the
+    /// ones the drop planner left owning a resource payload at their scope's end
+    /// (B62). Empty for every data pattern, and for a capture moved onward.
+    fn droppable_pattern_captures(&self, pattern: &ExprPattern) -> Vec<Id> {
+        Self::pattern_capture_ids(pattern)
+            .into_iter()
+            .filter(|capture_id| {
+                self.program.dropped_bindings.contains(capture_id)
+                    && self.binding_drops_nontrivially(*capture_id)
+            })
+            .collect()
+    }
+
+    /// The `finally` nodes for a pattern's owned captures, in REVERSE declaration
+    /// order — the order a scope's own locals drop in.
+    ///
+    /// The value destroyed is the capture's binding on the DECLARED path
+    /// (`compile_pattern`) and its subject-slot accessor on the ALIASED path
+    /// (`compile_is_pattern`, which a guarded leg uses): a resource never copies,
+    /// so a guarded leg's capture is still an accessor here, and the slot it
+    /// names has exactly one owner because the match consumed the subject.
+    fn capture_drop_nodes(&mut self, captures: Vec<Id>) -> Vec<js::Node<'src>> {
+        let mut drops = Vec::new();
+        for capture_id in captures.into_iter().rev() {
+            let Some(type_id) = self
+                .program
+                .variables
+                .get(&capture_id)
+                .map(|variable| variable.type_id)
+            else {
+                continue;
+            };
+            let accessor = self.is_bindings.get(&capture_id).cloned();
+            let value = accessor.unwrap_or_else(|| js::Node::Local(self.ng.name_for(capture_id)));
+            if let Some(drop) = self.resource_drop_of(type_id, value) {
+                drops.push(drop);
+            }
+        }
+        drops
     }
 
     /// Whether a dropped binding's type actually destroys something (a `Drop` impl
@@ -4570,16 +4657,8 @@ impl<'src> Transformer<'src> {
         let mut index = start;
         while index < statements.len() {
             let statement = statements[index];
-            let drop_binding = match self.program.entity_map.get(&statement) {
-                Some(Expr::Variable(variable_id))
-                    if self.program.dropped_bindings.contains(variable_id)
-                        && self.binding_drops_nontrivially(*variable_id) =>
-                {
-                    Some(*variable_id)
-                }
-                _ => None,
-            };
-            if let Some(variable_id) = drop_binding {
+            let teardown = self.statement_teardown(statement);
+            if !matches!(teardown, ScopeTeardown::None) {
                 // Emit the declaration (outside its own `try`).
                 if let Some(node) = self.walk_entity(statement, &mut out) {
                     if !matches!(node, js::Node::Void) {
@@ -4588,12 +4667,17 @@ impl<'src> Transformer<'src> {
                 }
                 // Wrap the rest of the scope in a `try` whose `finally` drops it.
                 let inner = self.walk_scope_body(statements, index + 1, tail, disposition.clone());
-                let type_id = self.program.variables.get(&variable_id).unwrap().type_id;
-                let value = js::Node::Local(self.ng.name_for(variable_id));
-                let finally = self
-                    .resource_drop_of(type_id, value)
-                    .map(|node| vec![node])
-                    .unwrap_or_default();
+                let finally = match teardown {
+                    ScopeTeardown::None => Vec::new(),
+                    ScopeTeardown::Binding(variable_id) => {
+                        let type_id = self.program.variables.get(&variable_id).unwrap().type_id;
+                        let value = js::Node::Local(self.ng.name_for(variable_id));
+                        self.resource_drop_of(type_id, value)
+                            .map(|node| vec![node])
+                            .unwrap_or_default()
+                    }
+                    ScopeTeardown::Captures(captures) => self.capture_drop_nodes(captures),
+                };
                 out.push(js::Node::Try(inner, finally));
                 return out;
             }
