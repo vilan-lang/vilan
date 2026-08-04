@@ -3617,3 +3617,62 @@ four consumers read one answer through one recognizer, and an unresolvable
 argument is a hard error per B55's never-silent pattern. The generic
 drop-forwarding refusal now catches the previously-untyped path. Record:
 affine-moves.md §9.5.]
+
+### Moved at the v0.29.0 cut (2026-08-04)
+
+#### B69. `preset = "release"` miscompiles: colliding identifiers — SHIPPED 2026-08-04
+
+(M; found 2026-08-04 by G3's differential gate, SEVERE, pre-existing on
+shipped v0.27.0 with no inference involved) — seven corpus programs emit
+colliding module-level identifiers under `preset = "release"`: `default.vl`
+two `function b` (infinite recursion), `capture-clones.vl` a TDZ, five plain
+redeclarations; `json-roundtrip.vl` an eighth exposed (not caused) by
+inference. The renamer under release options is the suspect; E36 tracks the
+missing release-preset corpus gate. Record: const-eval.md §9's ship notes.
+[Ship notes: the true blast radius was 57 OF 105 — G3's release-vs-release
+comparison was blind to defects present in both halves. Root cause: the
+scope-aware re-allocation pass collected `ng.names` (id-keyed source
+entities only), so ~30 next_name call sites' temp/monomorph names — minted
+from the SAME a,b,c alphabet — were invisible to the used sets and could be
+reissued. Readable mode survived only because its `$` prefix made the pools
+disjoint. The fix's invariant: every generated name is either re-allocated
+against its scope's used set or reserved in every scope; the collect walk's
+gaps cost a name its shortening, never its uniqueness (probed: zero
+unreached names corpus-wide). The E36 gate's first run found a SECOND
+release-only bug: tight printing fused `3 - -2` into postfix `3--(2)` —
+unary-minus.vl had never parsed under release; Formatter::between now
+states the token-stream rule. Six pins red-first over the three-leg
+equivalence (debug / release / release-sans-sweep — the third leg is what
+exposes fold-hidden collisions). The playground was never affected:
+vilan-wasm passes BuildOptions::default(), the debug preset.]
+
+#### E36. the release-preset differential gate — SHIPPED 2026-08-04
+
+(S; filed 2026-08-04 beside B69) — release_differential.rs runs 105 of 109
+corpus programs under both presets off the corpus's 8-way chunking and
+asserts identical output; marginal suite cost below measurement noise
+(isolated 3.4–3.6s); plant-proven at 56 red on the pre-fix transformer.
+nursery.vl is NOT_RUN with the E32 wall-clock reason (two host timers 10ms
+apart decide its print order). There is no run-only-on-difference shortcut:
+release always differs from debug by names, so the whole corpus runs twice.
+
+#### A23. style value types, round 2 — SHIPPED 2026-08-04
+
+(M; filed 2026-08-04 from the website raw-sweep's demand data) — the filed
+rows: background shorthand (36 sites), two-value padding/margin, a
+Length-accepting line-height, bare-"0" rendering, clamp/min/max
+constructors. [Ship notes: the headline REVERSED on reading the 36 sites
+verbatim — 20 plain colors and 13 gradients were ALREADY expressible by
+§0bis.3's types; the row was filed off raw counts hours after the slice
+that answered it. What was genuinely missing: background_image/_size (5
+sites, one unit — undoing §0bis.3's cut of the image slot, which had
+counted it without the size slot that is inert without it), Length::zero()
+(11 sites, not 7), Length::css() (calc's twin — probed: calc(clamp(..)) is
+valid CSS, so css buys byte-identity not reach), line_height_length. NOT
+minted: padding_xy (padding_y().padding_x() writes the same four longhands
+— A22-resolved identically in every order), a Background composite (an
+arity no site writes). 60 of the 107 surviving raw sites unblocked — 23
+byte-identical, 37 computed-identical; the conversion is safe incrementally
+in any order (checked at all 36 background sites). The per-row conversion
+table closes ui-styling.md §0bis.5; the website conversion rides the next
+cycle post-release.]
