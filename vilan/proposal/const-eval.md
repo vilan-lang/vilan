@@ -17,12 +17,17 @@ non-const call sites join R, roots (`main`, top-level initializers) never
 join — a root's call into R errors AT THAT call site, the outermost runtime
 crossing, while `emit` inside R-functions called from `const` chains stays
 legal (the styling property-function shape, pinned). Recorded refinements:
-indirect/closure-value paths into `emit` are the conservative gap;
 `run`/`--watch` write assets beside the canonical output each round (SHIPPED
 2026-07-20, hmr.md §11 S0 — single-package `run` and the `--watch` single arm
 now call `write_assets`; the workspace paths already did via
-`build_workspace_artifacts`); liveness-tied emission (dead-style
-elimination), Tier-2 LSP memoization, and deep failure spans as before. Implementation notes that
+`build_workspace_artifacts`). **The rest of the tail was verified piece by
+piece on 2026-08-04 and is now §8** — the indirect-call "conservative
+rejection" turned out to be a silent hole and is CLOSED (§8.1); deep failure
+attribution ships and expression-level spans are deferred with the question
+that blocks them (§8.2); the LSP's duplicate const pass is deleted and true
+Tier-2 memoization is deferred with its cache-key question (§8.3);
+liveness-tied emission (dead-style elimination) stays OUT, entangled with
+A7/A8. Implementation notes that
 amended the design: the JS-refugee hint lives in the ANALYZER, not the
 parser — `const x = 3` parses fine (assignment is an expression, so it is
 `const (x = 3)`), and the forwarding arm catches the `Assign` shape with
@@ -110,7 +115,9 @@ let narrowed = (const f()) + g();    // parenthesize to narrow the capture
   the checked-subscript message), the depth cap (`Depth`), an unavailable
   capability (`Unsupported`), or a non-data result — all report at the
   `const` expression with the failure message. Deep-span fidelity (pointing
-  inside the callee) is a recorded refinement shared with macro diagnostics.
+  inside the callee) is a recorded refinement shared with macro diagnostics —
+  DEFERRED with its blocker stated in §8.2; the failing *function* is named
+  and noted since 2026-08-04.
 - **Dependencies**: const expressions form a value dependency graph through
   the const-known bindings they read (imports included); evaluation follows
   it in deterministic order (module topological order, then binding order,
@@ -131,9 +138,11 @@ site with what it means ("styles are compile-time values — build them in a
 `const` expression", worded per API). v1 keeps the bit **std-internal** (users cannot
 declare const-only functions) and requires direct call chains — a const-only
 function passed indirectly (through a closure value) is conservatively
-rejected. This is one capability bit on a handful of internals, not function
-coloring: ordinary functions remain callable from both worlds with no
-annotation.
+rejected — enforced since 2026-08-04 at the point the VALUE is made, which is
+the only place the call graph can see it (§8.1); before that the sentence was
+aspirational and the escape was silent. This is one capability bit on a
+handful of internals, not function coloring: ordinary functions remain
+callable from both worlds with no annotation.
 
 ## 3. The asset channel — compile-time emission
 
@@ -359,13 +368,28 @@ That trade is the real decision, and it is bigger than G2.*
 
 What ships instead is the attribution the trace can carry without provenance.
 `Failure` gains a `trace: Vec<String>` that `call_value` appends to as the
-error unwinds — one push per named frame, innermost first, no cost on the
-success path. The const pass renders the innermost frame in the message and
-anchors a secondary note (C3) at that function's declaration, so the editor can
-jump to it; a std frame is legal in a note and illegal as a primary span (A2),
-which is exactly the shape C3 exists for. `failure.kind` stops being discarded:
-`Fuel` and `Depth` now render §4's promised "did not finish within the
-compile-time budget", with the specific cap named.
+error unwinds — one push per named frame, innermost first, nothing on the
+success path (anonymous closures contribute no frame, so it is the named call
+chain, not the stack). The const pass names the innermost frame in the message
+and anchors a secondary note (C3) at that function's NAME span (A1), carrying
+the chain elided to the innermost four — a depth miss unwinds hundreds of
+identical frames, and `… → recurse → recurse → recurse → recurse` says what
+512 repetitions would not. A std frame is legal in a note and would not be
+legal as a primary span (A2), which is exactly the shape C3 exists for. The
+frame name is printed only when it matches a declared function, so a
+monomorphized or synthetic name never reaches the user (B1); the note needs a
+UNIQUE match, since pointing at an arbitrary one of several would not be
+deterministic (C1).
+
+`failure.kind` stops being discarded: `Fuel` and `Depth` now render §4's
+promised "did not finish within the compile-time budget", with the specific cap
+named after the colon. That wording existed nowhere in the tree — users saw the
+macro engine's internal phrasing under a const prefix.
+
+Four pins, both halves plant-proven independently: dropping the trace push
+reddens all four; dropping the kind branch reddens exactly the two budget pins.
+En route the fourteen `Failure { .. }` literals became `Failure::new`, which is
+what let the struct grow a field without touching every site twice.
 
 ### 8.3 The LSP's duplicate pass — SHIPPED 2026-08-04; memoization deferred
 
@@ -374,7 +398,11 @@ compile-time budget", with the specific cap named.
 and no one read it. Reading the field deletes a full pass — 12–17 ms of every
 keystroke on a const-using entry, measured above — with no design and no
 behaviour change (the second run's errors were being discarded anyway, and on a
-program with const errors it returned an empty map regardless).
+program with const errors it returned an empty map regardless). The
+`Document::const_results` field went with it: `const_value_label` already had
+the `Program` in hand. Pinned by the invariant the deletion rests on — analysis
+leaves the folded values on the program — plant-proven by blanking the store;
+the two existing hover-value tests are the behaviour net.
 
 That leaves the *first* pass uncached, which is the Tier-2 item proper.
 *Question, deferred: what is a const expression's cache key?* Entity ids are
