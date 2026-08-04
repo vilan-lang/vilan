@@ -295,7 +295,10 @@ against prose.
 - **`reject_output_collisions` over `dist/`.** Unrepresentable for chunk
   names as argued above, but a leg whose entry file stem collides with
   another package's is still the pre-existing hole.
-- **HMR.** Dev builds ignore `split`, per §4, unchanged.
+- **HMR.** Dev builds ignore `split`, per §4, unchanged. One tidiness
+  consequence: a `--watch` round overwrites `dist/<leg>.js` with the whole
+  bundle and leaves the previous build's chunk files beside it. They are
+  inert (a whole bundle names no chunk), but they are strays.
 
 S4 (the consumer sweep) is untouched: `chunks.json` is emitted and
 documented, and no example serves it yet.

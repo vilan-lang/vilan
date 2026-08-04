@@ -181,7 +181,7 @@ pub fn transform_split<'src>(
     collect_references(&assembled.nodes, &mut eager_references);
     let mut forwarders: Vec<js::Node<'src>> = Vec::new();
     let mut registered_for_chunks: BTreeSet<String> = BTreeSet::new();
-    for (index, nodes) in assembled.chunks.iter().enumerate() {
+    for nodes in &assembled.chunks {
         for node in nodes {
             let js::Node::Function(function) = node else {
                 continue;
@@ -190,7 +190,6 @@ pub fn transform_split<'src>(
                 continue;
             }
             forwarders.push(chunk_forwarder(function));
-            let _ = index;
         }
     }
     // …and registers everything a chunk reads back out of it.
@@ -232,7 +231,7 @@ pub fn transform_split<'src>(
     // the embedded chunk map and the registrations. Every module binding has
     // initialized by then, and nothing can have navigated yet.
     let mut glue: Vec<js::Node<'src>> = Vec::new();
-    for (index, chunk) in plan.chunks.iter().enumerate() {
+    for chunk in &plan.chunks {
         glue.push(js::Node::Assignment(
             Box::new(js::Node::PropertyIndex(
                 Box::new(js::Node::Property(
@@ -245,7 +244,6 @@ pub fn transform_split<'src>(
                 crate::chunks::chunk_file_name(leg, &chunk.arm),
             ))),
         ));
-        let _ = index;
     }
     for name in &registered_for_chunks {
         glue.push(js::Node::Assignment(
