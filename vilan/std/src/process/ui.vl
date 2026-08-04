@@ -189,6 +189,13 @@ impl View {
 		self
 	}
 
+	/// Reactive `Style`, read once: the style the signal holds at render time
+	/// is the one served.
+	fun bind_styled(self, source: Signal<Style>): View {
+		set_attribute(self.attributes, "class", source.get().class_list());
+		self
+	}
+
 	/// Reactive attribute, read once.
 	fun bind_attr(self, name: str, source: Signal<str>): View {
 		set_attribute(self.attributes, name, source.get());

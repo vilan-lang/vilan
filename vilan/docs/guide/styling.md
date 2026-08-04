@@ -120,8 +120,42 @@ fun main() {
 ```
 
 The rule is compiled once. Only the variable's value changes at runtime.
-This one channel covers most "dynamic styling" needs; for the rest,
-`bind_class` swaps between prebuilt styles.
+This one channel covers most "dynamic styling" needs — a value that
+changes inside a rule.
+
+## Swapping whole styles
+
+When what changes is *which* style applies, not a value inside one, put
+the style in a signal and bind it. `bind_styled` is to `styled` what
+`bind_class` is to `class`:
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::style::{ style, space, Style, Color };
+import std::reactive::Signal;
+
+let idle = const style().padding(space(2)).background(Color::gray(100));
+let busy = const style().padding(space(2)).background(Color::blue(600));
+
+fun main() {
+	let state = Signal::new(idle);
+	let _root = mount_root("app", || {
+		view("div")
+			.bind_styled(state)
+			.child(view("button").text("start").on("click", || state.set(busy)))
+	});
+}
+```
+
+Both styles are built in `const`, so both sets of rules are in the
+stylesheet before the page loads; the signal only chooses between class
+strings that already exist. That is the construct-in-const rule holding
+with a signal in the middle — you still cannot build a style at runtime,
+and you never needed to.
+
+Server-side, `bind_styled` reads the signal once, like every other
+`bind_*` on the [SSR](ssr.md) layer: the style the signal holds when the
+request is rendered is the one served.
 
 > **Going deeper.** Each property-under-a-condition becomes one atomic
 > CSS rule with a generated class name, deduplicated across the whole
@@ -138,8 +172,10 @@ This one channel covers most "dynamic styling" needs; for the rest,
 - `+` is a per-property override, not CSS specificity. The right
   operand's value replaces the left's for the same property and
   condition.
-- `.class(name)` and `.styled(style)` both set the class attribute, so
-  the later call wins. Use one mechanism per element (custom classes can
-  ride along via `.raw`).
+- `.class(name)`, `.styled(style)`, `.bind_class(..)` and
+  `.bind_styled(..)` all set the class attribute, so the later call
+  wins — and a reactive one keeps winning every time its signal
+  changes. Use one mechanism per element (custom classes can ride along
+  via `.raw`).
 
 Full method table: the [style reference](../std/style.md).

@@ -6,6 +6,10 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**A style can live in a signal.** `view.bind_styled(signal)` is the reactive twin of `styled`, exactly as `bind_class` is `class`'s: point it at a `Signal<Style>` and the element's classes follow the signal. Both styles are still built in `const`, so every rule is in the stylesheet before the page loads and the signal only chooses between class strings that already exist — the construct-in-const rule holds with a signal in the middle. Server-side it reads once, like every other `bind_*` on the SSR layer. Previously the only way to swap a whole style reactively was `bind_class(signal.map(|s| s.class_list()))`.
+
 ## v0.24.0 — 2026-08-03
 
 **Mutate a signal's collection in place.** `signal.update(|&mut list| { list.push(item); })` hands the closure a writable view of the *stored* value, so growing a `Signal<List<T>>` no longer means the copy-transform-return dance `set_with` required (`|mut list| { list.push(x); list }` — a whole-list copy per push, written as a transformation when you meant a mutation). Subscribers are notified once, after the closure returns, whatever it did; inside a `batch` that notification defers and coalesces like any other write. It is one method for every container — `List`, `Map`, `Set`, a struct's fields, anything a closure can mutate through a view — rather than a per-collection twin. `set_with` is unchanged and remains the right form when you are computing a new value rather than editing one.

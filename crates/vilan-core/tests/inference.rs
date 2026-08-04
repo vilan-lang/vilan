@@ -27214,6 +27214,51 @@ fn ssr_bind_class_and_bind_attr_read_once() {
     );
 }
 
+/// `bind_styled` is `styled`'s reactive twin, so the process twin reads the
+/// signal once and renders the style it held — the class names being the
+/// content hashes the `const` chain already emitted.
+#[test]
+fn ssr_bind_styled_reads_the_current_style_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::style::{ style, space, Style };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let compact = const style().padding(space(2));
+            let roomy = const style().padding(space(6));
+            let theme: Signal<Style> = Signal::new(compact);
+            print(render(view("div").bind_styled(theme)));
+            theme.set(roomy);
+            print(render(view("div").bind_styled(theme)));
+        }
+        "#,
+        "<div class=\"s1ufvp8\"></div>\n<div class=\"s1ufvsw\"></div>\n",
+    );
+}
+
+/// The construct-in-const rule survives a signal in the middle: a `Signal<Style>`
+/// can only ever carry styles some `const` expression already emitted, so
+/// building one at the binding site is still the static error it always was.
+#[test]
+fn bind_styled_cannot_construct_its_style_at_runtime() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::style::{ style, space, Style };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let theme: Signal<Style> = Signal::new(style().padding(space(2)));
+            print(render(view("div").bind_styled(theme)));
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
 #[test]
 fn ssr_bind_each_renders_current_list() {
     assert_compiles_and_runs(
