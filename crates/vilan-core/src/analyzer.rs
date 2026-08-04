@@ -456,6 +456,15 @@ enum ResourceMoveViolation {
         reference_id: Id,
         binding: Id,
     },
+    /// R3: a consuming use of a resource parameter held by a LOAN convention
+    /// (`self` / bare / `&` / `&mut`). A loan changes no ownership, so a body
+    /// that moves its parameter out hands the caller a second owner while the
+    /// caller's binding stays live — the caller loaned it and still drops it at
+    /// scope end. `own` is the only convention a body may consume.
+    LoanConsumed {
+        at: Id,
+        binding: Id,
+    },
     /// §5 loan-only corollary: a consuming use (move / `own`-pass, `drop(x)`
     /// included) of a module-level resource, which has process lifetime and can
     /// only be loaned.
@@ -6067,6 +6076,17 @@ impl<'src> Analyzer<'src> {
             });
             return;
         }
+        // R3: a loaned parameter changes no ownership, so its body may not move
+        // it out. Reported here and the binding left owned, exactly like the
+        // module-level case — a later loan of the same parameter must not read
+        // as use-after-move on top of this.
+        if consuming && self.binding_is_loaned_parameter(binding) {
+            violations.push(ResourceMoveViolation::LoanConsumed {
+                at: use_id,
+                binding,
+            });
+            return;
+        }
         if let Some(state) = flow.moved.get(&binding) {
             // A DEFINITE move => use-after-move. A `MaybeMoved` came from an
             // already-reported R7 divergence (or a terminal tail with no
@@ -6091,6 +6111,16 @@ impl<'src> Analyzer<'src> {
             let span = **self.span_map.get(&use_id).unwrap_or(&&EMPTY_SPAN);
             flow.moved.insert(binding, MoveState::Moved(span));
         }
+    }
+
+    /// Whether `binding` is a PARAMETER held by a loan convention (`self` /
+    /// bare / `&` / `&mut`) rather than `own`. Locals answer `false` — a local
+    /// owns its value and may be moved. This is R3's "a loan changes no
+    /// ownership" read from the declaration side: only `own` may be consumed.
+    fn binding_is_loaned_parameter(&self, binding: Id) -> bool {
+        self.parameters
+            .get(&binding)
+            .is_some_and(|parameter| parameter.convention != Convention::Own)
     }
 
     /// The declared parameter conventions of a directly-resolved callee
@@ -6858,6 +6888,33 @@ impl<'src> Analyzer<'src> {
                             "`{name}` is declared outside this loop and moved inside it: the move \
                              would repeat on the next iteration; move a value declared inside the \
                              loop, or loan `{name}` with `&` / `&mut`"
+                        ),
+                        note: None,
+                    }
+                }
+                ResourceMoveViolation::LoanConsumed { at, binding } => {
+                    let name = self.binding_name(binding);
+                    let convention = self
+                        .parameters
+                        .get(&binding)
+                        .map(|parameter| parameter.convention)
+                        .unwrap_or(Convention::Bare);
+                    let declared = if name == "self" {
+                        Self::receiver_form(convention).to_string()
+                    } else {
+                        match convention {
+                            Convention::Ref => format!("&{name}"),
+                            Convention::RefMut => format!("&mut {name}"),
+                            Convention::Bare | Convention::Own => name.to_string(),
+                        }
+                    };
+                    let owned = format!("own {name}");
+                    Error {
+                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "cannot move the resource `{name}` out of this function: it is declared \
+                             `{declared}`, a loan, and a loan changes no ownership; declare it \
+                             `{owned}` to take ownership, or restructure with `Option` + `take`"
                         ),
                         note: None,
                     }
@@ -7680,6 +7737,17 @@ impl<'src> Analyzer<'src> {
                         format!(
                             "in `{name}`, `{binding_name}` is declared outside a loop and moved \
                              inside it"
+                        ),
+                    )
+                }
+                ResourceMoveViolation::LoanConsumed { at, binding } => {
+                    let binding_name = self.binding_name(*binding);
+                    (
+                        *at,
+                        "a loaned resource-typed parameter is moved out",
+                        format!(
+                            "in `{name}`, the loaned parameter `{binding_name}` is moved out here: \
+                             a loan changes no ownership, so declare it `own {binding_name}`"
                         ),
                     )
                 }

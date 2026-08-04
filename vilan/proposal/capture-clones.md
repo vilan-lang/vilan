@@ -214,17 +214,18 @@ copies everything" each turns the golden red.
 > (`a_guard_that_reads_a_copied_capture_reads_the_copy`) guards the new
 > reads-a-copy condition and is proven by planting it out.
 
-- **A moved-from `Option` is still readable, and still destroyed.**
-  `o.unwrap()` consumes `self`, but the affine checker does not treat a
-  `self`-by-value method call as a move of `o` — `o.is_some()` afterwards
-  compiles clean, and `o`'s scope-end teardown still fires, so the payload is
-  destroyed twice. This predates B53 in both directions: before `0835c7d` it
-  was a double drop of one value, after it a drop of each of two copies, and
-  now it is a double drop of one value again. Closing it means teaching the
-  move checker about `self`-consuming calls — a separate item, not a capture
-  question. `a_moved_resource_instantiation_destroys_one_value` pins the
-  honest (double) output so the hole stays visible; when the checker learns
-  the move, that expectation is the thing that changes.
+- **A moved-from `Option` is still readable, and still destroyed** —
+  **CLOSED 2026-08-04 (B60); see `affine-moves.md` for the record.**
+  `o.unwrap()` consumes `self`, but the affine checker did not treat the call
+  as a move of `o` — `o.is_some()` afterwards compiled clean, and `o`'s
+  scope-end teardown still fired, so the payload was destroyed twice. This
+  predated B53 in both directions: before `0835c7d` it was a double drop of
+  one value, after it a drop of each of two copies, and then a double drop of
+  one value again. The fix was not a new move system: `unwrap` was declaring
+  a LOANED receiver (`self`) while moving the payload out of it, so the
+  correction is `unwrap(own self)` plus a checker rule making a consumed loan
+  an error at all. `a_moved_resource_instantiation_destroys_one_value` now
+  asserts the single `drop a n=7`.
 - **A guard that needs a hoisted statement emits a dangling reference.**
   `compile_is_pattern`'s guarded-leg arm walks the guard into a `guard_block`
   that is never emitted, because an else-if chain has no statement slot before

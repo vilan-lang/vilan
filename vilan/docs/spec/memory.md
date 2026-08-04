@@ -290,7 +290,15 @@ changes no ownership and is policed by rule 4.
 - **R3: parameters.** `self` / `&x` / `&mut x` are loans, unchanged; `own
   x` is a move, and for a resource *only* a move: an `own` argument that is
   not the binding's last use is an error (where a data `own` would silently
-  copy).
+  copy). The rule reads in both directions: because a loan changes no
+  ownership, a body may not move a loaned resource parameter **out** — no
+  returning it, no `own`-passing it on, no consuming `match` of it. Doing so
+  would hand the caller a second owner while the caller's binding stays live
+  and still drops at its scope end, destroying one value twice. `own` is the
+  only convention a body may consume, and a **consuming method** therefore
+  declares `own self`: `o.unwrap()` is a move of `o`, so a later use of `o` is
+  use-after-move and `o` is not torn down at scope end. A bare `self`
+  receiver stays a loan (`db.exec(..)` never consumes `db`).
 - **R4: returns move out**, including through `if` / `match` tails (a
   diverging leg is exempt).
 - **R5: fields.** A struct literal moves resources in. A resource field is
@@ -328,8 +336,8 @@ changes no ownership and is policed by rule 4.
 - **R11: generics must be move-clean per instantiation.** Instantiating a
   type parameter with a resource type re-checks the instantiated body under
   the affine rules (T := the resource): every T-typed value is used at most
-  once as a move, with no captures and no copies. `Option::unwrap(self): T`
-  passes; a body that reads its parameter twice fails **at the instantiation
+  once as a move, with no captures and no copies. `Option::unwrap(own self):
+  T` passes; a body that reads its parameter twice fails **at the instantiation
   site**, not inside std. For an `own T` parameter the rule tightens to
   *exactly* once (a generic body is emitted once and so cannot run an
   instantiation-conditional destructor; zero moves would leak).
