@@ -79,14 +79,25 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   steps grow like Tailwind's. It's the usual argument to `padding`,
   `gap`, `margin`, and `radius`.
 - **`Length`** covers everything else: `Length::px(1.0)`,
-  `Length::rem(1.5)`, `Length::pct(50.0)`, `Length::auto()`, and
-  `Length::var("--w")` for a CSS variable (see dynamic values below).
+  `Length::rem(1.5)`, `Length::em(0.02)`, `Length::pct(50.0)`,
+  `Length::vh(100.0)`, `Length::vw(50.0)`, `Length::auto()`,
+  `Length::var("--w")` for a CSS variable (see dynamic values below), and
+  `Length::calc("100% - 2rem")` when the value is arithmetic — you write
+  the expression, not the `calc(..)` wrapper.
 - **`Color`** has `Color::white()`, `Color::black()`,
   `Color::transparent()`, `Color::hex("#663399")`, and stepped ramps
   like `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
   `Color::green(500)`.
 - Keyword properties use enums: `Display`, `Position`, `FlexDirection`,
-  `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`.
+  `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
+  `WhiteSpace`, `UserSelect`.
+
+Some properties take a plain `str` — `font_family`, `transform`,
+`box_shadow`, `text_decoration`, `flex`, `grid_template_columns`. That
+isn't a weaker `raw`: the property name is still checked and completable,
+and only the *value* is a CSS expression there is nothing to validate (a
+font stack, a transform list). Reach for them the same way you reach for
+`padding`.
 
 For anything the typed surface doesn't cover, escape hatches:
 

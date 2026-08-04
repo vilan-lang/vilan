@@ -45,7 +45,7 @@ record; the sections it points at carry the design.
 | dark×pseudo composition | **VERIFIED OPEN → SHIPPED 2026-08-04** | Implemented per §0bis.2: the condition grammar, `dark` with its own body, `pseudo` rejecting the reverse order with a message naming the fix, `media` composing for free. **Every pre-existing class name is byte-identical** — the corpus `.css` golden grew ten lines and changed none. 9 pins (composition, all-three-axes, the four refusals, and the two pre-existing nesting guards that shipped in 2026-07-10 and had never been pinned at all — `grep "cannot wrap" crates/` returned nothing), plus the corpus golden's composed selectors in bytes. Non-vacuity planted. Verification evidence: `Style::pseudo` panicked on `parts[1] != ""`, refusing **both** nesting directions (`dark(hover(..))` and `hover(dark(..))`). Cause was structural, not a missing case: the slot key `media:pseudo:property` has no third position and `dark` occupied the pseudo slot. `style.vl`'s semantics were unchanged since `ad691a7` (2026-07-10) — the only later commits are a reflow and doc comments. |
 | the html `<link>` scaffold | **VERIFIED OPEN → SHIPPED 2026-08-04** | Both `vilan init` browser-bearing templates carry the `<link>`, and both scaffolds now build a style so the link is live (the `cfeb585` move — the todo example dropping handwritten CSS for `std::style` — applied to the scaffolds); the fullstack template also gained the `/client.css` route, guarded with `fs::exists` so deleting every style doesn't crash the server at boot. `examples/reactive-ui` gained the link it was missing. 3 pins: init asserts emitted-AND-linked for the browser template, and asserts the served page links `/client.css` AND that the route returns the rules for the fullstack one; the examples gate grew a GENERAL rule — every emitted stylesheet must be linked by one of the example's pages, stated over what the build produced so a new example is covered the day it lands — proven non-vacuous by deleting reactive-ui's link. Verification evidence: emission shipped: `write_assets` (`crates/vilan-cli/src/main.rs`) writes `<out>.css` on `build`, `run`, `run --watch`, workspace and HMR paths. The *link* half existed only as hand-written bytes in two examples. No template linked it, and `examples/reactive-ui` **emitted `app.css` (pinned in `tests/examples.rs`) while its `index.html` never loaded it** — const styles compiled and then thrown away, the sharpest evidence the hookup was unfinished. |
 | `vilan fmt` chain splitting | **VERIFIED SHIPPED** — `9a3d9af`, 2026-07-28 | "vilan fmt splits method chains over 100 columns"; extended by the 2026-08-01 formatter arc (backlog 42–49, notably `bad9510`'s width-independent `})` seam rule). `formatter.rs` carries `LINE_BUDGET = 100`, `is_breakable_chain`, and style-chain pins including a literal `const style().display(..).flex_direction(..).gap(..)` case. Probed with the worktree binary: a 128-column style chain splits one link per line. **The "(or preserve)" half of §1's note is rejected by design, not open** — the formatter has one canonical output and no width knob, and `an_under_width_hand_split_chain_collapses` pins the rejoin. §1's note is corrected in place. |
-| the property long tail | **VERIFIED OPEN, quantified** | Supply: 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
+| the property long tail | **VERIFIED OPEN → FIRST SLICE SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. The item stays OPEN for the §3b half — the value types. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
 | critical CSS | **OPEN, out of this arc's scope** | A7-entangled; still §6 slice 6, proposal-only. Left filed. |
 | liveness-tied dead-style elimination | **OPEN, out of this arc's scope** | Rides G2's liveness-tied emission. Left filed. |
 
@@ -81,10 +81,45 @@ property slice should buy:
   cause is two value types, not twenty missing methods: `Length` had no
   `em`/`vh`/`vw`/`calc()`, and there is no per-edge border surface.
 
-The first slice below takes the first group down to its ≥5-site head plus the
-value-type units the head needs, and leaves the rest to `raw` — deliberately.
-§2.3's bargain still holds: the typed surface buys checking and completion for
-what people actually write; an exhaustive CSS mirror buys neither.
+**Slice 1, shipped 2026-08-04** — the first group's ≥5-site head, plus the
+value-type units that head needs, and nothing else. 18 methods: `flex`,
+`grid_template_columns`, `top`/`right`/`bottom`/`left`/`inset`,
+`border_color`, `box_shadow`, `font_family`, `letter_spacing`,
+`text_decoration`, `white_space`, `user_select`, `transform`, `flex_shrink`,
+and `min_width`/`max_height`. Four `Length` constructors: `em`, `vh`, `vw`,
+`calc(expression)` (the author writes the arithmetic, not the wrapper). Two
+enums: `WhiteSpace`, `UserSelect` — whose `none` is `Off`, following
+`Display::Hidden`'s rule about `Option::None` at use sites.
+
+Two deliberate departures from the ≥5 line, both stated rather than fudged:
+the inset family is admitted **as a family** (`bottom` 4 and `inset` 3 come in
+with `top` 22 and `left` 20 — splitting one CSS concept by a count would be
+arbitrary), and `min_width`/`max_height` are admitted as **symmetry**, since
+`max_width` and `min_height` already shipped and the missing halves of a
+quartet are a hole rather than a tail. `flex_shrink` (4) rides in beside the
+`flex` shorthand it decomposes. Everything below the line — `clip_path`,
+`animation`, `background_image`, `filter`, `z_index`, `align_self`,
+`flex_wrap`, `box_sizing`, `text_transform`, `pointer_events` — stays with
+`raw` until it earns a place.
+
+A `str`-valued method (`font_family`, `transform`, `box_shadow`,
+`text_decoration`, `flex`, `grid_template_columns`) is not a weaker `raw`: the
+property NAME stays checked and completable, and only the value — a font
+stack, a transform list, a shadow layer — is CSS text nothing could validate.
+That is the same bargain `transition` shipped with in v1.
+
+**What is still open**, and is the bigger half: §3b's ~120 sites where the
+property is typed and the VALUE TYPE cannot hold what was wanted —
+`background(Color)` bypassed 36 times for gradients and `rgba`,
+`border(Length, Color)` 19 times for `none` and non-`solid` styles, `padding`
+for two-value shorthands, `Color` for alpha. `Length::calc` and the new units
+take a bite out of it; the rest wants a `Color` with alpha, a gradient-capable
+background channel, and a per-edge border surface — one slice, designed
+together, not a scatter of methods. Filed here, not attempted.
+
+§2.3's bargain still holds throughout: the typed surface buys checking and
+completion for what people actually write; an exhaustive CSS mirror buys
+neither.
 
 ### 0bis.2 Design — dark × pseudo composes on one axis
 
@@ -278,9 +313,9 @@ atomic rule with the condition baked in:
 ### 2.3 The escape hatch
 
 The typed property surface covers the core that styles 90% of real UI
-(layout, spacing, color, typography, borders, radius, shadow, transition —
-the ~60-function std list, to be written out in slice 3). The tail does not
-block: `raw("mask-image", "linear-gradient(..)")` lowers to an atomic rule
+(layout, spacing, color, typography, borders, radius, shadow, transition — 28
+methods in v1, 46 after the 2026-08-04 demand-led slice, §0bis.1). The tail
+does not block: `raw("mask-image", "linear-gradient(..)")` lowers to an atomic rule
 like any other, minus value validation. Plain string classes coexist
 untouched (`view.class("leaflet-container")` — the method shipped as `class`,
 not the `class_name` this draft assumed) for third-party CSS.
@@ -355,7 +390,10 @@ our compiler — the wrong home for someone else's database.
 
 ## 7. Open questions
 
-- The v1 property-function list (write out the ~60 in slice 3's design note).
+- ~~The v1 property-function list~~ — settled by MEASUREMENT rather than by
+  writing out a target number: v1 shipped 28, the 2026-08-04 demand sweep
+  (§0bis.1) ranked the gap by real usage, and slice 1 took the head to 46. The
+  remaining question is not "which properties" but §3b's value types.
 - `Style` equality/hashing (memoized class strings suggest yes).
 - ~~Whether method sugar ships in v1~~ — settled: the builder chain IS the
   surface; free property functions are not shipped.

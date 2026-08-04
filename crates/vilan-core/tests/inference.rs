@@ -14650,6 +14650,157 @@ fn length_units_render_their_css() {
                 .height(Length::pct(50))
                 .margin(Length::auto())
                 .max_width(Length::var("--w"))
+                .font_size(Length::rem(1.5))
+                .letter_spacing(Length::em(0.02))
+                .min_height(Length::vh(100))
+                .min_width(Length::vw(50))
+                .max_height(Length::calc("100% - 2rem"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{width:37px}",
+        "{height:50%}",
+        "{margin:auto}",
+        "{max-width:var(--w)}",
+        "{font-size:1.5rem}",
+        "{letter-spacing:0.02em}",
+        "{min-height:100vh}",
+        "{min-width:50vw}",
+        // `calc` wraps: the author writes the arithmetic, not the call.
+        "{max-height:calc(100% - 2rem)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The property long tail's first slice (A8): the ≥5-site head of the demand
+/// sweep, one atomic rule each. Asserted as a table — every method's exact
+/// emitted declaration, so a wrong CSS property name or a mistyped keyword is
+/// a named failure rather than a silent one.
+#[test]
+fn the_demanded_properties_emit_their_declarations() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style, Color, Length, Position, UserSelect, WhiteSpace };
+        fun s(): Style {
+            style()
+                .position(Position::Absolute)
+                .inset(space(0))
+                .top(Length::px(4))
+                .right(Length::pct(50))
+                .bottom(Length::px(8))
+                .left(Length::auto())
+                .flex("1 1 auto")
+                .flex_shrink(0.0)
+                .grid_template_columns("repeat(3, 1fr)")
+                .font_family("system-ui, sans-serif")
+                .text_decoration("line-through")
+                .white_space(WhiteSpace::Nowrap)
+                .user_select(UserSelect::Off)
+                .border_color(Color::red(600))
+                .box_shadow("0 1px 2px rgba(0,0,0,0.08)")
+                .transform("translateY(-2px)")
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{inset:var(--space-0)}",
+        "{top:4px}",
+        "{right:50%}",
+        "{bottom:8px}",
+        "{left:auto}",
+        "{flex:1 1 auto}",
+        "{flex-shrink:0}",
+        "{grid-template-columns:repeat(3, 1fr)}",
+        "{font-family:system-ui, sans-serif}",
+        "{text-decoration:line-through}",
+        "{white-space:nowrap}",
+        // `Off`, not `None`: the `Display::Hidden` naming rule.
+        "{user-select:none}",
+        "{border-color:var(--red-600)}",
+        "{box-shadow:0 1px 2px rgba(0,0,0,0.08)}",
+        "{transform:translateY(-2px)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Every variant of the two new keyword enums maps to its CSS keyword — the
+/// ordering-sensitive, exhaustive half a happy-path pin misses.
+#[test]
+fn the_new_keyword_enums_cover_every_variant() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, UserSelect, WhiteSpace };
+        fun space_variants(): Style {
+            style()
+                .white_space(WhiteSpace::Normal)
+                .hover(style().white_space(WhiteSpace::Nowrap))
+                .focus(style().white_space(WhiteSpace::Pre))
+                .active(style().white_space(WhiteSpace::PreWrap))
+                .disabled(style().white_space(WhiteSpace::PreLine))
+        }
+        fun select_variants(): Style {
+            style()
+                .user_select(UserSelect::Auto)
+                .hover(style().user_select(UserSelect::Text))
+                .focus(style().user_select(UserSelect::All))
+                .active(style().user_select(UserSelect::Off))
+        }
+        let _a = const space_variants();
+        let _b = const select_variants();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{white-space:normal}",
+        "{white-space:nowrap}",
+        "{white-space:pre}",
+        "{white-space:pre-wrap}",
+        "{white-space:pre-line}",
+        "{user-select:auto}",
+        "{user-select:text}",
+        "{user-select:all}",
+        "{user-select:none}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The reason `border_color` exists as its own method: `border(width, color)`
+/// fills ONE slot, so recolouring under `:hover` used to mean restating the
+/// width. Two slots, two classes, and the pseudo-class rule wins by
+/// specificity — which is what four of the five real `border-color` uses in
+/// the demand sweep were hand-rolling through `raw`.
+#[test]
+fn border_color_is_its_own_slot_so_a_hover_can_recolour_a_border() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .border(Length::px(1), Color::gray(300))
+                .hover(style().border_color(Color::blue(600)))
         }
         let _s = const s();
         fun main() {}
@@ -14658,19 +14809,15 @@ fn length_units_render_their_css() {
     );
     let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
     assert!(
-        lines.iter().any(|l| l.contains("{width:37px}")),
+        lines
+            .iter()
+            .any(|line| line.contains("{border:1px solid var(--gray-300)}")),
         "{lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("{height:50%}")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("{margin:auto}")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("{max-width:var(--w)}")),
+        lines
+            .iter()
+            .any(|line| line.contains(":hover{border-color:var(--blue-600)}")),
         "{lines:?}"
     );
 }

@@ -7,7 +7,7 @@ Typed, compile-time atomic styles. Concepts and the emission model: the
 import std::style::{
 	style, space, Style, Length, Color,
 	Display, Position, FlexDirection, AlignItems, JustifyContent,
-	TextAlign, Cursor, Overflow,
+	TextAlign, Cursor, Overflow, WhiteSpace, UserSelect,
 };
 ```
 
@@ -20,9 +20,13 @@ fun space(step: i32): Length       // spacing scale: space(1) = 0.25rem
 impl Length {
 	fun px(value: f64): Length
 	fun rem(value: f64): Length
+	fun em(value: f64): Length     // relative to the element's own font size
 	fun pct(value: f64): Length
+	fun vh(value: f64): Length     // viewport units
+	fun vw(value: f64): Length
 	fun auto(): Length
 	fun var(name: str): Length     // a CSS custom-property reference ("--w")
+	fun calc(expression: str): Length  // "100% - 2rem" — no calc(..) wrapper
 }
 
 impl Color {
@@ -38,7 +42,10 @@ impl Color {
 ```
 
 Keyword enums: `Display` (Flex, Block, …), `Position`, `FlexDirection`,
-`AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`.
+`AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
+`WhiteSpace` (Normal, Nowrap, Pre, PreWrap, PreLine), `UserSelect` (Auto,
+Text, All, **Off** — `none`, named to stay clear of `Option::None`, like
+`Display::Hidden`).
 
 ## Style methods
 
@@ -54,8 +61,12 @@ Layout:
 | `flex_direction` | `FlexDirection` |
 | `align_items` | `AlignItems` |
 | `justify_content` | `JustifyContent` |
+| `flex` | `str` — the shorthand, `"1 1 auto"` |
+| `flex_shrink` | `f64` |
+| `grid_template_columns` | `str` — `"repeat(3, 1fr)"` |
 | `gap`, `padding`, `padding_x`, `padding_y`, `margin`, `margin_x`, `margin_y` | `Length` |
-| `width`, `height`, `max_width`, `min_height` | `Length` |
+| `width`, `height`, `min_width`, `max_width`, `min_height`, `max_height` | `Length` |
+| `top`, `right`, `bottom`, `left`, `inset` | `Length` |
 | `overflow` | `Overflow` |
 
 Appearance:
@@ -64,14 +75,26 @@ Appearance:
 |---|---|
 | `radius` | `Length` |
 | `border` | `(width: Length, color: Color)` |
+| `border_color` | `Color` — its own slot, so a `hover` can recolour without restating the width |
+| `box_shadow` | `str` |
 | `background`, `color` | `Color` |
+| `font_family` | `str` |
 | `font_size` | `Length` |
 | `font_weight` | `i32` |
 | `line_height` | `f64` |
+| `letter_spacing` | `Length` — usually `Length::em(..)` |
 | `text_align` | `TextAlign` |
+| `text_decoration` | `str` |
+| `white_space` | `WhiteSpace` |
+| `user_select` | `UserSelect` |
 | `cursor` | `Cursor` |
 | `opacity` | `f64` |
 | `transition` | `str` |
+| `transform` | `str` |
+
+A `str`-valued method is not a weaker `raw`: it keeps the property name
+checked and completable while the *value* stays a CSS expression the compiler
+has nothing to validate (a font stack, a transform list, a shadow layer).
 
 Escape hatches:
 

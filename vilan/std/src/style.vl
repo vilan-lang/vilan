@@ -42,12 +42,37 @@ impl Length {
 		Length { css = i"{value}rem", root = "" }
 	}
 
+	/// Relative to the element's own font size — the unit `letter_spacing`
+	/// and optical spacing are written in.
+	fun em(value: f64): Length {
+		Length { css = i"{value}em", root = "" }
+	}
+
 	fun pct(value: f64): Length {
 		Length { css = i"{value}%", root = "" }
 	}
 
+	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height
+	/// shell.
+	fun vh(value: f64): Length {
+		Length { css = i"{value}vh", root = "" }
+	}
+
+	fun vw(value: f64): Length {
+		Length { css = i"{value}vw", root = "" }
+	}
+
 	fun auto(): Length {
 		Length { css = "auto", root = "" }
+	}
+
+	/// A `calc()` expression, written WITHOUT the wrapper:
+	/// `Length::calc("100% - 2rem")`. The property stays typed while the
+	/// arithmetic — which the `Length` representation deliberately does not
+	/// model — rides a string. Composes with tokens through their rendered
+	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
+	fun calc(expression: str): Length {
+		Length { css = i"calc({expression})", root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
@@ -236,6 +261,23 @@ enum Overflow {
 	Scroll,
 }
 
+enum WhiteSpace {
+	Normal,
+	Nowrap,
+	Pre,
+	PreWrap,
+	PreLine,
+}
+
+enum UserSelect {
+	Auto,
+	Text,
+	All,
+	// `user-select:none` — named to stay clear of `Option::None` at use
+	// sites, the `Display::Hidden` rule.
+	Off,
+}
+
 // --- the class-name hash --------------------------------------------------------
 
 /// djb2 over the slot key and declaration, base36, prefixed for CSS validity.
@@ -420,6 +462,24 @@ impl Style {
 		self.with_length("gap", value)
 	}
 
+	/// The `flex` shorthand — grow, shrink and basis in one value
+	/// (`"1 1 auto"`, `"1"`, `"0 0 12rem"`). A string because the three parts
+	/// have three different value kinds; the alternative is three methods
+	/// nobody writes separately.
+	fun flex(self, value: str): Style {
+		self.raw("flex", value)
+	}
+
+	fun flex_shrink(self, value: f64): Style {
+		self.raw("flex-shrink", i"{value}")
+	}
+
+	/// The grid track list (`"repeat(3, 1fr)"`, `"12rem 1fr"`). `fr` is a grid
+	/// unit rather than a length, so the track list stays a string.
+	fun grid_template_columns(self, value: str): Style {
+		self.raw("grid-template-columns", value)
+	}
+
 	// --- box ---
 
 	fun padding(self, value: Length): Style {
@@ -454,12 +514,45 @@ impl Style {
 		self.with_length("height", value)
 	}
 
+	fun min_width(self, value: Length): Style {
+		self.with_length("min-width", value)
+	}
+
 	fun max_width(self, value: Length): Style {
 		self.with_length("max-width", value)
 	}
 
 	fun min_height(self, value: Length): Style {
 		self.with_length("min-height", value)
+	}
+
+	fun max_height(self, value: Length): Style {
+		self.with_length("max-height", value)
+	}
+
+	// --- placement ---
+	// The offsets a `position` other than `static` resolves against.
+
+	fun top(self, value: Length): Style {
+		self.with_length("top", value)
+	}
+
+	fun right(self, value: Length): Style {
+		self.with_length("right", value)
+	}
+
+	fun bottom(self, value: Length): Style {
+		self.with_length("bottom", value)
+	}
+
+	fun left(self, value: Length): Style {
+		self.with_length("left", value)
+	}
+
+	/// All four offsets at once — `inset(space(0))` is the fill-the-parent
+	/// idiom under `position(Position::Absolute)`.
+	fun inset(self, value: Length): Style {
+		self.with_length("inset", value)
 	}
 
 	fun radius(self, value: Length): Style {
@@ -474,6 +567,19 @@ impl Style {
 			emit("css", color.root);
 		}
 		self.rule("", "", "border", i"border:{width.css} solid {color.css}")
+	}
+
+	/// Just the colour, its own slot — so a `hover`/`focus` variant can
+	/// recolour a border without restating its width, which is what four of
+	/// the five real `border-color` sites were doing by hand.
+	fun border_color(self, value: Color): Style {
+		self.with_color("border-color", value)
+	}
+
+	/// A shadow list (`"0 1px 2px rgba(0,0,0,0.08)"`, `"none"`). Comma-joined
+	/// layers of four lengths and a colour: a string, like `transition`.
+	fun box_shadow(self, value: str): Style {
+		self.raw("box-shadow", value)
 	}
 
 	fun overflow(self, value: Overflow): Style {
@@ -495,12 +601,48 @@ impl Style {
 		self.with_color("color", value)
 	}
 
+	/// A font stack (`"system-ui, sans-serif"`). A string: the value is an
+	/// ordered fallback list of names the compiler has nothing to check.
+	fun font_family(self, value: str): Style {
+		self.raw("font-family", value)
+	}
+
 	fun font_size(self, value: Length): Style {
 		self.with_length("font-size", value)
 	}
 
 	fun font_weight(self, value: i32): Style {
 		self.raw("font-weight", i"{value}")
+	}
+
+	/// Tracking. Usually `Length::em(..)`, so it scales with the font size.
+	fun letter_spacing(self, value: Length): Style {
+		self.with_length("letter-spacing", value)
+	}
+
+	/// The `text-decoration` shorthand (`"underline"`, `"line-through"`,
+	/// `"none"`, or a full `"underline wavy #dc2626 1.5px"`).
+	fun text_decoration(self, value: str): Style {
+		self.raw("text-decoration", value)
+	}
+
+	fun white_space(self, value: WhiteSpace): Style {
+		self.raw("white-space", match value {
+			WhiteSpace::Normal => "normal",
+			WhiteSpace::Nowrap => "nowrap",
+			WhiteSpace::Pre => "pre",
+			WhiteSpace::PreWrap => "pre-wrap",
+			WhiteSpace::PreLine => "pre-line",
+		})
+	}
+
+	fun user_select(self, value: UserSelect): Style {
+		self.raw("user-select", match value {
+			UserSelect::Auto => "auto",
+			UserSelect::Text => "text",
+			UserSelect::All => "all",
+			UserSelect::Off => "none",
+		})
 	}
 
 	fun line_height(self, value: f64): Style {
@@ -530,6 +672,12 @@ impl Style {
 
 	fun transition(self, value: str): Style {
 		self.raw("transition", value)
+	}
+
+	/// A transform list (`"translateY(-2px)"`, `"rotate(45deg) scale(1.1)"`).
+	/// A string: the functions take angles, ratios and lengths in one value.
+	fun transform(self, value: str): Style {
+		self.raw("transform", value)
 	}
 
 	// --- conditions ---
