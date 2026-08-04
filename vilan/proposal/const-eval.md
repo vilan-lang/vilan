@@ -600,9 +600,10 @@ that exhaustion is cheap and generous enough that it never bites real code:
 | serialized size | uncapped | **256 bytes** |
 
 Sized against §9.1's distribution, not by feel: every fold in the tree completes
-within **200 fuel** and serializes to at most **33 bytes** (median 2). The
-numbers therefore carry ~50× and ~8× headroom over observed reality while
-sitting well under the explicit budget in every dimension. The size cap is what
+within **200 fuel** and serializes to at most **33 bytes** (median 2) — and once
+the generic exclusion above lands, to at most **21**. The numbers therefore
+carry ~50× and ~12× headroom over observed reality while sitting well under the
+explicit budget in every dimension. The size cap is what
 §5 asked for — "a 10 KB table literal replacing a 20-character call is a
 regression nobody asked for"; 256 bytes admits a small scale or lookup table and
 refuses a generated one, and explicit `const` remains the opt-in for big
@@ -729,18 +730,28 @@ design did not know it was possible — on its first run.
 
 **A pre-existing release-preset bug, found in passing and NOT fixed here.** The
 differential's first draft compared release-with-inference against
-release-without, and seven programs failed. Only one was inference's; the other
-six were the release preset's own short-name renaming colliding. `default.vl`
-emits two module-level `function b`, the second shadowing the first into
-infinite recursion; `capture-clones.vl` emits `for (const p of …) { const o = p;
-let p = null; … }`; `json-roundtrip.vl` redeclares `m`. All reproduce exactly on
-the **shipped v0.27.0 binary** with a `preset = "release"` manifest and no
-inference involved, so this predates G3 entirely. It is filed as a finding, not
-patched here — it is a codegen-renaming arc of its own, and folding it into an
-inference change would bury both.
+release-without, and seven programs failed. **None of the seven was a folding
+bug.** All were the release preset's own short-name renaming colliding, and all
+seven reproduce on the **shipped v0.27.0 binary** with a `preset = "release"`
+manifest and no inference anywhere near them:
 
-That is also why the differential compares two DEBUG builds, one with the sweep
-forced on. Observational neutrality is a property of folding, not of the
-printer, and pairing the two would have meant this gate reporting on the
-renaming bug forever instead of on inference. The release path keeps its own
-pin, gate 2.
+| program | what v0.27.0 emits under `release` |
+| --- | --- |
+| `default.vl` | two module-level `function b` — the second shadows the first into infinite recursion |
+| `capture-clones.vl` | `for (const p of …) { const o = p; let p = null; … }` — TDZ on `p` |
+| `derive-json.vl`, `iterator-protocol.vl`, `value-semantics.vl`, `map.vl`, `list-element-type.vl` | `SyntaxError: Identifier '…' has already been declared` |
+
+Inference exposed the same defect on an eighth, `json-roundtrip.vl`, which is
+clean on v0.27.0 and collides once folding changes which bindings survive — so
+the sweep does not cause the bug but can move which programs trip it. Filed as a
+finding, not patched: it is a codegen-renaming arc of its own, and folding it
+into an inference change would bury both.
+
+That is why the differential compares two DEBUG builds, one with the sweep
+forced on — and the reason is stronger than "less noise". Observational
+neutrality is a property of folding, not of the printer, but note what the
+release comparison actually did: `list-element-type.vl` is in the table above,
+so under release BOTH of its builds were already dying in the renaming bug, and
+the generic-context error printing `undefined` was **masked**. Confounding the
+two knobs did not merely add failures to read past; it hid the real one. The
+release path keeps its own pin, gate 2.

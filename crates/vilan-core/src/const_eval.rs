@@ -39,7 +39,7 @@ const INFERRED_LIMITS: Limits = Limits {
 /// The most bytes an inferred fold's literal may occupy (const-eval.md §9.3).
 /// §5's rule — "a 10 KB table literal replacing a 20-character call is a
 /// regression nobody asked for" — with explicit `const` as the opt-in for big
-/// results. The largest fold in the tree measures 33 bytes, the median 2.
+/// results. The largest fold in the tree measures 21 bytes, the median 2.
 const INFERRED_SIZE_CAP: usize = 256;
 
 /// Which const form a [`State`] is evaluating. They share one machine and

@@ -16,7 +16,7 @@ tracks the latest state.
 
 **Every fold is checked by running it.** Each corpus program is compiled twice — with the sweep and without — and every program whose output changed is executed both ways under node with identical results required. That gate is what caught the generic case above, on its first run. The pass is build-only: the language server never runs it, since silent fallback leaves nothing for an editor to surface. Record: `proposal/const-eval.md` §9.
 
-**Known, unrelated, and not fixed here**: the `release` preset's short-name renaming can emit colliding identifiers on some programs (two module-level `function b`, a `const` shadowing the `for` binding it initializes from). It reproduces on v0.27.0 with no inference involved and is filed for a codegen arc of its own.
+**Known, unrelated, and not fixed here**: the `release` preset's short-name renaming emits colliding identifiers on seven corpus programs — two module-level `function b` that shadow into infinite recursion, a `const` shadowing the `for` binding it initializes from, and five plain redeclarations. All seven reproduce on v0.27.0 with no inference involved; folding can shift which programs trip it but does not cause it. Filed for a codegen arc of its own.
 
 ## v0.27.0 — 2026-08-04
 
