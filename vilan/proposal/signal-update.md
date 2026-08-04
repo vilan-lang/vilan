@@ -129,12 +129,12 @@ returns.**
 - **`sync` is the `await` fence.** A view may not be live across an `await`
   (spec §6.6), and the view is live for exactly the closure's extent, so the
   callback must complete synchronously. `sync` states that contract, matching
-  `set_with`. **Honesty note:** the contract is not *enforced* today for a
-  `void`-returning closure parameter — `sync || void` accepts an awaiting
-  closure where `sync || i32` refuses it. That gap is pre-existing and
-  independent of `update` (§8); `sync` is written here because it is the
-  correct declaration and will start biting when the gap closes. The
-  rejection is pinned `#[ignore]`d, per the repo's known-but-unfixed rule.
+  `set_with`. **Closed 2026-08-04 (B61):** the contract was not *enforced* for a
+  `void`-returning closure parameter — `sync || void` accepted an awaiting
+  closure where `sync || i32` refused it, because both contract checks gated on
+  the ADAPTATION shape (a closure with a resolved, non-void return) rather than
+  on the marker. The marker is now the whole test, so `update` refuses an
+  awaiting `mutate`; `signal_update_refuses_an_awaiting_closure` pins it.
 - **`Signal<resource>`**: R10 rejects a resource argument to `Shared`, and
   `Signal<T>`'s storage *is* a `Shared<T>` — but the check keys on the
   written type's head, and `Signal`'s own `Shared<T>` field is generic at its
@@ -155,10 +155,15 @@ returns.**
 
 ## 8. Residuals / finds worth filing
 
-- **`sync` is not enforced for a `void`-returning closure parameter.**
+- ~~**`sync` is not enforced for a `void`-returning closure parameter.**
   `fun run_now(body: sync || void)` accepts `|| { sleep(1); }`; the same
   signature returning `i32` refuses it. Pre-existing, independent of A18,
-  reproducible with no std involvement. Pinned `#[ignore]`d.
+  reproducible with no std involvement. Pinned `#[ignore]`d.~~ **Fixed
+  2026-08-04 (B61):** the contract sites keyed on `closure_return_is_value`, the
+  ADAPTATION predicate, which excludes void by design; they ask
+  `parameter_is_closure` now. `Signal::update`'s `sync` is the only
+  `sync |…| void` declaration in tree and no in-tree caller awaited, so nothing
+  else moved.
 - **`Signal<resource>` slips R10.** `Shared<Database>` is refused;
   `Signal<Database>` compiles. R10's check keys on the written application's
   head, so a resource reaching `Shared` only through a generic struct field

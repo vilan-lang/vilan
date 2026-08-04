@@ -8,6 +8,8 @@ tracks the latest state.
 
 ## Unreleased
 
+**`sync` on a callback that returns nothing now means what it says.** A parameter declared `sync || void` accepted a closure that awaits, while the identical parameter returning `i32` refused it — so a `sync` marker on a void callback was a correct declaration that did not bite. Both checks were asking the wrong question: whether the callback returns a value decides whether an async closure can *adapt*, not whether a declared contract applies. The marker is the whole test now. The one place this changes in the standard library is `Signal::update`, whose `mutate` callback holds a writable view of the stored value: a view may not be live across an `await`, so an awaiting `update` body is refused rather than silently producing a view that outlives its guarantee.
+
 **A `match` guard may need a temporary, and now gets one.** A guard containing an `is` test, a `?` lift, or a nested `match` compiles to statements as well as an expression — and an `else if` chain has no room for a statement before a leg's condition, so those statements were built and thrown away. The emitted condition then read a variable nothing had declared, and a program that type-checked cleanly died at startup with `ReferenceError`. A match with such a guard is now emitted as a sequence of tests instead of a chain, each leg holding a slot for what its guard needs; the copies a guarded leg's captures owe are made there too, ahead of the guard, so `Some(mut xs) if xs.pop() is Some(_)` pops from the capture rather than from the value being matched. A guard that needs nothing keeps the chain, byte for byte.
 
 ---

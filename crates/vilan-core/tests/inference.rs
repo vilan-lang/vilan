@@ -4958,18 +4958,72 @@ fn a_shared_write_assignment_is_unchanged_for_both_pointees() {
 }
 
 #[test]
-#[ignore = "pre-existing: the `sync` contract is not enforced for a \
-`void`-returning closure parameter — `sync || void` accepts an awaiting \
-closure where `sync || i32` refuses it (proposal/signal-update.md §8). \
-`Signal::update` declares `sync` for the correct contract; un-ignore when \
-the void-return gap closes."]
 fn a_sync_void_parameter_refuses_an_async_closure() {
+    // B61: the `sync` marker is the whole contract — what the callback returns
+    // decides ADAPTATION, not whether the contract binds. `sync || void` used
+    // to accept an awaiting closure that the identical `sync || i32` refused.
     assert_fails_with(
         r#"
         import std::time::sleep;
         fun run_now(body: sync || void) { body(); }
         fun main() {
             run_now(|| { sleep(1); });
+        }
+        "#,
+        "requires a synchronous closure (`sync`)",
+    );
+}
+
+#[test]
+fn a_sync_void_parameter_still_takes_a_synchronous_closure() {
+    // The other half of B61: the marker refuses awaiting callbacks, not every
+    // callback. A void `sync` parameter is the ordinary case.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun run_now(body: sync || void) { body(); }
+        fun main() {
+            run_now(|| { print(1); });
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_sync_void_parameter_refuses_a_forwarded_async_closure() {
+    // B61 reaches the transitive path too: the closure passed to `run_now` is
+    // async only for the instance of `forward` whose `f` awaits, which is the
+    // per-instance check — and it gated on the same adaptation shape, so a
+    // void `sync` parameter escaped it as well. The value-returning twin is
+    // `a_forwarded_async_closure_into_a_sync_contract_is_refused`.
+    assert_fails_noting(
+        r#"
+        import std::time::sleep;
+        fun run_now(body: sync || void) { body(); }
+        fun forward(f: || i32) { run_now(|| { f(); }); }
+        fun main() {
+            forward(|| { sleep(1); 2 });
+        }
+        "#,
+        "passes an async closure that reaches `body`, which requires a synchronous closure (`sync`)",
+        "run_now(|| { f(); })",
+        "forwarded into the `sync` parameter `body` here",
+    );
+}
+
+#[test]
+fn signal_update_refuses_an_awaiting_closure() {
+    // A18 declared `Signal::update`'s `mutate` parameter `sync` because a view
+    // may not be live across an `await` (spec §6.6) — a correct declaration
+    // that did not bite until B61. It bites now.
+    assert_fails_with(
+        r#"
+        import std::reactive::Signal;
+        import std::time::sleep;
+        fun main() {
+            let items: Signal<List<i32>> = Signal::new([1]);
+            items.update(|&mut list| { sleep(1); list.push(2); });
         }
         "#,
         "requires a synchronous closure (`sync`)",
