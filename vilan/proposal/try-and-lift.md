@@ -329,3 +329,109 @@ byte-identical.
 (observable via the caller's `Err`); `ok_or(e)!` converts `None`→`Err` and runs;
 same-type `!` unchanged; the `E1 != E2` mismatch is rejected with the `.map_err` hint;
 `Option`-in-`Result` rejected with the `.ok_or` hint; a docs example shows the pattern.
+
+## 10. The B11 tail, verified (2026-08-04)
+
+B11's entry predates the STATUS convention and had never been reconciled, so
+every one of its three remainders was re-verified against the tree — the
+record read, then a probe compiled through the worktree binary. Result: one
+was settled and buildable, two are genuinely design-gated.
+
+| Remainder | Verdict | Evidence |
+| --- | --- | --- |
+| the bare-`?` **trait path** (user `Lift` containers) | **SETTLED — built, §11** | claim true (probe below); design fully specified by `expression-lifting.md` §4 + §7 |
+| **closure `!`** (the RPC-handler follow-up) | **OPEN — §12.1** | claim true (probe below); the `arg → Result` linkage exists nowhere in `proposal/`, and std has built nothing toward it |
+| **`Signal`/`Promise` `Lift` opt-ins** | **OPEN — §12.2** | claim true (probe below); the record names them as candidates and supplies no semantics; the contract members do not exist |
+
+### 10.1 A disambiguation the entry needed
+
+"Bare `?`" in B11 is **expression lifting's** `?` (`expression-lifting.md`),
+not §3's sentence "**Bare `a?`** (no following `.`) is a parse error" — that
+line was **superseded 2026-07-16**, when expression lifting shipped v1 and
+took over the grammar space. §3 is left as written because it is the record
+of the `?.` slice as designed; read it with this note.
+
+And the `?.` **chain** trait path is *not* the remainder: it shipped in the
+stabilization pass (the status header says so, and
+`a_user_lift_container_dispatches_to_its_own_map_and_and_then` pins a `Boxy`
+dispatching to its own `map`/`and_then`). What was left is **region-only**:
+expression lifting shipped "live for the std pair", so a user `Lift`
+container at a bare `?` was rejected.
+
+### 10.2 The probes
+
+Each run through `target/debug/vilan check` in the `lift-tail` worktree
+(the `PATH` binary is 0.27.0 and predates none of this, but is not the tree
+under test).
+
+**(1) bare `?` on a user `Lift` container** — a `Boxy<T>` with
+`impl Boxy<type T> with Lift {}` plus a conforming `map`/`and_then`,
+`let doubled = boxed? * 2;`:
+
+```
+Error: a bare `?` lifts an `Option` or a `Result`; this is Boxy<i32>
+       (expression lifting for user `Lift` containers is a recorded
+        follow-up; `?.` chains already support them)
+```
+
+Claim **confirmed** — a clean error that steers to `?.`, raised in
+`resolve_lift_region`, pinned by
+`expression_lift_on_a_user_container_is_the_recorded_follow_up`. And the
+design is **complete on paper**: `expression-lifting.md` §4 specifies the
+trait path exactly — "nested `and_then` calls ending in `map`, each
+continuation an IR-level closure over the remaining region — the user-`Lift`
+chain lowering, nested. Left-to-right, so effects order as written" — and §7's
+test plan already carries the row "user-`Lift` type through the trait path
+(effects ordered)". Nothing was left to decide, only to build. → §11.
+
+**(2) `!` inside a closure** — `|k: str| { let n = lookup(k)!; n + 1 }`:
+
+```
+Error: `!` requires the nearest enclosing function to declare an
+       `Option`/`Result`-compatible return type (closures and `async`
+        blocks are not yet supported)
+```
+
+Claim **confirmed**. The check is in the walk (`Node::TryAssert`) and turns
+on the *frame kind* — anything that is not a `ReturnFrame::Function` is
+refused — so a contextually-typed closure gets the same error today; the
+type's availability is not what gates it.
+
+Is the linkage design settled anywhere? **No.** An anchored sweep of
+`proposal/` finds four mentions, all of them deferrals:
+
+- §2 here: "**First follow-up** (not v1) … the motivating case is RPC handler
+  closures (`|request| { ... }` returning `RpcOutcome`, which would carry its
+  own `Try` impl …)".
+- §6 here: "its real payoff needs the `arg → Result` API redesign".
+- `transport-rpc.md` Q10: "really a **general error-handling dependency** …
+  Track as a prerequisite; revisit when `?`/try lands."
+- `p6-followups.md`: filed under "Further out (own proposals)".
+
+And std confirms nothing was built toward it: `arg<T: Wire>(request, index): T`
+returns `T` bare (a garbled argument poisons the request's deserializer, and
+`decode_failed` is the separate gate), and `grep "with Try"` over
+`vilan/std/src` finds exactly two impls — `Option` and `Result`. `RpcOutcome`
+has none. → recorded as the design question it is, §12.1.
+
+**(3) `?.` on a `Signal`** — `Signal<Profile>`, `s?.name`:
+
+```
+Error: `?.` lifts an `Option`, a `Result`, or a type opting in with
+       `impl .. with Lift`; this is Signal<Profile>
+```
+
+Claim **confirmed**, and it is the *ordinary* opt-in gate — nothing
+special-cases `Signal` or `Promise`. The record never gave them semantics:
+§3 calls them "the recorded candidates, **not v1** — each is its own decision
+because the reading of `?.` silently changes domain (reactive/async) with the
+receiver", and §6 repeats "each its own review".
+
+The contract members do not exist either. `Signal<T>` has
+`map<U>(self, transform: sync |T| U): Signal<U>` and **no `and_then`**; its
+`flatten` lives on a *specialized* `impl Signal<Signal<type U>>`, so §3's
+"its `and_then` is exactly the A4 `flatten` combinator" is a sketch, not a
+member — someone would have to write
+`and_then<U>(self, fn: sync |T| Signal<U>): Signal<U>` (= `map(fn).flatten()`,
+carrying `map`'s `sync` bound outward). `Promise<T>` is an `external struct`
+whose only member is `Promise::all`: neither `map` nor `and_then`. → §12.2.
