@@ -1,10 +1,23 @@
 // B53 (rule 1): pattern captures of aggregate elements copy — with two
-// elisions this golden pins in BYTES. `sum_over` is the read-only walker
-// (immutable capture, readonly-rooted subject, never a value seam): its
-// capture binds WITHOUT `__clone`, the share elision that keeps recursive
-// renderers linear. `first_or` returns its capture (the value seam), so it
-// binds WITH `__clone` — the copy that keeps a returned payload from
-// aliasing the caller's option (the `unwrap` leak).
+// elisions, across BOTH pattern-compilation paths, this golden pins the shapes
+// in BYTES.
+//
+// `total_width` is the read-only walker (immutable AGGREGATE capture,
+// readonly-rooted subject, never a value seam): its capture binds WITHOUT
+// `__clone`, the share elision that keeps recursive renderers linear.
+// `guarded_width` walks the same way through a GUARDED leg — which compiles by
+// the alias path, where captures are substituted at each reference rather than
+// declared — and shares there too.
+//
+// `first_or` RETURNS its capture (the value seam), so it binds WITH `__clone`:
+// the copy that keeps a returned payload from aliasing the caller's option (the
+// `unwrap` leak). `first_or_guarded` is its guarded twin, and its `__clone`
+// sits INSIDE the leg body, after the guard — a guard that rejects copies
+// nothing. `grow_first` copies through an `is` test, the third shape: a real
+// binding beside the subject temp.
+//
+// `sum_over` keeps the scalar case honest — an `i32` capture is not a cloneable
+// aggregate at all, so it never reaches the elisions.
 import std::io::print;
 import std::option::Option::{ self, Some, None };
 
@@ -20,6 +33,31 @@ fun sum_over(entries: List<(i32, i32)>): i32 {
 	total
 }
 
+fun total_width(rows: List<(List<i32>, i32)>): i32 {
+	mut total = 0;
+	for row in rows {
+		match row {
+			(let cells, let weight) => {
+				total = total + cells.len() * weight;
+			}
+		}
+	}
+	total
+}
+
+fun guarded_width(rows: List<(List<i32>, i32)>): i32 {
+	mut total = 0;
+	for row in rows {
+		match row {
+			(let cells, let weight) if weight > 1 => {
+				total = total + cells.len();
+			}
+			_ => {}
+		}
+	}
+	total
+}
+
 fun first_or(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
 	match held {
 		Some(let inner) => inner,
@@ -27,17 +65,43 @@ fun first_or(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
 	}
 }
 
+fun first_or_guarded(held: Option<List<i32>>, limit: i32, fallback: List<i32>): List<i32> {
+	match held {
+		Some(let inner) if limit > 0 => inner,
+		_ => fallback,
+	}
+}
+
+fun grow_first(pair: (List<i32>, i32)): i32 {
+	if pair is (mut cells, let weight) {
+		cells.push(weight);
+		ret cells.len();
+	}
+	0
+}
+
 fun main() {
 	mut entries = List::new();
 	entries.push((1, 2));
 	entries.push((10, 20));
 	print(sum_over(entries));
+	mut rows = List::new();
+	rows.push(([1, 2], 3));
+	rows.push(([4], 1));
+	print(total_width(rows));
+	print(guarded_width(rows));
 	let held: Option<List<i32>> = Some([1, 2]);
 	mut got = first_or(held, List::new());
 	got.push(9);
 	print(got.len());
+	mut guarded = first_or_guarded(held, 1, List::new());
+	guarded.push(9);
+	print(guarded.len());
 	match held {
 		Some(let inner) => print(inner.len()),
 		None => print(0),
 	}
+	let pair = ([1, 2], 3);
+	print(grow_first(pair));
+	print(pair.0.len());
 }

@@ -318,16 +318,27 @@ enum Postfix<'src> {
     DirectCall(Spanned<NodeList<'src>>),
 }
 
-/// Stamps a binder pattern's bindings mutable (or not). A faithful copy of
-/// `parser.rs::apply_binding_mutability` — note that a `Pattern::Array` binder is
-/// left UNTOUCHED (`other => other`), so `mut [a, b]` keeps `a`/`b` immutable: a
-/// reproduced quirk, recorded for S4, not fixed here. Used only by the match/`is`
+/// Stamps a binder pattern's bindings mutable (or not) — `mut` at the binder
+/// applies to every binding under it, and the pattern parser cannot see the
+/// keyword, so it walks them immutable and this restamps. Used by the match/`is`
 /// pattern grammar (the `let`/`mut` binding arm); `let`/parameter binders carry
-/// mutability in a separate field instead.
+/// mutability in a separate field and are restamped by the analyzer's
+/// `set_pattern_bindings_mutable` instead.
+///
+/// Tuple AND array binders recurse, matching that analyzer twin (B53 finding 5).
+/// The array arm used to fall through untouched, so `match arr { mut [a, b] => …
+/// }` bound `a`/`b` IMMUTABLE while the identical `mut [a, b] = arr` bound them
+/// mutable — one spelling of one keyword meaning two things.
 fn apply_binding_mutability(pattern: Pattern<'_>, mutable: bool) -> Pattern<'_> {
     match pattern {
         Pattern::Binding(name, _) => Pattern::Binding(name, mutable),
         Pattern::Tuple(patterns) => Pattern::Tuple(
+            patterns
+                .into_iter()
+                .map(|(pattern, span)| (apply_binding_mutability(pattern, mutable), span))
+                .collect(),
+        ),
+        Pattern::Array(patterns) => Pattern::Array(
             patterns
                 .into_iter()
                 .map(|(pattern, span)| (apply_binding_mutability(pattern, mutable), span))

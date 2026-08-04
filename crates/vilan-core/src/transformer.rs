@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic, LiftDispatch, Program,
-    TransferForm, TryDispatch,
+    CaptureCopy, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic,
+    LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
 use crate::id::Id;
@@ -2871,6 +2871,12 @@ impl<'src> Transformer<'src> {
                 }));
                 let mut conditions = Vec::new();
                 self.compile_is_pattern(pattern, js::Node::Local(subject_name), &mut conditions);
+                // B53: a capture that owes a copy becomes a real binding here,
+                // beside the subject temp and before the test — the test's
+                // outcome cannot change what the copy holds (a failing test
+                // never reads the capture), and the branch bodies are not
+                // reachable from this arm.
+                self.materialize_capture_clones(pattern, block);
                 // An irrefutable pattern (binding/wildcard/tuple) is always true.
                 conditions
                     .into_iter()
@@ -2947,6 +2953,13 @@ impl<'src> Transformer<'src> {
                         let condition = conditions.into_iter().reduce(|a, b| {
                             js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b))
                         });
+                        // B53: the leg's copies are made on ENTRY to the body,
+                        // after the guard has already decided — a guard that
+                        // rejects must leave the subject exactly as it found
+                        // it, having copied and consumed nothing. The guard
+                        // itself reads the subject's slots directly, which is
+                        // the same values the copy would hold.
+                        self.materialize_capture_clones(&leg.pattern, &mut leg_body);
                         let value = self.walk_entity(leg.body, &mut leg_body);
                         let value = value.unwrap_or(js::Node::Null);
                         self.push_result_or_divergence(&result_name, value, &mut leg_body);
@@ -3123,12 +3136,81 @@ impl<'src> Transformer<'src> {
         ))
     }
 
+    /// B53 (rule 1): whether this capture's slot read copies AT THIS EMISSION.
+    /// A capture whose type no instantiation can change always copies; a
+    /// generic-dependent one is re-decided here, per monomorphization —
+    /// `__clone` is identity on scalars and correct on aggregates, but on a
+    /// RESOURCE it mints a second owner (divergent state, a second destructor
+    /// run), and R11 (`docs/spec/memory.md`) requires `Option::unwrap(self): T`
+    /// to pass with no copies. A constraint this instance leaves unbound keeps
+    /// the conservative copy.
+    fn capture_copies(&self, capture_id: Id) -> bool {
+        match self.program.capture_clone_sites.get(&capture_id) {
+            None => false,
+            Some(CaptureCopy::Always) => true,
+            Some(CaptureCopy::UnlessResource(constraint_ids)) => {
+                !constraint_ids.iter().any(|constraint_id| {
+                    self.current_substitution
+                        .get(constraint_id)
+                        .map(|bound| self.resolve_type_id(*bound))
+                        .is_some_and(|bound| self.program.resource_types.contains(&bound))
+                })
+            }
+        }
+    }
+
+    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
+    /// leg) owes. That path binds nothing — each capture is recorded as an
+    /// accessor into the subject and substituted at every reference — so a
+    /// capture that must copy gets a real declaration here, and its alias
+    /// re-points at the declared name. Captures that share or move keep their
+    /// accessor, which is what keeps the elisions free.
+    ///
+    /// WHERE `out` goes decides WHEN the copy happens: for an `is` test the
+    /// statements before it (a copy of an unmatched payload is
+    /// `__clone(undefined)`, so a failing test pays nothing), for a guarded leg
+    /// the leg BODY — so a guard that rejects has copied nothing and left the
+    /// subject exactly as it found it.
+    fn materialize_capture_clones(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
+        for capture_id in Self::pattern_capture_ids(pattern) {
+            if !self.capture_copies(capture_id) {
+                continue;
+            }
+            let Some(accessor) = self.is_bindings.get(&capture_id).cloned() else {
+                continue;
+            };
+            self.used_helpers.insert("__clone");
+            let name = self.ng.name_for(capture_id);
+            let variable = js::Variable {
+                name: name.clone(),
+                value: Box::new(js::Node::Call(
+                    Box::new(js::Node::Local("__clone".to_string())),
+                    vec![accessor],
+                )),
+            };
+            let mutable = self
+                .program
+                .variables
+                .get(&capture_id)
+                .is_some_and(|variable| variable.mutable);
+            out.push(if mutable {
+                js::Node::LetVariable(variable)
+            } else {
+                js::Node::ConstVariable(variable)
+            });
+            self.is_bindings.insert(capture_id, js::Node::Local(name));
+        }
+    }
+
     // Compiles a match pattern against the JS expression holding the value it
     // matches: variant tests are appended to `conditions` and capture
     // declarations to `bindings`.
     /// Compiles a pattern for an `is` test: collects the boolean test conditions
     /// and records each capture as an alias to the subject's payload slot (so
-    /// references compile to `t[i]` rather than a binding statement).
+    /// references compile to `t[i]` rather than a binding statement). A capture
+    /// that owes a copy is turned into a real binding afterwards by
+    /// `materialize_capture_clones` — the alias alone would hand the body the
+    /// subject's own storage.
     fn compile_is_pattern(
         &mut self,
         pattern: &ExprPattern,
@@ -3613,16 +3695,15 @@ impl<'src> Transformer<'src> {
                     js::Node::Call(callee, _)
                         if matches!(callee.as_ref(), js::Node::Local(name) if name == "__clone")
                 );
-                let subject =
-                    if self.program.capture_clone_sites.contains(capture_id) && !already_cloned {
-                        self.used_helpers.insert("__clone");
-                        js::Node::Call(
-                            Box::new(js::Node::Local("__clone".to_string())),
-                            vec![subject],
-                        )
-                    } else {
-                        subject
-                    };
+                let subject = if self.capture_copies(*capture_id) && !already_cloned {
+                    self.used_helpers.insert("__clone");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__clone".to_string())),
+                        vec![subject],
+                    )
+                } else {
+                    subject
+                };
                 let variable = js::Variable {
                     name,
                     value: Box::new(subject),
