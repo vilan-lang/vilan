@@ -151,3 +151,7 @@ console.log(class_list(painted));
 const framed = [ [ new Map([ [ "::display", [ "::display", [ "s2m9jw6", "display:inline-flex" ] ] ], [ "::border-top", [ "::border-top", [ "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ], [ "::padding-top", [ "::padding-top", [ "stbzxoc", "padding-top:var(--space-2)" ] ] ], [ "::margin-left", [ "::margin-left", [ "s10oplpw", "margin-left:auto" ] ] ] ]) ] ];
 console.log(class_list(framed));
 console.log("s1mnphwb");
+const zeroed = [ [ new Map([ [ "::inset", [ "::inset", [ "s1ucbaf9", "inset:0" ] ] ], [ "::min-width", [ "::min-width", [ "sitgfdt", "min-width:0" ] ] ], [ "::left", [ "::left", [ "s1ypvw5g", "left:clamp(120px, 30%, 185px)" ] ] ], [ "::max-width", [ "::max-width", [ "s63dg6q", "max-width:calc(100% - 2rem)" ] ] ] ]) ] ];
+console.log(class_list(zeroed));
+const tiled = [ [ new Map([ [ "::background-image", [ "::background-image", [ "s5hidsk", "background-image:url(tile.png)" ] ] ], [ "::background-size", [ "::background-size", [ "skugn91", "background-size:120px 120px" ] ] ], [ "::line-height", [ "::line-height", [ "snq90yh", "line-height:24px" ] ] ] ]) ] ];
+console.log(class_list(tiled));

@@ -73,5 +73,26 @@ fun main() {
 		.margin_left(Length::auto());
 	print(framed.class_list());
 	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
+
+	// The remainder's value surfaces (ui-styling.md §0bis.5). `zero()` is a bare
+	// `0`, not `0px`; `css()` is verbatim where `calc()` wraps — the golden is
+	// where that pair is proven in bytes. Additions again: nothing above moves.
+	let zeroed = const style()
+		.inset(Length::zero())
+		.min_width(Length::zero())
+		.left(Length::css("clamp(120px, 30%, 185px)"))
+		.max_width(Length::calc("100% - 2rem"));
+	print(zeroed.class_list());
+
+	// Two methods per slot, deliberately: `background_image` writes the slot
+	// `background_gradient` writes, and `line_height_length` the slot
+	// `line_height` writes. So each pair OVERRIDES rather than racing — the
+	// class list shows one class per slot even though two methods wrote it.
+	let tiled = const style()
+		.background_image("url(tile.png)")
+		.background_size("120px 120px")
+		.line_height(1.5)
+		.line_height_length(Length::px(24));
+	print(tiled.class_list());
 }
 main();

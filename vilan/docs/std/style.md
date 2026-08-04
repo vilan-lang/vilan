@@ -25,8 +25,10 @@ impl Length {
 	fun vh(value: f64): Length     // viewport units
 	fun vw(value: f64): Length
 	fun auto(): Length
+	fun zero(): Length             // bare `0`, not `0px`
 	fun var(name: str): Length     // a CSS custom-property reference ("--w")
 	fun calc(expression: str): Length  // "100% - 2rem" — no calc(..) wrapper
+	fun css(expression: str): Length   // a COMPLETE value, verbatim: "clamp(..)"
 }
 
 impl Color {
@@ -56,10 +58,18 @@ so a ramp step stays a `var(--gray-900)` and keeps re-theming — which an
 minimum are checked during const evaluation, so a bad value stops the
 build naming itself.
 
+`calc` wraps and `css` does not: `Length::calc(e)` is
+`Length::css("calc(" + e + ")")`. Write `calc` for arithmetic, `css` for a
+value that is already whole — `clamp()`, `min()`, `max()`, `env()`,
+`fit-content()`, or one named expression reused across properties. Both
+refuse an empty value at const time.
+
 A `Gradient` is a **`background-image`** value, not a `Color`: it reaches
 a style through `background_gradient`, which fills a different slot from
-`background`. What stays with `raw`: positioned gradients
-(`at 20% 40%`), multi-layer lists, `repeating-*`, and data-URI images.
+`background`. What a `Gradient` cannot hold — positioned gradients
+(`at 20% 40%`), multi-layer lists, `repeating-*`, and data-URI images —
+goes to `background_image(str)`, which writes the **same slot**, so the two
+override each other instead of racing in the cascade.
 
 Keyword enums: `Display` (Flex, Block, …), `Position`, `FlexDirection`,
 `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
@@ -103,10 +113,13 @@ Appearance:
 | `box_shadow` | `str` |
 | `background`, `color` | `Color` |
 | `background_gradient` | `Gradient` — the `background-image` slot |
+| `background_image` | `str` — the same slot, for what a `Gradient` can't hold |
+| `background_size` | `str` — up to two components, so not a `Length` |
 | `font_family` | `str` |
 | `font_size` | `Length` |
 | `font_weight` | `i32` |
-| `line_height` | `f64` |
+| `line_height` | `f64` — unitless, and the one to prefer (inherits as a ratio) |
+| `line_height_length` | `Length` — the same slot, when the leading is absolute |
 | `letter_spacing` | `Length` — usually `Length::em(..)` |
 | `text_align` | `TextAlign` |
 | `text_decoration` | `str` |

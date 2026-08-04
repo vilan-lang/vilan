@@ -75,13 +75,38 @@ impl Length {
 		Length { css = "auto", root = "" }
 	}
 
+	/// Bare `0` — the unit-less zero CSS accepts for any length, and what the
+	/// `min-width:0` flex idiom and the `inset:0` fill-the-parent idiom are
+	/// written as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)`
+	/// renders `0px`; all three compute the same, and this one is the spelling.
+	fun zero(): Length {
+		Length { css = "0", root = "" }
+	}
+
 	/// A `calc()` expression, written WITHOUT the wrapper:
 	/// `Length::calc("100% - 2rem")`. The property stays typed while the
 	/// arithmetic — which the `Length` representation deliberately does not
 	/// model — rides a string. Composes with tokens through their rendered
 	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
+	///
+	/// Sugar over `css`: `Length::calc(e)` is `Length::css("calc(" + e + ")")`.
 	fun calc(expression: str): Length {
+		check_not_blank("Length::calc", expression);
 		Length { css = i"calc({expression})", root = "" }
+	}
+
+	/// A complete CSS value, verbatim — `Color::hex`'s twin for lengths, and
+	/// the escape for the functional values the representation does not model:
+	/// `Length::css("clamp(120px, 100vw, 1920px)")`, `min()`, `max()`, `env()`,
+	/// `fit-content()`. Use `calc` when you are writing ARITHMETIC and want the
+	/// wrapper supplied; use this when the value is already whole, which is also
+	/// what lets one named expression be reused across properties.
+	///
+	/// (`clamp`/`min`/`max` also nest inside `calc()`, so `calc` reaches them
+	/// too — at the cost of a wrapper the author did not write.)
+	fun css(expression: str): Length {
+		check_not_blank("Length::css", expression);
+		Length { css = expression, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
@@ -238,6 +263,18 @@ fun check_channel(name: str, value: i32) {
 fun check_alpha(value: f64) {
 	if value < 0.0 || value > 1.0 {
 		panic(i"alpha {value} is outside 0.0-1.0");
+	}
+}
+
+/// The one malformation a CSS-TEXT escape can actually detect: nothing at all.
+/// An empty value renders `property:`, a declaration the browser drops in
+/// silence, and the realistic way to produce one is an interpolation whose
+/// variable was never set — which is how real code writes background sizes and
+/// data-URI images. Everything else in a CSS expression is text this language
+/// deliberately does not model.
+fun check_not_blank(what: str, value: str) {
+	if value.trim() == "" {
+		panic(i"{what} was given an empty value");
 	}
 }
 
@@ -900,6 +937,28 @@ impl Style {
 		self.rule("", "", "background-image", "background-image:" + value.render())
 	}
 
+	/// The SAME slot `background_gradient` writes, as CSS text — the escape for
+	/// the image values a `Gradient` cannot hold: a `url()` or data URI, a
+	/// multi-layer list, a positioned or `repeating-*` gradient. One slot and
+	/// two methods is deliberate, the `border`/`border_none` shape: they
+	/// override each other under the ordinary last-wins rule, where two
+	/// different slots would race in the cascade. Reach for
+	/// `background_gradient` when a `Gradient` holds the value.
+	fun background_image(self, value: str): Style {
+		check_not_blank("background_image", value);
+		self.raw("background-image", value)
+	}
+
+	/// How the background image is sized (`"cover"`, `"120px 120px"`,
+	/// `"calc(100% - 2rem) auto"`). A string because the value is up to two
+	/// components per layer, which one `Length` cannot hold — the `flex` and
+	/// `grid_template_columns` bargain. It ships WITH `background_image` rather
+	/// than on its own count: a size is inert without an image (§0bis.5).
+	fun background_size(self, value: str): Style {
+		check_not_blank("background_size", value);
+		self.raw("background-size", value)
+	}
+
 	fun color(self, value: Color): Style {
 		self.with_color("color", value)
 	}
@@ -948,8 +1007,19 @@ impl Style {
 		})
 	}
 
+	/// The unitless form, and the one to prefer: a number inherits as a RATIO
+	/// and re-computes against each descendant's own font size.
 	fun line_height(self, value: f64): Style {
 		self.raw("line-height", i"{value}")
+	}
+
+	/// A line height WITH a unit, on the same slot `line_height` writes — a
+	/// sibling rather than a widened `line_height`, since the language has no
+	/// overloading and the `f64` form keeps its name and its callers. A length
+	/// inherits as a COMPUTED LENGTH, so it will not track a descendant that
+	/// resizes its text; reach for it when the design specifies a leading in px.
+	fun line_height_length(self, value: Length): Style {
+		self.with_length("line-height", value)
 	}
 
 	fun text_align(self, value: TextAlign): Style {

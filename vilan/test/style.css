@@ -1,5 +1,6 @@
 *.s1ekurdy{border:1px solid var(--gray-300)}
 *.s1mnphwb{border:none}
+*.s1ucbaf9{inset:0}
 *.s1ufvp8{padding:var(--space-2)}
 *.s1ufvq5{padding:var(--space-3)}
 *.s1ufvr2{padding:var(--space-4)}
@@ -17,9 +18,16 @@
 .s1kwp696{color:rgb(from var(--gray-900) r g b / 0.08)}
 .s1lsiu5q:hover{background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)}
 .s1sb4lgm{border-top:1px solid var(--gray-300)}
+.s1ypvw5g{left:clamp(120px, 30%, 185px)}
 .s2m9jw6{display:inline-flex}
+.s5hidsk{background-image:url(tile.png)}
+.s63dg6q{max-width:calc(100% - 2rem)}
+.s9bu6v3{line-height:1.5}
 .sbiovxm{display:flex}
 .siolu0w{background-color:var(--gray-50)}
+.sitgfdt{min-width:0}
+.skugn91{background-size:120px 120px}
+.snq90yh{line-height:24px}
 .stbzxoc{padding-top:var(--space-2)}
 .szxtch6{background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)}
 :root[data-theme="dark"] .s1mdwlwm:hover{background-color:var(--gray-50)}

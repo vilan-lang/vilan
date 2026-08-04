@@ -252,7 +252,13 @@ site, 8 layers), `repeating-linear-gradient` (1), and `background-image` as a
 data URI (2 sites, ~2 KB of embedded SVG each — not a value type's job).
 Those keep `raw`, and `background_image(str)` is deliberately NOT minted:
 3 sites is below the line, and minting it now would put a `str` method and a
-typed method on one slot for no demand.
+typed method on one slot for no demand. **Reversed 2026-08-04 by §0bis.5
+(A23)** — the count was taken over the image slot alone; `background-size` (2
+sites, inert without an image, always written beside one) belongs to the same
+unit, which puts the pair at five. The "two surfaces on one slot" objection is
+answered by `border`/`border_none`, which is the same shape and the reason the
+slot is the right one: two methods on one slot override, two on two slots
+race.
 
 **3. `border` gains `none` as a method, not a `BorderStyle` enum — because
 the sweep found ZERO non-`solid` borders.** All 17 width-and-color sites are
@@ -303,7 +309,11 @@ and is the clearest cut of all: **zero `raw` sites**, 5 typed uses, all five
 comma-separated multi-property lists — the value type people would need is
 the list they are already writing, and nothing is escaping. `line_height`
 keeps its `f64`: 4 sites want a `px` line height, under the line, and
-unitless is the correct default besides.
+unitless is the correct default besides. **Reversed 2026-08-04 by §0bis.5
+(A23)**, on the hole argument rather than the count: `line-height` is the one
+length-valued property whose typed method cannot hold a unit. `line_height`
+itself is untouched — the addition is the sibling `line_height_length(Length)`,
+and unitless remains the documented default.
 
 **A hazard this slice found and did NOT fix (recorded, not papered over).**
 Atomic longhand and shorthand rules of the same family carry equal
@@ -504,6 +514,213 @@ the design that would have had to refuse those sites.
   cost above. Zero instances across the corpus, the authoring rule in the docs
   covers it, and the fix is to write the edge with its colour
   (`border_top(width, colour)`). Recorded rather than papered over.
+
+### 0bis.5 Design — the website's measured remainder (A23)
+
+The third value-type slice, and the one whose charter the measurement
+contradicted hardest. A23 was filed off the raw-call **count** — 107 of the
+website's 341 `raw` sites survived the §0bis.3 conversion — on the same day
+§0bis.3's value types shipped, and the row was never checked against the
+supply that had landed hours earlier. Reading the 107 sites reverses the
+headline outright. Counts below are that reading, file and line, over
+`vilan-website/src/*.vl`.
+
+**1. `background` (36 sites, the headline) — nothing is missing. The value
+types §0bis.3 shipped already hold 33 of the 36, and the other three are
+§0bis.3's own recorded cuts.** The inventory, which is the whole argument:
+
+| what the 36 sites write | count | already expressible as |
+|---|---|---|
+| a hex or `rgba()` literal | 20 | `background(Color::hex(..))` / `background(Color::rgba(..))` |
+| `radial-gradient(closest-side, <colour>, transparent)` | 11 | `background_gradient(Gradient::radial(RadialExtent::ClosestSide).stop(..).stop(..))` |
+| `linear-gradient(to left\|to right, a, b)` | 2 | `Gradient::linear(270.0)` / `Gradient::linear(90.0)` — the side keywords ARE those angles |
+| `repeating-linear-gradient(..)` | 1 | — §0bis.3's recorded cut |
+| `rgba(18, 0, 4, calc(var(--nav-fade, 0) * 0.86))` | 1 | — §0bis.3's recorded cut (a live custom property in the alpha channel) |
+| `radial-gradient(340px circle at var(--glow-x..) .., ..)` | 1 | — §0bis.3's recorded cut (`at <position>`, and it wants live variables) |
+
+So the 36 sites are a **conversion** backlog, not a supply hole, and both
+candidates the charter offered fall to the inventory rather than to argument:
+
+- **A composite `Background` value type is not minted.** Every one of the 36
+  sites writes exactly ONE value into the shorthand. There is no composite in
+  the demand to model, and a value type for arities nobody writes is the
+  `Sides` rejection again.
+- **`background_position`, `background_repeat`, `background_attachment`,
+  `background_origin` and `background_clip` are not minted. Zero sites each**,
+  across 2926 lines of the one real consumer. Minting a slot with no site is
+  exactly the speculation §0bis.3 refused for `BorderStyle`'s other variants.
+
+What the sweep *did* find sits in the same family and outside the 36:
+**`background-image` (3 sites) and `background-size` (2), always written
+together** — the masthead's bloom (an eight-layer positioned gradient list,
+sized in `calc()` of the hero scale), its duo tile, and the theme's grain tile
+(both ~2 KB data URIs). Five sites, one unit: a background image you can set
+and cannot size is a half-surface, which is the `min_width`/`max_height`
+argument. So **`background_image(str)` and `background_size(str)` ship, and
+nothing else in the family does.** This reverses §0bis.3's cut of
+`background_image` at "3 sites, below the line", and names the error: the
+count was taken over the image slot alone, and `background-size` — which is
+inert without an image — was never counted with it.
+
+`str` on both, not `Gradient` and not `Length`. What defeats the value types
+at all five sites is precisely what §0bis.3 recorded as cut: a data URI and a
+multi-layer positioned list on the image slot, and a **two-value**
+`calc(..) calc(..)` on the size slot, which one `Length` cannot hold. §0bis.1's
+bargain applies unchanged — the property name stays checked and completable
+and only the value is CSS text nothing could validate.
+
+`background_image` and `background_gradient` write the **same slot**, and that
+is the point rather than a defect: it is the `border`/`border_none` shape. Two
+methods on one slot override each other under the ordinary last-wins rule; two
+methods on two slots would race in the cascade, which is the defect §0bis.3
+rejected `BorderStyle` for. Reach for `background_gradient` when a `Gradient`
+holds the value and `background_image` when it does not.
+
+**The A22 interaction, and the one hazard the conversion lane must carry.** No
+family-table row changes — A22 already lists all eight `background-*`
+longhands under `background`, so the two new methods join a row that was
+written for them. But converting `raw("background", v)` to a typed method
+moves a slot from the family **shorthand** to a **longhand**, so the
+shorthand's reset of the rest of the family stops happening. That is
+observable exactly when a background colour and a background image meet on one
+element. Checked at all 36 sites: `art_blob` — the base every one of the 11
+glow sites extends — carries no background at all (position, radius, `filter`,
+`pointer-events`), and no style anywhere in the website pairs a background
+colour with a gradient. So the conversion is safe **site by site and in any
+order**: a converted longhand and an unconverted `raw` shorthand still resolve
+by authoring order, through A22's `*` marker.
+
+**2. Two-value `padding` — `padding_xy` is NOT minted. §0bis.3 stands, and
+working A22 through is what confirms it.** All four sites are the `y x` form
+in px (`1px 6px`, `8px 20px`, `7px 14px`, `6px 10px`); still zero 3-value,
+zero 4-value, and `margin` is still never given a shorthand at all. The
+byte-diff is declaration SHAPE only, and the reason it is *only* that is
+structural: `padding_y(v).padding_x(h)` writes all four `padding-*` longhands,
+which is exactly the shorthand's coverage, so every direction agrees.
+
+| the site's neighbourhood | `raw("padding", "y x")` | `padding_y(y).padding_x(x)` |
+|---|---|---|
+| after a `padding(..)` | shorthand slot, last wins | four longhands; the `*` marker sorts the earlier shorthand first, so the longhands win |
+| before a `padding(..)` | shorthand slot, last wins | rule 1 drops all four — the box wins |
+| after a `padding_top(..)` | drops the edge | overwrites the same `padding-top` slot |
+| either side of a `+` | as above | as above, and still no emission |
+
+Identical computed result in each row. What the composition costs is four
+atomic declarations where the site wrote one — and the channel dedups
+build-wide, so `padding-top:8px` is very likely a rule the stylesheet already
+carries. By this section's own rule a method that buys one rule and no
+expressiveness is surface, so the four sites are recorded as byte-diff
+conversions the next cycle accepts, not as a missing method.
+
+**3. `line_height_length(Length)` — a sibling method, not a value type.** All
+four sites are px (`18px`, `24px`, `28px`, `48px`), which is under the ≥5 line
+§0bis.3 cut this at. It is admitted anyway on the **hole** argument rather than
+the tail argument: `line-height` is the one length-valued property in the
+surface whose typed method cannot hold a unit, while every other length-valued
+property takes `Length`. A `LineHeight` value type (unitless-or-`Length`) is
+rejected for §0bis.3's `Sides` reason — with no overloading it can only reach
+the property through a second method anyway, since `line_height(f64)` keeps its
+name and its callers, so the value type buys a type and no reach. The sibling
+takes `Length` rather than an `f64` of px because the hole is "cannot hold a
+unit", not "cannot hold px". Same slot as `line_height`, so mixing the two is
+an ordinary last-wins override, and `line-height` has no family. Additions
+only: `line_height` is untouched and every already-minted class keeps its name.
+The docs keep saying unitless is the right default, and now say why — a
+unitless value inherits as a ratio and re-computes per element, a length
+inherits as a computed length.
+
+**4. `Length::zero()` renders bare `0` — 11 sites, not the row's 7.** The
+recount: `inset:0` ×3, `min-width:0` ×3, `min-height:0` ×2 (the row missed
+these two), `top:0` ×2, `left:0` ×1. `0` is unit-legal for a length and is what
+the flex `min-width:0` idiom and the `inset:0` fill-the-parent idiom are
+written as everywhere; `space(0)` renders `var(--space-0)` and
+`Length::px(0.0)` renders `0px` — both computed-identical, neither
+byte-identical. A constructor, and no existing rule changes.
+
+**5. `Length::css(expression)` — the verbatim functional-value escape.
+`calc` is kept, unbroken, and is now documented as the sugar it is.** The probe
+first, because it decides the framing rather than the design: `clamp()`,
+`min()` and `max()` are math functions and **nest inside `calc()`** (CSS Values
+4), so `Length::calc("clamp(120px, 30%, 185px)")` is valid CSS today and
+already covers all three sites computed-identically. This is therefore not a
+capability gap, and saying otherwise would have been the easy wrong answer.
+What the sites show is a *shape*: the masthead names its whole scale
+(`let hero_scale = "clamp(1100px, 100vw, 1920px)"`), interpolates it into eight
+`Length::calc(i"..{hero_scale}..")` arithmetic expressions, and then hands it
+to `raw("width", hero_scale)` **whole** — a complete value, not an arithmetic
+fragment, which `calc` cannot say without adding a wrapper the author did not
+write. `Length::css` is `Color::hex`'s twin: `Color` has had an unvalidated
+verbatim escape since v1 and `Length` never did, the same symmetry hole
+`min_width`/`max_height` were admitted for. `calc` stays the ergonomic wrapper
+for the arithmetic case it was minted for (eight live sites and the docs'
+example); the relationship is stated rather than left implicit —
+`Length::calc(e)` is `Length::css(i"calc({e})")`. Not renamed, not deprecated,
+byte-identical output.
+
+**Const-validation, per §0bis.3's precedent.** The three new `str`-taking
+surfaces (`Length::css`, `background_image`, `background_size`) share the one
+malformation a CSS-text escape can actually detect: nothing. An empty or
+all-whitespace value renders `property:`, a declaration the browser drops in
+silence, and the realistic way to produce one is an interpolation whose
+variable was never set — which is exactly how the masthead writes its
+background sizes and how it and the theme write their mask and tile URIs.
+`Length::calc` gains the same guard: `calc()` is invalid CSS in every context,
+so the check can only turn a silent malformation into a build error naming the
+value, and no working program can reach it.
+
+**Cut from this slice, with the trigger that would reopen each.**
+`Gradient::stop`'s explicit percent stays required — 11 of the 13 convertible
+gradient sites write no positions, and `A 0%, B 100%` is computed-identical to
+the defaulted pair, so the cost is bytes and not behaviour. Reopen it if a
+THREE-stop gradient wants defaults, where the defaulted positions stop being
+trivially 0 and 100. The five unwritten `background-*` slots reopen at one real
+site each. `padding_xy` reopens if a 3- or 4-value shorthand ever appears,
+which no composition of the axis methods can express.
+
+#### What the next cycle's website conversion should do
+
+The conversion rides the release after this one (the site builds on the latest
+published toolchain). Per row: the sites it unblocks, what to write, and
+whether the emitted stylesheet comes out byte-identical or merely
+computed-identical — the distinction the last conversion stopped at, and the
+reason these sites were left behind.
+
+| the `raw` sites | n | unblocked by | what to write | bytes |
+|---|---|---|---|---|
+| `background: <hex\|rgba>` | 20 | §0bis.3 (shipped) | `.background(Color::hex(..))` / `.background(Color::rgba(..))` | **differs** — the slot moves to `background-color` |
+| `background: radial-gradient(closest-side, ..)` | 11 | §0bis.3 (shipped) | `.background_gradient(Gradient::radial(RadialExtent::ClosestSide).stop(c, 0.0).stop(Color::transparent(), 100.0))` | **differs** — the slot moves to `background-image`, and the stops gain explicit `0%`/`100%` |
+| `background: linear-gradient(to left\|right, ..)` | 2 | §0bis.3 (shipped) | `Gradient::linear(270.0)` / `Gradient::linear(90.0)` | **differs** — the side keyword becomes its angle |
+| `background:` the three §0bis.3 cuts | 3 | — | stays `raw`, deliberately | — |
+| `background-image: <data URI\|layer list>` | 3 | **`background_image(str)`** | `.background_image(value)` | identical |
+| `background-size: <two values>` | 2 | **`background_size(str)`** | `.background_size(value)` | identical |
+| `padding: "<y> <x>"` | 4 | §0bis.3 (shipped) | `.padding_y(Length::px(y)).padding_x(Length::px(x))` | **differs** — four declarations for one |
+| `line-height: <px>` | 4 | **`line_height_length`** | `.line_height_length(Length::px(v))` | identical |
+| bare `"0"` on `inset`/`min-width`/`min-height`/`top`/`left` | 11 | **`Length::zero()`** | `.inset(Length::zero())`, `.min_width(Length::zero())`, … | identical |
+| a whole `clamp()`/`min()` value | 3 | **`Length::css(str)`** | `.left(Length::css("clamp(120px, 30%, 185px)"))`, `.width(Length::css(hero_scale))` | identical |
+
+**60 of the 107 surviving `raw` calls**, of which 23 convert byte-identically
+and 37 computed-identically. Three sites stay `raw` by design.
+
+The row this slice was chartered from speaks of "the website's 26 byte-diff
+conversions", and **that number could not be reconciled**: no list of the 26
+is recorded in the backlog, in this file, or in any commit message, so there is
+nothing to check it against. The table above is a fresh measurement of the 107
+sites that are actually in the tree, taken site by site, and supersedes the
+figure rather than reproducing it. If the 26 was a count of sites the previous
+conversion attempted and reverted, it is a subset of the 37 here. The remaining 44
+are the properties still below the line — `clip-path` (4), `text-transform`
+(4), `pointer-events` (3), `animation` (3), `align-self` (3), the mask
+family (5), and a scatter of ones and twos — plus `Color::hex` being used to
+smuggle an `rgba(..)` string at four sites, which is a conversion fix
+(`Color::rgba`) rather than a missing method.
+
+Two orderings the lane should keep. The background conversion is safe in any
+order per the hazard worked through in decision 1, but it should be done
+**whole-file at a time** so a reviewer reads one slot convention per file. And
+the four `padding` sites and the eleven zero sites want to land in the same
+commit as their `.css` golden, since both change the stylesheet's bytes without
+changing a computed value — the shape of diff that is only reviewable if
+nothing else moves with it.
 
 ## 0. The problem
 
