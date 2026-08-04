@@ -290,6 +290,7 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
         Node::Unary(op, inner) => Node::Unary(op, desugar_boxed(inner, source)),
         Node::Reference(mutable, inner) => Node::Reference(mutable, desugar_boxed(inner, source)),
         Node::Dereference(inner) => Node::Dereference(desugar_boxed(inner, source)),
+        Node::Spread(inner) => Node::Spread(desugar_boxed(inner, source)),
         Node::TryAssert(inner) => Node::TryAssert(desugar_boxed(inner, source)),
         Node::Await(inner) => Node::Await(desugar_boxed(inner, source)),
         Node::Async(inner) => Node::Async(desugar_boxed(inner, source)),

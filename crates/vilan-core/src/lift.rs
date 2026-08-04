@@ -91,6 +91,7 @@ fn count_direct_splits(node: &Node) -> usize {
         Node::Unary(_, inner)
         | Node::Reference(_, inner)
         | Node::Dereference(inner)
+        | Node::Spread(inner)
         | Node::TryAssert(inner)
         | Node::Await(inner) => count_direct_splits(&inner.0),
         Node::MemberAccessor(subject, _) => count_direct_splits(&subject.0),
@@ -148,6 +149,10 @@ fn linearize<'src>(
         Node::Dereference(inner) => {
             let inner = flat_operand(*inner, steps, remaining);
             (Node::Dereference(Box::new(inner)), span)
+        }
+        Node::Spread(inner) => {
+            let inner = flat_operand(*inner, steps, remaining);
+            (Node::Spread(Box::new(inner)), span)
         }
         Node::TryAssert(inner) => {
             // Kept in the skeleton; the walk rejects a `!` that would run
@@ -311,6 +316,7 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Unary(op, inner) => Node::Unary(op, seal_boxed(inner)),
         Node::Reference(mutable, inner) => Node::Reference(mutable, seal_boxed(inner)),
         Node::Dereference(inner) => Node::Dereference(seal_boxed(inner)),
+        Node::Spread(inner) => Node::Spread(seal_boxed(inner)),
         Node::TryAssert(inner) => Node::TryAssert(seal_boxed(inner)),
         Node::Await(inner) => Node::Await(seal_boxed(inner)),
         Node::Async(inner) => Node::Async(seal_boxed(inner)),
