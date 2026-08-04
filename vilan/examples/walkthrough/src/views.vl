@@ -34,7 +34,7 @@ let shell = const style()
 	.display(Display::Flex)
 	.flex_direction(FlexDirection::Column)
 	.gap(space(3))
-	.raw("font-family", "system-ui, sans-serif");
+	.font_family("system-ui, sans-serif");
 
 let row = const style().display(Display::Flex).gap(space(2)).align_items(AlignItems::Center);
 
@@ -49,7 +49,7 @@ let button = const style()
 	.radius(space(1))
 	.background(Color::blue(600))
 	.color(Color::white())
-	.raw("border", "none")
+	.border_none()
 	.cursor(Cursor::Pointer);
 
 let muted = const style().color(Color::gray(500));

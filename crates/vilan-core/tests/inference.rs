@@ -15347,6 +15347,378 @@ fn border_color_is_its_own_slot_so_a_hover_can_recolour_a_border() {
     );
 }
 
+/// The property tail's SECOND slice (A8 §3b): the value types. Alpha is the
+/// single biggest driver of the escape hatch (58 sites), and it arrives two
+/// ways — a literal `rgba(..)` and `.alpha(..)` derived from an existing
+/// colour. The derived form is the one with a claim to prove: it renders the
+/// RELATIVE colour form so a ramp token stays a `var()`, which is what keeps
+/// a translucent themed colour themeable.
+#[test]
+fn alpha_colours_render_their_css() {
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .background(Color::rgba(27, 6, 13, 0.9))
+                .color(Color::gray(900).alpha(0.08))
+                .border(Length::px(1), Color::hex("#EB682E").alpha(0.6))
+                .border_color(Color::rgba(235, 104, 46, 1.0))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "##,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-color:rgba(27, 6, 13, 0.9)}",
+        // The token survives: `var(--gray-900)`, not `#111827`.
+        "{color:rgb(from var(--gray-900) r g b / 0.08)}",
+        "{border:1px solid rgb(from #EB682E r g b / 0.6)}",
+        "{border-color:rgba(235, 104, 46, 1)}",
+        // …and the token's `:root` line still rides out with it, which is
+        // what makes the translucent colour re-theme like the opaque one.
+        ":root{--gray-900:#111827}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// A gradient is `background-image`, not a `Color` — a separate slot from
+/// `background`, so a style may set both. Both constructors are pinned:
+/// radial is 12 of the 16 real gradient sites, linear 2, and they ship as a
+/// family (§0bis.3).
+#[test]
+fn gradients_paint_the_background_image_slot() {
+    let assets = collected_assets(
+        r##"
+        import std::style::{ style, Style, Color, Gradient, RadialExtent };
+        fun linear(): Style {
+            style()
+                .background(Color::gray(50))
+                .background_gradient(
+                    Gradient::linear(90.0)
+                        .stop(Color::hex("#B23056"), 0.0)
+                        .stop(Color::blue(600), 100.0),
+                )
+        }
+        fun radial(): Style {
+            style().background_gradient(
+                Gradient::radial(RadialExtent::ClosestSide)
+                    .stop(Color::rgba(178, 48, 86, 0.5), 0.0)
+                    .stop(Color::transparent(), 100.0),
+            )
+        }
+        fun corners(): Style {
+            style()
+                .background_gradient(
+                    Gradient::radial(RadialExtent::ClosestCorner)
+                        .stop(Color::black(), 0.0)
+                        .stop(Color::white(), 100.0),
+                )
+                .hover(style().background_gradient(
+                    Gradient::radial(RadialExtent::FarthestSide)
+                        .stop(Color::black(), 0.0)
+                        .stop(Color::white(), 100.0),
+                ))
+                .focus(style().background_gradient(
+                    Gradient::radial(RadialExtent::FarthestCorner)
+                        .stop(Color::black(), 0.0)
+                        .stop(Color::white(), 100.0),
+                ))
+        }
+        let _a = const linear();
+        let _b = const radial();
+        let _c = const corners();
+        fun main() {}
+        main();
+        "##,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{background-image:linear-gradient(90deg, #B23056 0%, var(--blue-600) 100%)}",
+        "{background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)}",
+        "{background-image:radial-gradient(closest-corner, #000000 0%, #ffffff 100%)}",
+        "{background-image:radial-gradient(farthest-side, #000000 0%, #ffffff 100%)}",
+        "{background-image:radial-gradient(farthest-corner, #000000 0%, #ffffff 100%)}",
+        // The image slot is not the colour slot: both survive on one style.
+        "{background-color:var(--gray-50)}",
+        // A stop's token carries its `:root` line out to the emitter.
+        ":root{--blue-600:#2563eb}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The border family: four edges plus `none`, `solid` baked in because the
+/// demand sweep found zero non-`solid` borders. Table-shaped, so a wrong CSS
+/// property name is a named failure.
+#[test]
+fn the_border_family_emits_one_declaration_per_edge() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .border_top(Length::px(1), Color::gray(300))
+                .border_right(Length::px(2), Color::blue(600))
+                .border_bottom(Length::rem(0.5), Color::red(500))
+                .border_left(Length::px(3), Color::green(700))
+        }
+        fun cleared(): Style {
+            style().border(Length::px(1), Color::gray(300)).border_none()
+        }
+        let _s = const s();
+        let _c = const cleared();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{border-top:1px solid var(--gray-300)}",
+        "{border-right:2px solid var(--blue-600)}",
+        "{border-bottom:0.5rem solid var(--red-500)}",
+        "{border-left:3px solid var(--green-700)}",
+        "{border:none}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Why `border_none()` is a method and not a `BorderStyle::None`: it fills
+/// the SAME slot the shorthand does, so clearing a border is the ordinary
+/// last-wins override and the cleared style carries ONE border class — not a
+/// second rule racing the first through the cascade.
+#[test]
+fn border_none_replaces_the_border_slot_rather_than_racing_it() {
+    let program = r#"
+        import std::print;
+        import std::style::{ style, Style, Color, Length };
+        fun cleared(): Style {
+            style().border(Length::px(1), Color::gray(300)).border_none()
+        }
+        fun main() {
+            let c = const cleared();
+            print(c.class_list());
+        }
+        main();
+        "#;
+    let output = compile_and_run(program).expect("a clean run");
+    assert_eq!(
+        output.trim().split(' ').count(),
+        1,
+        "the cleared style should carry one border class, got {output:?}"
+    );
+}
+
+/// The escape-hatch conversion this slice is evidence for: the typed method
+/// and the `raw` call it replaces are the SAME rule, so unwinding a real
+/// `raw` site changes zero bytes of stylesheet. Asserted on the CLASS LISTS
+/// — equal names means equal slot keys AND equal declarations, which a
+/// substring count over the emitted lines cannot tell apart (a diverging
+/// method still leaves the `raw` site's own line in the sheet).
+#[test]
+fn the_typed_methods_mint_the_rules_their_raw_sites_did() {
+    let source = r#"
+        import std::print;
+        import std::style::{ style, Style, Length };
+        fun escaped(): Style {
+            style()
+                .raw("border", "none")
+                .raw("margin-left", "auto")
+                .raw("padding-right", "16px")
+        }
+        fun typed(): Style {
+            style()
+                .border_none()
+                .margin_left(Length::auto())
+                .padding_right(Length::px(16))
+        }
+        fun main() {
+            let e = const escaped();
+            let t = const typed();
+            print(e.class_list());
+            print(t.class_list());
+        }
+        main();
+        "#;
+    let output = compile_and_run(source).expect("a clean run");
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 2, "{output:?}");
+    assert_eq!(lines[0].split(' ').count(), 3, "{output:?}");
+    assert_eq!(lines[0], lines[1], "the typed chain changed the classes");
+
+    // …and the shared rule is in the sheet once, not twice.
+    let assets = collected_assets(source);
+    let assembled = vilan_core::const_eval::assemble_assets(&assets);
+    let css = assembled.get("css").expect("css");
+    for expected in [
+        "{border:none}",
+        "{margin-left:auto}",
+        "{padding-right:16px}",
+    ] {
+        assert_eq!(
+            css.matches(expected).count(),
+            1,
+            "{expected} should be minted once by both spellings: {css}"
+        );
+    }
+}
+
+/// The eight box edges, the hole the surface had: `padding`, `padding_x` and
+/// `padding_y` shipped, and nothing could set one edge.
+#[test]
+fn the_box_edges_emit_their_longhands() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style, Length };
+        fun s(): Style {
+            style()
+                .padding_top(space(2))
+                .padding_right(Length::px(16))
+                .padding_bottom(space(3))
+                .padding_left(Length::px(8))
+                .margin_top(Length::px(96))
+                .margin_right(Length::px(1))
+                .margin_bottom(space(4))
+                .margin_left(Length::auto())
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{padding-top:var(--space-2)}",
+        "{padding-right:16px}",
+        "{padding-bottom:var(--space-3)}",
+        "{padding-left:8px}",
+        "{margin-top:96px}",
+        "{margin-right:1px}",
+        "{margin-bottom:var(--space-4)}",
+        // The flex-push idiom, five of the nine single-edge sites in the sweep.
+        "{margin-left:auto}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// `Display` could not name two legal values of its own property. Every
+/// variant, so the ordering-sensitive exhaustive half is covered rather than
+/// the two new arms alone.
+#[test]
+fn the_display_enum_covers_every_variant() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Display };
+        fun s(): Style {
+            style()
+                .display(Display::Flex)
+                .hover(style().display(Display::Grid))
+                .focus(style().display(Display::Block))
+                .active(style().display(Display::Inline))
+                .disabled(style().display(Display::InlineBlock))
+                .first(style().display(Display::InlineFlex))
+                .last(style().display(Display::InlineGrid))
+                .dark(style().display(Display::Hidden))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{display:flex}",
+        "{display:grid}",
+        "{display:block}",
+        "{display:inline}",
+        "{display:inline-block}",
+        "{display:inline-flex}",
+        "{display:inline-grid}",
+        "{display:none}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The value types validate at const time, the way `space` and the ramps do:
+/// a bad channel, a bad alpha or a one-stop gradient is a build error naming
+/// the value, not a silently invalid declaration in the stylesheet.
+#[test]
+fn out_of_range_colour_values_fail_the_build() {
+    for (source, expected) in [
+        (
+            r#"
+            import std::style::{ style, Style, Color };
+            fun s(): Style { style().background(Color::rgba(300, 0, 0, 0.5)) }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "red channel 300 is outside 0-255",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style, Color };
+            fun s(): Style { style().background(Color::rgba(0, 0, 0, 1.5)) }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "alpha 1.5 is outside 0.0-1.0",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style, Color };
+            fun s(): Style { style().color(Color::gray(500).alpha(-0.2)) }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "alpha -0.2 is outside 0.0-1.0",
+        ),
+        (
+            r#"
+            import std::style::{ style, Style, Color, Gradient };
+            fun s(): Style {
+                style().background_gradient(Gradient::linear(90.0).stop(Color::black(), 0.0))
+            }
+            let _s = const s();
+            fun main() {}
+            main();
+            "#,
+            "a gradient needs at least two stops",
+        ),
+    ] {
+        let diagnostics = failure_diagnostics(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains(expected)),
+            "missing {expected}: {diagnostics:#?}"
+        );
+    }
+}
+
 #[test]
 fn identical_rules_deduplicate_across_styles() {
     let assets = collected_assets(

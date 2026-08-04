@@ -5,9 +5,9 @@ Typed, compile-time atomic styles. Concepts and the emission model: the
 
 ```vilan,fragment
 import std::style::{
-	style, space, Style, Length, Color,
+	style, space, Style, Length, Color, Gradient,
 	Display, Position, FlexDirection, AlignItems, JustifyContent,
-	TextAlign, Cursor, Overflow, WhiteSpace, UserSelect,
+	TextAlign, Cursor, Overflow, WhiteSpace, UserSelect, RadialExtent,
 };
 ```
 
@@ -38,8 +38,28 @@ impl Color {
 	fun blue(step: i32): Color
 	fun red(step: i32): Color
 	fun green(step: i32): Color
+
+	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color  // a literal, 0-255 / 0.0-1.0
+	fun alpha(self, value: f64): Color   // THIS colour at that alpha
+}
+
+impl Gradient {
+	fun linear(degrees: f64): Gradient            // 0 up, 90 right, 180 down
+	fun radial(extent: RadialExtent): Gradient    // extent keyword; centred
+	fun stop(self, color: Color, percent: f64): Gradient
 }
 ```
+
+`alpha` renders the relative-colour form, `rgb(from <colour> r g b / a)`,
+so a ramp step stays a `var(--gray-900)` and keeps re-theming — which an
+8-digit hex could not do. Channels, alphas and the two-stop gradient
+minimum are checked during const evaluation, so a bad value stops the
+build naming itself.
+
+A `Gradient` is a **`background-image`** value, not a `Color`: it reaches
+a style through `background_gradient`, which fills a different slot from
+`background`. What stays with `raw`: positioned gradients
+(`at 20% 40%`), multi-layer lists, `repeating-*`, and data-URI images.
 
 Keyword enums: `Display` (Flex, Block, …), `Position`, `FlexDirection`,
 `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
@@ -56,7 +76,7 @@ Layout:
 
 | Method | Value |
 |---|---|
-| `display` | `Display` |
+| `display` | `Display` (Flex, Grid, Block, Inline, InlineBlock, InlineFlex, InlineGrid, Hidden) |
 | `position` | `Position` |
 | `flex_direction` | `FlexDirection` |
 | `align_items` | `AlignItems` |
@@ -65,6 +85,8 @@ Layout:
 | `flex_shrink` | `f64` |
 | `grid_template_columns` | `str` — `"repeat(3, 1fr)"` |
 | `gap`, `padding`, `padding_x`, `padding_y`, `margin`, `margin_x`, `margin_y` | `Length` |
+| `padding_top`, `padding_right`, `padding_bottom`, `padding_left` | `Length` — one edge |
+| `margin_top`, `margin_right`, `margin_bottom`, `margin_left` | `Length` — one edge |
 | `width`, `height`, `min_width`, `max_width`, `min_height`, `max_height` | `Length` |
 | `top`, `right`, `bottom`, `left`, `inset` | `Length` |
 | `overflow` | `Overflow` |
@@ -74,10 +96,13 @@ Appearance:
 | Method | Value |
 |---|---|
 | `radius` | `Length` |
-| `border` | `(width: Length, color: Color)` |
+| `border` | `(width: Length, color: Color)` — always `solid` |
+| `border_top`, `border_right`, `border_bottom`, `border_left` | `(width: Length, color: Color)` |
+| `border_none` | — fills the `border` slot, so it *removes* a border set earlier |
 | `border_color` | `Color` — its own slot, so a `hover` can recolour without restating the width |
 | `box_shadow` | `str` |
 | `background`, `color` | `Color` |
+| `background_gradient` | `Gradient` — the `background-image` slot |
 | `font_family` | `str` |
 | `font_size` | `Length` |
 | `font_weight` | `i32` |
@@ -95,6 +120,13 @@ Appearance:
 A `str`-valued method is not a weaker `raw`: it keeps the property name
 checked and completable while the *value* stays a CSS expression the compiler
 has nothing to validate (a font stack, a transform list, a shadow layer).
+
+**One arity per family.** The name carries the arity — whole box
+(`padding`), axis (`padding_x`), edge (`padding_top`) — and there is no
+multi-value shorthand method, because `padding_y(v).padding_x(h)` already
+computes `padding: v h`. Mixing a shorthand with its own longhands leaves
+two equally specific atomic rules whose order the class-name sort decides;
+the axis and edge methods share slots and override cleanly.
 
 Escape hatches:
 

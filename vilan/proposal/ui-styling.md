@@ -1,11 +1,11 @@
 # UI styling — typed atomic styles, compiled
 
-Status: **CORE SHIPPED 2026-07-10; TAIL SHIPPED 2026-08-04 except the
-A7/G2-entangled pieces** — §0bis is the live status and supersedes the
-"Remaining" list at the end of this paragraph, which is kept as the historical
-record of what the core's authors expected to be left. What remains open:
-critical CSS (A7), liveness-tied dead-style elimination (G2), and the property
-tail's VALUE-TYPE half (§0bis.1).
+Status: **CORE SHIPPED 2026-07-10; TAIL SHIPPED 2026-08-04, including the
+value types** — §0bis is the live status and supersedes the "Remaining" list
+at the end of this paragraph, which is kept as the historical record of what
+the core's authors expected to be left. What remains open: critical CSS (A7)
+and liveness-tied dead-style elimination (G2), both entangled elsewhere. The
+property tail's VALUE-TYPE half closed with §0bis.3.
 
 The original core record, unedited: **CORE SHIPPED 2026-07-10** — `std::style`
 (same day as the whole
@@ -53,7 +53,7 @@ record; the sections it points at carry the design.
 | dark×pseudo composition | **VERIFIED OPEN → SHIPPED 2026-08-04** | Implemented per §0bis.2: the condition grammar, `dark` with its own body, `pseudo` rejecting the reverse order with a message naming the fix, `media` composing for free. **Every pre-existing class name is byte-identical** — the corpus `.css` golden grew ten lines and changed none. 9 pins (composition, all-three-axes, the four refusals, and the two pre-existing nesting guards that shipped in 2026-07-10 and had never been pinned at all — `grep "cannot wrap" crates/` returned nothing), plus the corpus golden's composed selectors in bytes. Non-vacuity planted. Verification evidence: `Style::pseudo` panicked on `parts[1] != ""`, refusing **both** nesting directions (`dark(hover(..))` and `hover(dark(..))`). Cause was structural, not a missing case: the slot key `media:pseudo:property` has no third position and `dark` occupied the pseudo slot. `style.vl`'s semantics were unchanged since `ad691a7` (2026-07-10) — the only later commits are a reflow and doc comments. |
 | the html `<link>` scaffold | **VERIFIED OPEN → SHIPPED 2026-08-04** | Both `vilan init` browser-bearing templates carry the `<link>`, and both scaffolds now build a style so the link is live (the `cfeb585` move — the todo example dropping handwritten CSS for `std::style` — applied to the scaffolds); the fullstack template also gained the `/client.css` route, guarded with `fs::exists` so deleting every style doesn't crash the server at boot. `examples/reactive-ui` gained the link it was missing. 3 pins: init asserts emitted-AND-linked for the browser template, and asserts the served page links `/client.css` AND that the route returns the rules for the fullstack one; the examples gate grew a GENERAL rule — every emitted stylesheet must be linked by one of the example's pages, stated over what the build produced so a new example is covered the day it lands — proven non-vacuous by deleting reactive-ui's link. Verification evidence: emission shipped: `write_assets` (`crates/vilan-cli/src/main.rs`) writes `<out>.css` on `build`, `run`, `run --watch`, workspace and HMR paths. The *link* half existed only as hand-written bytes in two examples. No template linked it, and `examples/reactive-ui` **emitted `app.css` (pinned in `tests/examples.rs`) while its `index.html` never loaded it** — const styles compiled and then thrown away, the sharpest evidence the hookup was unfinished. |
 | `vilan fmt` chain splitting | **VERIFIED SHIPPED** — `9a3d9af`, 2026-07-28 | "vilan fmt splits method chains over 100 columns"; extended by the 2026-08-01 formatter arc (backlog 42–49, notably `bad9510`'s width-independent `})` seam rule). `formatter.rs` carries `LINE_BUDGET = 100`, `is_breakable_chain`, and style-chain pins including a literal `const style().display(..).flex_direction(..).gap(..)` case. Probed with the worktree binary: a 128-column style chain splits one link per line. **The "(or preserve)" half of §1's note is rejected by design, not open** — the formatter has one canonical output and no width knob, and `an_under_width_hand_split_chain_collapses` pins the rejoin. §1's note is corrected in place. |
-| the property long tail | **VERIFIED OPEN → FIRST SLICE SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. The item stays OPEN for the §3b half — the value types. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
+| the property long tail | **VERIFIED OPEN → BOTH SLICES SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. **The §3b half — the value types — then shipped the same day (§0bis.3):** `Color::rgba`/`.alpha`, the `Gradient` type on the `background-image` slot, `border_none()` and the four border edges, the eight `padding_*`/`margin_*` edges, `Display::InlineFlex`/`InlineGrid`. 8 more pins, all planted (one caught vacuous and rewritten), the corpus `.css` golden **13 lines added and none changed**, and five real `raw` sites in the examples converted with both stylesheets coming out byte-identical. The item CLOSES here; what remains under A8 is only the A7/G2-entangled pieces. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
 | critical CSS | **OPEN, out of this arc's scope** | A7-entangled; still §6 slice 6, proposal-only. Left filed. |
 | liveness-tied dead-style elimination | **OPEN, out of this arc's scope** | Rides G2's liveness-tied emission. Left filed. |
 
@@ -116,14 +116,15 @@ property NAME stays checked and completable, and only the value — a font
 stack, a transform list, a shadow layer — is CSS text nothing could validate.
 That is the same bargain `transition` shipped with in v1.
 
-**What is still open**, and is the bigger half: §3b's ~120 sites where the
+**What was still open**, and is the bigger half: §3b's ~120 sites where the
 property is typed and the VALUE TYPE cannot hold what was wanted —
 `background(Color)` bypassed 36 times for gradients and `rgba`,
 `border(Length, Color)` 19 times for `none` and non-`solid` styles, `padding`
 for two-value shorthands, `Color` for alpha. `Length::calc` and the new units
 take a bite out of it; the rest wants a `Color` with alpha, a gradient-capable
 background channel, and a per-edge border surface — one slice, designed
-together, not a scatter of methods. Filed here, not attempted.
+together, not a scatter of methods. **Designed and shipped in §0bis.3**
+(2026-08-04), whose re-sweep corrected three of the guesses in this paragraph.
 
 §2.3's bargain still holds throughout: the typed surface buys checking and
 completion for what people actually write; an exhaustive CSS mirror buys
@@ -173,6 +174,133 @@ same property are both (0,2,0) and are resolved by source order, where `.`
 sorting before `:` makes dark win. That is deterministic and defensible (a
 mode should not be undone by a state), and `dark(hover(..))` is now the
 precise way to say otherwise. Recorded, not altered.
+
+### 0bis.3 Design — the value types (§3b, the tail's second half)
+
+Numbered `.3` because `.2` is the shipped dark×pseudo design; this is the
+section the value-type slice was chartered to write.
+
+§0bis.1 estimated this half from the slice-1 sweep's margins. It was
+**re-swept site by site before designing**, over the same three consumers
+(the website's 341 `raw` calls, the examples' 6, the docs' 2), and the
+re-sweep corrected the estimate in ways that changed three of the four
+decisions. The counts below are that sweep; each design choice names the
+number it answers.
+
+The rule this slice states, and that future value-shaped work follows:
+
+> **One method per CSS declaration the value type can hold, and the method
+> NAME carries the arity.** A multi-value shorthand method is minted only
+> when no composition of the typed methods that already exist produces the
+> same computed result. vilan has no overloading, so arity lives in names —
+> but a name that buys nothing over `a().b()` is surface, not expressiveness.
+
+**1. `Color` gains alpha — 58 sites, the single biggest driver of the escape
+hatch.** Two constructors, because the sweep found two different needs.
+`Color::rgba(r, g, b, alpha)` is the literal (44 of the 58 sites write a bare
+`rgba(..)` — a brand palette, not a ramp step), the alpha twin of
+`Color::hex`, with its channels range-checked at const time the way `space`
+and the ramps are. `.alpha(value)` derives one color from another and is what
+the token case needs: it renders `rgb(from {css} r g b / {alpha})`, the
+relative-color form, **which keeps the origin a `var(--gray-900)` rather than
+resolving it** — so a themed color at 8% is still themeable, and the `root`
+declaration rides along untouched. That is the whole reason not to append an
+8-digit hex (works only on literals) and the reason not to multiply into a
+`color-mix` percentage: `0.07 * 100.0` is `7.000000000000001` in f64 and
+would be in the stylesheet, whereas relative color takes the author's alpha
+verbatim. Cut, recorded: two sites put a `calc(var(--nav-fade,0) * 0.86)` in
+the alpha channel. An `f64` alpha cannot hold a live custom-property
+computation and no value type short of a CSS expression tree could; those two
+stay `raw`.
+
+**2. A gradient is NOT a `Color` — it is `background-image`.** Answered
+honestly and against the first instinct: `background(Color)` is
+`background-color`, and no amount of widening `Color` makes a two-stop
+function fit a property that takes one color. So a separate `Gradient` value
+type and a separate `background_gradient(Gradient)` method writing the
+`background-image` slot — a *different* slot from `background`, which is
+exactly right, since CSS paints an image over a color and a style may set
+both. `Gradient::linear(degrees)` and `Gradient::radial(RadialExtent)` open
+one; `.stop(color, percent)` adds a stop; the stops carry their colors'
+`:root` lines out to the emitter, so a gradient of ramp tokens themes like
+everything else. **Both constructors ship, and the demand is why the charter's
+"linear v1" was widened:** radial is 12 of the 16 gradient sites (11 of them
+the identical `radial-gradient(closest-side, <alpha color>, transparent)`
+glow) and linear is 2 — under the ≥5-site rule linear alone would have been
+*out*. Splitting one CSS concept by a count is the arbitrary cut §0bis.1
+refused for the inset family; gradients are admitted as a family. Cut,
+recorded, with the site that forces each: `at <position>` (1 site, and the
+`circle at var(--glow-x)` one needs live variables), multi-layer lists (1
+site, 8 layers), `repeating-linear-gradient` (1), and `background-image` as a
+data URI (2 sites, ~2 KB of embedded SVG each — not a value type's job).
+Those keep `raw`, and `background_image(str)` is deliberately NOT minted:
+3 sites is below the line, and minting it now would put a `str` method and a
+typed method on one slot for no demand.
+
+**3. `border` gains `none` as a method, not a `BorderStyle` enum — because
+the sweep found ZERO non-`solid` borders.** All 17 width-and-color sites are
+`1px solid <alpha color>`; the alpha is what defeated them, and decision 1
+fixes that with no border work at all. What is left is `none` (3 sites), so
+`border_none()` ships and an enum does not: its other variants would be
+speculation, and — the load-bearing reason — `border_none()` writes the
+**same `border` slot** the shorthand does, so it *replaces* a border set
+earlier in the chain under the ordinary last-wins rule. A `BorderStyle` on a
+`border-style` longhand would instead emit a second atomic rule racing the
+shorthand in the cascade (see the hazard below). Per-edge ships as a family:
+`border_top/right/bottom/left(width, color)` — the sweep has 3 `border-top`
+and 2 `border-bottom` and zero left/right, and a quartet with two holes is a
+hole, not a tail (`min_width`/`max_height`'s precedent). All five bodies go
+through one `with_border` helper, and `border`'s own declaration is
+byte-identical to what it emitted before.
+
+**4. `padding`/`margin` get the four EDGES and no multi-value shorthand.**
+This is the decision the re-sweep reversed. Every multi-value site is
+2-value `y x` — 4 of them, zero 3-value, zero 4-value, and `margin` is never
+given a shorthand at all — and `padding_y(v).padding_x(h)` already computes
+exactly `padding: v h`. By the rule at the top of this section a
+`padding_xy(v, h)` would buy one atomic rule instead of four and no
+expressiveness, so it is not minted. The real hole is the single-edge
+longhands the surface never had: 9 sites (`margin-left: auto` alone is 5 of
+them — the flex-push idiom), against a surface that shipped `padding`,
+`padding_x`, `padding_y` and nothing else. So `padding_top/right/bottom/left`
+and `margin_top/right/bottom/left`, admitted as families, one `Length` each.
+A `Sides` value type (`Sides::xy`, `Sides::trbl`) was the alternative and is
+rejected: it can only reach `padding` by changing `padding(Length)`'s
+signature — churning every call site in the one real consumer — to model
+arities nobody writes.
+
+**5. `Display` gains `InlineFlex` and `InlineGrid`.** The smallest member of
+this class: an enum *is* a value type, and one that cannot name a legal value
+of its property has the same defect as a `Color` without alpha.
+`display:inline-flex` has 1 site; `InlineGrid` has none and comes in as the
+family half, since `InlineBlock` already shipped and splitting the inline
+forms by a count is the arbitrary cut again.
+
+**Cut from this slice, with the trigger that would reopen each.**
+`box_shadow` stays `str`: 5 of its 6 sites are one uniform
+`x y blur <color>` layer, and what actually defeated them was the color,
+which decision 1 now writes — a `Shadow` value type would be minted for one
+shape with no second consumer. Reopen it if a shadow wants a *ramp token*
+color, which the `str` form genuinely cannot hold. `transition` stays `str`
+and is the clearest cut of all: **zero `raw` sites**, 5 typed uses, all five
+comma-separated multi-property lists — the value type people would need is
+the list they are already writing, and nothing is escaping. `line_height`
+keeps its `f64`: 4 sites want a `px` line height, under the line, and
+unitless is the correct default besides.
+
+**A hazard this slice found and did NOT fix (recorded, not papered over).**
+Atomic longhand and shorthand rules of the same family carry equal
+specificity, so `padding(space(4)).padding_top(space(0))` resolves by
+*stylesheet order* — which here is the lexical sort over content-hashed class
+names, i.e. arbitrary. This is pre-existing (`padding` + `padding_x` has it
+today, as does `border` + `border_color`), and the per-edge families widen the
+exposure. It is not fixed here because every fix changes rule TEXT for
+already-minted rules — doubling a longhand's class for specificity
+(`.sX.sX{..}`) is the standard remedy and would rewrite every `padding_x`
+rule in every build — and class-name stability was this slice's hard
+constraint. The authoring rule goes in the docs instead ("one arity per
+family: the box or its edges, not both"), and the remedy is filed for a slice
+that is allowed to re-mint names.
 
 ## 0. The problem
 
@@ -322,7 +450,8 @@ atomic rule with the condition baked in:
 
 The typed property surface covers the core that styles 90% of real UI
 (layout, spacing, color, typography, borders, radius, shadow, transition — 28
-methods in v1, 46 after the 2026-08-04 demand-led slice, §0bis.1). The tail
+methods in v1, 46 after the 2026-08-04 demand-led property slice (§0bis.1),
+60 after the value-type slice the same day (§0bis.3)). The tail
 does not block: `raw("mask-image", "linear-gradient(..)")` lowers to an atomic rule
 like any other, minus value validation. Plain string classes coexist
 untouched (`view.class("leaflet-container")` — the method shipped as `class`,

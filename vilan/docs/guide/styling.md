@@ -88,9 +88,51 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   `Color::transparent()`, `Color::hex("#663399")`, and stepped ramps
   like `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
   `Color::green(500)`.
+- **Alpha** comes two ways. `Color::rgba(27, 6, 13, 0.9)` is a literal
+  translucent colour — `hex`'s twin, for a palette outside the ramps.
+  `some_color.alpha(0.08)` is *this colour at that alpha*, and is the
+  one to reach for on a ramp step: it keeps the token underneath, so
+  `Color::gray(900).alpha(0.08)` still re-themes when `--gray-900`
+  changes. Both check their range at build time — `alpha(1.5)` stops the
+  build.
+- **`Gradient`** is a `background-image` value, not a `Color`.
+  `Gradient::linear(degrees)` (0 points up, 90 to the right) or
+  `Gradient::radial(RadialExtent::ClosestSide)`, then `.stop(colour,
+  percent)` per stop, handed to `background_gradient`. It is a different
+  slot from `background`, so a style can set a colour *and* paint a
+  gradient over it. Two stops minimum.
 - Keyword properties use enums: `Display`, `Position`, `FlexDirection`,
   `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
-  `WhiteSpace`, `UserSelect`.
+  `WhiteSpace`, `UserSelect`, `RadialExtent`.
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::style::{ style, space, Style, Color, Gradient, Length, RadialExtent };
+
+let hero = const style()
+	.padding(space(6))
+	.radius(space(2))
+	.background(Color::gray(900))
+	.background_gradient(
+		Gradient::linear(135.0)
+			.stop(Color::rgba(178, 48, 86, 0.9), 0.0)
+			.stop(Color::blue(600), 100.0),
+	)
+	.border_top(Length::px(1), Color::white().alpha(0.14))
+	.color(Color::white());
+
+let glow = const style().background_gradient(
+	Gradient::radial(RadialExtent::ClosestSide)
+		.stop(Color::rgba(235, 104, 46, 0.4), 0.0)
+		.stop(Color::transparent(), 100.0),
+);
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("div").styled(hero).child(view("div").styled(glow))
+	});
+}
+```
 
 Some properties take a plain `str` — `font_family`, `transform`,
 `box_shadow`, `text_decoration`, `flex`, `grid_template_columns`. That
@@ -112,6 +154,38 @@ untyped property with a *typed* value, so a token still emits its
 `:root` declaration. The typed surface grows by demand — if you find
 yourself reaching for `raw` on the same property repeatedly, that is the
 evidence a method should exist.
+
+## Boxes, edges and borders
+
+Spacing comes in three arities, and the name says which: the whole box
+(`padding`, `margin`), an axis (`padding_x`, `margin_y`), or one edge
+(`padding_top`, `margin_left`, and the other six). There is no
+multi-value shorthand method, because there is nothing it would buy:
+`padding: 8px 16px` is `padding_y(..).padding_x(..)`, spelled with the
+methods you already have.
+
+Borders match: `border(width, colour)` for all four edges,
+`border_top`/`border_right`/`border_bottom`/`border_left` for one, and
+`border_none()` to remove one. `border_none()` fills the *same* slot the
+shorthand does, so `base.border_none()` genuinely takes the border off a
+style that set one. `border_color` is its own slot, which is what lets a
+`hover` recolour a border without restating its width.
+
+```vilan,fragment
+let card = const style()
+	.border(Length::px(1), Color::gray(300))
+	.hover(style().border_color(Color::blue(600)));
+
+let flush = const card.border_none().margin_left(Length::auto());
+```
+
+**Write one arity per family.** Mixing the box with its edges —
+`padding(space(4)).padding_top(space(0))` — leaves two rules of equal
+specificity, and which one wins is decided by the stylesheet's ordering
+of two generated class names rather than by the order you wrote them.
+The axis and edge methods share slots, so `padding_x(..)` then
+`padding_left(..)` *is* a clean override; it is the whole-box shorthand
+that does not compose.
 
 ## States and breakpoints
 
@@ -250,5 +324,11 @@ request is rendered is the one served.
   wins — and a reactive one keeps winning every time its signal
   changes. Use one mechanism per element (custom classes can ride along
   via `.raw`).
+- Don't mix a shorthand with its own longhands (`padding` with
+  `padding_top`, `border` with `border_color` at the *same* condition).
+  Each is its own atomic rule, they are equally specific, and the winner
+  is decided by class-name ordering. Under a condition there is no
+  problem — a `hover` rule is more specific than the base rule it
+  overrides.
 
 Full method table: the [style reference](../std/style.md).
