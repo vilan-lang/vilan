@@ -19013,6 +19013,334 @@ fn draft_generation_guard_discards_superseded_pushes() {
     );
 }
 
+// --- Draft re-push on reconnect (A14, proposal/draft-reconnect.md) ----------
+//
+// `repush()` re-sends edits the remote never accepted — `local != synced`,
+// which covers an edit whose commit never left AND one caught in flight by
+// the drop. Wired to a transport's reconnect hook, a dropped connection
+// stops losing the user's work. Delivery is at-least-once, by construction.
+
+#[test]
+fn draft_repush_resends_edits_the_remote_never_accepted() {
+    // The outage shape: a commit that fail-fast rejects while down leaves
+    // `local` ahead of `synced`, and the re-push sends it EXACTLY once —
+    // then settles the draft, so a second reconnect sends nothing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let down: Shared<bool> = Shared::new(true);
+            let sent: Shared<List<str>> = Shared::new([]);
+            let title = draft("base", |value: str| {
+                sent.write().push(value);
+                if down.read() { Some("not connected") } else { None }
+            });
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.state.get() == DraftState::Failed("not connected"));
+            print(title.synced.read());
+
+            // The connection comes back.
+            down.write() = false;
+            title.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.synced.read());
+            print(title.state.get() == DraftState::Synced);
+
+            // A LATER reconnect has nothing left to send.
+            title.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+        }
+        main();
+        "#,
+        "1\ntrue\nbase\n2\nmine\ntrue\n2\n",
+    );
+}
+
+#[test]
+fn draft_repush_on_a_clean_draft_sends_nothing() {
+    // `local == synced` — the remote already has everything. A screen full
+    // of untouched drafts costs zero frames on reconnect.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let name = draft("seed", |value: str| {
+                sent.write().push(value);
+                None
+            });
+
+            // Never edited.
+            name.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+
+            // Edited, pushed, settled — clean again.
+            name.push("edit");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            name.repush();
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(name.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "0\n1\n1\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_repush_is_at_least_once() {
+    // The documented hazard, pinned rather than hidden: a commit that
+    // SUCCEEDED server-side but whose acknowledgement was lost with the
+    // connection is indistinguishable from one that never arrived, so the
+    // re-push sends it again and the server sees it twice. Draft's own
+    // reconcile absorbs the duplicate (the state settles once, correctly);
+    // an appending commit closure would not.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let server_saw: Shared<List<str>> = Shared::new([]);
+            let ack_lost: Shared<bool> = Shared::new(true);
+            let title = draft("base", |value: str| {
+                // The server applies it either way.
+                server_saw.write().push(value);
+                if ack_lost.read() { Some("connection lost") } else { None }
+            });
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            ack_lost.write() = false;
+            title.repush();
+            sleep_for(Duration::millis(10));
+
+            print(server_saw.read().len());
+            print(server_saw.read()[0]);
+            print(server_saw.read()[1]);
+            print(title.state.get() == DraftState::Synced);
+            print(title.local.get());
+        }
+        main();
+        "#,
+        "2\nmine\nmine\ntrue\nmine\n",
+    );
+}
+
+#[test]
+fn draft_repush_rides_the_reconnect_hook_shape() {
+    // The composition the feature actually ships as: the hook is a plain
+    // `|| void` in a list, drained the way `handle_drop` drains
+    // `SocketDuplex.on_reconnect` — re-marked `async` at a `let` (J2's typed
+    // channel) so a hook that awaits does. One reconnect, one re-push.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let down: Shared<bool> = Shared::new(true);
+            let sent: Shared<List<str>> = Shared::new([]);
+            let title = draft("base", |value: str| {
+                sent.write().push(value);
+                if down.read() { Some("not connected") } else { None }
+            });
+
+            let on_reconnect: Shared<List<|| void>> = Shared::new([]);
+            on_reconnect.write().push(|| title.repush());
+
+            title.push("mine");
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+
+            // What the reconnect loop does after a successful re-dial.
+            down.write() = false;
+            for entry in on_reconnect.read() {
+                let hook: async || void = entry;
+                hook();
+            }
+            sleep_for(Duration::millis(10));
+            print(sent.read().len());
+            print(title.synced.read());
+        }
+        main();
+        "#,
+        "1\n2\nmine\n",
+    );
+}
+
+// --- Draft debounce (A14, proposal/draft-reconnect.md §5) -------------------
+//
+// `debounce(millis)` coalesces a burst of pushes into ONE commit, trailing
+// edge, over a real `std::time::Timer` — cancelling settles the verdict and
+// clears the host timeout. Local-first is untouched: the value and the
+// Dirty state still land synchronously; only the commit waits.
+
+#[test]
+fn draft_debounce_coalesces_a_burst_into_one_commit() {
+    // Three keystrokes inside the window produce one commit, carrying the
+    // LAST value. Without the window they produce three.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("a");
+            notes.push("ab");
+            notes.push("abc");
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.synced.read());
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "1\nabc\nabc\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_debounce_keeps_the_local_half_synchronous() {
+    // The window delays the COMMIT, never the keystroke: `local` and the
+    // Dirty state are set before `push` returns, exactly as undebounced.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            // Same instant: the user's text is there, the wire is not.
+            print(notes.local.get());
+            print(notes.state.get() == DraftState::Dirty);
+            print(sent.read().len());
+
+            sleep_for(Duration::millis(150));
+            print(sent.read().len());
+        }
+        main();
+        "#,
+        "typed\ntrue\n0\n1\n",
+    );
+}
+
+#[test]
+fn draft_commit_cancels_a_pending_debounce() {
+    // The explicit save (a blur, a Save button): the pending window is
+    // called off and the value goes now — exactly one commit, not the
+    // manual one plus the window's. The sleep deliberately outlasts the
+    // window, so a `commit` that failed to cancel shows up as a second
+    // commit rather than passing unobserved.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            notes.commit();
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "1\ntyped\ntrue\n",
+    );
+}
+
+#[test]
+fn draft_repush_cancels_a_pending_debounce() {
+    // A reconnect arriving mid-window: recovery is not typing, so the
+    // window is called off and the edit goes immediately. One commit — the
+    // sleep outlasts the window, so a re-push that sent WITHOUT cancelling
+    // shows up as the window's second commit.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ draft, Draft, DraftState };
+        import std::option::Option::{ self, Some, None };
+        import std::shared::Shared;
+        import std::time::{ sleep_for, Duration };
+
+        fun main() {
+            let sent: Shared<List<str>> = Shared::new([]);
+            let notes = draft("", |value: str| {
+                sent.write().push(value);
+                None
+            }).debounce(30);
+
+            notes.push("typed");
+            print(sent.read().len());
+            notes.repush();
+            sleep_for(Duration::millis(150));
+
+            print(sent.read().len());
+            print(sent.read()[0]);
+            print(notes.state.get() == DraftState::Synced);
+        }
+        main();
+        "#,
+        "0\n1\ntyped\ntrue\n",
+    );
+}
+
 #[test]
 fn bind_draft_compiles_for_the_browser() {
     // The ui seam: an input two-way bound to a draft (user input pushes;
