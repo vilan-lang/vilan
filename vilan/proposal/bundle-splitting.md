@@ -300,6 +300,21 @@ against prose.
   bundle and leaves the previous build's chunk files beside it. They are
   inert (a whole bundle names no chunk), but they are strays.
 
+**The measurement, now that both sides exist — and it confirms S1's
+verdict rather than softening it.** `examples/router` built whole is
+14864 B; built split it is 17355 B eager plus 312/1340/319 B of chunks.
+First load went UP by ~2.5 KB. The gate is not free: `swap_split`'s
+emitted body, the four `__chunk_*` helpers, the extra `Signal<Route>`
+instances, the forwarders, the registrations and the url map are a fixed
+cost paid once per split leg, and the router example's entire lazy mass
+(~1.9 KB) does not cover it. **`split = true` is a loss below roughly
+3–4 KB of per-route code and a win above it** — which is exactly §7's
+"the win scales with app code, not with the runtime", now with the
+constant measured. `--print-chunks` reports the numerator; this paragraph
+is the denominator. Nothing in the toolchain warns about it today, and a
+"your chunks are smaller than the machinery" note on a split build is
+the cheapest possible S3 addition.
+
 One find worth carrying past this arc: **a surface added to the browser
 `std::ui` must be added to the process twin too.** `std::router::pending`
 re-exports `ui::chunk_pending`, and `std::router` is analyzed in process
