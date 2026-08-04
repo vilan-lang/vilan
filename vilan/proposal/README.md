@@ -10,9 +10,8 @@ built), **deferred** (designed, deliberately not built, with a trigger),
 tracked as an open backlog item), **historical / superseded** (stale,
 kept for context only).
 
-**In flight 2026-08-03**: `std-surface.md` (the I4 implementation arc is
-still landing; its line below is finalized when it merges). The other four
-proposals from this cycle are merged and carry real status lines below.
+All five of this cycle's proposals are merged and carry real status
+lines below.
 
 The open-work tracker is [`backlog-2026-07-18.md`](backlog-2026-07-18.md)
 (status convention documented in its own header); [`backlog.md`](backlog.md)
@@ -90,7 +89,7 @@ is the historical record everything shipped gets moved into.
 | `watch-mode.md` | shipped arc (2026-07-02) | `--watch` mode across `build`/`check`/`test`/`run`. |
 | `web-playground.md` | shipped arc (live and complete 2026-08-02) | The compiler running in the visitor's browser (D11). |
 | `windows-support.md` | shipped arc (ratified + complete 2026-07-24) | First-class native Windows support for the toolchain. |
-| `std-surface.md` | *in flight 2026-08-03* | Std API surface audit — the missing basics (List/Map/Set/str), tracked as backlog I4. |
+| `std-surface.md` | shipped arc (v1 cut landed 2026-08-03; flagged tail open) | Std surface audit + the missing basics — List batch, clamp, the import steer (I4). |
 | `signal-update.md` | shipped arc | `Signal::update` — mutate in place, notify once (A18); design record + ship record, landed 2026-08-03. |
 | `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4). |
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
