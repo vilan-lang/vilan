@@ -32662,3 +32662,672 @@ fn a_trait_default_loop_specialized_for_a_generic_adapter_counts_elements() {
         "4\n",
     );
 }
+
+// --- B62: a pattern capture that takes ownership of a resource payload is
+// destroyed at its scope end (`vilan/proposal/affine-moves.md` §7) ------------
+
+/// The `resource struct Res` + `Drop` preamble every B62 pin below shares.
+const B62_PRELUDE: &str = r#"
+    import std::print;
+    import std::option::Option::{ self, Some, None };
+    import std::drop::{ Drop, drop };
+    resource struct Res {
+        tag: str,
+    }
+    impl Res with Drop {
+        fun drop(&mut self) {
+            print(i"drop {self.tag}");
+        }
+    }
+"#;
+
+fn b62_program(body: &str) -> String {
+    format!("{B62_PRELUDE}{body}")
+}
+
+#[test]
+fn b62_a_match_leg_capture_is_destroyed_at_the_leg_end() {
+    // The filed bug. Matching by value CONSUMES the subject (R6), so `o`'s own
+    // scope-end teardown is suppressed and the capture is the payload's only
+    // owner — but the drop planner never enrolled it, so the leg ended and
+    // nothing was destroyed. Before the fix this printed `leg payload\nafter`
+    // and leaked; it is the idiom B60 steers `if is_some { unwrap }` toward,
+    // which is what made it urgent.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "payload" });
+                match o {
+                    Some(let r) => print(i"leg {r.tag}"),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg payload\ndrop payload\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_nested_pattern_capture_is_destroyed() {
+    // The capture sits two levels down (`Some((let r, let n))`) and only one
+    // element is a resource: the enrollment is per CAPTURE, decided by the
+    // capture's own type, not by the pattern's shape.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<(Res, i32)> = Some((Res { tag = "nested" }, 7));
+                match o {
+                    Some((let r, let n)) => print(i"leg {r.tag} {n}"),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg nested 7\ndrop nested\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_mut_match_capture_is_destroyed() {
+    // `mut` at a binder changes mutability, not ownership. (A `mut` resource
+    // PARAMETER is rejected — it would copy — but a `mut` capture takes the
+    // payload by move like any other, so it owns and drops.)
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "before" });
+                match o {
+                    Some(mut r) => {
+                        r.tag = "mutated";
+                        print(i"leg {r.tag}");
+                    }
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg mutated\ndrop mutated\nafter\n",
+    );
+}
+
+#[test]
+fn b62_two_captures_in_one_leg_destroy_in_reverse_order() {
+    // Drop timing and order (`docs/spec/memory.md`): still-owned resources drop
+    // in REVERSE declaration order, and a leg's captures are declared left to
+    // right, so the second payload dies first — the same order a scope's `let`s
+    // get from `walk_scope_body`'s nested tries.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            resource enum Both {
+                Pair(Res, Res),
+                Nothing,
+            }
+            fun main() {
+                let both = Both::Pair(Res { tag = "first" }, Res { tag = "second" });
+                match both {
+                    Both::Pair(let x, let y) => print(i"leg {x.tag} {y.tag}"),
+                    Both::Nothing => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg first second\ndrop second\ndrop first\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_guarded_leg_capture_is_destroyed() {
+    // A guarded leg binds nothing — B53 records its captures as ACCESSORS into
+    // the subject and substitutes them at every reference — so the teardown
+    // destroys through the accessor. The subject was consumed by the match, so
+    // that slot has exactly one owner.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "guarded" });
+                match o {
+                    Some(let r) if r.tag == "guarded" => print(i"leg {r.tag}"),
+                    Some(let other) => print(i"other {other.tag}"),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg guarded\ndrop guarded\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_rejected_guard_destroys_nothing_and_the_next_leg_owns() {
+    // B59's ordering decision, read for resources: a guard is a decision
+    // procedure and a rejected leg must leave no trace. The teardown wraps the
+    // leg BODY, which a rejected guard never enters, so the payload survives
+    // into the next leg — which takes it and destroys it exactly once.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "kept" });
+                match o {
+                    Some(let a) if a.tag == "nope" => print(i"first {a.tag}"),
+                    Some(let b) => print(i"second {b.tag}"),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "second kept\ndrop kept\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_capture_moved_onward_is_destroyed_once_at_its_destination() {
+    // The capture leaves the leg as the match's value, so it is not owned at
+    // the leg's end and does not drop there; the `let` it lands in owns it and
+    // drops it at ITS scope end. Exactly one destruction, after `after`.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "moved" });
+                let out = match o {
+                    Some(let r) => r,
+                    None => Res { tag = "default" },
+                };
+                print(i"got {out.tag}");
+                print("after");
+            }
+            "#,
+        ),
+        "got moved\nafter\ndrop moved\n",
+    );
+}
+
+#[test]
+fn b62_a_capture_passed_by_own_is_destroyed_once_in_the_callee() {
+    // `own` moves, so the leg no longer owns it — the callee's own scope-end
+    // teardown is the single destruction, and it runs before `after`.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "sunk" });
+                match o {
+                    Some(let r) => sink(r),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "sink sunk\ndrop sunk\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_capture_stored_in_a_struct_is_destroyed_with_the_struct() {
+    // A struct literal moves resources in (R5): the leg hands ownership to the
+    // aggregate, which is itself a resource by containment and drops the
+    // payload at the binding's scope end.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            struct Holder {
+                item: Res,
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "stored" });
+                let holder = match o {
+                    Some(let r) => Holder { item = r },
+                    None => Holder { item = Res { tag = "default" } },
+                };
+                print(i"held {holder.item.tag}");
+                print("after");
+            }
+            "#,
+        ),
+        "held stored\nafter\ndrop stored\n",
+    );
+}
+
+#[test]
+fn b62_a_capture_returned_out_of_the_function_is_destroyed_by_the_caller() {
+    // R4: returns move out, including through a match tail. The leg drops
+    // nothing and the caller's binding is the owner.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun unwrap_or_default(own o: Option<Res>): Res {
+                match o {
+                    Some(let r) => r,
+                    None => Res { tag = "default" },
+                }
+            }
+            fun main() {
+                let got = unwrap_or_default(Some(Res { tag = "returned" }));
+                print(i"got {got.tag}");
+                print("after");
+            }
+            "#,
+        ),
+        "got returned\nafter\ndrop returned\n",
+    );
+}
+
+#[test]
+fn b62_a_leg_that_does_not_run_destroys_nothing() {
+    // The other arm is taken: the payload never existed, and the teardown lives
+    // inside the leg body, so nothing runs. (The `None` subject owns nothing.)
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = None;
+                match o {
+                    Some(let r) => print(i"leg {r.tag}"),
+                    None => print("none-arm"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "none-arm\nafter\n",
+    );
+}
+
+#[test]
+fn b62_an_early_return_out_of_a_leg_still_destroys_the_capture() {
+    // Every exit runs drops (`docs/spec/memory.md`, drop timing): the leg's
+    // teardown is a `finally`, so `ret` leaves through it.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun pick(own o: Option<Res>): i32 {
+                match o {
+                    Some(let r) => {
+                        print(i"leg {r.tag}");
+                        ret 1;
+                    }
+                    None => { ret 0; }
+                }
+                2
+            }
+            fun main() {
+                let got = pick(Some(Res { tag = "early" }));
+                print(i"got {got}");
+                print("after");
+            }
+            "#,
+        ),
+        "leg early\ndrop early\ngot 1\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_leg_capture_inside_a_loop_is_destroyed_each_iteration() {
+    // The capture is declared inside the repeatable interior, so its teardown
+    // is per-iteration — the same treatment a resource `let` in a loop body
+    // gets, and the reason R8 only polices bindings declared OUTSIDE the loop.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun make(n: i32): Option<Res> {
+                Some(Res { tag = i"loop{n}" })
+            }
+            fun main() {
+                for n in [0, 1] {
+                    match make(n) {
+                        Some(let r) => print(i"leg {r.tag}"),
+                        None => print("none"),
+                    }
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg loop0\ndrop loop0\nleg loop1\ndrop loop1\nafter\n",
+    );
+}
+
+#[test]
+fn b62_the_conditional_teardown_idiom_still_destroys_exactly_once() {
+    // The shape `docs/spec/memory.md` names as R7's answer. `drop(c)` moves the
+    // capture into the sink, so the leg does not also destroy it — the guard
+    // against the obvious over-enrollment.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                mut o: Option<Res> = Some(Res { tag = "taken" });
+                match o.take() {
+                    Some(let c) => drop(c),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "drop taken\nafter\n",
+    );
+}
+
+#[test]
+fn b62_an_is_capture_does_not_enroll_and_is_destroyed_once_by_its_subject() {
+    // The ownership split's negative half. `x is Some(let r)` is a TEST, not a
+    // consuming match (`is_some`'s body is exactly this, and B60 left it free
+    // on a resource), so the subject is loaned and stays the owner. Enrolling
+    // the capture here would destroy the payload twice.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "tested" });
+                if o is Some(let r) {
+                    print(i"is {r.tag}");
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "is tested\nafter\ndrop tested\n",
+    );
+}
+
+#[test]
+fn b62_a_loaned_match_subject_capture_does_not_enroll() {
+    // R6's second sentence: matching a loan (`match &x`) inspects without
+    // consuming, so the subject keeps ownership and its own scope-end teardown
+    // is the single destruction.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "loaned" });
+                match &o {
+                    Some(let r) => print(i"leg {r.tag}"),
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg loaned\nafter\ndrop loaned\n",
+    );
+}
+
+#[test]
+fn b62_a_destructure_capture_is_destroyed_at_its_scope_end() {
+    // The same root cause in the `let`-pattern position, which the drop
+    // planner's `Destructure` arm recorded as a known leak. `let (r, n) = pair`
+    // consumes `pair`, so the capture is the payload's only owner and drops at
+    // the enclosing scope's end like any `let`.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let pair = (Res { tag = "destructured" }, 3);
+                let (r, n) = pair;
+                print(i"pair {r.tag} {n}");
+                print("after");
+            }
+            "#,
+        ),
+        "pair destructured 3\nafter\ndrop destructured\n",
+    );
+}
+
+#[test]
+fn b62_a_loaned_destructure_capture_does_not_enroll() {
+    // `let (r, n) = &pair` loans: `pair` is never consumed, so it stays the
+    // owner and the captures must not double-enroll.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let pair = (Res { tag = "borrowed" }, 3);
+                let (r, n) = &pair;
+                print(i"pair {r.tag} {n}");
+                print("after");
+            }
+            "#,
+        ),
+        "pair borrowed 3\nafter\ndrop borrowed\n",
+    );
+}
+
+#[test]
+fn b62_a_data_capture_is_untouched_by_the_enrollment() {
+    // Data captures are completely unaffected: the program below owns one
+    // resource (so drop planning is switched on) and matches a DATA option
+    // beside it. Exactly one `try` is emitted — the resource `let`'s — and the
+    // data leg gets no teardown at all.
+    let js = compile(&b62_program(
+        r#"
+        fun main() {
+            let kept = Res { tag = "kept" };
+            let o: Option<i32> = Some(5);
+            match o {
+                Some(let n) => print(i"leg {n}"),
+                None => print("none"),
+            }
+            print(i"kept {kept.tag}");
+        }
+        "#,
+    ))
+    .expect("expected a clean compile");
+    assert_eq!(
+        js.matches("try").count(),
+        1,
+        "unexpected teardown in:\n{js}"
+    );
+}
+
+#[test]
+fn b62_an_overwritten_mut_capture_destroys_both_values_once_each() {
+    // R2 through a capture: assigning onto a `mut` capture that still owns its
+    // payload drops the OLD value at the assignment, and the leg's teardown
+    // destroys the new one. Two values, one destruction each.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "old" });
+                match o {
+                    Some(mut r) => {
+                        r = Res { tag = "new" };
+                        print(i"leg {r.tag}");
+                    }
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "drop old\nleg new\ndrop new\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_leg_capture_and_a_leg_local_drop_in_reverse_declaration_order() {
+    // The capture is declared before the leg's own statements, so its teardown
+    // wraps theirs: the local dies first, the capture last — the same nesting
+    // `walk_scope_body` gives two consecutive resource `let`s.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "capture" });
+                match o {
+                    Some(let r) => {
+                        let local = Res { tag = "local" };
+                        print(i"leg {r.tag} {local.tag}");
+                    }
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "leg capture local\ndrop local\ndrop capture\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_capture_consumed_by_a_nested_match_is_destroyed_once() {
+    // The outer capture is the inner match's subject, so the inner match
+    // consumes it and the outer leg drops nothing; the inner capture is the
+    // payload's last owner. One destruction, at the inner leg's end.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            resource enum Wrap {
+                Inner(Res),
+                Nothing,
+            }
+            fun main() {
+                let w: Option<Wrap> = Some(Wrap::Inner(Res { tag = "deep" }));
+                match w {
+                    Some(let inner) => match inner {
+                        Wrap::Inner(let r) => print(i"deep {r.tag}"),
+                        Wrap::Nothing => print("nothing"),
+                    },
+                    None => print("none"),
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "deep deep\ndrop deep\nafter\n",
+    );
+}
+
+#[test]
+fn b62_a_conditionally_moved_capture_is_an_r7_error() {
+    // R7 already governed captures — the affine scan seeds them
+    // (`seed_pattern_bindings`) so a leg-local move is compared across the
+    // branch — and the drop planner's enrollment must not open an escape hatch
+    // from it: a capture moved on one path and destroyed on another is exactly
+    // the runtime drop flag R7 exists to rule out. This pin guards that the
+    // rejection survives the enrollment.
+    assert_fails_with(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let flag = true;
+                let o: Option<Res> = Some(Res { tag = "conditional" });
+                match o {
+                    Some(let r) => {
+                        if flag {
+                            sink(r);
+                        }
+                    }
+                    None => print("none"),
+                }
+            }
+            "#,
+        ),
+        "moved on one path through this branch but not another",
+    );
+}
+
+// --- B62's residuals: found while pinning the split, each a DIFFERENT rule ----
+
+#[test]
+#[ignore = "B62 residual: consuming a loaned capture is not yet an error, and double-destroys"]
+fn b62_an_is_capture_consumed_by_an_own_call_is_rejected() {
+    // `is` loans its subject, so the capture is a view into a value the subject
+    // still owns. `own`-passing it hands a second owner the payload while the
+    // subject's scope-end teardown still fires: the program below prints
+    // `sink ic / drop ic / after / drop ic` — one value, TWO destructions.
+    //
+    // This is B60's rule (a body may only consume what it owns) in the capture
+    // position rather than the parameter position, and needs its own diagnostic
+    // and steer ("match by value, or `take`"), so it is not this arc's. The
+    // ownership split B62 pins is what makes it a bug: a loaned capture owns
+    // nothing, so it may not be consumed.
+    assert_fails(&b62_program(
+        r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "ic" });
+                if o is Some(let r) {
+                    sink(r);
+                }
+                print("after");
+            }
+            "#,
+    ));
+}
+
+#[test]
+#[ignore = "B62 residual: consuming a capture of a loaned match subject is not yet an error"]
+fn b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected() {
+    // The same hole through `match &x`, which R6 defines as inspecting without
+    // consuming. Prints `sink lc / drop lc / after / drop lc` today.
+    assert_fails(&b62_program(
+        r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "lc" });
+                match &o {
+                    Some(let r) => sink(r),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+    ));
+}
+
+#[test]
+#[ignore = "B62 residual: R11's exactly-once check does not see a generic body's pattern captures"]
+fn b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation() {
+    // R11 requires an `own T` parameter to be moved out on every path, because
+    // a generic body is emitted once and cannot destroy a `T`. A pattern
+    // capture of generic type is the same situation and is not checked: the
+    // match consumes `o` (so the parameter passes the exactly-once test), the
+    // capture `v` is never moved out, and the payload leaks — this prints
+    // `some / after` with no destruction.
+    //
+    // The fix belongs to `check_own_generic_exactly_once`, which would have to
+    // treat a still-owned CAPTURE at the fall-through end the way it treats a
+    // still-owned parameter. Concrete resource captures are unaffected: they
+    // are enrolled and destroyed (B62), which is why this is a residual and not
+    // a hole in the enrollment.
+    assert_fails(&b62_program(
+        r#"
+            fun peek<type T>(own o: Option<T>) {
+                match o {
+                    Some(let v) => print("some"),
+                    None => print("none"),
+                }
+            }
+            fun main() {
+                peek(Some(Res { tag = "gc" }));
+                print("after");
+            }
+            "#,
+    ));
+}
