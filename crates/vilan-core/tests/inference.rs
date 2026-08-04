@@ -23828,6 +23828,33 @@ fn an_inherent_method_refuses_a_spread_parameter() {
     );
 }
 
+/// Memberhood belongs to the impl/trait ITEM LIST, not to everything
+/// lexically inside it: a free `fun` declared in a member's body is still a
+/// free `fun`, and takes a spread like any other.
+#[test]
+fn a_function_nested_in_a_member_body_still_takes_a_spread() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point {
+            x: i32,
+        }
+        impl Point {
+            fun go(self): i32 {
+                fun helper(...items: (i32, i32)): i32 {
+                    items.1
+                }
+                helper(1, 2)
+            }
+        }
+        fun main() {
+            print(Point { x = 0 }.go());
+        }
+        "#,
+        "2\n",
+    );
+}
+
 #[test]
 fn an_external_fun_refuses_a_spread_parameter() {
     assert_fails_with(

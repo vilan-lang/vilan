@@ -2906,10 +2906,17 @@ impl<'a, 'src> Parser<'a, 'src> {
         // method or an `external` intrinsic). The block is tried first (chumsky
         // `block.map(Some).or(';'.map(|_| None))`), but the two lead on disjoint
         // tokens (`{` vs `;`) so a bare `;` short-circuits equivalently.
+        // A function declared INSIDE a member's body is a free function, not a
+        // member — memberhood belongs to the impl/trait item list, not to
+        // everything lexically within it. Clear the flag for the body (the
+        // member's own parameters were checked above, before this point).
         let body = if self.eat_ctrl(';') {
             None
         } else {
-            Some(self.parse_block()?)
+            let outer_member_body = std::mem::take(&mut self.in_member_body);
+            let block = self.parse_block();
+            self.in_member_body = outer_member_body;
+            Some(block?)
         };
         Some((
             Node::Func(Func {
@@ -3117,11 +3124,11 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// member (`...` IS part of the signature, unlike `mut`, and a method is
     /// reached by dispatch on three routes), and an `external fun` (the host's
     /// calling convention has no pack form).
-    fn reject_spread_position(&mut self, parameters: &[Parameter<'src>], position: &'static str) {
+    fn reject_spread_position(&mut self, parameters: &[Parameter<'src>], reason: &'static str) {
         for parameter in parameters.iter().filter(|parameter| parameter.spread) {
             self.errors.push(ParseError {
                 span: parameter.span,
-                reason: ParseErrorReason::Rule(position),
+                reason: ParseErrorReason::Rule(reason),
                 context: Vec::new(),
                 hint: None,
             });
@@ -3264,7 +3271,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body = self.in_member_body(|parser| parser.parse_item_body("implementation body"))?;
+        let body =
+            self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
         Some((
             Node::Impl(Box::new(subject), traits, body),
             self.span_from(start),
@@ -3274,7 +3282,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// Parses `body` with [`Parser::in_member_body`] set, restoring the previous
     /// value afterwards (impls nest inside modules, and a closure body inside a
     /// member is still inside the member).
-    fn in_member_body<T>(&mut self, body: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+    fn within_member_body<T>(&mut self, body: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
         let outer = std::mem::replace(&mut self.in_member_body, true);
         let result = body(self);
         self.in_member_body = outer;
@@ -3295,7 +3303,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             Vec::new()
         };
-        let body = self.in_member_body(Self::parse_trait_body)?;
+        let body = self.within_member_body(Self::parse_trait_body)?;
         Some((
             Node::Trait(name, generic_parameters, supertraits, body),
             self.span_from(start),
