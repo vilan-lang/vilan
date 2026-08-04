@@ -44,7 +44,7 @@ function drain(turn) {
 		turn[1].v = true;
 		draining_turns.v.push(turn);
 		let budget = 100000;
-		while (!($r(turn[0].v)) && budget > 0) {
+		while (!($t(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
 			for (const subscriber of wave) {
@@ -119,39 +119,42 @@ function $i(self, item, $j) {
 function $c(self, observer, $d, $e) {
 	$i(get_owner($e), $g(self, observer), $d);
 }
-function $r(self) {
+function $t(self) {
 	return self.length === 0;
 }
-function $s(self) {
+function $u(self) {
 	return __list_get(self, self.length - 1);
 }
-function $n(self, value, $o) {
-	self[0].v = value;
-	const $p = $o;
-	let $q = null;
-	if ($p[0] === 0) {
-		const turn = $p[1];
-		$q = enqueue(turn, self[1].v);
+function $p(self, $q) {
+	const $r = $q;
+	let $s = null;
+	if ($r[0] === 0) {
+		const turn = $r[1];
+		$s = enqueue(turn, self[1].v);
 	} else {
-		const $t = $s(draining_turns.v);
-		let $u = null;
-		if ($t[0] === 0) {
-			const draining = $t[1];
-			$u = enqueue(draining, self[1].v);
+		const $v = $u(draining_turns.v);
+		let $w = null;
+		if ($v[0] === 0) {
+			const draining = $v[1];
+			$w = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$u = undefined;
+			$w = undefined;
 		}
-		$q = $u;
+		$s = $w;
 	}
-	return $q;
+	return $s;
 }
-function $y(owner2, body) {
+function $n(self, value, $o) {
+	self[0].v = value;
+	$p(self, $o);
+}
+function $A(owner2, body) {
 	return body(owner2);
 }
-function $A(body) {
+function $C(body) {
 	const scope2 = new2();
 	const result = body(scope2);
 	return [ result, scope2 ];
@@ -172,16 +175,16 @@ $n(count, 3, [ 1 ]);
 console.log("done");
 const outer = new2();
 const inner = new2();
-(($v) => {
-	(($w) => {
+(($x) => {
+	(($y) => {
 		$c(count, (value) => {
 			return console.log("inner " + value);
-		}, [ 1 ], $w);
+		}, [ 1 ], $y);
 		return;
 	})(inner);
 	$c(count, (value) => {
 		return console.log("outer " + value);
-	}, [ 1 ], $v);
+	}, [ 1 ], $x);
 	return;
 })(outer);
 $n(count, 4, [ 1 ]);
@@ -191,24 +194,24 @@ dispose2(outer);
 $n(count, 6, [ 1 ]);
 console.log("end");
 const wrapped = new2();
-$y(wrapped, ($x) => {
+$A(wrapped, ($z) => {
 	$c(count, (value) => {
 		return console.log("wrapped " + value);
-	}, [ 1 ], $x);
+	}, [ 1 ], $z);
 	return;
 });
 $n(count, 7, [ 1 ]);
 dispose2(wrapped);
 $n(count, 8, [ 1 ]);
 console.log("fin");
-const $B = $A(($z) => {
+const $D = $C(($B) => {
 	$c(count, (value) => {
 		return console.log("comp " + value);
-	}, [ 1 ], $z);
+	}, [ 1 ], $B);
 	return "built";
 });
-const label = $B[0];
-const scope = $B[1];
+const label = $D[0];
+const scope = $D[1];
 console.log(label);
 $n(count, 9, [ 1 ]);
 dispose2(scope);

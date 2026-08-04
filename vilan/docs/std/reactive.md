@@ -37,6 +37,7 @@ impl Signal<type T> {
 	fun new(value: T): Signal<T>
 	fun set(self, value: T)                 // write + notify
 	fun set_with(self, transform: sync |T| T)    // read-modify-write
+	fun update(self, mutate: sync |&mut T| void) // mutate in place, notify once
 	fun map<U>(self, transform: sync |T| U): Signal<U>
 }
 impl Signal<type T> with Source<T> {
@@ -52,6 +53,31 @@ impl Signal<Signal<type U>> {
 
 - `set` notifies through the ambient turn when one exists (writes coalesce);
   outside any turn it notifies immediately.
+- `update` mutates the **stored** value through a writable view and notifies
+  once, unconditionally, after the closure returns — the collection door
+  (`proposal/signal-update.md`). It shares `set`'s notify half, so batching,
+  drain affinity, and dedup behave identically. A read from *inside* the
+  closure sees the in-progress value; a re-entrant `update` of the same
+  signal is unsupported.
+
+```vilan
+import std::print;
+import std::reactive::{ Signal, Owner, batch };
+
+fun main() {
+	let owner = Owner::new();
+	let todos: Signal<List<str>> = Signal::new([]);
+	owner.take(todos.sub(|list| print(list.len())));   // 0
+
+	todos.update(|&mut list| { list.push("write docs"); });   // 1
+
+	// Two updates, one notification: `update` batches like any write.
+	batch(|| {
+		todos.update(|&mut list| { list.push("ship it"); });
+		todos.update(|&mut list| { list.push("rest"); });
+	});                                                        // 3
+}
+```
 - `map`'s result is a live derived signal; its internal subscription is
   unowned (lives as long as the source).
 - `effect` requires an ambient owner; calling it outside every owner is a

@@ -220,8 +220,9 @@ rows[i].text = "sent";
 
 - "Why didn't my mutation stick?" You mutated a copy. Either take `&mut`
   at the function boundary, or restructure around `Shared` or a signal's
-  `set_with`.
+  `update`.
 - `shared.read().push(x)` is lost (it mutates a copy). Use
   `shared.write().push(x)`.
 - Signals hold values too. Mutate a signal's list with
-  `signal.set_with(|list| …)`, never by mutating a `get()` result.
+  `signal.update(|&mut list| …)` — which hands the closure a writable view
+  of the stored value — never by mutating a `get()` result.

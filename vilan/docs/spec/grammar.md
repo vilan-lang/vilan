@@ -79,7 +79,10 @@ A `;` body is a signature-only declaration: legal for `external`
 functions and required trait methods. A parameter's **convention** may
 come from the prefix (`own x`, `&mut self`) or from a view type
 (`x: &mut T`); the prefix wins if both are present (§6.3). The `borrows`
-clause names the parameter the returned view projects (§6.5).
+clause names the parameter the returned view projects (§6.5). A **closure
+literal's** parameters take this same rule, conventions included, so a
+callback can receive a writable view: `signal.update(|&mut list| { … })`
+against a `sync |&mut T| void` parameter.
 
 A leading `mut` is **binder mutability**, not a convention: the body may
 rebind and field-write its by-value copy, invisibly to the caller —
@@ -296,7 +299,7 @@ struct-init   = IDENT [ generic-args ]
 init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
                 [ ":" type ] expression ;
-closure-param = binder [ ":" type ] ;
+closure-param = parameter ;   (* the same rule as a function's *)
 ```
 
 Two consequences of the tier split are normative:

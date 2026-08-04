@@ -44,7 +44,7 @@ function drain(turn) {
 		turn[1].v = true;
 		draining_turns.v.push(turn);
 		let budget = 100000;
-		while (!($i(turn[0].v)) && budget > 0) {
+		while (!($k(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
 			turn[0].v = [  ];
 			for (const subscriber of wave) {
@@ -56,7 +56,7 @@ function drain(turn) {
 		turn[1].v = false;
 	}
 }
-function dispose(self, $p) {
+function dispose(self, $r) {
 	let kept = [  ];
 	for (const subscriber of self[0].v) {
 		if (subscriber[0] !== self[1]) {
@@ -64,10 +64,10 @@ function dispose(self, $p) {
 		}
 	}
 	self[0].v = kept;
-	const $q = $p;
-	let $r = null;
-	if ($q[0] === 0) {
-		const turn = $q[1];
+	const $s = $r;
+	let $t = null;
+	if ($s[0] === 0) {
+		const turn = $s[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== self[1]) {
@@ -75,11 +75,11 @@ function dispose(self, $p) {
 			}
 		}
 		turn[0].v = kept_pending;
-		$r = undefined;
+		$t = undefined;
 	} else {
-		$r = undefined;
+		$t = undefined;
 	}
-	return $r;
+	return $t;
 }
 function new2() {
 	return [ __shared_new([  ]) ];
@@ -91,34 +91,37 @@ function $a(value) {
 function $d(self) {
 	return self[0].v;
 }
-function $i(self) {
+function $k(self) {
 	return self.length === 0;
 }
-function $j(self) {
+function $l(self) {
 	return __list_get(self, self.length - 1);
 }
-function $e(self, value, $f) {
-	self[0].v = value;
-	const $g = $f;
-	let $h = null;
-	if ($g[0] === 0) {
-		const turn = $g[1];
-		$h = enqueue(turn, self[1].v);
+function $g(self, $h) {
+	const $i = $h;
+	let $j = null;
+	if ($i[0] === 0) {
+		const turn = $i[1];
+		$j = enqueue(turn, self[1].v);
 	} else {
-		const $k = $j(draining_turns.v);
-		let $l = null;
-		if ($k[0] === 0) {
-			const draining = $k[1];
-			$l = enqueue(draining, self[1].v);
+		const $m = $l(draining_turns.v);
+		let $n = null;
+		if ($m[0] === 0) {
+			const draining = $m[1];
+			$n = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$l = undefined;
+			$n = undefined;
 		}
-		$h = $l;
+		$j = $n;
 	}
-	return $h;
+	return $j;
+}
+function $e(self, value, $f) {
+	self[0].v = value;
+	$g(self, $f);
 }
 function $b(self, transform, $c) {
 	const derived = $a(transform($d(self)));
@@ -128,7 +131,7 @@ function $b(self, transform, $c) {
 	} ]);
 	return derived;
 }
-function $m(self, observer) {
+function $o(self, observer) {
 	const id = fresh_id();
 	self[1].v.push([ id, () => {
 		observer($d(self));
@@ -137,15 +140,15 @@ function $m(self, observer) {
 	observer($d(self));
 	return [ self[1], id ];
 }
-function $n(self, item, $o) {
+function $p(self, item, $q) {
 	self[0].v.push(() => {
-		dispose(item, $o);
+		dispose(item, $q);
 		return;
 	});
 	return item;
 }
-function $s(self, transform, $t) {
-	$e(self, transform($d(self)), $t);
+function $u(self, transform, $v) {
+	$e(self, transform($d(self)), $v);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -154,15 +157,15 @@ const count = $a(0);
 const doubled = $b(count, (n) => {
 	return n * 2;
 }, [ 1 ]);
-$n(owner, $m(doubled, (n) => {
+$p(owner, $o(doubled, (n) => {
 	return console.log(n);
 }), [ 1 ]);
 $e(count, 1, [ 1 ]);
-$s(count, (n) => {
+$u(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($d(doubled));
-$n(owner, $m(count, (n) => {
+$p(owner, $o(count, (n) => {
 	return console.log(n);
 }), [ 1 ]);
 $e(count, 20, [ 1 ]);

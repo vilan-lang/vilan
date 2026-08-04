@@ -4140,6 +4140,346 @@ fn dispose_in_a_batch_scrubs_the_pending_notify() {
     );
 }
 
+// --- `Signal::update`: in-place mutation (A18, proposal/signal-update.md) ---
+// The closure receives a writable view of the STORED value and the runtime
+// notifies once, unconditionally, after it returns. `sync` is the `await`
+// fence; the view obeys rule 3 like any other.
+
+#[test]
+fn update_mutates_a_list_in_place_and_a_later_get_sees_it() {
+    // A18's headline case: a push through the view, no copy-transform-return.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun main() {
+            let todos = Signal::new([1, 2]);
+            todos.update(|&mut list| { list.push(5); });
+            print(todos.get().len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn update_generalizes_over_every_collection() {
+    // The point of the design: one method serves `Map` and `Set` (and a user
+    // struct) exactly as it serves `List` — no per-container twin.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::set::Set;
+        import std::reactive::Signal;
+        struct Counter { hits: i32 }
+        fun main() {
+            let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+            scores.update(|&mut m| { m.insert("a", 1); m.insert("b", 2); });
+            print(scores.get().len());
+
+            let tags: Signal<Set<i32>> = Signal::new(Set::new());
+            tags.update(|&mut s| { s.insert(7); });
+            print(tags.get().len());
+
+            let counter = Signal::new(Counter { hits = 0 });
+            counter.update(|&mut c| { c.hits = 9; });
+            print(counter.get().hits);
+        }
+        "#,
+        "2\n1\n9\n",
+    );
+}
+
+#[test]
+fn update_over_a_scalar_signal_writes_through_the_view() {
+    // The scalar leg. `Shared::write()` over a scalar pointee lowers to its
+    // `(base, key)` pair, so the closure's `&mut i32` writes the cell rather
+    // than a stray number (which crashed at runtime before the fix).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun main() {
+            let count = Signal::new(1);
+            count.update(|&mut n| { n = *n + 10; });
+            print(count.get());
+        }
+        "#,
+        "11\n",
+    );
+}
+
+#[test]
+fn update_notifies_exactly_once_per_call() {
+    // Unconditional and single: two `update`s produce two notifications, one
+    // each, after the closure returns — never per mutation inside it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Owner };
+        fun main() {
+            let owner = Owner::new();
+            let xs = Signal::new([0]);
+            owner.take(xs.sub(|list| print(i"len {list.len()}")));   // immediate: len 1
+            xs.update(|&mut list| { list.push(1); list.push(2); });  // ONE notify, len 3
+            xs.update(|&mut list| { list.push(3); });                // len 4
+        }
+        "#,
+        "len 1\nlen 3\nlen 4\n",
+    );
+}
+
+#[test]
+fn update_notifies_even_when_the_closure_writes_nothing() {
+    // Unconditional, deliberately: `update` matches `set`, which never
+    // compares either. A no-op `mutate` still publishes.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Owner };
+        fun main() {
+            let owner = Owner::new();
+            let xs = Signal::new([0]);
+            owner.take(xs.sub(|list| print(i"len {list.len()}")));
+            xs.update(|&mut list| { });
+        }
+        "#,
+        "len 1\nlen 1\n",
+    );
+}
+
+#[test]
+fn update_coalesces_under_batch() {
+    // `update` shares `set`'s notify half verbatim, so turn deferral and dedup
+    // are inherited: two updates inside one `batch` settle as ONE notification
+    // at the boundary, carrying the final value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Owner, batch };
+        fun main() {
+            let owner = Owner::new();
+            let xs = Signal::new([0]);
+            owner.take(xs.sub(|list| print(i"len {list.len()}")));   // immediate: len 1
+            batch(|| {
+                xs.update(|&mut list| { list.push(1); });
+                xs.update(|&mut list| { list.push(2); });
+                print("inside");
+            });
+        }
+        "#,
+        "len 1\ninside\nlen 3\n",
+    );
+}
+
+#[test]
+fn a_reentrant_get_inside_update_sees_the_in_progress_value() {
+    // `mutate` writes STORAGE, so a read from inside the closure observes the
+    // mutations made so far — uniformly for an aggregate and for a scalar (a
+    // scalar view writes the same `(cell, "v")` slot `get` reads).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun main() {
+            let xs = Signal::new([1, 2]);
+            xs.update(|&mut list| {
+                list.push(3);
+                print(i"aggregate {xs.get().len()}");
+            });
+            let n = Signal::new(1);
+            n.update(|&mut value| {
+                value = *value + 10;
+                print(i"scalar {n.get()}");
+            });
+        }
+        "#,
+        "aggregate 3\nscalar 11\n",
+    );
+}
+
+#[test]
+fn update_refuses_a_view_escaping_its_closure() {
+    // Rule 3 holds for the callback's parameter exactly as for any other view:
+    // storing it in a struct field is the ordinary escape error.
+    assert_fails_with(
+        r#"
+        import std::reactive::Signal;
+        struct Hold { slot: &mut List<i32> }
+        fun main() {
+            let xs = Signal::new([1]);
+            xs.update(|&mut list| { let held = Hold { slot = list }; });
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn set_with_still_copies_and_transforms() {
+    // `update` does not replace `set_with`: the transform form is unchanged,
+    // and its `mut` copy is still a copy (the source list is untouched).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun main() {
+            mut seed = [1, 2];
+            let numbers = Signal::new(seed);
+            numbers.set_with(|mut list| {
+                list.push(5);
+                list
+            });
+            print(numbers.get().len());
+            print(seed.len());
+            let count = Signal::new(1);
+            count.set_with(|n| n + 4);
+            print(count.get());
+        }
+        "#,
+        "3\n2\n5\n",
+    );
+}
+
+// --- the language mechanism `update` needed: a closure literal's parameters
+// --- take the full parameter grammar (conventions included), not just `mut`.
+
+#[test]
+fn a_closure_parameter_takes_the_mut_view_convention() {
+    // `|&mut x|` is the prefix spelling; the callee mutates the CALLER's value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply(target: &mut List<i32>, mutate: sync |&mut List<i32>| void) {
+            mutate(target);
+        }
+        fun main() {
+            mut data = [1, 2];
+            apply(&mut data, |&mut list| { list.push(5); });
+            print(data.len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_closure_parameter_takes_the_view_convention_from_its_type() {
+    // The type-position spelling, inferred the same way a `fun` parameter's is.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply(target: &mut List<i32>, mutate: sync |&mut List<i32>| void) {
+            mutate(target);
+        }
+        fun main() {
+            mut data = [1, 2];
+            apply(&mut data, |list: &mut List<i32>| { list.push(5); });
+            print(data.len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_bare_closure_parameter_still_refuses_mutation() {
+    // The asymmetry closed only the view spelling: an unannotated parameter is
+    // still by value, and mutating it still steers to `mut` or `&mut`.
+    assert_fails_with(
+        r#"
+        fun apply(seed: List<i32>, mutate: sync |List<i32>| void) { mutate(seed); }
+        fun main() {
+            apply([1, 2], |list| { list.push(5); });
+        }
+        "#,
+        "cannot mutate immutable 'list'",
+    );
+}
+
+#[test]
+fn a_closure_parameter_refuses_mut_combined_with_a_convention() {
+    // `mut` and a convention stay non-composable in closure position too
+    // (proposal/mut-parameters.md §2), now that both are spellable there.
+    assert_fails_with(
+        r#"
+        fun apply(target: &mut List<i32>, mutate: sync |&mut List<i32>| void) {
+            mutate(target);
+        }
+        fun main() {
+            mut data = [1];
+            apply(&mut data, |&mut mut list| { list.push(5); });
+        }
+        "#,
+        "it cannot combine with `own` or a view",
+    );
+}
+
+#[test]
+fn a_scalar_shared_write_passes_as_a_mut_view() {
+    // The pre-existing bug `update`'s scalar leg exposed, pinned on its own
+    // terms — no `Signal` involved. `Shared::write()` over a scalar handed the
+    // callee the VALUE, and `slot[0][slot[1]]` on a number crashed at runtime.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        fun replace<T>(slot: &mut T, value: T) { slot = value; }
+        fun main() {
+            let cell: Shared<i32> = Shared::new(1);
+            replace(cell.write(), 9);
+            print(cell.read());
+            let listed: Shared<List<i32>> = Shared::new([1, 2]);
+            replace(listed.write(), [3, 4, 5]);
+            print(listed.read().len());
+        }
+        "#,
+        "9\n3\n",
+    );
+}
+
+#[test]
+fn a_shared_write_assignment_is_unchanged_for_both_pointees() {
+    // The assign-through path keeps taking the `v` slot, so the pair lowering
+    // above cannot regress `cell.write() = x` for a scalar or an aggregate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::shared::Shared;
+        fun main() {
+            let flag: Shared<bool> = Shared::new(false);
+            flag.write() = true;
+            print(flag.read());
+            let listed: Shared<List<i32>> = Shared::new([1]);
+            listed.write().push(2);
+            listed.write() = [7, 8, 9];
+            print(listed.read().len());
+        }
+        "#,
+        "true\n3\n",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing: the `sync` contract is not enforced for a \
+`void`-returning closure parameter — `sync || void` accepts an awaiting \
+closure where `sync || i32` refuses it (proposal/signal-update.md §8). \
+`Signal::update` declares `sync` for the correct contract; un-ignore when \
+the void-return gap closes."]
+fn a_sync_void_parameter_refuses_an_async_closure() {
+    assert_fails_with(
+        r#"
+        import std::time::sleep;
+        fun run_now(body: sync || void) { body(); }
+        fun main() {
+            run_now(|| { sleep(1); });
+        }
+        "#,
+        "requires a synchronous closure (`sync`)",
+    );
+}
+
 // === RPC foundation: the generic `call` helper (examples/rpc §4.1) ================
 
 #[test]
