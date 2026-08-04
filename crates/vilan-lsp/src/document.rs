@@ -761,10 +761,6 @@ pub struct Document {
     /// is no second `String` to keep in step.
     analyzed_index: Arc<LineIndex>,
     pub program: Option<Program<'static>>,
-    /// Evaluated `const` results (E9: hover shows a constant's VALUE). The
-    /// evaluation is fuel-capped and skips itself on any diagnostic, so a
-    /// broken document costs nothing.
-    pub const_results: std::collections::HashMap<Id, vilan_core::interpreter::ConstValue>,
     pub diagnostics: Vec<Error>,
     /// The source file each diagnostic belongs to, parallel to `diagnostics`
     /// (`SourceId(0)` = this document; imported modules publish to their own
@@ -987,7 +983,6 @@ impl Document {
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program: None,
-            const_results: Default::default(),
             diagnostics: vec![Error {
                 note: None,
                 span: vilan_core::span::Span::new((), 0..0),
@@ -1077,28 +1072,12 @@ impl Document {
             .as_ref()
             .map(vilan_core::platform_color::requirements)
             .unwrap_or_default();
-        // Evaluate `const`s so hover can show their VALUES (E9). `evaluate`
-        // skips itself on any diagnostic and is fuel-capped; its own errors
-        // are already published by the build, so the editor drops them here
-        // (squiggling them is the build's job — same wording, same spans).
-        let const_results = program
-            .as_ref()
-            .map(|program| {
-                vilan_core::const_eval::evaluate(
-                    program,
-                    &vilan_core::options::BuildOptions::default(),
-                )
-                .0
-            })
-            .unwrap_or_default();
-
         Document {
             // A fresh analysis IS the analyzed text: the map is identity.
             live_edits: Some(Vec::new()),
             analyzed_index: Arc::clone(&line_index),
             line_index,
             program,
-            const_results,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -1389,7 +1368,6 @@ impl Document {
             retained_tail_start: _,
             analyzed_index,
             program,
-            const_results,
             diagnostics,
             diagnostic_sources,
             warnings,
@@ -1404,7 +1382,6 @@ impl Document {
         // The analysis side, in full.
         self.analyzed_index = analyzed_index;
         self.program = program;
-        self.const_results = const_results;
         self.diagnostics = diagnostics;
         self.diagnostic_sources = diagnostic_sources;
         self.warnings = warnings;
@@ -1801,7 +1778,7 @@ impl Document {
             _ => id,
         };
         let initial = program.variables.get(&binding)?.initial?;
-        let value = self.const_results.get(&initial)?;
+        let value = program.const_results.get(&initial)?;
         fn render(value: &vilan_core::interpreter::ConstValue, out: &mut String) {
             use vilan_core::interpreter::ConstValue;
             match value {

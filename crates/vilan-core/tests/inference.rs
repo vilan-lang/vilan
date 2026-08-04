@@ -14999,6 +14999,46 @@ fn reaching_functions_inside_const_are_fine() {
     );
 }
 
+#[test]
+fn analysis_leaves_the_const_results_on_the_program() {
+    // The invariant the LSP relies on (const-eval.md §8.3): `analyze_source`
+    // already evaluated every `const`, so no consumer needs a second pass to
+    // read the values — hover reads `program.const_results` directly.
+    let source = r#"
+        fun square(n: i32): i32 { n * n }
+        fun main() {
+            let _folded = const square(7);
+        }
+        main();
+        "#
+    .to_string();
+    let values = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            program
+                .map(|program| program.const_results.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        values,
+        vec![vilan_core::interpreter::ConstValue::Number(49.0)],
+        "the folded value must survive on the program"
+    );
+}
+
 // Deep failure attribution (const-eval.md §8.2): the primary span stays the
 // `const` expression — there is no inner span to move to — but the frame trace
 // names the function the failure happened in and notes its declaration.
