@@ -32,6 +32,105 @@ so hover, go-to-def, typed diagnostics, functions, impls, and operator sugar
 all work out of the box, with no DSL toolchain to build. (The macro draft
 survives in git history; its §8 rejection rationale now lives here, inverted.)
 
+## 0bis. Status — the tail, reconciled 2026-08-04
+
+The status paragraph above was written the day the core shipped (2026-07-10)
+and never reconciled; it predates the STATUS convention. Every piece it lists
+as "Remaining" was re-verified against the tree at `e662973`. The table is the
+record; the sections it points at carry the design.
+
+| Piece | Verdict | Evidence |
+|---|---|---|
+| `bind_styled(Signal<Style>)` | **VERIFIED OPEN** | `bind_styled` appeared nowhere outside three prose lines (this file, `backlog-2026-07-18.md`, `backlog.md`). Both twins carried `bind_text`/`bind_class`/`bind_attr`/`bind_value`/`bind_draft`/`bind_each` and no `bind_styled`; `guide/styling.md` documented `bind_class` as the standing workaround. |
+| dark×pseudo composition | **VERIFIED OPEN** | `Style::pseudo` panicked on `parts[1] != ""`, refusing **both** nesting directions (`dark(hover(..))` and `hover(dark(..))`). Cause was structural, not a missing case: the slot key `media:pseudo:property` has no third position and `dark` occupied the pseudo slot. `style.vl`'s semantics were unchanged since `ad691a7` (2026-07-10) — the only later commits are a reflow and doc comments. |
+| the html `<link>` scaffold | **VERIFIED OPEN** (emit half shipped) | Emission shipped: `write_assets` (`crates/vilan-cli/src/main.rs`) writes `<out>.css` on `build`, `run`, `run --watch`, workspace and HMR paths. The *link* half existed only as hand-written bytes in two examples. No template linked it, and `examples/reactive-ui` **emitted `app.css` (pinned in `tests/examples.rs`) while its `index.html` never loaded it** — const styles compiled and then thrown away, the sharpest evidence the hookup was unfinished. |
+| `vilan fmt` chain splitting | **VERIFIED SHIPPED** — `9a3d9af`, 2026-07-28 | "vilan fmt splits method chains over 100 columns"; extended by the 2026-08-01 formatter arc (backlog 42–49, notably `bad9510`'s width-independent `})` seam rule). `formatter.rs` carries `LINE_BUDGET = 100`, `is_breakable_chain`, and style-chain pins including a literal `const style().display(..).flex_direction(..).gap(..)` case. Probed with the worktree binary: a 128-column style chain splits one link per line. **The "(or preserve)" half of §1's note is rejected by design, not open** — the formatter has one canonical output and no width knob, and `an_under_width_hand_split_chain_collapses` pins the rejoin. §1's note is corrected in place. |
+| the property long tail | **VERIFIED OPEN, quantified** | Supply: 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
+| critical CSS | **OPEN, out of this arc's scope** | A7-entangled; still §6 slice 6, proposal-only. Left filed. |
+| liveness-tied dead-style elimination | **OPEN, out of this arc's scope** | Rides G2's liveness-tied emission. Left filed. |
+
+Two verification by-products, filed rather than fixed here:
+
+- **`View.style_var` leaks its subscription** (browser twin). It is the only
+  reactive `View` method that calls `source.sub(..)` and parks the handle in a
+  `let _sub` instead of going through `source.effect(..)`, so the subscription
+  is never handed to the ambient owner and outlives its boundary's disposal.
+  Every sibling binder (`bind_text`, `bind_class`, `bind_attr`, `show`) uses
+  `effect`. Not touched here — it is a reactive-ownership bug, not a styling
+  one, and it wants its own pin.
+- **`view.class_name(..)` is vapor.** §2.3 and §4 below promise it for
+  third-party CSS; the shipped method is `.class(..)`. The prose is corrected
+  in place; no API is renamed.
+
+### 0bis.1 The demand sweep (what the long tail actually is)
+
+The 341 `raw` sites are not one tail but two, and the split decides what a
+property slice should buy:
+
+- **Properties with no typed method at all** — led by the inset family
+  (`top` 22, `left` 20, `right` 6, `bottom` 4, `inset` 3), `font-family` (25,
+  and the docs' own canonical example of a gap), `transform` (13),
+  `white-space` (9), `text-decoration` (9), `user-select` (8), `flex` (8),
+  `grid-template-columns` (7), `letter-spacing` (6), `box-shadow` (6),
+  `border-color` (5).
+- **Properties that ARE typed but whose value type cannot hold the value** —
+  about 120 sites. `background(Color)` bypassed 36 times for gradients and
+  `rgba`; `border(Length, Color)` 19 times for `none` and for recolouring
+  under `:hover` without restating the width; `width`/`height` 28 times for
+  `calc()`; `min_height` for `100vh`; `letter-spacing` for `em`. The root
+  cause is two value types, not twenty missing methods: `Length` had no
+  `em`/`vh`/`vw`/`calc()`, and there is no per-edge border surface.
+
+The first slice below takes the first group down to its ≥5-site head plus the
+value-type units the head needs, and leaves the rest to `raw` — deliberately.
+§2.3's bargain still holds: the typed surface buys checking and completion for
+what people actually write; an exhaustive CSS mirror buys neither.
+
+### 0bis.2 Design — dark × pseudo composes on one axis
+
+Settled here rather than by owner call: the mechanism follows directly from
+what the emitter already does, and the naming question has a precedent.
+
+The slot key stays three fields, but the middle one is a **condition**, not a
+pseudo-class. A condition is `""`, a pseudo-class (`hover`), the dark marker
+(`dark`), or dark stacked over a pseudo-class (`dark hover`) — the space
+mirroring the descendant combinator the selector renders. So:
+
+```
+""            .sX{..}
+"hover"       .sX:hover{..}
+"dark"        :root[data-theme="dark"] .sX{..}
+"dark hover"  :root[data-theme="dark"] .sX:hover{..}
+```
+
+Three consequences, all deliberate:
+
+- **Existing slot keys are unchanged, so every already-emitted class name is
+  unchanged.** Class names are content hashes of `key|declaration`; widening
+  the key to a fourth field would have rehashed every rule in every build for
+  no user-visible gain, and cross-program determinism is a shipped property of
+  this system.
+- **Nesting order is `dark(hover(..))`, and the reverse is refused** with a
+  message naming the fix. This is the `md(hover(..))` rule generalized:
+  conditions nest outside-in in the order the CSS nests them
+  (`@media` → the dark ancestor → the pseudo suffix). `md(dark(hover(..)))`
+  therefore composes for free — `media` already carries a condition through
+  untouched.
+- **The composed selector keeps `:` as its first byte**, which is what keeps
+  B35's ordering sound. `assemble_assets` has no "base < pseudo < media"
+  comparator; that band ordering falls out of ASCII (`.` < `:` < `@`) with a
+  numeric override for `@media` min-widths only. A composed dark rule sorts
+  into the same band as every other dark rule, and its specificity (0,3,0)
+  beats plain `dark` and plain `hover` (both 0,2,0) — so the cascade resolves
+  by specificity and never by the sort. This was exactly the class of bug B35
+  was; the invariant is now stated where the emitter can be read against it.
+
+The pre-existing tie it does **not** change: `dark(x)` and `hover(y)` on the
+same property are both (0,2,0) and are resolved by source order, where `.`
+sorting before `:` makes dark win. That is deterministic and defensible (a
+mode should not be undone by a state), and `dark(hover(..))` is now the
+precise way to say otherwise. Recorded, not altered.
+
 ## 0. The problem
 
 `std::ui` builds and updates DOM; nothing styles it. Handwritten CSS is the
@@ -76,9 +175,11 @@ view.class(card + active);   // padding resolves to space(6) — LAST WINS, alwa
   that grows and collides (`color`, `display` as user locals), and `.`-
   completion over the whole property surface — the discoverability the
   expression-flavored pivot was for. `+` (`impl Style with Add`) remains the
-  combinator for NAMED styles (variants). Implementation note: `vilan fmt`
-  should split (or preserve) multiline chains — check when the std module
-  lands.
+  combinator for NAMED styles (variants). Implementation note, **answered
+  2026-07-28 (`9a3d9af`)**: `vilan fmt` splits a chain over 100 columns, one
+  link per line. It does not *preserve* a hand-split narrow chain — the
+  formatter has one canonical output by design, so an under-width chain
+  rejoins.
 - **A `Style` value** is a map from property-slot → atomic class name. Each
   `(property, value, condition)` triple lowers to one CSS rule with a
   **content-hashed class name** (never a counter — deterministic across
@@ -169,8 +270,10 @@ atomic rule with the condition baked in:
   explicit, SSR-friendly control; an auto `prefers-color-scheme` mode is a
   recorded refinement.
 - Condition methods take a `Style` built by its own chain
-  (`.hover(style().background(..))`); one pseudo + one media may stack;
-  deeper nesting deferred.
+  (`.hover(style().background(..))`). **Stacking (as of 2026-08-04, §0bis.2):**
+  media × dark × pseudo, nested outside-in in that order —
+  `md(dark(hover(..)))`. Any other nesting order is refused with a message
+  naming the fix; pseudo-over-pseudo stays unsupported.
 
 ### 2.3 The escape hatch
 
@@ -179,7 +282,8 @@ The typed property surface covers the core that styles 90% of real UI
 the ~60-function std list, to be written out in slice 3). The tail does not
 block: `raw("mask-image", "linear-gradient(..)")` lowers to an atomic rule
 like any other, minus value validation. Plain string classes coexist
-untouched (`view.class_name("leaflet-container")`) for third-party CSS.
+untouched (`view.class("leaflet-container")` — the method shipped as `class`,
+not the `class_name` this draft assumed) for third-party CSS.
 
 ## 3. The construct-in-const rule (variant completeness)
 
@@ -214,7 +318,8 @@ proposal adds only:
   per map identity); reactive class switching composes with the existing
   turn/ownership machinery, staying a predictable map union under any
   interleaving. `view.style_var(name, signal)` writes custom properties for
-  dynamic values. Plain-string `class_name` remains.
+  dynamic values, and `view.bind_styled(signal)` (2026-08-04) swaps a whole
+  compiled style reactively. Plain-string `class` remains.
 - **HTML hookup**: browser builds emit `<out>.css`; the html host links it;
   A7's server render later inlines critical CSS via the same channel.
 - Server-layer code may hold `Style` values (plain data); platform rules are
