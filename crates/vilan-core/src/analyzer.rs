@@ -26248,8 +26248,37 @@ struct World<'src> {
     // own CLONE and expands against it, post-snapshot, on hit and miss
     // alike.
     macro_registry: crate::macros::MacroRegistry,
-    phase_analyze_start: crate::PhaseClock,
-    phase_base: std::time::Duration,
+    phase_marks: PhaseMarks,
+}
+
+/// The `VILAN_PHASE_TIMING` marks that belong to ONE analysis: when it
+/// started, and what its own base resolution cost. A base-cache HIT restores
+/// someone else's world, so both must be replaced together — the hit paid no
+/// base cost at all.
+///
+/// They are one field because they were two, and the hit path refreshed only
+/// the start instant: a warm analysis then printed `load+walk` as a fresh
+/// (small) elapsed MINUS a cold (large) cached base, and `Duration`'s
+/// subtraction panics on underflow. The marks run inside `analyze_source`'s
+/// `catch_unwind`, so the whole analysis returned `None` — with the
+/// instrument on, every analysis after the first in a process silently
+/// produced no program. Refreshing half of a pair is the bug this shape
+/// makes unrepresentable.
+#[derive(Clone, Copy)]
+struct PhaseMarks {
+    started: crate::PhaseClock,
+    base: std::time::Duration,
+}
+
+impl PhaseMarks {
+    /// The marks for an analysis starting now that has resolved no base of
+    /// its own — a base-cache hit, whose world came ready-made.
+    fn started_at(started: crate::PhaseClock) -> PhaseMarks {
+        PhaseMarks {
+            started,
+            base: std::time::Duration::ZERO,
+        }
+    }
 }
 
 pub fn analyze<'src>(
@@ -26340,7 +26369,7 @@ fn analyze_inner<'src>(
         world.sources[0] = entry_path.to_path_buf();
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
-        world.phase_analyze_start = phase_analyze_start;
+        world.phase_marks = PhaseMarks::started_at(phase_analyze_start);
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
             // Generated code demands a module this world never loaded:
             // rebuild fresh, with the load-region expansion restored.
@@ -27562,8 +27591,10 @@ fn analyze_inner<'src>(
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_struct_id,
-        phase_analyze_start,
-        phase_base,
+        phase_marks: PhaseMarks {
+            started: phase_analyze_start,
+            base: phase_base,
+        },
     };
     if base_cacheable && !entry_is_module {
         base_cache_store(platform, entry_seed_names, &world);
@@ -27615,8 +27646,7 @@ fn analyze_over_world<'src>(
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_struct_id,
-        phase_analyze_start,
-        phase_base,
+        phase_marks,
     } = world;
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
@@ -27637,7 +27667,7 @@ fn analyze_over_world<'src>(
     // Constraint resolution and the post-passes attribute their diagnostics per
     // anchor; anything unattributed defaults to the entry file.
     analyzer.set_current_source(SourceId(0));
-    let phase_load_walk = phase_analyze_start.elapsed();
+    let phase_load_walk = phase_marks.started.elapsed();
     let phase_build_start = crate::PhaseClock::now();
     analyzer.build();
     let phase_build = phase_build_start.elapsed();
@@ -28265,8 +28295,8 @@ fn analyze_over_world<'src>(
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
             "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
-            (phase_load_walk - phase_base).as_secs_f64() * 1000.0,
-            phase_base.as_secs_f64() * 1000.0,
+            (phase_load_walk - phase_marks.base).as_secs_f64() * 1000.0,
+            phase_marks.base.as_secs_f64() * 1000.0,
             phase_build.as_secs_f64() * 1000.0,
             phase_checks_start.elapsed().as_secs_f64() * 1000.0,
         );
