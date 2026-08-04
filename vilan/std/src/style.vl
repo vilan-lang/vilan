@@ -16,6 +16,15 @@
 // stylesheet plateau). Themeable tokens carry their value as a CSS custom
 // property (`var(--space-4)`) plus the `:root` line declaring it — re-theming
 // and dark mode swap property values with zero recompilation.
+//
+// Properties that COVER other properties (`padding` over its four edges,
+// `border` over its parts) form FAMILIES, and last-wins holds across a family,
+// not just across one property (§0bis.4): a shorthand set later drops the
+// slots it covers, and a shorthand's rule renders `*.sX{..}` so the lexical
+// sort puts it ahead of its family's longhands. The two meet exactly — a
+// shorthand and a longhand survive together only when the longhand came last —
+// so a family resolves by AUTHORING order, the way every other merge here
+// does, and never by the class-name sort.
 
 import pkg::asset::emit;
 import pkg::io::panic;
@@ -448,6 +457,72 @@ fun style(): Style {
 	Style { rules = Map::new() }
 }
 
+/// The shorthand-to-longhand table (§0bis.4): the properties a property
+/// COVERS, `;`-delimited and `;`-terminated at both ends so membership is one
+/// `contains(";" + property + ";")`. Everything else maps to "" and is a
+/// longhand (or a property with no family at all).
+///
+/// One whole-box shorthand per family, and everything it covers is a longhand
+/// — which is what keeps `border` ahead of `border-top` while `border-top`
+/// stays ahead of nothing. Deliberately NOT prefix-based: `border-radius`,
+/// `border-collapse` and `flex-direction` share a prefix with a shorthand and
+/// are not covered by it. Every row is earned by a real site in the demand
+/// sweep; a new property method that is a CSS shorthand over another writable
+/// property adds its row here in the same commit.
+///
+/// `raw` writes slots like any other method, so its properties are placed by
+/// this table too — `border_none()` IS `raw("border", "none")`, and the two
+/// live instances of the hazard this fixes both had `raw` on one side.
+fun family_longhands(property: str): str {
+	match property {
+		"padding" => ";padding-top;padding-right;padding-bottom;padding-left;",
+		"margin" => ";margin-top;margin-right;margin-bottom;margin-left;",
+		"inset" => ";top;right;bottom;left;",
+		"flex" => ";flex-grow;flex-shrink;flex-basis;",
+		"background" => ";background-color;background-image;background-position;background-size;background-repeat;background-attachment;background-origin;background-clip;",
+		"border" => border_longhands(),
+		_ => "",
+	}
+}
+
+/// `border`'s longhands: the three part shorthands, the four edges, and the
+/// twelve `border-<edge>-<part>` leaves. Built rather than written out, so
+/// each edge and part name appears once.
+fun border_longhands(): str {
+	mut out = ";border-width;border-style;border-color;";
+	for edge in ["top", "right", "bottom", "left"] {
+		out = out + i"border-{edge};";
+		for part in ["width", "style", "color"] {
+			out = out + i"border-{edge}-{part};";
+		}
+	}
+	out
+}
+
+/// Drops every slot the incoming `property` covers, under the SAME media and
+/// condition — the ordinary last-wins rule widened from one property to its
+/// family. A map removal and nothing else: no emission, so `+` resolves a
+/// family exactly as a chain does even though it is runtime-legal.
+fun without_covered(
+	rules: Map<str, (str, str)>,
+	media: str,
+	condition: str,
+	property: str,
+): Map<str, (str, str)> {
+	let longhands = family_longhands(property);
+	if longhands == "" {
+		ret rules;
+	}
+	mut out = rules;
+	for key in rules.keys() {
+		let parts = key.split(":");
+		if parts[0] == media && parts[1] == condition && longhands.contains(";" + parts[2] + ";") {
+			out.remove(key);
+		}
+	}
+	out
+}
+
 /// Whether a condition slot carries the dark marker — `"dark"` alone, or
 /// `"dark hover"` stacked over a pseudo-class.
 fun is_dark(condition: str): bool {
@@ -480,8 +555,21 @@ fun condition_pseudo(condition: str): str {
 /// carries a pseudo-class, so every dark rule lands in one band; composed
 /// rules then win their cascade on SPECIFICITY (0,3,0 over the 0,2,0 of plain
 /// `dark` and plain `:hover`), never on the sort.
-fun render_rule(media: str, condition: str, class: str, declaration: str): str {
-	mut selector = "." + class;
+///
+/// A family SHORTHAND carries one more sort marker, on the same principle
+/// (§0bis.4): its selector is `*.sX` rather than `.sX`. `*` is 0x2A and `.` is
+/// 0x2E, so every shorthand rule sorts ahead of its family's longhands inside
+/// its own band, and the band order simply grows a step to `*` < `.` < `:` <
+/// `@`. The marker is free of side effects: `*.sX` is the same compound
+/// selector as `.sX` matching the same elements at the same specificity (the
+/// universal selector contributes nothing), so the condition axis — which is
+/// also specificity — is exactly as it was.
+fun render_rule(media: str, condition: str, property: str, class: str, declaration: str): str {
+	mut selector = if family_longhands(property) == "" {
+		"." + class
+	} else {
+		"*." + class
+	};
 	if is_dark(condition) {
 		selector = ":root[data-theme=\"dark\"] " + selector;
 	}
@@ -497,12 +585,14 @@ fun render_rule(media: str, condition: str, class: str, declaration: str): str {
 }
 
 impl Style {
-	/// The one chokepoint: hash the slot, emit the atomic rule, insert last-wins.
+	/// The one chokepoint: hash the slot, emit the atomic rule, insert
+	/// last-wins — across the property's whole FAMILY, so a shorthand set here
+	/// clears the longhands it covers under this condition (§0bis.4).
 	fun rule(self, media: str, condition: str, property: str, declaration: str): Style {
 		let key = media + ":" + condition + ":" + property;
 		let class = class_hash(key + "|" + declaration);
-		emit("css", render_rule(media, condition, class, declaration));
-		mut rules = self.rules;
+		emit("css", render_rule(media, condition, property, class, declaration));
+		mut rules = without_covered(self.rules, media, condition, property);
 		rules.insert(key, (class, declaration));
 		Style { rules = rules }
 	}
@@ -620,10 +710,10 @@ impl Style {
 	// One edge at a time. The four come in as a FAMILY (§0bis.3): the sweep
 	// wanted `padding-left`, `padding-right` and `padding-top`, and splitting
 	// one CSS concept by a count is the cut the inset family already refused.
-	// Note `padding_x`/`padding_y` write these same slots, so mixing them is
-	// an ordinary last-wins override — whereas mixing an edge with the
-	// `padding` SHORTHAND leaves two equally specific rules whose order the
-	// class-name sort decides. One arity per family (§0bis.3's hazard note).
+	// `padding_x`/`padding_y` write these same slots, so mixing them with an
+	// edge is an ordinary last-wins override; mixing an edge with the `padding`
+	// SHORTHAND resolves by authoring order too, through the family rules in
+	// `rule` and `render_rule` (§0bis.4).
 
 	fun padding_top(self, value: Length): Style {
 		self.with_length("padding-top", value)
@@ -1047,14 +1137,26 @@ impl Style {
 	}
 }
 
-// `+` combines NAMED styles: per-property, right side wins. Runtime-legal —
-// the rules were already emitted when each side was constructed.
+// `+` combines NAMED styles: per-property, right side wins — and per FAMILY,
+// so a `border` on the right clears a `border-color` on the left exactly as it
+// would inside one chain. Still runtime-legal: the rules were already emitted
+// when each side was constructed, and resolving a family here is a map removal
+// (§0bis.4 — the `+` path is why the fix could not be a shorthand SPLIT, which
+// would have had to emit rules that did not exist yet).
+//
+// `b`'s slots replay in b's own insertion order, which is its authoring order,
+// so a right side that itself mixes a shorthand and a longhand lands the same
+// way it resolved on its own.
 impl Style with Add {
 	fun add(self, b: Style): Style {
 		mut rules = self.rules;
 		for key in b.rules.keys() {
 			match b.rules.get(key) {
-				Some(let entry) => rules.insert(key, entry),
+				Some(let entry) => {
+					let parts = key.split(":");
+					rules = without_covered(rules, parts[0], parts[1], parts[2]);
+					rules.insert(key, entry);
+				}
 				None => {}
 			}
 		}

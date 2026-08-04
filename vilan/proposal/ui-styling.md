@@ -54,6 +54,7 @@ record; the sections it points at carry the design.
 | the html `<link>` scaffold | **VERIFIED OPEN → SHIPPED 2026-08-04** | Both `vilan init` browser-bearing templates carry the `<link>`, and both scaffolds now build a style so the link is live (the `cfeb585` move — the todo example dropping handwritten CSS for `std::style` — applied to the scaffolds); the fullstack template also gained the `/client.css` route, guarded with `fs::exists` so deleting every style doesn't crash the server at boot. `examples/reactive-ui` gained the link it was missing. 3 pins: init asserts emitted-AND-linked for the browser template, and asserts the served page links `/client.css` AND that the route returns the rules for the fullstack one; the examples gate grew a GENERAL rule — every emitted stylesheet must be linked by one of the example's pages, stated over what the build produced so a new example is covered the day it lands — proven non-vacuous by deleting reactive-ui's link. Verification evidence: emission shipped: `write_assets` (`crates/vilan-cli/src/main.rs`) writes `<out>.css` on `build`, `run`, `run --watch`, workspace and HMR paths. The *link* half existed only as hand-written bytes in two examples. No template linked it, and `examples/reactive-ui` **emitted `app.css` (pinned in `tests/examples.rs`) while its `index.html` never loaded it** — const styles compiled and then thrown away, the sharpest evidence the hookup was unfinished. |
 | `vilan fmt` chain splitting | **VERIFIED SHIPPED** — `9a3d9af`, 2026-07-28 | "vilan fmt splits method chains over 100 columns"; extended by the 2026-08-01 formatter arc (backlog 42–49, notably `bad9510`'s width-independent `})` seam rule). `formatter.rs` carries `LINE_BUDGET = 100`, `is_breakable_chain`, and style-chain pins including a literal `const style().display(..).flex_direction(..).gap(..)` case. Probed with the worktree binary: a 128-column style chain splits one link per line. **The "(or preserve)" half of §1's note is rejected by design, not open** — the formatter has one canonical output and no width knob, and `an_under_width_hand_split_chain_collapses` pins the rejoin. §1's note is corrected in place. |
 | the property long tail | **VERIFIED OPEN → BOTH SLICES SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. **The §3b half — the value types — then shipped the same day (§0bis.3):** `Color::rgba`/`.alpha`, the `Gradient` type on the `background-image` slot, `border_none()` and the four border edges, the eight `padding_*`/`margin_*` edges, `Display::InlineFlex`/`InlineGrid`. 8 more pins, all planted (one caught vacuous and rewritten), the corpus `.css` golden **13 lines added and none changed**, and five real `raw` sites in the examples converted with both stylesheets coming out byte-identical. The item CLOSES here; what remains under A8 is only the A7/G2-entangled pieces. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
+| same-family rule ordering (A22) | **RECORDED OPEN → SHIPPED 2026-08-04** | The hazard §0bis.3 filed, fixed per §0bis.4: a family table, a shorthand dropping what it covers under the same condition, and a `*` marker putting shorthand rules ahead of their family's longhands in the existing lexical sort. **Every class name is unchanged** — the marker is in `render_rule`, not in the hash input — so the re-mint permission the slice was granted went unspent. The measurement is why: a scan of all 275 style chains, extensions and `+` merges across the website, examples, docs and tests found the hazard **live in two production sites** (`status_line`'s `margin` + `raw("margin-left")`, `df_node_lit`'s `border` + `raw("border-color")` across a `+`), and one of them is on the runtime-legal `+` path, which cannot emit — which is what ruled out resolving the conflict inside the `Style` by splitting the shorthand. The sweep also found the family inventory was four rows short: `inset` over the placement methods, `background` over the typed colour and gradient slots, and `flex` over `flex-shrink`. |
 | critical CSS | **OPEN, out of this arc's scope** | A7-entangled; still §6 slice 6, proposal-only. Left filed. |
 | liveness-tied dead-style elimination | **OPEN, out of this arc's scope** | Rides G2's liveness-tied emission. Left filed. |
 
@@ -316,7 +317,193 @@ already-minted rules — doubling a longhand's class for specificity
 rule in every build — and class-name stability was this slice's hard
 constraint. The authoring rule goes in the docs instead ("one arity per
 family: the box or its edges, not both"), and the remedy is filed for a slice
-that is allowed to re-mint names.
+that is allowed to re-mint names. **Fixed 2026-08-04 by §0bis.4 (A22)** — and
+the re-mint permission turned out not to be needed.
+
+### 0bis.4 Design — same-family override order (A22)
+
+The hazard §0bis.3 recorded, fixed. The charter for this slice lifted the
+class-name-stability constraint; the design that won does not spend it.
+
+**The measurement first, because it changed the design.** A family conflict is
+two slots on one style, under one condition, whose CSS properties overlap —
+one a shorthand, one something it covers. Scanning every `style()` chain, every
+named-style extension and every `+` merge across the website (the one real
+consumer), the examples, the docs and the tests — 275 chains — found **two
+live instances**, both of which today resolve by a coin flip of the class hash:
+
+- `vilan-website/src/playground_page.vl`, `status_line`:
+  `.margin(space(0)) … .raw("margin-left", "auto")` — a chain.
+- `vilan-website/src/art.vl`, `df_node_lit`:
+  `df_node + style().raw("border-color", …)` — a **`+` merge**, where
+  `df_node` carries `border` from `art_card`.
+
+Two facts follow, and between them they pick the design. First, the hazard is
+live, not theoretical — it is in production styling now. Second, **half of it
+is on the `+` path**, and `+` is runtime-legal (`view.styled(column + nav_row)`
+is an ordinary call in a view function). Anything `+` must do to resolve a
+conflict has to be doable **without emitting a rule**, because reaching `emit`
+from a runtime call is a compile error by construction, and making `add`
+const-only would break every call site that composes styles at render time.
+
+The sweep also corrected the family inventory. The record named two families;
+there are **six**, because `raw` writes CSS properties too and the family
+relation is a fact about the properties, not about which method wrote them:
+`padding`, `margin`, `inset` (over `top`/`right`/`bottom`/`left` — the
+placement methods are that shorthand's longhands and nobody had noticed),
+`border`, `background` (36 `raw("background", …)` sites over the typed
+`background`→`background-color` and `background_gradient`→`background-image`),
+and `flex` (8 `raw("flex", …)` sites over 4 `raw("flex-shrink", …)`).
+
+#### The three candidates
+
+**(a) Emission-order tier — within a family, longhand rules sort after
+shorthand rules.** The mechanism B35 already established: `assemble_assets`
+has no CSS comparator, it sorts lines lexically, and the cascade bands fall out
+of ASCII (`.` < `:` < `@`). Its recorded weakness was that the guarantee is
+stylesheet-global while the conflict is per-element — **and that weakness does
+not apply here.** `view.styled(style)` and `bind_styled(signal)` *set* the
+class attribute from exactly one `Style`; `class(name)` sets it from a string;
+there is no API that unions two styles' class lists onto one element. Two
+styles reach one element only through `+`, which merges them into one `Style`
+first. One element carries one style's slots, so a stylesheet-global order is
+a per-element order.
+
+Its real weakness is a different one: a fixed tier says *longhand beats
+shorthand*, which is Tailwind's rule, not this system's. §0 is explicit that
+merges resolving by stylesheet order instead of authoring order is the chronic
+pain a compiler that owns the pipeline exists to remove, and
+`padding_top(0).padding(4)` must resolve to `1rem` on all four edges.
+
+**(b) Specificity doubling — longhands emit `.sX.sX{..}`.** Rejected on three
+counts. It has (a)'s semantic defect *and* pays for it: the tier at least
+costs nothing, while doubling rewrites the text of every longhand rule in
+every build. It does not compose with the condition axis, which is also
+specificity: a doubled base longhand (0,2,0) ties a plain `hover` shorthand
+(0,2,0), so fixing the family axis breaks the condition axis — the two
+orderings are orthogonal and there is one specificity ladder. And it cannot
+order a pair like `border-top` against `border-color`, which are both
+longhands.
+
+**(c) Resolve at build — last-set-wins per (property, condition) over the
+family expansion.** The chain is ordered and fully known at const time, so a
+`Style` can hold the resolved result and the stylesheet never contains an
+intra-family conflict for one class. Setting `padding` after `padding_top`
+drops the edge; setting `padding_top` after `padding` **splits** the shorthand
+into the edges it still owns. Correct for every pair, including the
+non-subsuming ones (`border_top` against `border_color`), and it needs no
+ordering guarantee at all.
+
+It fails on the fact the measurement turned up. **The split has to emit** —
+`padding-right:1rem` is a rule that did not exist before — and the `+` path
+cannot emit. So (c) resolves the `status_line` chain and leaves `df_node_lit`
+exactly as broken as it is today, or refuses it and breaks the website build.
+Its second cost is that the split materializes rules that were never asked
+for: `border` decomposes into twelve longhands, since `border-color` and
+`border-top` cover different slices of the same twelve and nothing coarser
+separates them.
+
+#### The recommendation: (a), with the shorthand's slot dropped
+
+Take the tier, and remove its semantic defect at the object level rather than
+in the cascade. Two rules, and the interesting part is that they meet exactly:
+
+1. **A shorthand set later drops what it covers.** Inserting a slot whose
+   property covers other properties removes every slot for a covered property
+   *under the same media and condition*. This is the ordinary last-wins rule
+   widened from one property to a family — a map removal, no emission, so it
+   holds on the `+` path too.
+2. **A shorthand's rule sorts before its family's longhands.** A rule whose
+   property is a family shorthand renders `*.sX{..}` rather than `.sX{..}`.
+   `*` is 0x2A and `.` is 0x2E, so the existing lexical sort puts every
+   shorthand rule ahead of every longhand rule inside its own cascade band,
+   and `*.sX` is the same compound selector as `.sX` with the same
+   specificity — the universal selector contributes nothing. B35's ordering is
+   untouched: the numeric `@media` override reads a prefix the marker never
+   appears in, and the band order becomes `*` < `.` < `:` < `@`.
+
+**The tier and authoring order coincide, exactly.** Rule 1 means two slots of
+one family survive together only when the longhand was set *last* — a
+later shorthand would have dropped the longhand. So the one case the tier
+decides is the one where the longhand should win anyway, and the fixed tier
+never has to answer the question it would answer wrongly:
+
+| chain | slots after resolution | winner | by |
+|---|---|---|---|
+| `padding(4).padding_top(0)` | `padding`, `padding-top` | top `0` | the tier |
+| `padding_top(0).padding(4)` | `padding` | all `1rem` | the drop |
+| `padding(4).padding_x(6)` | `padding`, `padding-left`, `padding-right` | `1rem 1.5rem` | the tier |
+| `a{padding} + b{padding-top}` | both | b's top | the tier |
+| `a{padding-top} + b{padding}` | `padding` | b's box | the drop |
+
+The last two are why this design and not (c): `+` keeps "the right side wins"
+in both directions with no emission.
+
+**Specificity is untouched, so the condition axis is untouched.** `*.sX` is
+(0,1,0) exactly as `.sX` was, `*.sX:hover` is (0,2,0), and
+`:root[data-theme="dark"] *.sX` is (0,2,0) — every cross-condition pair
+resolves the way it did before this slice: a `dark` or `hover` shorthand still
+beats a base longhand on specificity, a `dark` longhand still beats a base
+shorthand, and a media block still wins its equal-specificity tie by the `@`
+band. This is the property (b) cannot have.
+
+#### The family table, and `raw`
+
+One level, one whole-box shorthand per family, and its longhands:
+
+| shorthand | covers |
+|---|---|
+| `padding` | `padding-top/right/bottom/left` |
+| `margin` | `margin-top/right/bottom/left` |
+| `inset` | `top`, `right`, `bottom`, `left` |
+| `border` | `border-width/style/color`, `border-top/right/bottom/left`, and the twelve `border-<edge>-<part>` |
+| `background` | `background-color/image/position/size/repeat/attachment/origin/clip` |
+| `flex` | `flex-grow`, `flex-shrink`, `flex-basis` |
+
+Every row is earned by a real site (above); the rule for adding one is that a
+new property method which is a CSS shorthand over another writable property
+adds its row in the same commit. The table is deliberately *not* prefix-based:
+`border-radius`, `border-collapse` and `flex-direction` are not covered by
+`border` and `flex`, and a prefix rule would silently swallow them.
+
+**`raw` participates, by property name — and this is a correction to the
+charter's suggested "raw stays opaque".** It has to: `border_none()` *is*
+`raw("border", "none")`, and both live instances of the hazard have `raw` on
+one side. Opacity would leave them exactly as arbitrary as they are today. The
+honest statement is that `raw` gains no mechanism of its own — it writes a slot
+like every other method, and the slot's property decides its family, because
+the family relation is a fact about CSS. What `raw` genuinely cannot do is
+supply a decomposition (`raw("padding", "1rem 2rem")` cannot be split into
+edges without parsing CSS the language deliberately does not model), and this
+design never needs one. That is a further argument for (a) over (c): (c) is
+the design that would have had to refuse those sites.
+
+#### Consequences, worked through
+
+- **Class names: none change.** The name is `class_hash(key + "|" +
+  declaration)`; the marker lives in `render_rule`, which is the emitter, not
+  the hash input. Every already-minted class in every program keeps its name,
+  including the shorthand rules'. The re-mint permission is not spent.
+- **Rule text: the shorthand rules only.** `.s1ufvr2{padding:var(--space-4)}`
+  becomes `*.s1ufvr2{padding:var(--space-4)}` — same class, same declaration,
+  same specificity, same matching, new sort position. Goldens change on those
+  lines and on the ordering; the verification is per class, that the
+  declaration is byte-identical and the selector's only delta is the marker.
+- **Class lists change only where a conflict existed** — at a drop, which is
+  the fix. A style with no intra-family conflict is byte-identical end to end.
+- **Dead rules.** A dropped slot's rule was already emitted and stays in the
+  stylesheet, unused. That is the existing over-approximation (a chain's
+  overridden `padding(4).padding(6)` has always emitted both, as do a
+  condition's inner base rules), and it is A8's remaining
+  liveness-tied-elimination item, not a new leak.
+- **The hole, stated.** Two longhands of one family that cover *different*
+  parts of it — `border_top` against `border_color`, or `raw`'s
+  `border-top-color` against either — are both rank 1, so they tie and the
+  hash decides. No static tier can order them, because the answer is authoring
+  order and the stylesheet has no record of it; only (c)'s split could, at the
+  cost above. Zero instances across the corpus, the authoring rule in the docs
+  covers it, and the fix is to write the edge with its colour
+  (`border_top(width, colour)`). Recorded rather than papered over.
 
 ## 0. The problem
 

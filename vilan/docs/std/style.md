@@ -121,12 +121,19 @@ A `str`-valued method is not a weaker `raw`: it keeps the property name
 checked and completable while the *value* stays a CSS expression the compiler
 has nothing to validate (a font stack, a transform list, a shadow layer).
 
-**One arity per family.** The name carries the arity — whole box
-(`padding`), axis (`padding_x`), edge (`padding_top`) — and there is no
-multi-value shorthand method, because `padding_y(v).padding_x(h)` already
-computes `padding: v h`. Mixing a shorthand with its own longhands leaves
-two equally specific atomic rules whose order the class-name sort decides;
-the axis and edge methods share slots and override cleanly.
+**The name carries the arity** — whole box (`padding`), axis
+(`padding_x`), edge (`padding_top`) — and there is no multi-value
+shorthand method, because `padding_y(v).padding_x(h)` already computes
+`padding: v h`.
+
+**Arities mix, and resolve in authoring order.** A property that covers
+others forms a family — `padding`, `margin`, `inset` (over `top`,
+`right`, `bottom`, `left`), `border` (over its parts and edges),
+`background`, `flex` — and last-wins applies to the whole family: a
+longhand written after the shorthand narrows it, a shorthand written
+after a longhand replaces the family outright. Per condition, so a
+`hover` or `dark` variant never disturbs the base, and through `raw`
+too, since the family is a fact about the CSS property.
 
 Escape hatches:
 
