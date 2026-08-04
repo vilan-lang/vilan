@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::analyzer::{Expr, Program, SourceId};
-use crate::call_graph::{Call, CallGraph, CallTarget};
+use crate::call_graph::{Call, CallGraph, CallTarget, Node};
 use crate::error::Error;
 use crate::id::Id;
 use crate::interpreter::{self, ConstValue, Limits};
@@ -256,8 +256,14 @@ impl<'p, 'src> State<'p, 'src> {
     /// path may reach `asset::emit`. R = the functions/closures that reach it
     /// through call sites OUTSIDE `const` subtrees; roots (`main`, top-level
     /// initializers) never join R — a root's call into R is the offending
-    /// boundary, reported at that call site. Indirect calls (closure values)
-    /// are the recorded conservative gap.
+    /// boundary, reported at that call site.
+    ///
+    /// A call THROUGH a value resolves to `CallTarget::Indirect(Value)`, which
+    /// carries no caller edge, so the fixpoint cannot follow it. §2's rule is
+    /// therefore a refusal at the point the value is MADE: an R-member
+    /// referenced as a function value, or an escaping R closure, outside every
+    /// `const` subtree. Without it the escape is silent and the emitted JS
+    /// carries a live `__emit_asset` call with no runtime binding.
     fn check_const_only(&mut self) {
         let Some(emit_id) = self.program.asset_emit_fn_id else {
             return;
@@ -337,15 +343,7 @@ impl<'p, 'src> State<'p, 'src> {
         boundary_errors.sort_by_key(|(site, _)| self.span_of(*site).start);
         boundary_errors.dedup();
         for (site, callee) in boundary_errors {
-            let name = if callee == emit_id {
-                "asset::emit".to_string()
-            } else {
-                self.program
-                    .functions
-                    .get(&callee)
-                    .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
-                    .unwrap_or_else(|| "this call".to_string())
-            };
+            let name = self.const_only_name(callee, emit_id);
             self.errors.push((
                 Error {
                     note: None,
@@ -358,6 +356,106 @@ impl<'p, 'src> State<'p, 'src> {
                 self.source_of(site),
             ));
         }
+
+        self.check_value_escapes(&graph, &in_r, emit_id);
+    }
+
+    /// The value-escape half of §2's rule. Two shapes make a runtime function
+    /// value out of R, and both bypass the call-graph fixpoint:
+    ///
+    /// - an R-member NAMED as a value (fn-to-closure coercion) — the call graph
+    ///   already separates these from call subjects in `function_references`;
+    /// - an R closure that is never immediately applied — it joined R through
+    ///   its own body, but nothing calls it by identity, so no boundary error
+    ///   can fire for it.
+    ///
+    /// Both are refused at the site the value is made, which is also the
+    /// narrowest span that identifies the problem (diagnostics-standard A1).
+    /// A reference inside a `const` subtree is untouched: there the interpreter
+    /// makes the call, which is the whole styling shape.
+    fn check_value_escapes(&mut self, graph: &CallGraph, in_r: &HashSet<Id>, emit_id: Id) {
+        let mut escapes: Vec<(Id, Option<Id>)> = Vec::new(); // (site, named function)
+
+        // `function_references` is keyed by every function node, every closure
+        // node, and every module-level binding's initializer — the same key set
+        // the graph itself walks. A `const`-marked initializer is skipped at
+        // build time, so module-level const chains never appear here at all.
+        let reference_owners = graph
+            .nodes()
+            .iter()
+            .map(|node| node.id())
+            .chain(self.program.module_level_bindings());
+        for owner in reference_owners {
+            for &(reference_id, function_id) in graph.function_references_of(owner) {
+                if !in_r.contains(&function_id) || self.in_const_subtree(reference_id) {
+                    continue;
+                }
+                escapes.push((reference_id, Some(function_id)));
+            }
+        }
+
+        // An immediately-applied closure literal is `CallTarget::Closure`; any
+        // R closure that is NOT one of those exists only as a value.
+        let mut applied: HashSet<Id> = HashSet::new();
+        for node in graph.nodes() {
+            for call in graph.calls_of(node.id()) {
+                if let CallTarget::Closure(target) = call.target {
+                    applied.insert(target);
+                }
+            }
+        }
+        for binding in self.program.module_level_bindings() {
+            for call in graph.initializer_calls_of(binding) {
+                if let CallTarget::Closure(target) = call.target {
+                    applied.insert(target);
+                }
+            }
+        }
+        for node in graph.nodes() {
+            let Node::Closure(closure_id) = *node else {
+                continue;
+            };
+            if !in_r.contains(&closure_id)
+                || applied.contains(&closure_id)
+                || self.in_const_subtree(closure_id)
+            {
+                continue;
+            }
+            escapes.push((closure_id, None));
+        }
+
+        escapes.sort_by_key(|(site, _)| self.span_of(*site).start);
+        escapes.dedup();
+        for (site, function_id) in escapes {
+            let subject = match function_id {
+                Some(function_id) => self.const_only_name(function_id, emit_id),
+                None => "this closure (it reaches `asset::emit`)".to_string(),
+            };
+            self.errors.push((
+                Error {
+                    note: None,
+                    span: self.span_of(site),
+                    msg: format!(
+                        "{subject} is compile-time-only; call it directly inside a `const` \
+                         expression — a compile-time-only function has no runtime value form"
+                    ),
+                },
+                self.source_of(site),
+            ));
+        }
+    }
+
+    /// How a const-only callee names itself in a diagnostic: `asset::emit`
+    /// itself, or the R-member that reaches it.
+    fn const_only_name(&self, callee: Id, emit_id: Id) -> String {
+        if callee == emit_id {
+            return "`asset::emit`".to_string();
+        }
+        self.program
+            .functions
+            .get(&callee)
+            .map(|function| format!("`{}` (it reaches `asset::emit`)", function.name))
+            .unwrap_or_else(|| "this closure (it reaches `asset::emit`)".to_string())
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic

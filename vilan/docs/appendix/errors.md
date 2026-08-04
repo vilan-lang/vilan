@@ -449,6 +449,20 @@ the `Style` in a `const` (`let card = const style()…`); select and merge
 already-built styles at runtime.
 → [Styling](../guide/styling.md), [Macros & const](../tour/macros-and-const.md)
 
+**"… is compile-time-only; evaluate this call inside a `const` expression"**
+The same rule, caught statically: some function on this call path reaches
+`asset::emit`, and the call itself sits in runtime code. The span is the
+outermost runtime crossing — the call that leaves ordinary code and enters
+style-building territory — so wrap *that* call in a `const`.
+
+**"… is compile-time-only; call it directly inside a `const` expression — a
+compile-time-only function has no runtime value form"**
+A compile-time-only function (or a closure that reaches one) was used as a
+*value* — passed to a higher-order function, stored in a binding, built as a
+closure literal — rather than called. The compiler cannot follow a call made
+through a value, so it refuses the value instead. Call it directly inside the
+`const`: `const apply(styled)` is fine, `apply(styled)` at runtime is not.
+
 **"a `const` result must be plain data; this evaluates to …"**
 The `const` expression produced something that can't be baked into the
 output (a closure, a host object). Fold values, not behavior.

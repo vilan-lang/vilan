@@ -14997,6 +14997,144 @@ fn reaching_functions_inside_const_are_fine() {
     );
 }
 
+// The value escape (const-eval.md §2): a call THROUGH a function or closure
+// value resolves to `Indirect(Value)`, which carries no caller edge, so the
+// R-fixpoint cannot follow it. v1 refuses at the reference — without which the
+// emitted JS carries a live `__emit_asset` call that has no runtime binding.
+
+#[test]
+fn a_function_reaching_emit_cannot_escape_as_a_value() {
+    let source = r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(styled);
+        }
+        main();
+        "#;
+    let reference = source.rfind("styled").unwrap();
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only")
+                && *range == (reference..reference + "styled".len())),
+        "no value-escape diagnostic at the reference: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_module_level_value_reference_to_an_emit_reaching_function_is_rejected() {
+    let source = r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        let HANDLER = styled;
+        fun main() {}
+        main();
+        "#;
+    let reference = source.rfind("styled").unwrap();
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, range)| message.contains("compile-time-only")
+                && *range == (reference..reference + "styled".len())),
+        "no value-escape diagnostic at the module-level reference: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_closure_reaching_emit_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(|| {
+                emit("css", ".a{}");
+                1
+            });
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn a_closure_wrapping_an_emit_reaching_call_cannot_escape_as_a_value() {
+    assert_fails_with(
+        r#"
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            let _x = apply(|| styled());
+        }
+        main();
+        "#,
+        "compile-time-only",
+    );
+}
+
+#[test]
+fn an_indirect_call_rooted_in_const_stays_legal() {
+    // The refusal is about RUNTIME escape only: inside a `const` expression the
+    // interpreter calls through the value happily, and the asset still flows.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            print(const apply(styled));
+        }
+        main();
+        "#,
+        "1\n",
+    );
+    let assets = collected_assets(
+        r#"
+        import std::print;
+        import std::asset::emit;
+        fun styled(): i32 {
+            emit("css", ".a{}");
+            1
+        }
+        fun apply(f: || i32): i32 {
+            f()
+        }
+        fun main() {
+            print(const apply(styled));
+        }
+        main();
+        "#,
+    );
+    assert_eq!(assets, vec![("css".to_string(), ".a{}".to_string())]);
+}
+
 // --- A8: std::style — typed atomic styles, compiled ---------------------------
 // The styling system riding const evaluation and the asset channel
 // (proposal/ui-styling.md): builder-chain construction inside `const`, atomic
