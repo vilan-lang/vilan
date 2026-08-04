@@ -183,7 +183,32 @@ is proven. Homebrew tap alongside it.
 5. **Publish**: `gh release create v<version>` with the changelog
    section as the release notes, all assets attached.
 
-Cutting a release is then: update `CHANGELOG.md` + bump versions (one
+**Standing pre-tag step: the reconciliation sweep.** Added 2026-08-03, after
+a records-reconciliation pass found the record drifting in both directions
+under concurrent sessions — a shipped item with no backlog marker, and
+(separately) a marker dated days before the code it names actually merged.
+Before cutting, not after CI has already tagged something wrong:
+
+(a) verify every `CHANGELOG.md` Unreleased entry's commit is an ancestor of
+    the intended tag (`git merge-base --is-ancestor <commit> HEAD`, checked
+    against the commit that will become the tag) before retitling it into
+    the dated section — under concurrent sessions entries drift both ways,
+    a commit filed under Unreleased that never landed on this branch, or a
+    commit that shipped with nothing filed for it;
+(b) close the backlog markers (`proposal/backlog-2026-07-18.md`) for
+    everything the release carries — an unmarked shipped item is exactly
+    how "entries routinely stay open after their arc ships" keeps
+    recurring;
+(c) move each newly-shipped entry's full body verbatim into
+    `proposal/backlog.md`, per that file's restructure convention (the
+    distilled file keeps a one-line tombstone, nothing is deleted).
+
+A release that ships with a wrong changelog section or a stale backlog is a
+smaller problem than one that has already tagged, so this runs before step
+2's changelog check, not after.
+
+Cutting a release is then: run the reconciliation sweep above, update
+`CHANGELOG.md` + bump versions (one
 script: `scripts/bump-version.sh` rewrites the three crate manifests and
 the extension's `package.json`), commit, tag, push the tag. Everything
 after is CI.
