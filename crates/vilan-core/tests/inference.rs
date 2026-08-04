@@ -29699,3 +29699,111 @@ fn an_entry_global_does_not_satisfy_a_std_import_path() {
         "#,
     );
 }
+
+// --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
+//
+// `display.vl` sits outside the always-loaded core set and outside its
+// transitive import closure, so `42.to_string()` fails with a bare "no method"
+// until the program names `Display`. The steer is a fourth appended hint at the
+// `MethodLookup::NoMethod` arm, backed by a std-wide index of trait-provided
+// method names built in the same lazy pass as the B4 import steer's.
+
+#[test]
+fn a_missing_to_string_steers_to_the_display_import() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() {
+            let x = 42;
+            print(x.to_string());
+        }
+        "#,
+        "to_string",
+        "i32 has no method 'to_string'; import std::display::Display to use it \
+         (`import std::display::Display;`)",
+    );
+}
+
+#[test]
+fn the_to_string_steer_covers_every_display_impl_subject() {
+    for (literal, type_name) in [
+        ("42", "i32"),
+        ("true", "bool"),
+        ("1.5f", "f64"),
+        ("7n", "BigInt"),
+    ] {
+        let source = format!(
+            r#"
+            fun main() {{
+                let value = {literal};
+                let _ = value.to_string();
+            }}
+            "#
+        );
+        let diagnostics = failure_diagnostics(&source);
+        assert!(
+            diagnostics.iter().any(|(message, _)| message
+                == &format!(
+                    "{type_name} has no method 'to_string'; import std::display::Display \
+                     to use it (`import std::display::Display;`)"
+                )),
+            "no steered diagnostic for {type_name}; got: {diagnostics:#?}"
+        );
+    }
+}
+#[test]
+fn the_import_steer_does_not_survive_the_import() {
+    // B5's no-repetition spirit: once `Display` is imported the call resolves,
+    // so there is no diagnostic left to carry a hint.
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, display::Display };
+        fun main() {
+            print(42.to_string());
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_method_no_std_trait_provides_carries_no_import_steer() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        fun main() {
+            let x = 42;
+            let _ = x.frobnicate();
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message == "i32 has no method 'frobnicate'"),
+        "expected the bare no-method error; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn the_import_steer_does_not_fire_for_a_user_type() {
+    // The index is keyed by the SUBJECT HEAD, so a user type that happens to
+    // miss a method std provides on some other type must stay unsteered.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Point {
+            x: i32,
+        }
+        fun main() {
+            let p = Point { x = 1 };
+            let _ = p.to_string();
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message == "Point has no method 'to_string'"),
+        "expected the bare no-method error; got: {diagnostics:#?}"
+    );
+}
+

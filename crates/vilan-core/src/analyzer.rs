@@ -1392,6 +1392,14 @@ pub struct Analyzer<'src> {
     // cache, then reused.
     std_module_files: Vec<(String, PathBuf)>,
     std_export_index: Option<HashMap<String, String>>,
+    // The sibling index for the METHOD steer (std-surface.md §5): which
+    // unloaded std module carries a method of this name on a subject with this
+    // head, and what to import to reach it. `(subject head, method name) ->
+    // (importable name, module name)`, e.g. `("i32", "to_string") ->
+    // ("Display", "display")`. Built in the SAME lazy pass as the export index
+    // above — a method declared inside an `impl` block is invisible to
+    // `collect_declared_names`, which only walks top-level items.
+    std_trait_method_index: Option<HashMap<(String, String), (String, String)>>,
     // Per generated-items walk: the ENTITY-ID range it produced, the origin
     // (the attribute/invocation span in the user's file), and the origin's
     // real source — so a diagnostic anchored in generated code re-anchors at
@@ -1592,23 +1600,96 @@ static EMPTY_SPAN: Span = Span { start: 0, end: 0 };
 /// leaf-importable and stay out.
 fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>) {
     for item in items {
-        let mut node = &item.0;
-        loop {
-            match node {
-                Node::Export(inner)
-                | Node::Derive(_, inner)
-                | Node::Service(_, inner)
-                | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
-                _ => break,
-            }
-        }
-        match node {
+        match unwrap_item(item) {
             Node::Func(function) | Node::MacroFun(function) => out.push(function.name.0),
             Node::Struct(name, ..) | Node::Enum(name, ..) | Node::Trait(name, ..) => {
                 out.push(name.0)
             }
             Node::Let(name, ..) => out.push(name.0),
             _ => {}
+        }
+    }
+}
+
+/// Strips a top-level item's wrappers (`export`, a derive, a service, a macro
+/// attribute) down to the item itself.
+fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
+    let mut node = &item.0;
+    loop {
+        match node {
+            Node::Export(inner)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
+            _ => break,
+        }
+    }
+    node
+}
+
+/// The leading identifier of a type expression, generic arguments stripped:
+/// `i32` -> `i32`, `List<type T>` -> `List`. `None` for anything else —
+/// notably a bare `type T` binder, which is a BLANKET impl subject and would
+/// otherwise match every type in the program.
+fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
+    match node {
+        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(name),
+        _ => None,
+    }
+}
+
+/// The bound names on an impl subject's own generic binders — the `Display` in
+/// `impl List<type T: Display>`. An inherent (trait-less) `impl` block still
+/// needs an import to be reachable, and its bound is the name that gets it.
+fn subject_binder_bounds<'src>(subject: &Node<'src>) -> Vec<&'src str> {
+    let Node::AccessorWithGenerics(_, arguments) = subject else {
+        return Vec::new();
+    };
+    arguments
+        .0
+        .iter()
+        .filter_map(|argument| match &argument.0 {
+            Node::TypeBinder(_, bounds) => Some(bounds),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|bound| type_head(&bound.0))
+        .collect()
+}
+
+/// What a module's `impl` blocks contribute to the B4 METHOD steer
+/// (std-surface.md §5): `((subject head, method name), importable name)` for
+/// every method the block declares.
+///
+/// The `importable name` is what a caller writes to make the block visible —
+/// the trait the impl names (`impl i32 with Display`), else a bound on the
+/// subject's binders (`impl List<type T: Display>`). It is checked against
+/// `declared`, the module's OWN top-level names, so the steer never suggests
+/// importing a name from a module that merely re-uses it.
+fn collect_impl_method_steers<'src>(
+    items: &NodeList<'src>,
+    declared: &HashSet<&'src str>,
+    out: &mut Vec<((&'src str, &'src str), &'src str)>,
+) {
+    for item in items {
+        let Node::Impl(subject, traits, body) = unwrap_item(item) else {
+            continue;
+        };
+        let Some(head) = type_head(&subject.0) else {
+            continue;
+        };
+        let Some(importable) = traits
+            .iter()
+            .filter_map(|trait_| type_head(&trait_.0))
+            .chain(subject_binder_bounds(&subject.0))
+            .find(|name| declared.contains(name))
+        else {
+            continue;
+        };
+        for member in &body.0 {
+            if let Node::Func(function) = unwrap_item(member) {
+                out.push(((head, function.name.0), importable));
+            }
         }
     }
 }
@@ -1835,6 +1916,7 @@ impl<'src> Analyzer<'src> {
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
+            std_trait_method_index: None,
             derived_origins: Vec::new(),
             closure_parameter_fill_sites: HashMap::new(),
             prepped_binder_inheritance: Vec::new(),
@@ -18352,6 +18434,12 @@ impl<'src> Analyzer<'src> {
                 let field_steer = self
                     .same_named_field_steer(&subject_type, member_name)
                     .unwrap_or_default();
+                // If an UNLOADED std module implements it for this type, the fix
+                // is an import, not a definition (std-surface.md §5 — the
+                // `42.to_string()` complaint that opened I4).
+                let import_steer = self
+                    .unimported_trait_method_steer(&subject_type, member_name)
+                    .unwrap_or_default();
                 self.diagnostics.push(Error {
                     note: None,
                     span: self
@@ -18360,8 +18448,8 @@ impl<'src> Analyzer<'src> {
                         .copied()
                         .unwrap_or(arguments_span),
                     msg: format!(
-                        "{} has no method '{}'{}{}",
-                        type_str, member_name, trait_only_note, field_steer
+                        "{} has no method '{}'{}{}{}",
+                        type_str, member_name, trait_only_note, field_steer, import_steer
                     ),
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
@@ -19042,37 +19130,106 @@ impl<'src> Analyzer<'src> {
     /// the SAME name (a layered std twin) keep the steer, genuinely
     /// different modules make it ambiguous and it stays silent.
     fn import_steer(&mut self, name: &str) -> Option<String> {
-        // The lazy std-wide index: module files the program never loaded,
-        // scanned for top-level declared names through the process-global
-        // parse cache. Built once, on the first failed resolution.
-        if self.std_export_index.is_none() {
-            let mut index: HashMap<String, String> = HashMap::new();
-            let mut ambiguous: HashSet<String> = HashSet::new();
-            let files = self.std_module_files.clone();
-            for (module_name, path) in &files {
-                let Some(loaded) = load_package_module(path) else {
-                    continue;
-                };
-                let mut names = Vec::new();
-                collect_declared_names(&loaded.ast.0, &mut names);
-                for declared in names {
-                    match index.get(declared) {
-                        Some(existing) if existing == module_name => {}
-                        Some(_) => {
-                            ambiguous.insert(declared.to_string());
-                        }
-                        None => {
-                            index.insert(declared.to_string(), module_name.clone());
-                        }
+        self.build_std_indexes_if_needed();
+        self.import_steer_inner(name)
+    }
+
+    /// The lazy std-wide scan behind both B4 steers: every std module file,
+    /// parsed through the process-global cache, indexed by the top-level names
+    /// it declares (the NAME steer) and by the methods its `impl` blocks
+    /// declare (the METHOD steer, std-surface.md §5). One pass, built once, on
+    /// the first failed resolution of either kind — a cold path.
+    ///
+    /// A name (or a `(head, method)` pair) two DIFFERENT modules provide is
+    /// dropped: the steer would have to guess, and B4 only steers when the fix
+    /// is unambiguous.
+    fn build_std_indexes_if_needed(&mut self) {
+        if self.std_export_index.is_some() {
+            return;
+        }
+        let mut export_index: HashMap<String, String> = HashMap::new();
+        let mut ambiguous_names: HashSet<String> = HashSet::new();
+        let mut method_index: HashMap<(String, String), (String, String)> = HashMap::new();
+        let mut ambiguous_methods: HashSet<(String, String)> = HashSet::new();
+        let files = self.std_module_files.clone();
+        for (module_name, path) in &files {
+            let Some(loaded) = load_package_module(path) else {
+                continue;
+            };
+            let mut names = Vec::new();
+            collect_declared_names(&loaded.ast.0, &mut names);
+            for declared in &names {
+                match export_index.get(*declared) {
+                    Some(existing) if existing == module_name => {}
+                    Some(_) => {
+                        ambiguous_names.insert(declared.to_string());
+                    }
+                    None => {
+                        export_index.insert(declared.to_string(), module_name.clone());
                     }
                 }
             }
-            for name in ambiguous {
-                index.remove(&name);
+            let declared: HashSet<&str> = names.into_iter().collect();
+            let mut steers = Vec::new();
+            collect_impl_method_steers(&loaded.ast.0, &declared, &mut steers);
+            for ((head, method), importable) in steers {
+                let key = (head.to_string(), method.to_string());
+                match method_index.get(&key) {
+                    // A module that provides the same method twice (two traits
+                    // over one subject) is not ambiguous — either import works.
+                    Some((_, existing)) if existing == module_name => {}
+                    Some(_) => {
+                        ambiguous_methods.insert(key);
+                    }
+                    None => {
+                        method_index.insert(key, (importable.to_string(), module_name.clone()));
+                    }
+                }
             }
-            self.std_export_index = Some(index);
         }
-        self.import_steer_inner(name)
+        for name in ambiguous_names {
+            export_index.remove(&name);
+        }
+        for key in ambiguous_methods {
+            method_index.remove(&key);
+        }
+        self.std_export_index = Some(export_index);
+        self.std_trait_method_index = Some(method_index);
+    }
+
+    /// The third steer at the "no method" site (std-surface.md §5): the method
+    /// exists in std, on this type, but in a module the program never loaded —
+    /// so nothing ever registered the `impl`. The classic is `42.to_string()`,
+    /// which needs `std::display::Display` even though the call names no trait.
+    ///
+    /// Discoverability here is module reachability, not the method's home: an
+    /// `impl` block registers when its FILE loads, so importing any name the
+    /// file declares is the fix, and the trait (or bound) the block already
+    /// names is the one worth quoting.
+    ///
+    /// No "is the module already loaded?" guard is needed: once it is, its
+    /// `impl` blocks are registered and the call RESOLVES — a bounded impl
+    /// whose bound is unsatisfied reports the bound, at the bound's own site,
+    /// and never reaches this arm.
+    fn unimported_trait_method_steer(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        // A generic parameter, a closure, a tuple — nothing with a nominal head
+        // to key on. `pretty_print_type` renders the head first, so a generic
+        // subject (`List<i32>`) reduces by dropping its arguments.
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let head = rendered.split('<').next()?.to_string();
+        self.build_std_indexes_if_needed();
+        let (importable, module_name) = self
+            .std_trait_method_index
+            .as_ref()?
+            .get(&(head, member_name.to_string()))?;
+        Some(format!(
+            "; import std::{module_name}::{importable} to use it \
+             (`import std::{module_name}::{importable};`)"
+        ))
     }
 
     fn import_steer_inner(&self, name: &str) -> Option<String> {
