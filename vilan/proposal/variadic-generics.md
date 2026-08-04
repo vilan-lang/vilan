@@ -788,6 +788,18 @@ they changed a ruling: **there is no range operator to be ambiguous with**
 is why the ruling is positional, and why the pin asserts the old behaviour
 rather than a new error).
 
+**Pins: 20** in `tests/inference.rs` (19 live, 1 `#[ignore]`d — the tuple-form
+bug below), two parser unit tests, one formatter round-trip over nine
+spellings, six parse-differential fixtures, and `vilan/test/tuple-spread.vl`
+with its golden and its interpreter-equivalence run. Every mechanism planted
+red and restored: the parser production takes **21** red, the type rule **11**,
+`check_tuple_spreads` **4**, the mark-driven splice **2**, the formatter's
+marker **1**. The disambiguation pin needed a plant of its own — a parser that
+stops absorbing `..` in the postfix chain, which is what a `..` *operator* would
+require — because a pin whose claim is "this was left alone" cannot be proven by
+breaking the feature. §S's 32 pins are untouched; the one that pinned this slice
+as deferred is now the one that pins it working.
+
 ### The bug this work found — in the TUPLE form, not the spread
 
 **A tuple-typed element loses its splice when its expression caches no type of
