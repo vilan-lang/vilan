@@ -13429,6 +13429,354 @@ fn optimistic_rolls_back_on_failure() {
     );
 }
 
+// --- A14: the optimistic-write → reconcile lifecycle, made observable and ---
+// --- made correct when writes overlap (proposal/optimistic-lifecycle.md). ---
+//
+// The free `optimistic` above is the stateless one-shot and its two pins are
+// the compatibility gate: they must keep their exact output. An
+// `Optimistic<T>` cell wraps the same signal and adds what a free function
+// over a bare `Signal` has nowhere to keep — a `Pending`/`Rejected` state to
+// bind, a generation so only the NEWEST write paints, and a confirmed shadow
+// so a rollback lands on server truth rather than on a local value.
+
+/// The `WriteState` renderer every pin below shares.
+const OPTIMISTIC_LABEL: &str = r#"
+        fun label(state: WriteState): str {
+            match state {
+                WriteState::Confirmed => "confirmed",
+                WriteState::Pending => "pending",
+                WriteState::Rejected(let reason) => i"rejected:{reason}",
+            }
+        }
+"#;
+
+#[test]
+fn an_optimistic_cell_publishes_pending_then_the_confirmed_value() {
+    // The state a spinner binds, and the reconcile to SERVER truth: the
+    // commit's `Ok` payload replaces the paint, it is not merely accepted.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("v1");
+            let cell = Optimistic::over(title);
+            let _watch = cell.state.sub(|state| print(i"state {{label(state)}}"));
+            let outcome = cell.write("v2", || {{
+                sleep_for(Duration::millis(5));
+                let reply: Result<str, str> = Ok("v2-server");
+                reply
+            }});
+            print(i"value {{title.get()}}");
+            print(outcome.is_ok());
+        }}
+        main();
+        "#
+        ),
+        "state confirmed\nstate pending\nstate confirmed\nvalue v2-server\ntrue\n",
+    );
+}
+
+#[test]
+fn an_optimistic_cell_rolls_back_and_publishes_the_rejection() {
+    // The failure half: the value returns to the last CONFIRMED truth and
+    // the reason lands somewhere a banner can bind, instead of only in the
+    // return value the free function hands back.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("v1");
+            let cell = Optimistic::over(title);
+            let _watch = cell.state.sub(|state| print(i"state {{label(state)}}"));
+            let _outcome = cell.write("v2", || {{
+                sleep_for(Duration::millis(5));
+                let reply: Result<str, str> = Err("offline");
+                reply
+            }});
+            print(i"value {{title.get()}}");
+        }}
+        main();
+        "#
+        ),
+        "state confirmed\nstate pending\nstate rejected:offline\nvalue v1\n",
+    );
+}
+
+#[test]
+fn a_superseded_optimistic_outcome_does_not_paint_the_cell() {
+    // The bug the free function has, fixed by the generation guard. An older
+    // write FAILS slowly while a newer one SUCCEEDS quickly: through
+    // `optimistic` the stale rollback lands last and the screen shows the
+    // cell's original value while the server holds the newer one. The newest
+    // write owns the cell, so the older outcome is discarded.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("A");
+            let cell = Optimistic::over(title);
+            let _older = async cell.write("B", || {{
+                sleep_for(Duration::millis(50));
+                let reply: Result<str, str> = Err("nope");
+                reply
+            }});
+            let _newer = async cell.write("C", || {{
+                sleep_for(Duration::millis(10));
+                let reply: Result<str, str> = Ok("C-server");
+                reply
+            }});
+            sleep_for(Duration::millis(90));
+            print(i"value {{title.get()}}");
+            print(i"state {{label(cell.state.get())}}");
+        }}
+        main();
+        "#
+        ),
+        "value C-server\nstate confirmed\n",
+    );
+}
+
+#[test]
+fn a_rollback_lands_on_the_last_confirmation_not_the_original_value() {
+    // Why the paint guard alone is not enough, and why `confirmed_generation`
+    // exists. The OLDER write succeeds (the server really does hold
+    // "B-server"); the newer one is refused. The rollback must land on what
+    // the server confirmed, not on the value the cell started at — which the
+    // paint guard, being about who paints, would never have recorded.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("A");
+            let cell = Optimistic::over(title);
+            let _older = async cell.write("B", || {{
+                sleep_for(Duration::millis(10));
+                let reply: Result<str, str> = Ok("B-server");
+                reply
+            }});
+            let _newer = async cell.write("C", || {{
+                sleep_for(Duration::millis(50));
+                let reply: Result<str, str> = Err("nope");
+                reply
+            }});
+            sleep_for(Duration::millis(90));
+            print(i"value {{title.get()}}");
+            print(i"state {{label(cell.state.get())}}");
+        }}
+        main();
+        "#
+        ),
+        "value B-server\nstate rejected:nope\n",
+    );
+}
+
+#[test]
+fn an_out_of_order_confirmation_cannot_walk_the_confirmed_shadow_backwards() {
+    // The edge the previous pin does NOT reach: two writes both succeed, and
+    // the OLDER one's reply arrives last. Advancing the shadow on arrival
+    // order would record "B-server" as server truth after "C-server" already
+    // superseded it — so a later rollback would display a value two writes
+    // stale. The shadow advances on WRITE order, which is why it carries a
+    // generation of its own.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("A");
+            let cell = Optimistic::over(title);
+            let _older = async cell.write("B", || {{
+                sleep_for(Duration::millis(50));
+                let reply: Result<str, str> = Ok("B-server");
+                reply
+            }});
+            let _newer = async cell.write("C", || {{
+                sleep_for(Duration::millis(10));
+                let reply: Result<str, str> = Ok("C-server");
+                reply
+            }});
+            sleep_for(Duration::millis(90));
+            print(i"settled {{title.get()}}");
+            let _refused = cell.write("D", || {{
+                sleep_for(Duration::millis(5));
+                let reply: Result<str, str> = Err("nope");
+                reply
+            }});
+            print(i"value {{title.get()}}");
+            print(i"state {{label(cell.state.get())}}");
+        }}
+        main();
+        "#
+        ),
+        "settled C-server\nvalue C-server\nstate rejected:nope\n",
+    );
+}
+
+#[test]
+fn an_optimistic_transition_publishes_one_coherent_wave() {
+    // A transition writes TWO signals, so an observer of both must never see
+    // half of one — no "new value, still confirmed", no "old value, already
+    // pending". `batch` joins the ambient turn when there is one and creates
+    // one when there is not; this program has none.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::reactive::{{ Signal, Optimistic, WriteState, combine }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        fun main() {{
+            let title = Signal::new("A");
+            let cell = Optimistic::over(title);
+            let both = combine((cell.value, cell.state));
+            let _watch = both.sub(|pair| {{
+                let (value, state) = pair;
+                print(i"{{value}}/{{label(state)}}");
+            }});
+            let _outcome = cell.write("B", || {{
+                sleep_for(Duration::millis(5));
+                let reply: Result<str, str> = Ok("B-server");
+                reply
+            }});
+        }}
+        main();
+        "#
+        ),
+        "A/confirmed\nB/pending\nB-server/confirmed\n",
+    );
+}
+
+#[test]
+fn a_held_turn_holds_the_whole_optimistic_lifecycle() {
+    // The transaction wins: inside a `turn` with an awaiting body nothing
+    // publishes mid-flight, so the paint and the `Pending` flip are never
+    // observed and only the reconciled value reaches subscribers. The cost is
+    // real and documented — a "Saving…" indicator inside a held turn never
+    // appears.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::{ Signal, Optimistic, WriteState, turn, FlushPolicy, turn_scope };
+        import std::result::Result::{ self, Ok, Err };
+
+        async fun tick() {
+            let _beat = 1;
+        }
+
+        fun main() {
+            let title = Signal::new("A");
+            let cell = Optimistic::over(title);
+            let _watch = title.sub(|value| print(i"held {value}"));
+            turn(FlushPolicy::AtEnd, || {
+                let _outcome = cell.write("B", || {
+                    tick();
+                    let reply: Result<str, str> = Ok("B-server");
+                    reply
+                });
+            });
+            print("after held turn");
+        }
+        main();
+        "#,
+        "held A\nheld B-server\nafter held turn\n",
+    );
+}
+
+#[test]
+fn an_optimistic_cell_reconciles_over_a_real_rpc_round_trip() {
+    // The lifecycle against a genuine wire turn rather than a bare `tick()`:
+    // `local_rpc` + a `[service]` whose handler suspends, so the commit rides
+    // the same `AtEnd` turn a real dispatch does. Both halves in one program —
+    // a rename the service accepts, then one it refuses (an empty reply, the
+    // shape `walkthrough`'s own commit adapter checks for) — and the call
+    // counter proves each write reached the server exactly once.
+    assert_compiles_and_runs(
+        &format!(
+            r#"
+        import std::print;
+        import std::shared::Shared;
+        import std::reactive::{{ Signal, Optimistic, WriteState }};
+        import std::result::Result::{{ self, Ok, Err }};
+        import std::json::{{ Json, json_codec }};
+        import std::rpc::{{ local_rpc }};
+        import std::time::{{ sleep_for, Duration }};
+        {OPTIMISTIC_LABEL}
+        [service(TitleClient)]
+        struct Titles {{ stored: Shared<str>, calls: Shared<i32> }}
+
+        impl Titles {{
+            [rpc]
+            fun rename(self, title: str): str {{
+                self.calls.write() = self.calls.read() + 1;
+                sleep_for(Duration::millis(5));
+                if title == "refuse" {{
+                    ""
+                }} else {{
+                    self.stored.write() = i"{{title}}-stored";
+                    self.stored.read()
+                }}
+            }}
+        }}
+
+        fun main() {{
+            let service = Titles {{ stored = Shared::new("v1"), calls = Shared::new(0) }};
+            let transport = local_rpc(service.dispatcher().into_protocol(json_codec()));
+            let client = TitleClient {{ transport, codec = json_codec() }};
+
+            let title = Signal::new("v1");
+            let cell = Optimistic::over(title);
+            let _watch = title.sub(|value| print(i"title {{value}}"));
+
+            let _accepted = cell.write("v2", || {{
+                let reply: Result<str, str> = match client.rename("v2") {{
+                    Ok(let stored) => if stored == "" {{ Err("save refused") }} else {{ Ok(stored) }},
+                    Err(let _error) => Err("rpc error"),
+                }};
+                reply
+            }});
+            print(i"state {{label(cell.state.get())}}");
+
+            let _refused = cell.write("refuse", || {{
+                let reply: Result<str, str> = match client.rename("refuse") {{
+                    Ok(let stored) => if stored == "" {{ Err("save refused") }} else {{ Ok(stored) }},
+                    Err(let _error) => Err("rpc error"),
+                }};
+                reply
+            }});
+            print(i"state {{label(cell.state.get())}}");
+            print(i"calls {{service.calls.read()}}");
+        }}
+        "#
+        ),
+        "title v1\ntitle v2\ntitle v2-stored\nstate confirmed\ntitle refuse\ntitle v2-stored\nstate rejected:save refused\ncalls 2\n",
+    );
+}
+
 // --- backlog J2: `async || T` closure types — asyncness as a type-level ---
 // --- contract, so indirect calls await implicitly like direct ones.     ---
 

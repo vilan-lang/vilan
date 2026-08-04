@@ -789,3 +789,120 @@ impl Draft<type T: PartialEq> {
 	}
 }
 
+// === The optimistic-write → reconcile lifecycle (A14) ========================
+//
+// `optimistic` above is the stateless one-shot: paint, await, confirm or roll
+// back. An `Optimistic<T>` cell is the same lifecycle made OBSERVABLE and
+// made correct when writes overlap (`proposal/optimistic-lifecycle.md`):
+//
+//   - `state` publishes `Pending` while a write is on the wire and
+//     `Rejected(reason)` when one is refused, so a spinner, a disabled
+//     button and a failure banner have something to bind. The free function
+//     hands the outcome to its caller and to no one else.
+//   - Two guards keep overlapping writes honest. Only the NEWEST write
+//     paints the cell (a superseded outcome is discarded, like `Draft`'s
+//     generation guard), and the rollback target is the last value the
+//     SERVER confirmed rather than whatever the signal happened to hold —
+//     which is a different question, so it has a counter of its own.
+//
+// The cell WRAPS an existing signal, so adopting it changes no binding.
+// Unlike `Draft` it does not re-push on reconnect, and that is deliberate:
+// re-push is at-least-once (`proposal/draft-reconnect.md` §3.2), safe for a
+// draft's "set this field to this value" and unsafe for the one-shot ACTIONS
+// this cell exists for. The rollback is the recovery; the user re-issues.
+
+/// Where a write made through an `Optimistic` cell stands. Bind it.
+[derive(PartialEq, Debug)]
+enum WriteState {
+	// Nothing in flight; the cell's value is the last confirmed truth.
+	Confirmed,
+	// The newest write is on the wire.
+	Pending,
+	// The newest write was refused; the cell has rolled back. Sticky until
+	// the next write, so a banner stays up until something changes.
+	Rejected(str),
+}
+
+struct Optimistic<T> {
+	// The signal being written — the one handed to `over`. Bind it.
+	value: Signal<T>,
+	// The lifecycle, for the UI.
+	state: Signal<WriteState>,
+	// The last value the server confirmed: the ROLLBACK TARGET, and the
+	// reason this cannot be a free function over a bare signal.
+	confirmed: Shared<T>,
+	// Claimed per write; only the newest write's outcome paints.
+	generation: Shared<i32>,
+	// The highest generation whose outcome reported a confirmation, so
+	// out-of-order completions cannot un-tell us what the server holds.
+	confirmed_generation: Shared<i32>,
+}
+
+impl Optimistic<type T> {
+	/// Wrap `signal` in an optimistic-write cell, seeded with its current
+	/// value as the confirmed truth — the value the cell is handed is, by
+	/// definition, the last thing anyone confirmed.
+	fun over(signal: Signal<T>): Optimistic<T> {
+		Optimistic {
+			value = signal,
+			state = Signal::new(WriteState::Confirmed),
+			confirmed = Shared::new(signal.get()),
+			generation = Shared::new(0),
+			confirmed_generation = Shared::new(0),
+		}
+	}
+
+	/// Paint `value` and flip to `Pending` in one wave, run `commit`, then
+	/// reconcile in one wave — the confirmed value on `Ok`, a rollback to the
+	/// last confirmed value on `Err`. Returns the outcome, so a caller that
+	/// wants its own error UX keeps it; the `state` signal is an addition to
+	/// that, not a replacement.
+	///
+	/// Awaits, like `optimistic`. Fire-and-forget is
+	/// `let _sent = async cell.write(..)`.
+	///
+	/// If a NEWER write claimed the cell while this one was on the wire, this
+	/// outcome does not paint: the newest write owns the cell, and its own
+	/// commit answers for it. The outcome still comes back here.
+	fun write(self, value: T, commit: async || Result<T, str>): Result<T, str> {
+		let mine = self.generation.read() + 1;
+		self.generation.write() = mine;
+		batch(|| {
+			self.value.set(value);
+			self.state.set(WriteState::Pending);
+		});
+
+		let outcome = commit();
+
+		// Knowledge first, and independently of the paint guard: a superseded
+		// write that SUCCEEDED still told us something true about the server,
+		// and it is the rollback target. Only a later write's confirmation may
+		// replace it, so out-of-order completions cannot walk it backwards.
+		match outcome {
+			Ok(let server_value) => {
+				if mine > self.confirmed_generation.read() {
+					self.confirmed.write() = server_value;
+					self.confirmed_generation.write() = mine;
+				}
+			},
+			// A refusal taught us only that the server still holds what it held.
+			Err(let _reason) => {},
+		}
+
+		if self.generation.read() == mine {
+			batch(|| {
+				match outcome {
+					Ok(let server_value) => {
+						self.value.set(server_value);
+						self.state.set(WriteState::Confirmed);
+					},
+					Err(let reason) => {
+						self.value.set(self.confirmed.read());
+						self.state.set(WriteState::Rejected(reason));
+					},
+				}
+			});
+		}
+		outcome
+	}
+}
