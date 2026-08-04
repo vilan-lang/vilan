@@ -1663,6 +1663,14 @@ pub struct Analyzer<'src> {
     // resource -> its destructor, data -> a no-op consume), and R11 exempts it
     // from the exactly-once rule — it IS the drop site. `None` until reachable.
     drop_fn_id: Option<Id>,
+    // B68 (affine-moves.md §9.4): the type of every `drop(x)` argument that
+    // carries no type on its own expr id — a VALUE argument (a call result), as
+    // opposed to a place or a construction. Inferred once by
+    // `record_drop_sink_argument_types` and read by every consumer of
+    // `drop_sink_argument_type_id`, including the transformer's rewrite (which
+    // gets it on the `Program`), so the analyzer and the rewrite cannot disagree
+    // about what a sink argument's type is.
+    drop_sink_value_types: HashMap<Id, TypeId>,
     // The enclosing `Lift` continuations' binder entities, innermost last —
     // what a walked `LiftBinder` node resolves to.
     lift_binder_stack: Vec<Id>,
@@ -2069,6 +2077,7 @@ impl<'src> Analyzer<'src> {
             hmr_take_fn_id: None,
             drop_trait_id: None,
             drop_fn_id: None,
+            drop_sink_value_types: HashMap::new(),
             lift_binder_stack: Vec::new(),
             lift_region_frames: Vec::new(),
             try_dispatch: HashMap::new(),
@@ -5722,25 +5731,70 @@ impl<'src> Analyzer<'src> {
     /// is not a resource and so seeds nothing — the concrete drop rides the
     /// monomorphized instance's own scan.
     fn drop_sink_argument_types(&self) -> Vec<TypeId> {
-        let Some(drop_fn_id) = self.drop_fn_id else {
-            return Vec::new();
-        };
-        let mut types = Vec::new();
-        for function_call in self.function_calls.values() {
-            let is_drop_sink = matches!(
-                self.expr_id_to_expr_map.get(&function_call.subject_id),
-                Some(Expr::Local(callee)) if *callee == drop_fn_id
-            );
-            if !is_drop_sink {
+        self.function_calls
+            .keys()
+            .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
+            .filter_map(|argument_id| self.drop_sink_argument_type_id(argument_id))
+            .collect()
+    }
+
+    /// The argument expression of a `drop(x)` sink call, or `None` when `call_id`
+    /// is not one. The single place the sink is recognized — by the std entity's
+    /// identity (destruction.md §6), never by name — so glue seeding, the §8
+    /// coloring edges, R11's forwarding check and the B68 recording pass cannot
+    /// disagree about which calls are sink calls.
+    fn drop_sink_argument_of(&self, call_id: Id) -> Option<Id> {
+        let drop_fn_id = self.drop_fn_id?;
+        let function_call = self.function_calls.get(&call_id)?;
+        matches!(
+            self.expr_id_to_expr_map.get(&function_call.subject_id),
+            Some(Expr::Local(callee)) if *callee == drop_fn_id
+        )
+        .then(|| function_call.argument_ids.first().copied())
+        .flatten()
+    }
+
+    /// B68 (affine-moves.md §9.4): infer and record the type of every `drop(x)`
+    /// argument that carries none on its own expr id.
+    ///
+    /// `drop<T>(own value: T)` takes its argument by move, so a **value**
+    /// argument — a call result — is owned by the `drop` expression itself and
+    /// must be destroyed there: it is never bound, so no scope-end teardown and
+    /// no R2 overwrite can reach it. Only the forms that store a type resolved
+    /// before (a place, through its binding; a construction, through
+    /// `resolved_types`), so `drop(identity(Db{..}))` read as *untyped* and the
+    /// rewrite silently lowered to the bare argument — a leak.
+    ///
+    /// Inference is run once, here, and the answer is shared with the rewrite on
+    /// the `Program`, so the analyzer's seeding and the transformer's lookup
+    /// cannot drift. Runs after constraint solving and before R11's
+    /// per-instantiation checks, which ask the same question of the same
+    /// argument. Recording only where the existing lookup is silent keeps every
+    /// already-resolving form byte-identical.
+    fn record_drop_sink_argument_types(&mut self) {
+        if self.drop_fn_id.is_none() {
+            return;
+        }
+        let sink_arguments: Vec<Id> = self
+            .function_calls
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|call_id| self.drop_sink_argument_of(call_id))
+            .filter(|argument_id| self.drop_sink_argument_type_id(*argument_id).is_none())
+            .collect();
+        for argument_id in sink_arguments {
+            let inferred =
+                self.infer_type(argument_id, &Type::Unknown, &SubstitutionContext::new());
+            // An unresolved argument stays unrecorded: the transformer's
+            // never-silent guard reports it rather than emitting a quiet leak.
+            if matches!(inferred, Type::Unresolved | Type::Unknown) {
                 continue;
             }
-            if let Some(argument_id) = function_call.argument_ids.first()
-                && let Some(type_id) = self.drop_sink_argument_type_id(*argument_id)
-            {
-                types.push(type_id);
-            }
+            let type_id = inferred.get_type_id(self);
+            self.drop_sink_value_types.insert(argument_id, type_id);
         }
-        types
     }
 
     /// The resource types reached by a `drop(db)` sink call, keyed by the enclosing
@@ -5752,9 +5806,9 @@ impl<'src> Analyzer<'src> {
     /// a type that has drop glue. Empty when `std::drop` is not loaded.
     fn drop_sink_types_by_root(&self) -> HashMap<Id, HashSet<TypeId>> {
         let mut by_root: HashMap<Id, HashSet<TypeId>> = HashMap::new();
-        let Some(drop_fn_id) = self.drop_fn_id else {
+        if self.drop_fn_id.is_none() {
             return by_root;
-        };
+        }
         let function_ids: Vec<Id> = self
             .functions
             .values()
@@ -5763,7 +5817,7 @@ impl<'src> Analyzer<'src> {
             .collect();
         for function_id in function_ids {
             let (calls, _) = self.r11_body_calls_and_closures(function_id);
-            let types = self.drop_sink_types_of_calls(&calls, drop_fn_id);
+            let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
                 by_root.entry(function_id).or_default().extend(types);
             }
@@ -5778,7 +5832,7 @@ impl<'src> Analyzer<'src> {
             let mut nested = Vec::new();
             let mut visited = HashSet::new();
             self.r11_collect_calls(return_id, &mut visited, &mut calls, &mut nested);
-            let types = self.drop_sink_types_of_calls(&calls, drop_fn_id);
+            let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
                 by_root.entry(closure_id).or_default().extend(types);
             }
@@ -5789,26 +5843,12 @@ impl<'src> Analyzer<'src> {
     /// The argument types of the `drop` sink calls among `calls` (the §8 coloring
     /// helper). Reads each argument's type the same way the transformer's rewrite
     /// will, so the seeded type matches the glue key.
-    fn drop_sink_types_of_calls(&self, calls: &[Id], drop_fn_id: Id) -> HashSet<TypeId> {
-        let mut types = HashSet::new();
-        for &call_id in calls {
-            let Some(function_call) = self.function_calls.get(&call_id) else {
-                continue;
-            };
-            let is_drop_sink = matches!(
-                self.expr_id_to_expr_map.get(&function_call.subject_id),
-                Some(Expr::Local(callee)) if *callee == drop_fn_id
-            );
-            if !is_drop_sink {
-                continue;
-            }
-            if let Some(argument_id) = function_call.argument_ids.first()
-                && let Some(type_id) = self.drop_sink_argument_type_id(*argument_id)
-            {
-                types.insert(type_id);
-            }
-        }
-        types
+    fn drop_sink_types_of_calls(&self, calls: &[Id]) -> HashSet<TypeId> {
+        calls
+            .iter()
+            .filter_map(|call_id| self.drop_sink_argument_of(*call_id))
+            .filter_map(|argument_id| self.drop_sink_argument_type_id(argument_id))
+            .collect()
     }
 
     /// An expression's type id, mirroring `transformer::expr_type_id`: the stored
@@ -5837,7 +5877,10 @@ impl<'src> Analyzer<'src> {
                         .get(binding)
                         .map(|parameter| parameter.type_id)
                 }),
-            _ => None,
+            // B68: a VALUE argument (a call result) stores no type on its own id
+            // and names no binding, so its type is the one
+            // `record_drop_sink_argument_types` inferred.
+            _ => self.drop_sink_value_types.get(&expr_id).copied(),
         }
     }
 
@@ -7793,28 +7836,14 @@ impl<'src> Analyzer<'src> {
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) {
-        let Some(drop_fn_id) = self.drop_fn_id else {
+        if self.drop_fn_id.is_none() {
             return;
-        };
+        }
         let mut offending: Vec<Id> = Vec::new();
         for &call_id in calls {
-            let Some((subject_id, argument_id)) =
-                self.function_calls.get(&call_id).and_then(|function_call| {
-                    Some((
-                        function_call.subject_id,
-                        *function_call.argument_ids.first()?,
-                    ))
-                })
-            else {
+            let Some(argument_id) = self.drop_sink_argument_of(call_id) else {
                 continue;
             };
-            let is_drop_sink = matches!(
-                self.expr_id_to_expr_map.get(&subject_id),
-                Some(Expr::Local(callee)) if *callee == drop_fn_id
-            );
-            if !is_drop_sink {
-                continue;
-            }
             let Some(argument_type) = self.drop_sink_argument_type_id(argument_id) else {
                 continue;
             };
@@ -24512,6 +24541,12 @@ pub struct Program<'src> {
     /// `drop` method (if any) and the resource members to destroy. The transformer
     /// emits one `__drop_<type>` helper per entry.
     pub drop_glue: HashMap<TypeId, DropGlue>,
+    /// B68 (affine-moves.md §9.4): the inferred type of each `drop(x)` argument
+    /// that carries none on its own expr id — a VALUE argument such as a call
+    /// result. The rewrite consults it so a `drop` of an unbound value resolves
+    /// to the same destructor a `let`-then-`drop` of it would. Keyed by the
+    /// argument expression's id; empty on a program with no such sink call.
+    pub drop_sink_value_types: HashMap<Id, TypeId>,
     /// Synthetic drop reachability edges (destruction.md §8): a function / closure
     /// node → the `drop` impl functions its owned resources reach. Appended by
     /// `CallGraph::successors` so platform coloring flows a `@process`-needing drop
@@ -27918,6 +27953,11 @@ fn analyze_over_world<'src>(
     analyzer.check_container_resource_arguments();
     analyzer.check_resource_any_coercion();
     analyzer.check_resource_moves();
+    // B68 (affine-moves.md §9.4): type every `drop(x)` argument that carries no
+    // type on its own expr id — a value argument such as a call result — before
+    // anything asks what a sink call destroys. R11's forwarding check below and
+    // the drop planning / glue seeding further down all read the same answer.
+    analyzer.record_drop_sink_argument_types();
     analyzer.check_resource_generic_instantiations();
     // Drop planning (destruction.md §5/§7): which resource locals are owned at
     // their scope's end (dropped there, reverse order) and which assignments
@@ -28504,6 +28544,7 @@ fn analyze_over_world<'src>(
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),
+        drop_sink_value_types: std::mem::take(&mut analyzer.drop_sink_value_types),
         drop_call_edges: std::mem::take(&mut analyzer.drop_call_edges),
         boxed_locals,
         generic_referenced_roots,

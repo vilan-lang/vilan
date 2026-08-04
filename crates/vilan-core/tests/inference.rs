@@ -24838,6 +24838,199 @@ fn a_void_async_parameter_still_stores_as_spawn() {
     );
 }
 
+// --- The adapted-instance escape (async-polymorphism.md A.4) ----------------
+//
+// A.4 recorded that adaptation covers the closures a body CALLS, and asserted
+// that a body which stores or returns a parameter closure instead "uses the
+// existing rules (the field/return divergence checks catch lies)". It did not:
+// those checks run outside any instance context, so they only ever saw the
+// GLOBAL async channels — a declared `async` parameter, an `async` field, an
+// async closure literal. A PLAIN parameter that is async only at one call site
+// was invisible to them, so an adapted instance could store it into a plain
+// field (or return it through a plain declared return) and the value escaped
+// with its asyncness stripped: a `|| i32` field holding a promise, and a later
+// call through it typed `i32` and yielding `Promise { <pending> }`.
+//
+// The checks now also run per instance, with the instance's bits — the same
+// two checks, the same refusal, given the context they were missing.
+
+#[test]
+fn an_adapted_instance_cannot_store_its_now_async_parameter_into_a_plain_field() {
+    // The escape, minimal: `f` is plain (so it adapts), async at this one call
+    // site, and stored into a field whose type awaits nothing. Before the fix
+    // this compiled and `(holder.hook)()` returned a promise typed `i32`.
+    assert_fails_with(
+        r#"
+        import std::time::sleep;
+        struct Holder {
+            hook: || i32,
+        }
+        fun install(f: || i32): Holder {
+            Holder { hook = f }
+        }
+        fun main() {
+            let holder = install(|| { sleep(1); 2 });
+            let _ = (holder.hook)();
+        }
+        "#,
+        "reaches `Holder`'s field `hook`, which awaits nothing",
+    );
+}
+
+#[test]
+fn an_adapted_instance_cannot_assign_its_now_async_parameter_into_a_plain_field() {
+    // The assignment half of the same store position — the global check already
+    // covered both shapes, and so does its per-instance twin.
+    assert_fails_with(
+        r#"
+        import std::time::sleep;
+        struct Holder {
+            hook: || i32,
+        }
+        fun install(f: || i32): Holder {
+            mut holder = Holder { hook = || 0 };
+            holder.hook = f;
+            holder
+        }
+        fun main() {
+            let _ = install(|| { sleep(1); 4 });
+        }
+        "#,
+        "reaches `Holder`'s field `hook`, which awaits nothing",
+    );
+}
+
+#[test]
+fn an_adapted_instance_cannot_return_its_now_async_parameter_through_a_plain_return() {
+    // The sibling escape position. Handing the parameter straight back is not
+    // A.4's effect-row case — the value's asyncness IS the parameter's, no
+    // effect variable connects two positions — so it is refused for the same
+    // reason the field store is.
+    assert_fails_with(
+        r#"
+        import std::time::sleep;
+        fun pass(f: || i32): || i32 {
+            f
+        }
+        fun main() {
+            let got = pass(|| { sleep(1); 3 });
+            let _ = got();
+        }
+        "#,
+        "reaches `pass`'s declared return type, which awaits nothing",
+    );
+}
+
+#[test]
+fn compose_with_an_async_argument_is_the_error_a4_said_it_was() {
+    // A.4: "`fun compose(f, g): |A| C { |a| g(f(a)) }` with an async `f` stays
+    // an error at the return". It did not — the returned closure is async only
+    // through the instance's bits, which the global check could not see, so
+    // this compiled and printed a promise. It is now the error A.4 described.
+    assert_fails_with(
+        r#"
+        import std::time::sleep;
+        fun compose(f: |i32| i32, g: |i32| i32): |i32| i32 {
+            |a| g(f(a))
+        }
+        fun main() {
+            let h = compose(|x| { sleep(1); x + 1 }, |y| y * 2);
+            let _ = h(3);
+        }
+        "#,
+        "reaches `compose`'s declared return type, which awaits nothing",
+    );
+}
+
+#[test]
+fn an_adapted_instance_storing_into_a_void_field_stays_spawn() {
+    // A.3: void positions keep spawn semantics at every boundary — end to end,
+    // through the store. The per-instance check cannot reach this even in
+    // principle: a void-returning parameter is not adaptive (`adaptive_params_of`
+    // requires a value return), so it never carries a bit and nothing can escape
+    // through it. Pinned anyway, because that is the behaviour A.3 promises and
+    // the upstream gate is not where a reader would look for it.
+    assert_compiles(
+        r#"
+        import std::time::sleep;
+        struct Holder {
+            on_done: || void,
+        }
+        fun install(f: || void): Holder {
+            Holder { on_done = f }
+        }
+        fun main() {
+            let _ = install(|| { sleep(1); });
+        }
+        "#,
+    );
+}
+
+#[test]
+fn an_adapted_instance_storing_into_an_async_field_is_the_fix() {
+    // The steer the diagnostic gives, proven to work: declaring the field
+    // `async || T` makes the store legal and awaits the later call through it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+        struct Holder {
+            hook: async || i32,
+        }
+        fun install(f: || i32): Holder {
+            Holder { hook = f }
+        }
+        fun main() {
+            let holder = install(|| { sleep(1); 2 });
+            print((holder.hook)());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_sync_instance_storing_the_same_parameter_into_a_plain_field_stays_legal() {
+    // The instance control: the SAME function, same store, a synchronous
+    // argument. Nothing escapes, nothing is refused — the check is per
+    // instance, not per function.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder {
+            hook: || i32,
+        }
+        fun install(f: || i32): Holder {
+            Holder { hook = f }
+        }
+        fun main() {
+            let holder = install(|| 7);
+            print((holder.hook)());
+        }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn transitive_adaptation_still_rides_past_a_store_free_body() {
+    // The guard on the other side: A.4 keeps transitive adaptation LEGAL (a
+    // call-position flow). Refusing escapes must not disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+        fun helper(f: || i32): i32 {
+            f() + 1
+        }
+        fun main() {
+            print(helper(|| { sleep(1); 10 }));
+        }
+        "#,
+        "11\n",
+    );
+}
+
 // --- C4 S1 chunk 1: the `resource` declaration modifier (surface only) -------
 //
 // destruction.md §3: `resource` is a declaration modifier in `external`'s
@@ -28502,6 +28695,165 @@ fn drop_of_data_is_a_no_op() {
         fun main() {
             let n = 5;
             drop(n);
+            print("ok");
+        }
+        "#,
+        "ok\n",
+    );
+}
+
+// --- B68: a VALUE argument to the sink (affine-moves.md §9.4) ---------------
+//
+// `drop` takes its argument `own`, so a non-place argument — a call result, a
+// construction — is owned by the `drop` expression itself and must be destroyed
+// there. Nothing else can destroy it: the value is never bound, so no scope-end
+// teardown and no overwrite drop can reach it. The rewrite therefore has to
+// resolve the type of ANY expression in argument position, not just the forms
+// that happen to carry a stored type.
+
+#[test]
+fn b68_drop_of_a_call_result_destroys_it() {
+    // The §9.4 repro. `drop(identity(Db{..}))` must destroy exactly what
+    // `let bound = identity(Db{..}); drop(bound)` destroys — the binding is not
+    // what makes the value droppable, the `own` sink is.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun identity(own value: Db): Db { value }
+        fun main() {
+            let bound = identity(Db { tag = "bound" });
+            drop(bound);
+            print("--");
+            drop(identity(Db { tag = "direct" }));
+            print("done");
+        }
+        "#,
+        "drop bound\n--\ndrop direct\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_construction_destroys_it() {
+    // The other non-place form: a construction handed straight to the sink. This
+    // one already worked (a struct initializer records its own type), and stays
+    // pinned so the B68 widening cannot regress it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            drop(Db { tag = "literal" });
+            print("done");
+        }
+        "#,
+        "drop literal\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_method_call_result_destroys_it() {
+    // The receiver-substituted form: the sink argument's type comes from a
+    // method's declared return type, which is only known through the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        struct Factory { tag: str }
+        impl Factory { fun open(self): Db { Db { tag = self.tag } } }
+        fun main() {
+            let factory = Factory { tag = "made" };
+            drop(factory.open());
+            print("done");
+        }
+        "#,
+        "drop made\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_nested_call_result_destroys_it() {
+    // Nesting is not a new case, but it is the one that proves the rewrite reads
+    // the OUTER call's result type rather than pattern-matching one call shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun identity(own value: Db): Db { value }
+        fun main() {
+            drop(identity(identity(Db { tag = "nested" })));
+            print("done");
+        }
+        "#,
+        "drop nested\ndone\n",
+    );
+}
+
+#[test]
+fn b68_drop_of_a_data_call_result_is_a_no_op() {
+    // The data control: an i32-returning call in argument position stays the
+    // no-op consume that still evaluates its argument for effects. Widening the
+    // type query must not conjure a destructor where there is none.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::drop;
+        fun sum(a: i32, b: i32): i32 { print("called"); a + b }
+        fun main() {
+            drop(sum(1, 2));
+            print("ok");
+        }
+        "#,
+        "called\nok\n",
+    );
+}
+
+#[test]
+fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_rejected_at_a_resource() {
+    // The B66/R11 interplay. `drop(t)` in an erased generic body is dirt at a
+    // resource instantiation (`a_generic_forwarding_own_t_to_the_drop_sink_is_
+    // rejected_at_a_resource`), for the reason that the erased body has no
+    // concrete destructor. Routing the same `T` through a call first changes
+    // nothing about that, so the call-result form joins the place form rather
+    // than slipping past the check untyped.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::drop::{ Drop, drop };
+        resource struct Db { tag: str }
+        impl Db with Drop { fun drop(&mut self) { print(self.tag); } }
+        fun identity<T>(own value: T): T { value }
+        fun consume<T>(own x: T) { drop(identity(x)); }
+        fun main() {
+            let db = Db { tag = "one" };
+            consume(db);
+        }
+        "#,
+        "consume(db)",
+        "pass a resource to `drop<T>`, whose erased body has no concrete destructor",
+    );
+}
+
+#[test]
+fn b68_a_generic_forwarding_a_call_result_to_the_sink_is_accepted_at_data() {
+    // The control for the pin above: the same generic instantiated only at data
+    // stays accepted — `drop` on data is the correct no-op consume.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::drop;
+        fun identity<T>(own value: T): T { value }
+        fun consume<T>(own x: T) { drop(identity(x)); }
+        fun main() {
+            consume(5);
             print("ok");
         }
         "#,
