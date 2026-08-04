@@ -218,3 +218,56 @@ harnesses. The suite wall now runs ~74 s against the 63.5 s E25-era
 measurement — the difference is six new suite-gate files the arc added
 (the differential, idempotence, and base-cache gates, two of which copy
 whole std trees), not a regression in the measured binaries.
+
+## 5. Two load-dependent flakes closed: harness clocks and a fixed port (E32/E33, 2026-08-04)
+
+Both were suite-*discipline* bugs, not suite-*speed* ones — no lever here
+made anything faster, but both were exactly the kind of load-dependent
+flake this file exists to keep out of the gate, so the record belongs
+here.
+
+**E32 — the cancellation family's timing budget measured the wrong
+thing.** Four inference.rs tests (three of them, in fact — see below)
+wrapped `started.elapsed() < 4s` around a full compile-then-run: the
+in-process `std` re-analysis `compile()` does on every call is not a
+`cargo build`, but under nextest's full parallelism it can itself run to
+several seconds (the same CPU-bound cost this whole file has been
+chasing), leaving near-zero budget for the actual node execution the
+claim is about. Fix: split `compile_and_run` into `compile()` + a new
+`run_js()`, and time only the run (`compile_and_run_timed`,
+`assert_runs_within`) — compile happens first, untimed. The 4 s budget
+itself is unchanged; it now measures the emitted program's own
+cancellation-reaction latency instead of harness overhead, which is what
+makes it load-immune: a slow *machine* no longer competes with the
+budget, only a slow *reaction* does. `nested_nurseries_join_inside_out`,
+the fourth test the backlog entry named, carries no wall-clock assertion
+in this tree — backlog drift, left untouched. Proven non-vacuous by
+inflating each restructured test's reaction latency past the budget
+(still under the guarded sibling's own timer, so the string assertions
+stayed green) and watching the elapsed check alone go red, then
+restoring.
+
+**E33 — the benchmarks e2e bound four fixed ports.**
+`vilan/benchmarks`'s `throughput.vl` (three servers: http-json,
+http-binary, ws-multiplex) and `realtime.vl` (one fan-out server) bound
+literal ports 48231–48234, colliding with anything else — including a
+second concurrent `cargo nextest run --workspace` — already holding one.
+Migrated all four to port 0 (the E19 `Server.port()` precedent already in
+use for `rpc_http`/`ssr`/`http_port`); each bind announces `[port] <n>`,
+and the Rust e2e test reads all four back, asserting they're real,
+distinct, and that exactly four showed up. Verified non-vacuous by
+holding 48231–48234 with an out-of-process listener: the fixed test
+passed regardless, and the pre-fix `.vl` sources reproduced the exact
+target failure (`Error: listen EADDRINUSE: address already in use
+:::48231`) against the same held ports.
+
+**Stress validation.** Both fixes were run against the shape of load that
+had actually produced the flakes: two full `cargo nextest run --workspace`
+runs started concurrently (2439 tests each, 16-core machine — the
+closest single-machine approximation of "two overlapping suite legs"),
+while the four cancellation tests and the benchmarks e2e were looped 5×
+each on the side. Result: 20/20 cancellation runs green, 5/5 benchmarks
+runs green, and both full-workspace runs finished clean (2439 passed, 0
+failed, 2 skipped each) — including `benchmarks_run_and_report_the_deterministic_counts`
+passing in *both* concurrent runs, which is the E33 collision scenario
+occurring for real and not colliding. Zero flakes.

@@ -92,8 +92,11 @@ fun watch(base: str): Session {
 fun run(finished: || void) {
 	section("realtime fan-out (sse + post, 3 sessions, 50 mutations)");
 	let board = Board { count = Signal::new(0) };
+	// Port 0 (E33 — a fixed port collides with concurrent e2e legs under
+	// nextest): the OS picks a free one, and `on_start` reads it back for
+	// the same-process client sessions below to dial.
 	serve_connected(
-		48232,
+		0,
 		board.dispatcher().into_protocol(json_codec()),
 		|id, end| {
 			sessions.write().push((id, ReactiveServer::new(end, json_codec())));
@@ -101,13 +104,15 @@ fun run(finished: || void) {
 		|id| {},
 		|request| Response::builder().code(404).body("benchmark").build(),
 		|server| {
-			drive(finished);
+			let port = server.port();
+			print(i"[port] {port}");
+			drive(port, finished);
 		},
 	);
 }
 
-fun drive(finished: || void) {
-	let base = "http://localhost:48232";
+fun drive(port: i32, finished: || void) {
+	let base = i"http://localhost:{port}";
 	let alice = watch(base);
 	let bob = watch(base);
 	let carol = watch(base);

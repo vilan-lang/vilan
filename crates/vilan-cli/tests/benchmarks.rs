@@ -47,6 +47,43 @@ fn benchmarks_run_and_report_the_deterministic_counts() {
         stderr.trim().is_empty(),
         "benchmarks wrote to stderr:\n{stderr}\nstdout:\n{stdout}"
     );
+
+    // E33: the benchmark program binds its four RPC/duplex servers on port
+    // 0 (throughput.vl's http-json, http-binary, and ws-multiplex servers;
+    // realtime.vl's fan-out server) and announces each `[port] <n>` — the
+    // same read-back precedent as `http_port.rs`'s `Server.port()` pin.
+    // Reading them back here proves the migration actually happened (not a
+    // silently-reintroduced fixed literal) and that every bind got a real,
+    // distinct, OS-assigned port.
+    let announced_ports: Vec<u16> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("[port] "))
+        .map(|port_text| {
+            port_text.trim().parse().unwrap_or_else(|error| {
+                panic!("`[port]` line did not carry a number: {port_text:?} ({error})")
+            })
+        })
+        .collect();
+    assert_eq!(
+        announced_ports.len(),
+        4,
+        "expected 4 `[port]` announcements (3 in throughput.vl, 1 in realtime.vl), got {announced_ports:?} in:\n{stdout}"
+    );
+    for port in &announced_ports {
+        assert_ne!(
+            *port, 0,
+            "port 0 was reported back instead of the bound one"
+        );
+    }
+    let mut distinct_ports = announced_ports.clone();
+    distinct_ports.sort_unstable();
+    distinct_ports.dedup();
+    assert_eq!(
+        distinct_ports.len(),
+        announced_ports.len(),
+        "the four servers should each get their own OS-assigned port, got {announced_ports:?}"
+    );
+
     for expected in [
         "== payload sizes ==",
         "== coalescing (update frames counted at the wire) ==",
