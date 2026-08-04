@@ -3278,3 +3278,102 @@ mutable ones — then decide whether `mut (a, b)` should stamp its
 elements mutable while in there.
 
 
+
+### Moved at the v0.25.0 cut (2026-08-04)
+
+#### A19. `Signal<resource>` slips R10 — SHIPPED 2026-08-04
+
+(S; found 2026-08-03 by the A18 arc) — `Shared<Database>` is refused by R10,
+but `Signal<Database>` compiles clean: the check keys on the WRITTEN type's
+head, so a resource reaching `Shared` through a generic struct field is
+invisible to it. Fix direction: R10 consults the instantiated field types
+(the same per-instantiation resolution B53's follow-up used for capture
+clones). Record: `signal-update.md` §6.
+
+#### A20. `map`/`filter`/`sort_by` element aliasing — SHIPPED 2026-08-04
+
+(M; found 2026-08-03 by the I4 arc, pre-existing — verified on the pre-I4
+tree for `map`/`filter`) — writing through an element of the RETURNED list
+shows in the receiver: the list-producing methods copy the spine, not the
+elements. One shared value-semantics hole, the same family as B53/B54
+(rule 1 at a list-producing seam); `sort_by` was deliberately kept
+consistent with its siblings rather than made unilaterally stricter, and
+new `reverse` happens not to alias (it rebuilds through `push`). Wants one
+slice with B53's SHARE/MOVE elision reasoning applied across all three.
+Record: `std-surface.md` §7. [Ship note: the "reverse does not alias"
+claim was WRONG — `self[index]` hands elements over uncopied; all four
+methods aliased. See `element-clones.md`.]
+
+#### B54. place-into-construction sharing — SHIPPED 2026-08-04
+
+(S–M; split from B53's ship record, `0835c7d`, v0.23.6, filed 2026-08-03 by
+the reconciliation sweep — the commit's own message named this as a
+backlog-recorded open edge and it had not actually been filed anywhere) — a
+place flowing into a CONSTRUCTION (a list/struct/variant literal payload:
+`List { a, b }` or `[x, y]` where `a`/`b`/`x`/`y` are existing places) is a
+separate, pre-existing sharing question from B53's capture aliasing — not
+capture-specific. Undesigned: whether rule 1's per-binding copy applies
+uniformly to a place read into a literal's field/element position, and what
+elision (if any) is sound there by the same SHARE/MOVE reasoning B53 used
+for pattern captures. B53's follow-up arc closed 2026-08-03 WITHOUT
+absorbing this (its `capture-clones.md` §5 records different holes) — this
+entry stands on its own. No repro is recorded yet; needs one before design.
+Related family: A20 (list-producing methods share elements).
+
+#### B55. a bounded-generic call through a re-dispatched callee emits an empty function body — SHIPPED 2026-08-04
+
+(M–L; found 2026-08-03 by I3's design probes — SILENT MISCOMPILE) — a
+generic function whose bound-satisfying call goes through a re-dispatching
+callee (`self.upstream.next()` — the adapter shape) compiles clean and
+emits an EMPTY body: exit 0 at compile time, `TypeError` at runtime. Two
+verified triggers: the `for`-loop protocol edge and a trait-default
+constructor. Bites any user writing a generic wrapper over an iterator
+today; the long pole for I3's adapter layer. Repros in
+`iterator-adapters.md` (P2). [Ship note: TWO root causes, not one — the
+loop arm's bare-id emission clearing the substitution, and whole-type
+`Self`-return specialization; plus the never-silent guard.]
+
+#### B56. `for v in self` over a generic lowers to a native `for...of` — SHIPPED 2026-08-04
+
+(M; same probes — SILENT MISCOMPILE) — inside a generic method,
+`for v in self` skips the iterator protocol and emits a native `for...of`
+over the struct's flat field array: wrong elements, wrong count, no
+diagnostic (a probe `to_list` returned 2 elements of a 3-element source).
+Repro in `iterator-adapters.md` (P3). [Ship note: the genuinely-missed
+subjects were `Type::Trait` and `Type::Generic`; a bound-less generic
+subject is now a clean compile error.]
+
+#### B59. a guard needing a hoisted statement emits a dangling reference — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-03 by the B53 follow-up arc, pre-existing on v0.23.6) —
+`compile_is_pattern`'s guarded-leg arm walks the guard expression into a
+`guard_block` that is never emitted (an else-if chain has no statement slot
+before a leg's condition), so any `is`/`?`/nested `match` INSIDE a guard
+drops its temporary: `if ($c[0] === 0)` with no `$c` — a runtime
+`ReferenceError` from a cleanly-compiling program. Pinned `#[ignore]`d as
+`a_guard_that_needs_a_temporary_emits_it`. Fix direction: give guard
+lowering a statement slot (hoist the leg chain out of expression position
+when any guard needs one). Record: `capture-clones.md` §5.
+
+#### B60. a self-by-value call is not a move to the affine checker — SHIPPED 2026-08-04
+
+(M; found 2026-08-03 by the B53 follow-up arc, pre-existing in both
+directions) — `o.unwrap()` consumes `self`, but the checker records no
+move: `o.is_some()` afterwards compiles clean and `o`'s scope-end teardown
+still fires, so one resource value is destroyed twice (the payload the
+caller now owns AND the source's copy). The follow-up arc made the capture
+itself MOVE correctly; this is the remaining source-side hole. Pinned
+honestly as `a_moved_resource_instantiation_destroys_one_value` (asserts
+the current double output so the hole stays visible). Fix: R11's
+move-out-of-`self` calls join the affine use-once accounting. Record:
+`capture-clones.md` §5. [Ship note: the premise was inverted — bare `self`
+is a LOAN per R3; what shipped is "a body may only consume what it owns"
+plus `own self` on Option's consuming combinators. See `affine-moves.md`.]
+
+#### B61. `sync` is unenforced for a void-returning closure parameter — SHIPPED 2026-08-04
+
+(S; found 2026-08-03 by the A18 arc, pre-existing, no std involved) —
+`sync || void` accepts an awaiting closure; the identical signature
+returning `i32` refuses it. So a `sync` declaration on a void callback is a
+correct declaration that does not yet bite. Pinned `#[ignore]`d in the
+signal-update arc's tests. Record: `signal-update.md` §6.

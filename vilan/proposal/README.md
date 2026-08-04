@@ -10,8 +10,7 @@ built), **deferred** (designed, deliberately not built, with a trigger),
 tracked as an open backlog item), **historical / superseded** (stale,
 kept for context only).
 
-All five of this cycle's proposals are merged and carry real status
-lines below.
+Cycle proposals through 2026-08-04 are merged and carry real status lines below.
 
 The open-work tracker is [`backlog-2026-07-18.md`](backlog-2026-07-18.md)
 (status convention documented in its own header); [`backlog.md`](backlog.md)
@@ -19,6 +18,7 @@ is the historical record everything shipped gets moved into.
 
 | File | Status | Description |
 |---|---|---|
+| `affine-moves.md` | shipped arc (2026-08-04) | A body may only consume what it owns — the B60 loan-consumption rule; §6 holds the B62/B63 finds. |
 | `ambient-owner.md` | shipped arc (2026-07-07) | The ambient owner / `comp` ergonomic layer over `std::reactive`. |
 | `analysis-reuse.md` | shipped arc (std-tax arc complete 2026-08-03) | The E3 arc: per-analysis leak closure, then incremental analysis via a cached, frozen std base. |
 | `analyzer-refactor.md` | design record (partially actioned) | A punch list of analyzer structural weaknesses behind a class of generic-inference bugs; several items done, the queue-v2/interning items unscheduled. |
@@ -42,6 +42,7 @@ is the historical record everything shipped gets moved into.
 | `docs-site.md` | shipped arc (2026-07-12) | The rendered docs site: mdBook, custom grammar, GitHub Pages publishing. |
 | `documentation.md` | shipped arc (Phase 3, 2026-07-12) | D1a, the user-facing reference docs — what the book covers and its phasing. |
 | `element-syntax.md` | shipped arc (2026-08-01, all five slices) | HTML-flavored markup sugar lowering to the `view` chain. |
+| `element-clones.md` | shipped arc (2026-08-04) | Rule 1's copy lands at the store — constructions, `own` arguments, returned by-value parameters (A20, B54); §7 holds the B64 find. |
 | `expression-lifting.md` | shipped arc (2026-07-16) | `a? + 10` / `a? + b?` — the `?` lift operator inside expressions (B11 tail slice). |
 | `fixed-arrays.md` | shipped (core); tail deferred, see backlog I2 | `[T; n]` fixed-length arrays; const-generic lengths left for §7. |
 | `fn-coercion.md` | shipped arc (2026-07-11) | Named functions used directly as closure values. |
@@ -58,6 +59,7 @@ is the historical record everything shipped gets moved into.
 | `memory-management-impl-plan.md` | shipped arc (Phases 1–6 essentials) | Implementation ledger for `Arena`/`Handle`/`Shared<T>`. |
 | `memory-management.md` | historical / superseded | Superseded by `memory-management-rev-1.md`. |
 | `memory-management-rev-1.md` | shipped arc (through Phase 6 essentials) | The memory-management design, revision 1 — largely superseded in turn by `claims-and-epochs.md` + `destruction.md`. |
+| `method-resolution.md` | draft — awaiting review | A deliberate method-resolution precedence rule + ambiguity diagnostic (B57); today's order is registration-order accident. |
 | `mut-parameters.md` | shipped arc (2026-08-03) | `mut` parameters — local rebindability of a callee's copy (backlog H9). |
 | `numeric-types.md` | shipped arc (2026-07-07); tail in backlog trailer | Sized numeric types (`u8`…`i64`/`f32`); native-width tail recorded, not filed as an open item. |
 | `org-migration.md` | shipped arc (migration complete 2026-07-29; tail resolved 2026-08-03) | The move to the `vilan-lang/vilan` org (F9), Pages tombstone, owner-string sweep. |
