@@ -179,13 +179,24 @@ let card = const style()
 let flush = const card.border_none().margin_left(Length::auto());
 ```
 
-**Write one arity per family.** Mixing the box with its edges —
-`padding(space(4)).padding_top(space(0))` — leaves two rules of equal
-specificity, and which one wins is decided by the stylesheet's ordering
-of two generated class names rather than by the order you wrote them.
-The axis and edge methods share slots, so `padding_x(..)` then
-`padding_left(..)` *is* a clean override; it is the whole-box shorthand
-that does not compose.
+**Mixing arities is fine, and it resolves in the order you wrote it.**
+A property that covers others — `padding` over its edges, `margin`,
+`inset` over `top`/`right`/`bottom`/`left`, `border` over its parts,
+`background`, `flex` — forms a *family*, and last-wins holds across the
+whole family, not just one property. So
+`padding(space(4)).padding_top(space(0))` is `1rem` on three edges and
+`0` on the top, and `padding_top(space(0)).padding(space(4))` is `1rem`
+all round: the later whole-box value replaces the edge outright, exactly
+as a second `padding(..)` would. The same holds across `+`, and across
+`raw` (a `raw("margin-left", "auto")` belongs to the `margin` family
+like the method does).
+
+```vilan,fragment
+// A tight box with one edge opened up, and a card whose border is
+// recoloured — both read top to bottom, like the rest of the chain.
+let panel = const style().padding(space(4)).padding_top(space(0));
+let lit = const card + style().border_color(Color::blue(600));
+```
 
 ## States and breakpoints
 
@@ -324,11 +335,10 @@ request is rendered is the one served.
   wins — and a reactive one keeps winning every time its signal
   changes. Use one mechanism per element (custom classes can ride along
   via `.raw`).
-- Don't mix a shorthand with its own longhands (`padding` with
-  `padding_top`, `border` with `border_color` at the *same* condition).
-  Each is its own atomic rule, they are equally specific, and the winner
-  is decided by class-name ordering. Under a condition there is no
-  problem — a `hover` rule is more specific than the base rule it
-  overrides.
+- A shorthand and its own longhands (`padding` with `padding_top`,
+  `border` with `border_color`) resolve by the order you wrote them, not
+  by specificity: a later longhand narrows the shorthand, a later
+  shorthand replaces the whole family. This holds per condition, so a
+  `dark` or `hover` variant of one family never disturbs the base.
 
 Full method table: the [style reference](../std/style.md).
