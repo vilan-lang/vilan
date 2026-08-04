@@ -65,7 +65,151 @@ fn the_router_example_splits_into_its_three_routes() {
     assert_eq!(of("Route::NotFound"), ["not_found_page"]);
     for chunk in &plan.chunks {
         assert!(chunk.bytes > 0, "byte estimate must be non-trivial");
+        assert_eq!(
+            chunk.functions.len(),
+            chunk.ids.len(),
+            "emission partitions on the same set the report names"
+        );
     }
+    // The tag is the arm's variant index, which is what a route value carries
+    // and so what the emitted chunk map is keyed by (S2).
+    let tags: Vec<usize> = plan.chunks.iter().map(|chunk| chunk.tag).collect();
+    assert_eq!(tags, [0, 1, 2], "one tag per arm, in declaration order");
+    let gate = plan
+        .gate
+        .as_ref()
+        .expect("the browser layer declares the gate");
+    assert_eq!(gate.calls.len(), 1, "the one recognized `swap` call");
+    assert_ne!(gate.swap, gate.swap_split, "the gate is a different method");
+}
+
+/// A `_` arm has no variant tag, so nothing could address its chunk at a
+/// navigation. Its exclusive code stays EAGER rather than becoming a chunk
+/// that can never be fetched — and it is still emitted, which is the part a
+/// naive "skip the arm" would lose.
+#[test]
+fn a_wildcard_arm_keeps_its_code_eager() {
+    let plan = plan_for(
+        r#"
+import std::ui::{View, view, mount_root};
+import std::reactive::Signal;
+import std::router::{current_path, segments};
+
+[derive(PartialEq)]
+enum Route {
+    Home,
+    Other,
+}
+
+fun parse(path: str): Route {
+    if segments(path).len() == 0 { Route::Home } else { Route::Other }
+}
+
+fun home_page(): View {
+    view("h1").child("home")
+}
+
+fun fallback_page(): View {
+    view("h1").child("elsewhere")
+}
+
+fun main() {
+    let route = current_path().map(parse);
+    mount_root("app", || {
+        view("div").swap(route, |current| match current {
+            Route::Home => home_page(),
+            _ => fallback_page(),
+        })
+    });
+}
+"#,
+        Platform::Browser,
+    );
+    assert_eq!(plan.sites, 1);
+    let arms: Vec<&str> = plan.chunks.iter().map(|chunk| chunk.arm.as_str()).collect();
+    assert_eq!(arms, ["Route::Home"], "only the tagged arm chunks");
+    assert_eq!(
+        plan.chunks[0].functions,
+        ["home_page"],
+        "and it keeps its own page"
+    );
+}
+
+/// Two route matches would alias each other's chunks — a chunk is addressed by
+/// the route value's variant tag alone — so v1 declines the split and the
+/// report says so, rather than emitting a map the runtime can misread.
+#[test]
+fn a_second_route_match_declines_the_split() {
+    let plan = plan_for(
+        r#"
+import std::ui::{View, view, mount_root};
+import std::reactive::Signal;
+import std::router::{current_path, segments};
+
+[derive(PartialEq)]
+enum Route {
+    Home,
+    Other,
+}
+
+[derive(PartialEq)]
+enum Tab {
+    Left,
+    Right,
+}
+
+fun parse(path: str): Route {
+    if segments(path).len() == 0 { Route::Home } else { Route::Other }
+}
+
+fun home_page(): View { view("h1").child("home") }
+fun other_page(): View { view("h1").child("other") }
+fun left_pane(): View { view("p").child("left") }
+fun right_pane(): View { view("p").child("right") }
+
+fun main() {
+    let route = current_path().map(parse);
+    let tab = Signal::new(Tab::Left);
+    mount_root("app", || {
+        view("div")
+            .child(view("section").swap(tab, |current| match current {
+                Tab::Left => left_pane(),
+                Tab::Right => right_pane(),
+            }))
+            .swap(route, |current| match current {
+                Route::Home => home_page(),
+                Route::Other => other_page(),
+            })
+    });
+}
+"#,
+        Platform::Browser,
+    );
+    assert_eq!(plan.sites, 2, "both matches are recognized");
+    assert!(plan.chunks.is_empty(), "but v1 splits neither");
+    let report = vilan_core::chunks::render(&plan, "app.vl");
+    assert!(
+        report.contains("v1 splits one per entry") && report.contains("nothing would split"),
+        "the report explains the decline: {report}"
+    );
+}
+
+/// The artifact name reduces an arm pattern to identifier characters, so
+/// `dist/<leg>.<arm>.js` is a real file name (`bundle-splitting.md` §3).
+#[test]
+fn a_chunk_file_name_is_its_arm_reduced_to_a_file_name() {
+    use vilan_core::chunks::chunk_file_name;
+    assert_eq!(
+        chunk_file_name("client", "Route::Home"),
+        "client.Route_Home.js"
+    );
+    assert_eq!(
+        chunk_file_name("client", "Route::Items(..)"),
+        "client.Route_Items.js"
+    );
+    // No arm reduces to nothing today (an untagged one stays eager); the
+    // fallback is what keeps that from ever naming `client..js`.
+    assert_eq!(chunk_file_name("client", "_"), "client.chunk.js");
 }
 
 /// The recognizer's silence: a browser app with swap but NO route match on

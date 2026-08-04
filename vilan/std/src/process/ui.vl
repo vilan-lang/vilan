@@ -388,3 +388,15 @@ fun render(view: View): str {
 	}
 	out + "</" + view.tag + ">"
 }
+
+/// The browser layer's route-chunk loading hook, in its server form
+/// (proposal/bundle-splitting.md §2). A server render is one pass over code
+/// that is already loaded, so nothing is ever in flight: this is always false.
+/// It exists because `std::router::pending` re-exports it, and the two `ui`
+/// layers declare the same surface — a component that binds it renders on
+/// both sides.
+let chunk_pending_signal: Signal<bool> = Signal::new(false);
+
+fun chunk_pending(): Signal<bool> {
+	chunk_pending_signal
+}

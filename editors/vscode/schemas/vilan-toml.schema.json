@@ -36,6 +36,11 @@
           "enum": ["node", "deno", "bun", "browser", "none"],
           "default": "node"
         },
+        "split": {
+          "type": "boolean",
+          "description": "Emit route chunks: an eager bundle plus one lazily imported file per route arm, fetched when a navigation reaches it. `browser` legs only. Replaced by `[entry.<name>] split` when entry sections are declared.",
+          "default": false
+        },
         "default-entry": {
           "type": "string",
           "description": "Which `[entry.<name>]` `vilan run` executes when several are runnable. `--entry` overrides it.",
@@ -141,6 +146,11 @@
             "description": "The entry's build platform. Must be a host — an entry is something to run.",
             "enum": ["node", "deno", "bun", "browser", "none"],
             "default": "node"
+          },
+          "split": {
+            "type": "boolean",
+            "description": "Emit route chunks: an eager bundle plus one lazily imported file per route arm, fetched when a navigation reaches it. `browser` legs only.",
+            "default": false
           }
         }
       }

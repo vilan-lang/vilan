@@ -98,6 +98,351 @@ pub fn transform_functions<'src>(
     ))
 }
 
+/// One emitted route chunk: the file a first navigation to `arm` fetches.
+pub struct EmittedChunk {
+    /// The arm pattern this chunk serves, as `--print-chunks` names it.
+    pub arm: String,
+    /// The route value's variant tag — the key the embedded map is read by.
+    pub tag: usize,
+    /// The artifact's file name, beside the entry bundle.
+    pub file: String,
+    pub source: String,
+}
+
+/// A split entry's artifacts (`bundle-splitting.md` §3): the eager bundle plus
+/// one file per route chunk. `chunks` is empty when the entry has nothing to
+/// split, and `main` is then byte-identical to [`transform`]'s output.
+pub struct SplitProgram {
+    pub main: String,
+    pub chunks: Vec<EmittedChunk>,
+}
+
+/// The registry the eager bundle and its chunks meet at. Not an ESM export:
+/// the emitted entry exports nothing and renames whole-program, and a relative
+/// `import()` cannot resolve in the playground's opaque-origin srcdoc frame —
+/// so the boundary is a runtime object keyed by the (already allocated)
+/// emitted names. `bundle-splitting.md` §3.
+const CHUNK_REGISTRY: &str = "__vilan_chunks";
+
+/// Emits `program` as an eager bundle plus one file per route chunk
+/// (`bundle-splitting.md` S2), for a browser entry that declared
+/// `split = true`. `leg` names the entry, and so its artifacts.
+///
+/// The walk, the name generator and the scope rename are the single-file
+/// build's, unchanged — the split is a partition of the assembled nodes, taken
+/// after the rename. That is what lets a chunk's declarations read the eager
+/// scope by name through the registry, and what keeps the eager bundle's
+/// module-binding block identical to the one a single-file build emits.
+pub fn transform_split<'src>(
+    program: &'src Program<'src>,
+    options: &BuildOptions,
+    leg: &str,
+) -> Result<SplitProgram, Error> {
+    let plan = crate::chunks::plan(program);
+    if plan.chunks.is_empty() {
+        // Nothing splittable: the entry is a single file, exactly as if the
+        // flag were absent. Reported by `--print-chunks`, not by a failure.
+        return Ok(SplitProgram {
+            main: transform(program, options)?,
+            chunks: Vec::new(),
+        });
+    }
+
+    let mut transformer = Transformer::new(program, options);
+    transformer.chunk_members = plan.members();
+    transformer.chunk_count = plan.chunks.len();
+    transformer.chunk_gate = plan.gate.as_ref().map(|gate| {
+        (
+            gate.swap,
+            gate.swap_split,
+            gate.calls.iter().copied().collect::<HashSet<Id>>(),
+        )
+    });
+    transformer.used_helpers.insert("__chunk_registry");
+    let formatter = transformer.formatter.clone();
+    let line_break = formatter.line_break;
+    let mut assembled = transformer.assemble()?;
+
+    // What each side can see of the other. The eager bundle's top level is the
+    // one scope a chunk can read from; a chunk's top level is the one a
+    // forwarder stands in for.
+    let mut eager_names = top_level_names(&assembled.nodes);
+    eager_names.extend(assembled.helpers.iter().map(|name| name.to_string()));
+    eager_names.extend(imported_symbols(&assembled.imports));
+    let chunk_names: Vec<BTreeSet<String>> = assembled
+        .chunks
+        .iter()
+        .map(|nodes| top_level_names(nodes))
+        .collect();
+
+    // The eager bundle keeps a forwarder for every chunk function it names, so
+    // every call site — the route match's arms — is emitted unchanged.
+    let mut eager_references = BTreeSet::new();
+    collect_references(&assembled.nodes, &mut eager_references);
+    let mut forwarders: Vec<js::Node<'src>> = Vec::new();
+    let mut registered_for_chunks: BTreeSet<String> = BTreeSet::new();
+    for nodes in &assembled.chunks {
+        for node in nodes {
+            let js::Node::Function(function) = node else {
+                continue;
+            };
+            if !eager_references.contains(&function.name) {
+                continue;
+            }
+            forwarders.push(chunk_forwarder(function));
+        }
+    }
+    // …and registers everything a chunk reads back out of it.
+    let mut chunk_sources: Vec<String> = Vec::new();
+    for (index, nodes) in assembled.chunks.iter().enumerate() {
+        let mut references = BTreeSet::new();
+        collect_references(nodes, &mut references);
+        let needs: Vec<String> = references
+            .into_iter()
+            .filter(|name| eager_names.contains(name) && !chunk_names[index].contains(name))
+            .collect();
+        registered_for_chunks.extend(needs.iter().cloned());
+
+        let mut chunk_nodes: Vec<js::Node<'src>> = vec![js::Node::ConstVariable(js::Variable {
+            name: CHUNK_REGISTRY.to_string(),
+            value: Box::new(js::Node::Property(
+                Box::new(js::Node::Local("globalThis".to_string())),
+                CHUNK_REGISTRY.to_string(),
+            )),
+        })];
+        for name in &needs {
+            chunk_nodes.push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(registry_slot(name)),
+            }));
+        }
+        chunk_nodes.extend(nodes.iter().cloned());
+        for name in &chunk_names[index] {
+            chunk_nodes.push(js::Node::Assignment(
+                Box::new(registry_slot(name)),
+                Box::new(js::Node::Local(name.clone())),
+            ));
+        }
+        chunk_sources.push(format!("{}{}", formatter.file(&chunk_nodes), line_break));
+    }
+
+    // The eager bundle's own glue: the registry handle first (nothing runs
+    // before it), then — at the seam between the module bindings and `main` —
+    // the embedded chunk map and the registrations. Every module binding has
+    // initialized by then, and nothing can have navigated yet.
+    let mut glue: Vec<js::Node<'src>> = Vec::new();
+    for chunk in &plan.chunks {
+        glue.push(js::Node::Assignment(
+            Box::new(js::Node::PropertyIndex(
+                Box::new(js::Node::Property(
+                    Box::new(js::Node::Local(CHUNK_REGISTRY.to_string())),
+                    "url".to_string(),
+                )),
+                Box::new(js::Node::Number(chunk.tag.to_string(), None)),
+            )),
+            Box::new(js::Node::String(Cow::Owned(
+                crate::chunks::chunk_file_name(leg, &chunk.arm),
+            ))),
+        ));
+    }
+    for name in &registered_for_chunks {
+        glue.push(js::Node::Assignment(
+            Box::new(registry_slot(name)),
+            Box::new(js::Node::Local(name.clone())),
+        ));
+    }
+    assembled
+        .nodes
+        .splice(assembled.main_body_start..assembled.main_body_start, glue);
+    assembled.nodes.splice(0..0, forwarders);
+    assembled.nodes.insert(
+        0,
+        js::Node::ConstVariable(js::Variable {
+            name: CHUNK_REGISTRY.to_string(),
+            value: Box::new(js::Node::Call(
+                Box::new(js::Node::Local("__chunk_registry".to_string())),
+                Vec::new(),
+            )),
+        }),
+    );
+
+    let body = formatter.file(&assembled.nodes);
+    let imports = assembled.imports.join("\n");
+    let helpers = assembled
+        .helpers
+        .iter()
+        .map(|name| helper_source(name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prelude = [imports, helpers]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let main = if prelude.is_empty() {
+        format!("{body}{line_break}")
+    } else {
+        format!("{prelude}\n{body}{line_break}")
+    };
+
+    Ok(SplitProgram {
+        main,
+        chunks: plan
+            .chunks
+            .iter()
+            .zip(chunk_sources)
+            .map(|(chunk, source)| EmittedChunk {
+                arm: chunk.arm.clone(),
+                tag: chunk.tag,
+                file: crate::chunks::chunk_file_name(leg, &chunk.arm),
+                source,
+            })
+            .collect(),
+    })
+}
+
+/// `__vilan_chunks.fn.<name>` — one function's slot in the registry.
+fn registry_slot<'src>(name: &str) -> js::Node<'src> {
+    js::Node::Property(
+        Box::new(js::Node::Property(
+            Box::new(js::Node::Local(CHUNK_REGISTRY.to_string())),
+            "fn".to_string(),
+        )),
+        name.to_string(),
+    )
+}
+
+/// The eager stand-in for a chunked function: same name, same parameters, one
+/// hop through the registry. Every call site the route match emits is
+/// unchanged, and a call made before the chunk landed fails loudly at the
+/// forwarder instead of yielding `undefined`.
+fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
+    js::Node::Function(js::Function {
+        name: function.name.clone(),
+        parameters: function.parameters.clone(),
+        body: vec![js::Node::Return(Box::new(js::Node::Call(
+            Box::new(registry_slot(&function.name)),
+            function
+                .parameters
+                .iter()
+                .map(|parameter| js::Node::Local(parameter.name.clone()))
+                .collect(),
+        )))],
+        is_async: function.is_async,
+    })
+}
+
+/// The names one file's top level declares — what the other side of the split
+/// can address it by.
+fn top_level_names(nodes: &[js::Node]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for node in nodes {
+        match node {
+            js::Node::Function(function) => {
+                names.insert(function.name.clone());
+            }
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                names.insert(variable.name.clone());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The symbols host `import` lines bind, so a chunk that names one can be
+/// handed it through the registry rather than re-importing the module.
+fn imported_symbols(imports: &[String]) -> Vec<String> {
+    imports
+        .iter()
+        .filter_map(|line| {
+            let start = line.find('{')? + 1;
+            let end = line.find('}')?;
+            Some(line.get(start..end)?.to_string())
+        })
+        .flat_map(|names| {
+            names
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Every identifier a run of nodes mentions. A superset of its free variables
+/// (a local shadowing a global is counted too), which is the safe direction:
+/// the extra name is bound from the registry and then shadowed, costing one
+/// declaration and never a missing one.
+fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>) {
+    for node in nodes {
+        collect_reference(node, out);
+    }
+}
+
+fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
+    match node {
+        js::Node::Local(name) => {
+            out.insert(name.clone());
+        }
+        js::Node::Function(function) => collect_references(&function.body, out),
+        js::Node::Closure(closure) => collect_references(&closure.body, out),
+        js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+            collect_reference(&variable.value, out)
+        }
+        js::Node::ForOf(_, iterable, body) => {
+            collect_reference(iterable, out);
+            collect_references(body, out);
+        }
+        js::Node::While(condition, body) => {
+            collect_reference(condition, out);
+            collect_references(body, out);
+        }
+        js::Node::If(branch) => collect_reference_if(branch, out),
+        js::Node::Try(body, finally) => {
+            collect_references(body, out);
+            collect_references(finally, out);
+        }
+        js::Node::Call(subject, arguments) => {
+            collect_reference(subject, out);
+            collect_references(arguments, out);
+        }
+        js::Node::Assignment(left, right)
+        | js::Node::Binary(_, left, right)
+        | js::Node::PropertyIndex(left, right) => {
+            collect_reference(left, out);
+            collect_reference(right, out);
+        }
+        js::Node::Await(inner)
+        | js::Node::Unary(_, inner)
+        | js::Node::Return(inner)
+        | js::Node::Throw(inner)
+        | js::Node::Spread(inner)
+        | js::Node::Property(inner, _) => collect_reference(inner, out),
+        js::Node::Array(items) => collect_references(items, out),
+        js::Node::String(_)
+        | js::Node::Number(_, _)
+        | js::Node::Bool(_)
+        | js::Node::Null
+        | js::Node::Void
+        | js::Node::Break
+        | js::Node::Continue => {}
+    }
+}
+
+fn collect_reference_if(branch: &js::IfBranch, out: &mut BTreeSet<String>) {
+    match branch {
+        js::IfBranch::If(condition, body, else_branch) => {
+            collect_reference(condition, out);
+            collect_references(body, out);
+            if let Some(else_branch) = else_branch {
+                collect_reference_if(else_branch, out);
+            }
+        }
+        js::IfBranch::Else(body) => collect_references(body, out),
+    }
+}
+
 /// Interprets a string literal's backslash escapes into the characters they
 /// denote (`\n` -> newline, `\t`, `\r`, `\"`, `\\`, `\0`), so the value is the
 /// real text — the JS formatter then re-escapes it for output. Borrows the slice
@@ -163,6 +508,9 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__nursery_run",
         "__sleep",
         "__timer",
+        "__chunk_arm",
+        "__chunk_ready",
+        "__chunk_load",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -209,6 +557,72 @@ fn helper_source(name: &str) -> &'static str {
              \t} catch (error) {\n\
              \t\treturn [ 1 ];\n\
              \t}\n\
+             }"
+        }
+        // Route chunks (`bundle-splitting.md` §2/§3). The registry is created on
+        // first touch and lives on `globalThis` because a chunk is a separate
+        // module with no lexical view of the entry bundle. `base` is captured
+        // from the entry's own <script> — a classic script's relative `import()`
+        // resolves against the DOCUMENT's URL, which is the route the user is
+        // on, so a bare `./chunk.js` would miss on every nested path. Node (and
+        // any host without `document`) resolves relative to the importing file,
+        // which is already right.
+        "__chunk_registry" => {
+            "function __chunk_registry() {\n\
+             \tlet chunks = globalThis.__vilan_chunks;\n\
+             \tif (chunks === undefined) {\n\
+             \t\tlet base = \"\";\n\
+             \t\tif (typeof document !== \"undefined\" && document.currentScript && document.currentScript.src) {\n\
+             \t\t\tbase = document.currentScript.src;\n\
+             \t\t}\n\
+             \t\tchunks = { fn: Object.create(null), url: Object.create(null), loaded: Object.create(null), pending: Object.create(null), base: base };\n\
+             \t\tglobalThis.__vilan_chunks = chunks;\n\
+             \t}\n\
+             \treturn chunks;\n\
+             }"
+        }
+        // The route arm a value selects. An enum emits as `[tag, ..]`, and the
+        // gate only ever sees the subject of a route `match`, so the tag is the
+        // first slot; anything else is a build with no chunk map, where every
+        // arm reports ready.
+        "__chunk_arm" => {
+            "function __chunk_arm(value) {\n\
+             \treturn Array.isArray(value) ? value[0] : -1;\n\
+             }"
+        }
+        // An arm with no entry in the map needs no chunk — which is every arm of
+        // every single-file build, so `swap_split` is `swap` there.
+        "__chunk_ready" => {
+            "function __chunk_ready(arm) {\n\
+             \tconst chunks = __chunk_registry();\n\
+             \treturn chunks.url[arm] === undefined || chunks.loaded[arm] === true;\n\
+             }"
+        }
+        // A failed fetch reports and does NOT continue: the route signal never
+        // advances, so the previous view stays and the navigation simply did not
+        // happen (`bundle-splitting.md` §2). The in-flight promise is dropped on
+        // failure so the next attempt refetches.
+        "__chunk_load" => {
+            "function __chunk_load(arm, then) {\n\
+             \tconst chunks = __chunk_registry();\n\
+             \tif (chunks.url[arm] === undefined || chunks.loaded[arm] === true) {\n\
+             \t\tthen();\n\
+             \t\treturn;\n\
+             \t}\n\
+             \tlet inflight = chunks.pending[arm];\n\
+             \tif (inflight === undefined) {\n\
+             \t\tconst url = chunks.url[arm];\n\
+             \t\tconst specifier = chunks.base === \"\" ? \"./\" + url : new URL(url, chunks.base).href;\n\
+             \t\tinflight = import(specifier).then(() => {\n\
+             \t\t\tchunks.loaded[arm] = true;\n\
+             \t\t}, (error) => {\n\
+             \t\t\tdelete chunks.pending[arm];\n\
+             \t\t\tconsole.error(\"[vilan] route chunk \" + url + \" failed to load\", error);\n\
+             \t\t\tthrow error;\n\
+             \t\t});\n\
+             \t\tchunks.pending[arm] = inflight;\n\
+             \t}\n\
+             \tinflight.then(then, () => {});\n\
              }"
         }
         "__random_int" => {
@@ -798,6 +1212,30 @@ struct Transformer<'src> {
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
     bodyless_emissions: Vec<Id>,
+    // Route-chunk partition (`bundle-splitting.md` S2): function id -> chunk
+    // index, plus how many chunks there are. Empty for every build that did not
+    // ask to split, which is what keeps single-file emission byte-identical —
+    // the partition is the ONLY thing this feature adds to the walk.
+    chunk_members: HashMap<Id, usize>,
+    chunk_count: usize,
+    // The route gate: `(View.swap, View.swap_split, the recognized call ids)`.
+    // `None` for every build that is not splitting.
+    chunk_gate: Option<(Id, Id, HashSet<Id>)>,
+}
+
+/// One entry's emission, partitioned. `chunks` is empty unless the transformer
+/// was given a route-chunk partition; the eager `nodes` are then exactly the
+/// nodes a single-file build would emit minus the chunked function
+/// declarations, renamed identically (one walk, one rename, then the split).
+struct Assembled<'src> {
+    imports: Vec<String>,
+    helpers: Vec<&'static str>,
+    nodes: Vec<js::Node<'src>>,
+    chunks: Vec<Vec<js::Node<'src>>>,
+    /// Where `main`'s inlined body starts in `nodes` — the seam a split build
+    /// files the chunk map and the registrations into, after every module
+    /// binding has initialized and before anything can navigate.
+    main_body_start: usize,
 }
 
 /// How a resource-owning scope's tail value is used when it is restructured into
@@ -911,6 +1349,9 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            chunk_members: HashMap::new(),
+            chunk_count: 0,
+            chunk_gate: None,
         }
     }
 
@@ -939,7 +1380,20 @@ impl<'src> Transformer<'src> {
         Ok(format!("{}{}", output, line_break))
     }
 
-    fn transform_entry_ast(mut self) -> Result<JsProgram<'src>, Error> {
+    fn transform_entry_ast(self) -> Result<JsProgram<'src>, Error> {
+        let assembled = self.assemble()?;
+        debug_assert!(
+            assembled.chunks.is_empty(),
+            "a single-file build splits nothing"
+        );
+        Ok(JsProgram {
+            imports: assembled.imports,
+            helpers: assembled.helpers,
+            nodes: assembled.nodes,
+        })
+    }
+
+    fn assemble(mut self) -> Result<Assembled<'src>, Error> {
         let global_scope = self
             .program
             .scopes
@@ -981,8 +1435,20 @@ impl<'src> Transformer<'src> {
         // referenced (dispatch candidates over-approximate reachability, like
         // everywhere else — such a binding is walked but then dropped here,
         // and it was admission-checked by the same graph).
-        let reachable_bindings =
-            crate::platform_color::reachable_bindings(self.program, &graph, main_fn.id);
+        // The route gate is a second root: nothing in source calls
+        // `View.swap_split`, so its own module state (the pending signal) is
+        // invisible to a walk from `main` alone.
+        let gate_roots: Vec<Id> = self
+            .chunk_gate
+            .as_ref()
+            .map(|(_, swap_split, _)| vec![*swap_split])
+            .unwrap_or_default();
+        let reachable_bindings = crate::platform_color::reachable_bindings(
+            self.program,
+            &graph,
+            main_fn.id,
+            &gate_roots,
+        );
         let binding_nodes: Vec<(Id, Vec<js::Node<'src>>)> = global_variables
             .iter()
             .filter(|binding| reachable_bindings.contains(binding))
@@ -1169,10 +1635,30 @@ impl<'src> Transformer<'src> {
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
         t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
-        let t_functions = t_functions.into_iter().map(|x| x.1);
+
+        // The route-chunk partition (`bundle-splitting.md` §1): a function
+        // reachable from exactly one route arm and nothing eager leaves the
+        // entry bundle. Everything else — module bindings included, which is
+        // what keeps B33's initialization order whole — stays. The buckets are
+        // assembled into ONE node vector below and split apart only after the
+        // rename, so a chunk's declarations are named exactly as they would
+        // have been in the single-file build and can never collide with the
+        // eager scope they read through the registry.
+        let mut eager_functions: Vec<js::Node<'src>> = Vec::new();
+        let mut chunked: Vec<Vec<js::Node<'src>>> = vec![Vec::new(); self.chunk_count];
+        for (id, node) in t_functions {
+            match self.chunk_members.get(&id) {
+                Some(&chunk) => chunked[chunk].push(node),
+                None => eager_functions.push(node),
+            }
+        }
+        let t_functions = eager_functions.into_iter();
 
         // Monomorphized variants are plain function declarations too; ordering
-        // among declarations is irrelevant since JS hoists them.
+        // among declarations is irrelevant since JS hoists them. They carry no
+        // function id, so they are never chunked — a conservative eager
+        // placement, correct at the cost of a chunk-exclusive instantiation
+        // riding along.
         let t_instances = self.monomorphized.into_iter();
 
         // Host imports (`import { a, b } from "module";`) from `[extern]` calls,
@@ -1185,22 +1671,52 @@ impl<'src> Transformer<'src> {
                 format!("import {{ {} }} from \"{}\";", names, module)
             })
             .collect::<Vec<_>>();
-        let helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
+        let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
+        // `__chunk_ready`/`__chunk_load` read the registry through
+        // `__chunk_registry`, so the helper's own dependency travels with it —
+        // including in a build that reached the gate without splitting, where
+        // an empty registry makes every arm ready.
+        if helpers
+            .iter()
+            .any(|helper| matches!(*helper, "__chunk_ready" | "__chunk_load"))
+            && !helpers.contains(&"__chunk_registry")
+        {
+            helpers.push("__chunk_registry");
+            helpers.sort();
+        }
 
-        let mut nodes = t_functions
-            .chain(t_instances)
-            .chain(t_global_variables)
-            .chain(hmr_expose)
-            .chain(t_main_fn_body)
-            .collect::<Vec<_>>();
+        let mut nodes = t_functions.collect::<Vec<_>>();
+        // Each chunk's declarations occupy one contiguous run, recorded so the
+        // rename below can see the whole program in one scope tree and the runs
+        // can then be lifted out intact.
+        let mut chunk_ranges: Vec<(usize, usize)> = Vec::with_capacity(chunked.len());
+        for bucket in chunked {
+            let start = nodes.len();
+            nodes.extend(bucket);
+            chunk_ranges.push((start, nodes.len()));
+        }
+        nodes.extend(t_instances);
+        nodes.extend(t_global_variables);
+        nodes.extend(hmr_expose);
+        let mut main_body_start = nodes.len();
+        nodes.extend(t_main_fn_body);
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
         // names per function).
         rename_for_scopes(&self.ng, self.program, &mut nodes);
-        Ok(JsProgram {
+        // Lift the chunk runs out, last first so the earlier ranges stay valid.
+        let mut chunks: Vec<Vec<js::Node<'src>>> = Vec::with_capacity(chunk_ranges.len());
+        for (start, end) in chunk_ranges.iter().rev() {
+            chunks.push(nodes.drain(start..end).collect());
+            main_body_start -= end - start;
+        }
+        chunks.reverse();
+        Ok(Assembled {
             imports,
             helpers,
             nodes,
+            chunks,
+            main_body_start,
         })
     }
 
@@ -2002,6 +2518,25 @@ impl<'src> Transformer<'src> {
                         // out at the consumption sites, so this is harmless for
                         // them, matching the value arm's unconditional insert.
                         self.referenced_globals.insert(target_id);
+                        // A split build's route match: `swap` becomes
+                        // `swap_split`, which waits for the arm's chunk before
+                        // letting the view advance (`bundle-splitting.md` §2).
+                        // Same shape, so the call's own type binding carries
+                        // over by position; every argument is emitted unchanged.
+                        if let Some(gate_target) = self.split_gate_target(*id, target_id) {
+                            let substitution = self
+                                .call_substitution(
+                                    *id,
+                                    target_id,
+                                    &function_call.generic_argument_ids,
+                                )
+                                .map(|substitution| {
+                                    self.rebind_by_position(target_id, gate_target, &substitution)
+                                })
+                                .unwrap_or_default();
+                            let name = self.emit_instance(gate_target, &substitution);
+                            return Some(js::Node::Call(Box::new(js::Node::Local(name)), args));
+                        }
                         // An external std intrinsic lowers to native JS or a
                         // runtime helper.
                         if let Some(intrinsic) = self.program.intrinsics.get(&target_id).copied() {
@@ -4259,6 +4794,37 @@ impl<'src> Transformer<'src> {
         Dispatch::Call(name, self.program.async_functions.contains(&next_id))
     }
 
+    /// The gate this call is retargeted to, if it is one of the split build's
+    /// recognized route matches. `None` for every other call in every other
+    /// build — which is why a flagless build emits exactly what it always did.
+    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<Id> {
+        let gate = self.chunk_gate.as_ref()?;
+        (target_id == gate.0 && gate.2.contains(&call_id)).then_some(gate.1)
+    }
+
+    /// Re-keys a type substitution from one function's generic parameters onto
+    /// another's, by position. The two must declare the same generics in the
+    /// same order — which is the standing requirement on `swap`/`swap_split`,
+    /// pinned by the gate's own test.
+    fn rebind_by_position(
+        &self,
+        from: Id,
+        to: Id,
+        substitution: &HashMap<TypeId, TypeId>,
+    ) -> HashMap<TypeId, TypeId> {
+        let (Some(from), Some(to)) = (
+            self.program.functions.get(&from),
+            self.program.functions.get(&to),
+        ) else {
+            return HashMap::new();
+        };
+        from.generic_parameter_constraint_ids
+            .iter()
+            .zip(to.generic_parameter_constraint_ids.iter())
+            .filter_map(|(from, to)| substitution.get(from).map(|bound| (*to, *bound)))
+            .collect()
+    }
+
     /// Emits a concrete (non-generic) function once, keyed by its id. Any active
     /// substitution and self-type are cleared while walking it, since its body
     /// has no generic parameters of its own and is not a default being
@@ -6088,6 +6654,13 @@ const RESERVED_NAMES: &[&str] = &[
     "__timer",
     "__Timer",
     "__hmr_active",
+    // Route chunks (`bundle-splitting.md` §3): the registry handle a split
+    // bundle and its chunks meet at, and the helpers behind the gate.
+    "__vilan_chunks",
+    "__chunk_registry",
+    "__chunk_arm",
+    "__chunk_ready",
+    "__chunk_load",
 ];
 
 /// The free identifiers a program's `[extern]`s introduce — an imported symbol

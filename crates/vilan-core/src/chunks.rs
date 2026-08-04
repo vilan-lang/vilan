@@ -17,8 +17,15 @@ use crate::id::Id;
 pub struct Chunk {
     /// The arm's pattern, as written (sliced from the entry source).
     pub arm: String,
+    /// The enum variant index the arm matches — the key the emitted chunk map
+    /// is addressed by at runtime, since that is what a route value carries
+    /// (an enum value emits as `[tag, ..]`).
+    pub tag: usize,
     /// The chunk's functions, by name, sorted.
     pub functions: Vec<String>,
+    /// The same functions, by id — what emission partitions on. Parallel to
+    /// `functions` only in content, not in order.
+    pub ids: Vec<Id>,
     /// The summed source-span bytes of those functions — an estimate.
     pub bytes: usize,
 }
@@ -33,6 +40,38 @@ pub struct ChunkPlan {
     /// v2's shared-chunk candidates).
     pub shared_functions: usize,
     pub chunks: Vec<Chunk>,
+    /// Where a split build wires the route gate: the recognized `swap` calls
+    /// and the two methods involved. `None` when nothing splits — and then the
+    /// emitter changes no call, which is what makes the flag's absence
+    /// byte-identical (`bundle-splitting.md` §4).
+    pub gate: Option<Gate>,
+}
+
+/// The gate wiring for one entry (`bundle-splitting.md` §2). `View.swap`'s
+/// render closure is `sync` and cannot await a chunk, so the wait moves
+/// upstream: the recognized calls are emitted against `View.swap_split`, which
+/// holds a gated signal and advances it only once the arm's chunk has landed.
+pub struct Gate {
+    /// The `swap` call ids the emitter retargets.
+    pub calls: Vec<Id>,
+    /// `View.swap` — what those calls resolve to today.
+    pub swap: Id,
+    /// `View.swap_split` — what they resolve to in a split build. Same shape,
+    /// so the call's own type binding carries over by position.
+    pub swap_split: Id,
+}
+
+impl ChunkPlan {
+    /// Each function's chunk index, for the emitter's partition.
+    pub fn members(&self) -> std::collections::HashMap<Id, usize> {
+        let mut members = std::collections::HashMap::new();
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            for id in &chunk.ids {
+                members.insert(*id, index);
+            }
+        }
+        members
+    }
 }
 
 /// Computes the plan.
@@ -42,13 +81,25 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         eager_functions: 0,
         shared_functions: 0,
         chunks: Vec::new(),
+        gate: None,
     };
-    let Some(swap_fn) = swap_function(program) else {
+    let Some(swap_fn) = view_method(program, "swap") else {
         return empty;
     };
     let sites = splittable_sites(program, swap_fn);
     if sites.is_empty() {
         return empty;
+    }
+    // v1 addresses a chunk by the route value's variant tag alone (that is all
+    // a `Signal<T>` carries at the gate), so two route matches over different
+    // enums would alias each other's chunks. Rather than emit a map the
+    // runtime can misread, a second splittable match declines the whole split —
+    // reported as such, and recorded as the v2 extension beside nested matches.
+    if sites.len() > 1 {
+        return ChunkPlan {
+            sites: sites.len(),
+            ..empty
+        };
     }
 
     let graph = program.call_graph();
@@ -82,7 +133,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
 
     // Per-arm reach, full expansion.
-    let mut arm_reach: Vec<(String, HashSet<Id>)> = Vec::new();
+    let mut arm_reach: Vec<(String, Option<usize>, HashSet<Id>)> = Vec::new();
     for site in &sites {
         for arm in &site.arms {
             let mut reach = HashSet::new();
@@ -95,7 +146,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
                     queue.push(next);
                 }
             }
-            arm_reach.push((arm.name.clone(), reach));
+            arm_reach.push((arm.name.clone(), arm.tag, reach));
         }
     }
 
@@ -104,9 +155,13 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     let mut eager_functions = 0usize;
     let mut chunks: Vec<Chunk> = arm_reach
         .iter()
-        .map(|(pattern, _)| Chunk {
+        .map(|(pattern, tag, _)| Chunk {
             arm: pattern.clone(),
+            // A `_` or binding arm has no tag to address a chunk by, so its
+            // exclusive functions stay eager (below) and its slot is dropped.
+            tag: tag.unwrap_or(usize::MAX),
             functions: Vec::new(),
+            ids: Vec::new(),
             bytes: 0,
         })
         .collect();
@@ -129,20 +184,23 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         let owners: Vec<usize> = arm_reach
             .iter()
             .enumerate()
-            .filter(|(_, (_, reach))| reach.contains(id))
+            .filter(|(_, (_, _, reach))| reach.contains(id))
             .map(|(index, _)| index)
             .collect();
         match owners.as_slice() {
             [] => {}
-            [only] => {
+            [only] if chunks[*only].tag != usize::MAX => {
                 let bytes = program
                     .span_map
                     .get(id)
                     .map(|span| span.end.saturating_sub(span.start))
                     .unwrap_or(0);
                 chunks[*only].functions.push(function.name.to_string());
+                chunks[*only].ids.push(*id);
                 chunks[*only].bytes += bytes;
             }
+            // An untagged arm's exclusive code has no chunk to ride in.
+            [_] => eager_functions += 1,
             _ => {
                 shared += 1;
                 eager_functions += 1;
@@ -151,19 +209,26 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     for chunk in &mut chunks {
         chunk.functions.sort();
+        chunk.ids.sort_by_key(|id| id.0);
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
+    let gate = view_method(program, "swap_split").map(|swap_split| Gate {
+        calls: sites.iter().map(|site| site.call).collect(),
+        swap: swap_fn,
+        swap_split,
+    });
     ChunkPlan {
         sites: sites.len(),
         eager_functions,
         shared_functions: shared,
         chunks,
+        gate,
     }
 }
 
-/// The std `View.swap` method, when the browser layer is loaded.
-fn swap_function(program: &Program<'_>) -> Option<Id> {
+/// A std `View` method by name, when the browser layer is loaded.
+fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
     let view_struct = program.structs.iter().find_map(|(id, struct_)| {
         (struct_.name == "View"
             && program
@@ -176,19 +241,24 @@ fn swap_function(program: &Program<'_>) -> Option<Id> {
             program.type_id_to_type_map.get(&implementation.subject),
             Some(crate::type_::Type::Struct(id, _)) if *id == view_struct
         )
-        .then(|| implementation.declarations.get("swap").copied())
+        .then(|| implementation.declarations.get(name).copied())
         .flatten()
     })
 }
 
 /// One recognized `.swap(signal, |current| match current { .. })` site.
 struct Site {
+    /// The `swap` call itself — what the gate retargets.
+    call: Id,
     closure: Id,
     arms: Vec<Arm>,
 }
 
 struct Arm {
     name: String,
+    /// The variant index this arm matches, when it matches one. `None` for a
+    /// wildcard or a plain binding — nothing a route value can be keyed by.
+    tag: Option<usize>,
     body: Id,
 }
 
@@ -252,7 +322,7 @@ impl Arm {
 /// argument's body is a `match` on that closure's parameter.
 fn splittable_sites(program: &Program<'_>, swap_fn: Id) -> Vec<Site> {
     let mut sites = Vec::new();
-    for call in program.function_calls.values() {
+    for (call_id, call) in &program.function_calls {
         let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) else {
             continue;
         };
@@ -299,17 +369,28 @@ fn splittable_sites(program: &Program<'_>, swap_fn: Id) -> Vec<Site> {
             continue;
         }
         sites.push(Site {
+            call: *call_id,
             closure: closure_id,
             arms: legs
                 .iter()
                 .map(|leg| Arm {
                     name: pattern_name(program, &leg.pattern),
+                    tag: pattern_tag(&leg.pattern),
                     body: leg.body,
                 })
                 .collect(),
         });
     }
     sites
+}
+
+/// The variant index an arm selects — the tag an emitted enum value carries in
+/// its first slot, and so the key a chunk is fetched by at a navigation.
+fn pattern_tag(pattern: &crate::analyzer::ExprPattern) -> Option<usize> {
+    match pattern {
+        crate::analyzer::ExprPattern::Variant(_, index, _) => Some(*index),
+        _ => None,
+    }
 }
 
 /// Renders an arm's pattern from the resolved program — enum names, not
@@ -385,12 +466,48 @@ fn expand(
     next
 }
 
+/// The artifact name for one chunk, per `bundle-splitting.md` §3's
+/// `dist/<leg>.<arm>.js`. An arm pattern is not a file name (`Route::Items(..)`),
+/// so it is reduced to its identifier characters — runs of anything else
+/// collapse to one `_`, which turns `Route::Items(..)` into `Route_Items`. A
+/// leg name is an identifier (the manifest checks it), so no chunk can collide
+/// with another leg's `dist/<leg>.js`.
+pub fn chunk_file_name(leg: &str, arm: &str) -> String {
+    let mut sanitized = String::with_capacity(arm.len());
+    for character in arm.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            sanitized.push(character);
+        } else if !sanitized.ends_with('_') {
+            sanitized.push('_');
+        }
+    }
+    let sanitized = sanitized.trim_matches('_');
+    // A pattern with no identifier characters at all would name `<leg>..js`.
+    // No such arm chunks today (an untagged arm stays eager), so this is a
+    // guard rather than a case — but a guard the name can't do without.
+    let sanitized = if sanitized.is_empty() {
+        "chunk"
+    } else {
+        sanitized
+    };
+    format!("{leg}.{sanitized}.js")
+}
+
 /// Renders the plan as the `--print-chunks` report.
 pub fn render(plan: &ChunkPlan, entry_name: &str) -> String {
     let mut out = String::new();
     if plan.sites == 0 {
         out.push_str(&format!(
             "[vilan chunks] {entry_name}: no splittable route matches\n"
+        ));
+        return out;
+    }
+    if plan.sites > 1 {
+        out.push_str(&format!(
+            "[vilan chunks] {entry_name}: {} splittable route matches — v1 splits \
+             one per entry (a chunk is addressed by the route value's variant tag, \
+             which two route enums would alias); nothing would split\n",
+            plan.sites,
         ));
         return out;
     }

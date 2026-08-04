@@ -1,0 +1,116 @@
+// The route-chunk fixture (proposal/bundle-splitting.md S2). Deliberately
+// shaped to exercise every rule the partition makes:
+//
+//   - three route arms, each with a page of its own -> three chunks;
+//   - `panel`, reached from all three arms -> SHARED, so it stays eager
+//     (v1 extracts no sibling chunk);
+//   - `docs_nav`, reached from one arm only -> that arm's chunk;
+//   - module bindings whose initializers PRINT and whose declaration order is
+//     the reverse of their dependency order -> B33's initialization order is
+//     observable, and must be identical split or not;
+//   - a chunked page reading a module binding (`LABEL`) -> the chunk reaches
+//     the eager scope through the registry;
+//   - `router::pending()` bound into the shell -> the loading hook is live
+//     while a chunk is in flight.
+
+import std::io::print;
+import std::option::Option::{ None, Some, self };
+import std::reactive::Signal;
+import std::router::{ Routable, current_path, link, pending, segments };
+import std::ui::{ View, mount_root, view };
+
+// === The route space =========================================================
+
+[derive(PartialEq)]
+enum Route {
+	Home,
+	Docs(i32),
+	NotFound,
+}
+
+fun parse(path: str): Route {
+	let parts = segments(path);
+	if parts.len() == 0 {
+		ret Route::Home;
+	}
+	if parts[0] == "docs" && parts.len() == 2 {
+		match parts[1].parse_i32() {
+			Some(let page) => ret Route::Docs(page),
+			None => {},
+		}
+	}
+	Route::NotFound
+}
+
+fun href(route: Route): str {
+	match route {
+		Route::Home => "/",
+		Route::Docs(let page) => i"/docs/{page}",
+		Route::NotFound => "/404",
+	}
+}
+
+impl Route with Routable {
+	fun to_path(self): str {
+		href(self)
+	}
+}
+
+// === Module state ============================================================
+// Declared newest-dependency-first on purpose: dependency order, not textual
+// order, decides when each initializer runs (b33-emission-order.md §1).
+
+let LABEL: str = i"scale {SCALED}";
+let SCALED: i32 = announce("SCALED", BASE * 3);
+let BASE: i32 = announce("BASE", 2);
+
+fun announce(name: str, value: i32): i32 {
+	print(i"init {name}={value}");
+	value
+}
+
+// === Pages ===================================================================
+
+// Reached from every arm, so the partition keeps it eager.
+fun panel(title: str, body: str): View {
+	view("section").child(view("h2").text(title)).child(view("p").text(body))
+}
+
+fun home_page(): View {
+	panel("Home", LABEL)
+}
+
+fun docs_page(page: i32): View {
+	view("article").child(panel("Docs", i"page {page}")).child(docs_nav(page))
+}
+
+// Only the docs arm reaches this, so it rides that chunk.
+fun docs_nav(page: i32): View {
+	view("nav").child(link("Next", Route::Docs(page + 1)))
+}
+
+fun not_found_page(): View {
+	panel("Nothing here", "try /docs/1")
+}
+
+// === The shell ===============================================================
+
+fun app(route: Signal<Route>): View {
+	view("main")
+		.child(view("nav")
+			.child(link("Home", Route::Home))
+			.child(link("Docs", Route::Docs(1))))
+		// The loading story's one hook: true while a route chunk is fetching,
+		// with the previous page still on screen behind it.
+		.child(view("p").class("pending").bind_text(pending().map(|busy| if busy { "..." } else { "" })))
+		.swap(route, |current| match current {
+			Route::Home => home_page(),
+			Route::Docs(let page) => docs_page(page),
+			Route::NotFound => not_found_page(),
+		})
+}
+
+fun main() {
+	let route = current_path().map(parse);
+	let _root = mount_root("app", || app(route));
+}

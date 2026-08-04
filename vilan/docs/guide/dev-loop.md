@@ -211,6 +211,82 @@ style change rather than the flicker-free stylesheet reload. That is still
 correct (the byte-diff classifies inlined CSS as a bundle change), but not
 as surgical. The `<link>` form is the one to prefer for the tightest loop.
 
+## Shipping routes separately
+
+A browser leg ships as one file, so first load pays for every page in the
+app. Opt one leg into route chunks and the compiler splits it for you:
+
+```toml
+[entry.client]
+target = "browser"
+split = true
+```
+
+Now `vilan build` writes an eager `dist/client.js` plus one
+`dist/client.<Route>.js` per arm of your route `match`, and a
+`dist/client.chunks.json` listing them (serve the whole directory and you
+are done). No keyword, no `lazy()` wrapper, nothing to forget: the router
+`match` already marks the seams, so the split is inferred from the code you
+wrote. A function only one arm can reach rides that arm's file; anything
+two arms share, and every module-level binding, stays eager.
+
+**What the user sees while a chunk loads: the page they were on.** The
+route signal doesn't advance until the code arrives, so there is no blank
+frame and no placeholder tree to design — the previous page simply stays,
+then swaps. First visit to a route pays one fetch; every later visit is
+instant. If the fetch fails, the navigation doesn't happen (and the console
+says why). For a progress indicator, bind `router::pending()` — it's an
+ordinary `Signal<bool>`, so `show` (or `bind_text`, or a class) is all it
+takes:
+
+```vilan,browser
+import std::reactive::Signal;
+import std::router::{ current_path, pending, segments };
+import std::ui::{ View, mount_root, view };
+
+[derive(PartialEq)]
+enum Route {
+	Home,
+	NotFound,
+}
+
+fun parse(path: str): Route {
+	if segments(path).len() == 0 { Route::Home } else { Route::NotFound }
+}
+
+fun home_page(): View {
+	view("h1").text("Home")
+}
+
+fun missing_page(): View {
+	view("h1").text("Nothing here")
+}
+
+fun main() {
+	let route = current_path().map(parse);
+	let _root = mount_root("app", || {
+		view("main")
+			// Visible only while a route chunk is in flight; the page behind
+			// it is the one you were already on.
+			.child(view("div").class("spinner").text("Loading…").show(pending()))
+			.swap(route, |current| match current {
+				Route::Home => home_page(),
+				Route::NotFound => missing_page(),
+			})
+	});
+}
+```
+
+Two things to know. `split` is a `browser` leg's key — a Node entry has no
+navigation to gate, and the build says so rather than ignoring the line.
+And `--watch` builds ignore it: HMR swaps whole bundles, so the dev loop
+keeps working on one file. Single-file emission stays the default and is
+not going anywhere; `split` is opt-in, per leg.
+
+`vilan build --print-chunks` reports what *would* split without emitting
+anything, which is the way to find out whether a leg has enough per-route
+code to be worth it.
+
 ## Cleaning up strays
 
 The swap disposes the UI root and closes the live rpc socket for you. Anything

@@ -76,6 +76,11 @@ pub struct Package {
     /// The default build platform (`node` / `deno` / `bun` / `browser` / `none`).
     /// Default `node`.
     pub target: Option<String>,
+    /// Route-chunk emission for the single-entry shape — the same key
+    /// `[entry.<name>] split` carries, since `[package] target = "browser"`
+    /// declares a browser entry just as an entry section does
+    /// (`bundle-splitting.md` §4).
+    pub split: Option<bool>,
     /// Which `[entry.<name>]` `vilan run` executes when the package declares
     /// several node entries (A15's follow-up). `--entry` still overrides it.
     #[serde(rename = "default-entry")]
@@ -145,6 +150,10 @@ pub struct EntryDecl {
     /// The entry's build platform (`node` / `deno` / `bun` / `browser`).
     /// Default `node`.
     pub target: Option<String>,
+    /// Emit this entry as an eager bundle plus one lazily-imported file per
+    /// route chunk (`bundle-splitting.md` §4). Browser entries only; default
+    /// `false`, and single-file emission stays the default mode forever.
+    pub split: Option<bool>,
 }
 
 impl EntryDecl {
@@ -158,6 +167,11 @@ impl EntryDecl {
     /// The declared platform, if any (validated by [`Manifest::validate`]).
     pub fn resolved_target(&self) -> Option<Platform> {
         self.target.as_deref().and_then(|t| Platform::parse(t).ok())
+    }
+
+    /// Whether this entry asked for route-chunk emission (default `false`).
+    pub fn splits(&self) -> bool {
+        self.split.unwrap_or(false)
     }
 }
 
@@ -412,6 +426,12 @@ impl Package {
     pub fn resolved_target(&self) -> Option<Platform> {
         self.target.as_deref().and_then(|t| Platform::parse(t).ok())
     }
+
+    /// Whether this package's single entry asked for route-chunk emission
+    /// (default `false`).
+    pub fn splits(&self) -> bool {
+        self.split.unwrap_or(false)
+    }
 }
 
 impl Manifest {
@@ -555,6 +575,12 @@ impl Manifest {
                 errors.push(format!("invalid `[package] target`: {error}"));
             }
         }
+        if package.splits() && self.entries.is_empty() {
+            let declared = package.target.as_deref().unwrap_or("node");
+            if !matches!(Platform::parse(declared), Ok(Platform::Browser)) {
+                errors.push(split_needs_a_browser_leg("[package] split", declared));
+            }
+        }
         // The designated default entry names one of this package's
         // `[entry.<name>]` sections — checkable right here, so a typo is a
         // manifest error rather than a `run` that picks the wrong leg.
@@ -592,11 +618,11 @@ impl Manifest {
             );
         }
         if let Some(package) = &self.package {
-            if package.entry.is_some() || package.target.is_some() {
+            if package.entry.is_some() || package.target.is_some() || package.split.is_some() {
                 errors.push(
-                    "`[package] entry`/`target` can't be combined with \
+                    "`[package] entry`/`target`/`split` can't be combined with \
                      `[entry.<name>]` sections: with multiple entries, each \
-                     declares its own `path` and `target`"
+                     declares its own `path`, `target` and `split`"
                         .to_string(),
                 );
             }
@@ -618,6 +644,15 @@ impl Manifest {
                          (`node`/`deno`/`bun`/`browser`), not `none`"
                     )),
                     Ok(_) => {}
+                }
+            }
+            if entry.splits() {
+                let declared = entry.target.as_deref().unwrap_or("node");
+                if !matches!(Platform::parse(declared), Ok(Platform::Browser)) {
+                    errors.push(split_needs_a_browser_leg(
+                        &format!("[entry.{name}] split"),
+                        declared,
+                    ));
                 }
             }
             if let Some(path) = &entry.path {
@@ -1234,6 +1269,18 @@ fn resolve_dependency_edges(
         edges.push((import_name.clone(), index));
     }
     Ok(edges)
+}
+
+/// The refusal for `split = true` outside a browser leg. Route chunks are
+/// fetched with `import()` when a navigation advances the route signal
+/// (`bundle-splitting.md` §2), so the key means nothing on a process leg —
+/// silently ignoring it would leave the author believing a bundle was split.
+fn split_needs_a_browser_leg(key: &str, declared: &str) -> String {
+    format!(
+        "`{key}` applies to a `browser` leg only: route chunks are fetched \
+         with `import()` when a navigation advances the route signal, and \
+         this leg targets `{declared}`"
+    )
 }
 
 /// Whether `name` is a valid Vilan identifier: a leading letter or `_`, then
@@ -2420,6 +2467,79 @@ mod tests {
         let client = &manifest.entries["client"];
         assert_eq!(client.path("client"), Path::new("web/main.vl"));
         assert_eq!(client.resolved_target(), Some(Platform::Browser));
+        assert!(!server.splits(), "single-file emission is the default");
+        assert!(
+            !client.splits(),
+            "a browser entry does not split by default"
+        );
+    }
+
+    #[test]
+    fn a_browser_entry_may_ask_to_split() {
+        let manifest = parse(
+            "[package]\nname = \"app\"\n\n[entry.server]\n\n\
+             [entry.client]\ntarget = \"browser\"\nsplit = true\n",
+        );
+        assert_eq!(manifest.validate(), Vec::<String>::new());
+        assert!(manifest.entries["client"].splits());
+        assert!(!manifest.entries["server"].splits());
+    }
+
+    #[test]
+    fn split_is_refused_outside_a_browser_leg() {
+        // A process leg has no navigation to gate, so the key is meaningless
+        // there — and an ignored key would read as a split that never happened.
+        let node_entry = parse("[package]\nname = \"app\"\n\n[entry.server]\nsplit = true\n");
+        assert!(
+            node_entry
+                .validate()
+                .iter()
+                .any(|e| e.contains("`[entry.server] split`")
+                    && e.contains("`browser` leg only")
+                    && e.contains("targets `node`")),
+            "{:?}",
+            node_entry.validate()
+        );
+        // Explicitly declared, not merely defaulted.
+        let bun_entry =
+            parse("[package]\nname = \"app\"\n\n[entry.probe]\ntarget = \"bun\"\nsplit = true\n");
+        assert!(
+            bun_entry
+                .validate()
+                .iter()
+                .any(|e| e.contains("`[entry.probe] split`") && e.contains("targets `bun`"))
+        );
+        // The single-entry shape carries the same key and the same refusal.
+        let package = parse("[package]\nname = \"app\"\nsplit = true\n");
+        assert!(
+            package
+                .validate()
+                .iter()
+                .any(|e| e.contains("`[package] split`") && e.contains("targets `node`"))
+        );
+        let browser_package =
+            parse("[package]\nname = \"app\"\ntarget = \"browser\"\nsplit = true\n");
+        assert_eq!(browser_package.validate(), Vec::<String>::new());
+        assert!(
+            browser_package
+                .package
+                .as_ref()
+                .expect("a package")
+                .splits()
+        );
+    }
+
+    #[test]
+    fn package_split_cannot_be_combined_with_entry_sections() {
+        // `[package] split` is the single-entry shape's key; with entry
+        // sections each entry declares its own.
+        let manifest = parse("[package]\nname = \"app\"\nsplit = true\n\n[entry.client]\n");
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|e| e.contains("can't be combined with") && e.contains("split"))
+        );
     }
 
     #[test]

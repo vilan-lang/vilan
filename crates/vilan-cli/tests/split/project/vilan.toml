@@ -1,0 +1,9 @@
+# The byte-pinned fixture for route-chunk emission (proposal/bundle-splitting.md
+# S2). A browser entry that opts in: `vilan build .` emits `app.js` (eager) plus
+# one `app.<arm>.js` per route arm and the `app.chunks.json` manifest.
+[package]
+name = "split_fixture"
+root = "."
+entry = "app.vl"
+target = "browser"
+split = true

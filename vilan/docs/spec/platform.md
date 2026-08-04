@@ -60,7 +60,8 @@ The manifest declares what a directory builds. Sections:
   repository pinned to exactly one of a tag or a commit; registry
   dependencies are future work).
 - **`[entry.<name>]`**: one build entry per table: `path` (default
-  `<root>/<name>.vl`) and `target` (default `node`). A package with
+  `<root>/<name>.vl`), `target` (default `node`), and `split` (default
+  `false`; §11.5). A package with
   entries builds each for its own platform; reachability (§11.2) is
   what lets one source tree serve several. `[package] default-entry`
   names the entry `vilan run` executes when several are runnable.
@@ -91,6 +92,16 @@ The manifest declares what a directory builds. Sections:
 Each entry emits `dist/<name>.js` for its platform (browser entries
 first, so a server that ships bundles finds them fresh), plus
 `dist/<name>.css` when const evaluation emitted style assets (§9.2).
+
+A `browser` entry declaring **`split = true`** emits **route chunks**
+instead of one file: `dist/<name>.js` carries every module-level binding
+(so §7.6's initialization order is untouched) and every function two or
+more route arms can reach, and `dist/<name>.<arm>.js` carries the
+functions exactly one arm of the entry's route `match` can reach. A
+`dist/<name>.chunks.json` lists them. Chunks are fetched when a
+navigation first reaches their arm, and the route value does not advance
+until one arrives; which functions land where is implementation-defined
+beyond that rule. `split` on a non-`browser` entry is a manifest error.
 `vilan run` builds all entries and starts one `@process` entry: the
 only one, the designated `default-entry`, or the one `--entry` names;
 `vilan check` checks every entry, always. The emitted text beyond
