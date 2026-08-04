@@ -418,3 +418,113 @@ builds a whole `CallGraph` per pass (~9.5 ms on a styling entry) and
 per-analysis waste independent of any cross-analysis memo, and `platform_color`
 and `init_order` build their own call graphs too. A shared per-analysis call
 graph is the obvious next slice and is not const-specific.
+
+### 8.4 The shared call graph — SHIPPED 2026-08-04 (E35)
+
+§8.3's closing paragraph filed this: "`check_const_only` builds a whole
+`CallGraph` per pass (~9.5 ms on a styling entry) … and `platform_color` and
+`init_order` build their own call graphs too. A shared per-analysis call graph
+is the obvious next slice." Both halves of that sentence turned out to be
+wrong in the specifics, and the slice was worth taking anyway.
+
+**The site inventory.** Seven, not three. `init_order` was NOT one of them —
+it has read the memo since B33 §4 — and neither is `chunks::plan`, which reads
+it too. The actual sites were:
+
+| Site | When | Verdict |
+| --- | --- | --- |
+| `context.rs` `thread_contexts` | before its own rewrite | **cannot be shared** (below) |
+| `async_infer.rs` `infer` | analysis tail | shared |
+| `platform_color.rs` `check` | analysis tail | shared |
+| `const_eval.rs` `check_const_only` | analysis tail | shared |
+| `platform_color.rs` `requirements` | LSP, AFTER `analyze_source` returned | shared (reads the memo) |
+| `main.rs` the `-d` dump | CLI, debug only | shared (reads the memo) |
+| `analyzer.rs` `Program::call_graph` | the memo itself | the one build, now installed |
+
+**Are they the same graph?** `CallGraph::build` takes exactly one argument.
+There is no entry-only mode, no std exclusion, no per-pass edge-kind option —
+one whole-program graph with one edge vocabulary, and the per-pass views
+(`successors`, `reachable_bindings`) are taken *downstream* of it. So no site
+could have been narrower than another by construction, and the only thing that
+can make two builds differ is the program state at the moment of the build.
+
+Exactly one pass changes that state. `context::apply` rewrites `entity_map`,
+`function_calls` and `generic_dispatch`: a threaded `get()` becomes an
+`Expr::Local` read and a consumed `run` becomes `Expr::Null` (edges vanish),
+and the hidden context argument mints new call entities (edges appear). Its
+graph is therefore stale the moment it is used, which is why it built its own,
+and that is now spelled in the type — `thread_contexts` returns
+`Option<CallGraph>`, `Some` only on the three paths where it applied no rewrite
+(the common case: most programs create no context at all), `None` when it did.
+This is not a theoretical hazard: planting `Some(graph)` on the rewrite path
+reddens 32 behaviour tests across nursery, context, rpc and async — the
+narrowing this slice had to avoid, demonstrated.
+
+Everything after it is provably frozen, per pass:
+
+- `async_infer::infer` writes `async_functions`, `async_values`,
+  `awaited_calls`, `adapted_instances`, diagnostics — no graph input;
+- `check_async_drops` / `check_context_drops` — diagnostics only;
+- `platform_color::check` — diagnostics only;
+- `const_eval::evaluate` — takes `&Program`, returns its results for the
+  caller to store;
+- `init_order`, chunk planning, emission, `requirements` — read only.
+
+So every pass's view is unchanged. This is a share, not a narrowing.
+
+**The numbers, and §8.3's error.** Measured on `VILAN_PHASE_TIMING`'s
+`post-passes` line (`analyze_source`, warm, first round discarded), 16-core
+WSL2. The machine was busy, so the two builds were compiled to separate
+binaries and run **alternately** — 6 interleaved bursts of 8 warm rounds, 48
+paired samples each — with a direct timing of one `CallGraph::build` on the
+same program in every round as a noise canary. The canary agrees across the
+pair to within 0.04 ms, which is what makes the two columns comparable.
+
+| Probe | builds | post-passes (min / median) | canary |
+| --- | --- | --- | --- |
+| `test/const.vl` (7 consts) | 3 → **1** | 3.00 / 3.20 → **2.10 / 2.20 ms** | 0.40 → 0.42 ms |
+| `test/style.vl` (styling entry) | 4 → **1** | 11.40 / 11.80 → **9.60 / 10.10 ms** | 0.55 → 0.58 ms |
+| 1-const styling entry | 4 → **1** | 4.40 / 4.60 → **2.70 / 2.80 ms** | 0.54 → 0.56 ms |
+| 3-const styling entry | 4 → **1** | 5.30 / 5.65 → **3.70 / 3.80 ms** | 0.54 → 0.56 ms |
+
+Whole-analysis wall follows it down by the same absolute amount (the styling
+entry: 12.95 → 11.20 ms median). The build counts are exact and
+machine-independent; read the times as ±0.2 ms.
+
+**§8.3's ~9.5 ms per build was an over-attribution, by about 17×.** That figure
+was inferred, not measured: the const pass's cost was split into a per-const
+slope and a fixed intercept via the 1-vs-3-const delta, and the whole intercept
+was charged to `CallGraph::build`. Timed directly, one build over these
+programs costs **0.40–0.58 ms**, and that number predicts the savings: 3 builds
+× 0.55 ms = 1.65 ms against 1.70 ms observed on `style.vl`, 2 × 0.40 = 0.80 ms
+against 1.00 ms on `const.vl`. The model closes on every probe. The rest of that
+intercept is the other fixed work §8.3 named in the same breath (a fresh
+`transform_const_program`, `free_locals`' `entity_map` scan) plus
+`check_value_escapes`. **`free_locals`' per-expression `entity_map` scan is
+still open and is now the larger half of the fixed cost** — the remaining
+`const`-specific slice, and unlike this one it needs a design.
+
+A second thing shrank the prize: the tree got much faster. §8.3 measured
+136–181 ms analyses on the v0.26.0 tree; the same probes now analyze warm in
+9–20 ms. A call-graph build was never 5–7 % of an analysis, but the analysis it
+is a fraction of is an order of magnitude smaller than when the item was filed.
+
+**Found on the way, and fixed first.** `VILAN_PHASE_TIMING` — the instrument
+this measurement depends on — panicked every warm analysis. On a base-cache HIT
+the hit path refreshed the world's start instant but kept the *cached* base
+duration, so the printed `load+walk` subtracted a large cold duration from a
+small warm one and `Duration` underflowed. The marks run inside
+`analyze_source`'s `catch_unwind`, so the analysis returned `None`: with the
+switch on, every analysis after the first in a process silently produced no
+program. That is the LSP's every-keystroke path, and it is why §8.3's numbers
+had to be gathered one process at a time.
+
+**Gates.** Full suite green. A thread-local build counter pins the invariant —
+no behaviour test can distinguish a shared build from a correct rebuild, so a
+counter is the only instrument that can — with one pin at 1 build for a
+context-free program and one at 2 for a context-threading one, both
+plant-proven. The post-pass sequence itself, which was duplicated between
+`analyze_source` and the CLI's `main.rs`, is now one `post_analysis_passes`
+called by both: that duplication is the standing trap that a pass added to one
+pipeline is skipped by the other, and it is also what makes "built once, at
+that point" a single place rather than a convention two files must keep.
