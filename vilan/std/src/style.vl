@@ -195,6 +195,125 @@ impl Color {
 			_ => panic(i"unknown green step {step} (ramps run 50, 100-900 by hundreds)"),
 		})
 	}
+
+	/// A literal color WITH alpha — the `hex` escape's translucent twin, and
+	/// what a brand palette outside the ramps is written in. Channels are
+	/// validated at const time, like every other scale here.
+	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
+		check_channel("red", red);
+		check_channel("green", green);
+		check_channel("blue", blue);
+		check_alpha(alpha);
+		Color { css = i"rgba({red}, {green}, {blue}, {alpha})", root = "" }
+	}
+
+	/// This color at `alpha` (0.0-1.0). Renders the RELATIVE color form,
+	/// `rgb(from <this> r g b / a)`, which keeps a token's identity intact —
+	/// `Color::gray(900).alpha(0.08)` is still `var(--gray-900)` underneath,
+	/// so it re-themes like the opaque color does, and it carries the token's
+	/// `:root` declaration onward. (An 8-digit hex would work only on a
+	/// literal; mixing toward `transparent` would need the alpha as a
+	/// percentage, and `0.07 * 100.0` is `7.000000000000001`.)
+	fun alpha(self, value: f64): Color {
+		check_alpha(value);
+		Color { css = i"rgb(from {self.css} r g b / {value})", root = self.root }
+	}
+}
+
+fun check_channel(name: str, value: i32) {
+	if value < 0 || value > 255 {
+		panic(i"{name} channel {value} is outside 0-255");
+	}
+}
+
+fun check_alpha(value: f64) {
+	if value < 0.0 || value > 1.0 {
+		panic(i"alpha {value} is outside 0.0-1.0");
+	}
+}
+
+/// How far a radial gradient's ending shape reaches — the CSS extent
+/// keywords. Position (`at 20% 40%`) is deliberately not modelled: the sites
+/// that want it want it computed from custom properties, which is `raw`'s job.
+enum RadialExtent {
+	ClosestSide,
+	ClosestCorner,
+	FarthestSide,
+	FarthestCorner,
+}
+
+/// A gradient — a `background-image` value, NOT a `Color` (CSS paints an
+/// image over a color, and `background` takes one color). Open one with
+/// `Gradient::linear`/`Gradient::radial`, add stops, and hand it to
+/// `background_gradient`.
+struct Gradient {
+	// The CSS function and its geometry argument, kept apart so `render`
+	// composes them once: `linear-gradient` + `90deg`, `radial-gradient` +
+	// `closest-side`.
+	function: str,
+	geometry: str,
+	// Stops as rendered CSS, comma-joined, plus the count the two-stop
+	// minimum is checked against.
+	stops: str,
+	stop_count: i32,
+	// The `:root` lines the stops' colors carry, emitted when the gradient
+	// reaches a `Style` — so a gradient of ramp tokens themes like everything
+	// else.
+	roots: List<str>,
+}
+
+impl Gradient {
+	/// `degrees` is the CSS angle: 0 points up, 90 to the right, 180 down.
+	fun linear(degrees: f64): Gradient {
+		Gradient {
+			function = "linear-gradient",
+			geometry = i"{degrees}deg",
+			stops = "",
+			stop_count = 0,
+			roots = [],
+		}
+	}
+
+	fun radial(extent: RadialExtent): Gradient {
+		Gradient {
+			function = "radial-gradient",
+			geometry = match extent {
+				RadialExtent::ClosestSide => "closest-side",
+				RadialExtent::ClosestCorner => "closest-corner",
+				RadialExtent::FarthestSide => "farthest-side",
+				RadialExtent::FarthestCorner => "farthest-corner",
+			},
+			stops = "",
+			stop_count = 0,
+			roots = [],
+		}
+	}
+
+	/// One color stop at `percent` along the gradient line. Positions are
+	/// explicit rather than defaulted — the value type holds pairs, so both
+	/// halves are written.
+	fun stop(self, color: Color, percent: f64): Gradient {
+		mut roots = self.roots;
+		if color.root != "" {
+			roots.push(color.root);
+		}
+		let rendered = i"{color.css} {percent}%";
+		Gradient {
+			function = self.function,
+			geometry = self.geometry,
+			stops = if self.stops == "" {
+				rendered
+			} else {
+				self.stops + ", " + rendered
+			},
+			stop_count = self.stop_count + 1,
+			roots = roots,
+		}
+	}
+
+	fun render(self): str {
+		i"{self.function}({self.geometry}, {self.stops})"
+	}
 }
 
 // --- keyword properties ---------------------------------------------------------
@@ -205,6 +324,8 @@ enum Display {
 	Block,
 	Inline,
 	InlineBlock,
+	InlineFlex,
+	InlineGrid,
 	// `display:none` — named to stay clear of `Option::None` at use sites.
 	Hidden,
 }
@@ -414,6 +535,8 @@ impl Style {
 			Display::Block => "block",
 			Display::Inline => "inline",
 			Display::InlineBlock => "inline-block",
+			Display::InlineFlex => "inline-flex",
+			Display::InlineGrid => "inline-grid",
 			Display::Hidden => "none",
 		})
 	}
@@ -494,6 +617,30 @@ impl Style {
 		self.with_length("padding-top", value).with_length("padding-bottom", value)
 	}
 
+	// One edge at a time. The four come in as a FAMILY (§0bis.3): the sweep
+	// wanted `padding-left`, `padding-right` and `padding-top`, and splitting
+	// one CSS concept by a count is the cut the inset family already refused.
+	// Note `padding_x`/`padding_y` write these same slots, so mixing them is
+	// an ordinary last-wins override — whereas mixing an edge with the
+	// `padding` SHORTHAND leaves two equally specific rules whose order the
+	// class-name sort decides. One arity per family (§0bis.3's hazard note).
+
+	fun padding_top(self, value: Length): Style {
+		self.with_length("padding-top", value)
+	}
+
+	fun padding_right(self, value: Length): Style {
+		self.with_length("padding-right", value)
+	}
+
+	fun padding_bottom(self, value: Length): Style {
+		self.with_length("padding-bottom", value)
+	}
+
+	fun padding_left(self, value: Length): Style {
+		self.with_length("padding-left", value)
+	}
+
 	fun margin(self, value: Length): Style {
 		self.with_length("margin", value)
 	}
@@ -504,6 +651,24 @@ impl Style {
 
 	fun margin_y(self, value: Length): Style {
 		self.with_length("margin-top", value).with_length("margin-bottom", value)
+	}
+
+	fun margin_top(self, value: Length): Style {
+		self.with_length("margin-top", value)
+	}
+
+	fun margin_right(self, value: Length): Style {
+		self.with_length("margin-right", value)
+	}
+
+	fun margin_bottom(self, value: Length): Style {
+		self.with_length("margin-bottom", value)
+	}
+
+	/// `margin_left(Length::auto())` is the flex-push idiom, and was five of
+	/// the nine single-edge sites in the demand sweep on its own.
+	fun margin_left(self, value: Length): Style {
+		self.with_length("margin-left", value)
 	}
 
 	fun width(self, value: Length): Style {
@@ -559,14 +724,47 @@ impl Style {
 		self.with_length("border-radius", value)
 	}
 
-	fun border(self, width: Length, color: Color): Style {
+	/// The one border body: `<width> solid <color>` on whichever edge the
+	/// property names. `solid` is baked in because the demand sweep found
+	/// ZERO non-`solid` borders across every line of styling written in the
+	/// language — a `BorderStyle` enum's other variants would be speculation
+	/// (§0bis.3).
+	fun with_border(self, property: str, width: Length, color: Color): Style {
 		if width.root != "" {
 			emit("css", width.root);
 		}
 		if color.root != "" {
 			emit("css", color.root);
 		}
-		self.rule("", "", "border", i"border:{width.css} solid {color.css}")
+		self.rule("", "", property, i"{property}:{width.css} solid {color.css}")
+	}
+
+	fun border(self, width: Length, color: Color): Style {
+		self.with_border("border", width, color)
+	}
+
+	fun border_top(self, width: Length, color: Color): Style {
+		self.with_border("border-top", width, color)
+	}
+
+	fun border_right(self, width: Length, color: Color): Style {
+		self.with_border("border-right", width, color)
+	}
+
+	fun border_bottom(self, width: Length, color: Color): Style {
+		self.with_border("border-bottom", width, color)
+	}
+
+	fun border_left(self, width: Length, color: Color): Style {
+		self.with_border("border-left", width, color)
+	}
+
+	/// No border. Written as a method rather than a `BorderStyle::None` so it
+	/// fills the SAME slot `border` does — removing a border a base style set
+	/// is then the ordinary last-wins override, not a second rule racing the
+	/// first through the cascade.
+	fun border_none(self): Style {
+		self.raw("border", "none")
 	}
 
 	/// Just the colour, its own slot — so a `hover`/`focus` variant can
@@ -595,6 +793,21 @@ impl Style {
 
 	fun background(self, value: Color): Style {
 		self.with_color("background-color", value)
+	}
+
+	/// A gradient, on the `background-image` slot — a DIFFERENT slot from
+	/// `background`, because a gradient is an image in CSS and paints over
+	/// the background colour rather than replacing it. Each stop's colour
+	/// carries its `:root` line out here, so a gradient of ramp tokens themes
+	/// like any other value.
+	fun background_gradient(self, value: Gradient): Style {
+		if value.stop_count < 2 {
+			panic(i"a gradient needs at least two stops, got {value.stop_count} — add .stop(color, percent)");
+		}
+		for root in value.roots {
+			emit("css", root);
+		}
+		self.rule("", "", "background-image", "background-image:" + value.render())
 	}
 
 	fun color(self, value: Color): Style {
