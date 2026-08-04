@@ -183,6 +183,13 @@ impl f64 {
 	fun is_infinite(self): bool {
 		!self.is_finite() && !self.is_nan()
 	}
+
+	/// `self` confined to `min..=max`. The integers get this from `Ord`'s
+	/// default; the floats are deliberately not `Ord` (NaN, see below), so they
+	/// carry it themselves — the same recipe `Ord::clamp` uses.
+	fun clamp(self, min: f64, max: f64): f64 {
+		self.min(max).max(min)
+	}
 }
 
 impl f64 with Default {
@@ -1334,6 +1341,12 @@ impl f32 {
 
 	[extern("Math.max")]
 	external fun max(self, other: f32): f32;
+
+	/// `self` confined to `min..=max` — see `f64::clamp` for why the floats
+	/// carry their own rather than inheriting `Ord`'s default.
+	fun clamp(self, min: f32, max: f32): f32 {
+		self.min(max).max(min)
+	}
 
 	/// Truncated remainder (sign follows the dividend), the method form of `%`.
 	fun rem(self, m: f32): f32 {

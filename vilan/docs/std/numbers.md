@@ -54,12 +54,27 @@ impl f64 {
 	fun round(self): f64
 	fun min(self, other: f64): f64
 	fun max(self, other: f64): f64
+	fun clamp(self, min: f64, max: f64): f64
 	fun sin(self): f64      // cos, tan, asin, acos, atan …
 }
 ```
 
 Every numeric type implements `Default` (zero), the operator traits, and
 comparison.
+
+`clamp` confines a value to a range. The integers inherit it from `Ord`; the
+floats are deliberately *not* `Ord` (NaN has no place in a total order), so
+`f64` and `f32` carry their own — same recipe, same result.
+
+```vilan
+import std::print;
+
+fun main() {
+	print(9.clamp(0, 5));       // 5   — i32, through Ord
+	print(9f.clamp(0f, 5f));    // 5
+	print((0f - 1f).clamp(0f, 5f));   // 0
+}
+```
 
 ## Conversions: `as_*`
 

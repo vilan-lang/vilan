@@ -22424,6 +22424,11 @@ pub enum Intrinsic {
     ListGet,
     // `List.pop(): Option<T>` -> a runtime helper that removes the last element.
     ListPop,
+    // `List.sort_by(cmp): List<T>` -> a runtime helper over the host's STABLE
+    // `Array.prototype.sort` (stable since ES2019), on a copy. `Ordering` is a
+    // numeric enum lowering to -1/0/1, which is already `sort`'s contract, so
+    // the vilan comparator passes through unwrapped.
+    ListSortBy,
     // `Option.take(&mut self): Option<T>` -> a runtime helper that reads the slot,
     // writes `None` back in place, and returns the old contents (destruction.md §6).
     OptionTake,
@@ -26411,6 +26416,7 @@ fn analyze_over_world<'src>(
                     ("len", Intrinsic::ListLen),
                     ("get", Intrinsic::ListGet),
                     ("pop", Intrinsic::ListPop),
+                    ("sort_by", Intrinsic::ListSortBy),
                 ] {
                     if let Some(id) = implementation.declarations.get(name).copied() {
                         intrinsics.insert(id, intrinsic);

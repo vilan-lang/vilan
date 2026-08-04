@@ -13,6 +13,32 @@ fun format<T: Display>(value: T): str {
 	value.to_string()
 }
 
+// `join` lives HERE because its `Display` bound does: an `impl` block may
+// extend a type from any module, but it can only name traits its own module
+// can reach, and `list.vl` must stay off the `display` chain (std-surface.md
+// §1.1). The cost is visibility — a program that imports only `List` does not
+// see `join` — and the mitigation is the "no method 'join'; import
+// std::display::Display" steer the analyzer emits for exactly this shape.
+// `str`'s own `Display` is the identity below, so `List<str>.join` costs
+// nothing extra.
+impl List<type T: Display> {
+	/// The elements' `to_string()` forms concatenated with `separator` between
+	/// them (no leading or trailing separator; an empty list joins to `""`).
+	fun join(self, separator: str): str {
+		mut result = "";
+		mut first = true;
+		for item in self {
+			if first {
+				first = false;
+			} else {
+				result = result + separator;
+			}
+			result = result + item.to_string();
+		}
+		result
+	}
+}
+
 impl str with Display {
 	fun to_string(self): str {
 		self

@@ -2,6 +2,7 @@
 // intrinsic): a `List` value is a native JS array, `List::new()` is `[]`, and
 // `push` is the native `.push`. Iterating a `List` uses a native `for...of`.
 import pkg::default::Default;
+import pkg::io::panic;
 import pkg::operators::{ Add, Mul };
 import pkg::option::Option;
 
@@ -55,6 +56,62 @@ impl List<type T> {
 		for item in self {
 			fn(item);
 		}
+	}
+
+	/// A new list with the elements in the opposite order. Eager and pure, like
+	/// `map`/`filter` — the receiver is untouched. (The LAZY adapter is `rev`,
+	/// which is a different method and belongs to the iterator paper.)
+	fun reverse(self): List<T> {
+		mut result = List::new();
+		mut index = self.len() - 1;
+		for index >= 0 {
+			result.push(self[index]);
+			index -= 1;
+		}
+		result
+	}
+
+	/// Inserts `value` before the element at `index`, shifting the tail right.
+	/// `index == len()` appends. PANICS out of bounds, in `[]`'s words: a bad
+	/// index is a caller bug, the class `[]` already punishes. (`get`'s
+	/// `Option` is for callers who don't know whether an index is live; an
+	/// arbitrary bad index passed to a splice is not that.)
+	fun insert(&mut self, index: i32, value: T): void {
+		let length = self.len();
+		if index < 0 || index > length {
+			panic(i"index out of bounds: the length is {length} but the index is {index}");
+		}
+		if index == length {
+			self.push(value);
+		} else {
+			// Grow by one (duplicating the last element), then shift the tail
+			// right into the new slot and overwrite the hole.
+			self.push(self[length - 1]);
+			mut cursor = length - 1;
+			for cursor > index {
+				self[cursor] = self[cursor - 1];
+				cursor -= 1;
+			}
+			self[index] = value;
+		}
+	}
+
+	/// Removes and returns the element at `index`, shifting the tail left.
+	/// PANICS out of bounds — see `insert`. (`pop` returns an `Option` because
+	/// "the list was empty" is a normal condition; a bad index is not.)
+	fun remove(&mut self, index: i32): T {
+		let length = self.len();
+		if index < 0 || index >= length {
+			panic(i"index out of bounds: the length is {length} but the index is {index}");
+		}
+		let removed = self[index];
+		mut cursor = index;
+		for cursor < length - 1 {
+			self[cursor] = self[cursor + 1];
+			cursor += 1;
+		}
+		self.pop();
+		removed
 	}
 }
 

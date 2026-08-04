@@ -20,6 +20,14 @@ fun main() {
 	print(y.round()); // 4
 	print(y.min(2f)); // 2
 	print(y.max(10f)); // 10
+
+	// `clamp` is `Ord`'s trait default for the integers; the floats are
+	// deliberately not `Ord` (NaN), so `f64`/`f32` carry their own.
+	print(b.clamp(3, 7)); // 3 — i32, through Ord
+	print(y.clamp(0f, 3f)); // 3
+	print(y.clamp(4f, 10f)); // 4
+	print(y.clamp(0f, 10f)); // 3.7
+	print(16f.as_f32().clamp(0f.as_f32(), 4f.as_f32())); // 4
 }
 
 fun parity() {

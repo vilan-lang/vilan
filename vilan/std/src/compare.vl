@@ -1,4 +1,4 @@
-import pkg::option::Option::{ Some, self };
+import pkg::option::Option::{ None, Some, self };
 
 trait PartialEq<B = Self> {
 	fun eq(self, b: B): bool;
@@ -62,6 +62,58 @@ trait Ord with Eq + PartialOrd {
 
 // The free-function forms of `min`/`max` (and `minmax`) moved to `std::math`
 // (backlog K2) — the trait METHODS above are the primary surface and stay.
+
+// `List`'s ordering- and equality-bounded methods live HERE, not in `list.vl`,
+// because they name traits this module declares (std-surface.md §1.1: a
+// method's discoverability is decided by which file it lives in). `compare` is
+// always loaded, so a program that imports nothing still reaches all four —
+// unlike `join`, whose `Display` bound strands it in `display.vl`.
+//
+// All four are eager and pure: they take `self` by value and return a new
+// value, matching `map`/`filter`/`fold`. `List`'s mutating methods
+// (`push`/`pop`/`insert`/`remove`) are the `&mut self` half of that line.
+impl List<type T> {
+	/// A new list ordered by `compare`, which reports how its first argument
+	/// relates to its second. STABLE: elements the comparator calls `Equal`
+	/// keep their input order (an intrinsic over the host's `Array.sort`, which
+	/// ECMA-262 has guaranteed stable since ES2019).
+	external fun sort_by(self, compare: |T, T| Ordering): List<T>;
+}
+
+impl List<type T: Ord> {
+	/// A new list in ascending `Ord` order — `sort_by(Ord::compare)`. Stable,
+	/// like `sort_by`. Named `sort`/`reverse` rather than the iterator paper's
+	/// lazy `rev`, so the eager and lazy surfaces never collide.
+	fun sort(self): List<T> {
+		self.sort_by(|a, b| a.compare(b))
+	}
+}
+
+impl List<type T: PartialEq> {
+	/// Whether any element equals `value`. For a PREDICATE (`|item| ...`), the
+	/// method is `find`, in `option.vl`.
+	fun contains(self, value: T): bool {
+		for item in self {
+			if item.eq(value) {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// The index of the FIRST element equal to `value` — `None` when there is
+	/// none.
+	fun index_of(self, value: T): Option<i32> {
+		mut index = 0;
+		for item in self {
+			if item.eq(value) {
+				ret Some(index);
+			}
+			index += 1;
+		}
+		None
+	}
+}
 
 // `str` carries the full ordering family (lexicographic, the native `<`), so
 // generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it.

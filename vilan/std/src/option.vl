@@ -274,8 +274,6 @@ impl str {
 impl List<type T> {
 	external fun get(self, index: i32): Option<T>;
 
-	external fun pop(&mut self): Option<T>;
-
 	fun first(self): Option<T> {
 		self.get(0)
 	}
@@ -284,5 +282,16 @@ impl List<type T> {
 	/// `None`.
 	fun last(self): Option<T> {
 		self.get(self.len() - 1)
+	}
+
+	/// The first element for which `predicate` holds — `None` when none does.
+	/// SHORT-CIRCUITS: the predicate is not called past the match.
+	fun find(self, predicate: |T| bool): Option<T> {
+		for item in self {
+			if predicate(item) {
+				ret Some(item);
+			}
+		}
+		None
 	}
 }
