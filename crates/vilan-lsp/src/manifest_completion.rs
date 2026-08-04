@@ -363,6 +363,12 @@ pub const TABLES: &[Table] = &[
                                 their source (`a/*count*/`).",
                 values: ValueSet::Boolean,
             },
+            Key {
+                name: "infer-const",
+                documentation: "Fold `let` initializers the compiler can evaluate, without the \
+                                `const` keyword (on under `release`, off under `debug`).",
+                values: ValueSet::Boolean,
+            },
         ],
     },
     Table {
