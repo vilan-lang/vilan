@@ -156,6 +156,31 @@ Tuple types are written the same way: `(i32, str)`. Positional access
 (`pair.0`, `pair.1`, chains like `nested.0.1`) types as that element;
 through a `mut` binding you can also assign one (`pair.0 = 5`).
 
+### Building one out of another
+
+A `..` entry **spreads** a tuple you already have — its elements go into
+the new tuple, so the type is the two concatenated. Spreads work in any
+position, as many as you like, mixed with ordinary entries:
+
+```vilan
+import std::print;
+
+fun main() {
+	let pair = (1, 2);
+	let lead = (..pair, 3);       // (i32, i32, i32)
+	let mid = (0, ..pair, 9);     // (i32, i32, i32, i32)
+	let both = (..pair, ..pair);  // (i32, i32, i32, i32)
+	print(lead.2);
+	print(mid.3);
+	print(both.3);
+}
+```
+
+Note this is a *shallow* concatenation: `..outer` contributes `outer`'s
+elements, so an element that is itself a tuple stays one. And `..` only
+means this at the start of an entry — `a..b` after an expression is not
+a spread, and vilan has no range operator for it to be confused with.
+
 ## Collections
 
 `List<T>` is built in and has literal syntax. `Map<K, V>` and `Set<T>`
