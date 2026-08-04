@@ -444,9 +444,12 @@ and the pack has no host form.
 ## S.8 Two consequences worth stating out loud
 
 - **The convention lives on the declaration, so a function *value* has the tuple
-  form.** `let f = log; f((1, 2))` — not `f(1, 2)`. A value's type is
-  `sync |T| R`; the desugar's left-hand side is a *declaration*, and a value has
-  none. Pinned.
+  form.** Passed where a `sync |(i32, i32)| i32` is wanted, `fun count(...items:
+  (i32, i32))` goes through — and the callback calls it `f((4, 5))`, not
+  `f(4, 5)`. A value's type is the parameter's; the desugar's left-hand side is a
+  *declaration*, and a value has none. Pinned. (Calling a function through a
+  `let`-bound name — `let f = count; f(…)` — does not work today for *any*
+  function, spread or not; that is a separate, pre-existing hole.)
 - **A spread declaration is not also callable in the tuple form.**
   `log((1, 2))` collects, as every call does, to the one-element pack
   `((i32, str))` — and then fails its own `(2..)` bound. Choosing `...` chooses
@@ -471,3 +474,27 @@ the ≥2 value syntax), and a spread parameter is the first thing that can
 produce such a value. `f()` under `T: (..)` binds `T = ()` and emits `f([])`;
 `f(x)` binds `T = (i32)` and emits `f([x])`. Both are pinned, including their
 emitted bytes.
+
+Two **pre-existing** limits the pack inherits, each pinned beside its tuple-form
+twin so it is on the record rather than mistaken for a spread bug — both fail
+*identically* on `fun f<T: (2..)>(items: T)`, so the desugar reproduces today's
+behaviour faithfully:
+
+- **A pack that is still an abstract `T` cannot be indexed positionally.**
+  `items.0` inside the generic body is "cannot access field '0' on type T" —
+  the body type-checks once, before any arity is known. A concrete pack type
+  (`...items: (i32, i32, i32)`) indexes fine.
+- **A comprehension's source must be a MAPPED tuple**, so a bare
+  element-bounded pack (`T: (..: Display)`) has no way to walk its elements and
+  the element bound has no consumer of its own. The mapped form is what a
+  comprehension reaches — which is why `gather` is the worked example.
+
+Together these say the useful shapes today are the **mapped** pack and the
+**concrete** pack; a bare `T: (..)` pack can be passed on but not taken apart.
+Both are squarely in the `keyof`/tuple-`for` tail this proposal already defers,
+and neither is made worse by the spread.
+
+The one position audited and deliberately left alone: **`Type::Closure`** — a
+spread function's value type is the tuple one (§S.8), which is what the closure
+path already produced and why the call-site collection lives on the
+declaration-resolving branch only.
