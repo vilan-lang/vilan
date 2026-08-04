@@ -234,6 +234,9 @@ generic signal's `Option` payload needed its parameter annotated
 (`|current: Option<Task>|`) — unannotated, the field access typed
 against the abstract `T`. What the slice deliberately defers (recorded
 in A12): re-push of dirty drafts on reconnect, and a debounced variant.
+**Both closed 2026-08-04** — `draft.repush()` wired through the (now
+public) `SocketTransport.on_reconnect` hook, and `draft.debounce(ms)`;
+record: `draft-reconnect.md`.
 
 ## 5. What the migration tests about vilan itself
 

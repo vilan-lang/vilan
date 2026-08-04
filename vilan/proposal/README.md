@@ -40,6 +40,7 @@ is the historical record everything shipped gets moved into.
 | `diagnostics-standard.md` | shipped / foundational (accepted 2026-07-16) | The rules a diagnostic message must follow, plus the audit plan the ledger executes. |
 | `distribution.md` | shipped arc (2026-07-25, provisioned 2026-07-29) | npm/Marketplace/Open VSX/Homebrew distribution (F7) plus the project-model deferrals (F5). |
 | `docs-site.md` | shipped arc (2026-07-12) | The rendered docs site: mdBook, custom grammar, GitHub Pages publishing. |
+| `draft-reconnect.md` | shipped arc (2026-08-04) | `Draft` re-push on reconnect and the debounced commit — A14's last reactive residual. |
 | `documentation.md` | shipped arc (Phase 3, 2026-07-12) | D1a, the user-facing reference docs — what the book covers and its phasing. |
 | `element-syntax.md` | shipped arc (2026-08-01, all five slices) | HTML-flavored markup sugar lowering to the `view` chain. |
 | `element-clones.md` | shipped arc (2026-08-04) | Rule 1's copy lands at the store — constructions, `own` arguments, returned by-value parameters (A20, B54); §7 holds the B64 find. |
