@@ -117,7 +117,7 @@ undone is everything *around* the value:
 - `examples/walkthrough/src/views.vl:83-97` — sign-in hand-writes three
   outcome branches into a `status` signal and has no `submitting` flag, so
   Submit stays live across the whole round trip. Kolt repeats it verbatim
-  (`/home/reed/code/kolt/src/views.vl:86-96`).
+  (its own `src/views.vl:86-96`).
 - Four more `report(client...)` sites in `examples/todo` and three in Kolt.
 - **Zero** user-authored pending booleans exist in the tree. The only
   in-flight indicator anyone renders is `Draft.state`, through a
