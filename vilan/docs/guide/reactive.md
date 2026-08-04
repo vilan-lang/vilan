@@ -273,6 +273,8 @@ struct Draft<T> {
 draft(initial: T, commit: async |T| Option<str>): Draft<T>
 draft.push(value)   // set local + spawn the commit (never waits on the wire)
 draft.adopt(remote) // fold in a remote change
+draft.commit()      // send now (the explicit save)
+draft.repush()      // re-send if the remote never got the current value
 ```
 
 The commit closure returns `None` on success or `Some(reason)` on
@@ -322,6 +324,68 @@ fun main() {
 > remembered so your eventual push knowingly overwrites it). The
 > [reactive reference](../std/reactive.md) states all of it precisely,
 > and `bind_draft` in [Building UI](ui.md) is the input-side wiring.
+
+### One commit per burst, not per keystroke
+
+Per-keystroke-*safe* is not per-keystroke-*cheap*: a bound input sends a
+frame for every character. `debounce(millis)` coalesces a burst into one
+commit, and it does **not** slow the typing down — `local` and the `Dirty`
+state still land the instant you press a key, so the input is as immediate
+as ever. Only the commit waits for you to stop:
+
+```vilan
+import std::print;
+import std::reactive::{ draft, Draft, DraftState };
+import std::option::Option::{ self, Some, None };
+import std::shared::Shared;
+import std::time::{ sleep_for, Duration };
+
+fun main() {
+	let saved: Shared<List<str>> = Shared::new([]);
+	let notes = draft("", |value: str| {
+		saved.write().push(value);
+		None
+	}).debounce(30);
+
+	notes.push("h");
+	notes.push("he");
+	notes.push("hey");
+	print(notes.local.get());       // "hey" — instantly, nothing was delayed
+	print(saved.read().len());      // 0 — the window is still open
+
+	sleep_for(Duration::millis(150));
+	print(saved.read().len());      // 1 — one commit for the whole burst
+	print(saved.read()[0]);         // "hey" — the value you ended on
+}
+```
+
+The commit fires after the last push (trailing edge). `commit()` — a blur
+handler, a Save button — cancels a pending window and sends immediately, so
+an explicit save costs one commit rather than yours plus the window's.
+
+### Surviving a dropped connection
+
+A draft edited while the connection is down keeps the user's text, but
+nothing re-sends it on its own: the cell holds an opaque commit closure and
+has no idea what transport it rides, so it cannot notice a reconnect. You
+connect the two, in one line:
+
+```vilan,fragment
+let title = draft(page.title, |value: str| { … client.rename(value) … });
+client.transport.on_reconnect(|| title.repush());
+```
+
+`repush()` re-sends only if the remote never got the current value — a clean
+draft does nothing, so a screen full of untouched drafts costs nothing on
+reconnect. It is also what a "retry" button in a failure banner calls.
+
+> **The honest part.** Delivery is *at-least-once*: a commit the server
+> applied but could not acknowledge before the socket died looks exactly
+> like one that never arrived, so it gets sent twice. That is harmless for
+> the shape drafts are built for — "set this field to this value" — and it
+> is not for a commit that appends. And a re-push that fails is not retried
+> on a timer; it rides the next reconnect, so a value the server keeps
+> refusing can't spin.
 
 ## Keyed reconciliation
 

@@ -50,6 +50,7 @@ enum ConnectionState { Connected, Reconnecting, Closed }
 
 impl SocketTransport {
 	fun connection_state(self): Signal<ConnectionState>
+	fun on_reconnect(self, hook: async || void)
 }
 ```
 
@@ -59,6 +60,21 @@ calls reject with `Transport("connection lost")`, new calls fail fast with
 10 attempts); on success → contract re-check, mirrors re-attach and resync,
 `Connected`. Backoff exhausted → `Closed`. Nothing is ever silently
 retried; retry is the app's decision.
+
+`on_reconnect` is where that decision goes. Hooks run after each successful
+re-dial, awaited in order, and the generated client registers its own mirror
+re-attach when it connects — so **a hook you register runs after the mirrors
+have resynced**, which `connection_state` cannot tell you: the state flips to
+`Connected` one beat earlier, because the re-attach's own rpc call needs a
+usable transport first. Bind the signal for a banner; use the hook for
+anything that needs current mirrors.
+
+```vilan,fragment
+client.transport.on_reconnect(|| title.repush());
+```
+
+Keep a hook short — it runs inside the reconnect loop's own extent, so a long
+round-trip inside one holds the reconnect open behind it.
 
 ## Transports
 

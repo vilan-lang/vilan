@@ -243,6 +243,21 @@ with "not connected". Nothing is silently retried, because an rpc might
 not be safe to repeat. Retrying is the app's decision: a draft's next
 push, or the user pressing the button again.
 
+Third — when you ask for it — a hook that runs once the connection is back
+*and* the mirrors have resynced. That is the moment to re-send whatever the
+outage swallowed, and for an edited draft it is one line:
+
+```vilan,fragment
+let title = draft(page.title, |value: str| { … client.rename(value) … });
+client.transport.on_reconnect(|| title.repush());
+```
+
+Without it the user's text survives in the input but never reaches the
+server until they type again. With it, the reconnect carries it. `repush`
+sends only when the remote is actually behind, and its delivery is
+at-least-once — see
+[local-first drafts](reactive.md#surviving-a-dropped-connection).
+
 > **Going deeper.** The backoff dials at 250 ms doubling to a 4 s cap,
 > ten attempts before giving up (`Closed`). Mirrors rebind by
 > re-running the contract check and re-attaching each subscription; you
