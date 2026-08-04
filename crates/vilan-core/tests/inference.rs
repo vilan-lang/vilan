@@ -34633,3 +34633,339 @@ fn b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation
             "#,
     ));
 }
+
+// === `Task<Task<T>>` assimilation (async-polymorphism.md Part B) =============
+//
+// A task of a task does not exist at runtime: `Task` is a host thenable, and
+// the promise resolution procedure ADOPTS a thenable result instead of boxing
+// it, recursively. The type used to sit one level deeper than the value —
+// `await` on a nested handle typed `Task<i32>` over a runtime `7`. The handle's
+// payload is now assimilated wherever a `Task<..>` is FORMED (the `async` seam
+// and generic substitution), which makes `Task<..>` idempotent as a type
+// constructor and `await`'s single unwrap exact.
+
+/// The runtime truth this is all measured against: one `await` on a nested task
+/// yields the INNERMOST value, not a handle.
+#[test]
+fn a_nested_task_awaits_to_the_inner_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let outer = async { inner };
+            print(await inner_value(outer));
+        }
+
+        fun inner_value(outer: Task<i32>): Task<i32> { outer }
+        "#,
+        "7\n",
+    );
+}
+
+/// The construction seam: `async { <a task> }` adds no layer — the handle it
+/// yields is a `Task<i32>`, and that is what the runtime holds.
+#[test]
+fn an_async_body_that_is_a_task_assimilates_at_construction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let outer: Task<i32> = async { inner };
+            let value: i32 = await outer;
+            print(value);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The typing this closes: `await` on a nested task is an `i32`, matching the
+/// value it produces. Before assimilation this was `Task<i32>` — one layer
+/// deeper than the runtime.
+#[test]
+fn awaiting_a_nested_task_types_as_the_inner_value() {
+    assert_compiles(
+        r#"
+        import std::task::Task;
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let outer = async { inner };
+            let value: i32 = await outer;
+        }
+        "#,
+    );
+}
+
+/// The other half, and the user-visible change: the one-layer-deep type is now
+/// REJECTED. Nothing produces a `Task<Task<i32>>`, so annotating one is an
+/// error rather than a silent lie about the value.
+#[test]
+fn a_nested_task_no_longer_types_one_layer_deep() {
+    assert_fails_with(
+        r#"
+        import std::task::Task;
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let outer = async { inner };
+            let value: Task<i32> = await outer;
+        }
+        "#,
+        "Expected Task<i32>, but got i32 instead.",
+    );
+}
+
+/// No infinite regress, and no residue: a CHAIN of wrapping collapses to one
+/// layer, because each construction assimilates as it is formed.
+#[test]
+fn a_chain_of_nested_tasks_collapses_to_one_layer() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun main() {
+            let a: Task<i32> = async { 7 };
+            let b: Task<i32> = async { a };
+            let c: Task<i32> = async { b };
+            let d: Task<i32> = async { c };
+            let value: i32 = await d;
+            print(value);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The same chain typed the old way is rejected at every depth — the pin that
+/// the collapse is total, not a single-layer trim.
+#[test]
+fn a_chain_of_nested_tasks_rejects_the_deep_type() {
+    assert_fails_with(
+        r#"
+        import std::task::Task;
+
+        fun main() {
+            let a: Task<i32> = async { 7 };
+            let b = async { a };
+            let c = async { b };
+            let value: Task<Task<i32>> = await c;
+        }
+        "#,
+        "Expected Task<Task<i32>>, but got i32 instead.",
+    );
+}
+
+/// An `async` literal directly inside an `async` literal — the same seam with
+/// no intervening binding, so the body type arrives already a handle.
+#[test]
+fn an_async_literal_body_assimilates() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun main() {
+            let outer: Task<i32> = async { async { 7 } };
+            let value: i32 = await outer;
+            print(value);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// THE SHARP EDGE: a generic `T` that happens to instantiate at a `Task`. The
+/// declared return `Task<T>` would substitute to `Task<Task<i32>>` — the very
+/// type the host cannot hold — so substitution assimilates too. Verified
+/// against the runtime: the program prints the inner value.
+#[test]
+fn a_generic_wrapper_instantiated_at_a_task_assimilates() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun wrap<T>(t: T): Task<T> { async { t } }
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let wrapped: Task<i32> = wrap(inner);
+            let value: i32 = await wrapped;
+            print(value);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The generic edge's negative half: the pre-assimilation typing is rejected.
+#[test]
+fn a_generic_wrapper_at_a_task_rejects_the_deep_type() {
+    assert_fails_with(
+        r#"
+        import std::task::Task;
+
+        fun wrap<T>(t: T): Task<T> { async { t } }
+
+        fun main() {
+            let inner: Task<i32> = async { 7 };
+            let value: Task<i32> = await wrap(inner);
+        }
+        "#,
+        "Expected Task<i32>, but got i32 instead.",
+    );
+}
+
+/// The combinators see the assimilated element type, so a join over
+/// generically-wrapped tasks yields the values the host actually produces.
+#[test]
+fn settle_all_over_generically_wrapped_tasks_yields_values() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun wrap<T>(t: T): Task<T> { async { t } }
+
+        fun main() {
+            let a: Task<i32> = async { 1 };
+            let b: Task<i32> = async { 2 };
+            let results: List<i32> = Task::settle_all([wrap(a), wrap(b)]);
+            print(results[0] + results[1]);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// The precision guard on the generic seam: the SAME wrapper at a non-task
+/// argument is untouched — `wrap(5)` is a `Task<i32>`, one layer, as always.
+#[test]
+fn a_generic_wrapper_at_a_non_task_is_unaffected() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun wrap<T>(t: T): Task<T> { async { t } }
+
+        fun main() {
+            let wrapped: Task<i32> = wrap(5);
+            let value: i32 = await wrapped;
+            print(value);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+/// Assimilation is `Task`-specific: every other nesting type constructor keeps
+/// its layers, including generic instantiation at its own type.
+#[test]
+fn non_task_nesting_is_untouched_by_assimilation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun hold<T>(value: T): Option<T> { Some(value) }
+
+        fun main() {
+            let nested: Option<Option<i32>> = hold(Some(4));
+            let lists: List<List<i32>> = [[1], [2]];
+            match nested {
+                Some(let inner) => match inner {
+                    Some(let value) => print(value + lists[1][0]),
+                    None => print("none"),
+                },
+                None => print("none"),
+            }
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// A plain (non-async) function returning a handle is NOT a nesting site: it
+/// hands back the task it built, and the type says so.
+#[test]
+fn a_plain_function_returning_a_task_still_yields_a_handle() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        fun make(): Task<i32> { async { 7 } }
+
+        fun main() {
+            let handle: Task<i32> = make();
+            print(await handle);
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// RESIDUAL, pinned with the honest CURRENT behavior: an `async fun` whose
+/// DECLARED return is itself a `Task`. Its calls are implicitly awaited, so the
+/// host assimilates the returned handle and the call site receives the inner
+/// `i32` — this program prints `7`, not a handle — while the type still reads
+/// `Task<i32>`. The same divergence as the one above, at a seam this fix cannot
+/// reach: async-ness is a whole-program fixpoint over the call graph
+/// (`async_infer::infer`), computed AFTER type inference, so while a call's type
+/// is being decided the analyzer does not yet know whether its callee is async
+/// and its result therefore assimilated. Closing it needs the two passes
+/// interleaved (or an `Awaited<T>` type-level operator), which is more than this
+/// item. Recorded in async-polymorphism.md.
+#[test]
+fn an_async_function_returning_a_task_is_assimilated_at_runtime_only() {
+    // The runtime: the call site receives the VALUE.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::task::Task;
+
+        async fun make(): Task<i32> { async { 7 } }
+
+        fun main() {
+            let result = make();
+            print(result);
+        }
+        "#,
+        "7\n",
+    );
+    // The type: still the handle, one layer deeper than that value.
+    assert_compiles(
+        r#"
+        import std::task::Task;
+
+        async fun make(): Task<i32> { async { 7 } }
+
+        fun main() { let result: Task<i32> = make(); }
+        "#,
+    );
+}
+
+/// The residual's desired end state — `#[ignore]`d until the seam above closes.
+/// Un-ignore when an async call's type assimilates its awaited result.
+#[test]
+#[ignore = "async-fun return assimilation needs the async fixpoint at typing time"]
+fn an_async_function_returning_a_task_should_type_as_the_value() {
+    assert_compiles(
+        r#"
+        import std::task::Task;
+
+        async fun make(): Task<i32> { async { 7 } }
+
+        fun main() { let result: i32 = make(); }
+        "#,
+    );
+}

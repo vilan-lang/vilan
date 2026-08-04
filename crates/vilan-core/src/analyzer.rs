@@ -16538,15 +16538,10 @@ impl<'src> Analyzer<'src> {
             Expr::Async(closure_id) => {
                 let body_id = self.closures.get(closure_id).map(|closure| closure.return_);
                 let inner_constraint = match &constraint {
-                    Type::Struct(id, arguments)
-                        if Some(*id) == self.task_struct_id
-                            || Some(*id) == self.promise_struct_id =>
-                    {
-                        arguments
-                            .first()
-                            .map(|type_id| type_id.get_type(self))
-                            .unwrap_or(Type::Unknown)
-                    }
+                    Type::Struct(id, arguments) if self.is_task_handle(*id) => arguments
+                        .first()
+                        .map(|type_id| type_id.get_type(self))
+                        .unwrap_or(Type::Unknown),
                     _ => Type::Unknown,
                 };
                 let body_type = body_id
@@ -16566,14 +16561,25 @@ impl<'src> Analyzer<'src> {
                 }
                 match self.task_struct_id.or(self.promise_struct_id) {
                     Some(handle_id) => {
-                        let body_type_id = body_type.get_type_id(self);
-                        Type::Struct(handle_id, vec![body_type_id])
+                        // A body that is ITSELF a task contributes no layer: the
+                        // host adopts the thenable, so this handle settles with
+                        // the inner value (see `assimilated_task_payload`).
+                        let payload = self.assimilated_task_payload(body_type);
+                        // Assimilation can expose a still-settling payload, which
+                        // defers for the same reason the body type does above.
+                        if matches!(payload, Type::Unresolved) {
+                            return Type::Unresolved;
+                        }
+                        let payload_id = payload.get_type_id(self);
+                        Type::Struct(handle_id, vec![payload_id])
                     }
                     None => Type::Any,
                 }
             }
             // `await <inner>` unwraps a `Task<T>` or raw `Promise<T>` to `T`
-            // (and is the identity on a non-task).
+            // (and is the identity on a non-task). One layer is exact: the
+            // handle's payload is assimilated wherever a `Task<..>` is formed,
+            // so a nested handle type never reaches here.
             Expr::Await(inner_id) => {
                 let inner = self.infer_type_inner(
                     *inner_id,
@@ -16583,15 +16589,10 @@ impl<'src> Analyzer<'src> {
                 );
                 match &inner {
                     Type::Unresolved => Type::Unresolved,
-                    Type::Struct(id, arguments)
-                        if Some(*id) == self.task_struct_id
-                            || Some(*id) == self.promise_struct_id =>
-                    {
-                        arguments
-                            .first()
-                            .map(|type_id| type_id.get_type(self))
-                            .unwrap_or(Type::Any)
-                    }
+                    Type::Struct(id, arguments) if self.is_task_handle(*id) => arguments
+                        .first()
+                        .map(|type_id| type_id.get_type(self))
+                        .unwrap_or(Type::Any),
                     _ => inner,
                 }
             }
@@ -18013,6 +18014,52 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// Whether `id` names the async handle: `std::task`'s `Task<T>`, or the raw
+    /// host `Promise<T>` it falls back to against an older std. Every async seam
+    /// treats the two alike, so they are asked for together.
+    fn is_task_handle(&self, id: Id) -> bool {
+        Some(id) == self.task_struct_id || Some(id) == self.promise_struct_id
+    }
+
+    /// The payload a freshly formed `Task<..>` actually carries.
+    ///
+    /// **A task of a task does not exist at runtime.** A `Task` is a host
+    /// thenable, and the promise resolution procedure ADOPTS a thenable result
+    /// rather than boxing it: a promise resolved with a promise settles with the
+    /// inner value, recursively. So `async { some_task }` produces a handle whose
+    /// awaited value is `T`, never `Task<T>` — the type used to sit one level
+    /// deeper than the value it described (async-polymorphism.md Part B).
+    ///
+    /// This strips those layers, so `Task<..>` is idempotent as a type
+    /// constructor and `await`'s single unwrap is exact. The loop is bounded by
+    /// `seen`: a self-referential payload (`X = Task<X>`) stops instead of
+    /// regressing forever, and honest chains (`Task<Task<Task<i32>>>`) collapse
+    /// in one pass because each layer's id is distinct.
+    ///
+    /// An ERASED handle (`Task` with no argument, from a type that never
+    /// resolved) is left alone: there is no payload to promote, and inventing one
+    /// would be a guess.
+    fn assimilated_task_payload(&self, payload: Type) -> Type {
+        let mut payload = payload;
+        let mut seen: Vec<TypeId> = Vec::new();
+        loop {
+            let Type::Struct(id, arguments) = &payload else {
+                return payload;
+            };
+            if !self.is_task_handle(*id) {
+                return payload;
+            }
+            let Some(inner_id) = arguments.first().copied() else {
+                return payload;
+            };
+            if seen.contains(&inner_id) {
+                return payload;
+            }
+            seen.push(inner_id);
+            payload = inner_id.get_type(self);
+        }
+    }
+
     /// Resolves any generic type parameters in `type_` using the substitution
     /// context, e.g. turning the return type `T` of `default<T>` into `Id` for
     /// a call `default<Id>()`.
@@ -18052,11 +18099,20 @@ impl<'src> Analyzer<'src> {
                 )
             }
             Type::Struct(id, arguments) => {
-                let arguments = arguments.clone();
-                Type::Struct(
-                    *id,
-                    self.substitute_argument_types(&arguments, substitution_context),
-                )
+                let (id, arguments) = (*id, arguments.clone());
+                let arguments = self.substitute_argument_types(&arguments, substitution_context);
+                // The `async` seam's assimilation, one level up: instantiating
+                // `Task<T>` at `T := Task<i32>` would otherwise mint the very
+                // type the runtime cannot hold (`fun wrap<T>(t: T): Task<T>`
+                // called with a task). The handle's payload is normalized here
+                // so no substitution can reintroduce a layer the host flattens.
+                if self.is_task_handle(id)
+                    && let Some(payload_id) = arguments.first().copied()
+                {
+                    let payload = self.assimilated_task_payload(payload_id.get_type(self));
+                    return Type::Struct(id, vec![payload.get_type_id(self)]);
+                }
+                Type::Struct(id, arguments)
             }
             // A parameterized trait substitutes its arguments (`Readable<U>` ->
             // `Readable<A>` under `U = A`), so a mapped trait template instantiates.
