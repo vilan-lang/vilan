@@ -124,6 +124,47 @@ fn module_resident_pages_chunk_like_entry_pages() {
 }
 
 #[test]
+fn the_report_carries_the_measured_verdict() {
+    // The report's numerator is the plan; its DENOMINATOR is what the same
+    // entry weighs emitted whole (bundle-splitting.md §S3, item 5). The router
+    // example is the recorded loss case — its lazy mass does not cover the
+    // gate — and the verdict must say so in bytes rather than in prose.
+    let staged = stage_example("router", "verdict");
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args([
+            "build",
+            staged.to_str().expect("utf-8 temp path"),
+            "--print-chunks",
+        ])
+        .output()
+        .expect("run vilan");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "build failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verdict = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("verdict:"))
+        .unwrap_or_else(|| panic!("no verdict line:\n{stdout}"));
+    assert!(
+        verdict.contains("adds") && verdict.contains("defers only"),
+        "the router example is a net loss and the verdict must say so: {verdict}"
+    );
+    // The numbers are real: whatever it claims the whole build weighs is what
+    // this very build wrote, since `--print-chunks` does not split.
+    let whole = std::fs::metadata(staged.join("app.js"))
+        .expect("the flag must not suppress the build")
+        .len();
+    assert!(
+        verdict.contains(&format!("{whole} whole")),
+        "the verdict's denominator must be the artifact on disk ({whole}): {verdict}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
 fn without_the_flag_the_report_is_absent() {
     let staged = stage_example("router", "silent");
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))

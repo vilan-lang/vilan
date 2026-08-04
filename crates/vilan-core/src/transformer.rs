@@ -115,6 +115,22 @@ pub struct EmittedChunk {
 pub struct SplitProgram {
     pub main: String,
     pub chunks: Vec<EmittedChunk>,
+    /// The same entry emitted as ONE file — the denominator of the split's
+    /// verdict (`bundle-splitting.md` §S3, item 5). Measured rather than
+    /// estimated: the fixed cost of the gate is not a constant the emitter can
+    /// be trusted to remember, so a split build emits both ways and compares.
+    pub whole_bytes: usize,
+}
+
+impl SplitProgram {
+    /// What this split cost, in emitted bytes.
+    pub fn cost(&self) -> crate::chunks::SplitCost {
+        crate::chunks::SplitCost {
+            eager: self.main.len(),
+            deferred: self.chunks.iter().map(|chunk| chunk.source.len()).sum(),
+            whole: self.whole_bytes,
+        }
+    }
 }
 
 /// The registry the eager bundle and its chunks meet at. Not an ESM export:
@@ -142,11 +158,18 @@ pub fn transform_split<'src>(
     if plan.chunks.is_empty() {
         // Nothing splittable: the entry is a single file, exactly as if the
         // flag were absent. Reported by `--print-chunks`, not by a failure.
+        let main = transform(program, options)?;
         return Ok(SplitProgram {
-            main: transform(program, options)?,
+            whole_bytes: main.len(),
+            main,
             chunks: Vec::new(),
         });
     }
+    // The denominator of the verdict below: the same program as one file. A
+    // second walk over an already-analyzed program, paid only by a leg that
+    // asked to split, and it buys an EXACT answer where a compiled-in threshold
+    // would only ever be a remembered measurement.
+    let whole_bytes = transform(program, options)?.len();
 
     let mut transformer = Transformer::new(program, options);
     transformer.chunk_members = plan.members();
@@ -286,6 +309,7 @@ pub fn transform_split<'src>(
 
     Ok(SplitProgram {
         main,
+        whole_bytes,
         chunks: plan
             .chunks
             .iter()
@@ -471,8 +495,11 @@ fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option
             {
                 return Some((preload.clone(), source.clone()));
             }
-            gate_source_name(subject, gates)
-                .or_else(|| arguments.iter().find_map(|node| gate_source_name(node, gates)))
+            gate_source_name(subject, gates).or_else(|| {
+                arguments
+                    .iter()
+                    .find_map(|node| gate_source_name(node, gates))
+            })
         }
         js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
             gate_source_name(&variable.value, gates)
@@ -2728,8 +2755,7 @@ impl<'src> Transformer<'src> {
                         // letting the view advance (`bundle-splitting.md` §2).
                         // Same shape, so the call's own type binding carries
                         // over by position; every argument is emitted unchanged.
-                        if let Some((gate_target, preload)) =
-                            self.split_gate_target(*id, target_id)
+                        if let Some((gate_target, preload)) = self.split_gate_target(*id, target_id)
                         {
                             let call_substitution = self.call_substitution(
                                 *id,
@@ -2752,8 +2778,7 @@ impl<'src> Transformer<'src> {
                                     self.rebind_by_position(target_id, preload, substitution)
                                 })
                                 .unwrap_or_default();
-                            let preload_name =
-                                self.emit_instance(preload, &preload_substitution);
+                            let preload_name = self.emit_instance(preload, &preload_substitution);
                             let name = self.emit_instance(gate_target, &substitution);
                             self.gate_call_names.insert(name.clone(), preload_name);
                             return Some(js::Node::Call(Box::new(js::Node::Local(name)), args));

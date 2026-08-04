@@ -24,7 +24,10 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+mod support;
 
 /// The emitted artifacts, in the order the golden directory holds them.
 const ARTIFACTS: &[&str] = &[
@@ -539,6 +542,242 @@ fn the_plan_and_the_emitted_chunks_agree() {
         }
     }
     let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn a_build_owns_its_legs_chunk_namespace() {
+    // `bundle-splitting.md` §S3, item 4. A leg's chunk files and its manifest
+    // belong to its LAST build: a renamed route arm must not leave the old
+    // arm's file beside the new one, and dropping `split` must not leave a
+    // manifest describing chunks the bundle no longer names.
+    let staged = stage("namespace", true);
+    build(&staged, &[]);
+    assert!(
+        staged.join("app.Route_Docs.js").is_file() && staged.join("app.chunks.json").is_file(),
+        "the split build writes the docs chunk and the manifest"
+    );
+
+    // Rename the arm. The chunk file is named after the arm, so the old one is
+    // now a stray — inert, but a stray the manifest no longer lists.
+    let source = read(&staged, "app.vl")
+        .replace("Docs(i32)", "Guide(i32)")
+        .replace("Route::Docs", "Route::Guide")
+        .replace("docs_page", "guide_page")
+        .replace("docs_nav", "guide_nav");
+    std::fs::write(staged.join("app.vl"), source).expect("rewrite the fixture");
+    build(&staged, &[]);
+    assert!(
+        staged.join("app.Route_Guide.js").is_file(),
+        "the renamed arm gets its own chunk"
+    );
+    assert!(
+        !staged.join("app.Route_Docs.js").exists(),
+        "the renamed arm's previous chunk file must be swept"
+    );
+    // …and the bundle itself is never mistaken for one of its chunks.
+    assert!(staged.join("app.js").is_file(), "the eager bundle survives");
+
+    // Dropping `split` takes the whole namespace with it.
+    let manifest = read(&staged, "vilan.toml")
+        .lines()
+        .filter(|line| !line.starts_with("split"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    std::fs::write(staged.join("vilan.toml"), manifest).expect("rewrite the manifest");
+    build(&staged, &[]);
+    let left: Vec<String> = std::fs::read_dir(&staged)
+        .expect("read the staged directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("app.") && name != "app.js" && name != "app.vl")
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a build with no chunks must leave none behind: {left:?}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn a_split_build_warns_when_the_gate_costs_more_than_it_defers() {
+    // `bundle-splitting.md` §S3, item 5. Splitting is not free — below a few KB
+    // of per-route code the gate, the forwarders and the chunk map cost more
+    // than the deferred mass saves — and the build says so with THIS leg's
+    // numbers, measured against the same entry emitted whole.
+    let staged = stage("cost", true);
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", staged.to_str().expect("utf-8 temp path")])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan build");
+    assert!(
+        output.status.success(),
+        "the warning must not fail the build"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("`split` on `app`"),
+        "the fixture's lazy mass is far below the gate's cost; the build must warn:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("adds") && stderr.contains("defers only"),
+        "the warning must name the numbers, not just complain:\n{stderr}"
+    );
+
+    // The numbers are this build's own: the eager bundle it just wrote, and the
+    // chunk files it just wrote.
+    let eager = std::fs::metadata(staged.join("app.js"))
+        .expect("the eager bundle")
+        .len();
+    let deferred: u64 = [
+        "app.Route_Home.js",
+        "app.Route_Docs.js",
+        "app.Route_NotFound.js",
+    ]
+    .iter()
+    .map(|name| std::fs::metadata(staged.join(name)).expect("a chunk").len())
+    .sum();
+    assert!(
+        stderr.contains(&format!("defers only {deferred}"))
+            && stderr.contains(&format!("{eager} bytes split")),
+        "the warning must be measured, not estimated (eager {eager}, deferred {deferred}):\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+/// A RUNNABLE split project: the fixture's client beside a node server that
+/// prints and returns. `vilan run` needs a node leg to launch, and the fixture
+/// package (browser-only) has none.
+fn stage_workspace(tag: &str) -> PathBuf {
+    let staged = std::env::temp_dir().join(format!("vilan_split_run_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    std::fs::create_dir_all(staged.join("src")).expect("create the staging directory");
+    std::fs::write(
+        staged.join("vilan.toml"),
+        "[package]\nname = \"split_run\"\n\n[entry.client]\ntarget = \"browser\"\nsplit = true\n\n[entry.server]\n",
+    )
+    .expect("write the manifest");
+    let client = std::fs::read_to_string(fixture("project").join("app.vl")).expect("the client");
+    std::fs::write(staged.join("src/client.vl"), client).expect("write the client");
+    std::fs::write(
+        staged.join("src/server.vl"),
+        "import std::io::print;\n\nfun main() {\n\tprint(\"server-booted\");\n}\n",
+    )
+    .expect("write the server");
+    staged
+}
+
+/// The leg's chunk artifacts currently on disk.
+fn chunk_artifacts(dist: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dist) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("client.") && name != "client.js")
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn vilan_run_emits_the_leg_whole_and_clears_the_chunks_a_build_left() {
+    // `bundle-splitting.md` §S4, item 6. Splitting is a BUILD optimization and
+    // single-file emission is first-class forever: every `run` form emits one
+    // file per leg, whatever the manifest declares, because that is the only
+    // shape the dev loop's whole-bundle diff-and-swap can classify. Refusing
+    // the combination instead would mean a project that ships split could not
+    // be developed without editing its manifest.
+    let staged = stage_workspace("whole");
+    build(&staged, &[]);
+    let dist = staged.join("dist");
+    assert_eq!(
+        chunk_artifacts(&dist),
+        vec![
+            "client.Route_Docs.js",
+            "client.Route_Home.js",
+            "client.Route_NotFound.js",
+            "client.chunks.json",
+        ],
+        "`vilan build` honours `split`"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", staged.to_str().expect("utf-8 temp path")])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("server-booted"),
+        "the run must build and boot:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("run: `client` emits as one file"),
+        "passing over a leg's `split` must be said out loud, once:\n{stderr}"
+    );
+
+    // The bundle is whole — the pages are declarations, not forwarders…
+    let bundle = read(&dist, "client.js");
+    assert!(
+        bundle.contains("function home_page(") && !bundle.contains("__vilan_chunks"),
+        "a run's bundle carries every route and names no chunk"
+    );
+    // …and nothing of the previous split build is left describing it. This is
+    // what moots the `--watch` stray-chunk residue S2 recorded: a leg's chunk
+    // namespace belongs to its last build, and this build had none.
+    assert_eq!(
+        chunk_artifacts(&dist),
+        Vec::<String>::new(),
+        "a whole-bundle build must sweep the leg's chunk namespace"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_watch_round_clears_the_chunks_a_build_left() {
+    // The same rule on the HMR path, which writes `dist/` itself rather than
+    // going through `build_workspace_artifacts`.
+    let staged = stage_workspace("watch");
+    build(&staged, &[]);
+    let dist = staged.join("dist");
+    assert!(
+        !chunk_artifacts(&dist).is_empty(),
+        "the seed build must leave chunks for the round to clear"
+    );
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args([
+            "run",
+            "--watch",
+            "--hmr-port",
+            "0",
+            staged.to_str().expect("utf-8 temp path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut cleared = false;
+    while Instant::now() < deadline {
+        if chunk_artifacts(&dist).is_empty() && dist.join("client.js").is_file() {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let left = chunk_artifacts(&dist);
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&staged);
+    assert!(
+        cleared,
+        "a watch round emits the leg whole, so the previous build's chunks must go: {left:?}"
+    );
 }
 
 #[test]

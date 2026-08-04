@@ -235,6 +235,57 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
 }
 
+/// What a split cost this leg, in emitted bytes (`bundle-splitting.md` §S3,
+/// item 5). S2's measurement showed the gate is NOT free — `swap_split`'s body,
+/// the `__chunk_*` helpers, the extra signal instances, the forwarders, the
+/// registrations and the url map are a fixed cost per split leg — so a leg with
+/// little per-route code ships MORE on first load than it would whole. The
+/// toolchain now measures that per leg rather than quoting a constant: a split
+/// build emits the same entry both ways and compares, which is exact and needs
+/// no threshold at all.
+pub struct SplitCost {
+    /// The eager bundle a split build writes — what the first load pays.
+    pub eager: usize,
+    /// The chunk files' total — what the first load does NOT pay.
+    pub deferred: usize,
+    /// The same entry emitted as one file — what the first load would pay
+    /// without `split`.
+    pub whole: usize,
+}
+
+impl SplitCost {
+    /// Bytes the split ADDS to the first load. Negative is the win.
+    pub fn added(&self) -> i64 {
+        self.eager as i64 - self.whole as i64
+    }
+
+    /// Whether splitting this leg made the first load bigger — the condition
+    /// the build warns on.
+    pub fn is_a_loss(&self) -> bool {
+        self.added() >= 0
+    }
+
+    /// The verdict in one sentence, shared by `--print-chunks` and the build
+    /// warning so the two can never disagree.
+    pub fn verdict(&self) -> String {
+        let added = self.added();
+        if added >= 0 {
+            format!(
+                "splitting adds {added} bytes to the first load and defers only {} — \
+                 the route gate, the forwarders and the chunk map cost more than this \
+                 leg's per-route code saves ({} bytes split against {} whole)",
+                self.deferred, self.eager, self.whole,
+            )
+        } else {
+            format!(
+                "splitting saves {} bytes on the first load and defers {} \
+                 ({} bytes split against {} whole)",
+                -added, self.deferred, self.eager, self.whole,
+            )
+        }
+    }
+}
+
 /// A std `View` method by name, when the browser layer is loaded.
 fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
     let view_struct = program.structs.iter().find_map(|(id, struct_)| {
