@@ -22,6 +22,16 @@ await the commit, then confirm or roll back, returning the outcome. **A6 is
 COMPLETE**; the cadence split for directly-awaiting `turn` bodies remains
 the one recorded refinement.
 
+**2026-08-04 — §5.5's follow-on now has a record of its own:
+`optimistic-lifecycle.md`** (A14). `optimistic` stays exactly as shipped and
+is still the one-shot spelling; what it could not do — being a free function
+over a bare signal — is hold state, so it has no observable pending or
+rejected status and it corrupts the cell when two writes overlap. An
+`Optimistic<T>` cell wraps the signal and adds both. §5's plan item 4 (the
+`AtSuspension` optimistic-paint corpus shape) and item 5 are closed there,
+Rust-side rather than in the corpus: the corpus gate byte-compares emitted
+JS without running it, so ordering cannot be pinned in a `.vl` program.
+
 **2026-07-18 — `turn_async` MERGED INTO `turn`** (post-v0.9.0, user's call):
 adaptation (async-polymorphism.md Part A) made the pair redundant — `turn`'s
 body is now a plain `(|| T) context turn_scope` parameter, so a synchronous
@@ -216,7 +226,7 @@ application-level answer and builds ON turns as a separate slice.
    subscriber fires only on its own turn's settle (the two-requests
    scenario, distilled); plus the `AtSuspension` optimistic-paint shape.
 5. **A6's remaining half** (optimistic-write → reconcile) stays a recorded
-   follow-on riding turns.
+   follow-on riding turns. *Closed 2026-08-04 — `optimistic-lifecycle.md`.*
 
 ## 6. Out of scope
 

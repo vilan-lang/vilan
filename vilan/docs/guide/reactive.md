@@ -257,7 +257,9 @@ difference is the point:
 **`optimistic(signal, value, commit)`** paints the value immediately,
 runs your async commit, and on failure rolls back. Use it for
 one-shot actions like a delete button: if the delete failed, the row
-should come back.
+should come back. When the write needs *watching* — a spinner, a button
+that shouldn't fire twice, a failure banner — reach for the
+[`Optimistic` cell](#watching-an-optimistic-write-land) below instead.
 
 **`draft(initial, commit)`** is for *editing*. It keeps the user's text
 on failure (rolling back mid-typing would eat their input) and retries
@@ -386,6 +388,61 @@ reconnect. It is also what a "retry" button in a failure banner calls.
 > is not for a commit that appends. And a re-push that fails is not retried
 > on a timer; it rides the next reconnect, so a value the server keeps
 > refusing can't spin.
+
+### Watching an optimistic write land
+
+`optimistic` hands the outcome back to whoever called it, and to no one
+else. That is enough for a write you await and immediately branch on, and
+not enough for the usual case: a button that should grey out while its
+write is in flight, and a banner that should say why it failed.
+
+`Optimistic::over(signal)` wraps the signal you already have — no binding
+changes — and adds a `state` signal to bind:
+
+```vilan
+import std::print;
+import std::reactive::{ Signal, Optimistic, WriteState };
+import std::result::Result::{ self, Ok, Err };
+
+fun main() {
+	let title = Signal::new("Draft post");
+	let saving = Optimistic::over(title);
+
+	// A write the server refuses. "Published" is painted first, so the UI
+	// never waits; the rejection rolls it back and says why.
+	let _refused = saving.write("Published", || {
+		let reply: Result<str, str> = Err("not allowed");
+		reply
+	});
+	print(title.get());
+	print(saving.state.get() == WriteState::Rejected("not allowed"));
+
+	// A write it accepts, answering with its own value — that value wins,
+	// not the one you painted.
+	let _accepted = saving.write("Published", || {
+		let reply: Result<str, str> = Ok("Published (v3)");
+		reply
+	});
+	print(title.get());
+	print(saving.state.get() == WriteState::Confirmed);
+}
+```
+
+`state` is `Confirmed`, `Pending`, or `Rejected(reason)`, and the value and
+the state are always published *together* — an observer of both never
+catches the cell mid-transition.
+
+> **Going deeper.** The cell also fixes something you can't fix from
+> outside: two writes in flight over one signal. Through the free
+> function, an older write failing *after* a newer one succeeded rolls the
+> newer value away, leaving the screen showing something the server
+> stopped holding two writes ago. The cell discards a superseded outcome —
+> the newest write owns the cell — and it rolls back to the last value the
+> **server** confirmed rather than to whatever the signal held when the
+> write started. Unlike a draft, it does **not** re-send on reconnect: a
+> re-send is at-least-once, which is fine for "set this field to this
+> value" and not for an action you'd rather not perform twice. The
+> rollback is the recovery.
 
 ## Keyed reconciliation
 

@@ -69,7 +69,7 @@ vilan/docs` gives you the same site locally with live reload.
 ### Guides
 | Chapter | Covers |
 |---|---|
-| [Reactive state](guide/reactive.md) | signals, derived state, effects, ownership & disposal, turns, `optimistic`, `Draft` |
+| [Reactive state](guide/reactive.md) | signals, derived state, effects, ownership & disposal, turns, `optimistic`/`Optimistic`, `Draft` |
 | [Building UI](guide/ui.md) | `view` chaining, binds, events, lists, conditionals, mounting |
 | [Styling](guide/styling.md) | `const` typed styles, lengths/colors, dynamic values |
 | [Routing](guide/routing.md) | enum routes, `parse`/`href`, `link`, `swap`, navigation |
