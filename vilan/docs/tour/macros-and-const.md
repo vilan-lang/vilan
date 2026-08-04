@@ -46,6 +46,43 @@ Three rules to know:
 The flagship user is styling: `const style()…` chains evaluate at build
 time and emit CSS. See the [styling guide](../guide/styling.md).
 
+### Release builds fold without the keyword
+
+A `release` build also folds ordinary initializers it can work out for
+itself, under the same rules — no keyword needed:
+
+```vilan
+import std::print;
+
+fun square(n: i32): i32 {
+	n * n
+}
+
+fun main() {
+	let side = 3 + 1;
+	print(square(side));   // release ships `16`; debug ships the calls
+}
+```
+
+`debug` deliberately does not, so the readable build keeps the
+computation where a stack trace can show it. Set the preset in
+`vilan.toml`:
+
+```toml
+[build]
+preset = "release"      # or: infer-const = false, to opt out
+```
+
+The keyword is still worth writing, and the difference is what happens
+when evaluation *fails*. `const` promises the fold and reports an error
+if it can't deliver — the budget blew, a host call snuck in, the result
+wasn't plain data. Inference promises nothing: anything it can't settle
+it silently leaves alone, to run at runtime exactly as written. So a
+release build never rejects a program a debug build accepts, and never
+changes what a program does — it only moves some of the arithmetic
+earlier. Write `const` when you want the guarantee (and the error when
+it breaks); let inference pick up the rest.
+
 ## Derive macros: impls from a type's shape
 
 You've already seen `[derive(PartialEq, Debug)]`. A derive is a macro: a

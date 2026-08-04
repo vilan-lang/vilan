@@ -77,3 +77,41 @@ type: numbers, strings, booleans, lists, tuples, structs and enums of
 const-evaluable contents. The expression's *type* is checked exactly
 as if it ran at runtime; `const` never changes typing, only when the
 computation happens.
+
+## 9.5 Inferred `const`
+
+A **release** build additionally folds `let` and `mut` initializers
+that were never marked `const`, where it can settle them under §9.2's
+environment. `let total = 1 + 2 * 3;` ships as `7` with no keyword.
+
+The keyword remains the contract, and the difference is what happens on
+failure. An explicit `const` that cannot be evaluated is a compile
+error (§9.3). An inferred fold that cannot be evaluated — for **any**
+reason: a runtime free variable, a host capability, a panic, a budget,
+a result that is not plain data — simply does not happen, with no
+diagnostic. The binding stays exactly as written and runs at runtime.
+Inference can therefore never change whether a program compiles, only
+when some of its arithmetic happens.
+
+Four rules bound it:
+
+- **Observable behaviour is preserved exactly.** An evaluation that
+  panics, prints, or exits is discarded and the binding left alone.
+  (An explicit `const` *does* discard what its evaluation printed —
+  that computation is what the author asked to move to compile time.)
+- **Inference never creates a const context.** Reaching a
+  compile-time-only function (§9.2) refuses the fold rather than
+  performing the emission, so whether a style compiles never depends on
+  the optimizer.
+- **Inferred evaluation has its own, tighter budgets**, and a fold
+  whose literal would be large is declined — explicit `const` is the
+  opt-in for expensive or bulky results.
+- **Type parameters are out of scope.** A binding inside a generic
+  function body is never folded: its value depends on a
+  monomorphization the const environment does not carry.
+
+The `debug` preset does not infer, so a debug build keeps every such
+computation where a stack trace can show it; `release` does. Folding is
+deterministic — the same source folds identically on every build — and
+the language server never runs the pass, since it produces nothing to
+report.

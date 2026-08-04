@@ -151,13 +151,90 @@ fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
     })
 }
 
+impl ConstValue {
+    /// The byte length of this value's emitted literal — the measure the
+    /// inferred form's size cap is stated in (const-eval.md §9.3).
+    ///
+    /// Mirrors `transformer::const_value_to_js` printed TIGHT, which is the
+    /// only combination that matters: inference is release-only, and the
+    /// release preset emits without spaces. Kept beside `ConstValue` rather
+    /// than beside the serializer because it is a property of the value, and
+    /// because a caller must be able to ask *before* deciding to serialize.
+    pub fn literal_size(&self) -> usize {
+        /// `[a,b,c]` — brackets plus the separating commas.
+        fn array_size(items: &[ConstValue]) -> usize {
+            2 + items.iter().map(ConstValue::literal_size).sum::<usize>()
+                + items.len().saturating_sub(1)
+        }
+        match self {
+            // `void 0`, `null`, `true` / `false`.
+            ConstValue::Undefined => 6,
+            ConstValue::Null => 4,
+            ConstValue::Bool(value) => {
+                if *value {
+                    4
+                } else {
+                    5
+                }
+            }
+            // The serializer's own special cases, then its shared path.
+            ConstValue::Number(number) if number.is_nan() => 3,
+            ConstValue::Number(number) if number.is_infinite() => {
+                if *number > 0.0 {
+                    8
+                } else {
+                    9
+                }
+            }
+            ConstValue::Number(number) if *number == 0.0 && number.is_sign_negative() => 2,
+            ConstValue::Number(number) => js_number_to_string(*number).len(),
+            ConstValue::BigInt(number) => format!("{number}n").len(),
+            // The quotes plus the escape expansion the JS printer applies, so
+            // a string of control bytes is not counted as if it were plain.
+            ConstValue::Str(text) => {
+                2 + text
+                    .chars()
+                    .map(|character| match character {
+                        '"' | '\\' | '\n' => 2,
+                        character if (character as u32) < 0x20 => 6,
+                        character => character.len_utf8(),
+                    })
+                    .sum::<usize>()
+            }
+            ConstValue::Array(items) => array_size(items),
+            // `new Set([…])` / `new Map([[k,v],…])`.
+            ConstValue::Set(items) => 9 + array_size(items),
+            ConstValue::Map(entries) => {
+                let pairs: usize = entries
+                    .iter()
+                    .map(|(key, value)| 3 + key.literal_size() + value.literal_size())
+                    .sum();
+                9 + 2 + pairs + entries.len().saturating_sub(1)
+            }
+        }
+    }
+}
+
+/// Everything one const evaluation produced. The result is what the caller
+/// wants; the other three are the interpreter's OBSERVABLE EFFECT channels,
+/// and which of them a caller may ignore is exactly what separates the two
+/// const forms (const-eval.md §9.2).
+struct ConstRun {
+    value: ConstValue,
+    assets: Vec<(String, String)>,
+    stdout: String,
+    exited: Option<i32>,
+}
+
 /// Evaluates a const mini-program — the functions and bindings one `const`
 /// expression needs, ending in `const __const_result = <expr>;` — and returns
-/// the result as plain data (const-eval.md §1).
-pub fn eval_const<'a>(
+/// the result as plain data (const-eval.md §1) together with every effect it
+/// produced. The two public entries below decide what to do about those.
+fn run_const<'a>(
     program: &'a JsProgram<'a>,
     limits: Limits,
-) -> Result<(ConstValue, Vec<(String, String)>), Failure> {
+    allow_assets: bool,
+) -> Result<ConstRun, Failure> {
     check_capabilities(program)?;
     let mut interpreter = Interpreter {
         fuel: limits.fuel,
@@ -165,8 +242,7 @@ pub fn eval_const<'a>(
         stdout: String::new(),
         exited: None,
         assets: Vec::new(),
-        // The one context where `asset::emit` is live (const-eval.md §3).
-        allow_assets: true,
+        allow_assets,
     };
     let globals = Scope::root();
     match interpreter.exec_body(&program.nodes, &globals)? {
@@ -188,7 +264,53 @@ pub fn eval_const<'a>(
             format!("a `const` result must be plain data; this evaluates to {what}"),
         )
     })?;
-    Ok((value, interpreter.assets))
+    Ok(ConstRun {
+        value,
+        assets: interpreter.assets,
+        stdout: interpreter.stdout,
+        exited: interpreter.exited,
+    })
+}
+
+/// The EXPLICIT `const` form (const-eval.md §1): the asset channel is live —
+/// this is the one context where `asset::emit` runs (§3) — and stdout and
+/// `process::exit` are DISCARDED. That is the contract, not an oversight: the
+/// user asked for this computation to happen at compile time, and printing is
+/// part of the computation that moved.
+pub fn eval_const<'a>(
+    program: &'a JsProgram<'a>,
+    limits: Limits,
+) -> Result<(ConstValue, Vec<(String, String)>), Failure> {
+    let run = run_const(program, limits, true)?;
+    Ok((run.value, run.assets))
+}
+
+/// The INFERRED form (const-eval.md §9.2): the same evaluator under tighter
+/// budgets, with every effect channel closed.
+///
+/// - **Assets are off**, so reaching `asset::emit` is a capability miss and the
+///   binding stays runtime. That is §5's "const-only functions never infer",
+///   enforced at the reach rather than by a syntactic guess.
+/// - **Any observable effect is a refusal.** An inferred fold is invisible, so
+///   swallowing a `print` — which the explicit form legitimately does — would
+///   silently change a working program's output when someone switched preset.
+///   The caller turns the refusal into a silent fallback like any other.
+pub fn eval_inferred<'a>(
+    program: &'a JsProgram<'a>,
+    limits: Limits,
+) -> Result<ConstValue, Failure> {
+    let run = run_const(program, limits, false)?;
+    if !run.stdout.is_empty() {
+        return Err(Failure::unsupported(
+            "output during evaluation (an inferred fold must be observably silent)",
+        ));
+    }
+    if run.exited.is_some() {
+        return Err(Failure::unsupported(
+            "a process exit during evaluation (an inferred fold must be observably silent)",
+        ));
+    }
+    Ok(run.value)
 }
 
 pub struct RunOutput {

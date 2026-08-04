@@ -67,6 +67,14 @@ pub struct BuildOptions {
     /// is not a user-facing `[build]` knob — `vilan.toml` cannot set it (an
     /// `hmr` key under `[build]` is ignored like any unknown key).
     pub hmr: bool,
+    /// Run the `const` INFERENCE sweep (const-eval.md §9): fold every `let`
+    /// initializer the const evaluator can settle, and silently leave alone
+    /// every one it cannot. On under `release`, OFF under `debug` — folded
+    /// computation vanishes from stack traces, so the readable build keeps it
+    /// (§9.4). Because debug is also `BuildOptions::default()`, and a bare
+    /// `vilan build file.vl` with no manifest resolves the default, the corpus
+    /// goldens are unaffected by construction.
+    pub infer_const: bool,
 }
 
 impl BuildOptions {
@@ -79,6 +87,7 @@ impl BuildOptions {
                 readable_names: true,
                 debug_names: false,
                 hmr: false,
+                infer_const: false,
             },
             Preset::Release => Self {
                 indent: false,
@@ -86,6 +95,7 @@ impl BuildOptions {
                 readable_names: false,
                 debug_names: false,
                 hmr: false,
+                infer_const: true,
             },
         }
     }

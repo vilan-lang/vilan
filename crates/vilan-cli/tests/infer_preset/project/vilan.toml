@@ -1,0 +1,9 @@
+# The `[build]` preset split for inferred `const` (proposal/const-eval.md §9.4).
+# `release` runs the inference sweep; `debug` does not, so folded computation
+# stays in stack traces where a debug build wants it. The suite builds this
+# same source under BOTH presets and pins each output byte-for-byte.
+[package]
+name = "infer_preset"
+
+[build]
+preset = "release"

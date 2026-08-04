@@ -409,6 +409,10 @@ pub struct Build {
     pub readable_names: Option<bool>,
     #[serde(rename = "debug-names")]
     pub debug_names: Option<bool>,
+    /// The `const` inference sweep (const-eval.md §9.4) — on under `release`,
+    /// off under `debug`, overridable here like every other knob.
+    #[serde(rename = "infer-const")]
+    pub infer_const: Option<bool>,
 }
 
 impl Package {
@@ -739,6 +743,7 @@ impl Manifest {
         options.spaces = build.spaces.unwrap_or(options.spaces);
         options.readable_names = build.readable_names.unwrap_or(options.readable_names);
         options.debug_names = build.debug_names.unwrap_or(options.debug_names);
+        options.infer_const = build.infer_const.unwrap_or(options.infer_const);
         Ok(options)
     }
 }

@@ -219,11 +219,11 @@ LSP-side evaluation rides the Tier-2 caching arc.
 - Floating point: no divergence to manage — the interpreter's f64 *is* JS's
   f64 (same representation, equivalence-gated), stated for the record.
 
-### Recorded v2: inferred `const`
+### Recorded v2: inferred `const` — DESIGNED AND SHIPPED, §9
 
 `let a = 1 + 2;` folding without the keyword (backlog G3). No fundamental
 blocker; recorded here so v1's design doesn't foreclose it. The rules that
-keep it sound:
+keep it sound (each settled, and one of them found incomplete, in §9):
 
 - **Inference is transparent; `const` stays the contract.** The explicit form
   ERRORS when evaluation fails; inference silently falls back to runtime on
@@ -528,3 +528,340 @@ plant-proven. The post-pass sequence itself, which was duplicated between
 called by both: that duplication is the standing trap that a pass added to one
 pipeline is skipped by the other, and it is also what makes "built once, at
 that point" a single place rather than a convention two files must keep.
+
+## 9. Inferred `const` — the design, 2026-08-04 (backlog G3)
+
+§5's "Recorded v2" is the constraint set; this section settles it into rules and
+numbers. Probes before implementation, the §8/A8 pattern — and one probe found a
+soundness hole §5 did not record (§9.2).
+
+The mechanism is small because v1 built it: `Program::const_results` is a
+`HashMap<Id, ConstValue>` the transformer consults for **any** entity id
+(`walk_entity_inner`'s first arm), so folding a binding is nothing more than
+putting its initializer's id in that map. Inference adds no serialization, no
+codegen, and no new evaluator — it adds a *decision procedure* for which ids may
+join, and it runs the SAME `State` machine the explicit form does, in a second
+mode.
+
+### 9.1 What infers — the filter, decided by measurement
+
+**Universe**: every `let`/`mut` binding with an initializer, in every source —
+entry, loaded modules, and **std** (std is analyzed as part of every program; a
+rule that excepted it would be a special case, and the measurement below says it
+does not need one). `mut` is eligible: `mut cache = <folded>` is a compile-time
+initial value for runtime-mutable state, exactly what §1 already spells
+`mut x = const initial()`.
+
+Two exclusions cost nothing and gain nothing to keep:
+
+- an initializer already `const`-marked — the explicit pass owns it;
+- an initializer that is already a literal or a bare local alias — folding is
+  the identity, and the attempt is pure cost.
+
+**Everything else is attempted, and the free-variable rule is the filter.** No
+extra syntactic pre-filter ships. That is a measured ruling, not a preference —
+the sweep runs per build, so "attempt everything" had to be priced first. On the
+largest in-tree programs (warm, release build, 16-core WSL2):
+
+| program | analysis | candidates (std / entry) | pass free-var rule | folds |
+| --- | --- | --- | --- | --- |
+| `examples/walkthrough` client (browser) | 210 ms | 396 (333 / 63) | 89 | 27 |
+| `examples/walkthrough` server (node) | 62 ms | 359 (311 / 48) | 69 | 23 |
+| `examples/rpc` main (node) | 52 ms | 304 (259 / 45) | 53 | 19 |
+| `test/style.vl` (browser) | 32 ms | 153 (153 / 0) | 17 | 13 |
+
+Attempting all of them, with `free_locals` as v1 wrote it, costs **more than the
+entire analysis**: 160 ms on the walkthrough client (76 %), 107 ms on its server
+(**173 %**), 53 ms on rpc (103 %). Unshippable — and the cause is not the
+evaluator. It is that `free_locals` scans the whole `entity_map` once per
+expression (0.09–0.40 ms per candidate), the per-analysis waste §8.3 already
+named while measuring the LSP and did not take.
+
+So take it. A **span-sorted index of every `Expr::Local` reference, bucketed by
+source and built once per program**, turns the free-variable check from a full
+scan into a binary search plus a walk of the root's own span range. Same
+candidates, same answers, and the whole sweep collapses:
+
+| program | sweep, full-scan | sweep, indexed | share of analysis |
+| --- | --- | --- | --- |
+| walkthrough client | 160 ms | **3.4 ms** | 2 % |
+| walkthrough server | 107 ms | **2.2 ms** | 4 % |
+| rpc main | 53 ms | **1.6 ms** | 3 % |
+| `test/style.vl` | 16 ms | **0.7 ms** | 2 % |
+
+(0.2 ms of query plus 0.3–0.7 ms to build the index; the remainder is the
+mini-program build and evaluation for the 17–89 survivors.) The explicit pass
+uses the same index, so the win is not inference's alone.
+
+The ruling therefore is: **the free-variable rule is the pre-filter.** It
+rejects 78–89 % of candidates, it is the rule the explicit form already
+enforces, so inference has exactly the eligibility §5 promised — and once the
+quadratic is gone it is free. A second, syntactic filter would buy a couple of
+milliseconds at the cost of a second definition of what infers, and the whole
+value of "same eligibility as the explicit form" is that there is only one.
+
+Two findings worth recording alongside the numbers. **84 % of candidates, and
+almost every fold, are std's** (26 of 27 folds on the walkthrough client; 19 of
+19 on rpc; 13 of 13 on `style.vl`, whose entry contributes no candidate at all).
+Inference's value in this tree is overwhelmingly in the standard library, which
+is an argument for *not* excepting std, not for excepting it. And **no fold in
+the tree is large or expensive**: the biggest serializes to 33 bytes, the median
+to 2, and every one of them completes within 200 fuel. That distribution is what
+sizes the budgets below.
+
+#### The one exclusion that is about soundness, not savings
+
+Everything above is a cost argument. There is exactly one filter that is not,
+and the corpus differential (§9.7) is what found it: **a binding inside a
+type-parameter-dependent function body is never swept.**
+
+`transform_const_program` builds the mini-program with no substitution context.
+Inside `List<T>::sum`, whose body opens `let total = T::default();`, that does
+not fail — it quietly evaluates to `undefined`, and the folded program prints
+`undefined` where it printed `0`. A silent wrong answer is the worst failure
+this feature can have, and it is invisible to every rule in §9.2, because
+nothing went wrong as far as the evaluator is concerned.
+
+This is not a new restriction; it is §5's recorded scope limit finally made
+operational. Const generics are out of scope, and §5 already said "a `const`
+inside a generic function body is legal only if its initializer is independent
+of the type parameters" — a judgement the explicit form pushes onto the author,
+who wrote the keyword. Inference has to make it itself, and the only safe
+answer is to decline.
+
+A function counts as type-parameter-dependent when its own generic parameters,
+**any parameter's type**, or its return type reaches a `Generic` — and the
+parameter clause is the load-bearing one. `List<T>::sum` has NO generic
+parameters of its own; `T` belongs to the receiver type. A check that read only
+`generic_parameter_constraint_ids` would have looked right, passed review, and
+missed the exact bug that motivated it. Unresolved and unknown types count as
+dependent too: a fold under either is unverifiable.
+
+The cost is real and worth stating plainly. Folds drop by roughly 60 % —
+27 → 10 on the walkthrough client, 23 → 12 on its server, 19 → 8 on rpc,
+13 → 3 on `style.vl` — because most of std's methods take a generic receiver.
+The sweep still costs 0.5–2.5 ms (1–3 % of analysis), the largest surviving fold
+is 21 bytes, and the corpus differential now reports 29 of 109 programs changed
+with every one of them observationally identical. Fewer folds that are all
+correct is the only version of this feature worth shipping.
+
+### 9.2 Silent fallback — and the effect rule §5 missed
+
+Per §5 the rule is absolute: **any** failure leaves the binding runtime with
+**zero** diagnostics. Concretely, every one of these falls back silently — a
+free variable that is not const-known, a binding reached through a called
+function that is not const-known, a dependency cycle, an unsupported capability
+(`[extern]` host bindings, `__env`/`__args`/`__random_int`/`__random_float`), a
+`panic` (`Thrown` — §5's load-bearing case: `if false { xs[5] }` evaluates to a
+panic and runs fine), fuel or depth exhaustion, a non-plain-data result, and the
+size cap. That is what makes the sweep safe to run over every binding in the
+program: a wrong answer is not a mis-compile, it is a missed optimization.
+
+Implementation-wise this is one `Mode` on the existing `State` and one
+`report()` that is a no-op in `Inferred` — not a parallel pass. The alternative,
+a second implementation of eligibility, is how the two forms would drift apart.
+
+**The hole §5 did not record.** §5 says "fallback preserves observable behavior
+exactly, panics included". Panics are not the only observable thing an
+evaluation can do. Probed against the tree at `eb96352`:
+
+```vilan
+fun noisy(): i32 { print("side effect!"); 7 }
+let x = const noisy();          // emits `const x = 7;` — and `side effect!` is GONE
+```
+
+The interpreter accumulates `console.log` into its own `stdout` and
+`process.exit` into `exited`; `eval_const` returns neither, so an explicit
+`const` **silently swallows both**. For the explicit form that is defensible and
+stays: you asked for compile-time evaluation, and the computation — printing
+included — is what you asked to move to compile time. For inference it is a
+mis-compile. A working program that prints would stop printing when someone
+switched preset, with no diagnostic anywhere, which is precisely the failure
+mode silent fallback exists to prevent.
+
+So the inferred form carries a rule the explicit form does not need: **an
+inferred fold must be observably silent.** `eval_inferred` refuses an evaluation
+that wrote to stdout or called `process::exit`, and the refusal is an ordinary
+failure, so it falls back like any other. This is stated as one rule over the
+interpreter's effect channels rather than three special cases, because the
+channels are the thing that must stay closed as the host table grows.
+
+The third channel is the asset channel, and it is what enforces §5's
+**"const-only functions never infer"**: an inferred attempt runs with
+`allow_assets: false`, so reaching `asset::emit` is an `Unsupported` capability
+miss and the binding stays runtime. Enforcing it at the *reach* rather than by a
+syntactic guess is both simpler and tighter — a function that could reach `emit`
+but does not on this input is still foldable, and one that reaches it through
+any path, direct or indirect, is not. Inference folds values; it never creates
+const contexts.
+
+### 9.3 Budgets
+
+Explicit `const` keeps `Limits { fuel: 1_000_000, call_depth: 512 }` and has no
+size cap: a budget miss there is a diagnostic (§4's "did not finish within the
+compile-time budget", shipped in §8.2), so the user can see it and act. An
+inferred attempt that exhausts its budget is silent, so it must be tight enough
+that exhaustion is cheap and generous enough that it never bites real code:
+
+| | explicit | inferred |
+| --- | --- | --- |
+| fuel | 1 000 000 | **10 000** (1 %) |
+| call depth | 512 | **64** (12.5 %) |
+| serialized size | uncapped | **256 bytes** |
+
+Sized against §9.1's distribution, not by feel: every fold in the tree completes
+within **200 fuel** and serializes to at most **33 bytes** (median 2) — and once
+the generic exclusion above lands, to at most **21**. The numbers therefore
+carry ~50× and ~12× headroom over observed reality while sitting well under the
+explicit budget in every dimension. The size cap is what
+§5 asked for — "a 10 KB table literal replacing a 20-character call is a
+regression nobody asked for"; 256 bytes admits a small scale or lookup table and
+refuses a generated one, and explicit `const` remains the opt-in for big
+results.
+
+A *relative* size rule (fold only if the literal is no longer than the source it
+replaces) was considered and rejected: it makes whether a program folds depend on
+its formatting, which is a determinism smell even though it is deterministic per
+source, and it refuses obviously-good folds where the call is short and the
+answer is a five-digit number.
+
+These are compiler constants, not manifest knobs. §8's deferred question — should
+`const` get a `[const]` budget section, or join `[macro]`'s (which would silently
+drop the const depth cap 512 → 16) — is untouched here and stays open; inference
+deliberately does not pre-empt it by inventing a knob of its own.
+
+### 9.4 The `[build]` preset gate
+
+`[build]` has exactly two presets today, `debug` and `release` (`options.rs`;
+`Preset::parse` accepts nothing else and the manifest rejects the rest). There
+is no `--release` flag: the preset is manifest-only, and a bare
+`vilan build foo.vl` with no `vilan.toml` resolves `BuildOptions::default()`,
+which *is* debug.
+
+Inference is therefore a `BuildOptions` field like every other code-generation
+knob — `infer_const`, **false** under `debug`, **true** under `release`, with a
+`[build] infer-const` override beside `indent`/`spaces`/`readable-names`/
+`debug-names`. Two consequences fall out for free:
+
+- **The corpus is byte-identical by construction.** The gate builds every
+  `vilan/test/*.vl` through the debug binary with no manifest, so `infer_const`
+  is off and no golden can move. A corpus diff after this change means the gate
+  leaked, and that is exactly what makes it a useful signal here.
+- **Debug ergonomics are the reason, and they are the ones §5 named**: folded
+  computation vanishes from stack traces, so the readable build keeps it.
+
+One ruling to state rather than leave implicit: the gate is the *option*, not
+the subcommand. `check` and `test` compile through the same `compile_to_js`
+seam, so a release-preset project infers under all three. §4 says `check` "does
+not need it", and that is true — inference produces no diagnostics — but it does
+not follow that `check` should differ from `build` in what code it accepts and
+how long it takes to accept it. `indent` and `readable_names` do not branch on
+the subcommand either; a codegen preset that meant different things per command
+is the surprise, not the consistency.
+
+### 9.5 Determinism
+
+Same source must fold identically across builds, and does, for two reasons that
+are worth separating.
+
+**The evaluator is already deterministic**, and that is a v1 property, not a new
+one: `check_capabilities` refuses any program carrying `[extern]` host bindings
+or the impure helpers `__scan`/`__env`/`__args`/`__random_int`/`__random_float`,
+and there is no clock in the host table at all — `Date.now` is not a case in the
+interpreter's method dispatch, which is why `time.vl` is on the equivalence
+suite's excluded list and why `the_clock_is_not_const_evaluable` already pins it.
+Inference inherits all of it by construction; it runs the same evaluator.
+
+**The sweep's own order is source-derived.** Candidates are visited sorted by
+`(SourceId, span.start)` rather than in `HashMap` order. Belt and braces, in
+fact: the result is order-*independent* anyway, because a candidate whose free
+variable is another candidate recurses through the existing `evaluate_one`,
+which memoizes in `results` and detects cycles through `in_progress`. Sorting is
+what makes that provable by reading rather than by trusting a hash seed.
+
+Chaining is worth stating explicitly since §5 did not: `let a = 1 + 2; let b = a
+* 2;` folds **both**, because in `Inferred` mode `classify` treats a pending
+candidate as const-known and recurses. In `Explicit` mode it does not — an
+explicit `const` whose free variable is a plain runtime binding must keep erroring
+with §1's message. If it did not, the same program would fail in debug and
+compile in release, which is the one thing the preset split must never do.
+
+### 9.6 The LSP and wasm — unreachable, and pinned there
+
+§4's tooling split is unconditional: the LSP evaluates explicit consts and
+**never** runs the inference sweep. Structurally, `const_eval::infer` is called
+from `crates/vilan-cli/src/main.rs` and nowhere else — not from
+`analyze_source`, which is the function the language server, the wasm
+playground, and every test harness enter through.
+
+That is the v0.23.0 lesson restated (unconditional code in `analyze()` runs on
+wasm — `Instant::now()` aborts there, and it took a deploy smoke test to find
+out). The sweep contains no clock, no filesystem, and no environment access, so
+linking it into `vilan-core` is safe; what must not happen is `analyze_source`
+*calling* it.
+
+Pinned the way the playground split guard is (`bundle-splitting.md` §11): a
+**source-level** assertion, `include_str!` plus `contains`, that the three
+analysis-side entry points never name the sweep. An output pin would be
+vacuous — `analyze_source` builds with `BuildOptions::default()`, so
+`infer_const` is off there whatever the call graph looks like, and a leak would
+stay invisible until someone changed the default and wondered why the editor got
+slow. The guard fails on the line that introduces the call, which is where the
+decision is actually made.
+
+### 9.7 The gates, and what running them found
+
+Inference is the first optimization in the tree that rewrites what a program
+computes by *running* that computation in a different engine, so the gate that
+matters is not "does it still compile" but "does it still do the same thing".
+Four, in increasing order of what they can catch:
+
+1. **The corpus stays byte-identical** (`vilan-cli/tests/corpus.rs`, unchanged).
+   True by construction, since the gate builds with no manifest and the default
+   preset is debug — which is exactly why a corpus diff here would be a real
+   signal that the preset gate leaked, rather than noise.
+2. **A release golden and its debug twin** (`vilan-cli/tests/infer_preset.rs` +
+   `tests/infer_preset/`). One source, no `const` keyword anywhere, compiled
+   under both presets and pinned byte-for-byte, plus both run under node and
+   compared. This is the only place the release path is pinned at all.
+3. **Twenty pins on the sweep's own decisions** (`vilan-core/tests/
+   const_inference.rs`), stated over `infer`'s result map rather than over
+   emitted JS — because the interesting cases are the ones that do NOT fold, and
+   a binding left alone is indistinguishable in the output from a binding nobody
+   swept. Ten plants were run against them; each reddens the pin it should.
+4. **The corpus differential** (`vilan-core/tests/infer_differential.rs`): every
+   corpus program transformed twice off ONE analysis, with the sweep's folds
+   installed and without, and every program whose emission changed run both ways
+   under node. 29 of 109 change; all 29 agree.
+
+Gate 4 is the one that earned its keep. It found the generic-context bug in
+§9.1 — which no pin written from the design would have caught, because the
+design did not know it was possible — on its first run.
+
+**A pre-existing release-preset bug, found in passing and NOT fixed here.** The
+differential's first draft compared release-with-inference against
+release-without, and seven programs failed. **None of the seven was a folding
+bug.** All were the release preset's own short-name renaming colliding, and all
+seven reproduce on the **shipped v0.27.0 binary** with a `preset = "release"`
+manifest and no inference anywhere near them:
+
+| program | what v0.27.0 emits under `release` |
+| --- | --- |
+| `default.vl` | two module-level `function b` — the second shadows the first into infinite recursion |
+| `capture-clones.vl` | `for (const p of …) { const o = p; let p = null; … }` — TDZ on `p` |
+| `derive-json.vl`, `iterator-protocol.vl`, `value-semantics.vl`, `map.vl`, `list-element-type.vl` | `SyntaxError: Identifier '…' has already been declared` |
+
+Inference exposed the same defect on an eighth, `json-roundtrip.vl`, which is
+clean on v0.27.0 and collides once folding changes which bindings survive — so
+the sweep does not cause the bug but can move which programs trip it. Filed as a
+finding, not patched: it is a codegen-renaming arc of its own, and folding it
+into an inference change would bury both.
+
+That is why the differential compares two DEBUG builds, one with the sweep
+forced on — and the reason is stronger than "less noise". Observational
+neutrality is a property of folding, not of the printer, but note what the
+release comparison actually did: `list-element-type.vl` is in the table above,
+so under release BOTH of its builds were already dying in the renaming bug, and
+the generic-context error printing `undefined` was **masked**. Confounding the
+two knobs did not merely add failures to read past; it hid the real one. The
+release path keeps its own pin, gate 2.
