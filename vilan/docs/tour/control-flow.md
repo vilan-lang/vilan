@@ -250,13 +250,13 @@ would become an `Option<bool>`, so `match` on the lifted value
 instead.
 
 > **Going deeper.** Both operators are trait-driven, not hard-coded to
-> `Option` and `Result`. `!` dispatches through `Try`, and `?.` through
-> `Try` plus the `Lift` marker (`std::operators`). Your own
-> two-outcome type can implement them and join in. A `?.` continuation
-> that itself produces the container flattens instead of nesting, so
-> `find(key)?.shelf()` on an `Option`-returning method stays a single
-> `Option`. (A bare `?` lifts the std pair only for now; a user `Lift`
-> container lifts through `?.` chains.)
+> `Option` and `Result`. `!` dispatches through `Try`; both lift forms —
+> `?.` and the bare `?` — go through the `Lift` marker
+> (`std::operators`). Your own container can opt in and lift the same
+> way, calling its own `map` and `and_then`
+> ([traits](../std/traits.md)). A continuation that itself produces the
+> container flattens instead of nesting, so `find(key)?.shelf()` on an
+> `Option`-returning method stays a single `Option`.
 
 ## Panics and asserts
 

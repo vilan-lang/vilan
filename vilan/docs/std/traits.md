@@ -102,8 +102,53 @@ trait Try<T, B> {
 	fun verdict(self): Verdict<T, B>;   // split into good/bad
 	fun from_bad(bad: B): Self;         // rebuild from the bad half (for propagation)
 }
-trait Lift {}                           // opt-in marker for ?.
+trait Lift {}                           // opt-in marker for ? and ?.
 ```
 
 `Option` and `Result` implement both in std. A custom two-outcome type that
-implements `Try` gets `!`; adding the `Lift` marker gets `?.`.
+implements `Try` gets `!`; adding the `Lift` marker gets both lift forms —
+the `?.` chain and the bare `?` that lifts a whole expression.
+
+`Lift` declares no members: it is consent, not a contract you fill in. What
+the operators actually call is a pair of ordinary methods your container
+supplies — `map<U>(self, |T| U)` for the plain case, and
+`and_then<U>(self, |T| Self-of-U)` for the flattening one. The element is the
+container's **first type argument**.
+
+```vilan
+import std::print;
+import std::operators::Lift;
+
+struct Tagged<T> {
+	value: T,
+	tag: str,
+}
+
+impl Tagged<type T> with Lift {}
+
+impl Tagged<type T> {
+	fun map<U>(self, fn: |T| U): Tagged<U> {
+		Tagged { value = fn(self.value), tag = self.tag }
+	}
+
+	fun and_then<U>(self, fn: |T| Tagged<U>): Tagged<U> {
+		let inner = fn(self.value);
+		Tagged { value = inner.value, tag = self.tag + "+" + inner.tag }
+	}
+}
+
+fun main() {
+	let price = Tagged { value = 40, tag = "eur" };
+	let tax = Tagged { value = 2, tag = "eur" };
+
+	let doubled = price? * 2;        // map — Tagged<i32>, value 80
+	let total = price? + tax?;       // and_then, then map — value 42
+	print(total.tag);                // eur+eur
+}
+```
+
+A region with several `?`s nests the calls left to right — `price.and_then(|p|
+tax.map(|t| p + t))` above — so short-circuiting and laziness are whatever
+your `and_then` does with the closure it is handed. Every receiver in one
+expression must be the same container; a type with a `map` but no `Lift` is
+refused, and a missing `map`/`and_then` is named in the error.

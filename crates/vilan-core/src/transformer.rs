@@ -2072,6 +2072,77 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// §4's TRAIT path for a region: `s₁.and_then(|x₁| … sₙ.map(|xₙ| body))`
+    /// — the user-`Lift` chain lowering, nested. Each split becomes a call on
+    /// its own receiver with the rest of the region as a closure, so
+    /// short-circuiting and laziness are the container's own `and_then`, not
+    /// a tag branch; a hoisted eval binds where it sits, inside the enclosing
+    /// continuation, which is what keeps effects in source order.
+    ///
+    /// Returns the region's value directly — unlike the std form there is no
+    /// result temp to assign into.
+    fn emit_lift_region_trait_steps(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        body_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let Some(((step_id, binder_id, is_split), rest)) = steps.split_first() else {
+            // The bottom: the body computes on the aliased elements. No
+            // rewrap — the innermost `map` (or `and_then`, when the body
+            // yields the container) does that.
+            return self.walk_entity(body_id, block).unwrap_or(js::Node::Void);
+        };
+        let value = self.walk_entity(*step_id, block).unwrap_or(js::Node::Void);
+        if !is_split {
+            let step_name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: step_name.clone(),
+                value: Box::new(value),
+            }));
+            self.is_bindings
+                .insert(*binder_id, js::Node::Local(step_name));
+            return self.emit_lift_region_trait_steps(rest, body_id, block);
+        }
+        // The analyzer records one dispatch per split, under its binder id.
+        let Some(LiftDispatch::Trait {
+            member_id,
+            impl_subject,
+            subject_type_id,
+            own_generic_value,
+        }) = self.program.lift_dispatch.get(binder_id).cloned()
+        else {
+            return js::Node::Void;
+        };
+        let dispatch = self.dispatch_to_member(
+            member_id,
+            impl_subject,
+            subject_type_id,
+            &[own_generic_value],
+        );
+        let Dispatch::Call(member_name, _) = dispatch else {
+            // A Lift impl's members are ordinary vilan methods.
+            return js::Node::Void;
+        };
+        let parameter = self.ng.next_name();
+        self.is_bindings
+            .insert(*binder_id, js::Node::Local(parameter.clone()));
+        let mut closure_body = Vec::new();
+        let continuation = self.emit_lift_region_trait_steps(rest, body_id, &mut closure_body);
+        closure_body.push(js::Node::Return(Box::new(continuation)));
+        js::Node::Call(
+            Box::new(js::Node::Local(member_name)),
+            vec![
+                value,
+                js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter { name: parameter }],
+                    body: closure_body,
+                    is_async: false,
+                }),
+            ],
+        )
+    }
+
     /// One step of an expression-lifting region, then the rest nested inside
     /// its good branch (a split) or plainly after it (an eval) —
     /// `expression-lifting.md` §4's std lowering. The recursion bottoms out by
@@ -2092,9 +2163,10 @@ impl<'src> Transformer<'src> {
                     flatten: false,
                     enum_id,
                 }) => self.variant_value(*enum_id, 0, vec![value]),
-                // v1 regions are std-only (the analyzer rejects user `Lift`
-                // containers at a bare `?` with the recorded follow-up note).
-                Some(LiftDispatch::Trait { .. }) => unreachable!(),
+                // A trait-path region never reaches the std emitter — the
+                // `Expr::LiftRegion` arm routes it to
+                // `emit_lift_region_trait_steps` before this runs.
+                Some(LiftDispatch::Trait { .. } | LiftDispatch::TraitRegion) => unreachable!(),
             };
             block.push(js::Node::Assignment(
                 Box::new(js::Node::Local(result_name.to_string())),
@@ -3096,8 +3168,9 @@ impl<'src> Transformer<'src> {
                         flatten: false,
                         enum_id,
                     }) => self.variant_value(*enum_id, 0, vec![value]),
-                    // Handled by the early trait-path branch above.
-                    Some(LiftDispatch::Trait { .. }) => unreachable!(),
+                    // Handled by the early trait-path branch above; a region
+                    // marker never lands on a chain node.
+                    Some(LiftDispatch::Trait { .. } | LiftDispatch::TraitRegion) => unreachable!(),
                 };
                 good_body.push(js::Node::Assignment(
                     Box::new(js::Node::Local(result_name.clone())),
@@ -3129,6 +3202,20 @@ impl<'src> Transformer<'src> {
             // as-is (flatten). No closures — cheaper than the `and_then`/
             // `map` nest it replaces.
             Expr::LiftRegion(steps, body_id) => {
+                // A user `Lift` container takes §4's TRAIT path instead: the
+                // nested `and_then`/`map` calls ARE the value — no result
+                // temp, no tag branching, since short-circuiting is the
+                // container's own `and_then`.
+                if matches!(
+                    self.program.lift_dispatch.get(&id),
+                    Some(LiftDispatch::TraitRegion)
+                ) {
+                    let value = self.emit_lift_region_trait_steps(steps, *body_id, block);
+                    for (_, binder_id, _) in steps {
+                        self.is_bindings.remove(binder_id);
+                    }
+                    return Some(value);
+                }
                 let result_name = self.ng.next_name();
                 block.push(js::Node::LetVariable(js::Variable {
                     name: result_name.clone(),

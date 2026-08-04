@@ -20345,16 +20345,22 @@ impl<'src> Analyzer<'src> {
     }
 
     /// An expression-lifting region (proposal/expression-lifting.md): every
-    /// `?` receiver must split the SAME std container — `Option`, or `Result`
-    /// with one error type (v1 lifts the std pair; a user `Lift` type lifts
-    /// through `?.` chains, the trait path is the recorded follow-up). Each
-    /// split binder grounds as its own receiver's element, each eval binder
-    /// as its step's type; the body then types the region — wrapped back into
-    /// the container (map), or taken as-is when it yields the container
-    /// itself (flatten, the chain rule inherited).
+    /// `?` receiver must split the SAME container — `Option`, `Result` with
+    /// one error type, or one user type opting in with `impl .. with Lift`.
+    /// Each split binder grounds as its own receiver's element, each eval
+    /// binder as its step's type; the body then types the region — wrapped
+    /// back into the container (map), or taken as-is when it yields the
+    /// container itself (flatten, the chain rule inherited).
+    ///
+    /// The std pair lowers inline; a user container takes §4's TRAIT path —
+    /// nested `and_then` calls ending in `map`, one dispatch recorded per
+    /// split under its binder id.
     fn resolve_lift_region(&mut self, id: Id, steps: &[(Id, Id, bool)], body_id: Id) -> Resolution {
         let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
         let mut family: Option<(Id, Vec<TypeId>)> = None;
+        // The splits in source order, for the trait path's per-split dispatch.
+        let mut splits: Vec<(Id, Type)> = Vec::new();
+        let mut is_std_family = true;
         for (step_id, binder_id, is_split) in steps {
             if !self.expr_id_to_expr_map.contains_key(step_id) {
                 return Resolution::Deferred;
@@ -20379,34 +20385,51 @@ impl<'src> Analyzer<'src> {
                 {
                     (*enum_id, arguments.clone())
                 }
+                // The trait path: the marker is the gate, then the `M<T, ..>`
+                // element convention, exactly as at a `?.` chain.
                 other => {
-                    let rendered = self.pretty_print_type(other, &HashMap::new());
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span: step_span,
-                        msg: format!(
-                            "a bare `?` lifts an `Option` or a `Result`; this is {rendered} \
-                             (expression lifting for user `Lift` containers is a recorded \
-                             follow-up; `?.` chains already support them)"
-                        ),
-                    });
-                    return Resolution::Failed;
+                    let other = other.clone();
+                    if !self.opts_into_lift(&other) {
+                        self.lift_opt_in_error("a bare `?`", &other, step_span);
+                        return Resolution::Failed;
+                    }
+                    let Some((nominal_id, arguments)) = self.lift_element_of(&other) else {
+                        let rendered = self.pretty_print_type(&other, &HashMap::new());
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span: step_span,
+                            msg: format!(
+                                "a bare `?` needs a container with an element type; \
+                                 this is {rendered}"
+                            ),
+                        });
+                        return Resolution::Failed;
+                    };
+                    is_std_family = false;
+                    (nominal_id, arguments)
                 }
             };
+            splits.push((*binder_id, step_type.clone()));
             match &family {
                 None => family = Some((enum_id, arguments.clone())),
                 Some((family_id, family_arguments)) => {
                     if *family_id != enum_id {
                         let first = self.render_container_name(*family_id);
                         let second = self.render_container_name(enum_id);
+                        // The `.ok_or` steer is the Option→Result conversion,
+                        // so it only helps when both sides are the std pair.
+                        let steer = if is_std_family {
+                            " Convert first: `.ok_or(err)` turns an `Option` into a `Result`."
+                        } else {
+                            ""
+                        };
                         self.diagnostics.push(Error {
                             note: None,
                             span,
                             msg: format!(
                                 "every `?` in one lifted expression must split the same \
-                                 container: this region lifts both `{first}` and `{second}`. \
-                                 Convert first: `.ok_or(err)` turns an `Option` into a \
-                                 `Result`."
+                                 container: this region lifts both `{first}` and \
+                                 `{second}`.{steer}"
                             ),
                         });
                         return Resolution::Failed;
@@ -20459,7 +20482,10 @@ impl<'src> Analyzer<'src> {
             // The body resolves after the binders' wake; retry then.
             return Resolution::Deferred;
         }
-        let flatten = matches!(&body_type, Type::Enum(enum_id, _) if *enum_id == family_id);
+        let flatten = matches!(
+            &body_type,
+            Type::Enum(nominal, _) | Type::Struct(nominal, _) if *nominal == family_id
+        );
         let result = if flatten {
             // Flatten: the body's container IS the region. For Result, the
             // error types must agree (the short-circuited Err passes through
@@ -20488,27 +20514,89 @@ impl<'src> Analyzer<'src> {
                     });
                 }
             }
-            body_type
+            body_type.clone()
         } else {
-            let body_type_id = body_type.get_type_id(self);
+            let body_type_id = body_type.clone().get_type_id(self);
             let mut result_arguments = family_arguments.clone();
             if result_arguments.is_empty() {
                 result_arguments.push(body_type_id);
             } else {
                 result_arguments[0] = body_type_id;
             }
-            Type::Enum(family_id, result_arguments)
+            // A user `Lift` subject may be a struct; the std pair is an enum.
+            // The region rebuilds the receivers' OWN shape.
+            match splits.first().map(|(_, split_type)| split_type) {
+                Some(Type::Struct(..)) => Type::Struct(family_id, result_arguments),
+                _ => Type::Enum(family_id, result_arguments),
+            }
         };
+        if !is_std_family && !self.record_lift_region_trait_path(&splits, flatten, &result, span) {
+            return Resolution::Failed;
+        }
         self.lift_dispatch.insert(
             id,
-            LiftDispatch::Std {
-                flatten,
-                enum_id: family_id,
+            if is_std_family {
+                LiftDispatch::Std {
+                    flatten,
+                    enum_id: family_id,
+                }
+            } else {
+                LiftDispatch::TraitRegion
             },
         );
         let result_id = result.get_type_id(self);
         self.resolved_types.insert(id, result_id);
         Resolution::Resolved
+    }
+
+    /// §4's trait path for a region: `s₁.and_then(|x₁| … sₙ.map(|xₙ| body))`.
+    /// Every split but the last carries the rest of the region, so it wants
+    /// `and_then`; the last wants `map` — unless the body already yields the
+    /// container, in which case it wants `and_then` too (the flatten rule).
+    ///
+    /// Each member's own generic `U` is the same value at every split: the
+    /// REGION's element, which is what each continuation ultimately produces
+    /// (`and_then<U>(self, |T| Self-of-U)` and `map<U>(self, |T| U)` agree on
+    /// it). One `LiftDispatch::Trait` is recorded per split, under the split's
+    /// binder id.
+    fn record_lift_region_trait_path(
+        &mut self,
+        splits: &[(Id, Type)],
+        flatten: bool,
+        result: &Type,
+        span: Span,
+    ) -> bool {
+        let element_id = match result {
+            Type::Enum(_, arguments) | Type::Struct(_, arguments) => arguments
+                .first()
+                .copied()
+                .unwrap_or_else(|| Type::Unknown.get_type_id(self)),
+            _ => Type::Unknown.get_type_id(self),
+        };
+        let last = splits.len().saturating_sub(1);
+        for (index, (binder_id, subject_type)) in splits.iter().enumerate() {
+            let member_name = if index < last || flatten {
+                "and_then"
+            } else {
+                "map"
+            };
+            let Some((member_id, impl_subject)) =
+                self.lift_contract_member("a bare `?`", subject_type, member_name, span)
+            else {
+                return false;
+            };
+            let subject_type_id = subject_type.clone().get_type_id(self);
+            self.lift_dispatch.insert(
+                *binder_id,
+                LiftDispatch::Trait {
+                    member_id,
+                    impl_subject,
+                    subject_type_id,
+                    own_generic_value: element_id,
+                },
+            );
+        }
+        true
     }
 
     /// A B4 import steer for a name that failed scope resolution
@@ -20664,14 +20752,20 @@ impl<'src> Analyzer<'src> {
         ))
     }
 
-    /// The short name of a std container enum, for region diagnostics.
-    fn render_container_name(&self, enum_id: Id) -> &'static str {
-        if Some(enum_id) == self.option_enum_id {
-            "Option"
-        } else if Some(enum_id) == self.result_enum_id {
-            "Result"
+    /// The short name of a lift container, for region diagnostics — `Option`,
+    /// `Result`, or a user container's own name (a `Lift` subject may be
+    /// either an enum or a struct).
+    fn render_container_name(&self, nominal_id: Id) -> String {
+        if Some(nominal_id) == self.option_enum_id {
+            "Option".to_string()
+        } else if Some(nominal_id) == self.result_enum_id {
+            "Result".to_string()
+        } else if let Some(enum_) = self.enums.get(&nominal_id) {
+            enum_.name.to_string()
+        } else if let Some(struct_) = self.structs.get(&nominal_id) {
+            struct_.name.to_string()
         } else {
-            "container"
+            "container".to_string()
         }
     }
 
@@ -20681,15 +20775,11 @@ impl<'src> Analyzer<'src> {
     /// the container's own `map` (or `and_then`, when the continuation yields
     /// the container's type — the flattening rule) with the continuation as a
     /// closure argument.
-    fn resolve_lift_trait(
-        &mut self,
-        id: Id,
-        binder_id: Id,
-        continuation_id: Id,
-        subject_type: Type,
-        span: Span,
-    ) -> Resolution {
-        // The opt-in gate: an `impl .. with Lift` whose subject reconciles.
+    /// The `Lift` opt-in gate (`try-and-lift.md` §8.1): a type lifts only when
+    /// some `impl .. with Lift` subject reconciles with it. Having a `map`
+    /// alone is not consent — silent lifting over anything mappable reads as a
+    /// footgun, so the marker stays the gate for BOTH operators.
+    fn opts_into_lift(&mut self, subject_type: &Type) -> bool {
         let lift_subjects: Vec<TypeId> = match self.lift_trait_id {
             Some(lift_id) => self
                 .implementations
@@ -20699,41 +20789,92 @@ impl<'src> Analyzer<'src> {
                 .collect(),
             None => Vec::new(),
         };
-        let mut opted_in = false;
         for subject in lift_subjects {
             let candidate = subject.get_type(self);
             if self
-                .reconcile_type(&subject_type, &candidate, &HashMap::new())
+                .reconcile_type(subject_type, &candidate, &HashMap::new())
                 .is_some()
             {
-                opted_in = true;
-                break;
+                return true;
             }
         }
-        if !opted_in {
-            let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-            self.diagnostics.push(Error { note: None,
-                span,
-                msg: format!(
-                    "`?.` lifts an `Option`, a `Result`, or a type opting in with `impl .. with Lift`; this is {rendered}"
-                ),
-            });
+        false
+    }
+
+    /// The message both lift operators give a type that never opted in.
+    /// `operator` is how the site spells itself (`` `?.` `` / "a bare `?`").
+    fn lift_opt_in_error(&mut self, operator: &str, subject_type: &Type, span: Span) {
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        self.diagnostics.push(Error {
+            note: None,
+            span,
+            msg: format!(
+                "{operator} lifts an `Option`, a `Result`, or a type opting in with \
+                 `impl .. with Lift`; this is {rendered}"
+            ),
+        });
+    }
+
+    /// The duck-typed half of the `Lift` contract: the container's own `map` /
+    /// `and_then`, resolved by the ordinary method machinery (the `for … in` /
+    /// `next()` precedent). `Lift` is a MARKER — it declares no members, so
+    /// B29's per-member conformance check has nothing to verify; this lookup
+    /// is the contract's only gate, and it names the member it wanted.
+    fn lift_contract_member(
+        &mut self,
+        operator: &str,
+        subject_type: &Type,
+        member_name: &str,
+        span: Span,
+    ) -> Option<(Id, TypeId)> {
+        if let Some(found) = self.method_member_impl_subject(subject_type, member_name) {
+            return Some(found);
+        }
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        self.diagnostics.push(Error {
+            note: None,
+            span,
+            msg: format!(
+                "{operator} on {rendered} needs {} `{member_name}` method: the Lift contract \
+                 (`map<U>(self, |T| U)`, `and_then<U>(self, |T| Self-of-U)`)",
+                if member_name == "and_then" { "an" } else { "a" }
+            ),
+        });
+        None
+    }
+
+    /// A container's element under the `M<T, ..>` convention: its FIRST type
+    /// argument. `None` when the type is not a nominal container at all.
+    fn lift_element_of(&mut self, subject_type: &Type) -> Option<(Id, Vec<TypeId>)> {
+        match subject_type {
+            Type::Enum(nominal, arguments) | Type::Struct(nominal, arguments) => {
+                Some((*nominal, arguments.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_lift_trait(
+        &mut self,
+        id: Id,
+        binder_id: Id,
+        continuation_id: Id,
+        subject_type: Type,
+        span: Span,
+    ) -> Resolution {
+        if !self.opts_into_lift(&subject_type) {
+            self.lift_opt_in_error("`?.`", &subject_type, span);
             return Resolution::Failed;
         }
         // The element: the container's first type argument.
-        let (nominal_id, arguments) = match &subject_type {
-            Type::Enum(nominal, arguments) | Type::Struct(nominal, arguments) => {
-                (*nominal, arguments.clone())
-            }
-            other => {
-                let rendered = self.pretty_print_type(other, &HashMap::new());
-                self.diagnostics.push(Error {
-                    note: None,
-                    span,
-                    msg: format!("`?.` needs a container with an element type; this is {rendered}"),
-                });
-                return Resolution::Failed;
-            }
+        let Some((nominal_id, arguments)) = self.lift_element_of(&subject_type) else {
+            let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+            self.diagnostics.push(Error {
+                note: None,
+                span,
+                msg: format!("`?.` needs a container with an element type; this is {rendered}"),
+            });
+            return Resolution::Failed;
         };
         let element = arguments
             .first()
@@ -20753,15 +20894,8 @@ impl<'src> Analyzer<'src> {
         );
         let member_name = if flatten { "and_then" } else { "map" };
         let Some((member_id, impl_subject)) =
-            self.method_member_impl_subject(&subject_type, member_name)
+            self.lift_contract_member("`?.`", &subject_type, member_name, span)
         else {
-            let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-            self.diagnostics.push(Error { note: None,
-                span,
-                msg: format!(
-                    "`?.` on {rendered} needs a `{member_name}` method: the Lift contract (`map<U>(self, |T| U)`, `and_then<U>(self, |T| Self-of-U)`)"
-                ),
-            });
             return Resolution::Failed;
         };
         // The member's own generic `U`: the continuation's result for `map`,
@@ -24014,6 +24148,14 @@ pub enum LiftDispatch {
         subject_type_id: TypeId,
         own_generic_value: TypeId,
     },
+    /// A user `Lift` container in an expression-lifting REGION
+    /// (`expression-lifting.md` §4's trait path). The region lowers to nested
+    /// `and_then` calls ending in `map`, so the dispatch is PER SPLIT, not per
+    /// region: each split's own `Trait` entry is recorded under its BINDER id
+    /// (a synthetic id the region rewrite mints, so it can never collide with
+    /// an expression's own entry — a `?.` chain may itself be a receiver).
+    /// This entry at the region marks which path to take.
+    TraitRegion,
 }
 
 #[derive(Debug, Clone)]
