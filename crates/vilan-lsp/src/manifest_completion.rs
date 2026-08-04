@@ -195,6 +195,14 @@ pub const TABLES: &[Table] = &[
                 values: ValueSet::Platform,
             },
             Key {
+                name: "split",
+                documentation: "Emit route chunks: an eager bundle plus one lazily imported \
+                                file per route arm, fetched when a navigation reaches it. \
+                                `browser` legs only. Replaced by `[entry.<name>] split` when \
+                                entry sections are declared.",
+                values: ValueSet::Boolean,
+            },
+            Key {
                 name: "default-entry",
                 documentation: "Which `[entry.<name>]` `vilan run` executes when several \
                                 are runnable. `--entry` overrides it.",
@@ -303,6 +311,13 @@ pub const TABLES: &[Table] = &[
                 documentation: "The entry's build platform. Must be a host: an entry is \
                                 something to run.",
                 values: ValueSet::Platform,
+            },
+            Key {
+                name: "split",
+                documentation: "Emit route chunks: an eager bundle plus one lazily imported \
+                                file per route arm, fetched when a navigation reaches it. \
+                                `browser` legs only.",
+                values: ValueSet::Boolean,
             },
         ],
     },
