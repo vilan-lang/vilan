@@ -4,14 +4,32 @@
 // dependency is structural — known when it is built, not discovered by running
 // it — and `bind_text` takes that derived source, so the text updates itself.
 // (The i-string renders the number directly, by host coercion.)
+//
+// Styling is `std::style`: a `Style` is built inside `const`, so the compiler
+// evaluates the chain at build time and writes real CSS into `app.css` beside
+// the bundle. `.styled(..)` only puts the generated class names on the element
+// — `index.html` links the sidecar.
 
 import std::reactive::Signal;
+import std::style::{ Color, Display, FlexDirection, Style, space, style };
 import std::ui::{ View, view };
+
+fun card_style(): Style {
+	style()
+		.display(Display::Flex)
+		.flex_direction(FlexDirection::Column)
+		.gap(space(3))
+		.padding(space(4))
+		.radius(space(2))
+		.background(Color::gray(100))
+}
 
 fun counter(): View {
 	let count = Signal::new(0);
+	let card = const card_style();
 
 	view("section")
+		.styled(card)
 		.child(view("h1").text("hello from Vilan"))
 		.child(view("p").bind_text(count.map(|n| i"clicked {n} times")))
 		.child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))

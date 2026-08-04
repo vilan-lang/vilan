@@ -92,6 +92,7 @@ too.
 | `children` | `(items: List<View>): View` | append several |
 | `bind_text` | `(source: Signal<str>): View` | reactive text |
 | `bind_class` | `(source: Signal<str>): View` | reactive class |
+| `bind_styled` | `(source: Signal<Style>): View` | reactive compiled style — `styled`'s reactive twin |
 | `bind_attr` | `(name: str, source: Signal<str>): View` | reactive attribute |
 | `bind_value` | `(signal: Signal<str>): View` | two-way input bind |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |

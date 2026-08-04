@@ -12,12 +12,20 @@ async fun main() {
 	// Read once at boot; the server runs from the project root (`vilan run .`).
 	let client_js = fs::read_file_to_str("dist/client.js");
 	let shell = fs::read_file_to_str("src/app.html");
+	// The style sidecar the build writes from the client's `const` styles.
+	// Guarded because a client with no styles emits no file at all.
+	let client_css = if fs::exists("dist/client.css") {
+		fs::read_file_to_str("dist/client.css")
+	} else {
+		""
+	};
 
 	Server::builder()
 		.port(8080)
 		.on_request(|request| {
 			match request.path() {
 				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+				"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
 				_ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
 			}
 		})

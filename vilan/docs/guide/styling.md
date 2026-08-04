@@ -37,6 +37,30 @@ fun main() {
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
 
+## Getting the stylesheet onto the page
+
+The build writes every emitted rule into a sidecar beside the bundle —
+`app.js` gets `app.css`, `dist/client.js` gets `dist/client.css` — and
+**your page has to link it**. Nothing injects the tag for you: the HTML
+shell is yours, not the compiler's.
+
+```text
+<link rel="stylesheet" href="app.css" />
+```
+
+Both `vilan init` browser templates already carry the line, and the
+fullstack one also carries the route that serves it:
+
+```vilan,fragment
+"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
+```
+
+Miss the link and nothing announces it — the app runs, unstyled, while
+the compiler faithfully rebuilds a stylesheet nobody loads. A `<link>`
+(rather than an inlined `<style>`) is also what lets `--watch` hot-swap
+CSS without reloading the page; see
+[the dev loop](dev-loop.md#the-css-link-idiom).
+
 At runtime you can still *select and combine* styles you already built.
 `a + b` merges two styles (per property, the right side wins), and
 picking one of two styles in an `if` is fine. What you can't do is
@@ -55,22 +79,39 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   steps grow like Tailwind's. It's the usual argument to `padding`,
   `gap`, `margin`, and `radius`.
 - **`Length`** covers everything else: `Length::px(1.0)`,
-  `Length::rem(1.5)`, `Length::pct(50.0)`, `Length::auto()`, and
-  `Length::var("--w")` for a CSS variable (see dynamic values below).
+  `Length::rem(1.5)`, `Length::em(0.02)`, `Length::pct(50.0)`,
+  `Length::vh(100.0)`, `Length::vw(50.0)`, `Length::auto()`,
+  `Length::var("--w")` for a CSS variable (see dynamic values below), and
+  `Length::calc("100% - 2rem")` when the value is arithmetic — you write
+  the expression, not the `calc(..)` wrapper.
 - **`Color`** has `Color::white()`, `Color::black()`,
   `Color::transparent()`, `Color::hex("#663399")`, and stepped ramps
   like `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
   `Color::green(500)`.
 - Keyword properties use enums: `Display`, `Position`, `FlexDirection`,
-  `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`.
+  `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
+  `WhiteSpace`, `UserSelect`.
+
+Some properties take a plain `str` — `font_family`, `transform`,
+`box_shadow`, `text_decoration`, `flex`, `grid_template_columns`. That
+isn't a weaker `raw`: the property name is still checked and completable,
+and only the *value* is a CSS expression there is nothing to validate (a
+font stack, a transform list). Reach for them the same way you reach for
+`padding`.
 
 For anything the typed surface doesn't cover, escape hatches:
 
 ```vilan,fragment
-.raw("font-family", "system-ui, sans-serif")
+.raw("clip-path", "polygon(0 0, 100% 0, 100% 80%)")
 .with_length("scroll-margin-top", space(4))
 .with_color("outline-color", Color::blue(300))
 ```
+
+`raw` takes any property; `with_length` and `with_color` take an
+untyped property with a *typed* value, so a token still emits its
+`:root` declaration. The typed surface grows by demand — if you find
+yourself reaching for `raw` on the same property repeatedly, that is the
+evidence a method should exist.
 
 ## States and breakpoints
 
@@ -86,14 +127,45 @@ let button = const style()
 ```
 
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
-`.last`, `.dark` (dark mode via `prefers-color-scheme`), and
-`.pseudo(name, inner)` for anything else. Breakpoints work the same way:
-`.sm(inner)` (640px), `.md(inner)` (768px), `.lg(inner)` (1024px),
-`.xl(inner)` (1280px), or `.media(min_width, inner)`. All are `min-width`
-conditions, so chains are mobile-first: in
-`.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching breakpoint wins
-(the stylesheet emits media rules in ascending min-width order, which is
-what makes that true).
+`.last`, `.dark`, and `.pseudo(name, inner)` for anything else.
+Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
+(768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
+`.media(min_width, inner)`. All are `min-width` conditions, so chains are
+mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
+breakpoint wins (the stylesheet emits media rules in ascending min-width
+order, which is what makes that true).
+
+## Dark mode, and stacking conditions
+
+`.dark(inner)` applies under a `:root[data-theme="dark"]` ancestor — an
+explicit switch you set on the document, not `prefers-color-scheme`. That
+is deliberate: a server can decide the theme and write the attribute
+before a byte of JavaScript runs, and a user's toggle is one attribute
+write.
+
+Conditions **stack**, nesting outside-in in the order the CSS nests them:
+a breakpoint outside dark, dark outside the pseudo-class.
+
+```vilan,fragment
+let button = const style()
+	.background(Color::gray(100))
+	.hover(style().background(Color::gray(200)))
+	.dark(style().background(Color::gray(800)))
+	.dark(style().hover(style().background(Color::gray(700))))
+	.md(style().dark(style().hover(style().background(Color::gray(600)))));
+```
+
+Write them in any other order and the build stops and tells you which
+order it wanted — `hover(dark(..))` says to write `dark(hover(..))`. No
+axis may wrap itself, so one media, one dark and one pseudo-class is the
+whole lattice.
+
+Why the order matters beyond spelling: `dark(hover(..))` produces a
+*more specific* selector than either `dark(..)` or `hover(..)`, so it
+beats both. Between a plain `.dark(x)` and a plain `.hover(y)` on the
+same property the two are equally specific and dark wins — a theme
+shouldn't be undone by a hover — so when a dark theme needs its own
+hover colour, say so with `dark(hover(..))`.
 
 ## Dynamic values
 
@@ -120,15 +192,50 @@ fun main() {
 ```
 
 The rule is compiled once. Only the variable's value changes at runtime.
-This one channel covers most "dynamic styling" needs; for the rest,
-`bind_class` swaps between prebuilt styles.
+This one channel covers most "dynamic styling" needs — a value that
+changes inside a rule.
+
+## Swapping whole styles
+
+When what changes is *which* style applies, not a value inside one, put
+the style in a signal and bind it. `bind_styled` is to `styled` what
+`bind_class` is to `class`:
+
+```vilan,browser
+import std::ui::{ view, View, mount_root };
+import std::style::{ style, space, Style, Color };
+import std::reactive::Signal;
+
+let idle = const style().padding(space(2)).background(Color::gray(100));
+let busy = const style().padding(space(2)).background(Color::blue(600));
+
+fun main() {
+	let state = Signal::new(idle);
+	let _root = mount_root("app", || {
+		view("div")
+			.bind_styled(state)
+			.child(view("button").text("start").on("click", || state.set(busy)))
+	});
+}
+```
+
+Both styles are built in `const`, so both sets of rules are in the
+stylesheet before the page loads; the signal only chooses between class
+strings that already exist. That is the construct-in-const rule holding
+with a signal in the middle — you still cannot build a style at runtime,
+and you never needed to.
+
+Server-side, `bind_styled` reads the signal once, like every other
+`bind_*` on the [SSR](ssr.md) layer: the style the signal holds when the
+request is rendered is the one served.
 
 > **Going deeper.** Each property-under-a-condition becomes one atomic
 > CSS rule with a generated class name, deduplicated across the whole
 > build: two styles that both say `padding(space(4))` share one class.
-> `styled` sets `class_list()`, the space-joined class names. A
-> breakpoint can't wrap another media-conditioned style (you'll get a
-> compile-time panic saying so).
+> `styled` sets `class_list()`, the space-joined class names. Each
+> combination of conditions is its own slot, so `hover(..)` and
+> `dark(hover(..))` never fight over one — they are different rules with
+> different class names, resolved by CSS specificity.
 
 ## Traps
 
@@ -138,8 +245,10 @@ This one channel covers most "dynamic styling" needs; for the rest,
 - `+` is a per-property override, not CSS specificity. The right
   operand's value replaces the left's for the same property and
   condition.
-- `.class(name)` and `.styled(style)` both set the class attribute, so
-  the later call wins. Use one mechanism per element (custom classes can
-  ride along via `.raw`).
+- `.class(name)`, `.styled(style)`, `.bind_class(..)` and
+  `.bind_styled(..)` all set the class attribute, so the later call
+  wins — and a reactive one keeps winning every time its signal
+  changes. Use one mechanism per element (custom classes can ride along
+  via `.raw`).
 
 Full method table: the [style reference](../std/style.md).

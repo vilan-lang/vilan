@@ -28,6 +28,12 @@
 //! the event needs the browser-only `std::dom::Event`, so it is not part of a
 //! shared component; `style_var` — the stub no-ops `style.setProperty`, so its
 //! folded `style` attribute is not observable; `mount` — a client entry, not a view.
+//!
+//! One assertion here is deliberately NOT a differential: the browser leg's
+//! second output line re-reads a `bind_styled` class after firing a click that
+//! writes its signal. The process twin reads once by design, so there is no
+//! counterpart to compare it against — it pins the reactive half that the tree
+//! comparison, taken at mount, cannot see.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,12 +52,14 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 
 /// The shared component — identical bytes in both legs (written to each package).
 /// It exercises every read-once binding form: static `class`/`attr`, `bind_text`,
-/// `bind_class`, `bind_attr`, `bind_each` (keyed, over a list), `when` (taken),
+/// `bind_class`, `bind_attr`, `bind_styled` (a `Signal<Style>` over compiled
+/// atomic classes), `bind_each` (keyed, over a list), `when` (taken),
 /// `show` (hidden), `swap` (a value branch), `bind_value`, a discarded `on`
 /// handler, and nested composition — with `&`/`<`/`>`/`"` in the data to drive
 /// escaping on both sides.
 const COMPONENT: &str = r#"import std::ui::{ view, View };
 import std::reactive::Signal;
+import std::style::{ style, space, Style };
 
 [derive(PartialEq)]
 enum Tab {
@@ -77,6 +85,9 @@ fun app(): View {
 	let hide_note = Signal::new(false);
 	let tab = Signal::new(Tab::Settings);
 	let query = Signal::new("hello");
+	let compact = const style().padding(space(2));
+	let roomy = const style().padding(space(6));
+	let theme: Signal<Style> = Signal::new(compact);
 	view("main")
 		.class("app")
 		.attr("id", "root")
@@ -91,6 +102,8 @@ fun app(): View {
 		}))
 		.child(view("input").attr("type", "text").bind_value(query))
 		.child(view("button").text("save").on("click", || query.set("x")))
+		.child(view("p").attr("id", "themed").bind_styled(theme).text("styled"))
+		.child(view("button").attr("id", "theme").text("theme").on("click", || theme.set(roomy)))
 		.child(view("svg")
 			.class("icon")
 			.attr("viewBox", "0 0 24 24")
@@ -199,6 +212,22 @@ if (!svg || svg.namespaceURI !== SVG_NS || !path || path.namespaceURI !== SVG_NS
 }
 
 console.log(serialize(root.children[0]));
+
+// `bind_styled`'s REACTIVE half, browser only — the process twin reads once by
+// design, so this line sits deliberately OUTSIDE the tree comparison above.
+// Fire the theme button's handler and re-read the styled paragraph's class: the
+// binding is an ambient `effect`, so the attribute must follow the signal.
+const byId = (el, id) => el.attributes.some(([n, v]) => n === "id" && v === id)
+    ? el
+    : el.children.map(c => byId(c, id)).find(Boolean);
+const themed = byId(root, "themed");
+const button = byId(root, "theme");
+if (!themed || !button) {
+    console.error("bind_styled probe is missing its nodes");
+    process.exit(1);
+}
+for (const handler of button.listeners.click || []) handler();
+console.log("AFTER " + themed.attributes.find(([n]) => n === "class")[1]);
 "#;
 
 fn build(dir: &Path) {
@@ -253,8 +282,17 @@ fn ssr_process_render_matches_browser_dom_tree() {
         String::from_utf8_lossy(&browser.stdout),
         String::from_utf8_lossy(&browser.stderr)
     );
-    let browser_tree = String::from_utf8_lossy(&browser.stdout)
-        .trim_end()
+    // Line 1 is the canonical tree; line 2 is the browser-only `bind_styled`
+    // reactive probe (see the harness), which has no process-twin counterpart.
+    let browser_stdout = String::from_utf8_lossy(&browser.stdout);
+    let mut browser_lines = browser_stdout.trim_end().lines();
+    let browser_tree = browser_lines
+        .next()
+        .expect("browser harness printed no tree")
+        .to_string();
+    let styled_after_click = browser_lines
+        .next()
+        .expect("browser harness printed no bind_styled probe")
         .to_string();
 
     // Process leg: `render(app())`.
@@ -286,6 +324,18 @@ fn ssr_process_render_matches_browser_dom_tree() {
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M5 12h14\"></path></svg>"
             ),
         "rendered markup is missing expected structure: {server_markup}"
+    );
+    // `bind_styled` on both twins: the class is the CONTENT HASH of
+    // `padding:var(--space-2)` — the same name the `style.vl` corpus golden
+    // carries, so this doubles as a cross-program determinism check.
+    assert!(
+        server_markup.contains("<p id=\"themed\" class=\"s1ufvp8\">styled</p>"),
+        "bind_styled did not render the compiled style's class: {server_markup}"
+    );
+    // …and the browser twin follows the signal: `space(6)`, not `space(2)`.
+    assert_eq!(
+        styled_after_click, "AFTER s1ufvsw",
+        "bind_styled did not re-set the class attribute after a signal write"
     );
 
     let _ = std::fs::remove_dir_all(&root);

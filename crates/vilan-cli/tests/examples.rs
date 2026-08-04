@@ -199,6 +199,70 @@ fn check_post_build(directory: &str, staged: &std::path::Path) -> Option<String>
     }
 }
 
+/// Every path under `root` with the given extension, recursively.
+fn files_with_extension(root: &std::path::Path, extension: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Whether a page loads `name` through a `<link rel="stylesheet">` — both
+/// words inside ONE tag, so a filename mentioned in a comment doesn't count.
+fn links_stylesheet(page: &str, name: &str) -> bool {
+    page.split("<link")
+        .skip(1)
+        .filter_map(|rest| rest.split_once('>'))
+        .any(|(tag, _)| tag.contains("stylesheet") && tag.contains(name))
+}
+
+/// Every stylesheet a build EMITS must be loaded by one of the example's own
+/// pages. A `const style()` chain compiled into a sidecar no page links is
+/// work redone on every build and thrown away — silent, because the app still
+/// runs, just unstyled. `reactive-ui` was in exactly that state: `app.css`
+/// emitted (and asserted present, above) and `index.html` never linking it.
+///
+/// Stated over what the build produced rather than over a per-example list, so
+/// a new example is covered the day it lands. No example TRACKS a `.css` file,
+/// so every one found here is emitted output.
+fn unlinked_stylesheets(directory: &str, staged: &std::path::Path) -> Option<String> {
+    let stylesheets = files_with_extension(staged, "css");
+    if stylesheets.is_empty() {
+        return None;
+    }
+    let pages: Vec<String> = files_with_extension(staged, "html")
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
+    let unlinked: Vec<String> = stylesheets
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !pages.iter().any(|page| links_stylesheet(page, name)))
+        .collect();
+    (!unlinked.is_empty()).then(|| {
+        format!(
+            "{directory}: emitted stylesheets that no page links: {unlinked:?} — \
+             the const styles compile on every build and are thrown away"
+        )
+    })
+}
+
 #[test]
 fn every_example_builds() {
     let mut failures = Vec::new();
@@ -211,6 +275,10 @@ fn every_example_builds() {
 
         if output.status.success() {
             if let Some(failure) = check_post_build(&directory, &staged) {
+                failures.push(failure);
+                continue;
+            }
+            if let Some(failure) = unlinked_stylesheets(&directory, &staged) {
                 failures.push(failure);
                 continue;
             }

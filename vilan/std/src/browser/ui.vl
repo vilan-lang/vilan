@@ -215,6 +215,19 @@ impl View {
 		self
 	}
 
+	/// Reactive `Style` — the reactive twin of `styled`, the way `bind_class`
+	/// is `class`'s. The whole compiled style swaps when `source` changes.
+	/// Nothing is CONSTRUCTED here: every candidate style emitted its rules
+	/// inside its own `const` expression, and `class_list` is a map read, so
+	/// the construct-in-const rule holds with a signal in the middle.
+	fun bind_styled(self, source: Signal<Style>): View {
+		let element = self.element;
+		source.effect(|value| {
+			element.set_attribute("class", value.class_list());
+		});
+		self
+	}
+
 	/// Reactive attribute.
 	fun bind_attr(self, name: str, source: Signal<str>): View {
 		let element = self.element;

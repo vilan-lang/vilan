@@ -5,7 +5,12 @@
 // construct inside `const` expressions and the whole stylesheet exists at
 // build time. `+` combines named styles (right side wins per property).
 //
-// Slot keys encode conditions as `media:pseudo:property`; class names are
+// Slot keys encode conditions as `media:condition:property`, where a CONDITION
+// is "" (base), a pseudo-class ("hover"), the dark marker ("dark"), or dark
+// stacked over a pseudo-class ("dark hover") — the space mirroring the
+// descendant combinator the selector renders. Conditions nest OUTSIDE-IN in
+// the order the CSS nests them, `md(dark(hover(..)))`; any other order is
+// refused with a message naming the fix. Class names are
 // content hashes of `key|declaration` (deterministic across builds — the
 // channel dedups identical rules program-wide, which is what makes the
 // stylesheet plateau). Themeable tokens carry their value as a CSS custom
@@ -37,12 +42,37 @@ impl Length {
 		Length { css = i"{value}rem", root = "" }
 	}
 
+	/// Relative to the element's own font size — the unit `letter_spacing`
+	/// and optical spacing are written in.
+	fun em(value: f64): Length {
+		Length { css = i"{value}em", root = "" }
+	}
+
 	fun pct(value: f64): Length {
 		Length { css = i"{value}%", root = "" }
 	}
 
+	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height
+	/// shell.
+	fun vh(value: f64): Length {
+		Length { css = i"{value}vh", root = "" }
+	}
+
+	fun vw(value: f64): Length {
+		Length { css = i"{value}vw", root = "" }
+	}
+
 	fun auto(): Length {
 		Length { css = "auto", root = "" }
+	}
+
+	/// A `calc()` expression, written WITHOUT the wrapper:
+	/// `Length::calc("100% - 2rem")`. The property stays typed while the
+	/// arithmetic — which the `Length` representation deliberately does not
+	/// model — rides a string. Composes with tokens through their rendered
+	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
+	fun calc(expression: str): Length {
+		Length { css = i"calc({expression})", root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
@@ -231,6 +261,23 @@ enum Overflow {
 	Scroll,
 }
 
+enum WhiteSpace {
+	Normal,
+	Nowrap,
+	Pre,
+	PreWrap,
+	PreLine,
+}
+
+enum UserSelect {
+	Auto,
+	Text,
+	All,
+	// `user-select:none` — named to stay clear of `Option::None` at use
+	// sites, the `Display::Hidden` rule.
+	Off,
+}
+
 // --- the class-name hash --------------------------------------------------------
 
 /// djb2 over the slot key and declaration, base36, prefixed for CSS validity.
@@ -267,7 +314,7 @@ fun encode36(value: u32): str {
 // --- Style ----------------------------------------------------------------------
 
 struct Style {
-	// Slot key `media:pseudo:property` -> (class name, declaration). The
+	// Slot key `media:condition:property` -> (class name, declaration). The
 	// declaration is kept so condition combinators can re-emit it under
 	// their selector.
 	rules: Map<str, (str, str)>,
@@ -280,11 +327,45 @@ fun style(): Style {
 	Style { rules = Map::new() }
 }
 
-fun render_rule(media: str, pseudo: str, class: str, declaration: str): str {
+/// Whether a condition slot carries the dark marker — `"dark"` alone, or
+/// `"dark hover"` stacked over a pseudo-class.
+fun is_dark(condition: str): bool {
+	condition.split(" ")[0] == "dark"
+}
+
+/// The condition's pseudo-class, if any: `"hover"` from `"hover"` and from
+/// `"dark hover"`, `""` from `""` and from `"dark"`.
+fun condition_pseudo(condition: str): str {
+	if !is_dark(condition) {
+		ret condition;
+	}
+	let parts = condition.split(" ");
+	if parts.len() > 1 {
+		parts[1]
+	} else {
+		""
+	}
+}
+
+/// One atomic rule as CSS text. The three condition axes nest the way CSS
+/// nests them — media outermost, then the dark ancestor selector, then the
+/// pseudo-class suffix — which is exactly the outside-in order the condition
+/// combinators require at the call site.
+///
+/// The leading byte is load-bearing (B35): `assemble_assets` has no
+/// "base < pseudo < media" comparator, it sorts lines lexically with a numeric
+/// override for `@media` min-widths, and the band order falls out of ASCII
+/// ('.' < ':' < '@'). A dark rule starts with ':' whether or not it also
+/// carries a pseudo-class, so every dark rule lands in one band; composed
+/// rules then win their cascade on SPECIFICITY (0,3,0 over the 0,2,0 of plain
+/// `dark` and plain `:hover`), never on the sort.
+fun render_rule(media: str, condition: str, class: str, declaration: str): str {
 	mut selector = "." + class;
-	if pseudo == "dark" {
+	if is_dark(condition) {
 		selector = ":root[data-theme=\"dark\"] " + selector;
-	} else if pseudo != "" {
+	}
+	let pseudo = condition_pseudo(condition);
+	if pseudo != "" {
 		selector = selector + ":" + pseudo;
 	}
 	mut rule = selector + "{" + declaration + "}";
@@ -296,10 +377,10 @@ fun render_rule(media: str, pseudo: str, class: str, declaration: str): str {
 
 impl Style {
 	/// The one chokepoint: hash the slot, emit the atomic rule, insert last-wins.
-	fun rule(self, media: str, pseudo: str, property: str, declaration: str): Style {
-		let key = media + ":" + pseudo + ":" + property;
+	fun rule(self, media: str, condition: str, property: str, declaration: str): Style {
+		let key = media + ":" + condition + ":" + property;
 		let class = class_hash(key + "|" + declaration);
-		emit("css", render_rule(media, pseudo, class, declaration));
+		emit("css", render_rule(media, condition, class, declaration));
 		mut rules = self.rules;
 		rules.insert(key, (class, declaration));
 		Style { rules = rules }
@@ -381,6 +462,24 @@ impl Style {
 		self.with_length("gap", value)
 	}
 
+	/// The `flex` shorthand — grow, shrink and basis in one value
+	/// (`"1 1 auto"`, `"1"`, `"0 0 12rem"`). A string because the three parts
+	/// have three different value kinds; the alternative is three methods
+	/// nobody writes separately.
+	fun flex(self, value: str): Style {
+		self.raw("flex", value)
+	}
+
+	fun flex_shrink(self, value: f64): Style {
+		self.raw("flex-shrink", i"{value}")
+	}
+
+	/// The grid track list (`"repeat(3, 1fr)"`, `"12rem 1fr"`). `fr` is a grid
+	/// unit rather than a length, so the track list stays a string.
+	fun grid_template_columns(self, value: str): Style {
+		self.raw("grid-template-columns", value)
+	}
+
 	// --- box ---
 
 	fun padding(self, value: Length): Style {
@@ -415,12 +514,45 @@ impl Style {
 		self.with_length("height", value)
 	}
 
+	fun min_width(self, value: Length): Style {
+		self.with_length("min-width", value)
+	}
+
 	fun max_width(self, value: Length): Style {
 		self.with_length("max-width", value)
 	}
 
 	fun min_height(self, value: Length): Style {
 		self.with_length("min-height", value)
+	}
+
+	fun max_height(self, value: Length): Style {
+		self.with_length("max-height", value)
+	}
+
+	// --- placement ---
+	// The offsets a `position` other than `static` resolves against.
+
+	fun top(self, value: Length): Style {
+		self.with_length("top", value)
+	}
+
+	fun right(self, value: Length): Style {
+		self.with_length("right", value)
+	}
+
+	fun bottom(self, value: Length): Style {
+		self.with_length("bottom", value)
+	}
+
+	fun left(self, value: Length): Style {
+		self.with_length("left", value)
+	}
+
+	/// All four offsets at once — `inset(space(0))` is the fill-the-parent
+	/// idiom under `position(Position::Absolute)`.
+	fun inset(self, value: Length): Style {
+		self.with_length("inset", value)
 	}
 
 	fun radius(self, value: Length): Style {
@@ -435,6 +567,19 @@ impl Style {
 			emit("css", color.root);
 		}
 		self.rule("", "", "border", i"border:{width.css} solid {color.css}")
+	}
+
+	/// Just the colour, its own slot — so a `hover`/`focus` variant can
+	/// recolour a border without restating its width, which is what four of
+	/// the five real `border-color` sites were doing by hand.
+	fun border_color(self, value: Color): Style {
+		self.with_color("border-color", value)
+	}
+
+	/// A shadow list (`"0 1px 2px rgba(0,0,0,0.08)"`, `"none"`). Comma-joined
+	/// layers of four lengths and a colour: a string, like `transition`.
+	fun box_shadow(self, value: str): Style {
+		self.raw("box-shadow", value)
 	}
 
 	fun overflow(self, value: Overflow): Style {
@@ -456,12 +601,48 @@ impl Style {
 		self.with_color("color", value)
 	}
 
+	/// A font stack (`"system-ui, sans-serif"`). A string: the value is an
+	/// ordered fallback list of names the compiler has nothing to check.
+	fun font_family(self, value: str): Style {
+		self.raw("font-family", value)
+	}
+
 	fun font_size(self, value: Length): Style {
 		self.with_length("font-size", value)
 	}
 
 	fun font_weight(self, value: i32): Style {
 		self.raw("font-weight", i"{value}")
+	}
+
+	/// Tracking. Usually `Length::em(..)`, so it scales with the font size.
+	fun letter_spacing(self, value: Length): Style {
+		self.with_length("letter-spacing", value)
+	}
+
+	/// The `text-decoration` shorthand (`"underline"`, `"line-through"`,
+	/// `"none"`, or a full `"underline wavy #dc2626 1.5px"`).
+	fun text_decoration(self, value: str): Style {
+		self.raw("text-decoration", value)
+	}
+
+	fun white_space(self, value: WhiteSpace): Style {
+		self.raw("white-space", match value {
+			WhiteSpace::Normal => "normal",
+			WhiteSpace::Nowrap => "nowrap",
+			WhiteSpace::Pre => "pre",
+			WhiteSpace::PreWrap => "pre-wrap",
+			WhiteSpace::PreLine => "pre-line",
+		})
+	}
+
+	fun user_select(self, value: UserSelect): Style {
+		self.raw("user-select", match value {
+			UserSelect::Auto => "auto",
+			UserSelect::Text => "text",
+			UserSelect::All => "all",
+			UserSelect::Off => "none",
+		})
 	}
 
 	fun line_height(self, value: f64): Style {
@@ -493,11 +674,22 @@ impl Style {
 		self.raw("transition", value)
 	}
 
+	/// A transform list (`"translateY(-2px)"`, `"rotate(45deg) scale(1.1)"`).
+	/// A string: the functions take angles, ratios and lengths in one value.
+	fun transform(self, value: str): Style {
+		self.raw("transform", value)
+	}
+
 	// --- conditions ---
 	// A condition takes a Style built by its own chain and re-emits each of
 	// its properties under the condition's selector. (The inner chain's base
 	// rules also emit — deduplicated, possibly unused: the recorded
 	// over-approximation, shared with unused styles generally.)
+	//
+	// The three axes nest OUTSIDE-IN in the order the selector nests them:
+	// media, then dark, then the pseudo-class — `md(dark(hover(..)))`. Every
+	// other order is a build error naming the fix, so there is exactly one
+	// spelling per combination and one slot key per combination with it.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -523,13 +715,48 @@ impl Style {
 		self.pseudo("last-child", inner)
 	}
 
-	/// Dark mode: explicit `:root[data-theme="dark"]` control (SSR-friendly);
-	/// combining with pseudo/media in one slot is deferred.
+	/// Dark mode: explicit `:root[data-theme="dark"]` control — SSR-friendly,
+	/// since the server can set `data-theme` before a byte of JS runs.
+	/// STACKS OVER A PSEUDO-CLASS, dark on the outside: `dark(hover(..))`
+	/// nests the way the selector does (`:root[data-theme="dark"] .c:hover`),
+	/// the same outside-in rule that makes `md(hover(..))` legal and
+	/// `hover(md(..))` an error. The composed rule's specificity (0,3,0) beats
+	/// both plain `dark` and plain `hover` (0,2,0), so it wins its cascade on
+	/// specificity rather than on emission order.
 	fun dark(self, inner: Style): Style {
-		self.pseudo("dark", inner)
+		mut out = self;
+		for key in inner.rules.keys() {
+			match inner.rules.get(key) {
+				Some(let entry) => {
+					let (_class, declaration) = entry;
+					let parts = key.split(":");
+					if parts[0] != "" {
+						panic("nest conditions as md(dark(..)) — dark cannot wrap a media-conditioned style");
+					}
+					if is_dark(parts[1]) {
+						panic("dark cannot wrap an already dark-conditioned style");
+					}
+					let condition = if parts[1] == "" {
+						"dark"
+					} else {
+						"dark " + parts[1]
+					};
+					out = out.rule("", condition, parts[2], declaration);
+				}
+				None => {}
+			}
+		}
+		out
 	}
 
+	/// An arbitrary pseudo-class — `.pseudo("focus-visible", ..)`; the named
+	/// methods above are the common set. A pseudo-class takes the INNERMOST
+	/// position: `dark` and a breakpoint may wrap it, and it may wrap neither
+	/// (nor another pseudo-class). `pseudo("dark", ..)` is `dark(..)`.
 	fun pseudo(self, name: str, inner: Style): Style {
+		if name == "dark" {
+			ret self.dark(inner);
+		}
 		mut out = self;
 		for key in inner.rules.keys() {
 			match inner.rules.get(key) {
@@ -538,6 +765,9 @@ impl Style {
 					let parts = key.split(":");
 					if parts[0] != "" {
 						panic(i"nest conditions as md(hover(..)) — {name} cannot wrap a media-conditioned style");
+					}
+					if is_dark(parts[1]) {
+						panic(i"nest dark OUTSIDE the pseudo — dark({name}(..)), not {name}(dark(..))");
 					}
 					if parts[1] != "" {
 						panic(i"{name} cannot wrap an already pseudo-conditioned style");
@@ -550,8 +780,10 @@ impl Style {
 		out
 	}
 
-	/// Breakpoints (Tailwind's): min-width media queries. Media may wrap a
-	/// pseudo-conditioned style (`md(hover(..))`), never another media.
+	/// Breakpoints (Tailwind's): min-width media queries. Media is the
+	/// OUTERMOST condition — it may wrap a pseudo-conditioned style
+	/// (`md(hover(..))`), a dark one (`md(dark(..))`) or both
+	/// (`md(dark(hover(..)))`), and never another media.
 	fun sm(self, inner: Style): Style {
 		self.media("640px", inner)
 	}

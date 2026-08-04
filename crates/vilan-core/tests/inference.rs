@@ -14878,6 +14878,187 @@ fn dark_prefixes_the_theme_selector() {
     );
 }
 
+/// dark × pseudo composes on ONE slot: the dark ancestor selector and the
+/// pseudo-class suffix land in the same rule, nested the way CSS nests them.
+#[test]
+fn dark_stacks_over_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().dark(style().hover(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":root[data-theme=\"dark\"] .")
+                && line.ends_with(":hover{background-color:var(--gray-700)}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// All three axes at once, media outermost. The composed line still starts
+/// with '@', so B35's numeric media ordering keeps seeing it.
+#[test]
+fn a_breakpoint_wraps_dark_over_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().md(style().dark(style().hover(style().padding(space(6)))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| line
+            == "@media (min-width: 768px){:root[data-theme=\"dark\"] .s19fbteb:hover{padding:var(--space-6)}}"),
+        "{assets:?}"
+    );
+}
+
+/// Composition has ONE spelling. dark goes outside the pseudo — the same
+/// outside-in rule that makes `md(hover(..))` legal — and the refusal names
+/// the fix rather than just saying no.
+#[test]
+fn a_pseudo_class_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("dark(hover(..)), not hover(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn dark_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().dark(style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already dark-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn dark_cannot_wrap_a_breakpoint() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().dark(style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The two nesting guards that shipped with the core in 2026-07-10 and were
+/// never pinned (found by the A8 tail's verification sweep).
+#[test]
+fn a_pseudo_class_cannot_wrap_a_pseudo_class() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().focus(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already pseudo-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_breakpoint_cannot_wrap_a_breakpoint() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().md(style().lg(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("cannot wrap another media-conditioned style")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The slot key gained a condition GRAMMAR, not a fourth field — so every
+/// class name minted before dark×pseudo existed is byte-identical after it.
+/// (The `style.vl` corpus golden is the broad version of this; these two are
+/// the ones the composition code could plausibly have disturbed.)
+#[test]
+fn composing_dark_leaves_the_uncomposed_class_names_untouched() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::gray(50)).hover(style().background(Color::gray(100)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    assert!(
+        lines.contains(&".siolu0w{background-color:var(--gray-50)}")
+            && lines.contains(&".s1c7l5ao:hover{background-color:var(--gray-100)}"),
+        "{assets:?}"
+    );
+}
+
 #[test]
 fn an_unknown_scale_step_fails_the_build() {
     let diagnostics = failure_diagnostics(
@@ -14950,6 +15131,157 @@ fn length_units_render_their_css() {
                 .height(Length::pct(50))
                 .margin(Length::auto())
                 .max_width(Length::var("--w"))
+                .font_size(Length::rem(1.5))
+                .letter_spacing(Length::em(0.02))
+                .min_height(Length::vh(100))
+                .min_width(Length::vw(50))
+                .max_height(Length::calc("100% - 2rem"))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{width:37px}",
+        "{height:50%}",
+        "{margin:auto}",
+        "{max-width:var(--w)}",
+        "{font-size:1.5rem}",
+        "{letter-spacing:0.02em}",
+        "{min-height:100vh}",
+        "{min-width:50vw}",
+        // `calc` wraps: the author writes the arithmetic, not the call.
+        "{max-height:calc(100% - 2rem)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The property long tail's first slice (A8): the ≥5-site head of the demand
+/// sweep, one atomic rule each. Asserted as a table — every method's exact
+/// emitted declaration, so a wrong CSS property name or a mistyped keyword is
+/// a named failure rather than a silent one.
+#[test]
+fn the_demanded_properties_emit_their_declarations() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style, Color, Length, Position, UserSelect, WhiteSpace };
+        fun s(): Style {
+            style()
+                .position(Position::Absolute)
+                .inset(space(0))
+                .top(Length::px(4))
+                .right(Length::pct(50))
+                .bottom(Length::px(8))
+                .left(Length::auto())
+                .flex("1 1 auto")
+                .flex_shrink(0.0)
+                .grid_template_columns("repeat(3, 1fr)")
+                .font_family("system-ui, sans-serif")
+                .text_decoration("line-through")
+                .white_space(WhiteSpace::Nowrap)
+                .user_select(UserSelect::Off)
+                .border_color(Color::red(600))
+                .box_shadow("0 1px 2px rgba(0,0,0,0.08)")
+                .transform("translateY(-2px)")
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{inset:var(--space-0)}",
+        "{top:4px}",
+        "{right:50%}",
+        "{bottom:8px}",
+        "{left:auto}",
+        "{flex:1 1 auto}",
+        "{flex-shrink:0}",
+        "{grid-template-columns:repeat(3, 1fr)}",
+        "{font-family:system-ui, sans-serif}",
+        "{text-decoration:line-through}",
+        "{white-space:nowrap}",
+        // `Off`, not `None`: the `Display::Hidden` naming rule.
+        "{user-select:none}",
+        "{border-color:var(--red-600)}",
+        "{box-shadow:0 1px 2px rgba(0,0,0,0.08)}",
+        "{transform:translateY(-2px)}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// Every variant of the two new keyword enums maps to its CSS keyword — the
+/// ordering-sensitive, exhaustive half a happy-path pin misses.
+#[test]
+fn the_new_keyword_enums_cover_every_variant() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, UserSelect, WhiteSpace };
+        fun space_variants(): Style {
+            style()
+                .white_space(WhiteSpace::Normal)
+                .hover(style().white_space(WhiteSpace::Nowrap))
+                .focus(style().white_space(WhiteSpace::Pre))
+                .active(style().white_space(WhiteSpace::PreWrap))
+                .disabled(style().white_space(WhiteSpace::PreLine))
+        }
+        fun select_variants(): Style {
+            style()
+                .user_select(UserSelect::Auto)
+                .hover(style().user_select(UserSelect::Text))
+                .focus(style().user_select(UserSelect::All))
+                .active(style().user_select(UserSelect::Off))
+        }
+        let _a = const space_variants();
+        let _b = const select_variants();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    for expected in [
+        "{white-space:normal}",
+        "{white-space:nowrap}",
+        "{white-space:pre}",
+        "{white-space:pre-wrap}",
+        "{white-space:pre-line}",
+        "{user-select:auto}",
+        "{user-select:text}",
+        "{user-select:all}",
+        "{user-select:none}",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "missing {expected}: {lines:?}"
+        );
+    }
+}
+
+/// The reason `border_color` exists as its own method: `border(width, color)`
+/// fills ONE slot, so recolouring under `:hover` used to mean restating the
+/// width. Two slots, two classes, and the pseudo-class rule wins by
+/// specificity — which is what four of the five real `border-color` uses in
+/// the demand sweep were hand-rolling through `raw`.
+#[test]
+fn border_color_is_its_own_slot_so_a_hover_can_recolour_a_border() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color, Length };
+        fun s(): Style {
+            style()
+                .border(Length::px(1), Color::gray(300))
+                .hover(style().border_color(Color::blue(600)))
         }
         let _s = const s();
         fun main() {}
@@ -14958,19 +15290,15 @@ fn length_units_render_their_css() {
     );
     let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
     assert!(
-        lines.iter().any(|l| l.contains("{width:37px}")),
+        lines
+            .iter()
+            .any(|line| line.contains("{border:1px solid var(--gray-300)}")),
         "{lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("{height:50%}")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("{margin:auto}")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("{max-width:var(--w)}")),
+        lines
+            .iter()
+            .any(|line| line.contains(":hover{border-color:var(--blue-600)}")),
         "{lines:?}"
     );
 }
@@ -28047,6 +28375,51 @@ fn ssr_bind_class_and_bind_attr_read_once() {
         }
         "#,
         "<a class=\"active\" href=\"/x\">go</a>\n",
+    );
+}
+
+/// `bind_styled` is `styled`'s reactive twin, so the process twin reads the
+/// signal once and renders the style it held — the class names being the
+/// content hashes the `const` chain already emitted.
+#[test]
+fn ssr_bind_styled_reads_the_current_style_once() {
+    assert_compiles_and_runs(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::style::{ style, space, Style };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let compact = const style().padding(space(2));
+            let roomy = const style().padding(space(6));
+            let theme: Signal<Style> = Signal::new(compact);
+            print(render(view("div").bind_styled(theme)));
+            theme.set(roomy);
+            print(render(view("div").bind_styled(theme)));
+        }
+        "#,
+        "<div class=\"s1ufvp8\"></div>\n<div class=\"s1ufvsw\"></div>\n",
+    );
+}
+
+/// The construct-in-const rule survives a signal in the middle: a `Signal<Style>`
+/// can only ever carry styles some `const` expression already emitted, so
+/// building one at the binding site is still the static error it always was.
+#[test]
+fn bind_styled_cannot_construct_its_style_at_runtime() {
+    assert_fails_with(
+        r#"
+        import std::ui::{ view, View, render };
+        import std::style::{ style, space, Style };
+        import std::reactive::Signal;
+        import std::print;
+        fun main() {
+            let theme: Signal<Style> = Signal::new(style().padding(space(2)));
+            print(render(view("div").bind_styled(theme)));
+        }
+        main();
+        "#,
+        "compile-time-only",
     );
 }
 
