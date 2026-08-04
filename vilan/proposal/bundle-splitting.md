@@ -322,7 +322,14 @@ builds as well (the SSR shadow, and the layer-requirement machinery), so
 the browser-only version left `std::router` uncompilable there. The
 existing layer-requirement and SSR-import pins caught it — but nothing
 structurally holds the two `ui` layers' surfaces against each other, which
-is a standing gap this arc noticed rather than closed.
+is a standing gap this arc noticed rather than closed. **CLOSED 2026-08-04**
+by `crates/vilan-core/tests/std_twin_parity.rs`: both twins are analyzed on
+their platform and their declared surfaces compared off the resulting
+`Program`, with a reasoned allowlist for the deliberate divergences.
+`View.swap_split` is one of them — emitter-selected, never written, and a
+process build never splits, so its absence degrades the chunk gate away
+instead of breaking a build. That is precisely the line `chunk_pending`
+crossed: it is the one name here that user code binds.
 
 S4 (the consumer sweep) is untouched: `chunks.json` is emitted and
 documented, and no example serves it yet.
