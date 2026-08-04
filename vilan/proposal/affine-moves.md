@@ -161,7 +161,12 @@ slice (§6).
 This is also why four combinators were **not** converted (below): they cost
 the same elision on data paths that no resource program pays for.
 
+> **Closed 2026-08-04 by B63(a) — §7.** The golden is back to its pre-B60
+> form; the line above is kept as the record of why it moved at all.
+
 ## 6. Residuals
+
+All four are settled below in §7 except the last, which is B62's.
 
 - **`map`, `is_some_and`, `ok_or`, `unzip` at a resource instantiation are
   now a compile error rather than a silent double-destroy.** `map` was
@@ -170,17 +175,21 @@ the same elision on data paths that no resource program pays for.
   other three were left, because converting each costs the same lost SHARE
   elision on data call sites and no pin asserts them clean at a resource. The
   conservative error is the honest state. Unblocked by §5's elision slice.
+  **Closed by §7.**
 - **`or`, `or_else`, `xor`, `inspect`, `eq`, `unwrap_or` cannot be made
   move-clean at all under R6.** Each reads `self` twice (`match self { Some(_)
   => self, .. }`) or duplicates the payload, and R6 consumes the subject on
   ANY by-value match, so there is no `own self` spelling that passes. They
   reject at a resource instantiation. Rewriting them over `is` tests (which
-  loan) would fix it and is a std slice, not a checker one.
+  loan) would fix it and is a std slice, not a checker one. **Closed by §7 —
+  and this bullet was wrong twice: `eq` never rejected, and the three that
+  still reject do not reject for the reason given here.**
 - **A bare non-`self` resource parameter is a loan, per R3 — but §6.3's
   convention table calls bare `x: T` "by value (a copy, rule 1)".** The two
   readings disagree for resources. This arc enforces R3's (bare = loan, and
   consuming it is now an error), which is what the implementation and every
-  call site already assumed. Worth reconciling in the spec text.
+  call site already assumed. Worth reconciling in the spec text. **Closed by
+  §7.**
 - **A `match` arm capture of a resource payload is never destroyed.** `match
   o { Some(let r) => print(r.tag), None => {} }` prints no drop for `r`.
   Verified **pre-existing** against the v0.24.0 release, unrelated to this
@@ -333,3 +342,117 @@ Three residuals, each a **different rule** from this one, pinned
   treat a still-owned capture at the fall-through end the way that check
   treats a still-owned parameter.
   `b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation`.
+
+## 8. B63 — the residuals closed, 2026-08-04
+
+> **Status: SHIPPED.** Three parts: the elision blocker, the three
+> conversions, and a rewrite of the six over `is` tests that decides each on
+> its own merits instead of as a block. Plus §6.3's table, reconciled.
+
+### 8.1 The blocker: a diagnostic helper was answering a semantic question
+
+`readonly_root` answers *"what `declare it …` advice applies to this place"*.
+The share elision asked it *"can this place change"*. Those coincide for
+every root the diagnostic knows how to advise about and diverge for exactly
+one: an `own` parameter, where the advice would be `mut own x` — a parse
+error — so `readonly_root` must answer `None`, and the elision read that as
+"writable" and copied.
+
+Split, not widened. `share_subject_is_stable` is the semantic predicate: a
+declared-readonly root (bare parameter, `&` view, immutable `let`) qualifies
+*because the compiler rejects every write to it*, and an `own` root qualifies
+when no write reaches it. The second clause is not decoration — **an `own`
+parameter is genuinely writable** (`fun f(own h: Holder) { h.n = 5; }`
+compiles), which is why a blanket admission would have been unsound. The
+write set is collected program-wide from the three forms a write takes: an
+assignment's place root, an explicit `&mut place`, and any argument (receiver
+included) bound to a `&mut` parameter; an unresolvable callee is treated
+conservatively. A `mut` local that is never written would qualify by the same
+reasoning and is deliberately left out — it moves goldens for a gain nothing
+has asked for.
+
+The elision is invisible to output, so its proof is bytes:
+`closure-param-inference.js` loses the `__clone` §5 recorded and is
+byte-identical to its pre-B60 form, runtime output unchanged. The soundness
+boundary has two pins, one per write source, each red when its source is
+dropped.
+
+### 8.2 The three conversions
+
+`is_some_and`, `ok_or`, `unzip` take `own self`. Each is pinned at a resource
+instantiation (accepted, correct value, and — where a value survives the call
+— destroyed exactly once) and at data (behaviour identical). No golden moved
+for these: with §8.1 in place, `own self` costs nothing on a data path.
+
+Two of the three resource pins record an ABSENT drop, and it is B62's, not
+this arc's: `is_some_and`'s payload goes to the predicate through a match-arm
+capture, which the drop planner never seeds as owned. Every combinator B60
+already converted (`is_none_or`, `map_or`, `filter`, …) has the same hole. The
+conversion is what turns "compile error" into "compiles, runs, and leaks the
+payload"; B62 is what turns the second into "and destroys it".
+
+### 8.3 The six, one ruling each
+
+Rewritten over `is`, which LOANS — so `self` is read once and the receiver
+survives the test. That alone settles three of them. The other three turn out
+to reject for a reason §6 did not name, and it is not R6:
+
+> **A generic body cannot destroy a `T`** (destruction.md §6). Any combinator
+> with a path that *discards* a resource value it was handed is therefore
+> impossible at a resource instantiation, whatever its receiver convention.
+
+| Combinator | Ruling at a resource | Why |
+|---|---|---|
+| `inspect(own self, fn)` | **WORKS** | `if self is Some(let x) { fn(x) }` loans the payload to `fn` and hands `self` straight back. The old `match` consumed the subject (R6) and then read it again — the actual two-read case. One value, one drop. |
+| `eq(self, b)` | **WORKS — and always did** | §6 was wrong: the old `match (self, b)` moved nothing out of a loan, so the rule it was said to break never applied. It compiled and ran at v0.25.0 too; nobody had pinned it. The rewrite is a shape win — the per-comparison tuple is gone (`equality.js`, `generic-equality.js`), and both sides stay loans, read once per path. |
+| `or_else(own self, fn)` | **WORKS** | The fallback is PRODUCED on the `None` path, never handed in and discarded. A `self` that reaches that path is `None` — no payload to destroy. |
+| `or(own self, b)` | **REJECTS, correctly** | `Some(a).or(b)` must destroy `b`. `b` stays a LOAN so the rejection is forced; see §8.4 for why `own b` would be worse than useless. |
+| `xor(own self, own b)` | **REJECTS, correctly** | `Some(a).xor(Some(b))` is `None` — it discards BOTH. Here `own b` is right: R7 catches the discard directly ("moved on one path but not all"), which is the honest sentence. |
+| `unwrap_or(own self, fallback)` | **REJECTS, correctly** | `Some(v).unwrap_or(f)` must destroy `f`. §6 filed this under "reads `self` twice"; it does not — it reads `self` once and the problem was always the fallback. `own self` removes the receiver from the report. `unwrap_or_else` is the clean spelling and is pinned as the steer. |
+
+What changed for the three that still reject is the **diagnostic**: each is
+now a single error naming the value that genuinely cannot be handled, where
+before there were two, led by a distraction about `self` whose suggested fix
+(`own self`) does not fix anything. The pins assert the count, which is the
+half that makes them pins rather than restatements.
+
+### 8.4 New find — "moved out on every path" is not what the checker checks
+
+`check_own_generic_exactly_once` implements *moved on EVERY path* as *still
+owned after `plan_scope`*, and `plan_branches` merges by INTERSECTION: a
+binding survives owned only if owned in every arm. That is the correct merge
+for planning drops and the wrong one for finding leaks. Two `own` parameters
+moved on DIFFERENT branches therefore both look moved:
+
+```vilan,fragment
+fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
+    if flag { first } else { second }
+}
+```
+
+`pick(true, Some(a), Some(b))` compiles, returns `a`, and destroys nothing —
+`b` is a resource that is never torn down. R7 does not cover it either:
+branch TAILS are R4 move-outs, not a rejoin. **Verified pre-existing on
+v0.25.0**, unrelated to this arc except that it is exactly the shape `or`
+would have taken. It is why `or` keeps its alternative a loan: declaring
+`own b` makes `or` COMPILE at a resource and leak silently, which is the
+class of bug B60 existed to remove.
+
+Filed with an `#[ignore]`d pin
+(`two_own_generics_moved_on_different_branches_is_not_every_path`). The fix is
+a union merge for the leak question — but it needs `is`-refinement or it will
+reject correct code: `or_else` leaves `self` un-moved on the `else` path and
+that is sound, because a `self` reaching it is `None` and has no payload.
+
+### 8.5 §6.3's table, reconciled
+
+The table called bare `x: T` "by value (a copy, rule 1)"; R3 calls it a loan.
+Both stay, as one rule read at two types: the table gains a data column and a
+resource column, with the prose that says why they are the same rule — for
+data a loan is indistinguishable from a copy (the callee's copy is private),
+so the data column states what the implementation performs and the resource
+column states the ownership the convention carries. R3 is named as normative
+and gains bare `x` in its list; the table's note spells out the consequence
+the "a copy" reading hid — a body may not move a bare resource parameter out.
+`mut own x` being a parse error is stated where `mut` is introduced, since
+§8.1 turns on it.

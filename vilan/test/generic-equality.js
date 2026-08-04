@@ -23,18 +23,22 @@ function $e(a, b) {
 	return a !== b;
 }
 function $f(self, b) {
-	const $g = [ self, b ];
-	let $h = null;
-	if ($g[0][0] === 0 && $g[1][0] === 0) {
-		const x = $g[0][1];
-		const y = $g[1][1];
-		$h = eq(x, y);
-	} else if ($g[0][0] === 1 && $g[1][0] === 1) {
-		$h = true;
+	const $g = self;
+	let $j = null;
+	if ($g[0] === 0) {
+		const $h = b;
+		let $i = null;
+		if ($h[0] === 0) {
+			$i = eq($g[1], $h[1]);
+		} else {
+			$i = false;
+		}
+		$j = $i;
 	} else {
-		$h = false;
+		const $k = b;
+		$j = $k[0] === 1;
 	}
-	return $h;
+	return $j;
 }
 const p1 = [ 1, 2 ];
 const p2 = [ 1, 2 ];

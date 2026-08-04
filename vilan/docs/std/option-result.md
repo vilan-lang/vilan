@@ -23,13 +23,13 @@ enum Option<T> { Some(T), None }
 impl Option<type T> {
 	// predicates
 	fun is_some(self): bool
-	fun is_some_and(self, fn: |T| bool): bool
+	fun is_some_and(own self, fn: |T| bool): bool
 	fun is_none(self): bool
 	fun is_none_or(own self, fn: |T| bool): bool
 
 	// extraction
 	fun unwrap(own self): T                  // panics on None
-	fun unwrap_or(self, fallback: T): T
+	fun unwrap_or(own self, fallback: T): T
 	fun unwrap_or_else(own self, fn: || T): T
 
 	// in-place partial move — read/replace the slot through `&mut self`,
@@ -42,23 +42,23 @@ impl Option<type T> {
 	fun map_or<U>(own self, fn: |T| U, fallback: U): U
 	fun map_or_else<U>(own self, fn: |T| U, fallback: || U): U
 	fun map_or_default<U: Default>(own self, fn: |T| U): U
-	fun inspect(self, fn: |T| void): Self    // peek, pass through
+	fun inspect(own self, fn: |T| void): Self  // peek, pass through
 	fun filter(own self, predicate: |T| bool): Option<T>
 
 	// combination
 	fun and<U>(own self, own b: Option<U>): Option<U>
 	fun and_then<U>(own self, fn: |T| Option<U>): Option<U>
-	fun or(self, b: Option<T>): Option<T>
-	fun or_else(self, fn: || Option<T>): Option<T>
-	fun xor(self, b: Option<T>): Option<T>
+	fun or(own self, b: Option<T>): Option<T>
+	fun or_else(own self, fn: || Option<T>): Option<T>
+	fun xor(own self, own b: Option<T>): Option<T>
 	fun zip<U>(own self, own peer: Option<U>): Option<(T, U)>
 
 	// bridging
-	fun ok_or<E>(self, err: E): Result<T, E>
+	fun ok_or<E>(own self, err: E): Result<T, E>
 	fun ok_or_else<E>(own self, err: || E): Result<T, E>
 }
 impl Option<type T: Default> { fun unwrap_or_default(own self): T }
-impl Option<(type T, type U)> { fun unzip(self): (Option<T>, Option<U>) }
+impl Option<(type T, type U)> { fun unzip(own self): (Option<T>, Option<U>) }
 ```
 
 `str.parse_i32(): Option<i32>` (declared here) is the string→number path.
@@ -84,6 +84,17 @@ argument, into a struct field. Either way the payload is destroyed exactly
 once. A capture taken from a loan (`match &opt`, or `opt is Some(let value)`)
 consumes nothing and owns nothing: `opt` stays the owner and tears the
 payload down itself.
+
+Three combinators are **rejected** at an `Option<SomeResource>`, and the rule
+is one sentence: each has a path that *discards* a resource value it was
+handed, and a generic body cannot destroy a `T`. `opt.or(other)` throws
+`other` away when `opt` is `Some`; `opt.xor(other)` throws both away when both
+are `Some`; `opt.unwrap_or(fallback)` throws the fallback away when `opt` is
+`Some`. Each names the discarded value in its diagnostic. The spellings that
+*produce* the alternative instead of taking one in — `or_else`,
+`unwrap_or_else` — work, because nothing is ever discarded. Everything else on
+this surface is fine at a resource, including `inspect` and `==`, which loan
+rather than consume.
 
 `take` and `replace` mutate the `Option` in place through `&mut self`: `take`
 swaps `None` in and hands the old contents back, `replace` swaps a new value in

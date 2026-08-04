@@ -207,7 +207,7 @@ is now use-driven (the wrap sites insert it), which cut the moved goldens from
   capture is neither a parameter nor a local of the closure, and telling them
   apart needs a per-body declared-inside set (the shape
   `scan_one_closure_captures` already computes for R9). Narrow, and unrelated
-  to either backlog item.
+  to either backlog item. **CLOSED 2026-08-04 — §8.**
 - **`Set`'s store rides an undeclared `own`.** The other two std containers
   were surveyed. `Map::insert` is already covered — it stores through a
   `(key, value)` TUPLE, which is a construction, so both slots copy (visible in
@@ -217,3 +217,77 @@ is now use-driven (the wrap sites insert it), which cut the moved goldens from
   program can see the sharing — and a change with no red pin behind it is not
   one to make. `own value: V` there is the one-word fix if a read-back that
   does not copy ever appears.
+
+## 8. B64 — the closure half of the return rule, 2026-08-04
+
+> **Status: SHIPPED.** §7's first bullet, closed — and it was two cases, not
+> one.
+
+### 8.1 The rule, restated so the closure case is not an exception
+
+§3 named three exemptions from the return copy and framed them as facts about
+conventions: *a local moves*, *an `own` parameter moves*, *a view is a borrow*.
+The first two are really one fact about FRAMES:
+
+> **The returning frame owns this storage, and it dies at the return.**
+
+A local is a dead owner because the frame dies. An `own` parameter is the
+callee's because the caller already gave it up and, again, the frame dies. So
+the exemption is not "locals and `own` parameters are free" — it is "**what the
+returning frame owns** is free".
+
+Inside a closure that premise fails for anything the closure did not declare.
+The capture's frame does not die at the closure's return, and a closure runs
+many times where a body runs once. Both halves show:
+
+```vilan,fragment
+mut xs = [1, 2];
+let get = || xs;                                        // hands out `xs`
+fun make(own items: List<i32>): || List<i32> { || items } // hands out the SAME list every call
+```
+
+The first is §7's repro. The second is the case §7 did not name, and it is why
+"treat a capture like a bare parameter" would have been the wrong fix: the
+`own` exemption is exactly right one frame out (`fun with(own self, …): Self {
+… self }` must stay free) and exactly wrong one frame in. So:
+
+> **A returned place rooted at a binding the closure did not declare copies**,
+> whatever convention that binding carries. The parameter exemptions apply to
+> the closure's OWN parameters, and the local exemption to its own locals.
+
+`&`/`&mut` is unchanged and still exempt at every depth — rule 3's `borrows`
+projection is an alias on purpose.
+
+### 8.2 The declared-inside set
+
+`closure_declared_bindings` reuses R9's body walk (`scan_capture_body`) with an
+empty resource set. R9 wants the captured RESOURCE references and computes the
+declared-inside set on the way; this wants only the set. One walk, so the two
+answers cannot drift — which matters, because they are answering the same
+question ("is this name from inside or outside?") for different reasons.
+
+### 8.3 A pre-existing R9 false positive, fixed by the same walk
+
+The walk built its declared-inside set from `let`s, `match` leg patterns,
+parameters and nested closures' parameters — but not from `is` patterns. So a
+closure testing its own parameter reported the binding it had just introduced
+as a resource captured from outside:
+
+```vilan,fragment
+let read = |o: Option<Db>| {
+    if o is Some(let d) { d.handle } else { 0 }   // rejected on v0.25.0: "cannot capture the resource `d`"
+};
+```
+
+The `match` twin was always accepted; only the `is` arm was missing. Pinned
+(`a_closures_own_is_capture_is_not_a_resource_capture`), red against the arm
+removed.
+
+### 8.4 Coverage
+
+Five pins, three red before the fix (the two capture cases plus the field
+projection), one guarding the elision the rule must not eat (a closure's own
+local still donates — proven by the absent `__clone`, since behaviour cannot
+see the difference), one the R9 fix above. **No corpus golden moved**: no
+in-tree program returns a capture out of a closure, which is also why this
+survived to be found by review rather than by a failure.

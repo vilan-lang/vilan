@@ -85,7 +85,7 @@ too.
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
 | `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `Signal<str>` tracks |
-| `style_var` | `(name: str, source: Signal<str>): View` | reactive CSS custom property |
+| `style_var` | `(name: str, source: Signal<str>): View` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
 | `child` | `(content: C): View`; `C: Slot` | element, text node (`str`/`Signal<str>`), or `List<View>` |

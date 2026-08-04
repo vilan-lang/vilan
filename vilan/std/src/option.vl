@@ -49,7 +49,7 @@ impl Option<type T> {
 		self is Some(_)
 	}
 
-	fun is_some_and(self, fn: |T| bool): bool {
+	fun is_some_and(own self, fn: |T| bool): bool {
 		match self {
 			Some(let x) => fn(x),
 			_ => false,
@@ -74,7 +74,11 @@ impl Option<type T> {
 		}
 	}
 
-	fun unwrap_or(self, fallback: T): T {
+	/// `fallback` is a LOAN (R3), so at a resource instantiation this rejects:
+	/// `Some(v).unwrap_or(f)` has to destroy `f`, and a generic body cannot
+	/// destroy a `T`. `unwrap_or_else` is the resource-clean spelling — it
+	/// PRODUCES the fallback on the `None` path instead of discarding it.
+	fun unwrap_or(own self, fallback: T): T {
 		match self {
 			Some(let x) => x,
 			_ => fallback,
@@ -116,15 +120,18 @@ impl Option<type T> {
 		}
 	}
 
-	fun inspect(self, fn: |T| void): Self {
-		match self {
-			Some(let x) => fn(x),
-			_ => {}
+	/// Tested with `is`, not matched: `is` LOANS the subject, so `self` is read
+	/// once here and handed straight back. A by-value `match` would consume it
+	/// (R6) and the trailing `self` would be a second read of a consumed value,
+	/// which is why this is the shape that works at a resource.
+	fun inspect(own self, fn: |T| void): Self {
+		if self is Some(let x) {
+			fn(x)
 		}
 		self
 	}
 
-	fun ok_or<E>(self, err: E): Result<T, E> {
+	fun ok_or<E>(own self, err: E): Result<T, E> {
 		match self {
 			Some(let x) => Ok(x),
 			_ => Err(err),
@@ -156,25 +163,41 @@ impl Option<type T> {
 		self.and_then(|x| predicate(x).then_some(x))
 	}
 
-	fun or(self, b: Option<T>): Option<T> {
-		match self {
-			Some(_) => self,
-			_ => b,
+	/// `b` is a LOAN (R3), so at a resource instantiation this rejects:
+	/// `Some(a).or(Some(b))` has to destroy `b`, and a generic body cannot
+	/// destroy a `T`. Declaring `own b` would NOT fix it — it would leak the
+	/// discarded value silently (`affine-moves.md` §6).
+	fun or(own self, b: Option<T>): Option<T> {
+		if self is Some(_) {
+			self
+		} else {
+			b
 		}
 	}
 
-	fun or_else(self, fn: || Option<T>): Option<T> {
-		match self {
-			Some(_) => self,
-			_ => fn(),
+	/// Resource-clean, unlike `or`: the fallback is PRODUCED on the `None`
+	/// path, never discarded, and a `self` that reaches that path is `None` —
+	/// it carries no payload to destroy.
+	fun or_else(own self, fn: || Option<T>): Option<T> {
+		if self is Some(_) {
+			self
+		} else {
+			fn()
 		}
 	}
 
-	fun xor(self, b: Option<T>): Option<T> {
-		match (self, b) {
-			(Some(_), None) => self,
-			(None, Some(_)) => b,
-			_ => None,
+	/// Rejects at a resource instantiation, correctly: `Some(a).xor(Some(b))`
+	/// is `None`, which destroys BOTH payloads, and a generic body cannot
+	/// destroy a `T`.
+	fun xor(own self, own b: Option<T>): Option<T> {
+		if self is Some(_) {
+			if b is Some(_) {
+				None
+			} else {
+				self
+			}
+		} else {
+			b
 		}
 	}
 
@@ -196,7 +219,7 @@ impl Option<type T: Default> {
 }
 
 impl Option<(type T, type U)> {
-	fun unzip(self): (Option<T>, Option<U>) {
+	fun unzip(own self): (Option<T>, Option<U>) {
 		match self {
 			Some((let x, let y)) => (Some(x), Some(y)),
 			_ => (None, None),
@@ -230,11 +253,19 @@ impl Option<type T> with Default {
 }
 
 impl Option<type T: PartialEq> with PartialEq {
+	/// Both sides stay LOANS and each is read once per path — `is` tests and
+	/// captures loan, where the old `match (self, b)` built a tuple of the two,
+	/// a store that copies (R1 forbids it for a resource). Comparing two
+	/// `Option<resource>`s is therefore accepted, and consumes neither.
 	fun eq(self, b: Option<T>): bool {
-		match (self, b) {
-			(Some(let x), Some(let y)) => x == y,
-			(None, None) => true,
-			_ => false,
+		if self is Some(let x) {
+			if b is Some(let y) {
+				x == y
+			} else {
+				false
+			}
+		} else {
+			b is None
 		}
 	}
 }

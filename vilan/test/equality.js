@@ -1,32 +1,36 @@
 function eq(self, b) {
-	const $a = [ self, b ];
-	let $b = null;
-	if ($a[0][0] === 0 && $a[1][0] === 0) {
-		const x = $a[0][1];
-		const y = $a[1][1];
-		$b = x === y;
-	} else if ($a[0][0] === 1 && $a[1][0] === 1) {
-		$b = true;
-	} else {
-		$b = false;
-	}
-	return $b;
-}
-function eq2(self, b) {
-	const $c = [ self, b ];
+	const $a = self;
 	let $d = null;
-	if ($c[0][0] === 0 && $c[1][0] === 0) {
-		const x = $c[0][1];
-		const y = $c[1][1];
-		$d = x === y;
-	} else if ($c[0][0] === 1 && $c[1][0] === 1) {
-		const x2 = $c[0][1];
-		const y2 = $c[1][1];
-		$d = x2 === y2;
+	if ($a[0] === 0) {
+		const $b = b;
+		let $c = null;
+		if ($b[0] === 0) {
+			$c = $a[1] === $b[1];
+		} else {
+			$c = false;
+		}
+		$d = $c;
 	} else {
-		$d = false;
+		const $e = b;
+		$d = $e[0] === 1;
 	}
 	return $d;
+}
+function eq2(self, b) {
+	const $f = [ self, b ];
+	let $g = null;
+	if ($f[0][0] === 0 && $f[1][0] === 0) {
+		const x = $f[0][1];
+		const y = $f[1][1];
+		$g = x === y;
+	} else if ($f[0][0] === 1 && $f[1][0] === 1) {
+		const x2 = $f[0][1];
+		const y2 = $f[1][1];
+		$g = x2 === y2;
+	} else {
+		$g = false;
+	}
+	return $g;
 }
 function eq3(self, b) {
 	return self[0] === b[0] && self[1] === b[1];

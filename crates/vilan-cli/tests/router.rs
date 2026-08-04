@@ -5,7 +5,9 @@
 //! parse-on-load, typed `link` hrefs, plain-click interception (and modifier
 //! passthrough), `pushState`/`popstate` driving one signal, nested layouts
 //! through `swap`, the `PartialEq` no-op on an unchanged route, and disposal
-//! of a swapped-out subtree's subscriptions.
+//! of a swapped-out subtree's subscriptions — `bind_text`'s, and (A21)
+//! `style_var`'s, whose signal is written from a button outside the subtree so
+//! the write lands after the page is gone.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -104,6 +106,16 @@ fun home_page(): View {
 	view("section").text("home")
 }
 
+/// The swapped-AWAY page for the disposal check (A21): a `style_var` whose
+/// signal is written from a button OUTSIDE the swapped subtree, so the write
+/// can be fired after this page is gone.
+fun login_page(width: Signal<str>): View {
+	view("section")
+		.attr("id", "login")
+		.style_var("--w", width)
+		.bind_text(current_path())
+}
+
 fun workspace_layout(org: str, inner: WorkspaceRoute): View {
 	view("section")
 		.child(view("aside").text(org))
@@ -115,14 +127,16 @@ fun workspace_layout(org: str, inner: WorkspaceRoute): View {
 }
 
 fun app(route: Signal<Route>): View {
+	let width = Signal::new("10px");
 	view("main")
 		.child(view("nav")
 			.child(link("Home", Route::Home))
 			.child(link("Tasks", Route::Workspace("acme", WorkspaceRoute::Tasks))))
 		.child(view("button").text("go").on("click", || navigate(href(Route::Login))))
+		.child(view("button").attr("id", "widen").text("widen").on("click", || width.set("99px")))
 		.swap(route, |current| match current {
 			Route::Home => home_page(),
-			Route::Login => view("section").bind_text(current_path()),
+			Route::Login => login_page(width),
 			Route::Workspace(let org, let inner) => workspace_layout(org, inner),
 			Route::NotFound => view("section").text("not found"),
 		})
@@ -148,7 +162,11 @@ const HARNESS: &str = r#"class StubElement {
         this.hidden = false;
         this.value = "";
         this.attributes = {};
-        this.style = { setProperty: () => {} };
+        // Recorded, not dropped: `style_var`'s only observable effect is this
+        // write, so a no-op stub cannot see a subscription that outlived its
+        // boundary (A21).
+        this.styleProperties = {};
+        this.style = { setProperty: (name, value) => { this.styleProperties[name] = value; } };
     }
     set textContent(text) { this._text = text; this.children = []; }
     get textContent() { return this._text; }
@@ -236,6 +254,7 @@ main.find(e => e.tagName === "button").click();
 assert(global.location.pathname === "/login", "navigate() from an event handler");
 const loginPage = page();
 assert(loginPage.textContent === "/login", "page binding tracks current_path()");
+assert(loginPage.styleProperties["--w"] === "10px", "style_var writes the custom property on mount");
 
 homeLink.click();
 assert(page().textContent === "home", "navigated back to home");
@@ -246,6 +265,15 @@ const staleText = loginPage.textContent;
 tasksLink.click();
 assert(loginPage.textContent === staleText,
     "swapped-out subtree's subscription was disposed (detached element never updates again)");
+
+// A21: `style_var` was the one reactive View method built on `sub` + a parked
+// `let _sub` instead of `effect`, so its subscription never reached the owner
+// and outlived the boundary. Fire its signal from a button OUTSIDE the swapped
+// subtree, well after the unmounting turn: a leaked subscription writes the
+// detached element, a disposed one does not.
+main.find(e => e.attributes.id === "widen").click();
+assert(loginPage.styleProperties["--w"] === "10px",
+    "style_var's subscription was disposed with the swapped-out subtree");
 
 global.location.pathname = "/login";
 for (const h of popstateHandlers) h({});
