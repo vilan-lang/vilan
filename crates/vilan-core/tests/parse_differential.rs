@@ -177,6 +177,15 @@ fn corpus_absent_constructs() -> Vec<(String, String)> {
         ("tuple_bound_both", "fun a<T: (2..10)>(): T { default() }"),
         ("tuple_bound_hi", "fun b<T: (..10)>(): T { default() }"),
         ("tuple_bound_element", "fun c<T: (..: Show)>(): T { default() }"),
+        // Spread parameters (variadic-generics.md §S): the marker is three `.`
+        // control tokens with no node of its own, in every legal shape — bare,
+        // after a fixed parameter with `mut`, and over a mapped pack.
+        ("spread_bare", "fun d<T: (..: Show)>(...items: T): i32 { 0 }"),
+        ("spread_after_fixed", "fun e<T: (2..)>(sep: str, mut ...rest: T): i32 { 0 }"),
+        (
+            "spread_mapped",
+            "fun f<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> { gather(sources) }",
+        ),
         // A generic default and a `type` binder default together.
         ("generic_defaults", "struct Cell<T = Self, type U = i32> { value: T }"),
         // Import/use path shapes: a top-level set, a deeply nested set, a use set.

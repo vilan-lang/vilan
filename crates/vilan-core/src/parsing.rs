@@ -4434,6 +4434,29 @@ mod tests {
     }
 
     #[test]
+    fn a_spread_parameter_is_marked_and_only_the_last_one_is() {
+        // `...` is three `.` control tokens (the lexer has none of its own), so
+        // the flag is the ONLY record that it was written — a dropped one is
+        // silent. `mut` may precede it; the pack type is mandatory.
+        match only_item("fun log<T: (2..)>(sep: str, mut ...items: T): i32 { 0 }") {
+            Node::Func(function) => {
+                let spreads: Vec<bool> = function
+                    .parameters
+                    .0
+                    .iter()
+                    .map(|parameter| parameter.spread)
+                    .collect();
+                assert_eq!(spreads, vec![false, true]);
+                let last = &function.parameters.0[1];
+                assert!(last.mutable, "`mut ...items` keeps binder mutability");
+                assert_eq!(last.convention, Convention::Bare);
+                assert!(last.declared_type.is_some(), "the pack type is mandatory");
+            }
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn async_fun_is_a_function_not_an_expression() {
         // `async fun` is an item (the expression attempt fails on `fun`), unlike
         // `async { .. }` / `async expr`, which are expressions.
