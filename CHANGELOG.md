@@ -6,6 +6,16 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Mutate a signal's collection in place.** `signal.update(|&mut list| { list.push(item); })` hands the closure a writable view of the *stored* value, so growing a `Signal<List<T>>` no longer means the copy-transform-return dance `set_with` required (`|mut list| { list.push(x); list }` — a whole-list copy per push, written as a transformation when you meant a mutation). Subscribers are notified once, after the closure returns, whatever it did; inside a `batch` that notification defers and coalesces like any other write. It is one method for every container — `List`, `Map`, `Set`, a struct's fields, anything a closure can mutate through a view — rather than a per-collection twin. `set_with` is unchanged and remains the right form when you are computing a new value rather than editing one.
+
+**Closure parameters take the full parameter grammar.** `|&mut list|`, `|&view|`, and `|list: &mut List<i32>|` now mean in a closure literal exactly what they mean on a function: a closure can receive a view and mutate the caller's value. Previously every closure parameter was by-value regardless of what was written or declared, so a `&mut` callback could not be expressed at all — which is what `update` needed. The combinations that would mislead are still refused (`mut` with a convention), now in both positions.
+
+**A `Shared<i32>`'s write view survives being passed.** `Shared::write()` over a scalar produced the slot's *value* rather than a view of it, so it worked as an assignment target (`cell.write() = x`) and over aggregates, but handing it to anything expecting `&mut i32` gave the callee a bare number and crashed at runtime with no diagnostic. It now lowers to a proper view in every position; `cell.write() = x` is byte-for-byte unchanged.
+
+---
+
 ## v0.23.6 — 2026-08-03
 
 **Destructure and `match` captures are now true copies.** Binding a piece of a value — `let (xs, n) = pair`, `Some(let inner) => …` — used to share the underlying storage with the source: growing `pair.0` showed through `xs`, mutating a `mut` capture wrote back into the source, and a returned capture (`option.unwrap()`) handed the caller a live alias into the option's payload. All three now copy, per the value-semantics rule every other binding already followed. Two elisions keep the cost where it belongs: a read-only capture from an immutable source still shares (recursive walkers like SSR rendering stay linear), and destructuring a temporary that dies on the spot moves instead of copying.
