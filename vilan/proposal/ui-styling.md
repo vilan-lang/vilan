@@ -1,6 +1,14 @@
 # UI styling — typed atomic styles, compiled
 
-Status: **CORE SHIPPED 2026-07-10** — `std::style` (same day as the whole
+Status: **CORE SHIPPED 2026-07-10; TAIL SHIPPED 2026-08-04 except the
+A7/G2-entangled pieces** — §0bis is the live status and supersedes the
+"Remaining" list at the end of this paragraph, which is kept as the historical
+record of what the core's authors expected to be left. What remains open:
+critical CSS (A7), liveness-tied dead-style elimination (G2), and the property
+tail's VALUE-TYPE half (§0bis.1).
+
+The original core record, unedited: **CORE SHIPPED 2026-07-10** — `std::style`
+(same day as the whole
 prerequisite stack: `const`, the asset channel, this). Shipped: `Style` as a
 slot map (`media:pseudo:property` → class + declaration), the builder chain
 (~30 properties), `Color`/`Length`/`space` tokens with `:root` var emission
