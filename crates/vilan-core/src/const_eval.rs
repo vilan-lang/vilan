@@ -16,6 +16,42 @@ use crate::interpreter::{self, ConstValue, FailureKind, Limits};
 use crate::options::BuildOptions;
 use crate::span::Span;
 use crate::transformer;
+use crate::type_::{Type, TypeId};
+
+/// The budgets the EXPLICIT form evaluates under (const-eval.md §9.3). A miss
+/// here is a diagnostic (§4's "did not finish within the compile-time budget"),
+/// so the user can see it and act — which is what lets them be generous.
+const EXPLICIT_LIMITS: Limits = Limits {
+    fuel: 1_000_000,
+    call_depth: 512,
+};
+
+/// The budgets an INFERRED attempt evaluates under (const-eval.md §9.3):
+/// tighter in every dimension, because a miss here is silent. Sized against
+/// the measurement in §9.1 — every fold the tree produces completes within 200
+/// fuel — so these carry ~50× headroom while sitting at 1 % of the explicit
+/// fuel and 12.5 % of its depth.
+const INFERRED_LIMITS: Limits = Limits {
+    fuel: 10_000,
+    call_depth: 64,
+};
+
+/// The most bytes an inferred fold's literal may occupy (const-eval.md §9.3).
+/// §5's rule — "a 10 KB table literal replacing a 20-character call is a
+/// regression nobody asked for" — with explicit `const` as the opt-in for big
+/// results. The largest fold in the tree measures 33 bytes, the median 2.
+const INFERRED_SIZE_CAP: usize = 256;
+
+/// Which const form a [`State`] is evaluating. They share one machine and
+/// differ in exactly three places — whether a failure is a diagnostic, which
+/// budgets apply, and whether a pending inference candidate counts as
+/// compile-time-known — so a second implementation of eligibility (the way the
+/// two forms would silently drift apart) is not needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Explicit,
+    Inferred,
+}
 
 pub fn evaluate(
     program: &Program,
@@ -33,21 +69,115 @@ pub fn evaluate(
     if !program.diagnostics.is_empty() {
         return (HashMap::new(), Vec::new(), Vec::new());
     }
-    let mut state = State {
-        program,
-        options,
-        const_set: program.const_exprs.iter().copied().collect(),
-        results: HashMap::new(),
-        assets: Vec::new(),
-        failed: HashSet::new(),
-        in_progress: HashSet::new(),
-        errors: Vec::new(),
-    };
+    let mut state = State::new(program, options, Mode::Explicit, HashSet::new());
     state.check_const_only();
     for &expr_id in &program.const_exprs {
         state.evaluate_one(expr_id);
     }
     (state.results, state.assets, state.errors)
+}
+
+/// The INFERENCE sweep (const-eval.md §9): fold every `let`/`mut` initializer
+/// the const evaluator can settle, and leave every one it cannot exactly as it
+/// was — with **zero** diagnostics, whatever went wrong.
+///
+/// Returns only the NEW folds; the explicit pass's results are already on the
+/// program and are seeded in here so an inferred fold may read a binding the
+/// explicit form settled.
+///
+/// **This runs on the `vilan` CLI's build path and nowhere else.** It must
+/// never be called from `analyze_source`, which is what the language server,
+/// the wasm playground, and the test harnesses enter through (§4's tooling
+/// split, §9.6) — silent-fallback optimization produces nothing an editor
+/// could surface. `const_eval_reach.rs` pins that at the source level, the way
+/// the playground's split guard does.
+pub fn infer(program: &Program, options: &BuildOptions) -> HashMap<Id, ConstValue> {
+    // The preset gate (§9.4): debug keeps the computation so it stays in stack
+    // traces. A program that failed analysis is skipped for the same reason
+    // `evaluate` skips it — the transformer's entity lookups assume a clean
+    // program.
+    if !options.infer_const || !program.diagnostics.is_empty() {
+        return HashMap::new();
+    }
+    let candidates = inference_candidates(program);
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    let mut state = State::new(
+        program,
+        options,
+        Mode::Inferred,
+        candidates.iter().copied().collect(),
+    );
+    // An inferred fold may read what the explicit pass already computed.
+    state.results = program.const_results.clone();
+    for &expr_id in &candidates {
+        state.evaluate_one(expr_id);
+    }
+    debug_assert!(
+        state.errors.is_empty(),
+        "the inference sweep produced a diagnostic; silent fallback is the whole \
+         reason it is safe to run over every binding (const-eval.md §9.2)"
+    );
+    for id in program.const_results.keys() {
+        state.results.remove(id);
+    }
+    state.results
+}
+
+/// The bindings the sweep attempts, in a SOURCE-DERIVED order (§9.5): sorted by
+/// file and then by position, never in `HashMap` order, so the same source
+/// folds identically across builds by reading rather than by trusting a hash
+/// seed.
+///
+/// The universe is every `let`/`mut` initializer in every source — entry,
+/// modules, and std alike (§9.1: std holds almost every fold in this tree, so a
+/// rule that excepted it would cost the feature most of its value). Two
+/// exclusions are pure savings: an already-`const` initializer belongs to the
+/// explicit pass, and a literal or bare-alias initializer folds to itself.
+/// A binding DECLARED inside a `const` expression is a third: the enclosing
+/// expression already folded, so the transformer never walks as far as this
+/// initializer.
+///
+/// The fourth is the one that is about SOUNDNESS rather than savings — a
+/// binding inside a type-parameter-dependent function body, where a fold has no
+/// monomorphization context and would silently produce the wrong value. See
+/// [`GenericRegions`].
+///
+/// Everything else is attempted, and the free-variable rule is the filter.
+fn inference_candidates(program: &Program) -> Vec<Id> {
+    let const_set: HashSet<Id> = program.const_exprs.iter().copied().collect();
+    let generic_regions = GenericRegions::build(program);
+    let mut candidates: Vec<Id> = program
+        .variables
+        .values()
+        .filter_map(|variable| variable.initial)
+        .filter(|initial| {
+            !const_set.contains(initial)
+                && !matches!(
+                    program.entity_map.get(initial),
+                    Some(
+                        Expr::String(_)
+                            | Expr::MultilineString(_)
+                            | Expr::Number(..)
+                            | Expr::Bool(_)
+                            | Expr::Null
+                            | Expr::Local(_)
+                    )
+                )
+                && !within_a_const_expression(program, *initial)
+                && !generic_regions.covers(program, *initial)
+        })
+        .collect();
+    candidates.sort_by_key(|id| {
+        (
+            program.source_of(*id).map(|source| source.0),
+            program.span_map.get(id).map(|span| span.start),
+            id.0,
+        )
+    });
+    candidates.dedup();
+    candidates
 }
 
 /// Deduplicates and deterministically orders the collected `(kind, line)`
@@ -121,10 +251,257 @@ fn render_call_chain(trace: &[String]) -> String {
     }
 }
 
+/// The source regions where a fold would be meaningless: the bodies of every
+/// function whose meaning depends on a TYPE PARAMETER (const-eval.md §9.1).
+///
+/// This is §5's recorded scope limit — const generics are out, and "a `const`
+/// inside a generic function body is legal only if its initializer is
+/// independent of the type parameters" — made operational. The explicit form
+/// pushes that judgement onto the author, who wrote the keyword. Inference has
+/// to make it itself, and the failure mode if it does not is the worst kind:
+/// `transform_const_program` walks the initializer with NO substitution
+/// context, so `let total = T::default();` inside `List<T>::sum` does not fail
+/// — it quietly evaluates to `undefined`, and the folded program prints
+/// `undefined` where it used to print `0`. Found by the corpus differential on
+/// `list-element-type.vl`, which is exactly the gate's job.
+///
+/// A function counts as type-parameter-dependent when its own generic
+/// parameters, any parameter's type, or its return type mentions a `Generic` —
+/// the receiver is what catches `List<T>`'s methods, whose own
+/// `generic_parameter_constraint_ids` are empty because `T` belongs to the
+/// type, not the method. Conservative on purpose: an unresolved or unknown type
+/// counts too.
+///
+/// Stored per source as a merged, sorted, DISJOINT interval list, so nesting
+/// (a closure inside a generic function) needs no special case and a
+/// containment test is one binary search.
+struct GenericRegions {
+    by_source: HashMap<u32, Vec<(usize, usize)>>,
+}
+
+impl GenericRegions {
+    fn build(program: &Program) -> Self {
+        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+        let mut mentions = TypeParameterScan::new(program);
+        for (function_id, function) in &program.functions {
+            let dependent = !function.generic_parameter_constraint_ids.is_empty()
+                || function
+                    .return_type_id
+                    .is_some_and(|type_id| mentions.reaches_a_type_parameter(type_id))
+                || function.parameters.iter().any(|parameter_id| {
+                    program
+                        .parameters
+                        .get(parameter_id)
+                        .is_some_and(|parameter| {
+                            mentions.reaches_a_type_parameter(parameter.type_id)
+                        })
+                });
+            if !dependent {
+                continue;
+            }
+            let (Some(source), Some(span)) = (
+                program.source_of(*function_id),
+                program.span_map.get(function_id),
+            ) else {
+                continue;
+            };
+            by_source
+                .entry(source.0)
+                .or_default()
+                .push((span.start, span.end));
+        }
+        for regions in by_source.values_mut() {
+            regions.sort_unstable();
+            // Merge into disjoint intervals: a nested function's span is
+            // absorbed by its enclosing one, so `covers` never has to look at
+            // more than the single interval a binary search lands in.
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
+            for &(start, end) in regions.iter() {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            *regions = merged;
+        }
+        Self { by_source }
+    }
+
+    fn covers(&self, program: &Program, id: Id) -> bool {
+        let (Some(source), Some(span)) = (program.source_of(id), program.span_map.get(&id)) else {
+            return false;
+        };
+        let Some(regions) = self.by_source.get(&source.0) else {
+            return false;
+        };
+        let index = regions.partition_point(|(start, _)| *start <= span.start);
+        index > 0 && regions[index - 1].1 >= span.end
+    }
+}
+
+/// Walks a `TypeId` looking for a type parameter, memoizing per type so a
+/// deeply shared type is not re-walked once per function signature.
+struct TypeParameterScan<'p, 'src> {
+    program: &'p Program<'src>,
+    seen: HashMap<TypeId, bool>,
+}
+
+impl<'p, 'src> TypeParameterScan<'p, 'src> {
+    fn new(program: &'p Program<'src>) -> Self {
+        Self {
+            program,
+            seen: HashMap::new(),
+        }
+    }
+
+    fn reaches_a_type_parameter(&mut self, type_id: TypeId) -> bool {
+        let mut visiting = HashSet::new();
+        self.walk(type_id, &mut visiting)
+    }
+
+    fn walk(&mut self, type_id: TypeId, visiting: &mut HashSet<TypeId>) -> bool {
+        if let Some(answer) = self.seen.get(&type_id) {
+            return *answer;
+        }
+        // A recursive type (`enum Tree { Node(List<Tree>) }`) would otherwise
+        // walk forever. Mid-cycle it contributes nothing.
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        let answer = match self.program.type_id_to_type_map.get(&type_id) {
+            // The type parameter itself, and the two "we do not know" cases —
+            // conservative, since a fold under either is unverifiable.
+            Some(Type::Generic(_)) | Some(Type::Unknown) | Some(Type::Unresolved) | None => true,
+            Some(Type::Closure(arguments, result)) => {
+                let result = *result;
+                arguments
+                    .clone()
+                    .into_iter()
+                    .chain(std::iter::once(result))
+                    .any(|inner| self.walk(inner, visiting))
+            }
+            Some(Type::Enum(_, arguments))
+            | Some(Type::Struct(_, arguments))
+            | Some(Type::Trait(_, arguments))
+            | Some(Type::Tuple(arguments)) => arguments
+                .clone()
+                .into_iter()
+                .any(|inner| self.walk(inner, visiting)),
+            Some(Type::Array(element, _)) => {
+                let element = *element;
+                self.walk(element, visiting)
+            }
+            Some(Type::Mapped(binder, source, template)) => {
+                let (binder, source, template) = (*binder, *source, *template);
+                self.walk(binder, visiting)
+                    || self.walk(source, visiting)
+                    || self.walk(template, visiting)
+            }
+            Some(_) => false,
+        };
+        visiting.remove(&type_id);
+        self.seen.insert(type_id, answer);
+        answer
+    }
+}
+
+/// Whether `id` sits inside some `const` expression's span, in the same file.
+fn within_a_const_expression(program: &Program, id: Id) -> bool {
+    let Some(source) = program.source_of(id) else {
+        return false;
+    };
+    let Some(span) = program.span_map.get(&id) else {
+        return false;
+    };
+    program.const_exprs.iter().any(|root| {
+        program.source_of(*root) == Some(source)
+            && program
+                .span_map
+                .get(root)
+                .is_some_and(|root_span| span.start >= root_span.start && span.end <= root_span.end)
+    })
+}
+
+/// A span-sorted index of every `Expr::Local` reference, bucketed by source.
+///
+/// This exists because `free_locals` used to answer "which locals does this
+/// subtree reference?" by scanning the WHOLE `entity_map` — 0.09–0.40 ms per
+/// expression, which the explicit form could afford at a handful of `const`s
+/// per program and inference could not at several hundred candidates
+/// (const-eval.md §9.1: the unindexed sweep cost more than the entire
+/// analysis, up to 173 % of it). §8.3 named the same waste while measuring the
+/// LSP and left it; this takes it, and both forms get it.
+///
+/// References are keyed by their source and sorted by start, so a query is a
+/// binary search to the root's span followed by a walk of just that range.
+struct LocalIndex {
+    /// Per `SourceId.0`: `(start, end, reference id, bound id)`, sorted.
+    by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>>,
+}
+
+impl LocalIndex {
+    fn build(program: &Program) -> Self {
+        let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::new();
+        for (id, expr) in &program.entity_map {
+            if let Expr::Local(binding) = expr
+                && let Some(source) = program.source_of(*id)
+                && let Some(span) = program.span_map.get(id)
+            {
+                by_source
+                    .entry(source.0)
+                    .or_default()
+                    .push((span.start, span.end, *id, *binding));
+            }
+        }
+        for references in by_source.values_mut() {
+            // Sorted by position, which is also the order diagnostics want.
+            references.sort_unstable_by_key(|(start, end, id, _)| (*start, *end, id.0));
+        }
+        Self { by_source }
+    }
+
+    /// Every `Expr::Local` reference whose span lies within `root`'s (same
+    /// file), paired with the binding it names.
+    fn references_within(
+        &self,
+        program: &Program,
+        root: Id,
+    ) -> impl Iterator<Item = (Id, Id)> + '_ {
+        // An unknown source or span yields an empty slice, so the bounds below
+        // are never consulted.
+        let (candidates, end) = self
+            .lookup(program, root)
+            .unwrap_or((&[] as &[(usize, usize, Id, Id)], 0));
+        candidates
+            .iter()
+            .take_while(move |(start, ..)| *start < end)
+            .filter(move |(_, reference_end, ..)| *reference_end <= end)
+            .map(|(_, _, id, binding)| (*id, *binding))
+    }
+
+    /// The references at or after `root`'s span start, in `root`'s file, plus
+    /// the span end the caller stops at.
+    fn lookup(&self, program: &Program, root: Id) -> Option<(&[(usize, usize, Id, Id)], usize)> {
+        let source = program.source_of(root)?;
+        let root_span = **program.span_map.get(&root)?;
+        let references = self.by_source.get(&source.0)?;
+        let first = references.partition_point(|(start, ..)| *start < root_span.start);
+        Some((&references[first..], root_span.end))
+    }
+}
+
 struct State<'p, 'src> {
     program: &'p Program<'src>,
     options: &'p BuildOptions,
+    /// Which form this is evaluating — see [`Mode`].
+    mode: Mode,
     const_set: HashSet<Id>,
+    /// The initializers the inference sweep is attempting. Empty in
+    /// [`Mode::Explicit`]; in [`Mode::Inferred`] a candidate counts as
+    /// compile-time-known, which is what makes `let a = 1 + 2; let b = a * 2;`
+    /// fold both (const-eval.md §9.5).
+    inferable: HashSet<Id>,
+    locals: LocalIndex,
     results: HashMap<Id, ConstValue>,
     assets: Vec<(String, String)>,
     failed: HashSet<Id>,
@@ -144,6 +521,42 @@ enum Known<'src> {
 }
 
 impl<'p, 'src> State<'p, 'src> {
+    fn new(
+        program: &'p Program<'src>,
+        options: &'p BuildOptions,
+        mode: Mode,
+        inferable: HashSet<Id>,
+    ) -> Self {
+        Self {
+            program,
+            options,
+            mode,
+            const_set: program.const_exprs.iter().copied().collect(),
+            inferable,
+            locals: LocalIndex::build(program),
+            results: HashMap::new(),
+            assets: Vec::new(),
+            failed: HashSet::new(),
+            in_progress: HashSet::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Records a diagnostic — or, in [`Mode::Inferred`], does not.
+    ///
+    /// This is the single place silent fallback is implemented (const-eval.md
+    /// §9.2). Every failure path below calls it and then returns `false`; the
+    /// `false` is what leaves the binding runtime, and in the inferred mode
+    /// that is the ONLY thing that happens. Keeping it to one method is what
+    /// makes "zero diagnostics, whatever went wrong" checkable by reading
+    /// rather than by auditing every arm.
+    fn report(&mut self, anchor: Id, error: Error) {
+        if self.mode == Mode::Inferred {
+            return;
+        }
+        self.errors.push((error, self.source_of(anchor)));
+    }
+
     fn evaluate_one(&mut self, expr_id: Id) -> bool {
         if self.results.contains_key(&expr_id) {
             return true;
@@ -152,14 +565,12 @@ impl<'p, 'src> State<'p, 'src> {
             return false;
         }
         if !self.in_progress.insert(expr_id) {
-            self.errors.push((
-                Error {
-                    note: None,
-                    span: self.span_of(expr_id),
-                    msg: "`const` expressions form a dependency cycle".to_string(),
-                },
-                self.source_of(expr_id),
-            ));
+            let error = Error {
+                note: None,
+                span: self.span_of(expr_id),
+                msg: "`const` expressions form a dependency cycle".to_string(),
+            };
+            self.report(expr_id, error);
             self.failed.insert(expr_id);
             return false;
         }
@@ -185,17 +596,15 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
                 Known::Runtime(name) => {
-                    self.errors.push((
-                        Error {
-                            note: None,
-                            span: self.span_of(reference_id),
-                            msg: format!(
-                                "`{name}` is a runtime value; a `const` expression reads only \
-                                 compile-time-known bindings"
-                            ),
-                        },
-                        self.source_of(reference_id),
-                    ));
+                    let error = Error {
+                        note: None,
+                        span: self.span_of(reference_id),
+                        msg: format!(
+                            "`{name}` is a runtime value; a `const` expression reads only \
+                             compile-time-known bindings"
+                        ),
+                    };
+                    self.report(reference_id, error);
                     ok = false;
                 }
             }
@@ -228,17 +637,15 @@ impl<'p, 'src> State<'p, 'src> {
                         }
                     }
                     Known::Runtime(name) => {
-                        self.errors.push((
-                            Error {
-                                note: None,
-                                span: self.span_of(expr_id),
-                                msg: format!(
-                                    "this `const` expression reaches `{name}`, whose value is not \
-                                     compile-time-known"
-                                ),
-                            },
-                            self.source_of(expr_id),
-                        ));
+                        let error = Error {
+                            note: None,
+                            span: self.span_of(expr_id),
+                            msg: format!(
+                                "this `const` expression reaches `{name}`, whose value is not \
+                                 compile-time-known"
+                            ),
+                        };
+                        self.report(expr_id, error);
                         ok = false;
                     }
                 }
@@ -250,17 +657,30 @@ impl<'p, 'src> State<'p, 'src> {
                 attempts += 1;
                 continue;
             }
-            return match interpreter::eval_const(&mini, Limits::default()) {
-                Ok((value, assets)) => {
-                    self.results.insert(expr_id, value);
-                    self.assets.extend(assets);
-                    true
-                }
-                Err(failure) => {
-                    let error = self.failure_error(expr_id, failure);
-                    self.errors.push((error, self.source_of(expr_id)));
-                    false
-                }
+            return match self.mode {
+                Mode::Explicit => match interpreter::eval_const(&mini, EXPLICIT_LIMITS) {
+                    Ok((value, assets)) => {
+                        self.results.insert(expr_id, value);
+                        self.assets.extend(assets);
+                        true
+                    }
+                    Err(failure) => {
+                        let error = self.failure_error(expr_id, failure);
+                        self.report(expr_id, error);
+                        false
+                    }
+                },
+                // The inferred form's tighter budgets, its closed effect
+                // channels (both inside `eval_inferred`), and the size cap —
+                // and any of the three missing is a silent fallback, which is
+                // simply `false` with nothing reported (const-eval.md §9.2/3).
+                Mode::Inferred => match interpreter::eval_inferred(&mini, INFERRED_LIMITS) {
+                    Ok(value) if value.literal_size() <= INFERRED_SIZE_CAP => {
+                        self.results.insert(expr_id, value);
+                        true
+                    }
+                    _ => false,
+                },
             };
         }
     }
@@ -575,32 +995,27 @@ impl<'p, 'src> State<'p, 'src> {
     /// whose span lies inside the expression's span (same source file), minus
     /// bindings DECLARED inside it (block `let`s, closure parameters — their
     /// references are internal, not free).
+    ///
+    /// Answered from [`LocalIndex`], which is why the inference sweep is
+    /// affordable at all (const-eval.md §9.1).
     fn free_locals(&self, root: Id) -> Vec<(Id, Id)> {
         let root_span = self.span_of(root);
         let Some(root_source) = self.program.source_of(root) else {
             return Vec::new();
         };
-        let within = |id: Id| -> bool {
-            self.program.source_of(id) == Some(root_source)
-                && self
-                    .program
-                    .span_map
-                    .get(&id)
-                    .map(|span| span.start >= root_span.start && span.end <= root_span.end)
-                    .unwrap_or(false)
-        };
-        let mut references = Vec::new();
-        for (id, expr) in &self.program.entity_map {
-            if let Expr::Local(binding) = expr
-                && within(*id)
-                && !within(*binding)
-            {
-                references.push((*id, *binding));
-            }
-        }
-        // Deterministic diagnostic order.
-        references.sort_by_key(|(id, _)| self.span_of(*id).start);
-        references
+        let declared_within =
+            |id: Id| -> bool {
+                self.program.source_of(id) == Some(root_source)
+                    && self.program.span_map.get(&id).is_some_and(|span| {
+                        span.start >= root_span.start && span.end <= root_span.end
+                    })
+            };
+        // The index yields references in span order already — the order
+        // diagnostics want.
+        self.locals
+            .references_within(self.program, root)
+            .filter(|(_, binding)| !declared_within(*binding))
+            .collect()
     }
 
     fn classify(&self, binding: Id) -> Known<'src> {
@@ -615,6 +1030,14 @@ impl<'p, 'src> State<'p, 'src> {
                 return Known::Runtime(variable.name);
             };
             if self.const_set.contains(&initial) {
+                return Known::Const(initial);
+            }
+            // A binding the sweep is itself attempting counts as
+            // compile-time-known, so chains fold (const-eval.md §9.5). ONLY in
+            // the inferred mode: an explicit `const` reading a plain runtime
+            // binding must keep erroring with §1's message, or the same program
+            // would fail in debug and compile in release.
+            if self.mode == Mode::Inferred && self.inferable.contains(&initial) {
                 return Known::Const(initial);
             }
             let literal = matches!(

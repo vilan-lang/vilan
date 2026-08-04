@@ -2522,6 +2522,23 @@ fn compile_to_js(
         // only meaningful for a program that analyzed cleanly.
         vilan_core::init_order::check_cycles(&mut program);
 
+        // The `const` INFERENCE sweep (const-eval.md §9) — THE ONE CALL SITE.
+        // It lives here, on the CLI's build path, and not beside the explicit
+        // pass inside `analyze_source`, because the language server and the
+        // wasm playground enter through that function and must never run it
+        // (§4's tooling split, §9.6): inference is silent-fallback
+        // optimization, so it produces nothing an editor could surface.
+        // `crates/vilan-core/tests/const_eval_reach.rs` pins the separation at
+        // the source level, the way the playground's split guard does.
+        //
+        // Gated on the `[build]` preset — off under `debug`, on under
+        // `release` (§9.4). Runs AFTER `check_cycles` so a program with any
+        // diagnostic is already excluded: folds are an optimization over code
+        // that compiles, never a way of making code compile.
+        program
+            .const_results
+            .extend(vilan_core::const_eval::infer(&program, options));
+
         for (index, error) in program.diagnostics.iter().enumerate() {
             let source = program.diagnostic_source(index);
             load_diagnostic_file(&mut diagnostic_files, &program, source);
