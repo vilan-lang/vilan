@@ -81,9 +81,17 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
 - **`Length`** covers everything else: `Length::px(1.0)`,
   `Length::rem(1.5)`, `Length::em(0.02)`, `Length::pct(50.0)`,
   `Length::vh(100.0)`, `Length::vw(50.0)`, `Length::auto()`,
-  `Length::var("--w")` for a CSS variable (see dynamic values below), and
+  `Length::zero()` for a bare `0`, `Length::var("--w")` for a CSS
+  variable (see dynamic values below), and
   `Length::calc("100% - 2rem")` when the value is arithmetic — you write
   the expression, not the `calc(..)` wrapper.
+- **`Length::css(..)`** is the verbatim escape, `Color::hex`'s twin: a
+  complete CSS value written as text, for the functional forms `Length`
+  does not model — `Length::css("clamp(1100px, 100vw, 1920px)")`,
+  `min()`, `max()`, `env()`, `fit-content()`. Use `calc` when you are
+  writing *arithmetic* and want the wrapper supplied; use `css` when the
+  value is already whole, which is also what lets one named expression be
+  reused across several properties. An empty value stops the build.
 - **`Color`** has `Color::white()`, `Color::black()`,
   `Color::transparent()`, `Color::hex("#663399")`, and stepped ramps
   like `Color::gray(300)`, `Color::blue(600)`, `Color::red(500)`,
@@ -100,7 +108,10 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   `Gradient::radial(RadialExtent::ClosestSide)`, then `.stop(colour,
   percent)` per stop, handed to `background_gradient`. It is a different
   slot from `background`, so a style can set a colour *and* paint a
-  gradient over it. Two stops minimum.
+  gradient over it. Two stops minimum. For the image values a `Gradient`
+  can't hold — a `url()` or data URI, a multi-layer list, a positioned or
+  `repeating-*` gradient — `background_image(str)` writes the *same* slot,
+  and `background_size(str)` sizes it.
 - Keyword properties use enums: `Display`, `Position`, `FlexDirection`,
   `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
   `WhiteSpace`, `UserSelect`, `RadialExtent`.
@@ -135,11 +146,20 @@ fun main() {
 ```
 
 Some properties take a plain `str` — `font_family`, `transform`,
-`box_shadow`, `text_decoration`, `flex`, `grid_template_columns`. That
+`box_shadow`, `text_decoration`, `flex`, `grid_template_columns`,
+`background_image`, `background_size`. That
 isn't a weaker `raw`: the property name is still checked and completable,
 and only the *value* is a CSS expression there is nothing to validate (a
 font stack, a transform list). Reach for them the same way you reach for
 `padding`.
+
+`line-height` has two methods rather than one, because it takes two kinds
+of value and the language has no overloading. Prefer **`line_height(1.5)`**:
+a unitless number inherits as a *ratio* and re-computes against each
+descendant's own font size. Reach for **`line_height_length(Length::px(24))`**
+when a design specifies a leading in absolute units — a length inherits as a
+computed length and will not track a child that resizes its text. Both write
+the same slot, so a later one simply replaces an earlier one.
 
 For anything the typed surface doesn't cover, escape hatches:
 
@@ -162,7 +182,9 @@ Spacing comes in three arities, and the name says which: the whole box
 (`padding_top`, `margin_left`, and the other six). There is no
 multi-value shorthand method, because there is nothing it would buy:
 `padding: 8px 16px` is `padding_y(..).padding_x(..)`, spelled with the
-methods you already have.
+methods you already have. The two axes cover all four edges between them
+— exactly what the shorthand covers — so the composed form also *resolves*
+like the shorthand wherever it meets one (see mixing arities, below).
 
 Borders match: `border(width, colour)` for all four edges,
 `border_top`/`border_right`/`border_bottom`/`border_left` for one, and
