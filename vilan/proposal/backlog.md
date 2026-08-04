@@ -3479,3 +3479,90 @@ binds `:48231` and collides with concurrent e2e legs under nextest
 48231–48234 across throughput.vl and realtime.vl; all migrated; the literal
 collision was reproduced pre-fix against held ports and the fixed tests
 survived the same scenario.]
+
+### Moved at the v0.27.0 cut (2026-08-04)
+
+#### A16. Bundle splitting — ARC COMPLETE 2026-08-04
+
+(Full lineage: filed as M–L user request 2026-07-24, proposal-first; the
+proposal drafted 2026-08-03 from two source sweeps; S1 --print-chunks shipped
+2026-08-03 as the measure-first gate; S2 emission shipped 2026-08-04 —
+`[entry.<name>] split = true`, partition after the single rename so chunk
+bodies are byte-identical to the single-file build, the runtime registry,
+`View.swap_split` degrading to `swap` with no chunk map, four plant-proven
+gates; S3 shipped same day — initial-route preload planted by the emitter
+before the swap mount, `chunk_error()` + the stuck-`pending()` fix, the
+generation guard on Draft::push's shape, the namespace sweep for stray
+chunks, the per-leg split-cost warning; S4 decisions — `run` ignores `split`
+in every form by the single-file-dev doctrine (fixing a three-way
+inconsistency), fullstack's server reads chunks.json, the playground is
+guarded at the source level because its `std_sources` is empty. Break-even
+remeasured at ≈6KB fixed cost per split leg — more than double S2's figure
+once the gate machinery rides along — so no in-tree example declares
+`split = true` and the take-up instrument is `--print-chunks`' verdict going
+positive on a real app. Records: bundle-splitting.md, complete.)
+
+#### A22. same-family style rules resolve by stylesheet order — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-04 by the A8 value-type slice, pre-existing) — atomic
+longhand and shorthand rules of one family were equally specific, resolving
+by the lexical sort over content-hashed class names. The measurement changed
+the design: the hazard was LIVE in two production sites (the website's
+`margin-left: auto` flex-push was dead), and one sat on the runtime-legal `+`
+merge path, which killed the resolve-at-build candidate (a split cannot emit
+from `add`). Shipped: an object-level family drop (a later shorthand clears
+its family's slots — a map removal, so `+` does it too) plus the `*.sX`
+selector marker riding B35's existing lexical sort so shorthands order ahead
+of longhands at identical specificity. Zero classes renamed — the re-mint
+permission went unspent. Family inventory grew inset/background/flex; `raw`
+participates by property name (border_none() IS raw). One documented hole:
+two longhands covering different parts of one family tie, zero instances.
+Record: ui-styling.md §0bis.4.
+
+#### B65. a capture of a LOANED subject can be consumed — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-04 by the B62 arc, pre-existing) — B60's "a body may
+only consume what it owns" had no CAPTURE twin: `if o is Some(let r) {
+sink(r) }` and `match &o { Some(let r) => sink(r) }` both compiled and
+double-destroyed. Shipped: collect_loaned_pattern_captures maps every
+capture bound by a loaned subject to that subject (all three loan forms),
+riding MoveScan so R11's per-instantiation scan covers it free; its own
+diagnostic steers to consuming the subject — "copy the payload" proved an
+impossible steer (no Clone/Copy exists; copying is implicit for data and
+forbidden for resources). Record: affine-moves.md §9.
+
+#### B66. a generic body's capture leaks at a resource instantiation — SHIPPED 2026-08-04, WIDENED
+
+(S–M; found 2026-08-04 by the B62 arc, pre-existing) — the filed capture
+case generalized to the honest rule: plan_scope's `dropped` set is exactly
+the teardowns a generic body cannot run, so the check asks about all of it —
+captures, let-locals, and the R2 overwrite position (`mut held = a; held =
+b`) found and closed in the same arc rather than filed. The compat sweep
+also proved B63 §8.2's claim that `map`/`is_some_and` were clean FALSE —
+closure-valued callees loan their arguments, so both leaked at a resource;
+pins corrected to assert rejection. Record: affine-moves.md §9.
+
+#### B67. branch-divergent moves leak — SHIPPED 2026-08-04
+
+(M; found 2026-08-04 by the B63 arc, pre-existing) — `pick(true, Some(a),
+Some(b))` with two `own` parameters moved on different branches compiled and
+destroyed nothing. The filed diagnosis (intersection merge wrong for
+leak-finding) was half wrong: intersection is exact for both questions GIVEN
+R7 — the defect was R7's reach cut by an over-broad R4 tail exemption.
+Shipped: the exemption replaced by `is`-refinement, with `or_else` and `or`
+proven legal in the design note before implementation (removing the
+exemption alone broke exactly those 2 of 1442 pins); the diagnostic reuses
+R7's ConditionalMove verbatim. Record: affine-moves.md §9.
+
+#### E34. the std::ui twin-surface parity gate — SHIPPED 2026-08-04
+
+(S; found 2026-08-04 by the A16 S2 arc) — a surface added to browser
+`std::ui` had to be manually mirrored or process builds broke at analysis.
+Shipped: each twin analyzed on its platform, surfaces read off the Program
+(module-scope bindings by source + declared types' members), divergences
+allowlisted with per-name reasons under the distilled rule — emitter-selected
+names are safe browser-only, user-bindable ones are the hazard. `ui` is the
+only twin today, and the twin inventory itself is gated so std cannot grow an
+ungated one. Fired correctly the same day on the A16 S3 surfaces — its
+designed collision, resolved by allowlisting with reasons. Record: the gate
+file's own header (crates/vilan-core/tests/std_twin_parity.rs).
