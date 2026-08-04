@@ -66,7 +66,7 @@ function = [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
            [ ":" type ] [ "borrows" IDENT ]
            ( block | ";" ) ;
 
-parameter  = [ "mut" | convention ] binder [ ":" type ] ;
+parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
 
@@ -92,6 +92,18 @@ combines with a convention, is not part of the signature (trait
 conformance ignores it), and is rejected on an `external fun` (no body).
 A resource cannot be taken `mut` (a resource never copies; take it
 `own`).
+
+A leading `...` marks a **spread parameter**: a call convention over an
+ordinary tuple parameter, where the call site writes the pack's elements
+out flat — `fun f(...items: T) { … }` is `fun f(items: T) { … }` with
+`f(a, b)` meaning `f((a, b))` (§5.9). It must be the **last** parameter
+(so at most one per signature), must declare its type, and takes a plain
+name binder. Unlike `mut` it **is** part of the signature, and it is
+rejected outside a free `fun`: on a closure literal, on a trait
+declaration or any `impl` member, and on an `external fun`. It never
+combines with a convention — the argument is a tuple the *call site*
+builds, so there is nothing to transfer or alias — but `mut` may precede
+it (`mut ...items: T`).
 
 ### Structs and enums
 
@@ -299,7 +311,7 @@ struct-init   = IDENT [ generic-args ]
 init-field    = IDENT [ "=" expression ] ;   (* shorthand: name alone *)
 closure       = ( "||" | "|" [ closure-param { "," closure-param } [ "," ] ] "|" )
                 [ ":" type ] expression ;
-closure-param = parameter ;   (* the same rule as a function's *)
+closure-param = parameter ;   (* the same rule as a function's, less "..." *)
 ```
 
 Two consequences of the tier split are normative:

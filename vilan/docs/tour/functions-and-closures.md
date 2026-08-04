@@ -57,6 +57,42 @@ fun main() {
 }
 ```
 
+## Taking any number of arguments
+
+Prefix the last parameter with `...` and callers write its elements out
+flat instead of building a tuple. The parameter itself is an ordinary
+tuple parameter — `fun f(...items: T)` is `fun f(items: T)`, and
+`f(a, b)` is `f((a, b))` — so `T` is the whole **pack**, a tuple of
+however many arguments arrived, and its bound decides how many are
+allowed:
+
+```vilan
+import std::print;
+
+// `(..)` admits any arity, including none at all.
+fun how_many<T: (..)>(...items: T): i32 {
+	1
+}
+
+// A fixed parameter first; the spread takes whatever is left.
+fun first_of(head: i32, ...rest: (i32, i32)): i32 {
+	head
+}
+
+fun main() {
+	print(how_many());
+	print(how_many("a", true, 3));
+	print(first_of(7, 8, 9));
+}
+```
+
+`T: (2..)` would reject `how_many(1)` with the arity bound's own error,
+and `T: (..: Display)` would require every argument to be printable.
+Since the arguments are collected into a value the *call site* builds,
+`...` never combines with `own`, `&`, or `&mut`; `mut ...items` is fine,
+and means what `mut` always means. `...` belongs to a plain `fun` — not
+to a closure, a trait method, an `impl` member, or an `external fun`.
+
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes

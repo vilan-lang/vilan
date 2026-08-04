@@ -86,7 +86,9 @@ their declaration.
 A `let` may also redeclare a name **within the same scope**: the later
 binding shadows the earlier one from its own declaration point onward,
 while uses before that point keep the earlier binding (parameters —
-`mut` or not — and loop/pattern bindings are shadowable the same way). Visibility starts at
+`mut`, spread, or plain — and loop/pattern bindings are shadowable the same way). A
+spread parameter binds one name to the whole pack, like any other
+parameter; it declares no per-element names. Visibility starts at
 the **end** of the declaring statement, so an initializer never reads the
 binding it declares: in `let x = x + 1;` the right-hand `x` is the
 previous `x` (an enclosing or earlier same-scope binding) and an error

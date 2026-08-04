@@ -191,7 +191,31 @@ declared range (endpoints inclusive), and every element must satisfy the
 element bound. A generic parameter forwarded into a tuple-bounded
 position satisfies it only through its own declared tuple bound: a
 contained arity range whose element bound names the same trait or a
-subtrait. *`keyof` and spread parameters are recorded future work.*
+subtrait.
+
+A **spread parameter** `...items: T` is a *call convention* over an
+ordinary tuple parameter — the call site writes the pack's elements out
+flat, and they are collected into that one tuple argument:
+
+```vilan,fragment
+fun log<T: (..: Display)>(...items: T)      //  log(1, "hi")  ==  log((1, "hi"))
+fun gather<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T>
+```
+
+`T` is the **pack** — the tuple of the collected arguments' types — not
+each element's type; a uniform requirement is spelled as the element
+bound. The callee side is unchanged in every respect, so a spread
+parameter's legal call arities are exactly the arities its declared type
+admits, by the rule above: `(2..)` refuses a one-argument call, and `(..)`
+accepts a zero-argument one (the empty pack `()`). A spread parameter is
+what makes 0- and 1-arity tuple *values* reachable; tuple types already
+admit them. Since the convention lives on the declaration, a spread
+function used as a **value** has its tuple type, and is called with a
+tuple.
+
+Grammar and the positions where `...` is rejected: §3.3. *`keyof`, and
+spreading a tuple INTO a spread parameter (`f(..existing)`, which needs
+the tuple-value spread), are recorded future work.*
 
 **Positional access** `t.0`, `t.1` (chaining as `t.0.1`) types as that
 element and, through a `mut` binding, assigns it. Tuples store flat: a
