@@ -9,5 +9,9 @@
 # Line 2: belt and braces — the byte-identity corpus is exempt from any
 # filter, ever. Its `.js` goldens are compared byte-for-byte against fresh
 # compiler output, so no filter may ever touch them.
+#
+# Line 3: the same exemption for the split-emission fixture and its goldens
+# (proposal/bundle-splitting.md S2), compared the same byte-for-byte way.
 * text=auto eol=lf
 vilan/test/** -text
+crates/vilan-cli/tests/split/** -text
