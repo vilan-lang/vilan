@@ -186,6 +186,15 @@ fn corpus_absent_constructs() -> Vec<(String, String)> {
             "spread_mapped",
             "fun f<T: (2..)>(...sources: (U in T: Signal<U>)): Signal<T> { gather(sources) }",
         ),
+        // Tuple-value spreads (variadic-generics.md §T): two `.` control tokens
+        // where an element begins, in every position the rule admits — leading,
+        // trailing, interleaved, twice, alone, and at a call site.
+        ("spread_value_lead", "fun g(): i32 { let t = (..a, b); 0 }"),
+        ("spread_value_trail", "fun h(): i32 { let t = (b, ..a); 0 }"),
+        ("spread_value_mid", "fun i(): i32 { let t = (b, ..a, c); 0 }"),
+        ("spread_value_twice", "fun j(): i32 { let t = (..a, ..b); 0 }"),
+        ("spread_value_lone", "fun k(): i32 { let t = (..a); 0 }"),
+        ("spread_value_call", "fun l(): i32 { pack(..pair, 7) }"),
         // A generic default and a `type` binder default together.
         ("generic_defaults", "struct Cell<T = Self, type U = i32> { value: T }"),
         // Import/use path shapes: a top-level set, a deeply nested set, a use set.

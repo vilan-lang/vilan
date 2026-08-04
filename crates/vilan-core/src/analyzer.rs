@@ -1607,6 +1607,17 @@ pub struct Analyzer<'src> {
     // stays because the LSP re-analyzes per keystroke and an unbounded entity
     // per deferral is a real cost.
     spread_packs: HashMap<Id, Vec<Id>>,
+    // Expression ids written as a tuple-value spread `..e`
+    // (variadic-generics.md §T). The spread FORWARDS to its operand's entity
+    // rather than wrapping it, so this set is the whole of the marker: the
+    // tuple's type rule concatenates a marked element's elements instead of
+    // nesting it, and `check_tuple_spreads` reports every marked id whose
+    // operand is not a tuple, or which never landed in a tuple construction at
+    // all.
+    spread_elements: HashSet<Id>,
+    // The `..e` span (including the dots) of each marked id, for diagnostics —
+    // the operand's own span covers `e` alone.
+    spread_spans: HashMap<Id, Span>,
     // The trait a bound call resolved through (`value.tag()` where `T: Marker`
     // found `tag` in `Marker`), keyed by call id. The OnConstraint emission
     // dispatches on THAT trait's surface — override, else default — so an
@@ -2065,6 +2076,8 @@ impl<'src> Analyzer<'src> {
             static_subject_bindings: HashMap::new(),
             own_generic_call_bindings: HashMap::new(),
             spread_packs: HashMap::new(),
+            spread_elements: HashSet::new(),
+            spread_spans: HashMap::new(),
             bound_dispatch_traits: HashMap::new(),
             prepped_trait_impls: Vec::new(),
             conformance_signature_checks: Vec::new(),
@@ -2326,6 +2339,121 @@ impl<'src> Analyzer<'src> {
             return true;
         }
         false
+    }
+
+    /// Every tuple-value spread `..e` must be (a) an element of a tuple
+    /// construction and (b) a spread of a tuple — and an ABSTRACT pack may only
+    /// be the construction's lone part (variadic-generics.md §T.2/§T.4).
+    ///
+    /// One post-solve sweep rather than a check at each site that could host a
+    /// `..`: the type rule reads the mark in exactly one place, so a spread that
+    /// reaches no tuple construction is not something a call path can be trusted
+    /// to notice — a call to a function with no spread parameter, to a closure,
+    /// to a variant constructor, each resolve down their own road. Asking
+    /// afterwards which marks landed in a tuple covers all of them at once, and
+    /// cannot be dodged by a road not yet built.
+    fn check_tuple_spreads(&mut self) {
+        if self.spread_elements.is_empty() {
+            return;
+        }
+        // Every id that is an element of some tuple construction — written, or
+        // synthesized by a spread call site's collection (§S.1), which is the
+        // desugar that makes `f(..pair)` legal.
+        let mut in_a_construction: HashSet<Id> = HashSet::new();
+        // Constructions holding a spread, with their element count: an abstract
+        // pack is admissible only where it is the lone part.
+        let mut constructions: Vec<Vec<Id>> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            let Expr::Tuple(item_ids) = expr else {
+                continue;
+            };
+            in_a_construction.extend(item_ids.iter().copied());
+            if item_ids.iter().any(|id| self.spread_elements.contains(id)) {
+                constructions.push(item_ids.clone());
+            }
+        }
+
+        let mut marked: Vec<Id> = self.spread_elements.iter().copied().collect();
+        marked.sort_by_key(|id| id.0);
+        let mut errors: Vec<(Span, String)> = Vec::new();
+        for id in marked {
+            let span = self
+                .spread_spans
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN));
+            if !in_a_construction.contains(&id) {
+                errors.push((
+                    span,
+                    "`..` splices a tuple's elements into a tuple construction, so it \
+                     belongs inside `(…)` — or at a call to a spread parameter, which \
+                     builds one. Write `f((..pair))` to pass the concatenation as a \
+                     single tuple argument"
+                        .to_string(),
+                ));
+                continue;
+            }
+            // A bare name's own expr id usually carries no type entry — the type
+            // lives on the binding it names — so the place lookup is the fallback,
+            // exactly as every other post-solve reader of an operand's type does.
+            let Some(operand_type) = self.type_of_expr(id).or_else(|| self.place_value_type(id))
+            else {
+                continue;
+            };
+            // A type the solver never settled is another diagnostic's business.
+            if matches!(operand_type, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
+            let operand_type = self.expand_mapped(operand_type);
+            if let Type::Generic(constraint_id) = operand_type {
+                if !self.tuple_bounds.contains_key(&constraint_id) {
+                    let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                    errors.push((span, Self::not_a_tuple_message(&label)));
+                    continue;
+                }
+                // An abstract pack: a tuple whose elements are not yet a
+                // sequence, so a concatenation with anything else has no type to
+                // name until the arity is known. Alone, there is nothing to
+                // concatenate and the construction IS the pack.
+                let alone = constructions
+                    .iter()
+                    .filter(|items| items.contains(&id))
+                    .all(|items| items.len() == 1);
+                if !alone {
+                    let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                    errors.push((
+                        span,
+                        format!(
+                            "'{label}' is a tuple of unknown arity here, so its elements \
+                             cannot be concatenated with others: the body is checked once, \
+                             before any call fixes the arity. Spread it ALONE (`(..pack)`) to \
+                             forward the whole pack, or take a concrete tuple type"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            if !matches!(operand_type, Type::Tuple(_)) {
+                let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                errors.push((span, Self::not_a_tuple_message(&label)));
+            }
+        }
+        for (span, msg) in errors {
+            self.diagnostics.push(Error {
+                note: None,
+                span,
+                msg,
+            });
+        }
+    }
+
+    /// The one wording for "this is not a tuple", so the value spread and any
+    /// later reader of the rule cannot drift apart.
+    fn not_a_tuple_message(label: &str) -> String {
+        format!(
+            "cannot spread '{label}': `..` splices the ELEMENTS of a tuple into the \
+             construction, so its operand must be a tuple"
+        )
     }
 
     /// B12: every recorded generic instantiation must SATISFY its parameter's
@@ -13954,12 +14082,27 @@ impl<'src> Analyzer<'src> {
         if let Node::LiftGroup(inner) = &node.0 {
             return self.walk_expr_node(inner, scope_id);
         }
+        // `..e` FORWARDS like `const` does — the operand is the entity, and the
+        // spread is a mark on it (variadic-generics.md §T.5). That is what makes
+        // the feature a type rule and nothing else: every pass after this one —
+        // clone sites, escapes, const reach, and emission — sees the very
+        // expression a nested tuple element would have been, and only
+        // `infer_type_path` reads the mark, to concatenate instead of nest.
+        if let Node::Spread(operand) = &node.0 {
+            let operand_id = self.walk_expr_node(operand, scope_id);
+            self.spread_elements.insert(operand_id);
+            self.spread_spans.insert(operand_id, node.1);
+            return operand_id;
+        }
         let id = self.new_entity_id();
 
         let entity = match &node.0 {
             // Handled by the forwarding arm above; a `Const` node never
             // reaches the entity match.
             Node::Const(..) => unreachable!("`const` forwards to its inner expression"),
+            // Likewise: `..e` forwards to its operand and marks it, so a
+            // `Spread` node never reaches the entity match.
+            Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
             // Elements desugar to their view chains before analysis
             // (elements::rewrite_items, at every lift site); one reaching the
             // entity match is a pass bug, degraded like a parse error rather
@@ -17330,14 +17473,55 @@ impl<'src> Analyzer<'src> {
             // `i32`, matching `List.len()`.
             Expr::ArrayLen(_, _) => self.primitive_struct_type("i32"),
             Expr::Tuple(item_ids) => {
+                // A construction that is EXACTLY one spread is the concatenation
+                // of one: its type is the operand's, unchanged. This is the only
+                // shape in which an abstract pack may be spread — with nothing to
+                // concatenate it with, no symbolic concatenation is needed
+                // (variadic-generics.md §T.4), and it is the shape `f(..items)`
+                // desugars to, which is how a pack is forwarded to another spread
+                // function.
+                if let [only] = item_ids[..] {
+                    if self.spread_elements.contains(&only) {
+                        return self.infer_type_inner(
+                            only,
+                            &constraint,
+                            substitution_context,
+                            exprs_seen,
+                        );
+                    }
+                }
                 let constraint_items = match constraint {
                     Type::Tuple(items) => items.clone(),
                     _ => Vec::new(),
                 };
-                let mut items = Vec::with_capacity(item_ids.len());
-                for (i, id) in item_ids.clone().iter().enumerate() {
+                let mut items: Vec<TypeId> = Vec::with_capacity(item_ids.len());
+                for id in item_ids.clone().iter() {
+                    // A spread contributes the ELEMENTS of its operand's tuple
+                    // type, so the constraint cursor is the count of slots
+                    // produced so far, not the element's index. Its operand takes
+                    // no constraint of its own: the operand's arity is what says
+                    // where in the expected tuple it lands, so there is nothing
+                    // to slice until it is known.
+                    if self.spread_elements.contains(id) {
+                        let inferred = self.infer_type_inner(
+                            *id,
+                            &Type::Unknown,
+                            substitution_context,
+                            exprs_seen,
+                        );
+                        if matches!(inferred, Type::Unresolved) {
+                            return Type::Unresolved;
+                        }
+                        // A non-tuple operand — and an ABSTRACT pack, which is a
+                        // tuple whose elements are not yet a sequence — contributes
+                        // nothing here; `check_tuple_spreads` reports which it was.
+                        if let Type::Tuple(elements) = self.expand_mapped(inferred) {
+                            items.extend(elements);
+                        }
+                        continue;
+                    }
                     let constraint_item = constraint_items
-                        .get(i)
+                        .get(items.len())
                         .map(|x| x.get_type(self))
                         .unwrap_or(Type::Unknown);
                     let inferred = self.infer_type_inner(
@@ -24574,6 +24758,12 @@ pub struct Program<'src> {
     // layout — which elements are themselves tuples (and so are spread, not nested)
     // — resolving any generic element through the active monomorphization.
     pub expr_type_ids: HashMap<Id, TypeId>,
+    /// Element expressions written as a tuple-value spread `..e`
+    /// (variadic-generics.md §T). Such an element splices because it was
+    /// WRITTEN as one — the type rule already proved its operand a tuple — so
+    /// its emission asks for no type lookup and none can go missing. A plain
+    /// element still splices by TYPE (flat storage), which is the older rule.
+    pub spread_elements: HashSet<Id>,
     // The next unused entity id. Post-analysis passes (the context threading
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
@@ -28110,6 +28300,7 @@ fn analyze_over_world<'src>(
     analyzer.check_rpc_signatures();
     analyzer.check_expose_fields();
     analyzer.check_generic_bound_satisfaction();
+    analyzer.check_tuple_spreads();
     // The HMR transfer bound at `dev::stash`/`dev::take` call sites (`hmr.md` §4);
     // inert unless `std::dev` is loaded. Runs inside `analyze()` (like the S2a
     // classification) so both the CLI and the LSP/test pipelines get it.
@@ -28694,6 +28885,7 @@ fn analyze_over_world<'src>(
         expr_types,
         declaration_labels,
         expr_type_ids,
+        spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::new(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),

@@ -222,13 +222,13 @@ chain   = path { call-suffix | postfix } ;
 path    = ( IDENT generic-args ␣"::"  (* generic static head *)
           | atom )
           { "::" IDENT } ;
-call-suffix = [ generic-args ] "(" [ expression { "," expression } [ "," ] ] ")" ;
+call-suffix = [ generic-args ] "(" [ entry { "," entry } [ "," ] ] ")" ;
 member  = NUMBER                          (* tuple index: .0 *)
         | IDENT [ call-suffix ] ;         (* field / ONE fused method call *)
 postfix = "." member
         | "[" expression "]"             (* index *)
         | "!"                            (* try-assert, §5.10 *)
-        | "(" [ expression { "," expression } [ "," ] ] ")"
+        | "(" [ entry { "," entry } [ "," ] ] ")"
                                           (* direct call on the chain result *)
         | "?." member ;                  (* lift link, §5.10 *)
 
@@ -236,7 +236,9 @@ atom    = literal | IDENT | IDENT generic-args
         | "(" expression ")" | tuple | list
         | tuple-comprehension | macro-invocation | macro-block
         | element ;
-tuple   = "(" expression "," expression { "," expression } [ "," ] ")" ;
+tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
+entry   = spread | expression ;
+spread  = ".." expression ;
 list    = "[" [ expression { "," expression } [ "," ] ] "]" ;
 tuple-comprehension = "(" IDENT "in" secondary-expr "=>" expression ")" ;
 
@@ -258,6 +260,15 @@ chain's result, calling a closure-typed value
 through the following plain postfixes up to the next `?.` or `!`:
 `a?.b.c()!` lifts `b.c()` into the container, then try-asserts the
 result (§5.10).
+
+A leading `..` marks a **tuple-value spread** (§5.9). It is recognized
+only where an *entry* begins — a tuple construction's entry, or a call
+argument — so `..` after an expression is unaffected and remains the
+member-access dots it has always been (`(1..3, x)` is not a spread). A
+tuple construction whose only entry is a spread is still a tuple, not a
+parenthesized group: `(..a)` is the concatenation of one, and `(e)` is a
+group as before. There is no type-level spread; `(..T, U)` does not
+parse.
 
 An **element** appears only in atom position, where `<` begins no other
 expression; after an operand, `<` remains a comparison (`x < <div/>` is

@@ -213,9 +213,38 @@ admit them. Since the convention lives on the declaration, a spread
 function used as a **value** has its tuple type, and is called with a
 tuple.
 
-Grammar and the positions where `...` is rejected: §3.3. *`keyof`, and
-spreading a tuple INTO a spread parameter (`f(..existing)`, which needs
-the tuple-value spread), are recorded future work.*
+Grammar and the positions where `...` is rejected: §3.3.
+
+A **tuple-value spread** `..e` is an entry of a tuple construction that
+contributes the *elements* of `e`'s tuple type rather than `e` itself, so
+the construction's type is the **concatenation** of its entries, in
+written order:
+
+```vilan,fragment
+let pair = (1, 2);
+let lead = (..pair, 3);      //  (i32, i32, i32)
+let mid  = (0, ..pair, 9);   //  (i32, i32, i32, i32)
+let both = (..pair, ..pair); //  (i32, i32, i32, i32)
+```
+
+Spreads may appear in any position, in any number, mixed freely with
+ordinary entries, and a construction whose only entry is a spread is
+still a construction (`(..pair)` is the concatenation of one). The
+operand must be a tuple; anything else is an error naming the type.
+Concatenation is one level deep — a spread operand's own nested elements
+keep their nesting, since it contributes its *elements*, not its slots.
+
+A spread is also a **call argument**, which is what lets a pack be
+forwarded: since `f(a, b)` means `f((a, b))`, `f(..pair)` means
+`f((..pair))`, and the arity bound is checked on the concatenation.
+Passing a spread to a function that has no spread parameter builds no
+tuple and is an error; write the construction (`f((..pair))`) instead.
+
+A tuple that is still an abstract generic pack has no known element
+sequence while the body is checked, so it may be spread only where there
+is nothing to concatenate it with — alone, as `inner(..items)`, which is
+how a pack is forwarded to another spread function. *`keyof` and the
+type-level spread `(..T, U)` are recorded future work.*
 
 **Positional access** `t.0`, `t.1` (chaining as `t.0.1`) types as that
 element and, through a `mut` binding, assigns it. Tuples store flat: a

@@ -506,6 +506,14 @@ pub enum Node<'src> {
         Spanned<NodeList<'src>>,
     ),
     Tuple(NodeList<'src>),
+    // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
+    // inside a tuple construction it contributes the ELEMENTS of `e`'s tuple
+    // type rather than `e` itself, so the construction's type is the
+    // concatenation. Written only where an element begins — a tuple
+    // construction's element or a call argument (which a spread parameter
+    // collects into a tuple construction) — so a `..` after an expression is
+    // still the member-access dots it has always been.
+    Spread(Box<Spanned<Self>>),
     // A prefix operator: `!x` or `-x`.
     Unary(char, Box<Spanned<Self>>),
     // `&x` / `&mut x` — take a (readonly / writable) view of a place. The bool is
@@ -668,6 +676,7 @@ impl<'src> Node<'src> {
             | Node::TryAssert(inner)
             | Node::Lifted(inner)
             | Node::LiftGroup(inner)
+            | Node::Spread(inner)
             | Node::Unary(_, inner) => visit(inner),
             Node::LiftRegion(steps, body) => {
                 for (step, _) in steps {

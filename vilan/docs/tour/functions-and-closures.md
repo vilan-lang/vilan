@@ -93,6 +93,37 @@ Since the arguments are collected into a value the *call site* builds,
 and means what `mut` always means. `...` belongs to a plain `fun` — not
 to a closure, a trait method, an `impl` member, or an `external fun`.
 
+### Passing a pack on
+
+Since `f(a, b)` means `f((a, b))`, a `..` spread at the call site means
+`f((..pair))` — the arguments you already hold, written out flat. That is
+how a pack is forwarded to another spread function, and it is not the
+same as passing the tuple itself, which would arrive as a pack of one:
+
+```vilan
+import std::print;
+
+fun how_many<T: (..)>(...items: T): i32 {
+	1
+}
+
+fun forward<T: (..)>(...items: T): i32 {
+	how_many(..items)
+}
+
+fun main() {
+	let pair = (1, 2);
+	print(how_many(..pair));       // a pack of 2
+	print(how_many(..pair, 3));    // a pack of 3
+	print(forward(1, 2, 3));       // a pack of 3, passed on
+}
+```
+
+The bound is checked on what the spread actually contributes, so a
+`T: (3..)` would reject `how_many(..pair)` for having only two. A spread
+at a call to a function *without* a spread parameter builds no tuple and
+is an error — write the tuple yourself (`takes_a_tuple((..pair))`).
+
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes

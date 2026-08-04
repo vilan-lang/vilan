@@ -1450,11 +1450,15 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// `( expr, … )` argument list (allow-trailing), carrying its own `(`..`)` span.
+    /// An argument may be a spread (`f(..pair)`) — a spread parameter collects the
+    /// arguments into a tuple construction, so the spread lands inside one
+    /// (variadic-generics.md §T.6); anywhere else the analyzer refuses it.
     fn parse_argument_list(&mut self) -> Option<Spanned<NodeList<'src>>> {
         let start = self.position;
         self.expect_ctrl('(')?;
-        let arguments =
-            self.comma_list(Self::parse_expression, |parser| parser.peek_is_ctrl(')'))?;
+        let arguments = self.comma_list(Self::parse_element_or_spread, |parser| {
+            parser.peek_is_ctrl(')')
+        })?;
         self.expect_ctrl(')')?;
         Some((arguments, self.span_from(start)))
     }
@@ -1707,6 +1711,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.attempt(|parser| {
             let start = parser.position;
             parser.expect_ctrl('(')?;
+            // A leading `..` settles the tuple/group fork on the spot: `..e` is not
+            // an expression, so a group cannot hold one, and the ≥2-element minimum
+            // that exists only to keep `(e)` a group does not apply
+            // (variadic-generics.md §T.3). `(..pair)` is the concatenation of one —
+            // the shape `f(..pair)` desugars to.
+            if let Some(spread) = parser.parse_spread_element() {
+                let mut items = vec![spread];
+                while parser.eat_ctrl(',') {
+                    items.push(parser.parse_element_or_spread()?);
+                }
+                parser.expect_ctrl(')')?;
+                return Some((Node::Tuple(items), parser.span_from(start)));
+            }
             let first = parser.parse_expression()?;
             if parser.peek_is_ctrl(',') {
                 // A tuple is `expr (',' expr)*` (≥2 elements) with NO trailing comma
@@ -1715,7 +1732,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 // either). Every `,` here must be followed by an expression.
                 let mut items = vec![first];
                 while parser.eat_ctrl(',') {
-                    items.push(parser.parse_expression()?);
+                    items.push(parser.parse_element_or_spread()?);
                 }
                 parser.expect_ctrl(')')?;
                 Some((Node::Tuple(items), parser.span_from(start)))
@@ -1729,6 +1746,48 @@ impl<'a, 'src> Parser<'a, 'src> {
                     Some(first)
                 }
             }
+        })
+    }
+
+    /// One entry of a tuple construction or an argument list: a spread (`..e`) or
+    /// an ordinary expression.
+    fn parse_element_or_spread(&mut self) -> Option<Spanned<Node<'src>>> {
+        match self.parse_spread_element() {
+            Some(spread) => Some(spread),
+            None => self.parse_expression(),
+        }
+    }
+
+    /// `..e` — a tuple-value spread, recognized ONLY where an element begins
+    /// (variadic-generics.md §T.1). That position, not adjacency, is what
+    /// separates it from the member-access dots: `(1..3, x)` starts its first
+    /// element with `1`, so it never reaches here and parses exactly as it did
+    /// before this feature existed. Declines (consuming nothing) when the two
+    /// dots are absent.
+    fn parse_spread_element(&mut self) -> Option<Spanned<Node<'src>>> {
+        if !(self.peek_is_ctrl('.') && self.peek_at_is_ctrl(1, '.')) {
+            return None;
+        }
+        self.attempt(|parser| {
+            let start = parser.position;
+            parser.bump();
+            parser.bump();
+            // `...e` in a value position is the parameter marker written where a
+            // value spread belongs. Consume the third dot and name the difference,
+            // rather than reading `..` and then failing to parse `.e`.
+            if parser.eat_ctrl('.') {
+                parser.errors.push(ParseError {
+                    span: parser.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "`...` marks a spread PARAMETER, on a declaration; a tuple-value \
+                         spread is `..` — write `(..pair, x)`",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            let operand = parser.parse_expression()?;
+            Some((Node::Spread(Box::new(operand)), parser.span_from(start)))
         })
     }
 
@@ -4128,6 +4187,52 @@ mod tests {
                 assert!(matches!(arguments.0[0].0, Node::Accessor("a")));
             }
             other => panic!("expected a Call, got {other:?}"),
+        }
+    }
+
+    /// `..e` is a spread only where an ELEMENT BEGINS — a tuple construction's
+    /// entry and a call argument (variadic-generics.md §T.1). Position, not
+    /// adjacency, is the disambiguator, and the leading `..` also settles the
+    /// tuple/group fork, which is what makes the lone `(..a)` a construction.
+    #[test]
+    fn a_leading_dot_dot_marks_a_spread_element() {
+        let spread_at = |node: &Node, index: usize| match node {
+            Node::Tuple(items) => matches!(items[index].0, Node::Spread(_)),
+            other => panic!("expected a Tuple, got {other:?}"),
+        };
+        assert!(spread_at(&expr("(..a, b)").0, 0), "leading");
+        assert!(spread_at(&expr("(b, ..a)").0, 1), "trailing");
+        assert!(spread_at(&expr("(b, ..a, c)").0, 1), "interleaved");
+        let twice = expr("(..a, ..b)");
+        assert!(spread_at(&twice.0, 0) && spread_at(&twice.0, 1), "two");
+        // A lone spread is a Tuple, not the group `(e)` would have dissolved to.
+        assert!(spread_at(&expr("(..a)").0, 0), "lone");
+        match &expr("f(..a)").0 {
+            Node::Call(_, _, arguments) => {
+                assert!(matches!(arguments.0[0].0, Node::Spread(_)));
+            }
+            other => panic!("expected a Call, got {other:?}"),
+        }
+    }
+
+    /// The ruling's whole value is what it leaves ALONE. `..` after an
+    /// expression is still the member-access dots it has always been: `(1..3,
+    /// x)` parses — silently, as it did before the spread existed — into a
+    /// member chain over `1` whose first link is an error node, and reaches no
+    /// spread branch because its element does not begin with `..`. Vilan has no
+    /// range operator; if one ever lands, this is the shape it must not break.
+    #[test]
+    fn dots_after_an_expression_are_still_member_access() {
+        match &expr("(1..3, x)").0 {
+            Node::Tuple(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(
+                    !matches!(items[0].0, Node::Spread(_)),
+                    "`1..3` is not a spread — the element does not begin with `..`"
+                );
+                assert!(matches!(items[0].0, Node::MemberAccessor(_, _)));
+            }
+            other => panic!("expected a Tuple, got {other:?}"),
         }
     }
 

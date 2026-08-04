@@ -143,6 +143,11 @@ The *only* way nested becomes flat, in both type and value position:
 (..a, b)       // value: a = (x, y)  ->  (x, y, b)
 ```
 
+The **value** form is SHIPPED — §T below, which settles everything these two
+lines left open (the `..` ambiguity, the positions, abstract packs, the
+non-tuple error). The **type** form is not built; §T.7 records why and what it
+would take.
+
 ---
 
 ## Inference
@@ -375,19 +380,22 @@ holds of tuples.
 
 ## S.4 The other direction — spreading a tuple INTO a spread parameter
 
-**Deferred, refused with a steer, not silently mis-parsed.**
+**SHIPPED 2026-08-04, one slice later — §T.6.** This section shipped the
+**callee** direction only, and refused `f(..existing)` because under the
+desugar it is exactly `f((..existing))`: a **tuple-value spread**, which
+§Surface syntax describes (`(..a, b)`) and which *was never built* — no spread
+node in the AST, no parser production, no type rule. That was the correct read,
+and it named the next slice precisely.
 
-`f(..existing)` is the natural companion — forward a pack you already hold — and
-under the desugar it is exactly `f((..existing))`. That is a **tuple-value
-spread**, which §Surface syntax describes (`(..a, b)`) and which *was never
-built*: there is no spread node in the AST, no parser production, no type rule
-for it. Shipping the caller direction therefore means shipping tuple-value
-spread first — its own slice, with its own type rule (the concatenation of two
-tuple types) and its own independent uses (`combine((..pair, extra))`).
-
-So v1 ships the **callee** direction only. Forwarding a pack works through the
-tuple form (`inner(items)` against a tuple parameter); forwarding it to another
-*spread* function waits for the tuple-value spread.
+The refusal, honestly labelled: it was a **plain parse failure**, not the steer
+this section's prose claimed ("found '.' expected an expression"), and its pin
+was the only §S refusal asserted with a bare `assert_fails` rather than its
+message. §T built the missing piece, and `f(..existing)` now works by the route
+this section predicted — the call site's collection puts the spread inside the
+tuple it was already building, and nothing in §S changed to allow it. The pin
+became a working one; the shapes that are still wrong (a spread at a call to a
+function with **no** spread parameter, a spread of a non-tuple) get real steers
+now, which is what this section wanted all along.
 
 ## S.5 Conventions — refused, and for a reason that outlives v1
 
@@ -398,8 +406,9 @@ constructs**. There is no caller-side tuple to transfer ownership of, and none
 to alias — so `own` has nothing to move and a view has nothing to point at.
 This is a different reason from `mut`'s exclusion (`mut-parameters.md` §2, where
 the question "which thing is mutable" stops being one question), and unlike a
-scoping decision it does not expire: even once §S.4 lands, `f(..existing)` still
-*builds* a fresh tuple, so there is still nothing for a convention to name.
+scoping decision it does not expire — confirmed by §T, which landed §S.4:
+`f(..existing)` still *builds* a fresh tuple (it emits `f([...existing])`), so
+there is still nothing for a convention to name.
 Conventions on the individual arguments are unaffected — they are ordinary
 expressions.
 
@@ -518,3 +527,307 @@ Two bugs the work found and fixed on the way:
 - The parser's spread refusals needed the **inferred** convention, not just the
   written prefix: `...items: &T` takes its `Ref` from the type. Pinned
   separately from the prefix cases.
+
+---
+
+# §T Tuple-value spread
+
+Status: SHIPPED 2026-08-04 (backlog B3's next slice, the one §S.4 named).
+§Surface syntax gave this feature **one line** — `(..a, b)  // value: a = (x, y)
+-> (x, y, b)` — which settles the spelling and one position and nothing else.
+This section settles the rest and records the build. Where §S was settled by
+*desugar*, §T is settled by **one type rule**: a tuple construction's type is
+the concatenation of its parts. Every ruling below is read off that rule, and
+the feature's whole implementation is that rule plus a parser production — no
+new emission, no new type, no new pass over the tree.
+
+## T.1 The spelling, and why `..` needs no disambiguation
+
+`..` is two `.` control tokens. The lexer has no `..` and no `...`; both of the
+language's existing spreads spell themselves out of separate dots
+(`parse_tuple_bound`, `eat_spread`), and this one does too.
+
+**Vilan has no range operator.** Probed rather than assumed: `0..3` is not an
+expression anywhere — `let r = 0..3` and `for i in 0..3` both fail today. The
+`..` in expression position was simply unclaimed, and the ambiguity this slice
+was expected to resolve does not exist.
+
+What does exist, and is the real hazard, is that a **leading dot silently
+absorbs dots**: `(1..3, x)` parses today as a two-element tuple whose first
+element is a member chain over `1` with an error link, *emitting no parse error
+at all* (the diagnostic comes later, from the analyzer). So the ruling is by
+**position, not adjacency**:
+
+> `..` is a spread only where an **element begins** — an entry of a tuple
+> construction, or a call argument. It is recognized *before* the element's
+> expression is parsed, so an expression that starts with anything else can
+> never reach it.
+
+`(1..3, x)` therefore starts its first element with `1`, never reaches the
+spread branch, and parses exactly as it did before this feature existed. That is
+pinned in the parser's own tests, because the value of the ruling is precisely
+that it left something alone.
+
+Two consequences worth stating:
+
+- **What this costs a future range operator.** An infix or postfix range
+  (`1..3`, `1..`) stays available — those begin with an expression. A *prefix*
+  range (`..end`) is now claimed inside a tuple construction and an argument
+  list. That is the deliberate trade: the spread is the older design, and it is
+  the one with a caller.
+- **No adjacency check**, matching `eat_spread` and `parse_tuple_bound` — the
+  house idiom for a multi-dot marker. Tightening one of the three in isolation
+  would be a worse inconsistency than the sloppiness it removes.
+
+`...e` written where a value spread belongs is its own steer rather than a
+`..` followed by a broken expression: *"`...` marks a spread PARAMETER, on a
+declaration; a tuple-value spread is `..`"*. The two markers are one dot apart
+and one is the sibling feature, so the confusion is the likely one.
+
+## T.2 The type rule: concatenation
+
+Each entry of a tuple construction contributes a **sequence** of element types:
+
+- an ordinary entry contributes itself — one slot;
+- a spread `..e` contributes **the elements of `e`'s tuple type**, in order.
+
+The construction's type is the concatenation, in written order; its arity is the
+sum. Bidirectional inference follows: an expected tuple type is sliced by the
+**count of slots produced so far**, not by the entry's index, so an annotation
+still reaches the entries after a spread. A spread's operand takes no constraint
+of its own — its arity is what decides where the following entries land in the
+expected tuple, so there is nothing to slice until it is known.
+
+The operand must be a tuple. Anything else is refused, naming the type:
+
+> `cannot spread 'i32': `..` splices the ELEMENTS of a tuple into the
+> construction, so its operand must be a tuple`
+
+A **mapped** pack (`(U in T: Signal<U>)`) is a tuple once its source is
+concrete, and is expanded before the question is asked — so a mapped pack
+spreads like any other.
+
+## T.3 Positions: all of them, and the lone spread
+
+Leading, trailing, interleaved, and **any number** of spreads, freely mixed with
+ordinary entries. Decided rather than inherited: concatenation is
+position-independent and associative, and the emission is a JS array literal
+whose splices may appear anywhere in it. A rule against interleaving or against
+a second spread would have no mechanism behind it — it would be a restriction
+invented to look careful.
+
+```vilan
+(..a, x)        (x, ..a)        (x, ..a, y)        (..a, ..b)
+```
+
+**A construction whose only entry is a spread is a tuple, not a group.**
+`(..a)` is legal. The ≥2-entry minimum on a written tuple exists for exactly one
+reason — `(e)` has to stay a grouping — and `..e` is not an expression outside
+element position, so the ambiguity that motivates the minimum cannot arise. This
+shape is not decorative: it is what `f(..pair)` desugars to (§T.6), and it is
+the only shape in which an abstract pack may be spread (§T.4).
+
+The **empty** tuple spreads too: `(..none, 7)` where `none: ()` is the 1-tuple
+`(i32)`, emitting `[7]`. `()` and `(x)` are arities source syntax still cannot
+*write*, but §S made them reachable and this concatenates them like any other.
+
+## T.4 Abstract packs: the concatenation of one
+
+§S.9 recorded that a still-abstract pack "can be passed on but not taken apart"
+— `items.0` inside a generic body is refused because the body type-checks once,
+before any call fixes the arity. A **value** spread does not need positions at
+runtime (the splice is arity-agnostic), so the recorded limit does not settle
+this on its own. It is settled by asking what the constructed *type* would be.
+
+`(..items, x)` where `items: T` is an abstract pack has the type "T's elements,
+then X" — a **symbolic concatenation**, the value-side twin of `Type::Mapped`,
+which would have to survive substitution and expand when `T` is fixed, and which
+would need the type-level `(..T, U)` (§T.7) before it could even be annotated.
+That is a real slice, not a corner of this one.
+
+But the degenerate case needs none of it. **Concatenation of one is identity**:
+`(..items)` — the lone spread, nothing to concatenate with — is `T`, unchanged.
+So the rule falls out whole rather than being carved:
+
+> A spread contributes its operand's element **sequence**. An abstract pack's
+> sequence is not known, so a construction containing one is well-typed only
+> when there is nothing to concatenate it with — when the spread is the
+> construction's only entry.
+
+```vilan
+fun outer<T: (..)>(...items: T): i32 { inner(..items) }      // OK — forwards the pack
+fun outer<T: (..)>(...items: T): i32 { inner(..items, 9) }   // refused, with the reason
+```
+
+This is not a consolation prize: the lone form is **the** §S.4 use case.
+Forwarding a pack to another *spread* function is exactly `inner(..items)` —
+and it is not the same as `inner(items)`, which collects to the one-element pack
+`((T))` by §S.8. `..` is what a pack hand-off needs, and it is the shape this
+rule admits.
+
+The refusal names the reason and both steers (spread it alone, or take a
+concrete tuple type), because the fix depends on which the author meant.
+
+## T.5 Emission: the same splice, reached from the mark
+
+Emission reuses the node the tuple form already emitted, and produces **the same
+bytes** for a spread as for the nested element it replaces:
+
+```vilan
+let inner = (10, 11);
+(inner, 12)      // type ((i32,i32), i32)   emits [ ...inner, 12 ]
+(..inner, 12)    // type (i32, i32, i32)    emits [ ...inner, 12 ]
+```
+
+The two differ *only* in type. Flat storage is what makes that true, and it is
+why `.1` on the concatenation resolves to the same slot the nested form reaches
+through `.0.1` — offsets come from the type's flat widths, which already sum
+across nesting.
+
+One line of emission is nevertheless new, and it is a **correctness** line, not
+a convenience. The existing splice is decided by asking whether the element's
+*type* is a tuple — a lookup in the type cache, which carries no entry for an
+expression that never cached one. A spread's splice is decided by the **mark**:
+
+> a `..e` element splices because it was WRITTEN as one — the type rule already
+> proved the operand a tuple — so it asks for no type lookup, and none can go
+> missing.
+
+That is the right source of truth regardless, since a spread's splice-ness is
+not a type question. It also keeps this feature clear of a **pre-existing bug in
+the tuple form** (§T.8): a tuple-typed element whose expression caches no type —
+a call, an `if` — loses its splice today and the construction silently nests,
+so every read past it is `undefined`. `(..make(), 6)` is correct; `(make(), 6)`
+is not, and was not before this slice.
+
+The mechanism that carries the spread through the rest of the compiler is that
+**`..e` forwards to its operand's entity instead of wrapping it**, the way
+`const` already does, with the spread recorded as a *mark* on that entity. So
+every pass after the walk — clone sites, escapes, const reach, the rule-1/3/4
+scans — sees the very expression a nested element would have been, and cannot
+get the spread wrong by not knowing about it. Two readers consult the mark: the
+type rule, and the splice above.
+
+The mechanism that carries this through the whole compiler is that **`..e`
+forwards to its operand's entity instead of wrapping it**, the way `const`
+already does, with the spread recorded as a *mark* on that entity. So every pass
+after the walk — clone sites, escapes, const reach, the rule-1/3/4 scans, the
+transformer — sees the very expression a nested element would have been, and
+cannot get the spread wrong by not knowing about it. Exactly one reader consults
+the mark: the tuple's type rule.
+
+## T.6 The circle: `f(..tuple)`
+
+§S.4's refusal is retired. Under the desugar `f(a, b)` is `f((a, b))`, so
+`f(..pair)` is `f((..pair))` — the call site's collection already builds an
+`Expr::Tuple` from the arguments, and a spread argument simply lands inside it.
+No new call-site machinery, no second desugar; the bound is checked on the
+**concatenated** arity, so a spread that violates `(2..)` still fails with the
+shipped bound error, naming the concatenation.
+
+```vilan
+fun need2<T: (2..)>(...items: T): i32 { … }
+let pair = (1, 2);
+need2(..pair);        // T = (i32, i32) — emits need2([ ...pair ])
+need2(..pair, 7);     // T = (i32, i32, i32)
+```
+
+The shapes that are still wrong get their own steer. A spread argument to a
+function with **no** spread parameter builds no tuple, so it is refused with the
+tuple form:
+
+> ``` `..` splices a tuple's elements into a tuple construction, so it belongs
+> inside `(…)` — or at a call to a spread parameter, which builds one. Write
+> `f((..pair))` to pass the concatenation as a single tuple argument```
+
+That check is **one post-solve sweep**, not a check at each site that could host
+a `..`. Since the type rule reads the mark in exactly one place, a spread that
+reaches no tuple construction is not something an individual call path can be
+trusted to notice — a call to a plain function, to a closure, to a variant
+constructor each resolve down their own road, and a road not yet built would
+inherit the hole. Asking afterwards *which marks landed in a tuple* covers all
+of them at once and cannot be dodged.
+
+## T.7 What does NOT ship: the type-level `(..T, U)`
+
+§Surface syntax's other line — `(..T, U)` as a **type** — is not built, and was
+not in this slice. `parse_type_atom` has no `..` branch, so it does not parse;
+nothing regressed, and nothing new blocks it.
+
+It is the natural companion to §T.4: a symbolic concatenation type is what would
+let an abstract pack be spread alongside other elements, and the type surface is
+what would let the result be *annotated*. Building it means a `Type::Concat`-
+style representation that survives substitution, expands when its source tuple
+resolves, participates in `reconcile_type` and the tuple-bound arity check, and
+prints — the same list `Type::Mapped` needed. It belongs with the `keyof` tail
+this proposal already defers, and it now has a concrete demand attached to it
+(the §T.4 refusal) rather than being a line in a syntax sketch.
+
+## T.8 Ship record (2026-08-04)
+
+The whole feature is four edits and a sweep:
+
+- **Parser** — `Node::Spread(Box<Spanned<Node>>)`, produced by one helper that
+  is tried where an element begins, from `parse_paren_atom`'s entry list and
+  `parse_argument_list`. A leading `..` also settles the tuple/group fork on the
+  spot, which is what makes `(..a)` a construction.
+- **Analyzer walk** — `Node::Spread` forwards to its operand's entity and marks
+  it (§T.5), so there is no `Expr::Spread` and no pass to teach.
+- **Type rule** — `infer_type_path`'s `Expr::Tuple` arm concatenates, with the
+  constraint cursor counting slots rather than entries, and the lone-spread
+  identity short-circuit ahead of it.
+- **`check_tuple_spreads`** — the post-solve sweep: every mark must have landed
+  in a tuple construction, must be a tuple, and must be alone if it is abstract.
+- **Formatter** — `..` then the operand printed *without* the operand rule's
+  parentheses, since `..` takes the whole following expression and a wrap would
+  be token drift rather than a faithful reprint.
+
+Two things probed and confirmed rather than assumed, both recorded above because
+they changed a ruling: **there is no range operator to be ambiguous with**
+(§T.1), and **`(1..3, x)` already parsed silently** into a member chain (which
+is why the ruling is positional, and why the pin asserts the old behaviour
+rather than a new error).
+
+**Pins: 20** in `tests/inference.rs` (19 live, 1 `#[ignore]`d — the tuple-form
+bug below), two parser unit tests, one formatter round-trip over nine
+spellings, six parse-differential fixtures, and `vilan/test/tuple-spread.vl`
+with its golden and its interpreter-equivalence run. Every mechanism planted
+red and restored: the parser production takes **21** red, the type rule **11**,
+`check_tuple_spreads` **4**, the mark-driven splice **2**, the formatter's
+marker **1**. The disambiguation pin needed a plant of its own — a parser that
+stops absorbing `..` in the postfix chain, which is what a `..` *operator* would
+require — because a pin whose claim is "this was left alone" cannot be proven by
+breaking the feature. §S's 32 pins are untouched; the one that pinned this slice
+as deferred is now the one that pins it working.
+
+### The bug this work found — in the TUPLE form, not the spread
+
+**A tuple-typed element loses its splice when its expression caches no type of
+its own**, so the construction silently nests and every read past it is
+`undefined`. It reproduces on the released v0.28.0 binary, needs no `..`, and is
+as old as flat lowering:
+
+```vilan
+fun make(): (i32, i32) { (4, 5) }
+let n = (make(), 6);   // emits [ make(), 6 ]  — NOT [ ...make(), 6 ]
+n.1                    // reads n[2] (the flat offset) -> undefined
+```
+
+A name or a tuple literal splices; a **call** or an **`if`** does not. The splice
+test reads the type cache, which holds entries for bindings and literals but not
+for every expression — so the flat-storage invariant the whole tuple design
+rests on is broken exactly where the type is computed on demand rather than
+stored. The root cause is the cache's coverage, not the splice test, and fixing
+it means typing every expression into it: a real slice with its own blast radius
+(nothing in the corpus writes this shape, because it does not work).
+
+Pinned `#[ignore]`d in both forms — the nested one, which is the bug, and the
+spread one, which is **not** affected because §T.5 drives its splice from the
+mark. That asymmetry is the reason the mark-driven rule is there.
+
+One thing found and left alone: `reconcile_type`'s tuple arm zips without a
+length check, so `(i32, str)` reconciles against `(i32, str, bool)` and yields a
+2-tuple. Arity is caught elsewhere (argument count, the tuple bound), and
+concatenation exercises this path harder than the tuple form did — but no
+observed failure came out of it, so it is recorded here rather than fixed
+speculatively as part of a feature slice.

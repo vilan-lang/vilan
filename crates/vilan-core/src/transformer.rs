@@ -4218,12 +4218,19 @@ impl<'src> Transformer<'src> {
             Expr::Tuple(ids) => {
                 // Tuples store flat: a tuple-typed element's value is itself a flat
                 // array, so splice its slots in (`...elem`) rather than nesting it.
+                // A `..e` element splices because it was WRITTEN as one — the type
+                // rule already proved the operand a tuple (variadic-generics.md
+                // §T.2), so it needs no type lookup and cannot lose the splice to a
+                // missing one, which the type-driven test does for an element whose
+                // expression caches no type of its own (a call, an `if`).
                 let items = ids
                     .iter()
                     .filter_map(|id| {
                         let walked = self.walk_entity(*id, block)?;
                         let value = self.maybe_clone(*id, walked);
-                        Some(if self.is_tuple_typed(*id) {
+                        let splices =
+                            self.program.spread_elements.contains(id) || self.is_tuple_typed(*id);
+                        Some(if splices {
                             js::Node::Spread(Box::new(value))
                         } else {
                             value
