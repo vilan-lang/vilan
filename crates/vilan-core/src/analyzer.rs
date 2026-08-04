@@ -8450,6 +8450,13 @@ impl<'src> Analyzer<'src> {
             .any(|name| self.primitive_struct_ids.get(name) == Some(&id))
     }
 
+    /// Whether a struct id is `Shared` — the reference cell the runtime
+    /// deliberately shares rather than copies (`__clone` returns a plain object
+    /// unchanged, and `Shared::clone` is the identity).
+    fn is_shared_cell(&self, id: Id) -> bool {
+        self.primitive_struct_ids.get("Shared") == Some(&id)
+    }
+
     /// Whether a type is a scalar for the **view** machinery — a `(base, key)`
     /// pair written through by `base[key] = v` rather than an aggregate reference.
     /// The scalar primitives, plus `bool`: `bool` is a numeric *enum*, so
@@ -8469,6 +8476,11 @@ impl<'src> Analyzer<'src> {
     /// need a semantic copy (rule 1). Scalars and `bool` do not.
     fn is_cloneable_aggregate(&self, type_: &Type) -> bool {
         match type_ {
+            // `Shared<T>` is a `{ v }` CELL, and `__clone` shares a plain object
+            // by reference on purpose — sharing the cell is what `Shared` is
+            // for. Marking it cloneable emitted a `__clone` that copies nothing:
+            // pure cost, and a lie about the semantics.
+            Type::Struct(id, _) if self.is_shared_cell(*id) => false,
             Type::Struct(id, _) => !self.is_scalar_primitive(*id),
             Type::Tuple(_) => true,
             // A fixed-length array is a value like a `List`/tuple — copied, so
@@ -8493,17 +8505,33 @@ impl<'src> Analyzer<'src> {
     /// `Local` reference, whose own expr id usually carries no type entry (the
     /// type lives on the variable/parameter it names).
     fn place_value_type(&self, expr_id: Id) -> Option<Type> {
-        if let Some(value_type) = self.type_of_expr(expr_id) {
-            return Some(value_type);
+        self.place_value_type_id(expr_id)
+            .map(|type_id| type_id.get_type(self))
+    }
+
+    /// `type_of_expr`'s interned half — the copy passes need the `TypeId` itself
+    /// to ask the resource questions (`type_is_resource`,
+    /// `resource_triggering_constraints`), which are keyed by id.
+    fn type_id_of_expr(&self, expr_id: Id) -> Option<TypeId> {
+        self.expr_id_to_type_id_map
+            .get(&expr_id)
+            .or_else(|| self.resolved_types.get(&expr_id))
+            .copied()
+    }
+
+    /// `place_value_type`'s interned half.
+    fn place_value_type_id(&self, expr_id: Id) -> Option<TypeId> {
+        if let Some(type_id) = self.type_id_of_expr(expr_id) {
+            return Some(type_id);
         }
         match self.expr_id_to_expr_map.get(&expr_id)? {
             Expr::Local(binding_id) => {
                 if let Some(variable) = self.variables.get(binding_id) {
-                    Some(variable.type_id.get_type(self))
+                    Some(variable.type_id)
                 } else {
                     self.parameters
                         .get(binding_id)
-                        .map(|parameter| parameter.type_id.get_type(self))
+                        .map(|parameter| parameter.type_id)
                 }
             }
             _ => None,
@@ -11717,80 +11745,216 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Rule 1 (value semantics): the value expressions that must be deep-copied
-    /// at code generation, because they bind or assign an aggregate *place* that
-    /// would otherwise alias its source under JS reference semantics. Fresh
-    /// values (constructors, literals, calls) own their result and are left
-    /// alone. Rule 2 (elision) then removes the copies whose source is dead (see
-    /// `is_elidable_copy`).
-    fn compute_clone_sites(&self, shared_captures: &HashSet<Id>) -> HashSet<Id> {
+    /// at code generation, because they bind, assign, or STORE an aggregate
+    /// *place* that would otherwise alias its source under JS reference
+    /// semantics. Fresh values (constructors, literals, calls) own their result
+    /// and are left alone. Rule 2 (elision) then removes the copies whose source
+    /// is dead (see `is_elidable_copy`).
+    ///
+    /// The store positions (B54/A20, `proposal/element-clones.md`) are the ones
+    /// that install a place's value in a slot of an aggregate that OUTLIVES the
+    /// expression, so that two owners exist afterwards: a construction
+    /// literal's element/field/payload, and an `own` argument (which is how
+    /// `List::push` declares that it keeps what it is given).
+    fn compute_clone_sites(&mut self, shared_captures: &HashSet<Id>) -> HashMap<Id, CopyDecision> {
         let repeatable = self.collect_repeatable_interiors();
-        let mut sites = HashSet::new();
-        for expr in self.expr_id_to_expr_map.values() {
-            let (value_id, value_type) = match expr {
-                Expr::Variable(variable_id) => match self.variables.get(variable_id) {
-                    Some(variable) => match variable.initial {
-                        Some(value_id) => (value_id, variable.type_id.get_type(self)),
-                        None => continue,
-                    },
-                    None => continue,
-                },
-                Expr::Assignment(_target_id, value_id) => match self.type_of_expr(*value_id) {
-                    Some(value_type) => (*value_id, value_type),
-                    None => continue,
-                },
-                _ => continue,
-            };
-            if self.is_place_expr(value_id)
-                && self.is_cloneable_aggregate(&value_type)
-                && !self.resource_value_places.contains(&value_id)
-                && !self.is_elidable_copy(value_id, &repeatable, shared_captures)
+        // Phase 1 — the candidate positions, collected before any classifying
+        // so the (`&mut`, memoizing) resource query can run over them.
+        let mut candidates: Vec<(Id, TypeId)> = Vec::new();
+        let mut consider = |analyzer: &Self, value_id: Id, type_id: Option<TypeId>| {
+            if analyzer.is_place_expr(value_id)
+                // Rule 3: a VIEW is an alias on purpose. A `&mut` parameter
+                // forwarded into a construction (`Some(p)`) must stay the same
+                // view, or the write through the capture lands on a detached
+                // copy. A projection THROUGH a view (`p.field`) is an ordinary
+                // place and does copy — the same line `assignment_target_is_view`
+                // draws.
+                && !analyzer.assignment_target_is_view(value_id)
+                && !analyzer.resource_value_places.contains(&value_id)
+                && !analyzer.is_elidable_copy(value_id, &repeatable, shared_captures)
             {
-                sites.insert(value_id);
-            }
-        }
-        // An aggregate place passed to an `own` parameter is copied: the callee
-        // owns its value, so mutating it must not affect the caller. Resolved by
-        // the direct `subject -> Local(callee)` path, with the same elision.
-        for expr in self.expr_id_to_expr_map.values() {
-            let Expr::Call(call_id) = expr else {
-                continue;
-            };
-            let Some(function_call) = self.function_calls.get(call_id) else {
-                continue;
-            };
-            let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
-                Some(Expr::Local(callee_id)) => *callee_id,
-                _ => continue,
-            };
-            let parameter_ids = self
-                .functions
-                .get(&callee_id)
-                .map(|function| function.parameters.clone())
-                .or_else(|| {
-                    self.external_functions
-                        .get(&callee_id)
-                        .map(|external| external.parameters.clone())
-                });
-            let Some(parameter_ids) = parameter_ids else {
-                continue;
-            };
-            for (parameter_id, argument_id) in parameter_ids.iter().zip(&function_call.argument_ids)
-            {
-                let is_own = self
-                    .parameters
-                    .get(parameter_id)
-                    .is_some_and(|parameter| parameter.convention == Convention::Own);
-                if is_own
-                    && self.is_place_expr(*argument_id)
-                    && !self.resource_value_places.contains(argument_id)
-                    && self
-                        .place_value_type(*argument_id)
-                        .is_some_and(|value_type| self.is_cloneable_aggregate(&value_type))
-                    && !self.is_elidable_copy(*argument_id, &repeatable, shared_captures)
-                {
-                    sites.insert(*argument_id);
+                if let Some(type_id) = type_id {
+                    candidates.push((value_id, type_id));
                 }
             }
+        };
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Variable(variable_id) => {
+                    if let Some(variable) = self.variables.get(variable_id) {
+                        if let Some(value_id) = variable.initial {
+                            consider(self, value_id, Some(variable.type_id));
+                        }
+                    }
+                }
+                Expr::Assignment(_target_id, value_id) => {
+                    consider(self, *value_id, self.type_id_of_expr(*value_id));
+                }
+                // A construction's slots are field initializations (rule 1 names
+                // them outright): each one installs its value in a new aggregate
+                // that outlives the literal, so a place read there copies.
+                Expr::List(element_ids) | Expr::Tuple(element_ids) => {
+                    for element_id in element_ids {
+                        consider(self, *element_id, self.place_value_type_id(*element_id));
+                    }
+                }
+                Expr::StructInitializer(_struct_id, assignments) => {
+                    for value_id in assignments.values() {
+                        consider(self, *value_id, self.place_value_type_id(*value_id));
+                    }
+                }
+                Expr::Call(call_id) => {
+                    let Some(function_call) = self.function_calls.get(call_id) else {
+                        continue;
+                    };
+                    let callee_id = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                        Some(Expr::Local(callee_id)) => *callee_id,
+                        _ => continue,
+                    };
+                    // A variant construction is spelled as a call but builds an
+                    // aggregate: `Some(xs)` stores `xs` as the payload, so its
+                    // arguments are construction slots. Variants carry no
+                    // `Parameter` entries, which is why the `own` arm below
+                    // never saw them.
+                    if matches!(
+                        self.expr_id_to_expr_map.get(&callee_id),
+                        Some(Expr::EnumVariant(_, _))
+                    ) {
+                        for argument_id in &function_call.argument_ids {
+                            consider(self, *argument_id, self.place_value_type_id(*argument_id));
+                        }
+                        continue;
+                    }
+                    // An aggregate place passed to an `own` parameter is copied:
+                    // the callee owns its value, so mutating it must not affect
+                    // the caller. This is also how a STORING container method
+                    // declares itself — `List::push(&mut self, own item: T)`
+                    // keeps what it is given, so the argument is a slot
+                    // initialization like any construction's.
+                    let Some(parameter_ids) = self
+                        .functions
+                        .get(&callee_id)
+                        .map(|function| &function.parameters)
+                        .or_else(|| {
+                            self.external_functions
+                                .get(&callee_id)
+                                .map(|external| &external.parameters)
+                        })
+                    else {
+                        continue;
+                    };
+                    for (parameter_id, argument_id) in
+                        parameter_ids.iter().zip(&function_call.argument_ids)
+                    {
+                        let is_own = self
+                            .parameters
+                            .get(parameter_id)
+                            .is_some_and(|parameter| parameter.convention == Convention::Own);
+                        if is_own {
+                            consider(self, *argument_id, self.place_value_type_id(*argument_id));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Phase 2 — the type filter and the per-instantiation question, exactly
+        // as `compute_capture_clone_sites` phase 2 asks them. A bare `T` is
+        // admitted without knowing whether it is an aggregate (`__clone` is
+        // identity on scalars) so that a generic store — `push`'s `own item: T`,
+        // which is what `map`/`filter`/`reverse` build their results through —
+        // is honest at every instantiation; a resource one MOVES (R1).
+        let mut sites = HashMap::new();
+        for (value_id, type_id) in candidates {
+            let value_type = type_id.get_type(self);
+            if !(self.is_cloneable_aggregate(&value_type) || matches!(value_type, Type::Generic(_)))
+            {
+                continue;
+            }
+            if self.type_is_resource(type_id) {
+                continue;
+            }
+            let decision = match self.resource_triggering_constraints(type_id, &value_type) {
+                triggers if triggers.is_empty() => CopyDecision::Always,
+                triggers => CopyDecision::UnlessResource(triggers),
+            };
+            sites.insert(value_id, decision);
+        }
+        sites
+    }
+
+    /// Rule 1's RETURN clause (`proposal/element-clones.md` §3): a place a body
+    /// hands back that it does not own — one rooted at a by-value PARAMETER —
+    /// copies. Without it a call hands the caller a live alias into the
+    /// caller's own argument (`fun identity(c: List<i32>): List<i32> { c }`),
+    /// which breaks the invariant every other elision here rests on, spelled
+    /// out in `compute_clone_sites`' own doc: *calls own their result*. It is
+    /// also what makes `List::map` share elements — its `push` is handed
+    /// `fn(item)`, a call result, and trusts it.
+    ///
+    /// A place rooted at a LOCAL is left alone: the frame dies at the return,
+    /// so the local is a dead owner and donates its storage (`mut result = …;
+    /// result`, which is how every list-producing method ends). Views are
+    /// excluded by the type filter — a `borrows` projection returns an alias on
+    /// purpose (rule 3).
+    ///
+    /// Keyed by the LEAF expression, not the return value: a tail can be an
+    /// `if`/`match` whose arms return different things, and only the arms that
+    /// hand back a parameter's storage owe a copy. Leaf ids never collide with
+    /// `clone_sites`' — an expression occupies exactly one syntactic position,
+    /// and a return leaf is not also an initializer or an argument.
+    fn compute_return_clone_sites(&mut self) -> HashMap<Id, CopyDecision> {
+        let mut seams: Vec<Id> = self
+            .closures
+            .values()
+            .map(|closure| closure.return_)
+            .collect();
+        seams.extend(self.return_sites.iter().map(|(_, value_id)| *value_id));
+        let mut candidates: Vec<(Id, TypeId)> = Vec::new();
+        for seam in seams {
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(seam, &mut leaves);
+            for leaf in leaves {
+                // Rooted at a BY-VALUE parameter: the caller's storage, which
+                // outlives the call. An `own` parameter is the callee's own —
+                // the caller already copied it in (or donated a dead one), so
+                // handing it back is handing back what this body owns, and a
+                // fluent builder (`fun with(own self, …): Self { … self }`)
+                // stays free. A `&`/`&mut` one is a borrow: returning through
+                // it is rule 3's `borrows` projection, deliberately an alias.
+                let owned_by_callee = self
+                    .place_root(leaf)
+                    .and_then(|root| self.parameters.get(&root))
+                    .map(|parameter| parameter.convention);
+                if !matches!(owned_by_callee, Some(Convention::Bare)) {
+                    continue;
+                }
+                // Rule 3 again: a returned view is a `borrows` projection.
+                if self.assignment_target_is_view(leaf)
+                    || self.resource_value_places.contains(&leaf)
+                {
+                    continue;
+                }
+                if let Some(type_id) = self.place_value_type_id(leaf) {
+                    candidates.push((leaf, type_id));
+                }
+            }
+        }
+        let mut sites = HashMap::new();
+        for (value_id, type_id) in candidates {
+            let value_type = type_id.get_type(self);
+            if !(self.is_cloneable_aggregate(&value_type) || matches!(value_type, Type::Generic(_)))
+            {
+                continue;
+            }
+            if self.type_is_resource(type_id) {
+                continue;
+            }
+            let decision = match self.resource_triggering_constraints(type_id, &value_type) {
+                triggers if triggers.is_empty() => CopyDecision::Always,
+                triggers => CopyDecision::UnlessResource(triggers),
+            };
+            sites.insert(value_id, decision);
         }
         sites
     }
@@ -11809,11 +11973,11 @@ impl<'src> Analyzer<'src> {
     /// existing unconditional per-element clone.
     ///
     /// Returns the copy sites (keyed by how the copy is decided — see
-    /// [`CaptureCopy`]) and the SHARED captures, the ones the share elision
+    /// [`CopyDecision`]) and the SHARED captures, the ones the share elision
     /// left aliasing their subject. The second set is not codegen's business:
     /// it is what rule 2's move elision must refuse to move out of, so this
     /// pass runs BEFORE `compute_clone_sites`.
-    fn compute_capture_clone_sites(&mut self) -> (HashMap<Id, CaptureCopy>, HashSet<Id>) {
+    fn compute_capture_clone_sites(&mut self) -> (HashMap<Id, CopyDecision>, HashSet<Id>) {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -11875,13 +12039,13 @@ impl<'src> Analyzer<'src> {
         // `unwrap` honest.
         //
         // A GENERIC-DEPENDENT capture is decided per instantiation
-        // ([`CaptureCopy::UnlessResource`]): std's `unwrap` binds
+        // ([`CopyDecision::UnlessResource`]): std's `unwrap` binds
         // `Some(let v)` at type `T`, and both aggregate-ness AND
         // resource-ness are only known once `T` is bound — after this pass.
         //
         // The SHARE decision consults no elision, so it is complete before
         // phase 3 needs it.
-        let mut classified: Vec<(Id, Id, CaptureCopy)> = Vec::new();
+        let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::new();
         for (capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
@@ -11908,8 +12072,8 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let copy = match self.resource_triggering_constraints(type_id, &capture_type) {
-                triggers if triggers.is_empty() => CaptureCopy::Always,
-                triggers => CaptureCopy::UnlessResource(triggers),
+                triggers if triggers.is_empty() => CopyDecision::Always,
+                triggers => CopyDecision::UnlessResource(triggers),
             };
             if !capture_is_mutable
                 && self.readonly_root(subject_id).is_some()
@@ -22689,18 +22853,19 @@ pub struct DropGlue {
     pub members: DropMembers,
 }
 
-/// B53 (rule 1): how a pattern capture's copy is decided. The analyzer settles
-/// it from the capture's DECLARED type, which inside a generic body is only
-/// half the answer — `Option::unwrap`'s `Some(let x)` is typed `T`, and whether
-/// a `T` copies depends on what `T` is bound to at each instantiation.
+/// Rule 1: how one copy is decided. The analyzer settles it from the value's
+/// DECLARED type, which inside a generic body is only half the answer —
+/// `Option::unwrap`'s `Some(let x)` is typed `T`, `List::push`'s `own item` is
+/// typed `T`, and whether a `T` copies depends on what `T` is bound to at each
+/// instantiation. Shared by both passes (B53's captures and B54/A20's stores).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CaptureCopy {
+pub enum CopyDecision {
     /// A cloneable aggregate whose copy-ness no instantiation can change:
     /// `__clone` at every emission.
     Always,
-    /// A generic-dependent capture — a bare `T`, or an aggregate over one
+    /// A generic-dependent value — a bare `T`, or an aggregate over one
     /// (`Wrap<T>`, `(T, i32)`) — with the generic constraints whose binding to
-    /// a resource type makes the WHOLE capture a resource. Resource-ness by
+    /// a resource type makes the WHOLE value a resource. Resource-ness by
     /// containment is a union over members, so "any one of these is bound to a
     /// resource" is exact, not conservative.
     ///
@@ -22961,9 +23126,17 @@ pub struct Program<'src> {
     /// returned closures against the declared type's (missing) async marker.
     pub return_sites: Vec<(Id, Id)>,
     // Rule 1 (value semantics): value expressions that the transformer wraps in
-    // a deep copy because they bind/assign an aggregate place that would
-    // otherwise alias its source. Filled by `compute_clone_sites`.
-    pub clone_sites: HashSet<Id>,
+    // a deep copy because they bind, assign, or STORE an aggregate place that
+    // would otherwise alias its source. Filled by `compute_clone_sites`; keyed
+    // by how the copy is decided, since a generic store (`push`'s `own item: T`)
+    // is only settled per monomorphization — see [`CopyDecision`].
+    pub clone_sites: HashMap<Id, CopyDecision>,
+    // Rule 1's return clause: the tail/`ret` LEAF places a body hands back that
+    // it does not own (rooted at a by-value parameter), which the transformer
+    // wraps where the place itself is emitted. Filled by
+    // `compute_return_clone_sites`; a separate map from `clone_sites` so the
+    // two hooks never double-wrap one expression.
+    pub return_clone_sites: HashMap<Id, CopyDecision>,
     /// H9: `mut` parameters of aggregate type — the transformer emits
     /// `x = __clone(x)` at body entry for each (see
     /// `compute_parameter_entry_clones`; scalar `mut` parameters with views
@@ -22973,8 +23146,8 @@ pub struct Program<'src> {
     /// PLACE subject — `compile_pattern` / `compile_is_pattern` wrap each one's
     /// slot read in `__clone`. Filled by `compute_capture_clone_sites`; the
     /// value says whether the copy is unconditional or re-decided per
-    /// monomorphization (see [`CaptureCopy`]).
-    pub capture_clone_sites: HashMap<Id, CaptureCopy>,
+    /// monomorphization (see [`CopyDecision`]).
+    pub capture_clone_sites: HashMap<Id, CopyDecision>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
     /// per monomorphization — a generic capture bound at `T` copies for a
@@ -26681,6 +26854,7 @@ fn analyze_over_world<'src>(
     let (capture_clone_sites, shared_captures) = analyzer.compute_capture_clone_sites();
     let resource_types = analyzer.compute_resource_types();
     let clone_sites = analyzer.compute_clone_sites(&shared_captures);
+    let return_clone_sites = analyzer.compute_return_clone_sites();
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
@@ -26977,6 +27151,7 @@ fn analyze_over_world<'src>(
         adapted_instances: HashMap::new(),
         return_sites: analyzer.return_sites.clone(),
         clone_sites,
+        return_clone_sites,
         parameter_entry_clones,
         capture_clone_sites,
         resource_types,

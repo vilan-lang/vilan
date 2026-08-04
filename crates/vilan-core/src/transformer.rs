@@ -1,5 +1,5 @@
 use crate::analyzer::{
-    CaptureCopy, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic,
+    CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic,
     LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
@@ -82,9 +82,6 @@ pub fn transform_functions<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    if !program.clone_sites.is_empty() || !program.parameter_entry_clones.is_empty() {
-        transformer.used_helpers.insert("__clone");
-    }
     let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
 
     let nodes = t_functions
@@ -1113,12 +1110,6 @@ impl<'src> Transformer<'src> {
                 format!("import {{ {} }} from \"{}\";", names, module)
             })
             .collect::<Vec<_>>();
-        // Value-semantics copies (`own` arguments, aggregate bindings) lower to
-        // the `__clone` helper rather than `structuredClone`, which can't copy
-        // the closures a struct may hold.
-        if !self.program.clone_sites.is_empty() || !self.program.parameter_entry_clones.is_empty() {
-            self.used_helpers.insert("__clone");
-        }
         let helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
 
         let mut nodes = t_functions
@@ -1202,6 +1193,7 @@ impl<'src> Transformer<'src> {
             .filter_map(|parameter_id| {
                 let name = self.ng.name_for(*parameter_id);
                 if self.program.parameter_entry_clones.contains(parameter_id) {
+                    self.used_helpers.insert("__clone");
                     Some(js::Node::Assignment(
                         Box::new(js::Node::Local(name.clone())),
                         Box::new(js::Node::Call(
@@ -1222,14 +1214,38 @@ impl<'src> Transformer<'src> {
     }
 
     /// Rule 1 (value semantics): wrap a value in `__clone(...)` when the analyzer
-    /// marked this binding/assignment as copying an aggregate place that would
-    /// otherwise alias its source. `__clone` (not `structuredClone`) so a value
-    /// holding closures can be copied.
-    fn maybe_clone(&self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
-        if self.program.clone_sites.contains(&value_id) {
+    /// marked this binding, assignment, or STORE as copying an aggregate place
+    /// that would otherwise alias its source. `__clone` (not `structuredClone`)
+    /// so a value holding closures can be copied.
+    fn maybe_clone(&mut self, value_id: Id, node: js::Node<'src>) -> js::Node<'src> {
+        if self.copy_applies(self.program.clone_sites.get(&value_id)) {
+            self.used_helpers.insert("__clone");
             js::Node::Call(Box::new(js::Node::Local("__clone".to_string())), vec![node])
         } else {
             node
+        }
+    }
+
+    /// Whether a recorded copy decision fires AT THIS EMISSION. A value whose
+    /// type no instantiation can change always copies; a generic-dependent one
+    /// is re-decided here, per monomorphization — `__clone` is identity on
+    /// scalars and correct on aggregates, but on a RESOURCE it mints a second
+    /// owner (divergent state, a second destructor run), and R11
+    /// (`docs/spec/memory.md`) requires `Option::unwrap(self): T` to pass with
+    /// no copies. A constraint this instance leaves unbound keeps the
+    /// conservative copy.
+    fn copy_applies(&self, decision: Option<&CopyDecision>) -> bool {
+        match decision {
+            None => false,
+            Some(CopyDecision::Always) => true,
+            Some(CopyDecision::UnlessResource(constraint_ids)) => {
+                !constraint_ids.iter().any(|constraint_id| {
+                    self.current_substitution
+                        .get(constraint_id)
+                        .map(|bound| self.resolve_type_id(*bound))
+                        .is_some_and(|bound| self.program.resource_types.contains(&bound))
+                })
+            }
         }
     }
 
@@ -1612,6 +1628,28 @@ impl<'src> Transformer<'src> {
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        let node = self.walk_entity_inner(id, block)?;
+        // Rule 1's return clause: a tail/`ret` leaf that hands back a place the
+        // body does not own copies HERE, where the place itself is emitted, so
+        // that a tail `if`/`match` copies only in the arms that owe it. Keyed by
+        // a map of its own, so a leaf that is also a `clone_sites` entry (it
+        // never is — one expression, one syntactic position) could not be
+        // wrapped twice.
+        if self.copy_applies(self.program.return_clone_sites.get(&id)) {
+            self.used_helpers.insert("__clone");
+            return Some(js::Node::Call(
+                Box::new(js::Node::Local("__clone".to_string())),
+                vec![node],
+            ));
+        }
+        Some(node)
+    }
+
+    fn walk_entity_inner(
+        &mut self,
+        id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
         // A `const` expression's computed value replaces the whole subtree —
         // in-place serialization (const-eval.md §1). The const mini-programs
         // themselves are built by `transform_const_program` with the results
@@ -3105,9 +3143,14 @@ impl<'src> Transformer<'src> {
                 js::Node::Local(result_name)
             }
             Expr::List(ids) => {
+                // An element read from a place is a construction slot: it copies
+                // (B54), unless the analyzer elided it.
                 let items = ids
                     .iter()
-                    .filter_map(|id| self.walk_entity(*id, block))
+                    .filter_map(|id| {
+                        self.walk_entity(*id, block)
+                            .map(|node| self.maybe_clone(*id, node))
+                    })
                     .collect();
                 js::Node::Array(items)
             }
@@ -3143,7 +3186,8 @@ impl<'src> Transformer<'src> {
                 let items = ids
                     .iter()
                     .filter_map(|id| {
-                        let value = self.walk_entity(*id, block)?;
+                        let walked = self.walk_entity(*id, block)?;
+                        let value = self.maybe_clone(*id, walked);
                         Some(if self.is_tuple_typed(*id) {
                             js::Node::Spread(Box::new(value))
                         } else {
@@ -3161,7 +3205,7 @@ impl<'src> Transformer<'src> {
                     .filter_map(|(i, id)| {
                         // let field = struct_.fields.get(*i).unwrap();
                         let value = self.walk_entity(*id, block);
-                        value.map(|x| (i, x))
+                        value.map(|x| (i, self.maybe_clone(*id, x)))
                     })
                     .collect::<Vec<_>>();
                 properties.sort_by(|a, b| a.0.cmp(b.0));
@@ -3236,26 +3280,8 @@ impl<'src> Transformer<'src> {
     }
 
     /// B53 (rule 1): whether this capture's slot read copies AT THIS EMISSION.
-    /// A capture whose type no instantiation can change always copies; a
-    /// generic-dependent one is re-decided here, per monomorphization —
-    /// `__clone` is identity on scalars and correct on aggregates, but on a
-    /// RESOURCE it mints a second owner (divergent state, a second destructor
-    /// run), and R11 (`docs/spec/memory.md`) requires `Option::unwrap(self): T`
-    /// to pass with no copies. A constraint this instance leaves unbound keeps
-    /// the conservative copy.
     fn capture_copies(&self, capture_id: Id) -> bool {
-        match self.program.capture_clone_sites.get(&capture_id) {
-            None => false,
-            Some(CaptureCopy::Always) => true,
-            Some(CaptureCopy::UnlessResource(constraint_ids)) => {
-                !constraint_ids.iter().any(|constraint_id| {
-                    self.current_substitution
-                        .get(constraint_id)
-                        .map(|bound| self.resolve_type_id(*bound))
-                        .is_some_and(|bound| self.program.resource_types.contains(&bound))
-                })
-            }
-        }
+        self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
     /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
@@ -5465,9 +5491,6 @@ pub fn transform_const_program<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    if !program.clone_sites.is_empty() || !program.parameter_entry_clones.is_empty() {
-        transformer.used_helpers.insert("__clone");
-    }
     let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
 
     body.push(js::Node::ConstVariable(js::Variable {
