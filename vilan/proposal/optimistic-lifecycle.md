@@ -463,14 +463,27 @@ cannot be pinned there.
 3. **Rejection is observable** — `Rejected(reason)`, value rolled back.
 4. **The §1 probe, fixed** — older-failing / newer-succeeding overlap
    settles at the newer confirmation, not the older rollback.
-5. **`confirmed_generation`** — older-succeeding / newer-failing overlap
-   rolls back to the older *confirmation*, not to the cell's original value
+5. **The confirmed shadow** — older-succeeding / newer-failing overlap rolls
+   back to the older *confirmation*, not to the cell's original value
    (§4's row 3).
-6. **One coherent wave** — a `combine((value, state))` observer with no
+6. **`confirmed_generation` specifically.** Written after (5) turned out not
+   to reach it: in that scenario the surviving write is the current one, so
+   the *comparison* is never exercised — only the shadow's existence is.
+   The edge needs two writes that both **succeed** with the older reply
+   arriving last, then a third that fails; the rollback must land on the
+   later confirmation, not the later arrival.
+7. **One coherent wave** — a `combine((value, state))` observer with no
    ambient turn sees no half-transition, for both the paint and the
    reconcile.
-7. **The same, for `Draft::push`** — the shipped regression §5 found.
-8. **A held turn holds the whole lifecycle** — nothing pending-visible.
-9. **Over a real round trip** — `local_rpc` + a `[service]` whose handler
-   suspends, following `inference.rs:6134-6174`'s precedent, so the pin
-   exercises a genuine wire turn rather than a bare `tick()`.
+8. **The same, for `Draft::push` and `Draft::adopt`** — the shipped
+   regression §5 found. Both written red-first against shipped code.
+9. **A held turn holds the whole lifecycle** — nothing pending-visible.
+10. **Over a real round trip** — `local_rpc` + a `[service]` whose handler
+    suspends, following `inference.rs:6134-6174`'s precedent, so the pin
+    exercises a genuine wire turn rather than a bare `tick()`, and a call
+    counter proves each write reached the server exactly once.
+
+Each of the four guards was proven non-vacuous by planting the bug it
+removes and watching its own pin — and only its own pin — go red: the paint
+generation, the shadow's existence, the shadow's ordering comparison, and
+the `batch` around the paint transition.
