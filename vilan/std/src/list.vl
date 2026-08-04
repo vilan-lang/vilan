@@ -11,7 +11,10 @@ external struct List<T>;
 impl List<type T> {
 	external fun new(): List<T>;
 
-	external fun push(&mut self, item: T): void;
+	/// Appends `item`, which the list KEEPS — hence `own` (rule 1: storing a
+	/// place in a slot that outlives the call is a copy, and `own` is how a
+	/// signature says so; a fresh value moves in for free).
+	external fun push(&mut self, own item: T): void;
 
 	/// Removes and returns the last element — `None` when empty (an intrinsic:
 	/// the compiler lowers it over the native `.pop`).
