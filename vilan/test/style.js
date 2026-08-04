@@ -83,3 +83,10 @@ const responsive = [ [ new Map([ [ "640px::padding", [ "640px::padding", [ "sl8r
 console.log(class_list(responsive));
 const themed = [ [ new Map([ [ ":dark:background-color", [ ":dark:background-color", [ "suuxkdy", "background-color:var(--gray-900)" ] ] ], [ ":dark hover:background-color", [ ":dark hover:background-color", [ "s8ww588", "background-color:var(--gray-700)" ] ] ], [ "768px:dark hover:background-color", [ "768px:dark hover:background-color", [ "s8ahr6b", "background-color:var(--gray-50)" ] ] ] ]) ] ];
 console.log(class_list(themed));
+const translucent = [ [ new Map([ [ "::background-color", [ "::background-color", [ "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ], [ "::color", [ "::color", [ "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ] ] ]) ] ];
+console.log(class_list(translucent));
+const painted = [ [ new Map([ [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ "::background-image", [ "::background-image", [ "s1fek3dv", "background-image:linear-gradient(90deg, var(--blue-600) 0%, transparent 100%)" ] ] ], [ ":hover:background-image", [ ":hover:background-image", [ "s1lsiu5q", "background-image:radial-gradient(closest-side, rgba(178, 48, 86, 0.5) 0%, transparent 100%)" ] ] ] ]) ] ];
+console.log(class_list(painted));
+const framed = [ [ new Map([ [ "::display", [ "::display", [ "s2m9jw6", "display:inline-flex" ] ] ], [ "::border-top", [ "::border-top", [ "s1sb4lgm", "border-top:1px solid var(--gray-300)" ] ] ], [ "::padding-top", [ "::padding-top", [ "stbzxoc", "padding-top:var(--space-2)" ] ] ], [ "::margin-left", [ "::margin-left", [ "s10oplpw", "margin-left:auto" ] ] ] ]) ] ];
+console.log(class_list(framed));
+console.log("s1mnphwb");

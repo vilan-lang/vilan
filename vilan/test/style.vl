@@ -1,5 +1,5 @@
 import std::print;
-import std::style::{ Color, Display, Length, Style, space, style };
+import std::style::{ Color, Display, Gradient, Length, RadialExtent, Style, space, style };
 
 // Typed atomic styles (proposal/ui-styling.md): construction inside `const`
 // via the builder chain; atomic rules and theme vars flow through the asset
@@ -40,5 +40,38 @@ fun main() {
 		.dark(style().hover(style().background(Color::gray(700))))
 		.md(style().dark(style().hover(style().background(Color::gray(50)))));
 	print(themed.class_list());
+
+	// The value types (ui-styling.md §0bis.3). A translucent token renders as
+	// a RELATIVE colour, so `var(--gray-900)` survives into the declaration
+	// and its `:root` line still emits — the golden is where that is proven in
+	// bytes. Every line this block adds is an ADDITION: the rules above keep
+	// the exact class names they had before the value types existed.
+	let translucent = const style()
+		.background(Color::rgba(27, 6, 13, 0.9))
+		.color(Color::gray(900).alpha(0.08));
+	print(translucent.class_list());
+
+	// A gradient is `background-image`, a different slot from `background` —
+	// both survive on one style. Stops carry their colours' `:root` lines.
+	let painted = const style()
+		.background(Color::gray(50))
+		.background_gradient(Gradient::linear(90.0)
+			.stop(Color::blue(600), 0.0)
+			.stop(Color::transparent(), 100.0))
+		.hover(style().background_gradient(Gradient::radial(RadialExtent::ClosestSide)
+			.stop(Color::rgba(178, 48, 86, 0.5), 0.0)
+			.stop(Color::transparent(), 100.0)));
+	print(painted.class_list());
+
+	// `border_none()` fills the SAME slot the shorthand does, so the cleared
+	// style carries ONE border class — the golden shows both declarations, and
+	// the class list shows the override.
+	let framed = const style()
+		.display(Display::InlineFlex)
+		.border_top(Length::px(1), Color::gray(300))
+		.padding_top(space(2))
+		.margin_left(Length::auto());
+	print(framed.class_list());
+	print(const style().border(Length::px(1), Color::gray(300)).border_none().class_list());
 }
 main();
