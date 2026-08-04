@@ -88,7 +88,7 @@ function $c(self, fallback) {
 		const x = __clone($d[1]);
 		$e = x;
 	} else {
-		$e = fallback;
+		$e = __clone(fallback);
 	}
 	return $e;
 }
@@ -99,7 +99,7 @@ function $w(self, fallback) {
 		const x = __clone($x[1]);
 		$y = x;
 	} else {
-		$y = fallback;
+		$y = __clone(fallback);
 	}
 	return $y;
 }

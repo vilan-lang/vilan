@@ -13,7 +13,7 @@ function eq2(self, b) {
 function $a(self, predicate) {
 	for (const item of self) {
 		if (predicate(item)) {
-			return [ 0, item ];
+			return [ 0, __clone(item) ];
 		}
 	}
 	return [ 1 ];
@@ -25,7 +25,7 @@ function $b(self, fallback) {
 		const x = __clone($c[1]);
 		$d = x;
 	} else {
-		$d = fallback;
+		$d = __clone(fallback);
 	}
 	return $d;
 }

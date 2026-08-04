@@ -25,7 +25,7 @@ function set_attribute(attributes, name2, value) {
 			updated.push([ name2, value ]);
 			found = true;
 		} else {
-			updated.push(attribute);
+			updated.push(__clone(attribute));
 		}
 	}
 	if (!(found)) {
@@ -36,15 +36,15 @@ function set_attribute(attributes, name2, value) {
 function text(self, content) {
 	self[3].v = content;
 	self[2].v = [  ];
-	return self;
+	return __clone(self);
 }
 function bind_text(self, source) {
 	self[3].v = $d(source);
 	self[2].v = [  ];
-	return self;
+	return __clone(self);
 }
 function place(self, parent) {
-	parent[2].v.push([ 0, self ]);
+	parent[2].v.push([ 0, __clone(self) ]);
 }
 function place2(self, parent) {
 	parent[2].v.push([ 1, self ]);
@@ -54,7 +54,7 @@ function place3(self, parent) {
 }
 function place4(self, parent) {
 	for (const item of self) {
-		parent[2].v.push([ 0, item ]);
+		parent[2].v.push([ 0, __clone(item) ]);
 	}
 }
 function apply(self, parent, name2) {
@@ -177,11 +177,11 @@ function $f(self, source, key, build) {
 			return build(item, $h);
 		}) ]);
 	}
-	return self;
+	return __clone(self);
 }
 function $m(self, name2, value) {
 	apply(value, self, name2);
-	return self;
+	return __clone(self);
 }
 function $o(self) {
 	return self[0].v;
@@ -192,27 +192,27 @@ function $n(self, source, build) {
 	self[2].v.push([ 0, $i(owner, ($p) => {
 		return build(value, $p);
 	}) ]);
-	return self;
+	return __clone(self);
 }
 function $q(self, content) {
 	place(content, self);
-	return self;
+	return __clone(self);
 }
 function $v(self, name2, value) {
 	apply2(value, self, name2);
-	return self;
+	return __clone(self);
 }
 function $w(self, content) {
 	place2(content, self);
-	return self;
+	return __clone(self);
 }
 function $x(self, content) {
 	place3(content, self);
-	return self;
+	return __clone(self);
 }
 function $y(self, content) {
 	place4(content, self);
-	return self;
+	return __clone(self);
 }
 const title = $a("Tasks <live>");
 const todos = $b([ "alpha", "beta & gamma" ]);

@@ -2,6 +2,12 @@ function __at(list, index) {
 	if (index >= 0 && index < list.length) return list[index];
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 async function __hmac_sha512(key, data) {
 	const imported = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-512" }, false, [ "sign" ]);
 	return new Uint8Array(await crypto.subtle.sign("HMAC", imported, data));
@@ -129,7 +135,7 @@ function decode_url(text) {
 		set(out, write, chunk2 >> 10 & 255);
 		set(out, write + 1, chunk2 >> 2 & 255);
 	}
-	return [ 0, out ];
+	return [ 0, __clone(out) ];
 }
 function set(self, index, value2) {
 	self.fill(value2, index, index + 1);
@@ -207,7 +213,7 @@ function bool_value(self, value2) {
 }
 function new3(root) {
 	const stack = __shared_new([  ]);
-	stack.v.push(root);
+	stack.v.push(__clone(root));
 	return [ stack, __shared_new([ 1 ]) ];
 }
 function ok(self) {
@@ -415,7 +421,7 @@ function $y(segment) {
 		let $V = null;
 		if ($U[0] === 0) {
 			const claims = $U[1];
-			$V = [ 0, claims ];
+			$V = [ 0, __clone(claims) ];
 		} else {
 			const _reason = $U[1];
 			$V = [ 1 ];

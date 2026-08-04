@@ -22,7 +22,7 @@ function $d(self, fallback) {
 		const x = __clone($e[1]);
 		$f = x;
 	} else {
-		$f = fallback;
+		$f = __clone(fallback);
 	}
 	return $f;
 }
@@ -45,7 +45,7 @@ function $j(self, fn) {
 	return result;
 }
 function $k(self, init, fn) {
-	let accumulator = init;
+	let accumulator = __clone(init);
 	for (const item of self) {
 		accumulator = fn(accumulator, item);
 	}
@@ -55,7 +55,7 @@ function $l(self, predicate) {
 	let result = [  ];
 	for (const item of self) {
 		if (predicate(item)) {
-			result.push(item);
+			result.push(__clone(item));
 		}
 	}
 	return result;

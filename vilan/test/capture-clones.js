@@ -52,7 +52,7 @@ function first_or(held2, fallback) {
 		const inner2 = __clone($g[1]);
 		$h = inner2;
 	} else {
-		$h = fallback;
+		$h = __clone(fallback);
 	}
 	return $h;
 }
@@ -63,7 +63,7 @@ function first_or_guarded(held2, limit, fallback) {
 		const inner2 = __clone($i[1]);
 		$j = inner2;
 	} else {
-		$j = fallback;
+		$j = __clone(fallback);
 	}
 	return $j;
 }

@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __json_kind(value) {
 	if (value === null) return "null";
 	if (Array.isArray(value)) return "array";
@@ -113,9 +119,9 @@ function $g(self, err) {
 	let $i = null;
 	if ($h[0] === 0) {
 		const x = $h[1];
-		$i = [ 0, x ];
+		$i = [ 0, __clone(x) ];
 	} else {
-		$i = [ 1, err ];
+		$i = [ 1, __clone(err) ];
 	}
 	return $i;
 }

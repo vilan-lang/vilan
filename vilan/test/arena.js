@@ -38,7 +38,7 @@ function $b(self, value) {
 		$d = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;
-		self[0].push([ self[2], value ]);
+		self[0].push([ self[2], __clone(value) ]);
 		$d = [ index2, self[2] ];
 	}
 	return $d;
@@ -65,7 +65,7 @@ function $i(self, fallback) {
 		const x = __clone($j[1]);
 		$k = x;
 	} else {
-		$k = fallback;
+		$k = __clone(fallback);
 	}
 	return $k;
 }
@@ -82,7 +82,7 @@ function $l(self, handle, value) {
 function $n(self, handle) {
 	let $o = null;
 	if ($g(self, handle)) {
-		const removed = __at(self[0], handle[0])[1];
+		const removed = __clone(__at(self[0], handle[0])[1]);
 		__at(self[0], handle[0])[0] = __at(self[0], handle[0])[0] + 1;
 		self[1].push(handle[0]);
 		$o = [ 0, removed ];
@@ -107,7 +107,7 @@ function $s(self, value) {
 		$u = [ index, __at(self[0], index)[0] ];
 	} else {
 		const index2 = self[0].length;
-		self[0].push([ self[2], value ]);
+		self[0].push([ self[2], __clone(value) ]);
 		$u = [ index2, self[2] ];
 	}
 	return $u;
@@ -143,5 +143,5 @@ const leaf2 = $s(graph, [ 3, [  ] ]);
 let root_edges = [  ];
 root_edges.push(leaf1);
 root_edges.push(leaf2);
-const root = $s(graph, [ 1, root_edges ]);
+const root = $s(graph, [ 1, __clone(root_edges) ]);
 console.log(sum_from(graph, root));

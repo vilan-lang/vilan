@@ -22,7 +22,7 @@ function poke(x) {
 function with_x(self, value) {
 	self = __clone(self);
 	self[0] = value;
-	return self;
+	return __clone(self);
 }
 console.log(bump(1));
 let list = [ 1, 2 ];

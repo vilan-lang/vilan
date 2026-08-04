@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function $a(self) {
 	return self.length === 0;
 }
@@ -9,7 +15,7 @@ function $b(self, fn) {
 	return result;
 }
 function $c(self, init, fn) {
-	let accumulator = init;
+	let accumulator = __clone(init);
 	for (const item of self) {
 		accumulator = fn(accumulator, item);
 	}
@@ -19,7 +25,7 @@ function $d(self, predicate) {
 	let result = [  ];
 	for (const item of self) {
 		if (predicate(item)) {
-			result.push(item);
+			result.push(__clone(item));
 		}
 	}
 	return result;
