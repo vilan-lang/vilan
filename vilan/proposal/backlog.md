@@ -3377,3 +3377,105 @@ plus `own self` on Option's consuming combinators. See `affine-moves.md`.]
 returning `i32` refuses it. So a `sync` declaration on a void callback is a
 correct declaration that does not yet bite. Pinned `#[ignore]`d in the
 signal-update arc's tests. Record: `signal-update.md` §6.
+
+### Moved at the v0.26.0 cut (2026-08-04)
+
+#### B58. a bound on a trait's own generic parameter does not reach its default bodies — SHIPPED 2026-08-04
+
+(M; found 2026-08-03 by I3's design probes) — a `trait X<T: Bound>`'s default
+member bodies cannot use `Bound`'s members on `T`-typed values: the bound is
+enforced at impl sites but is not IN SCOPE inside defaults. This — not
+associated types — is what blocks I3's headline blanket-adapter direction
+(`xs.filter(f)` via `Iterable` defaults). Evidence in `iterator-adapters.md`
+(P4). Probed 2026-08-04 by the B55/B56 arc: NOT the same mechanism
+(bound-to-bound flow at `satisfies_trait_bound`), behavior byte-identical
+after those fixes — stands on its own. [Ship note: the probe's steer was
+wrong on both counts — the real causes were empty-substitution default
+emission (transformer) and return-type inference re-binding a shared trait
+parameter (analyzer); the spec gained the bound-as-assumption dual rule.]
+
+#### B62. a match arm capture of a resource payload is never destroyed — SHIPPED 2026-08-04
+
+(M; found 2026-08-04 by the B60 arc, verified pre-existing on v0.24.0) —
+`match o { Some(let r) => .. }` on an `Option<resource>` prints NO drop for
+`r`: the capture enters no owner's scope-end plan. Extra urgency: `match` is
+exactly the idiom B60's new conditional-move rejection steers users toward,
+so the recommended path leaks the resource the rejected path double-dropped.
+Fix direction: a pattern capture of a resource joins the leg scope's owned
+set (the same plan_expr accounting bindings get). Pin red-first per payload
+shape (match leg, `is` capture, nested). Record: `affine-moves.md` §6.
+[Ship note: the shipped rule keys on the SUBJECT — a capture of a consumed
+subject owns like a `let`, a capture of a loaned subject enrolls nothing;
+the twin `let`-destructure hole was fixed in the same arc; the loan-side
+consume hole is filed as B65.]
+
+#### B63. Option's remaining combinators at resource instantiations — SHIPPED 2026-08-04
+
+(S–M; from the B60 arc, 2026-08-04) — after B60, `is_some_and`, `ok_or`,
+`unzip` REJECT at a resource instantiation rather than silently
+double-destroying (convertible to `own self`; blocked on separating the
+elision predicate from `readonly_root`, a diagnostic helper reused for a
+semantic decision), and `or`/`or_else`/`xor`/`inspect`/`eq`/`unwrap_or`
+CANNOT be move-clean under R6 (each reads `self` twice or duplicates the
+payload) — rewriting them over `is` tests is a std slice. Also reconcile
+spec §6.3's bare-parameter table with R3: they disagree for resources (the
+implementation enforces R3's loan reading). Record: `affine-moves.md` §6.
+[Ship note: the filed analysis was corrected in three places — `eq` never
+rejected (nothing was pinned), `unwrap_or` was a discard case not a
+two-read case, and the real law is "a generic body cannot destroy a T";
+`inspect`/`or_else` work after the `is`-test rewrites; only
+`or`/`xor`/`unwrap_or` reject, correctly, one error each.]
+
+#### B64. a closure returning a captured local still aliases — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-04 by the A20/B54 arc) — the return-clause copy keys on
+by-value PARAMETERS; a closure that returns a local it captured from the
+enclosing frame hands back live storage the same way `fun identity(c) { c }`
+did before the fix. Same store-rule reasoning applies; needs the
+capture-root walk. Record: `element-clones.md` §7 (which also records two
+deliberate non-takes: the caller-side escape summary that would free builder
+chains without the `own self` opt-out, and `Set::insert`'s undeclared `own`
+— unobservable today). [Ship note: reframed on FRAMES — the returning frame
+owns what it DECLARED; the fix also covers an `own`-parameter capture
+handed out repeatedly, which the "capture like a bare parameter" reading
+would have missed; bycatch fixed a pre-existing R9 false positive.]
+
+#### A21. View.style_var leaks its subscription — SHIPPED 2026-08-04
+
+(S; found 2026-08-04 by the A8 arc) — the only reactive `View` method built
+on `source.sub(..)` + `let _sub` instead of `effect`, so its subscription
+outlives the view's boundary: a swapped-out view keeps reacting. A
+reactive-ownership bug, not a styling one. Fix: route it through `effect`
+like every `bind_*`; pin the disposal (swap out, fire the signal, assert no
+write). Record: `ui-styling.md` §0bis. [Ship note: the ssr.md residue about
+the DOM stub no-oping style.setProperty proved FALSE — the stub has folded
+the property into the style attribute since 309e2bb; style_var now lives in
+the shared component, both twins byte-identical.]
+
+#### E32. the cancellation test family is wall-clock-bounded — SHIPPED 2026-08-04
+
+(S; observed independently by four lanes, 2026-08-04; verified on unmodified
+base commits) — four tests
+(`a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time`,
+`cancel_cuts_a_sleeping_child_short_and_keeps_the_value`,
+`outer_cancel_chains_into_nested_nurseries`,
+`nested_nurseries_join_inside_out`, inference.rs ~21829 and neighbours)
+assert `started.elapsed() < 4s` where elapsed INCLUDES a ~4.3s debug-build
+compile plus a node spawn — under nextest's full parallelism the compile
+alone eats the budget, and which test fails varies per run (the flake
+signature). Fix: measure the program's own runtime (split the compile out of
+the timed window), not the harness wall clock. All four pass in isolation in
+~2.3s. [Ship note: only THREE of the four ever carried the assertion —
+`nested_nurseries_join_inside_out` was drift in this very entry; the fix
+split compile()/run_js() with budgets unchanged, plant-proven per test,
+stress-validated under two concurrent full suites.]
+
+#### E33. the benchmarks e2e binds a fixed port — SHIPPED 2026-08-04
+
+(S; found 2026-08-04) — `benchmarks_run_and_report_the_deterministic_counts`
+binds `:48231` and collides with concurrent e2e legs under nextest
+(`EADDRINUSE`). Fix: port 0 + read-back, the E19 precedent
+(`Server.port()`). [Ship note: FOUR fixed ports existed, not one —
+48231–48234 across throughput.vl and realtime.vl; all migrated; the literal
+collision was reproduced pre-fix against held ports and the fixed tests
+survived the same scenario.]
