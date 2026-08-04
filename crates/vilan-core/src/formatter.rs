@@ -3009,6 +3009,16 @@ impl<'src> Printer<'src> {
                 self.out.push('*');
                 self.print_split_operand(operand, 10, split);
             }
+            // `..e` — a tuple-value spread (variadic-generics.md §T). The operand
+            // is printed WITHOUT the operand rule's parentheses: `..` takes the
+            // whole following expression in the parser, so a wrap would be token
+            // drift, not a faithful reprint. The split is handed down so a long
+            // spread operand still breaks.
+            Node::Spread(operand) => {
+                self.out.push_str("..");
+                self.split = split;
+                self.print_expr(operand);
+            }
             Node::Await(operand) => {
                 self.out.push_str("await ");
                 self.print_split_operand(operand, 10, split);
