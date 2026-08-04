@@ -668,13 +668,10 @@ rule admits.
 The refusal names the reason and both steers (spread it alone, or take a
 concrete tuple type), because the fix depends on which the author meant.
 
-## T.5 Emission and the rest of the compiler: already written
+## T.5 Emission: the same splice, reached from the mark
 
-**Emission needed no code at all**, and that is the design working rather than
-luck. Tuples store flat, so the transformer already splices a *tuple-typed*
-element's slots into a constructed tuple (`[...inner, 12]`) — the shape §S
-records as having needed no spread path of its own. A value spread produces
-**the same bytes** as the nested element it replaces:
+Emission reuses the node the tuple form already emitted, and produces **the same
+bytes** for a spread as for the nested element it replaces:
 
 ```vilan
 let inner = (10, 11);
@@ -683,9 +680,33 @@ let inner = (10, 11);
 ```
 
 The two differ *only* in type. Flat storage is what makes that true, and it is
-why `.2` on the concatenation resolves to the same slot the nested form reaches
+why `.1` on the concatenation resolves to the same slot the nested form reaches
 through `.0.1` — offsets come from the type's flat widths, which already sum
 across nesting.
+
+One line of emission is nevertheless new, and it is a **correctness** line, not
+a convenience. The existing splice is decided by asking whether the element's
+*type* is a tuple — a lookup in the type cache, which carries no entry for an
+expression that never cached one. A spread's splice is decided by the **mark**:
+
+> a `..e` element splices because it was WRITTEN as one — the type rule already
+> proved the operand a tuple — so it asks for no type lookup, and none can go
+> missing.
+
+That is the right source of truth regardless, since a spread's splice-ness is
+not a type question. It also keeps this feature clear of a **pre-existing bug in
+the tuple form** (§T.8): a tuple-typed element whose expression caches no type —
+a call, an `if` — loses its splice today and the construction silently nests,
+so every read past it is `undefined`. `(..make(), 6)` is correct; `(make(), 6)`
+is not, and was not before this slice.
+
+The mechanism that carries the spread through the rest of the compiler is that
+**`..e` forwards to its operand's entity instead of wrapping it**, the way
+`const` already does, with the spread recorded as a *mark* on that entity. So
+every pass after the walk — clone sites, escapes, const reach, the rule-1/3/4
+scans — sees the very expression a nested element would have been, and cannot
+get the spread wrong by not knowing about it. Two readers consult the mark: the
+type rule, and the splice above.
 
 The mechanism that carries this through the whole compiler is that **`..e`
 forwards to its operand's entity instead of wrapping it**, the way `const`
@@ -766,6 +787,31 @@ they changed a ruling: **there is no range operator to be ambiguous with**
 (§T.1), and **`(1..3, x)` already parsed silently** into a member chain (which
 is why the ruling is positional, and why the pin asserts the old behaviour
 rather than a new error).
+
+### The bug this work found — in the TUPLE form, not the spread
+
+**A tuple-typed element loses its splice when its expression caches no type of
+its own**, so the construction silently nests and every read past it is
+`undefined`. It reproduces on the released v0.28.0 binary, needs no `..`, and is
+as old as flat lowering:
+
+```vilan
+fun make(): (i32, i32) { (4, 5) }
+let n = (make(), 6);   // emits [ make(), 6 ]  — NOT [ ...make(), 6 ]
+n.1                    // reads n[2] (the flat offset) -> undefined
+```
+
+A name or a tuple literal splices; a **call** or an **`if`** does not. The splice
+test reads the type cache, which holds entries for bindings and literals but not
+for every expression — so the flat-storage invariant the whole tuple design
+rests on is broken exactly where the type is computed on demand rather than
+stored. The root cause is the cache's coverage, not the splice test, and fixing
+it means typing every expression into it: a real slice with its own blast radius
+(nothing in the corpus writes this shape, because it does not work).
+
+Pinned `#[ignore]`d in both forms — the nested one, which is the bug, and the
+spread one, which is **not** affected because §T.5 drives its splice from the
+mark. That asymmetry is the reason the mark-driven rule is there.
 
 One thing found and left alone: `reconcile_type`'s tuple arm zips without a
 length check, so `(i32, str)` reconciles against `(i32, str, bool)` and yields a

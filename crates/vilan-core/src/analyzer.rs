@@ -24758,6 +24758,12 @@ pub struct Program<'src> {
     // layout — which elements are themselves tuples (and so are spread, not nested)
     // — resolving any generic element through the active monomorphization.
     pub expr_type_ids: HashMap<Id, TypeId>,
+    /// Element expressions written as a tuple-value spread `..e`
+    /// (variadic-generics.md §T). Such an element splices because it was
+    /// WRITTEN as one — the type rule already proved its operand a tuple — so
+    /// its emission asks for no type lookup and none can go missing. A plain
+    /// element still splices by TYPE (flat storage), which is the older rule.
+    pub spread_elements: HashSet<Id>,
     // The next unused entity id. Post-analysis passes (the context threading
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
@@ -28879,6 +28885,7 @@ fn analyze_over_world<'src>(
         expr_types,
         declaration_labels,
         expr_type_ids,
+        spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::new(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
