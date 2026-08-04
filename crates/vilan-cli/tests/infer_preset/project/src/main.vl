@@ -1,0 +1,55 @@
+import std::print;
+import std::range::Range;
+
+// Inferred `const` (proposal/const-eval.md §9): every binding below is an
+// ORDINARY `let` — no keyword anywhere — and the release build folds the ones
+// the const evaluator can settle. The debug twin of this file's golden keeps
+// every one of them as written.
+
+fun square(n: i32): i32 {
+	n * n
+}
+
+fun scale(count: i32): List<i32> {
+	mut out: List<i32> = List::new();
+	for index in Range::new(0, count) {
+		out.push(index * 3);
+	}
+	out
+}
+
+// `shifted2` reads a parameter, so as a binding IN ITS OWN RIGHT it can never
+// be settled — the free-variable rule is the filter (§9.1). A CALL to `offset`
+// with a const-known argument still folds, though: the rule constrains free
+// variables, never calls (§1's no-coloring rule, inherited whole).
+fun offset(base: i32): i32 {
+	let shifted2 = base + 100;
+	shifted2
+}
+
+// Prints, so folding it would delete output from a working program (§9.2).
+fun announce(): i32 {
+	print("built");
+	5
+}
+
+fun main() {
+	// Arithmetic, and a chain through it.
+	let a = 1 + 2 * 3;
+	let b = a * 2;
+
+	// A call with const-known arguments folds; calls are unrestricted.
+	let squared = square(b);
+
+	// A small list is well inside the 256-byte cap.
+	let steps = scale(4);
+
+	// Folds at the call site, though `offset`'s own local never could.
+	let shifted = offset(a);
+
+	// Does NOT fold: folding it would delete `built` from the output.
+	let announced = announce();
+
+	print(a + b + squared + steps[2] + shifted + announced);
+}
+main();
