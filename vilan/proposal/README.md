@@ -93,4 +93,5 @@ is the historical record everything shipped gets moved into.
 | `signal-update.md` | shipped arc | `Signal::update` — mutate in place, notify once (A18); design record + ship record, landed 2026-08-03. |
 | `iterator-adapters.md` | draft — awaiting review | Iterator adapter layer + pipeline ergonomics over `Iterable` (I3); found 4 compiler prerequisites (P1–P4). |
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
+| `capture-clones.md` | shipped arc | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |

@@ -3206,4 +3206,75 @@ organized by originating section for lookup.
    and the rejection of `mut` combined with a view convention if that is
    the settled rule.
 
+### Moved at the v0.24.0 cut (2026-08-03)
+
+#### A18. signals of collections: the mutate-in-place gap — SHIPPED 2026-08-03
+
+(design (a) `Signal::update` per owner call, same day the entry was filed;
+full record in `signal-update.md`. Original entry:) (M; user
+report 2026-08-03; design first, sized without it) — mutating a
+`Signal<List<T>>` today is `signal.set_with(|list| { ... })`, a
+copy-transform-return dance (`reactive.vl:419`: `set_with(self,
+transform: sync |T| T)`), made worse by the missing `mut`-parameter
+form (H9) — the tester's real code needed `|temp| { mut list = temp;
+list.push(5); list }`. `Shared` already has the right shape for the
+STORAGE half: `write(self): &mut T borrows self` (`shared.vl:28`), but
+a signal write must also NOTIFY, so a bare view is not enough. Two
+candidate designs, one to be picked on paper: (a) **`update(self,
+mutate: sync |&mut T| void)`** — the closure receives a writable view
+of the stored value, the runtime notifies once after it returns;
+composes with `batch` coalescing for free; smallest surface. (b)
+**`write(self): SignalWrite<T>`** — a guard whose view mutates storage
+and whose `drop` notifies (rides C4 Tier-1 deterministic destruction);
+reads best (`signal.write().push(5)`) but hangs semantics on
+temporary-drop timing and needs a rule-4 story for a held guard across
+a re-entrant read. Either generalizes over EVERY collection — a
+dedicated `ListSignal` was considered and rejected as non-general
+(Set/Map/user types would each need a twin; the user's own framing).
+Note this is the same gap Solid-family frameworks carry; the memory
+model's views are exactly the tool they lack.
+
+#### B53. Pattern captures alias their source — SHIPPED 2026-08-03, COMPLETE
+
+(`0835c7d` in v0.23.6 was the first half — destructure + unguarded match
+legs via `compute_capture_clone_sites`/`compile_pattern`, the SHARE and
+MOVE elisions, 5 pins, corpus fixture `capture-clones.vl`, 12 goldens
+runtime-verified. An adversarial review the same day found it HALF-fixed:
+`is` captures and GUARDED match legs compile through the sibling
+`compile_is_pattern` path and still aliased; the conservative
+generic-capture clone deep-copied RESOURCES (violating `memory.md` R11,
+e.g. through `Option::unwrap()`); the SHARE elision composed unsoundly
+with rule 2's move elision; and seam detection missed non-place tails
+(braced blocks, `if`-expression value positions). The follow-up arc
+closed all four the same day — `materialize_capture_clones` on the
+`is`-path with guard-ordering decided (copy on leg entry; a rejecting
+guard copies nothing), resources MOVE out of generic captures via
+per-instantiation `resource_triggering_constraints` (reaching through
+`Wrap<T>`, wider than the review filed), the capture pass stratified
+before `compute_clone_sites` so SHARE is never an elidable-copy source,
+tail-leaf seam collection, and `mut [a, b]` stamps its elements in
+`match`/`is` exactly as in `let`. 14 pins, 10 red-first against v0.23.6;
+only the rewritten fixture's golden changed — every other corpus golden
+byte-identical, which is the SHARE elision's survival proof. Two open
+holes found on the way are filed as B59 (guard-hoisted temporary) and
+B60 (self-by-value is not a move); full record in `capture-clones.md`.
+Original entry:) (S–M;
+found 2026-08-03 while building H9, pinned as an `#[ignore]`d test
+`a_mut_destructure_capture_does_not_alias_its_source`) — rule 1 says
+a binding copies its aggregate place, and `mut copy = single` does
+(`compute_clone_sites` reads `Variable.initial`), but a DESTRUCTURE
+capture does not: `mut (xs, n) = pair; xs.push(9)` grows `pair.0`
+too (v0.23.5 prints "3 3" where rule 1 says "3 2"). The transformer's
+`Expr::Destructure` arm binds captures from positional slots of a
+temp (`const __d = value; const xs = __d[0]`) with no `__clone` on
+any slot, and `compute_clone_sites` has no Destructure arm. Mostly
+masked because binder-element captures parse immutable (even under
+`mut (a, b)` — `apply_binding_mutability` leaves tuple/array
+elements untouched, itself a quirk worth folding into the fix) and
+an immutable alias is unobservable; `set_pattern_bindings_mutable`
+(`mut` destructuring let) opens the observable path. Fix at the root:
+clone captures per rule 1 (with the same elision rules), not just
+mutable ones — then decide whether `mut (a, b)` should stamp its
+elements mutable while in there.
+
 
