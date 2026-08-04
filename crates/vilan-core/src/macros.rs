@@ -543,7 +543,7 @@ fn macro_shape(function: &Func) -> Option<MacroShape> {
         return None;
     }
     let type_name = |index: usize| -> Option<&str> {
-        let (_, type_, _, _) = function.parameters.0.get(index)?;
+        let type_ = &function.parameters.0.get(index)?.declared_type;
         match type_.as_deref().map(|spanned| &spanned.0) {
             Some(Node::Accessor(name)) => Some(*name),
             _ => None,
@@ -1771,14 +1771,15 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
         .parameters
         .0
         .iter()
-        .map(|(pattern, type_, _convention, span)| {
-            let parameter_name = match pattern {
+        .map(|parameter| {
+            let parameter_name = match &parameter.pattern {
                 Pattern::Binding(name, _) => (*name).to_string(),
-                _ => slice(text, *span).to_string(),
+                _ => slice(text, parameter.span).to_string(),
             };
             array(vec![
                 string_literal(&parameter_name),
-                type_
+                parameter
+                    .declared_type
                     .as_ref()
                     .map(|type_| construct_type_expr(type_, text))
                     .unwrap_or_else(void_type_expr),

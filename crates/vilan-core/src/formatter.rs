@@ -1753,7 +1753,8 @@ impl<'src> Printer<'src> {
     fn print_parameters(&mut self, parameters: &Spanned<Vec<crate::node::Parameter<'src>>>) {
         let (parameters, list_span) = (&parameters.0, parameters.1);
         let split = std::mem::take(&mut self.split);
-        let parameter_spans: Vec<Span> = parameters.iter().map(|parameter| parameter.3).collect();
+        let parameter_spans: Vec<Span> =
+            parameters.iter().map(|parameter| parameter.span).collect();
         if !parameters.is_empty()
             && (split != Split::Off || self.comment_outside_elements(list_span, &parameter_spans))
         {
@@ -1779,8 +1780,8 @@ impl<'src> Printer<'src> {
         self.indent += 1;
         let mut prev_end = open;
         for parameter in parameters {
-            self.flush_element_comments(parameter.3.into_range().start, prev_end);
-            prev_end = parameter.3.into_range().end;
+            self.flush_element_comments(parameter.span.into_range().start, prev_end);
+            prev_end = parameter.span.into_range().end;
             self.line();
             self.print_parameters_inner(std::slice::from_ref(parameter));
             self.out.push(',');
@@ -1793,15 +1794,21 @@ impl<'src> Printer<'src> {
     /// Prints the comma-separated parameters themselves, without the surrounding
     /// delimiters (shared by function `(…)` and closure `|…|` lists).
     fn print_parameters_inner(&mut self, parameters: &[crate::node::Parameter<'src>]) {
-        for (index, (binder, parameter_type, convention, _)) in parameters.iter().enumerate() {
+        for (index, parameter) in parameters.iter().enumerate() {
+            let (binder, parameter_type) = (&parameter.pattern, &parameter.declared_type);
             if index > 0 {
                 self.out.push_str(", ");
+            }
+            // `mut` (binder mutability) and the conventions are exclusive by
+            // the grammar, so at most one prefix prints.
+            if parameter.mutable {
+                self.out.push_str("mut ");
             }
             let type_is_reference = matches!(
                 parameter_type.as_deref().map(|spanned| &spanned.0),
                 Some(Node::Reference(..))
             );
-            match convention {
+            match parameter.convention {
                 Convention::Own => self.out.push_str("own "),
                 Convention::Ref if !type_is_reference => self.out.push('&'),
                 Convention::RefMut if !type_is_reference => self.out.push_str("&mut "),

@@ -36,6 +36,27 @@ allowed to do with them:
 fun largest<T: PartialOrd>(a: T, b: T): T { … }
 ```
 
+Parameters are immutable by default, like `let` bindings. Write `mut` to
+make one a scratch copy the body can rebind and mutate — the caller
+never sees it, because parameters arrive by value (to change the
+caller's value, take `&mut` instead). It works on `self` and closure
+parameters too:
+
+```vilan
+import std::print;
+
+fun bump(mut x: i32): i32 {
+	x = x + 1;
+	x
+}
+
+fun main() {
+	let original = 7;
+	print(bump(original)); // 8
+	print(original);       // 7 — untouched
+}
+```
+
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes

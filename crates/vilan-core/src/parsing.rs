@@ -2264,16 +2264,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// One closure parameter: `binder (: type)?`, carrying the bare convention and
-    /// the binder's span.
+    /// One closure parameter: `mut? binder (: type)?`, carrying the bare
+    /// convention and the binder's span. `mut` is binder mutability, the same
+    /// as on a function parameter (proposal/mut-parameters.md).
     fn parse_closure_parameter(&mut self) -> Option<Parameter<'src>> {
+        let mutable = self.eat(&Token::Mut);
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
             Some(Box::new(self.parse_type()?))
         } else {
             None
         };
-        Some((pattern, parameter_type, Convention::Bare, pattern_span))
+        self.reject_mut_destructure(mutable, &pattern, pattern_span);
+        Some(Parameter {
+            pattern,
+            declared_type: parameter_type,
+            convention: Convention::Bare,
+            mutable,
+            span: pattern_span,
+        })
     }
 
     // --- Binders and patterns ------------------------------------------------
@@ -2841,6 +2850,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         let name = (name, self.span_from(name_start));
         let generic_parameters = self.parse_generic_parameters();
         let parameters = self.parse_function_parameters()?;
+        if external {
+            // An external has no Vilan body, so there is no copy to mutate —
+            // a `mut` parameter on one can only be a misunderstanding.
+            for parameter in &parameters.0 {
+                if parameter.mutable {
+                    self.errors.push(ParseError {
+                        span: parameter.span,
+                        reason: ParseErrorReason::Rule(
+                            "an `external fun` has no body; `mut` marks a \
+                             parameter the body mutates, so it has no meaning here",
+                        ),
+                        context: Vec::new(),
+                        hint: None,
+                    });
+                }
+            }
+        }
         let return_type = if self.eat_op(":") {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
@@ -2894,10 +2920,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((parameters, self.span_from(start)))
     }
 
-    /// One function parameter: `(own | & mut?)? binder (: type)?`. The convention is
-    /// the explicit prefix, else inferred from a `&T` / `&mut T` type, else `Bare`.
-    /// (Distinct from a closure parameter, which carries no convention.)
+    /// One function parameter: `(mut | own | & mut?)? binder (: type)?`. The
+    /// convention is the explicit prefix, else inferred from a `&T` / `&mut T`
+    /// type, else `Bare`. A leading `mut` is binder mutability, not a
+    /// convention (proposal/mut-parameters.md): the body may rebind and
+    /// field-write its by-value copy, invisibly to the caller.
     fn parse_function_parameter(&mut self) -> Option<Parameter<'src>> {
+        let start = self.position;
+        let mutable = self.eat(&Token::Mut);
         let prefix = if self.eat(&Token::Own) {
             Some(Convention::Own)
         } else if self.eat_op("&") {
@@ -2909,6 +2939,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
+        // `own mut x` / `&mut mut x` — a stray `mut` after the convention,
+        // consumed here so the binder still parses and the rule below fires.
+        let misplaced_mut = prefix.is_some() && self.eat(&Token::Mut);
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
             Some(Box::new(
@@ -2925,7 +2958,47 @@ impl<'a, 'src> Parser<'a, 'src> {
                     _ => Convention::Bare,
                 },
             );
-        Some((pattern, parameter_type, convention, pattern_span))
+        // `mut` marks the callee's by-value copy writable, so it composes with
+        // nothing that changes how the argument is received: not `own` (already
+        // rebindable), not a view (mutability there belongs to the target, via
+        // `&mut`). The inferred-convention arm catches `mut x: &T` too.
+        if (mutable && convention != Convention::Bare) || misplaced_mut {
+            let span = self.span_from(start);
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(
+                    "`mut` makes the parameter's by-value copy writable; it cannot \
+                     combine with `own` or a view (`&`, `&mut`), which choose how \
+                     the argument is received",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+        self.reject_mut_destructure(mutable, &pattern, pattern_span);
+        Some(Parameter {
+            pattern,
+            declared_type: parameter_type,
+            convention,
+            mutable,
+            span: pattern_span,
+        })
+    }
+
+    /// `mut` on a parameter applies to a plain name binder; a destructure gets
+    /// its mutable pieces in the body (`mut (a, b) = pair;`).
+    fn reject_mut_destructure(&mut self, mutable: bool, pattern: &Pattern<'src>, span: Span) {
+        if mutable && !matches!(pattern, Pattern::Binding(..)) {
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(
+                    "`mut` on a parameter applies to a plain name; destructure in \
+                     the body (`mut (a, b) = pair;`) for mutable pieces",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
     }
 
     // --- Structs / enums -----------------------------------------------------
@@ -4190,7 +4263,7 @@ mod tests {
                     .parameters
                     .0
                     .iter()
-                    .map(|(_, _, convention, _)| *convention)
+                    .map(|parameter| parameter.convention)
                     .collect();
                 assert_eq!(
                     conventions,
@@ -4212,7 +4285,7 @@ mod tests {
                     .parameters
                     .0
                     .iter()
-                    .map(|(_, _, convention, _)| *convention)
+                    .map(|parameter| parameter.convention)
                     .collect();
                 assert_eq!(
                     conventions,

@@ -2214,6 +2214,272 @@ fn own_parameter_is_a_mutable_copy() {
     );
 }
 
+// --- H9: `mut` parameters (proposal/mut-parameters.md) ---------------------
+// `fun f(mut x: T) { body }` ≡ `fun f(x': T) { mut x = x'; body }` — binder
+// mutability of the callee's by-value copy, exclusive with conventions,
+// never part of the signature.
+
+#[test]
+fn a_mut_parameter_rebinds_its_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun bump(mut x: i32): i32 { x = x + 1; x }
+        fun main() { print(bump(1)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_mut_parameter_is_invisible_to_the_caller() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun grow(mut xs: List<i32>): i32 { xs.push(9); xs.len() }
+        fun main() {
+            mut list = [1, 2];
+            print(grow(list));  // 3 — the callee's copy grew
+            print(list.len());  // 2 — the caller's value untouched
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_plain_parameter_beside_a_mut_one_still_rejects_writes() {
+    // The mixed list pins two things: `mut` is per-parameter, and the plain
+    // parameter's rejection now offers BOTH spellings (copy vs caller).
+    assert_fails_with(
+        r#"
+        fun f(mut a: i32, b: i32) { a = 1; b = 2; }
+        fun main() { f(1, 2); }
+        "#,
+        "declare it `mut b` to mutate this function's copy, or `&mut b` to mutate the caller's value",
+    );
+}
+
+#[test]
+fn a_mut_parameter_takes_field_writes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point { x: i32 }
+        fun place(mut p: Point): i32 { p.x = 42; p.x }
+        fun main() { print(place(Point { x = 0 })); }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_closure_mut_parameter_works_unannotated() {
+    // The field case that filed H9, verbatim: mutating a `Signal<List<T>>`
+    // via `set_with(|mut list| { list.push(..); list })`. The closure's
+    // parameter type lands from `set_with`'s declared signature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::reactive::Signal;
+        fun main() {
+            mut seed = [1, 2];
+            let numbers = Signal::new(seed);
+            numbers.set_with(|mut list| {
+                list.push(5);
+                list
+            });
+            print(numbers.get().len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing closure-deferral gap: a binding initialized from a \
+closure parameter typed via a plain function's declared closure type stays \
+unknown — the hand-written `mut x = v;` form fails identically (H9's desugar \
+reproduces it faithfully); un-ignore when the deferral wakes such bindings"]
+fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply(xs: List<i32>, grow: |List<i32>| i32): i32 { grow(xs) }
+        fun main() {
+            mut list = [1, 2];
+            print(apply(list, |mut xs| {
+                xs.push(5);
+                xs.len()
+            }));
+            print(list.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_closure_mut_parameter_works_annotated() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let bump = |mut v: i32| { v = v + 1; v };
+            print(bump(1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mut_self_is_the_builder_idiom() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point { x: i32 }
+        impl Point {
+            fun with_x(mut self, value: i32): Point { self.x = value; self }
+        }
+        fun main() {
+            let original = Point { x = 0 };
+            let moved = original.with_x(9);
+            print(moved.x);
+            print(original.x); // the receiver copy mutated; the original didn't
+        }
+        "#,
+        "9\n0\n",
+    );
+}
+
+#[test]
+fn a_mut_parameter_roots_a_writable_view() {
+    // `&mut x` of a `mut` parameter's copy is fine (readonly_root clears);
+    // the view writes land in the copy, still invisible to the caller.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun poke(mut x: i32): i32 { let v = &mut x; v = 5; x }
+        fun main() { print(poke(1)); }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_mut_parameter_feeds_a_ref_mut_argument() {
+    // A `mut` parameter is a mutable place, so passing `&mut` of it to a
+    // writable-view parameter passes check_mutable_arguments.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun bump(c: &mut i32) { c += 1; }
+        fun outer(mut x: i32): i32 { bump(&mut x); x }
+        fun main() { print(outer(1)); }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn mut_does_not_combine_with_a_convention() {
+    assert_fails_with(
+        r#"
+        fun f(mut own x: i32) {}
+        fun main() { f(1); }
+        "#,
+        "cannot combine with `own` or a view",
+    );
+}
+
+#[test]
+fn mut_does_not_combine_with_an_inferred_view_convention() {
+    // `mut x: &mut i32` — no prefix, but the type makes the convention RefMut.
+    assert_fails_with(
+        r#"
+        fun f(mut x: &mut i32) {}
+        fun main() {}
+        "#,
+        "cannot combine with `own` or a view",
+    );
+}
+
+#[test]
+fn mut_needs_a_name_binder_not_a_destructure() {
+    assert_fails_with(
+        r#"
+        fun f(mut (a, b): (i32, i32)) {}
+        fun main() {}
+        "#,
+        "applies to a plain name",
+    );
+}
+
+#[test]
+fn an_external_fun_rejects_mut_parameters() {
+    assert_fails_with(
+        r#"
+        external fun host(mut x: i32);
+        fun main() {}
+        "#,
+        "an `external fun` has no body",
+    );
+}
+
+#[test]
+fn a_mut_parameter_never_takes_a_resource() {
+    // R1: a resource never copies, and a `mut` parameter IS a copy — the
+    // rejection steers to `own` (transfer), the sanctioned resource intake.
+    assert_fails_with(
+        r#"
+        resource struct Conn { id: i32 }
+        impl Conn { fun close(own self) {} }
+        fun misuse(mut c: Conn) {}
+        fun main() {}
+        "#,
+        "a resource never copies",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing rule-1 hole found while building H9 (backlog B53): a \
+mutable destructure capture aliases its source — `mut (xs, n) = pair; \
+xs.push(9)` grows pair.0 too. Un-ignore when Destructure captures clone."]
+fn a_mut_destructure_capture_does_not_alias_its_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            mut (xs, n) = pair;
+            xs.push(9);
+            print(xs.len());
+            print(pair.0.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn trait_conformance_ignores_parameter_mut() {
+    // `mut` is the impl's local business — a trait signature without it is
+    // satisfied by an impl with it (and the receiver likewise).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Doubler { fun doubled(self, x: i32): i32; }
+        struct Twice {}
+        impl Twice with Doubler {
+            fun doubled(mut self, mut x: i32): i32 { x = x * 2; x }
+        }
+        fun main() { print(Twice {}.doubled(21)); }
+        "#,
+        "42\n",
+    );
+}
+
 #[test]
 fn shared_write_is_a_view_not_a_value() {
     // `write()` returns a view (`&mut T`), so binding its result to a value slot

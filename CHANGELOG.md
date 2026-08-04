@@ -6,6 +6,12 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`mut` parameters.** `fun f(mut x: i32)`, `|mut list| { … }`, and `mut self` now parse and work: `mut` makes the parameter a scratch copy the body can rebind and mutate — field writes included — with nothing visible to the caller, exactly as if the body opened with `mut x = x`. It works in every parameter position, stays out of trait signatures, and refuses the combinations that would mislead (`mut own`, `mut` with a view, `mut` on an `external fun`, `mut` on a resource). The old error for assigning through a parameter steered everyone to `&mut`, which changes the caller contract; it now offers both spellings: `mut x` to mutate your copy, `&mut x` to mutate the caller's value.
+
+---
+
 ## v0.23.5 — 2026-08-03
 
 **See what bundle splitting would save, today.** `vilan build --print-chunks` reports the route-chunk plan for each entry: which `View.swap` route matches are splittable, which functions every path needs eagerly, and which pages (with their exclusive helpers, wherever they live — entry or module) would load lazily per route, with estimated sizes. Analysis only — the emitted JavaScript is unchanged. The instrument for the bundle-splitting arc (`proposal/bundle-splitting.md`): emission lands when a real app's report shows meaningful per-route mass.

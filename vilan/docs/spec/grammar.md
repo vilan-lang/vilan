@@ -66,7 +66,7 @@ function = [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
            [ ":" type ] [ "borrows" IDENT ]
            ( block | ";" ) ;
 
-parameter  = [ convention ] binder [ ":" type ] ;
+parameter  = [ "mut" | convention ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
 binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
 
@@ -80,6 +80,15 @@ functions and required trait methods. A parameter's **convention** may
 come from the prefix (`own x`, `&mut self`) or from a view type
 (`x: &mut T`); the prefix wins if both are present (§6.3). The `borrows`
 clause names the parameter the returned view projects (§6.5).
+
+A leading `mut` is **binder mutability**, not a convention: the body may
+rebind and field-write its by-value copy, invisibly to the caller —
+`fun f(mut x: T) { … }` is `fun f(x': T) { mut x = x'; … }`. It applies
+to a plain name binder (including `self` and closure parameters), never
+combines with a convention, is not part of the signature (trait
+conformance ignores it), and is rejected on an `external fun` (no body).
+A resource cannot be taken `mut` (a resource never copies; take it
+`own`).
 
 ### Structs and enums
 

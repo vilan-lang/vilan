@@ -82,7 +82,7 @@ pub fn transform_functions<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    if !program.clone_sites.is_empty() {
+    if !program.clone_sites.is_empty() || !program.parameter_entry_clones.is_empty() {
         transformer.used_helpers.insert("__clone");
     }
     let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();
@@ -1108,7 +1108,7 @@ impl<'src> Transformer<'src> {
         // Value-semantics copies (`own` arguments, aggregate bindings) lower to
         // the `__clone` helper rather than `structuredClone`, which can't copy
         // the closures a struct may hold.
-        if !self.program.clone_sites.is_empty() {
+        if !self.program.clone_sites.is_empty() || !self.program.parameter_entry_clones.is_empty() {
             self.used_helpers.insert("__clone");
         }
         let helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
@@ -1180,6 +1180,37 @@ impl<'src> Transformer<'src> {
         } else {
             node
         }
+    }
+
+    /// H9 (proposal/mut-parameters.md): the body-entry statements realizing
+    /// `mut x = x'` — `x = __clone(x)` for an aggregate `mut` parameter
+    /// (rule 1's copy), `x = [x]` for a scalar one some view roots in (the
+    /// boxed cell its `(base, key)` views write through). Run before
+    /// anything else in the body, including tuple-parameter destructures
+    /// and resource teardown wrapping.
+    fn parameter_entry_preludes(&mut self, parameter_ids: &[Id]) -> Vec<js::Node<'src>> {
+        parameter_ids
+            .iter()
+            .filter_map(|parameter_id| {
+                let name = self.ng.name_for(*parameter_id);
+                if self.program.parameter_entry_clones.contains(parameter_id) {
+                    Some(js::Node::Assignment(
+                        Box::new(js::Node::Local(name.clone())),
+                        Box::new(js::Node::Call(
+                            Box::new(js::Node::Local("__clone".to_string())),
+                            vec![js::Node::Local(name)],
+                        )),
+                    ))
+                } else if self.program.boxed_locals.contains(parameter_id) {
+                    Some(js::Node::Assignment(
+                        Box::new(js::Node::Local(name.clone())),
+                        Box::new(js::Node::Array(vec![js::Node::Local(name)])),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Rule 1 (value semantics): wrap a value in `__clone(...)` when the analyzer
@@ -1925,7 +1956,7 @@ impl<'src> Transformer<'src> {
                         name: self.ng.name_for(*parameter_id),
                     })
                     .collect::<Vec<_>>();
-                let mut body = Vec::new();
+                let mut body = self.parameter_entry_preludes(&closure.parameters);
                 // Tuple-parameter destructures run before the body proper.
                 let parameter_destructures = closure.parameter_destructures.clone();
                 for destructure_id in parameter_destructures {
@@ -3657,7 +3688,8 @@ impl<'src> Transformer<'src> {
         // A body owning resource locals is restructured into per-resource
         // `try`/`finally` teardown (destruction.md §7); one owning none emits
         // exactly as before (byte-identical corpus gate).
-        let body = if self.scope_needs_drops(&function.body.0) {
+        let mut body = self.parameter_entry_preludes(&function.parameters);
+        body.extend(if self.scope_needs_drops(&function.body.0) {
             self.walk_scope_body(
                 &function.body.0,
                 0,
@@ -3675,7 +3707,7 @@ impl<'src> Transformer<'src> {
                 }
             }
             body
-        };
+        });
         // An `own` resource parameter not moved out drops at the body's scope end
         // (destruction.md §6). Its `finally` wraps the WHOLE body — outside any
         // local teardown — so parameters drop last (declared before the locals =>
@@ -5211,7 +5243,7 @@ pub fn transform_const_program<'src>(
             format!("import {{ {} }} from \"{}\";", names, module)
         })
         .collect::<Vec<_>>();
-    if !program.clone_sites.is_empty() {
+    if !program.clone_sites.is_empty() || !program.parameter_entry_clones.is_empty() {
         transformer.used_helpers.insert("__clone");
     }
     let helpers = transformer.used_helpers.into_iter().collect::<Vec<_>>();

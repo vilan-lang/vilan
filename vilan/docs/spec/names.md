@@ -85,8 +85,8 @@ their declaration.
 
 A `let` may also redeclare a name **within the same scope**: the later
 binding shadows the earlier one from its own declaration point onward,
-while uses before that point keep the earlier binding (parameters and
-loop/pattern bindings are shadowable the same way). Visibility starts at
+while uses before that point keep the earlier binding (parameters —
+`mut` or not — and loop/pattern bindings are shadowable the same way). Visibility starts at
 the **end** of the declaring statement, so an initializer never reads the
 binding it declares: in `let x = x + 1;` the right-hand `x` is the
 previous `x` (an enclosing or earlier same-scope binding) and an error

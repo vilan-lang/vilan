@@ -342,6 +342,10 @@ pub struct Parameter<'src> {
     /// How the parameter receives its argument (rule 3). Recorded now; the
     /// default flip and mutability checking consume it later.
     pub convention: Convention,
+    /// `mut x` (proposal/mut-parameters.md): the body may rebind and
+    /// field-write its by-value copy. Never part of the signature —
+    /// conformance checking compares conventions only.
+    pub mutable: bool,
 }
 
 /// The precomputed view sets the rule-4 scan matches against: origins for
@@ -7526,20 +7530,24 @@ impl<'src> Analyzer<'src> {
     fn collect_rpc_signature(&mut self, function: &'src Func<'src>) {
         let mut members = Vec::new();
         for parameter in &function.parameters.0 {
-            let parameter_name = match &parameter.0 {
+            let parameter_name = match &parameter.pattern {
                 Pattern::Binding(name, _) => name,
                 _ => "_",
             };
             if parameter_name == "self" {
                 continue;
             }
-            match parameter.1.as_deref() {
+            match parameter.declared_type.as_deref() {
                 Some(type_node) => members.push((
                     format!("parameter `{parameter_name}`"),
                     Some(&type_node.0),
                     type_node.1,
                 )),
-                None => members.push((format!("parameter `{parameter_name}`"), None, parameter.3)),
+                None => members.push((
+                    format!("parameter `{parameter_name}`"),
+                    None,
+                    parameter.span,
+                )),
             }
         }
         match function.return_type.as_deref() {
@@ -8436,6 +8444,22 @@ impl<'src> Analyzer<'src> {
     /// If a place is a field/deref chain rooted in something immutable, its name
     /// and the fix hint (`&mut x` for a readonly parameter, `mut` for an
     /// immutable `let` local). `None` when the root is mutable — a `mut` local,
+    /// The "declare it …" clause for an immutable-root diagnostic, from
+    /// [`Self::readonly_root`]'s fix marker. A plain parameter offers BOTH
+    /// spellings — `mut` (this function's copy) and `&mut` (the caller's
+    /// value) — because which one is wanted is the author's intent, not
+    /// something the checker can see (H9, proposal/mut-parameters.md).
+    fn immutability_advice(name: &str, fix: &str) -> String {
+        match fix {
+            "`mut-or-&mut`" => format!(
+                "declare it `mut {name}` to mutate this function's copy, or \
+                 `&mut {name}` to mutate the caller's value"
+            ),
+            "`&mut`" => format!("declare it `&mut {name}` to allow mutation"),
+            _ => "declare it `mut` to allow mutation".to_string(),
+        }
+    }
+
     /// or an `own` / `&mut` parameter. A bare parameter is readonly by default
     /// (the position-default-convention flip).
     fn readonly_root(&self, expr_id: Id) -> Option<(&'src str, &'static str)> {
@@ -8447,8 +8471,16 @@ impl<'src> Analyzer<'src> {
             Expr::Dereference(operand_id) => self.readonly_root(*operand_id),
             Expr::Local(binding_id) => {
                 if let Some(parameter) = self.parameters.get(binding_id) {
-                    matches!(parameter.convention, Convention::Bare | Convention::Ref)
-                        .then_some((parameter.name, "`&mut`"))
+                    match parameter.convention {
+                        // A `mut` parameter's copy is writable (H9).
+                        Convention::Bare if !parameter.mutable => {
+                            Some((parameter.name, "`mut-or-&mut`"))
+                        }
+                        // A `&` view is readonly by the VIEW's mutability;
+                        // `mut` does not apply to it.
+                        Convention::Ref => Some((parameter.name, "`&mut`")),
+                        _ => None,
+                    }
                 } else if let Some(variable) = self.variables.get(binding_id) {
                     // A binding holding a view is governed by the view's
                     // mutability, not the `let`/`mut` of the binding: `let v =
@@ -9794,6 +9826,17 @@ impl<'src> Analyzer<'src> {
         for expr in self.expr_id_to_expr_map.values() {
             if let Expr::Reference(operand, _) = expr {
                 if let Some(root) = self.place_root(*operand) {
+                    // A `mut` parameter is a mutable scalar cell like any
+                    // `mut` local (H9): viewed, it re-boxes at body entry so
+                    // the `(base, key)` view writes through a real cell.
+                    if let Some(parameter) = self.parameters.get(&root) {
+                        if parameter.mutable
+                            && self.is_scalar_view_pointee(&parameter.type_id.get_type(self))
+                        {
+                            boxed.insert(root);
+                        }
+                        continue;
+                    }
                     match self
                         .variables
                         .get(&root)
@@ -11109,15 +11152,11 @@ impl<'src> Analyzer<'src> {
             .collect();
         for target_id in assignment_targets {
             if let Some((name, fix)) = self.readonly_root(target_id) {
-                let advice = if fix == "`&mut`" {
-                    format!("declare it `&mut {name}`")
-                } else {
-                    "declare it `mut`".to_string()
-                };
+                let advice = Self::immutability_advice(name, fix);
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot mutate immutable '{name}'; {advice} to allow mutation."),
+                    msg: format!("cannot mutate immutable '{name}'; {advice}."),
                 });
             }
         }
@@ -11170,17 +11209,11 @@ impl<'src> Analyzer<'src> {
                     .is_some_and(|parameter| parameter.convention == Convention::RefMut);
                 if writable {
                     if let Some((name, fix)) = self.readonly_root(*argument_id) {
-                        let advice = if fix == "`&mut`" {
-                            format!("declare it `&mut {name}`")
-                        } else {
-                            "declare it `mut`".to_string()
-                        };
+                        let advice = Self::immutability_advice(name, fix);
                         self.diagnostics.push(Error {
                             note: None,
                             span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "cannot mutate immutable '{name}'; {advice} to allow mutation."
-                            ),
+                            msg: format!("cannot mutate immutable '{name}'; {advice}."),
                         });
                     }
                 }
@@ -11314,16 +11347,11 @@ impl<'src> Analyzer<'src> {
             .collect();
         for (reference_id, operand_id) in references {
             if let Some((name, fix)) = self.readonly_root(operand_id) {
-                let advice = if fix == "`&mut`" {
-                    format!("declare it `&mut {name}`")
-                } else {
-                    "declare it `mut`".to_string()
-                };
-                self.diagnostics.push(Error { note: None,
+                let advice = Self::immutability_advice(name, fix);
+                self.diagnostics.push(Error {
+                    note: None,
                     span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "cannot take a writable view of immutable '{name}'; {advice} to allow mutation."
-                    ),
+                    msg: format!("cannot take a writable view of immutable '{name}'; {advice}."),
                 });
             }
         }
@@ -11681,6 +11709,51 @@ impl<'src> Analyzer<'src> {
                     sites.insert(*argument_id);
                 }
             }
+        }
+        sites
+    }
+
+    /// H9 (proposal/mut-parameters.md): the runtime half of `mut x = x'`,
+    /// emitted at BODY ENTRY (`compile-to-js` prepends the statements) —
+    /// body entry rather than the `own`-style call site because a `mut`
+    /// parameter also exists on closures and dispatched callees, where no
+    /// call-site resolution exists; one site per function covers every call
+    /// path, at the cost of `own`'s last-read elision.
+    ///
+    /// Two disjoint forms per parameter: an AGGREGATE copies
+    /// (`x = __clone(x)` — rule 1, so callee writes never alias the
+    /// caller's value; scalars already copy by JS value passing), and a
+    /// SCALAR some `&`/`&mut` view roots in re-boxes (`x = [x]`, via
+    /// `compute_boxed_locals`) so the view has a real cell to write
+    /// through. A resource never clones (R1): a `mut` resource parameter
+    /// is rejected, steering to `own` (transfer).
+    fn compute_parameter_entry_clones(&mut self) -> HashSet<Id> {
+        let mut sites = HashSet::new();
+        let mut resource_rejections: Vec<(Id, &'src str)> = Vec::new();
+        let mutable_parameters: Vec<(Id, &'src str, TypeId)> = self
+            .parameters
+            .iter()
+            .filter(|(_, parameter)| parameter.mutable)
+            .map(|(parameter_id, parameter)| (*parameter_id, parameter.name, parameter.type_id))
+            .collect();
+        for (parameter_id, name, type_id) in mutable_parameters {
+            if self.type_is_resource(type_id) {
+                resource_rejections.push((parameter_id, name));
+                continue;
+            }
+            if self.is_cloneable_aggregate(&type_id.get_type(self)) {
+                sites.insert(parameter_id);
+            }
+        }
+        for (parameter_id, name) in resource_rejections {
+            self.diagnostics.push(Error {
+                note: None,
+                span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                msg: format!(
+                    "a resource never copies, so `mut {name}` cannot take one; \
+                     declare it `own {name}` to transfer it in"
+                ),
+            });
         }
         sites
     }
@@ -12744,15 +12817,15 @@ impl<'src> Analyzer<'src> {
                 self.span_map.insert(marker, &function.name.1);
                 self.expr_id_to_scope_id_map.insert(marker, scope_id);
                 let mut signature = format!("macro fun {}(", function.name.0);
-                for (index, (pattern, type_, _, _)) in function.parameters.0.iter().enumerate() {
+                for (index, parameter) in function.parameters.0.iter().enumerate() {
                     if index > 0 {
                         signature.push_str(", ");
                     }
-                    match pattern {
+                    match &parameter.pattern {
                         Pattern::Binding(name, _) => signature.push_str(name),
                         _ => signature.push('_'),
                     }
-                    if let Some(type_) = type_.as_deref() {
+                    if let Some(type_) = parameter.declared_type.as_deref() {
                         signature.push_str(": ");
                         signature.push_str(&render_type(&type_.0));
                     }
@@ -14111,7 +14184,13 @@ impl<'src> Analyzer<'src> {
         type_scope_id: Id,
         destructures: &mut Vec<Id>,
     ) -> Id {
-        let (pattern, parameter_type, convention, span) = parameter;
+        let crate::node::Parameter {
+            pattern,
+            declared_type: parameter_type,
+            convention,
+            mutable,
+            span,
+        } = parameter;
         let parameter_id = self.new_entity_id();
         // Peel a `context` clause (proposal/ambient-owner.md §5) — a
         // parameter's closure type is the one position v1 supports. The
@@ -14204,6 +14283,7 @@ impl<'src> Analyzer<'src> {
                 name,
                 type_id,
                 convention: *convention,
+                mutable: *mutable,
             },
         );
         self.expr_id_to_expr_map
@@ -22458,6 +22538,11 @@ pub struct Program<'src> {
     // a deep copy because they bind/assign an aggregate place that would
     // otherwise alias its source. Filled by `compute_clone_sites`.
     pub clone_sites: HashSet<Id>,
+    /// H9: `mut` parameters of aggregate type — the transformer emits
+    /// `x = __clone(x)` at body entry for each (see
+    /// `compute_parameter_entry_clones`; scalar `mut` parameters with views
+    /// ride `boxed_locals` instead).
+    pub parameter_entry_clones: HashSet<Id>,
     /// Destruction (destruction.md §5/§7): resource-typed locals still owned at
     /// their declaring scope's fall-through end. The transformer wraps the owning
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
@@ -23283,7 +23368,7 @@ pub(crate) fn service_impl_source(
             }
             let mut parameters = Vec::new();
             for parameter in &function.parameters.0 {
-                let parameter_name = match &parameter.0 {
+                let parameter_name = match &parameter.pattern {
                     Pattern::Binding(name, _) => *name,
                     _ => "_",
                 };
@@ -23291,7 +23376,7 @@ pub(crate) fn service_impl_source(
                     continue;
                 }
                 let type_string = parameter
-                    .1
+                    .declared_type
                     .as_deref()
                     .map(|type_| render_type(&type_.0))
                     .unwrap_or_else(|| "_".to_string());
@@ -26152,6 +26237,7 @@ fn analyze_over_world<'src>(
     // write-through deref form before codegen reads the targets.
     analyzer.rewrite_view_assignment_targets();
     let clone_sites = analyzer.compute_clone_sites();
+    let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
@@ -26447,6 +26533,7 @@ fn analyze_over_world<'src>(
         adapted_instances: HashMap::new(),
         return_sites: analyzer.return_sites.clone(),
         clone_sites,
+        parameter_entry_clones,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),

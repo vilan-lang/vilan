@@ -1,0 +1,49 @@
+// H9 (proposal/mut-parameters.md): `mut` parameters — binder mutability of
+// the callee's by-value copy, in every position. The scalar rebinding costs
+// nothing at the call site; the aggregate copies at body entry (rule 1); the
+// viewed scalar re-boxes so its view writes through a real cell.
+import std::io::print;
+
+fun bump(mut x: i32): i32 {
+	x = x + 1;
+	x
+}
+
+fun grow(mut xs: List<i32>): i32 {
+	xs.push(9);
+	xs.len()
+}
+
+fun poke(mut x: i32): i32 {
+	let cell = &mut x;
+	cell = 5;
+	x
+}
+
+struct Point {
+	x: i32,
+}
+
+impl Point {
+	fun with_x(mut self, value: i32): Point {
+		self.x = value;
+		self
+	}
+}
+
+fun main() {
+	print(bump(1));
+	mut list = [1, 2];
+	print(grow(list));
+	print(list.len());
+	print(poke(1));
+	let original = Point { x = 0 };
+	let moved = original.with_x(9);
+	print(moved.x);
+	print(original.x);
+	let shrink = |mut v: i32| {
+		v = v - 1;
+		v
+	};
+	print(shrink(3));
+}

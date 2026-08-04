@@ -136,6 +136,11 @@ element. The parameter conventions:
 | ref | `&x` / `x: &T` | readonly view |
 | ref mut | `&mut x` / `x: &mut T` | writable view |
 
+Orthogonal to the conventions, `mut x: T` marks the **binder** mutable:
+the callee may rebind and field-write its by-value copy (rule 1 copies
+an aggregate at body entry), with nothing visible to the caller. To
+mutate the *caller's* value, use `&mut`.
+
 ## 6.4 Rule 4 — no invalidating mutation under a live view
 
 While a view of a place is live, mutations that would **invalidate** the

@@ -111,17 +111,21 @@ pub struct Func<'src> {
     pub body: Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>>,
 }
 
-/// A parsed parameter: its name, optional declared type, and how it receives its
-/// argument (rule 3 conventions).
-/// A parsed parameter: name, optional declared type, view convention, and the
-/// span of the name (for go-to-definition / hover in the language server).
-pub type Parameter<'src> = (
-    // The binder: a plain name (`x`) or a tuple destructure (`(a, b)`).
-    Pattern<'src>,
-    Option<Box<Spanned<Node<'src>>>>,
-    Convention,
-    Span,
-);
+/// A parsed parameter: binder, optional declared type, how it receives its
+/// argument (rule 3 conventions), binder mutability, and the binder's span
+/// (for go-to-definition / hover in the language server).
+#[derive(Debug)]
+pub struct Parameter<'src> {
+    /// The binder: a plain name (`x`) or a tuple destructure (`(a, b)`).
+    pub pattern: Pattern<'src>,
+    pub declared_type: Option<Box<Spanned<Node<'src>>>>,
+    pub convention: Convention,
+    /// `mut x` — the body may rebind and field-write its copy
+    /// (proposal/mut-parameters.md). Exclusive with `own`/`&`/`&mut`,
+    /// never part of the signature.
+    pub mutable: bool,
+    pub span: Span,
+}
 
 /// How a parameter receives its argument (rule 3). `Bare` is the default (a
 /// readonly view, once the default flip lands); `Ref` / `RefMut` are `&` / `&mut`
@@ -575,9 +579,9 @@ impl<'src> Node<'src> {
             parameters: &'a Spanned<Vec<Parameter<'src>>>,
             visit: &mut dyn FnMut(&'a Spanned<Node<'src>>),
         ) {
-            for (pattern, type_, _, _) in &parameters.0 {
-                visit_pattern(pattern, visit);
-                if let Some(type_) = type_.as_deref() {
+            for parameter in &parameters.0 {
+                visit_pattern(&parameter.pattern, visit);
+                if let Some(type_) = parameter.declared_type.as_deref() {
                     visit(type_);
                 }
             }
