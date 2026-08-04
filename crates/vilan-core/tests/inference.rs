@@ -842,16 +842,17 @@ fn requirement_line_of(source: &str, function_name: &str) -> Option<String> {
         .expect("worker panicked")
 }
 
-/// Compile, then execute the emitted JS with `node`, returning its stdout. A
-/// compile failure or a non-zero exit becomes `Err`. This catches *runtime*
-/// miscompiles — a program that type-checks but emits the wrong code (e.g. a
-/// generic dispatch that resolves to `undefined`) — which `assert_compiles`
-/// alone cannot see.
-fn compile_and_run(source: &str) -> Result<String, Vec<String>> {
+/// Execute already-compiled JS with `node`, returning its stdout on a clean
+/// exit or the stderr lines otherwise. Split out of `compile_and_run` (E32)
+/// so a caller that needs to bound wall clock can time only the RUN: the
+/// `compile` step above re-analyzes all of `std` in-process on every call
+/// and can itself take seconds under nextest's full parallelism, which must
+/// not count against a budget that is really about the emitted program's
+/// own behavior.
+fn run_js(js: &str) -> Result<String, Vec<String>> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    let js = compile(source)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.js", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
@@ -866,12 +867,55 @@ fn compile_and_run(source: &str) -> Result<String, Vec<String>> {
     }
 }
 
+/// Compile, then execute the emitted JS with `node`, returning its stdout. A
+/// compile failure or a non-zero exit becomes `Err`. This catches *runtime*
+/// miscompiles — a program that type-checks but emits the wrong code (e.g. a
+/// generic dispatch that resolves to `undefined`) — which `assert_compiles`
+/// alone cannot see.
+fn compile_and_run(source: &str) -> Result<String, Vec<String>> {
+    run_js(&compile(source)?)
+}
+
+/// `compile_and_run`, but timing only the RUN (E32): `compile` happens
+/// first and is excluded from the returned `Duration`. For claims about the
+/// emitted PROGRAM's own runtime behavior (a cancellation reacting inside
+/// some window), the harness's compile step is noise — it reruns `std`
+/// analysis in-process and can itself run to several seconds under load,
+/// which used to be folded into (and starve) these tests' timing budget.
+fn compile_and_run_timed(source: &str) -> (Result<String, Vec<String>>, std::time::Duration) {
+    match compile(source) {
+        Ok(js) => {
+            let started = std::time::Instant::now();
+            let result = run_js(&js);
+            (result, started.elapsed())
+        }
+        Err(errors) => (Err(errors), std::time::Duration::ZERO),
+    }
+}
+
 #[track_caller]
 fn assert_compiles_and_runs(source: &str, expected_stdout: &str) {
     match compile_and_run(source) {
         Ok(stdout) => assert_eq!(stdout, expected_stdout, "stdout mismatch"),
         Err(errors) => panic!("expected a clean run, got: {errors:#?}"),
     }
+}
+
+/// `assert_compiles_and_runs`, bounding only the RUN's wall clock (E32):
+/// compile happens first, untimed, so the budget measures the emitted
+/// program's own behavior rather than the harness's (load-sensitive)
+/// compile step.
+#[track_caller]
+fn assert_runs_within(source: &str, expected_stdout: &str, budget: std::time::Duration) {
+    let (outcome, elapsed) = compile_and_run_timed(source);
+    match outcome {
+        Ok(stdout) => assert_eq!(stdout, expected_stdout, "stdout mismatch"),
+        Err(errors) => panic!("expected a clean run, got: {errors:#?}"),
+    }
+    assert!(
+        elapsed < budget,
+        "the run alone (compile excluded) took {elapsed:?}, budget was {budget:?}"
+    );
 }
 
 /// Like `compile_and_run`, but a ZERO-exit run yields `(stdout, stderr)` — for
@@ -22612,9 +22656,12 @@ fn cancel_cuts_a_sleeping_child_short_and_keeps_the_value() {
     // The child's 5000ms sleep aborts when the body cancels; its AbortError
     // is a cancellation echo (absorbed, not a winner) and the body's value
     // comes back. The elapsed bound is what pins the abort — without it the
-    // join would wait out the timer.
-    let started = std::time::Instant::now();
-    assert_compiles_and_runs(
+    // join would wait out the timer. Only the RUN is timed (E32): compiling
+    // this program re-analyzes `std` in-process and can itself take
+    // seconds under nextest's full parallelism, which is not part of the
+    // claim (the claim is about the emitted program's own scheduling, not
+    // the harness's compile step).
+    assert_runs_within(
         r#"
         import std::print;
         import std::time::sleep;
@@ -22634,10 +22681,7 @@ fn cancel_cuts_a_sleeping_child_short_and_keeps_the_value() {
         }
         "#,
         "cancelled\n1\n",
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(4),
-        "the cancelled sleep should not run out its timer"
+        std::time::Duration::from_secs(4),
     );
 }
 
@@ -22645,9 +22689,12 @@ fn cancel_cuts_a_sleeping_child_short_and_keeps_the_value() {
 fn a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time() {
     // children[0] sleeps 5000ms; children[1] fails at 20ms. The failure
     // latches AT SETTLE (not at drain order), aborts the sibling's sleep,
-    // and wins with its origin — promptly.
-    let started = std::time::Instant::now();
-    match compile_and_run(
+    // and wins with its origin — promptly. Only the RUN is timed (E32):
+    // `compile_and_run_timed` runs the in-process `std` re-analysis first,
+    // untimed, so the budget below measures the emitted program's own
+    // reaction time, not a harness compile step that can itself take
+    // seconds under nextest's full parallelism.
+    let (outcome, elapsed) = compile_and_run_timed(
         r#"
         import std::print;
         import std::io::panic;
@@ -22668,7 +22715,8 @@ fn a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time() {
             print("unreachable");
         }
         "#,
-    ) {
+    );
+    match outcome {
         Ok(stdout) => panic!("expected the nursery failure to propagate, got: {stdout:?}"),
         Err(errors) => {
             let stderr = errors.join("\n");
@@ -22680,8 +22728,8 @@ fn a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time() {
         }
     }
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(4),
-        "the first error should abort the slow sibling, not wait it out"
+        elapsed < std::time::Duration::from_secs(4),
+        "the first error should abort the slow sibling, not wait it out (run alone took {elapsed:?}, compile excluded)"
     );
 }
 
@@ -22689,9 +22737,10 @@ fn a_fast_failure_behind_a_slow_sibling_reacts_at_settle_time() {
 fn outer_cancel_chains_into_nested_nurseries() {
     // The inner nursery chains to the outer's signal at creation: the outer
     // cancel aborts the inner's sleeping child, the echo absorbs, and the
-    // inner nursery still returns its value.
-    let started = std::time::Instant::now();
-    assert_compiles_and_runs(
+    // inner nursery still returns its value. Only the RUN is timed (E32):
+    // see `cancel_cuts_a_sleeping_child_short_and_keeps_the_value` above for
+    // why the compile step is excluded from the budget.
+    assert_runs_within(
         r#"
         import std::print;
         import std::time::sleep;
@@ -22717,10 +22766,7 @@ fn outer_cancel_chains_into_nested_nurseries() {
         }
         "#,
         "inner-returned\n3\ndone\n",
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(4),
-        "the outer cancel should reach the inner nursery's child"
+        std::time::Duration::from_secs(4),
     );
 }
 
