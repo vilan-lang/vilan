@@ -319,7 +319,12 @@ changes no ownership and is policed by rule 4.
   `Set` and every external generic (`Shared`, `Task`, `Promise`, `Context`)
   reject resource type arguments in v1: their internals are host code the
   move checker cannot see. `Option` is the sanctioned container (it is a
-  Vilan enum, checkable under R11).
+  Vilan enum, checkable under R11). The rule is read **per instantiation**,
+  not per written head: a resource that reaches a container through a
+  generic aggregate's member is rejected the same way, so `Signal<Database>`
+  — whose storage is a `Shared<T>` — is refused exactly as
+  `Shared<Database>` is. Holding the resource in a struct field of your own
+  is the sanctioned alternative, and stays legal.
 - **R11: generics must be move-clean per instantiation.** Instantiating a
   type parameter with a resource type re-checks the instantiated body under
   the affine rules (T := the resource): every T-typed value is used at most

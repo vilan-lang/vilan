@@ -155,20 +155,20 @@ pub fn infer(program: &mut Program) {
             let Some(parameter_record) = program.parameters.get(parameter) else {
                 continue;
             };
-            let Some(Type::Closure(_, return_type)) = program
-                .type_id_to_type_map
-                .get(&parameter_record.type_id)
-                .cloned()
-            else {
+            // A `sync`-marked parameter is a deliberate contract
+            // (async-polymorphism.md A.2) — refused, with the contract's
+            // steer. The marker is the whole test: WHAT the callback returns
+            // decides adaptation, not the contract. Without it there is
+            // nothing to diverge from here — a plain value-returning
+            // parameter ADAPTS (the instance worklist handled it), a void one
+            // is spawn semantics, and an unresolved return can't be a known
+            // lie. (B61: gating this on a resolved non-void return let
+            // `sync || void` accept an awaiting closure that `sync || i32`
+            // refused, so the marker did not bite on a void callback.)
+            if !program.sync_values.contains(parameter) {
                 continue;
-            };
-            // Void = spawn semantics; an UNRESOLVED return can't be a
-            // known lie — only a resolved non-void return diverges.
-            let indeterminate = matches!(
-                program.type_id_to_type_map.get(&return_type),
-                Some(Type::Void) | Some(Type::Unknown) | Some(Type::Unresolved) | None
-            );
-            if indeterminate {
+            }
+            if !parameter_is_closure(program, *parameter) {
                 continue;
             }
             // The argument VALUE is async through any channel — a literal, a
@@ -176,13 +176,6 @@ pub fn infer(program: &mut Program) {
             // an async-returning call (the same shapes that make a call
             // through it await).
             if !value_async_in(program, &held_values, &async_set, &no_flags, &[], *argument) {
-                continue;
-            }
-            // A `sync`-marked parameter is a deliberate contract
-            // (async-polymorphism.md A.2) — refused, with the contract's
-            // steer. A PLAIN value-returning parameter ADAPTS (the instance
-            // worklist handled it), so it no longer errors here.
-            if !program.sync_values.contains(parameter) {
                 continue;
             }
             divergences.push(anchored(
@@ -1076,8 +1069,21 @@ fn subject_adapted_here(
         })
 }
 
+/// Whether the parameter's type is a closure at all — the shape a `sync`
+/// CONTRACT applies to. A contract binds whatever the callback returns:
+/// `sync || void` says the callback completes before the declaring function's
+/// protocol moves on, exactly as `sync || i32` does (B61).
+fn parameter_is_closure(program: &Program, parameter_id: Id) -> bool {
+    program
+        .parameters
+        .get(&parameter_id)
+        .and_then(|parameter| program.type_id_to_type_map.get(&parameter.type_id))
+        .is_some_and(|type_| matches!(type_, Type::Closure(_, _)))
+}
+
 /// Whether the parameter's type is a closure with a RESOLVED, non-void
-/// return — the shape that adapts (or, marked, contracts).
+/// return — the shape that ADAPTS. Not the shape a contract applies to: see
+/// `parameter_is_closure` for that.
 fn closure_return_is_value(program: &Program, parameter_id: Id) -> bool {
     let Some(parameter) = program.parameters.get(&parameter_id) else {
         return false;
@@ -1148,8 +1154,9 @@ fn sync_violations_at(
     };
     let empty_flags = HashMap::new();
     for (argument, parameter) in function_call.argument_ids.iter().zip(&function.parameters) {
-        if !program.sync_values.contains(parameter) || !closure_return_is_value(program, *parameter)
-        {
+        // B61: the contract, not the adaptation shape — a `sync` marker binds a
+        // void-returning callback too.
+        if !program.sync_values.contains(parameter) || !parameter_is_closure(program, *parameter) {
             continue;
         }
         if !value_async_in(program, held_values, async_set, flags, bits, *argument) {

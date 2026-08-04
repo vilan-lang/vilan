@@ -2923,14 +2923,13 @@ fn a_mut_array_binder_in_an_is_test_stamps_its_elements() {
 }
 
 #[test]
-#[ignore = "pre-existing hole found while closing B53's findings: a match GUARD \
-whose expression needs hoisted statements (any `is` test, a `?` lift, a nested \
-match) drops them — `compile_is_pattern`'s guarded-leg arm walks the guard into \
-a `guard_block` that is never emitted, because an else-if chain has no statement \
-slot before a leg's condition. The reference dangles: `if ($c[0] === 0)` with no \
-`$c`. Un-ignore when guarded legs emit as nested ifs. See \
-proposal/capture-clones.md §5."]
 fn a_guard_that_needs_a_temporary_emits_it() {
+    // B59: a guard whose expression needs hoisted statements (an `is` test, a
+    // `?` lift, a nested `match`) used to drop them — an else-if chain has no
+    // statement slot before a leg's condition — and the emitted condition
+    // referenced a temporary that was never declared. Such a leg is now emitted
+    // with its own slot, and the copies its captures owe are declared ahead of
+    // the guard, so the guard's `pop` takes from the copy, not the subject.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -2947,6 +2946,104 @@ fn a_guard_that_needs_a_temporary_emits_it() {
         }
         "#,
         "1\n2\n",
+    );
+}
+
+#[test]
+fn a_guard_that_lifts_emits_its_temporary() {
+    // B59, the `?` shape: the lift compiles to a temp plus an `if` over the
+    // container's variant, all of which the else-if chain used to drop.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if (held?.len()).unwrap_or(0) > 2 => print(inner.len()),
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guard_that_matches_emits_its_temporary() {
+    // B59, the nested-`match` shape: an inner match is a subject temp, a result
+    // temp and an if-chain — three statements with nowhere to go.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if match inner.len() { 0 => false, _ => true } => {
+                    print(inner.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_later_guarded_leg_gets_its_own_slot() {
+    // B59, ordering: the leg that needs the slot is not the first, so its
+    // statements have to run only after the earlier leg has declined — a slot
+    // hoisted to the top of the match would pop before the first guard is
+    // even asked.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut held: Option<List<i32>> = Some([1, 2, 3]);
+            match held {
+                Some(let inner) if inner.len() > 5 => print(1),
+                Some(mut inner) if inner.pop() is Some(let last) => {
+                    print(last);
+                    print(inner.len());
+                }
+                _ => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_guard_that_reads_a_copied_capture_reads_the_copy() {
+    // B59: the copy a capture owes is declared ahead of a guard that READS it —
+    // the guard and the body must see the same binding. `inner` is returned (the
+    // value seam), so it copies; the guard's `len` is the copy's.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun keep(held: Option<List<i32>>): List<i32> {
+            match held {
+                Some(let inner) if inner.len() > 1 => inner,
+                _ => List::new(),
+            }
+        }
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2]);
+            mut got = keep(held);
+            got.push(9);
+            print(got.len());
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
     );
 }
 
@@ -4861,18 +4958,72 @@ fn a_shared_write_assignment_is_unchanged_for_both_pointees() {
 }
 
 #[test]
-#[ignore = "pre-existing: the `sync` contract is not enforced for a \
-`void`-returning closure parameter — `sync || void` accepts an awaiting \
-closure where `sync || i32` refuses it (proposal/signal-update.md §8). \
-`Signal::update` declares `sync` for the correct contract; un-ignore when \
-the void-return gap closes."]
 fn a_sync_void_parameter_refuses_an_async_closure() {
+    // B61: the `sync` marker is the whole contract — what the callback returns
+    // decides ADAPTATION, not whether the contract binds. `sync || void` used
+    // to accept an awaiting closure that the identical `sync || i32` refused.
     assert_fails_with(
         r#"
         import std::time::sleep;
         fun run_now(body: sync || void) { body(); }
         fun main() {
             run_now(|| { sleep(1); });
+        }
+        "#,
+        "requires a synchronous closure (`sync`)",
+    );
+}
+
+#[test]
+fn a_sync_void_parameter_still_takes_a_synchronous_closure() {
+    // The other half of B61: the marker refuses awaiting callbacks, not every
+    // callback. A void `sync` parameter is the ordinary case.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun run_now(body: sync || void) { body(); }
+        fun main() {
+            run_now(|| { print(1); });
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_sync_void_parameter_refuses_a_forwarded_async_closure() {
+    // B61 reaches the transitive path too: the closure passed to `run_now` is
+    // async only for the instance of `forward` whose `f` awaits, which is the
+    // per-instance check — and it gated on the same adaptation shape, so a
+    // void `sync` parameter escaped it as well. The value-returning twin is
+    // `a_forwarded_async_closure_into_a_sync_contract_is_refused`.
+    assert_fails_noting(
+        r#"
+        import std::time::sleep;
+        fun run_now(body: sync || void) { body(); }
+        fun forward(f: || i32) { run_now(|| { f(); }); }
+        fun main() {
+            forward(|| { sleep(1); 2 });
+        }
+        "#,
+        "passes an async closure that reaches `body`, which requires a synchronous closure (`sync`)",
+        "run_now(|| { f(); })",
+        "forwarded into the `sync` parameter `body` here",
+    );
+}
+
+#[test]
+fn signal_update_refuses_an_awaiting_closure() {
+    // A18 declared `Signal::update`'s `mutate` parameter `sync` because a view
+    // may not be live across an `await` (spec §6.6) — a correct declaration
+    // that did not bite until B61. It bites now.
+    assert_fails_with(
+        r#"
+        import std::reactive::Signal;
+        import std::time::sleep;
+        fun main() {
+            let items: Signal<List<i32>> = Signal::new([1]);
+            items.update(|&mut list| { sleep(1); list.push(2); });
         }
         "#,
         "requires a synchronous closure (`sync`)",
@@ -22483,6 +22634,93 @@ fn r10_option_accepts_a_resource_argument() {
         import std::option::Option;
         resource struct Db { handle: i32 }
         fun sink(item: Option<Db>) {}
+        fun main() {}
+        "#,
+    );
+}
+
+// --- A19: R10 is asked per INSTANTIATION, not per written head — a resource
+// --- reaching a container through a generic aggregate's member is still R10's.
+
+#[test]
+fn r10_refuses_a_resource_reaching_shared_through_a_generic_field() {
+    // The general case, which `Signal` is only one instance of: `Cell<T>`'s
+    // `Shared<T>` holds nothing at its declaration and a `Shared<Db>` here.
+    // The diagnostic anchors at what the user wrote (A2) and names the path the
+    // resource took to get there (B3).
+    assert_fails_spanning(
+        r#"
+        import std::shared::Shared;
+        resource struct Db { handle: i32 }
+        struct Cell<T> { value: Shared<T> }
+        fun sink(cell: Cell<Db>) {}
+        fun main() {}
+        "#,
+        "Cell<Db>",
+        "`Shared` cannot hold the resource `Db`, reached through `Cell.value`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_signal_of_a_resource() {
+    // `Signal<T>`'s storage IS a `Shared<T>` (signal-update.md §6), so
+    // `Signal<Database>` is `Shared<Database>` by another name — and used to
+    // compile clean while the direct spelling was refused.
+    assert_fails_spanning(
+        r#"
+        import std::reactive::Signal;
+        import std::db::Database;
+        fun sink(cell: Signal<Database>) {}
+        fun main() {}
+        "#,
+        "Signal<Database>",
+        "`Shared` cannot hold the resource `Database`, reached through `Signal.value`",
+    );
+}
+
+#[test]
+fn r10_leaves_a_signal_of_data_alone() {
+    // The other direction: the descent looks at the INSTANTIATED member, so a
+    // data argument reaches a `Shared<i32>` / `Shared<List<str>>` and stops.
+    assert_compiles(
+        r#"
+        import std::reactive::Signal;
+        fun main() {
+            let count: Signal<i32> = Signal::new(1);
+            let names: Signal<List<str>> = Signal::new(["a"]);
+            count.set(2);
+            names.set(["b"]);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn r10_refuses_a_resource_reaching_a_list_through_two_generic_fields() {
+    // The descent is transitive, and the path names every step it took.
+    assert_fails_spanning(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Inner<T> { items: List<T> }
+        struct Outer<T> { inner: Inner<T> }
+        fun sink(outer: Outer<Db>) {}
+        fun main() {}
+        "#,
+        "Outer<Db>",
+        "`List` cannot hold the resource `Db`, reached through `Outer.inner.items`",
+    );
+}
+
+#[test]
+fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
+    // A generic struct is not itself a container: `Holder<Db>` keeps the
+    // resource in a field, which is what R10's own steer recommends. Only a
+    // NATIVE container beneath it is refused.
+    assert_compiles(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Holder<T> { value: T }
+        fun sink(holder: Holder<Db>) {}
         fun main() {}
         "#,
     );
