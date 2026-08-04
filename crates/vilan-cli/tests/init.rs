@@ -325,6 +325,10 @@ fn the_fullstack_template_matches_the_blessed_example_layout() {
                 entry.path, blessed_entry.path,
                 "{example}: `[entry.{name}] path`"
             );
+            assert_eq!(
+                entry.split, blessed_entry.split,
+                "{example}: `[entry.{name}] split`"
+            );
         }
 
         // ...and the layout the manifest implies is on disk in both.

@@ -388,6 +388,39 @@ fn the_plan_and_the_emitted_chunks_agree() {
     let _ = std::fs::remove_dir_all(&staged);
 }
 
+#[test]
+fn split_off_a_browser_leg_stops_the_build() {
+    // The manifest's refusal reaching a real `vilan build`: a key that cannot
+    // apply is a build error naming the leg, not a silently ignored line.
+    let staged = stage("refused", true);
+    std::fs::write(
+        staged.join("vilan.toml"),
+        "[package]\nname = \"split_fixture\"\nroot = \".\"\nentry = \"app.vl\"\nsplit = true\n",
+    )
+    .expect("write the manifest");
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", staged.to_str().expect("utf-8 temp path")])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run vilan build");
+    assert!(
+        !output.status.success(),
+        "a `split` outside a browser leg must not build"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("`[package] split`")
+            && text.contains("`browser` leg only")
+            && text.contains("targets `node`"),
+        "the refusal must name the key and the leg it found: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
 /// The DOM/history stub the split bundle runs against — `router.rs`'s, plus a
 /// settle step, because a chunk arrives on a microtask rather than inline.
 /// Node resolves the chunks' relative `import()` against the importing file, so

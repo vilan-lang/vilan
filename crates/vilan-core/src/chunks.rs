@@ -482,6 +482,14 @@ pub fn chunk_file_name(leg: &str, arm: &str) -> String {
         }
     }
     let sanitized = sanitized.trim_matches('_');
+    // A pattern with no identifier characters at all would name `<leg>..js`.
+    // No such arm chunks today (an untagged arm stays eager), so this is a
+    // guard rather than a case — but a guard the name can't do without.
+    let sanitized = if sanitized.is_empty() {
+        "chunk"
+    } else {
+        sanitized
+    };
     format!("{leg}.{sanitized}.js")
 }
 
