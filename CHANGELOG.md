@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.25.0 — 2026-08-04
 
 **A resource cannot hide in a container behind a generic.** `Shared<Database>` was refused — the native containers' internals are host code the move checker cannot see — but `Signal<Database>` compiled clean, even though a `Signal`'s storage *is* a `Shared`. The rule was being read off the type you wrote rather than the one you got: `Signal`'s `Shared<T>` field holds nothing at its declaration, and only becomes a `Shared<Database>` at the point of use. It is now read per use, descending a generic type's fields as they stand at that use, so the rule covers any generic of your own with a `List`, `Map`, `Set`, `Shared`, `Task`, `Promise`, or `Context` field — not just `Signal`. The error names the route the resource took to get there (``Shared` cannot hold the resource `Database`, reached through `Signal.value``) and points at the field it landed in. `Signal<i32>`, `Signal<List<str>>`, and holding a resource in a struct field of your own are all unaffected.
 
