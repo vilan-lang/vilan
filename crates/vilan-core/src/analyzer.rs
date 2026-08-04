@@ -396,6 +396,40 @@ struct MoveScan<'a> {
     /// not of the scan root), so both the concrete scan and R11's
     /// per-instantiation scan share one set.
     loaned_captures: &'a HashMap<Id, Id>,
+    /// B67: what each `x is P` test proves about `x`'s payload, keyed by the
+    /// test's expression id. Precomputed because classification is `&mut self`
+    /// and the scan is `&self` — the same reason `resource_bindings` is.
+    is_refinements: &'a HashMap<Id, IsRefinement>,
+}
+
+/// One arm's outcome, for R7's cross-arm comparison and the continuation merge.
+struct ArmMoveState {
+    /// The move state at the arm's end.
+    post: HashMap<Id, MoveState>,
+    /// Whether every path through the arm leaves the scope, so it never reaches
+    /// the merge (the R4/R7 diverging-leg exemption).
+    diverges: bool,
+}
+
+/// B67 — what an `x is P` test proves about `x`'s PAYLOAD on each side of the
+/// branch. Not a type refinement (the analyzer has none, and `x` keeps its
+/// declared type everywhere): the only question asked is *"can `x` still be
+/// holding something that would have to be destroyed here?"*, because a value
+/// with no payload needs no move and no drop.
+///
+/// Conservative by construction: a variant whose payload cannot be classified
+/// completely counts as carrying one, so the failure mode is an over-report,
+/// never a missed leak.
+struct IsRefinement {
+    /// The place tested — only a bare `Expr::Local` refines anything.
+    binding: Id,
+    /// The tested variant carries no resource payload, so the binding is
+    /// payload-free wherever the test SUCCEEDS (`x is None`).
+    payload_free_when_true: bool,
+    /// Every OTHER variant carries no resource payload, so the binding is
+    /// payload-free wherever the test FAILS — `Option`'s complement of `Some`
+    /// is `None`, which is what makes `or_else` legal.
+    payload_free_when_false: bool,
 }
 
 /// One arm of an `if` / `match` as the drop planner sees it (destruction.md §7):
@@ -419,6 +453,10 @@ enum GenericLeak {
     /// a pattern capture that took a consumed subject's payload (B62), or a
     /// `let` local of delta-resource type.
     ScopeEndDrop,
+    /// R2's overwrite drop — the third and last place the planner can schedule a
+    /// destruction. `mut held = a; held = b;` must destroy `a` at the
+    /// assignment, which a generic body cannot do either.
+    Overwrite,
 }
 
 /// A resource binding's move state on the path currently being scanned
@@ -4852,6 +4890,123 @@ impl<'src> Analyzer<'src> {
         loaned
     }
 
+    /// B67: what every `x is P` test in the program proves about `x`'s payload,
+    /// keyed by the test's expression id. `resource_constraints` is the R11 delta
+    /// set (empty for the concrete scan, where `type_is_resource_with` agrees
+    /// with `type_is_resource` because no `Generic` is in the set).
+    ///
+    /// Only a bare local subject and a variant pattern refine anything; every
+    /// other shape is simply absent from the map and exempts nothing.
+    fn collect_is_refinements(
+        &mut self,
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> HashMap<Id, IsRefinement> {
+        let tests: Vec<(Id, Id, ExprPattern)> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(id, expr)| match expr {
+                Expr::Is(subject, pattern) => Some((*id, *subject, pattern.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut refinements = HashMap::new();
+        for (test_id, subject_id, pattern) in tests {
+            let ExprPattern::Variant(pattern_enum_id, variant_index, _) = pattern else {
+                continue;
+            };
+            let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(&subject_id) else {
+                continue;
+            };
+            let binding = *binding;
+            let Some(subject_type_id) = self.place_value_type_id(subject_id) else {
+                continue;
+            };
+            let Type::Enum(enum_id, arguments) = subject_type_id.get_type(self) else {
+                continue;
+            };
+            if enum_id != pattern_enum_id {
+                continue;
+            }
+            let Some(enum_) = self.enums.get(&enum_id) else {
+                continue;
+            };
+            // A declared `resource enum` is a resource whatever its payload — the
+            // value itself is the thing that must be destroyed, so no variant of
+            // it is ever payload-free.
+            if enum_.resource {
+                continue;
+            }
+            let parameters = enum_.generic_parameter_constraint_ids.clone();
+            let payloads: Vec<Vec<TypeId>> = enum_
+                .variants
+                .iter()
+                .map(|variant| variant.data_type_ids.clone())
+                .collect();
+            if variant_index >= payloads.len() {
+                continue;
+            }
+            let context = Self::instantiation_context(&parameters, &arguments);
+            let tested: Vec<Vec<TypeId>> = vec![payloads[variant_index].clone()];
+            let others: Vec<Vec<TypeId>> = payloads
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != variant_index)
+                .map(|(_, payload)| payload.clone())
+                .collect();
+            refinements.insert(
+                test_id,
+                IsRefinement {
+                    binding,
+                    payload_free_when_true: self.payloads_are_resource_free(
+                        &tested,
+                        &context,
+                        resource_constraints,
+                        memo,
+                    ),
+                    payload_free_when_false: self.payloads_are_resource_free(
+                        &others,
+                        &context,
+                        resource_constraints,
+                        memo,
+                    ),
+                },
+            );
+        }
+        refinements
+    }
+
+    /// Whether none of these variant payloads (substituted through `context`)
+    /// is a resource. An EMPTY payload is trivially free — that is the `None`
+    /// case, and it needs no substitution to be certain of. An incomplete
+    /// classification counts as "may be a resource" (conservative: B67's
+    /// exemption may only ever be granted on proof).
+    fn payloads_are_resource_free(
+        &mut self,
+        payloads: &[Vec<TypeId>],
+        context: &SubstitutionContext,
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> bool {
+        for payload in payloads {
+            if payload.is_empty() {
+                continue;
+            }
+            let mut visiting = HashSet::new();
+            let (found, complete) = self.any_member_resource(
+                payload,
+                context,
+                resource_constraints,
+                memo,
+                &mut visiting,
+            );
+            if found || !complete {
+                return false;
+            }
+        }
+        true
+    }
+
     /// R1–R9 (destruction.md §4): the affine move checker. Classifies resource
     /// bindings once, scans every function and closure body for moves, then runs
     /// the R9 capture check and emits the collected violations.
@@ -4900,11 +5055,15 @@ impl<'src> Analyzer<'src> {
             .filter(|id| resource_bindings.contains(id))
             .collect();
         let loaned_captures = self.collect_loaned_pattern_captures();
+        // The concrete scan knows no generic resources, so the empty constraint
+        // set makes `type_is_resource_with` agree with `type_is_resource`.
+        let is_refinements = self.collect_is_refinements(&HashSet::new(), &mut HashMap::new());
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
             resource_value_places: &resource_value_places,
             module_level_bindings: &module_level_bindings,
             loaned_captures: &loaned_captures,
+            is_refinements: &is_refinements,
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.emit_resource_move_violations(violations);
@@ -6431,9 +6590,13 @@ impl<'src> Analyzer<'src> {
             self.scan_move(*condition, false, false, scan, flow, loop_depth, violations);
         }
         let outer_bindings: HashSet<Id> = flow.decl_loop_depth.keys().copied().collect();
+        // `conditions[i]` guards `arms[i]`; a trailing `else` has none, so its
+        // index is `conditions.len()` — which is exactly what B67's refinement
+        // reads to know that arm is the one where every test failed.
         self.scan_move_branches(
             anchor_id,
             &arms,
+            &conditions,
             !has_else,
             &outer_bindings,
             consuming,
@@ -6487,10 +6650,14 @@ impl<'src> Analyzer<'src> {
             self.seed_pattern_bindings(&leg.pattern, scan, flow, loop_depth);
             arms.push((Vec::new(), leg.body));
         }
-        // A `match` is exhaustive (checked elsewhere) — no implicit fall-through.
+        // A `match` is exhaustive (checked elsewhere) — no implicit fall-through,
+        // and no `is`-refinement to carry: a by-value match CONSUMES its subject
+        // on every path (R6), so the question B67 asks cannot arise, and a
+        // `match &x` subject never owned the payload to begin with.
         self.scan_move_branches(
             anchor_id,
             &arms,
+            &[],
             false,
             &outer_bindings,
             consuming,
@@ -6503,13 +6670,24 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The shared arm merge for `if`/`match` (R7). Forks the move state per arm,
-    /// compares the pre-tail state of non-diverging arms for conditional moves,
-    /// and joins the arms into the continuation state.
+    /// compares the non-diverging arms for conditional moves, and joins them into
+    /// the continuation state.
+    ///
+    /// B67 removed the exemption that used to strip each arm's tail place from
+    /// the comparison. It was written for R4 (a branch tail is the branch's
+    /// produced value, not a rejoin) and was over-broad: it permitted "each arm
+    /// produces its own value", which is right, and equally permitted "each arm
+    /// produces a DIFFERENT value and abandons the other" — `if flag { first }
+    /// else { second }`, which destroys neither. `if flag { x } else { x }` never
+    /// needed it: when every arm moves the tail binding the counts already match.
+    /// What the exemption really protected is the `is`-refined shape, which
+    /// `conditions` now handles exactly (see `binding_is_payload_free_on_arm`).
     #[allow(clippy::too_many_arguments)]
     fn scan_move_branches(
         &self,
         anchor_id: Id,
         arms: &[(Vec<Id>, Id)],
+        conditions: &[Id],
         has_implicit_else: bool,
         outer_bindings: &HashSet<Id>,
         consuming: bool,
@@ -6520,59 +6698,68 @@ impl<'src> Analyzer<'src> {
         violations: &mut Vec<ResourceMoveViolation>,
     ) {
         let entry = flow.moved.clone();
-        // Per arm: (post-arm state, R7-comparison state, diverges).
-        let mut arm_states: Vec<(HashMap<Id, MoveState>, HashMap<Id, MoveState>, bool)> =
-            Vec::new();
+        let mut arm_states: Vec<ArmMoveState> = Vec::new();
         for (statements, tail) in arms {
             flow.moved = entry.clone();
             for statement in statements {
                 self.scan_move(*statement, false, false, scan, flow, loop_depth, violations);
             }
-            // A bare resource place as the tail is the branch's produced value —
-            // an R4 move-out, exempt from R7 in TERMINAL position (the branches do
-            // not rejoin into continuing code). A move via a call/statement is not.
-            let tail_place = if consuming && terminal {
-                self.direct_place_binding(*tail, scan)
-            } else {
-                None
-            };
             self.scan_move(
                 *tail, consuming, terminal, scan, flow, loop_depth, violations,
             );
-            let diverges = self.block_diverges(statements, *tail);
-            let mut r7_state = flow.moved.clone();
-            if let Some(binding) = tail_place {
-                r7_state.remove(&binding);
-            }
-            arm_states.push((flow.moved.clone(), r7_state, diverges));
+            arm_states.push(ArmMoveState {
+                post: flow.moved.clone(),
+                diverges: self.block_diverges(statements, *tail),
+            });
         }
         // An `if` without `else` has an implicit empty arm: it moves nothing, so
         // any binding moved on a real arm is conditionally moved.
         if has_implicit_else {
-            arm_states.push((entry.clone(), entry.clone(), false));
+            arm_states.push(ArmMoveState {
+                post: entry.clone(),
+                diverges: false,
+            });
         }
 
         // R7: over the NON-DIVERGING arms (a diverging leg never reaches the
         // merge — R4/R7 exemption), an outer binding moved on some but not all is
-        // a conditional move.
-        let live: Vec<&(HashMap<Id, MoveState>, HashMap<Id, MoveState>, bool)> = arm_states
+        // a conditional move. An arm on which the binding provably carries no
+        // resource payload counts as needing no move: there is nothing there to
+        // destroy, so leaving it un-moved leaks nothing.
+        let live: Vec<(usize, &ArmMoveState)> = arm_states
             .iter()
-            .filter(|(_, _, diverges)| !diverges)
+            .enumerate()
+            .filter(|(_, arm)| !arm.diverges)
             .collect();
         let mut candidates: HashSet<Id> = HashSet::new();
-        for (_, r7_state, _) in &live {
-            for binding in r7_state.keys() {
+        for (_, arm) in &live {
+            for binding in arm.post.keys() {
                 if outer_bindings.contains(binding) {
                     candidates.insert(*binding);
                 }
             }
         }
+        // C1: a HashSet's order is not stable, and each candidate can raise a
+        // diagnostic — sort before reporting.
+        let mut candidates: Vec<Id> = candidates.into_iter().collect();
+        candidates.sort_by_key(|binding| {
+            let span = **self.span_map.get(binding).unwrap_or(&&EMPTY_SPAN);
+            (span.start, span.end)
+        });
         for binding in candidates {
             let moved_count = live
                 .iter()
-                .filter(|(_, r7_state, _)| r7_state.contains_key(&binding))
+                .filter(|(_, arm)| arm.post.contains_key(&binding))
                 .count();
-            if moved_count != 0 && moved_count != live.len() {
+            let disposed_count = live
+                .iter()
+                .filter(|(arm_index, arm)| {
+                    arm.post.contains_key(&binding)
+                        || self
+                            .binding_is_payload_free_on_arm(scan, conditions, *arm_index, binding)
+                })
+                .count();
+            if moved_count != 0 && disposed_count != live.len() {
                 violations.push(ResourceMoveViolation::ConditionalMove {
                     at: anchor_id,
                     binding,
@@ -6582,8 +6769,52 @@ impl<'src> Analyzer<'src> {
 
         // Merge: the continuation state is the lattice join of the post-arm
         // states over non-diverging arms (all diverge => the continuation is dead;
-        // keep the entry state).
+        // keep the entry state). Intersection-shaped, and correct BECAUSE R7 holds
+        // above: with no conditional moves, ownership is single-valued at every
+        // program point, so the join and the meet of the arm states agree.
         flow.moved = self.merge_arm_states(&entry, &live, outer_bindings);
+    }
+
+    /// B67's `is`-refinement, read at one arm. In an `if` chain, arm *i* is
+    /// entered only when condition *i* holds and conditions `0..i` do not; the
+    /// trailing `else` (index `conditions.len()`) only when none holds. The
+    /// binding is exempt from R7's every-path requirement on this arm when some
+    /// test on the path proves it carries no resource payload here.
+    ///
+    /// This is what keeps `or_else` legal: `if self is Some(_) { self } else {
+    /// fn() }` leaves `self` un-moved on the else arm, and that is sound because
+    /// a `self` reaching it cannot be `Some` — only `None`, which has no payload.
+    ///
+    /// `match` passes no conditions. A by-value `match` consumes its subject on
+    /// every path (R6) so the question cannot arise, and `match &x` never owns it.
+    fn binding_is_payload_free_on_arm(
+        &self,
+        scan: &MoveScan<'_>,
+        conditions: &[Id],
+        arm_index: usize,
+        binding: Id,
+    ) -> bool {
+        let proves = |condition: &Id, when_true: bool| {
+            scan.is_refinements
+                .get(condition)
+                .is_some_and(|refinement| {
+                    refinement.binding == binding
+                        && if when_true {
+                            refinement.payload_free_when_true
+                        } else {
+                            refinement.payload_free_when_false
+                        }
+                })
+        };
+        if let Some(condition) = conditions.get(arm_index)
+            && proves(condition, true)
+        {
+            return true;
+        }
+        conditions
+            .iter()
+            .take(arm_index)
+            .any(|condition| proves(condition, false))
     }
 
     /// Join the post-arm move states of the non-diverging arms into the state
@@ -6593,15 +6824,15 @@ impl<'src> Analyzer<'src> {
     fn merge_arm_states(
         &self,
         entry: &HashMap<Id, MoveState>,
-        live: &[&(HashMap<Id, MoveState>, HashMap<Id, MoveState>, bool)],
+        live: &[(usize, &ArmMoveState)],
         outer_bindings: &HashSet<Id>,
     ) -> HashMap<Id, MoveState> {
         if live.is_empty() {
             return entry.clone();
         }
         let mut keys: HashSet<Id> = entry.keys().copied().collect();
-        for (post, _, _) in live {
-            for binding in post.keys() {
+        for (_, arm) in live {
+            for binding in arm.post.keys() {
                 if outer_bindings.contains(binding) {
                     keys.insert(*binding);
                 }
@@ -6613,8 +6844,8 @@ impl<'src> Analyzer<'src> {
             let mut any_absent = false;
             let mut any_maybe = false;
             let mut span = EMPTY_SPAN;
-            for (post, _, _) in live {
-                match post.get(&binding) {
+            for (_, arm) in live {
+                match arm.post.get(&binding) {
                     Some(MoveState::Moved(move_span)) => {
                         any_moved = true;
                         span = *move_span;
@@ -6679,17 +6910,6 @@ impl<'src> Analyzer<'src> {
         }
         self.scan_move(tail, false, false, scan, flow, inner_depth, violations);
         flow.moved = snapshot;
-    }
-
-    /// A tail expression that is directly a resource binding (`Local`) — the
-    /// branch's produced value (R4 move-out), for the R7 terminal exemption.
-    fn direct_place_binding(&self, expr_id: Id, scan: &MoveScan<'_>) -> Option<Id> {
-        match self.expr_id_to_expr_map.get(&expr_id) {
-            Some(Expr::Local(binding)) if scan.resource_bindings.contains(binding) => {
-                Some(*binding)
-            }
-            _ => None,
-        }
     }
 
     /// Seed the resource bindings a pattern introduces (`Some(let c)`, tuple /
@@ -7344,6 +7564,10 @@ impl<'src> Analyzer<'src> {
             let resource_bindings = self.collect_instantiation_bindings(&resources, &mut memo);
             let resource_value_places =
                 self.collect_instantiation_value_places(&resources, &mut memo);
+            // Per instantiation: `Option<T>`'s `None` is payload-free at every
+            // instantiation, but a variant carrying `T` is a resource only at
+            // this one, so the refinement is recomputed under the delta set.
+            let is_refinements = self.collect_is_refinements(&resources, &mut memo);
             let (calls, closures) = self.r11_body_calls_and_closures(instance.callee);
             let violations = {
                 // A generic body's bindings are all in-body (parameters / locals);
@@ -7355,6 +7579,7 @@ impl<'src> Analyzer<'src> {
                     resource_value_places: &resource_value_places,
                     module_level_bindings: &no_module_level,
                     loaned_captures: &loaned_captures,
+                    is_refinements: &is_refinements,
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
@@ -7446,28 +7671,43 @@ impl<'src> Analyzer<'src> {
         );
         for parameter in &own_params {
             if owned.contains(parameter) {
-                self.emit_generic_leak(instance, *parameter, GenericLeak::OwnParameter);
+                self.emit_generic_leak(instance, *parameter, *parameter, GenericLeak::OwnParameter);
             }
         }
         // B66: the SAME question, asked of every other value the body would have
-        // to destroy. `plan_scope`'s `dropped` is exactly the set of scope-end
-        // teardowns it planned — a pattern capture that owns a consumed
-        // subject's payload (B62), or a `let` local of delta-resource type —
-        // and a generic body can run none of them. Asking only about `own`
-        // parameters left `fun peek<T>(own o: Option<T>)` clean: the match
-        // consumes `o`, so the parameter passes, and the capture leaks.
-        //
+        // to destroy. The drop planner schedules a destruction in exactly two
+        // other places, and a generic body can run neither — `dropped` (a
+        // scope-end teardown: a pattern capture that owns a consumed subject's
+        // payload per B62, or a `let` local of delta-resource type) and
+        // `overwrites` (R2's drop of the value an assignment replaces). Asking
+        // only about `own` parameters left `fun peek<T>(own o: Option<T>)`
+        // clean: the match consumes `o`, so the parameter passes, and the
+        // capture leaks.
         if !body_is_move_clean {
             return;
         }
-        // Sorted by span (C1: deterministic order; `dropped` is a HashSet).
-        let mut leaked: Vec<Id> = dropped.into_iter().collect();
-        leaked.sort_by_key(|binding| {
-            let span = **self.span_map.get(binding).unwrap_or(&&EMPTY_SPAN);
+        // Sorted by span (C1: deterministic order; both sets are HashSets).
+        let mut leaked: Vec<(Id, Id, GenericLeak)> = dropped
+            .into_iter()
+            .map(|binding| (binding, binding, GenericLeak::ScopeEndDrop))
+            .chain(overwrites.into_iter().filter_map(|assignment| {
+                let Some(Expr::Assignment(target_id, _)) =
+                    self.expr_id_to_expr_map.get(&assignment)
+                else {
+                    return None;
+                };
+                let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id) else {
+                    return None;
+                };
+                Some((assignment, *binding, GenericLeak::Overwrite))
+            }))
+            .collect();
+        leaked.sort_by_key(|(note_anchor, _, _)| {
+            let span = **self.span_map.get(note_anchor).unwrap_or(&&EMPTY_SPAN);
             (span.start, span.end)
         });
-        for binding in leaked {
-            self.emit_generic_leak(instance, binding, GenericLeak::ScopeEndDrop);
+        for (note_anchor, binding, leak) in leaked {
+            self.emit_generic_leak(instance, note_anchor, binding, leak);
         }
     }
 
@@ -7477,7 +7717,13 @@ impl<'src> Analyzer<'src> {
     /// when instantiated with a resource" framing so it reads as one R11 family,
     /// with the specific steer. Two kinds, one rule: an `own T` parameter never
     /// moved out, and (B66) any other value still owning at a scope's end.
-    fn emit_generic_leak(&mut self, instance: &R11Instance, binding: Id, leak: GenericLeak) {
+    fn emit_generic_leak(
+        &mut self,
+        instance: &R11Instance,
+        note_anchor: Id,
+        binding: Id,
+        leak: GenericLeak,
+    ) {
         let name = self
             .functions
             .get(&instance.callee)
@@ -7496,11 +7742,18 @@ impl<'src> Analyzer<'src> {
                      that scope would have to destroy it"
                 ),
             ),
+            GenericLeak::Overwrite => (
+                "a resource-typed value is overwritten while it still owns a payload".to_string(),
+                format!(
+                    "in `{name}`, this assignment would have to destroy `{binding_name}`'s \
+                     previous value (R2) before the new one moves in"
+                ),
+            ),
         };
         let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
         let call_source = self.source_of_id(instance.call_id);
-        let note_span = **self.span_map.get(&binding).unwrap_or(&&EMPTY_SPAN);
-        let note_source = self.source_of_id(binding);
+        let note_span = **self.span_map.get(&note_anchor).unwrap_or(&&EMPTY_SPAN);
+        let note_source = self.source_of_id(note_anchor);
         let note = crate::error::Note {
             span: note_span,
             msg: detail,
