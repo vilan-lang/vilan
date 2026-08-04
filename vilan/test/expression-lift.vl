@@ -1,10 +1,34 @@
 // expression-lift.vl — bare-`?` expression lifting (proposal/expression-lifting.md):
 // single-receiver map (either operand side), the applicative form with lazy
 // right receivers, Result first-error-wins, flatten through a container body,
-// paren-delimited regions composing with `!`, and a twice-evaluated receiver.
+// paren-delimited regions composing with `!`, a twice-evaluated receiver, and
+// §4's TRAIT path — a user `Lift` container lifting through its own
+// `map`/`and_then`, nested left to right.
 import std::print;
+import std::display::format;
 import std::option::Option::{ self, Some, None };
 import std::result::Result::{ self, Ok, Err };
+import std::operators::Lift;
+
+// A user `Lift` container that tags every member it runs through, so the
+// printed tag names which method the lowering picked and in what order.
+struct Boxy<T> {
+	value: T,
+	tag: str,
+}
+
+impl Boxy<type T> with Lift {}
+
+impl Boxy<type T> {
+	fun map<U>(self, fn: |T| U): Boxy<U> {
+		Boxy { value = fn(self.value), tag = self.tag + ".map" }
+	}
+
+	fun and_then<U>(self, fn: |T| Boxy<U>): Boxy<U> {
+		let inner = fn(self.value);
+		Boxy { value = inner.value, tag = self.tag + "+" + inner.tag }
+	}
+}
 
 fun fetch(log: &mut List<i32>, value: Option<i32>): Option<i32> {
 	log.push(1);
@@ -58,4 +82,23 @@ fun main() {
 
 	let size = Some(4);
 	print((size? * size?).unwrap_or(-1)); // 16 — a receiver may repeat
+
+	// The trait path: a user `Lift` container's OWN members run.
+	let boxed = Boxy { value = 20, tag = "a" };
+	let doubled: Boxy<i32> = boxed? * 2;
+	print(i"{format(doubled.value)} [{doubled.tag}]"); // 40 [a.map]
+
+	// Two receivers nest — `left.and_then(|x| right.map(|y| x + y))`.
+	let left = Boxy { value = 40, tag = "L" };
+	let right = Boxy { value = 2, tag = "R" };
+	let paired: Boxy<i32> = left? + right?;
+	print(i"{format(paired.value)} [{paired.tag}]"); // 42 [L+R.map]
+
+	// A container body flattens through `and_then`, one level.
+	let boxes: Boxy<List<Boxy<i32>>> = Boxy {
+		value = [Boxy { value = 7, tag = "inner" }],
+		tag = "outer",
+	};
+	let picked: Boxy<i32> = boxes?[0];
+	print(i"{format(picked.value)} [{picked.tag}]"); // 7 [outer+inner]
 }

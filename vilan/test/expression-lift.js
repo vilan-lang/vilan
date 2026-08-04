@@ -8,6 +8,9 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function to_string(self) {
+	return "" + self;
+}
 function fetch2(log3, value) {
 	log3.push(1);
 	return value;
@@ -51,6 +54,20 @@ function $c(self, fallback) {
 		$e = __clone(fallback);
 	}
 	return $e;
+}
+function $H(self, fn) {
+	return [ fn(self[0]), self[1] + ".map" ];
+}
+function $J(value) {
+	return to_string(value);
+}
+function $K(self, fn) {
+	const inner = fn(self[0]);
+	return [ __clone(inner[0]), self[1] + "+" + inner[1] ];
+}
+function $N(self, fn) {
+	const inner = fn(self[0]);
+	return [ __clone(inner[0]), self[1] + "+" + inner[1] ];
 }
 const count = [ 0, 2 ];
 let $a = null;
@@ -172,3 +189,21 @@ if ($F[0] === 1) {
 	}
 }
 console.log($c($E, -(1)));
+const boxed = [ 20, "a" ];
+const doubled = $H(boxed, ($I) => {
+	return $I * 2;
+});
+console.log("" + $J(doubled[0]) + " [" + doubled[1] + "]");
+const left = [ 40, "L" ];
+const right = [ 2, "R" ];
+const paired = $K(left, ($L) => {
+	return $H(right, ($M) => {
+		return $L + $M;
+	});
+});
+console.log("" + $J(paired[0]) + " [" + paired[1] + "]");
+const boxes = [ [ [ 7, "inner" ] ], "outer" ];
+const picked = $N(boxes, ($O) => {
+	return __at($O, 0);
+});
+console.log("" + $J(picked[0]) + " [" + picked[1] + "]");

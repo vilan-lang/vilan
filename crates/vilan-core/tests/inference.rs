@@ -9060,26 +9060,211 @@ fn expression_lift_bare_iterable_is_the_identity_error() {
     );
 }
 
-#[test]
-fn expression_lift_on_a_user_container_is_the_recorded_follow_up() {
-    // v1 lifts the std pair at a bare `?`; a user `Lift` container gets the
-    // clean follow-up error (its `?.` chains keep working).
-    assert_fails_with(
-        r#"
+// --- The bare-`?` TRAIT path (expression-lifting.md §4, B11's tail) ---
+//
+// A user `Lift` container in a region lowers to nested `and_then` calls
+// ending in `map` — its OWN members, not the inline std form. Every pin below
+// reads the tag each member appends, so a passing run proves *which* member
+// ran and in what order; a value-only assertion could not tell the trait path
+// from the std one.
+
+/// The shared fixture: `Boxy` tags every member it runs through.
+const USER_LIFT_CONTAINER: &str = r#"
+        import std::print;
+        import std::display::format;
         import std::operators::Lift;
-        struct Boxy<T> { value: T }
+
+        struct Boxy<T> { value: T, tag: str }
+
         impl Boxy<type T> with Lift {}
+
         impl Boxy<type T> {
             fun map<U>(self, fn: |T| U): Boxy<U> {
-                Boxy { value = fn(self.value) }
+                Boxy { value = fn(self.value), tag = self.tag + ".map" }
+            }
+
+            fun and_then<U>(self, fn: |T| Boxy<U>): Boxy<U> {
+                let inner = fn(self.value);
+                Boxy { value = inner.value, tag = self.tag + "+" + inner.tag }
+            }
+        }
+"#;
+
+#[test]
+fn expression_lift_on_a_user_container_maps_through_its_own_map() {
+    // One receiver, a plain body: the region is `boxed.map(|x| x * 2)`, and
+    // the `.map` the tag picks up is the user's method — not the inline
+    // tag-branch lowering the std pair gets.
+    assert_compiles_and_runs(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        fun main() {{
+            let boxed = Boxy {{ value = 20, tag = \"a\" }};
+            let doubled: Boxy<i32> = boxed? * 2;
+            print(i\"{{format(doubled.value)}} [{{doubled.tag}}]\");
+        }}
+        "
+        ),
+        "40 [a.map]\n",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_nests_and_then_ending_in_map() {
+    // Two receivers: `left.and_then(|x| right.map(|y| x + y))` — §4's
+    // "nested `and_then` calls ending in `map`". The tag pins the whole
+    // shape: `R.map` is the inner member, `L+…` the outer `and_then`'s
+    // concatenation, so a flat or reversed nesting would read differently.
+    assert_compiles_and_runs(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        fun main() {{
+            let left = Boxy {{ value = 40, tag = \"L\" }};
+            let right = Boxy {{ value = 2, tag = \"R\" }};
+            let total: Boxy<i32> = left? + right?;
+            print(i\"{{format(total.value)}} [{{total.tag}}]\");
+        }}
+        "
+        ),
+        "42 [L+R.map]\n",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_flattens_through_and_then() {
+    // The body yields the receiver's own container (`rows?[0]` on a
+    // `Boxy<List<Boxy<i32>>>`), so the region is ONE level — `and_then`, not
+    // `map` (the chain rule inherited). The annotation pins the type; the
+    // tag's `+` (and_then's join, never map's `.map`) pins the member.
+    assert_compiles_and_runs(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        fun main() {{
+            let rows: Boxy<List<Boxy<i32>>> = Boxy {{
+                value = [Boxy {{ value = 7, tag = \"inner\" }}],
+                tag = \"outer\",
+            }};
+            let first: Boxy<i32> = rows?[0];
+            print(i\"{{format(first.value)}} [{{first.tag}}]\");
+        }}
+        "
+        ),
+        "7 [outer+inner]\n",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_orders_effects_left_to_right() {
+    // §4: "Left-to-right, so effects order as written." The right receiver
+    // is built inside the left's continuation, and a hoisted eval step
+    // between them runs there too — L, M, R, in source order.
+    assert_compiles_and_runs(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        fun boxed(label: str, value: i32): Boxy<i32> {{
+            print(label);
+            Boxy {{ value = value, tag = label }}
+        }}
+
+        fun noise(label: str): i32 {{
+            print(label);
+            0
+        }}
+
+        fun main() {{
+            let total: Boxy<i32> = boxed(\"L\", 40)? + noise(\"M\") + boxed(\"R\", 2)?;
+            print(i\"{{format(total.value)}} [{{total.tag}}]\");
+        }}
+        "
+        ),
+        "L\nM\nR\n42 [L+R.map]\n",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_keeps_the_marker_as_the_gate() {
+    // The opt-in gate is unchanged by the trait path: a mappable container
+    // WITHOUT `impl .. with Lift` is still refused, and the message names
+    // the marker (the same steer `?.` gives).
+    assert_fails_with(
+        r#"
+        struct Sneaky<T> { value: T }
+        impl Sneaky<type T> {
+            fun map<U>(self, fn: |T| U): Sneaky<U> {
+                Sneaky { value = fn(self.value) }
             }
         }
         fun main() {
-            let boxed = Boxy { value = 1 };
-            let x = boxed? + 1;
+            let s = Sneaky { value = 1 };
+            let x = s? + 1;
         }
         "#,
-        "a bare `?` lifts an `Option` or a `Result`",
+        "opting in with `impl .. with Lift`",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_names_the_missing_contract_member() {
+    // `Lift` is a MARKER — no members, so B29's conformance check has
+    // nothing to verify. The duck-typed lookup is the contract's real gate:
+    // a container with only `map`, used where the body flattens, is told
+    // which member the contract wants.
+    assert_fails_with(
+        r#"
+        import std::operators::Lift;
+        struct Halfy<T> { value: T }
+        impl Halfy<type T> with Lift {}
+        impl Halfy<type T> {
+            fun map<U>(self, fn: |T| U): Halfy<U> {
+                Halfy { value = fn(self.value) }
+            }
+        }
+        fun main() {
+            let rows: Halfy<List<Halfy<i32>>> = Halfy { value = [Halfy { value = 7 }] };
+            let first: Halfy<i32> = rows?[0];
+        }
+        "#,
+        "needs an `and_then` method: the Lift contract",
+    );
+}
+
+#[test]
+fn expression_lift_on_a_user_container_rejects_a_mixed_region() {
+    // "All receivers must be the same named container" holds across the
+    // std/user line too, and the message names both rather than assuming
+    // the Option/Result pair.
+    assert_fails_with(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        import std::option::Option::{{ self, Some, None }};
+        fun main() {{
+            let boxed = Boxy {{ value = 40, tag = \"a\" }};
+            let counted = Some(2);
+            let total = boxed? + counted?;
+        }}
+        "
+        ),
+        "must split the same container",
+    );
+}
+
+#[test]
+fn expression_lift_never_absorbs_a_user_container_chain() {
+    // §5's absorption rejection is container-agnostic: a `?.` chain stays a
+    // sealed atom, so `boxed?.name` is still `Boxy<str>` — the region shipping
+    // for user containers does not change what a chain means.
+    assert_compiles_and_runs(
+        &format!(
+            "{USER_LIFT_CONTAINER}
+        struct User {{ name: str }}
+        fun main() {{
+            let boxed = Boxy {{ value = User {{ name = \"ada\" }}, tag = \"u\" }};
+            let named = boxed?.name;
+            print(i\"{{named.value}} [{{named.tag}}]\");
+        }}
+        "
+        ),
+        "ada [u.map]\n",
     );
 }
 
