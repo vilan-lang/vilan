@@ -1349,10 +1349,21 @@ impl<'src> Transformer<'src> {
                     || self.generic_ref_param_is_scalar(*binding)
             }
             Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
-            // `*obj.slot()` — a `borrows` call returning a scalar view.
-            Some(Expr::Call(..)) => self.program.scalar_view_calls.contains(&operand),
+            // `*obj.slot()` — a `borrows` call returning a scalar view. A
+            // scalar `Shared::write()` is one too: it lowers to the `(base,
+            // key)` pair, and the analyzer cannot classify it (the pointee is
+            // generic until this monomorphization).
+            Some(Expr::Call(..)) => {
+                self.program.scalar_view_calls.contains(&operand)
+                    || self.call_is_scalar_shared_write(operand)
+            }
             _ => false,
         }
+    }
+
+    /// Whether a call expression is a `Shared::write()` with a scalar pointee.
+    fn call_is_scalar_shared_write(&self, call_expr_id: Id) -> bool {
+        self.is_shared_write(call_expr_id) && self.shared_write_pointee_is_scalar(call_expr_id)
     }
 
     /// A `&`/`&mut` parameter whose declared pointee is a generic that resolves,
@@ -1499,6 +1510,77 @@ impl<'src> Transformer<'src> {
             Expr::Dereference(operand) => self.place_root_local(*operand),
             _ => None,
         }
+    }
+
+    /// Whether this intrinsic call is a `Shared::write()` whose pointee resolves
+    /// (under the active monomorphization) to a scalar — the case that lowers to
+    /// a `(base, key)` pair rather than to the bare `cell.v` slot access.
+    fn emits_scalar_shared_write(&self, intrinsic: Intrinsic, call_expr_id: Id) -> bool {
+        matches!(intrinsic, Intrinsic::SharedWrite)
+            && self.shared_write_pointee_is_scalar(call_expr_id)
+    }
+
+    /// Whether a `Shared::write()` call's pointee resolves to a scalar under the
+    /// active monomorphization. A call expression carries no recorded type of its
+    /// own, so this reads the extern's declared return type (`&mut T`, erased to
+    /// the generic `T`) and resolves it through the current substitution — the
+    /// same channel `generic_ref_param_is_scalar` uses for a `&mut T` parameter.
+    fn shared_write_pointee_is_scalar(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(function_call) = self.program.function_calls.get(call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(callee_id)) = self.program.entity_map.get(&function_call.subject_id)
+        else {
+            return false;
+        };
+        if !self.program.external_functions.contains_key(callee_id) {
+            return false;
+        }
+        // The pointee is the RECEIVER's `Shared<T>` type argument. The extern's
+        // own declared `&mut T` names the impl binder, which the caller's
+        // monomorphization substitution does not bind — the receiver's resolved
+        // type does carry the concrete argument.
+        let Some(receiver_type_id) = function_call
+            .argument_ids
+            .first()
+            .and_then(|receiver_id| self.expr_type_id(*receiver_id))
+        else {
+            return false;
+        };
+        let Some(Type::Struct(_, arguments)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(receiver_type_id))
+        else {
+            return false;
+        };
+        arguments
+            .first()
+            .is_some_and(|pointee| self.resolves_to_scalar_view_pointee(*pointee))
+    }
+
+    /// The cell's `v` slot for a `Shared::write()` call — the form the pair
+    /// lowering above is built from, and the one the assign-through path wants
+    /// back (`cell.write() = x` is `cell.v = x` for every pointee).
+    fn shared_write_slot(
+        &mut self,
+        call_expr_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return None;
+        };
+        let receiver_id = *self
+            .program
+            .function_calls
+            .get(call_id)?
+            .argument_ids
+            .first()?;
+        let receiver = self.walk_entity(receiver_id, block)?;
+        Some(js::Node::Property(Box::new(receiver), "v".to_string()))
     }
 
     /// Whether an expression is a `Shared::write()` call — a single-slot view of
@@ -1728,7 +1810,7 @@ impl<'src> Transformer<'src> {
                             &own_values,
                             preferred,
                         ) {
-                            return Some(self.emit_dispatch(dispatch, args));
+                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                         }
                     }
                 }
@@ -1755,7 +1837,7 @@ impl<'src> Transformer<'src> {
                             &own_values,
                             preferred,
                         ) {
-                            return Some(self.emit_dispatch(dispatch, args));
+                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                         }
                     }
                 }
@@ -1769,7 +1851,7 @@ impl<'src> Transformer<'src> {
                 {
                     if let Some(type_id) = concrete_type.or(self.current_self_type) {
                         if let Some(dispatch) = self.resolve_dispatch(type_id, member_name) {
-                            return Some(self.emit_dispatch(dispatch, args));
+                            return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                         }
                     }
                 }
@@ -1798,7 +1880,7 @@ impl<'src> Transformer<'src> {
                         // An external std intrinsic lowers to native JS or a
                         // runtime helper.
                         if let Some(intrinsic) = self.program.intrinsics.get(&target_id).copied() {
-                            return Some(self.emit_intrinsic(intrinsic, args));
+                            return Some(self.emit_intrinsic(intrinsic, args, Some(*id)));
                         }
                         // An `[extern]`-bound external lowers to its host (JS)
                         // import/call, method, or property access.
@@ -2264,7 +2346,8 @@ impl<'src> Transformer<'src> {
                                 .unwrap_or_default();
                             let saved = self.current_substitution.clone();
                             self.current_substitution.extend(substitution);
-                            let call = self.emit_dispatch(dispatch, vec![lhs.clone(), rhs.clone()]);
+                            let call =
+                                self.emit_dispatch(dispatch, vec![lhs.clone(), rhs.clone()], None);
                             self.current_substitution = saved;
                             return Some(if matches!(*op, BinaryOp::NotEq) {
                                 js::Node::Unary('!', Box::new(call))
@@ -2288,7 +2371,7 @@ impl<'src> Transformer<'src> {
                     {
                         if let Some(dispatch) = self.resolve_dispatch(concrete_type_id, member_name)
                         {
-                            let call = self.emit_dispatch(dispatch, vec![lhs, rhs]);
+                            let call = self.emit_dispatch(dispatch, vec![lhs, rhs], None);
                             return Some(if matches!(*op, BinaryOp::NotEq) {
                                 js::Node::Unary('!', Box::new(call))
                             } else {
@@ -2553,7 +2636,15 @@ impl<'src> Transformer<'src> {
                 // A primitive view's `*c` is a `[0]` slot write — the normal path.
                 if let Some(Expr::Dereference(operand)) = self.program.entity_map.get(target_id) {
                     if self.is_shared_write(*operand) {
-                        let slot = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
+                        // Take the `v` slot directly rather than walking the
+                        // call: a SCALAR pointee now lowers the call to the
+                        // `(base, key)` pair, and assigning to the pair would
+                        // write the pair, not the cell.
+                        let operand = *operand;
+                        let slot = self
+                            .shared_write_slot(operand, block)
+                            .or_else(|| self.walk_entity(operand, block))
+                            .unwrap_or(js::Node::Void);
                         return Some(js::Node::Assignment(Box::new(slot), Box::new(value)));
                     }
                     if !self.derefs_scalar_view(*operand) {
@@ -3321,7 +3412,22 @@ impl<'src> Transformer<'src> {
         &mut self,
         intrinsic: Intrinsic,
         args: Vec<js::Node<'src>>,
+        call_expr_id: Option<Id>,
     ) -> js::Node<'src> {
+        // `Shared::write()` over a SCALAR pointee is a view like any other, so
+        // it lowers to the `(base, key)` pair the view machinery reads. `cell.v`
+        // alone is the VALUE: passing it where a `&mut i32` is expected handed
+        // the callee a number, and `slot[0][slot[1]]` on it is `undefined` — a
+        // runtime crash, not a diagnostic. The assign-through and deref sites
+        // take the `v` slot back off the pair. Whether the pointee is scalar is
+        // decidable only here, per monomorphization.
+        if call_expr_id.is_some_and(|id| self.emits_scalar_shared_write(intrinsic, id)) {
+            let cell = args.into_iter().next().unwrap_or(js::Node::Void);
+            return js::Node::Array(vec![
+                cell,
+                js::Node::String(std::borrow::Cow::Borrowed("v")),
+            ]);
+        }
         // A method that maps directly onto a native JS method (`str`, `Set`, `Map`):
         // the receiver is `self` (the first argument), the rest pass through as args.
         fn native_method<'a, I: Iterator<Item = js::Node<'a>>>(
@@ -3956,9 +4062,10 @@ impl<'src> Transformer<'src> {
         &mut self,
         dispatch: Dispatch<'src>,
         args: Vec<js::Node<'src>>,
+        call_expr_id: Option<Id>,
     ) -> js::Node<'src> {
         match dispatch {
-            Dispatch::Intrinsic(intrinsic) => self.emit_intrinsic(intrinsic, args),
+            Dispatch::Intrinsic(intrinsic) => self.emit_intrinsic(intrinsic, args, call_expr_id),
             Dispatch::Extern(member_id, binding) => {
                 let call = self.emit_extern(member_id, binding, args);
                 self.maybe_await(member_id, call)
