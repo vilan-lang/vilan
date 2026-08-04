@@ -59,6 +59,11 @@ pub struct Gate {
     /// `View.swap_split` — what they resolve to in a split build. Same shape,
     /// so the call's own type binding carries over by position.
     pub swap_split: Id,
+    /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
+    /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
+    /// the same generics as `swap_split` in the same order, so the gate call's
+    /// type argument rebinds onto it by position too.
+    pub preload: Id,
 }
 
 impl ChunkPlan {
@@ -213,11 +218,14 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
-    let gate = view_method(program, "swap_split").map(|swap_split| Gate {
-        calls: sites.iter().map(|site| site.call).collect(),
-        swap: swap_fn,
-        swap_split,
-    });
+    let gate = view_method(program, "swap_split")
+        .zip(std_function(program, "chunk_preload"))
+        .map(|(swap_split, preload)| Gate {
+            calls: sites.iter().map(|site| site.call).collect(),
+            swap: swap_fn,
+            swap_split,
+            preload,
+        });
     ChunkPlan {
         sites: sites.len(),
         eager_functions,
@@ -244,6 +252,21 @@ fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
         .then(|| implementation.declarations.get(name).copied())
         .flatten()
     })
+}
+
+/// A free std function by name — restricted to std sources, so an app function
+/// of the same name can never be mistaken for the one the gate wires.
+fn std_function(program: &Program<'_>, name: &str) -> Option<Id> {
+    program
+        .functions
+        .iter()
+        .find(|(id, function)| {
+            function.name == name
+                && program
+                    .source_of(**id)
+                    .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|(id, _)| *id)
 }
 
 /// One recognized `.swap(signal, |current| match current { .. })` site.

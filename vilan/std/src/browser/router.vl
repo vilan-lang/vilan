@@ -13,9 +13,10 @@
 // available when building for the browser.
 
 import pkg::dom::Event;
+import pkg::option::Option;
 import pkg::reactive::{ FlushPolicy, Signal, turn };
 import pkg::shared::Shared;
-import pkg::ui::{ View, chunk_pending, view };
+import pkg::ui::{ View, chunk_failure, chunk_pending, view };
 
 /// `history.pushState(state, title, path)` — state and title are unused ("").
 [extern("history.pushState")]
@@ -110,4 +111,14 @@ fun plain_left_click(event: Event): bool {
 /// chunk to wait for.
 fun pending(): Signal<bool> {
 	chunk_pending()
+}
+
+/// Why the last route chunk fetch FAILED, or `None`
+/// (proposal/bundle-splitting.md §S3) — the failure hook beside `pending()`.
+/// A failed fetch leaves the route where it was (the navigation simply did not
+/// happen) and publishes the reason here; the next navigation clears it and
+/// refetches, so a retry is a link click and needs no API. Always `None` in a
+/// single-file build.
+fun chunk_error(): Signal<Option<str>> {
+	chunk_failure()
 }

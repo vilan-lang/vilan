@@ -456,6 +456,16 @@ impl View {
 	/// `chunk_pending()` reads true. The first arm is the same story with an
 	/// empty previous view: the swap is not wired until its chunk arrives.
 	///
+	/// Overlapping navigations resolve by GENERATION, not by arrival: each
+	/// value taken from `source` claims the next generation, and a chunk that
+	/// lands after a later navigation started is dropped rather than swapped in
+	/// (`Draft::push`'s guard in `std::reactive`, same shape). Without it a slow
+	/// A followed by a fast B would leave A on screen.
+	///
+	/// A failed fetch leaves the route where it was and publishes the reason on
+	/// `chunk_error()`; the next navigation to that arm refetches, since the
+	/// failed attempt is not remembered as in flight.
+	///
 	/// In a build with no chunk map — every single-file build, which is every
 	/// build that did not ask to split — `chunk_ready` is true for every arm
 	/// and this is `swap`, one derived signal deeper.
@@ -466,6 +476,7 @@ impl View {
 	): View {
 		let gated: Signal<T> = Signal::new(source.get());
 		let wired: Shared<bool> = Shared::new(false);
+		let generation: Shared<i32> = Shared::new(0);
 		let advance = |value: T| {
 			gated.set(value);
 			if !wired.read() {
@@ -474,17 +485,33 @@ impl View {
 			}
 		};
 		source.effect(|value: T| {
+			// Claim this navigation's generation before anything can await, so
+			// a continuation can tell whether it is still the latest.
+			let mine = generation.read() + 1;
+			generation.write() = mine;
+			clear_chunk_error();
 			let arm = chunk_arm(value);
 			if chunk_ready(arm) {
+				// Navigating BACK to loaded code while something is in flight
+				// ends the wait: that fetch has just been superseded, and its
+				// arrival is dropped by the generation guard below.
+				set_chunk_pending(false);
 				advance(value);
 			} else {
-				chunk_pending_signal.set(true);
+				set_chunk_pending(true);
 				// The continuation lands outside every turn, so it opens its
 				// own — the navigation's DOM work settles as one wave, exactly
 				// as an event handler's would.
 				chunk_load(arm, || turn(FlushPolicy::AtSuspension, || {
-					chunk_pending_signal.set(false);
-					advance(value);
+					if generation.read() == mine {
+						set_chunk_pending(false);
+						advance(value);
+					}
+				}), |reason: str| turn(FlushPolicy::AtSuspension, || {
+					if generation.read() == mine {
+						set_chunk_pending(false);
+						chunk_error_signal.set(Some(reason));
+					}
 				}));
 			}
 		});
@@ -497,6 +524,11 @@ impl View {
 /// `std::router::pending`, which is where an app reads it.
 let chunk_pending_signal: Signal<bool> = Signal::new(false);
 
+/// Why the last route chunk fetch failed, or `None` (§S3). Re-exported as
+/// `std::router::chunk_error`. Cleared when the next navigation starts, so a
+/// view bound to it shows the failure exactly until something is retried.
+let chunk_error_signal: Signal<Option<str>> = Signal::new(None);
+
 /// The route arm a value selects. See `swap_split`.
 [extern("__chunk_arm")]
 external fun chunk_arm<T>(value: T): i32;
@@ -506,15 +538,55 @@ external fun chunk_arm<T>(value: T): i32;
 [extern("__chunk_ready")]
 external fun chunk_ready(arm: i32): bool;
 
-/// Fetches `arm`'s chunk and then calls `then`. A failed fetch reports to the
-/// console and never calls back, so the navigation does not happen and the
-/// previous view stays.
+/// Fetches `arm`'s chunk and then calls `then` — or `failed` with the reason,
+/// which is also reported to the console. A failure is not remembered as in
+/// flight, so the next navigation to the arm refetches.
 [extern("__chunk_load")]
-external fun chunk_load(arm: i32, then: || void): void;
+external fun chunk_load(arm: i32, then: || void, failed: |str| void): void;
+
+/// Starts `arm`'s chunk fetching without waiting for it. Failure is silent
+/// here — `chunk_load` has already reported it, and the gate's own load
+/// surfaces it on `chunk_error()`.
+[extern("__chunk_preload")]
+external fun chunk_preload_arm(arm: i32): void;
+
+/// The BOOT PRELOAD (proposal/bundle-splitting.md §S3): start the chunk for
+/// `source`'s current value and do not wait. A split build's emitter plants a
+/// call to this immediately before the statement that mounts the route swap —
+/// the swap is the last call in its view chain, so without it the whole shell
+/// subtree is built before the boot route's chunk is even asked for. Declares
+/// the same generics as `swap_split`, in the same order, because the emitter
+/// rebinds the gate call's type argument onto it by position. `swap_split` then
+/// joins the in-flight fetch this started rather than opening a second one.
+fun chunk_preload<T: PartialEq>(source: Signal<T>) {
+	chunk_preload_arm(chunk_arm(source.get()));
+}
 
 /// True while a route chunk is being fetched.
 fun chunk_pending(): Signal<bool> {
 	chunk_pending_signal
+}
+
+/// Why the last route chunk fetch failed, or `None`.
+fun chunk_failure(): Signal<Option<str>> {
+	chunk_error_signal
+}
+
+/// Publish a change of the in-flight flag — only a real change, so an ordinary
+/// navigation over already-loaded code notifies nothing.
+fun set_chunk_pending(busy: bool) {
+	if chunk_pending_signal.get() != busy {
+		chunk_pending_signal.set(busy);
+	}
+}
+
+/// Drop a recorded failure — only when there is one, so an ordinary navigation
+/// publishes nothing to a view bound to `chunk_error()`.
+fun clear_chunk_error() {
+	match chunk_error_signal.get() {
+		Some(let _reason) => chunk_error_signal.set(None),
+		None => {},
+	}
 }
 
 /// Something that can fill a child position (proposal/element-syntax.md §5) —

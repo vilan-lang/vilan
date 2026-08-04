@@ -276,41 +276,194 @@ fn splitting_moves_the_route_chunks_and_nothing_else() {
     let _ = std::fs::remove_dir_all(&single);
 }
 
-#[test]
-fn a_split_bundle_runs_its_routes_and_fetches_one_chunk_at_a_time() {
-    let staged = stage("run", true);
-    build(&staged, &[]);
-    std::fs::write(staged.join("harness.js"), HARNESS).expect("write the harness");
-
+/// Writes the shared DOM stub plus `driver` beside a staged build and runs it
+/// under node, returning its stdout. Node resolves the chunks' relative
+/// `import()` against the importing file, so they load off disk exactly as a
+/// browser would load them off the origin.
+fn run_under_node(staged: &Path, driver: &str) -> String {
+    std::fs::write(staged.join("stub.js"), STUB).expect("write the DOM stub");
+    std::fs::write(staged.join("harness.js"), driver).expect("write the harness");
     let output = Command::new("node")
         .arg("harness.js")
-        .current_dir(&staged)
+        .current_dir(staged)
         .output()
         .expect("run the node harness");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         output.status.success(),
         "the split harness failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    stdout
+}
+
+#[test]
+fn a_split_bundle_runs_its_routes_and_fetches_one_chunk_at_a_time() {
+    let staged = stage("run", true);
+    build(&staged, &[]);
+    let stdout = run_under_node(
+        &staged,
+        r#"const stub = require("./stub.js");
+require("./app.js");
+const chunks = globalThis.__vilan_chunks;
+
+(async () => {
+	// The BOOT PRELOAD (bundle-splitting.md §S3): the emitter plants
+	// `chunk_preload(route)` ahead of the statement that mounts the swap, so the
+	// boot route's chunk is on the wire before the first element of the shell is
+	// created. Without it the whole shell is built first and the fetch trails it.
+	console.log("preloaded-before-the-shell", stub.first_element_saw_a_fetch());
+	console.log("boot", stub.page());
+	await stub.settle();
+	console.log("home", stub.page());
+
+	// Navigating: the signal does not advance until the chunk does, so the
+	// PREVIOUS page is what is on screen — the whole loading story.
+	stub.go("/docs/3");
+	console.log("fetching", stub.page());
+	await stub.settle();
+	console.log("docs", stub.page());
+
+	// Only what was navigated to was ever fetched.
+	const fetched = Object.keys(chunks.loaded)
+		.map((arm) => chunks.url[arm].replace("app.", "").replace(".js", ""))
+		.sort()
+		.join(",");
+	console.log("fetched", fetched);
+})();
+"#,
+    );
     assert_eq!(
         stdout,
         // B33 (b33-emission-order.md §1): `BASE` before `SCALED`, though
-        // `app.vl` declares them the other way round. Then: nothing rendered
-        // before the boot route's chunk lands; the home page once it does; the
-        // PREVIOUS view still on screen while the docs chunk is in flight
-        // (bundle-splitting.md §2); the docs page once it lands. `NotFound` is
-        // never navigated to, so it is never fetched. `<p>...</p>` is
-        // `router::pending()`, live through both fetches.
+        // `app.vl` declares them the other way round. Then: the boot chunk
+        // already fetching before the shell exists; nothing rendered before it
+        // lands; the home page once it does; the PREVIOUS view still on screen
+        // while the docs chunk is in flight (bundle-splitting.md §2); the docs
+        // page once it lands. `NotFound` is never navigated to, so it is never
+        // fetched. The first `<p>...</p>` is `router::pending()`, live through
+        // both fetches; the second `<p>` is `router::chunk_error()`, empty
+        // throughout because nothing failed.
         "init BASE=2\n\
          init SCALED=6\n\
-         boot <main><nav><a>Home</a><a>Docs</a></nav><p>...</p></main>\n\
-         home <main><nav><a>Home</a><a>Docs</a></nav><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
-         fetching <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
-         docs <main><nav><a>Home</a><a>Docs</a></nav><p></p><article><section><h2>Docs</h2><p>page 3</p></section><nav><a>Next</a></nav></article></main>\n\
+         preloaded-before-the-shell true\n\
+         boot <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><p></p></main>\n\
+         home <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         fetching <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         docs <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><article><section><h2>Docs</h2><p>page 3</p></section><nav><a>Next</a></nav></article></main>\n\
          fetched Route_Docs,Route_Home\n",
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn a_failed_chunk_fetch_surfaces_and_the_next_navigation_retries() {
+    // The error hook (bundle-splitting.md §S3). The fetch is made controllable
+    // by pointing an arm's entry in the embedded map at a file that is not
+    // there — the same failure a 404 on the origin produces, and the only knob
+    // needed to drive it.
+    let staged = stage("failure", true);
+    build(&staged, &[]);
+    let stdout = run_under_node(
+        &staged,
+        r#"const stub = require("./stub.js");
+require("./app.js");
+const chunks = globalThis.__vilan_chunks;
+
+(async () => {
+	await stub.settle();
+	console.log("home", stub.page());
+
+	const real = chunks.url[2];
+	chunks.url[2] = "app.Route_Missing.js";
+	stub.go("/nope");
+	await stub.settle();
+	// The navigation did not happen: the previous page is still on screen, the
+	// pending flag is back down (it must not stick), and the reason reached the
+	// app — `!` renders only for a non-empty message.
+	console.log("failed", stub.page());
+	console.log("still-pending", Object.keys(chunks.pending).length > 0);
+
+	// A failed fetch is not remembered as in flight, so the next navigation to
+	// the same arm refetches — a retry is a link click, not an API.
+	chunks.url[2] = real;
+	stub.go("/nope");
+	await stub.settle();
+	console.log("retried", stub.page());
+})();
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "init BASE=2\n\
+         init SCALED=6\n\
+         home <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         failed <main><nav><a>Home</a><a>Docs</a></nav><p></p><p>!</p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         still-pending false\n\
+         retried <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><section><h2>Nothing here</h2><p>try /docs/1</p></section></main>\n",
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn a_chunk_that_lands_after_a_later_navigation_does_not_swap() {
+    // Overlapping navigations resolve by GENERATION, not by arrival
+    // (bundle-splitting.md §S3, `Draft::push`'s guard). The in-flight fetch is
+    // made controllable by seeding the registry's pending slot with a promise
+    // the harness resolves by hand — `__chunk_load` joins an existing one
+    // rather than opening a second, so this IS the arm's fetch.
+    let staged = stage("generation", true);
+    build(&staged, &[]);
+    let stdout = run_under_node(
+        &staged,
+        r#"const stub = require("./stub.js");
+require("./app.js");
+const chunks = globalThis.__vilan_chunks;
+
+(async () => {
+	await stub.settle();
+	stub.go("/docs/1");
+	await stub.settle();
+	stub.go("/");
+	await stub.settle();
+	console.log("home", stub.page());
+
+	// NotFound's chunk is the slow one, and its arrival is the harness's to
+	// choose. Landing it registers the arm's functions for real, so the stale
+	// arrival below could genuinely render if nothing stopped it.
+	let land;
+	chunks.pending[2] = new Promise((resolve) => {
+		land = async () => {
+			await import("./app.Route_NotFound.js");
+			chunks.loaded[2] = true;
+			resolve();
+		};
+	});
+
+	stub.go("/nope");
+	console.log("in-flight", stub.page());
+
+	// A second navigation, to code that is already here, wins immediately —
+	// and ends the wait, since the fetch it supersedes can no longer land.
+	stub.go("/docs/2");
+	await stub.settle();
+	console.log("superseded", stub.page());
+
+	// …and when the superseded chunk finally arrives, it must NOT swap.
+	await land();
+	await stub.settle();
+	console.log("stale-arrival", stub.page());
+})();
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "init BASE=2\n\
+         init SCALED=6\n\
+         home <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         in-flight <main><nav><a>Home</a><a>Docs</a></nav><p>...</p><p></p><section><h2>Home</h2><p>scale 6</p></section></main>\n\
+         superseded <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><article><section><h2>Docs</h2><p>page 2</p></section><nav><a>Next</a></nav></article></main>\n\
+         stale-arrival <main><nav><a>Home</a><a>Docs</a></nav><p></p><p></p><article><section><h2>Docs</h2><p>page 2</p></section><nav><a>Next</a></nav></article></main>\n",
     );
     let _ = std::fs::remove_dir_all(&staged);
 }
@@ -422,10 +575,11 @@ fn split_off_a_browser_leg_stops_the_build() {
 }
 
 /// The DOM/history stub the split bundle runs against — `router.rs`'s, plus a
-/// settle step, because a chunk arrives on a microtask rather than inline.
-/// Node resolves the chunks' relative `import()` against the importing file, so
-/// they load off disk exactly as a browser would load them off the origin.
-const HARNESS: &str = r#"class StubElement {
+/// settle step (a chunk arrives on a microtask rather than inline), a
+/// `location`/`popstate` driver, and one instrument: whether a chunk fetch was
+/// already in flight when the FIRST element was created, which is how the boot
+/// preload is observed.
+const STUB: &str = r#"class StubElement {
 	constructor(tagName) {
 		this.tagName = tagName;
 		this.children = [];
@@ -462,8 +616,15 @@ const HARNESS: &str = r#"class StubElement {
 }
 
 const root = new StubElement("div");
+let first_element_saw_a_fetch = null;
+const fetching = () =>
+	globalThis.__vilan_chunks !== undefined &&
+	Object.keys(globalThis.__vilan_chunks.pending).length > 0;
 global.document = {
-	createElement: (tag) => new StubElement(tag),
+	createElement: (tag) => {
+		if (first_element_saw_a_fetch === null) first_element_saw_a_fetch = fetching();
+		return new StubElement(tag);
+	},
 	createElementNS: (namespace, tag) => new StubElement(tag),
 	getElementById: (id) => (id === "app" ? root : null),
 	querySelector: () => null,
@@ -474,32 +635,13 @@ global.history = { pushState(state, title, path) { global.location.pathname = pa
 const popstate = [];
 global.window = { addEventListener: (event, handler) => { if (event === "popstate") popstate.push(handler); } };
 
-require("./app.js");
-
-const page = () => root.children.map((child) => child.render()).join("");
-const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
-const chunks = globalThis.__vilan_chunks;
-
-(async () => {
-	// Nothing is rendered before the boot route's own code has landed, and
-	// `router::pending()` — bound to the `<p>` — reads busy meanwhile.
-	console.log("boot", page());
-	await settle();
-	console.log("home", page());
-
-	// Navigating: the signal does not advance until the chunk does, so the
-	// PREVIOUS page is what is on screen — the whole loading story.
-	global.location.pathname = "/docs/3";
-	for (const handler of popstate) handler({});
-	console.log("fetching", page());
-	await settle();
-	console.log("docs", page());
-
-	// Only what was navigated to was ever fetched.
-	const fetched = Object.keys(chunks.loaded)
-		.map((arm) => chunks.url[arm].replace("app.", "").replace(".js", ""))
-		.sort()
-		.join(",");
-	console.log("fetched", fetched);
-})();
+module.exports = {
+	page: () => root.children.map((child) => child.render()).join(""),
+	settle: () => new Promise((resolve) => setTimeout(resolve, 50)),
+	go: (path) => {
+		global.location.pathname = path;
+		for (const handler of popstate) handler({});
+	},
+	first_element_saw_a_fetch: () => first_element_saw_a_fetch,
+};
 "#;
