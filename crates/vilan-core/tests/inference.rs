@@ -2962,6 +2962,323 @@ fn a_guard_that_needs_a_temporary_emits_it() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B54 / A20 (rule 1 at the STORE seams). A place read into a slot of an
+// aggregate that outlives the expression must copy: a construction literal's
+// element/field/payload (B54), and the argument of a container method that
+// keeps it (A20, via `own`). See proposal/element-clones.md.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_list_literal_element_copies_its_source_place() {
+    // B54: `[xs]` installed the caller's storage as element 0, so growing the
+    // result's element grew `xs`. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2];
+            mut ys = [xs];
+            ys[0].push(9);
+            print(xs.len());
+            print(ys[0].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_tuple_literal_element_copies_its_source_place() {
+    // The same seam through a tuple, whose elements store flat.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2];
+            mut pair = (xs, 1);
+            pair.0.push(9);
+            print(xs.len());
+            print(pair.0.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_struct_literal_field_copies_its_source_place() {
+    // Rule 1 names "field initialization" outright; it was not enforced.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        fun main() {
+            mut xs = [1, 2];
+            mut holder = Holder { items = xs };
+            holder.items.push(9);
+            print(xs.len());
+            print(holder.items.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_variant_payload_copies_its_source_place() {
+    // A variant constructor has no `Parameter` entries, so the `own`-argument
+    // arm never saw it: `Some(xs)` captured `xs`'s storage as the payload.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut xs = [1, 2];
+            let held = Some(xs);
+            xs.push(9);
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+            print(xs.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_construction_does_not_see_later_writes_to_its_source() {
+    // The read direction of the list-literal seam: the source grows, and the
+    // already-built list must not.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2];
+            let held = [xs];
+            xs.push(9);
+            print(held[0].len());
+            print(xs.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_nested_construction_copies_at_every_level() {
+    // A struct literal inside a list literal: the copy has to reach the inner
+    // field, not just the outer element.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Row { cells: List<i32> }
+        fun main() {
+            mut cells = [1, 2];
+            mut rows = [Row { cells = cells }];
+            rows[0].cells.push(9);
+            print(cells.len());
+            print(rows[0].cells.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_pushed_place_copies_into_the_receiver() {
+    // A20's root: `push` STORES its argument, so the argument is owned by the
+    // callee — `own item: T`. Without it `acc.push(xs)` filed the caller's
+    // storage into `acc`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2];
+            mut acc: List<List<i32>> = List::new();
+            acc.push(xs);
+            acc[0].push(9);
+            print(xs.len());
+            print(acc[0].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn filter_does_not_share_elements_with_its_receiver() {
+    // A20: `filter` pushes the loop element straight through.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs: List<List<i32>> = List::new();
+            xs.push([1, 2]);
+            mut kept = xs.filter(|c| true);
+            kept[0].push(9);
+            print(xs[0].len());
+            print(kept[0].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn reverse_does_not_share_elements_with_its_receiver() {
+    // A20's record claimed `reverse` "happens not to alias" because it rebuilds
+    // through `push`. It does alias: rebuilding through `push` copies the SPINE
+    // only, and `self[index]` hands the element over uncopied.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs: List<List<i32>> = List::new();
+            xs.push([1, 2]);
+            xs.push([3]);
+            mut flipped = xs.reverse();
+            flipped[1].push(9);
+            print(xs[0].len());
+            print(flipped[1].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn sort_by_does_not_share_elements_with_its_receiver() {
+    // A20: the intrinsic is `list.slice().sort(cmp)` — a new spine over the
+    // same elements.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        struct Cell { n: i32 }
+        fun main() {
+            mut cells: List<Cell> = List::new();
+            cells.push(Cell { n = 5 });
+            mut sorted = cells.sort_by(|a, b| a.n.compare(b.n));
+            sorted[0].n = 99;
+            print(cells[0].n);
+            print(sorted[0].n);
+        }
+        "#,
+        "5\n99\n",
+    );
+}
+
+#[test]
+fn map_does_not_share_elements_with_its_receiver() {
+    // A20's fourth method, and the one the STORE rule alone does not reach:
+    // `map` pushes `fn(item)`, a call result, which the elision framework
+    // assumes is owned. It is not owned when the closure returns a place it
+    // borrowed — so the copy lands at the closure's RETURN.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs: List<List<i32>> = List::new();
+            xs.push([1, 2]);
+            mut mapped = xs.map(|c| c);
+            mapped[0].push(9);
+            print(xs[0].len());
+            print(mapped[0].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_list_method_chain_does_not_share_elements() {
+    // The composed case: every hop of `map(...).filter(...)` has to hold.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs: List<List<i32>> = List::new();
+            xs.push([1, 2]);
+            mut out = xs.map(|c| c).filter(|c| true);
+            out[0].push(9);
+            print(xs[0].len());
+            print(out[0].len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_returned_parameter_place_does_not_alias_the_caller() {
+    // "Calls own their result" is the assumption every copy elision rests on
+    // (`compute_clone_sites`' own doc comment). A function returning a
+    // by-value parameter broke it outright: the caller's binding skipped its
+    // copy because the initializer was a call, and the call handed back the
+    // caller's own storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun identity(c: List<i32>): List<i32> { c }
+        fun main() {
+            mut xs = [1, 2];
+            mut got = identity(xs);
+            got.push(9);
+            print(xs.len());
+            print(got.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_of_a_parameter_does_not_alias_the_caller() {
+    // The projecting getter — the shape that makes `map`'s closure leak.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        fun items_of(holder: Holder): List<i32> { holder.items }
+        fun main() {
+            mut holder = Holder { items = [1, 2] };
+            mut got = items_of(holder);
+            got.push(9);
+            print(holder.items.len());
+            print(got.len());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_returned_local_still_moves() {
+    // The elision the return rule must NOT eat: a function's own local is a
+    // dead owner at the tail, so it donates its storage rather than copying.
+    // Behaviour is identical either way — `copy-elision.js`/`list-methods.js`
+    // pin the absence of `__clone` in bytes — so this only guards the output.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun build(): List<List<i32>> {
+            mut result: List<List<i32>> = List::new();
+            result.push([1, 2]);
+            result
+        }
+        fun main() {
+            mut built = build();
+            built[0].push(9);
+            print(built[0].len());
+        }
+        "#,
+        "3\n",
+    );
+}
+
 #[test]
 fn a_guard_that_lifts_emits_its_temporary() {
     // B59, the `?` shape: the lift compiles to a temp plus an `if` over the

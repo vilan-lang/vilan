@@ -1,0 +1,112 @@
+// B54 / A20 (rule 1 at the STORE and RETURN seams) — this golden pins the
+// emitted SHAPES in BYTES. See proposal/element-clones.md.
+//
+// `hold_*` are the four construction seams (B54): a place read into a list
+// element, a tuple element, a struct field, or a variant payload installs its
+// value in a slot of an aggregate that outlives the literal, so it binds WITH
+// `__clone`.
+//
+// `donate` is the MOVE elision on the same seams: every source there is a local
+// read exactly once, a dead owner, so the construction takes its storage and
+// NOT ONE `__clone` is emitted. That absence is the pin — it is what keeps a
+// build-once-and-hand-off path free.
+//
+// `keep_scalars` keeps the type filter honest: `i32` elements never reach the
+// copy question at all.
+//
+// `first_of` is the RETURN seam: it hands back a by-value parameter, which the
+// caller would otherwise alias, so the tail copies. `own_through` is the same
+// tail through an `own` parameter — the callee owns that one, so it moves.
+//
+// `elements_are_independent` drives the three list-producing methods whose
+// results used to share the receiver's elements; the copies live inside std
+// (`push`'s `own item`, `sort_by`'s `own self`), so what this pins here is the
+// OUTPUT.
+import std::io::print;
+import std::compare::Ordering;
+import std::option::Option::{ self, Some, None };
+
+struct Holder { items: List<i32> }
+
+struct Cell { n: i32 }
+
+fun hold_in_list(items: List<i32>): List<List<i32>> {
+	[items]
+}
+
+fun hold_in_tuple(items: List<i32>): (List<i32>, i32) {
+	(items, 1)
+}
+
+fun hold_in_struct(items: List<i32>): Holder {
+	Holder { items }
+}
+
+fun hold_in_variant(items: List<i32>): Option<List<i32>> {
+	Some(items)
+}
+
+fun donate(): List<List<i32>> {
+	let first = [1, 2];
+	let second = [3];
+	[first, second]
+}
+
+fun keep_scalars(a: i32, b: i32): (i32, i32) {
+	(a, b)
+}
+
+fun first_of(primary: List<i32>, fallback: List<i32>): List<i32> {
+	if primary.len() > 0 { primary } else { fallback }
+}
+
+fun own_through(own items: List<i32>): List<i32> {
+	items
+}
+
+fun elements_are_independent() {
+	mut rows: List<List<i32>> = List::new();
+	rows.push([1, 2]);
+	mut kept = rows.filter(|row| true);
+	kept[0].push(9);
+	print(rows[0].len());
+	mut flipped = rows.reverse();
+	flipped[0].push(9);
+	print(rows[0].len());
+	mut mapped = rows.map(|row| row);
+	mapped[0].push(9);
+	print(rows[0].len());
+	mut cells: List<Cell> = List::new();
+	cells.push(Cell { n = 5 });
+	mut sorted = cells.sort_by(|a, b| a.n.compare(b.n));
+	sorted[0].n = 99;
+	print(cells[0].n);
+}
+
+fun main() {
+	mut source = [1, 2];
+	mut listed = hold_in_list(source);
+	listed[0].push(9);
+	print(source.len());
+	mut tupled = hold_in_tuple(source);
+	tupled.0.push(9);
+	print(source.len());
+	mut held = hold_in_struct(source);
+	held.items.push(9);
+	print(source.len());
+	mut wrapped = hold_in_variant(source);
+	source.push(9);
+	match wrapped {
+		Some(let inner) => print(inner.len()),
+		None => print(0),
+	}
+	print(donate().len());
+	print(keep_scalars(4, 6).0);
+	mut chosen = first_of(source, [7]);
+	chosen.push(9);
+	print(source.len());
+	mut owned = own_through([1, 2]);
+	owned.push(9);
+	print(owned.len());
+	elements_are_independent();
+}

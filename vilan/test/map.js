@@ -24,7 +24,7 @@ function $a() {
 	return [ table ];
 }
 function $b(self, key2, value2) {
-	self[0].set(hash(key2), [ key2, value2 ]);
+	self[0].set(hash(key2), [ __clone(key2), __clone(value2) ]);
 }
 function $c(self) {
 	return self[0].size;
@@ -37,7 +37,7 @@ function $e(self, key2) {
 	let $g = null;
 	if ($f[0] === 0) {
 		const entry = $f[1];
-		$g = [ 0, entry[1] ];
+		$g = [ 0, __clone(entry[1]) ];
 	} else {
 		$g = [ 1 ];
 	}
@@ -50,7 +50,7 @@ function $h(self, fallback) {
 		const x = __clone($i[1]);
 		$j = x;
 	} else {
-		$j = fallback;
+		$j = __clone(fallback);
 	}
 	return $j;
 }
@@ -69,14 +69,14 @@ function $o() {
 	return [ table ];
 }
 function $p(self, key2, value2) {
-	self[0].set(hash2(key2), [ key2, value2 ]);
+	self[0].set(hash2(key2), [ __clone(key2), __clone(value2) ]);
 }
 function $q(self, key2) {
 	const $r = __map_get(self[0], hash2(key2));
 	let $s = null;
 	if ($r[0] === 0) {
 		const entry = $r[1];
-		$s = [ 0, entry[1] ];
+		$s = [ 0, __clone(entry[1]) ];
 	} else {
 		$s = [ 1 ];
 	}
@@ -89,21 +89,21 @@ function $t(self, fallback) {
 		const x = __clone($u[1]);
 		$v = x;
 	} else {
-		$v = fallback;
+		$v = __clone(fallback);
 	}
 	return $v;
 }
 function $w(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(entry[0]);
+		result.push(__clone(entry[0]));
 	}
 	return result;
 }
 function $x(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(entry[1]);
+		result.push(__clone(entry[1]));
 	}
 	return result;
 }

@@ -2,6 +2,12 @@ function __at(list, index) {
 	if (index >= 0 && index < list.length) return list[index];
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __json_tag(value) {
 	return typeof value === "string" ? value : Object.keys(value)[0];
 }
@@ -171,7 +177,7 @@ function bool_value(self, value2) {
 	write_byte(self, $ac);
 }
 function new3(bytes) {
-	return [ bytes, __shared_new(0), __shared_new([ 1 ]) ];
+	return [ __clone(bytes), __shared_new(0), __shared_new([ 1 ]) ];
 }
 function ok(self) {
 	const $af = self[2].v;
@@ -536,7 +542,7 @@ function bool_value3(self, value2) {
 }
 function new5(root) {
 	const stack = __shared_new([  ]);
-	stack.v.push(root);
+	stack.v.push(__clone(root));
 	return [ stack, __shared_new([ 1 ]) ];
 }
 function ok2(self) {
@@ -652,7 +658,7 @@ function begin_list4(self) {
 		const elements = subject;
 		let index = elements.length - 1;
 		while (index >= 0) {
-			self[0].v.push(__at(elements, index));
+			self[0].v.push(__clone(__at(elements, index)));
 			index = index - 1;
 		}
 		$E = elements.length;
@@ -682,12 +688,12 @@ function begin_variant4(self, name, arity) {
 			const payload = subject[name];
 			let $G = null;
 			if (arity === 1) {
-				self[0].v.push(payload);
+				self[0].v.push(__clone(payload));
 			} else {
 				const elements = payload;
 				let index = elements.length - 1;
 				while (index >= 0) {
-					self[0].v.push(__at(elements, index));
+					self[0].v.push(__clone(__at(elements, index)));
 					index = index - 1;
 				}
 				$G = undefined;

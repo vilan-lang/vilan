@@ -6,6 +6,12 @@ function __at_put(list, index, value) {
 	if (index >= 0 && index < list.length) return list[index] = value;
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
@@ -17,12 +23,12 @@ function $a(self, index, value) {
 		})();
 	}
 	if (index === length) {
-		self.push(value);
+		self.push(__clone(value));
 	} else {
-		self.push(__at(self, length - 1));
+		self.push(__clone(__at(self, length - 1)));
 		let cursor = length - 1;
 		while (cursor > index) {
-			__at_put(self, cursor, __at(self, cursor - 1));
+			__at_put(self, cursor, __clone(__at(self, cursor - 1)));
 			cursor = cursor - 1;
 		}
 		__at_put(self, index, value);
@@ -35,10 +41,10 @@ function $b(self, index) {
 			throw "index out of bounds: the length is " + length + " but the index is " + index;
 		})();
 	}
-	const removed = __at(self, index);
+	const removed = __clone(__at(self, index));
 	let cursor = index;
 	while (cursor < length - 1) {
-		__at_put(self, cursor, __at(self, cursor + 1));
+		__at_put(self, cursor, __clone(__at(self, cursor + 1)));
 		cursor = cursor + 1;
 	}
 	__list_pop(self);

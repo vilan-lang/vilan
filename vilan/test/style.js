@@ -43,19 +43,19 @@ function add(self, b) {
 		}
 		$h;
 	}
-	return [ rules ];
+	return [ __clone(rules) ];
 }
 function $a(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(entry[1]);
+		result.push(__clone(entry[1]));
 	}
 	return result;
 }
 function $c(self) {
 	let result = [  ];
 	for (const entry of __map_values(self[0])) {
-		result.push(entry[0]);
+		result.push(__clone(entry[0]));
 	}
 	return result;
 }
@@ -64,14 +64,14 @@ function $d(self, key) {
 	let $f = null;
 	if ($e[0] === 0) {
 		const entry = $e[1];
-		$f = [ 0, entry[1] ];
+		$f = [ 0, __clone(entry[1]) ];
 	} else {
 		$f = [ 1 ];
 	}
 	return $f;
 }
 function $i(self, key, value) {
-	self[0].set(hash(key), [ key, value ]);
+	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
 const card = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];
 const active = [ [ new Map([ [ "::padding", [ "::padding", [ "s1ufvsw", "padding:var(--space-6)" ] ] ] ]) ] ];

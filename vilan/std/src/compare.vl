@@ -77,7 +77,12 @@ impl List<type T> {
 	/// relates to its second. STABLE: elements the comparator calls `Equal`
 	/// keep their input order (an intrinsic over the host's `Array.sort`, which
 	/// ECMA-262 has guaranteed stable since ES2019).
-	external fun sort_by(self, compare: |T, T| Ordering): List<T>;
+	///
+	/// `own self` because the result is built from the receiver's ELEMENTS: the
+	/// intrinsic reorders a copied spine, so without owning them the two lists
+	/// would share element storage (rule 1, A20). A receiver that is dead at the
+	/// call donates instead of copying.
+	external fun sort_by(own self, compare: |T, T| Ordering): List<T>;
 }
 
 impl List<type T: Ord> {

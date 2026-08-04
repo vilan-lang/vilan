@@ -40,7 +40,7 @@ function enqueue(turn, subscribers) {
 			}
 		}
 		if (!(seen)) {
-			turn[0].v.push(subscriber);
+			turn[0].v.push(__clone(subscriber));
 		}
 	}
 	if (turn[2].v && !(turn[3].v) && !(turn[1].v)) {
@@ -55,7 +55,7 @@ function enqueue(turn, subscribers) {
 function drain(turn) {
 	if (!(turn[1].v)) {
 		turn[1].v = true;
-		draining_turns.v.push(turn);
+		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
 		while (!($h(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;
@@ -73,7 +73,7 @@ function dispose(self, $J) {
 	let kept = [  ];
 	for (const subscriber of self[0].v) {
 		if (subscriber[0] !== self[1]) {
-			kept.push(subscriber);
+			kept.push(__clone(subscriber));
 		}
 	}
 	self[0].v = kept;
@@ -84,7 +84,7 @@ function dispose(self, $J) {
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== self[1]) {
-				kept_pending.push(subscriber2);
+				kept_pending.push(__clone(subscriber2));
 			}
 		}
 		turn[0].v = kept_pending;
@@ -141,7 +141,7 @@ function $m(value) {
 	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $n(self, key, value) {
-	self[0].set(hash(key), [ key, value ]);
+	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
 function $p(self, $e) {
 	const $q = $e;
@@ -229,7 +229,7 @@ function $H(self, item, $I) {
 		dispose(item, $I);
 		return;
 	});
-	return item;
+	return __clone(item);
 }
 function $N(self, $e) {
 	const $O = $e;

@@ -18,6 +18,11 @@
 //
 // `sum_over` keeps the scalar case honest — an `i32` capture is not a cloneable
 // aggregate at all, so it never reaches the elisions.
+//
+// B54 note: the `fallback` legs of `first_or`/`first_or_guarded` also copy now,
+// and for a reason that is NOT about captures — `fallback` is a by-value
+// parameter the function hands back, which rule 1's return clause copies
+// (proposal/element-clones.md §3). B53 closed that leak for captures only.
 import std::io::print;
 import std::option::Option::{ self, Some, None };
 

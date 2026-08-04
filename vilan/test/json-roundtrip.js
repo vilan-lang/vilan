@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __json_kind(value) {
 	if (value === null) return "null";
 	if (Array.isArray(value)) return "array";
@@ -94,7 +100,7 @@ function $d(value) {
 		}
 		result.push($g[1]);
 	}
-	return [ 0, result ];
+	return [ 0, __clone(result) ];
 }
 function $a(text) {
 	const $b = __try_parse_json(text);
@@ -159,9 +165,9 @@ function $u(self, err) {
 	let $w = null;
 	if ($v[0] === 0) {
 		const x = $v[1];
-		$w = [ 0, x ];
+		$w = [ 0, __clone(x) ];
 	} else {
-		$w = [ 1, err ];
+		$w = [ 1, __clone(err) ];
 	}
 	return $w;
 }
@@ -179,7 +185,7 @@ function $D(value) {
 		}
 		result.push($F[1]);
 	}
-	return [ 0, result ];
+	return [ 0, __clone(result) ];
 }
 function $H(value) {
 	let $I = null;
@@ -231,7 +237,7 @@ function $T(value) {
 		}
 		result.push($V[1]);
 	}
-	return [ 0, result ];
+	return [ 0, __clone(result) ];
 }
 function $Q(text) {
 	const $R = __try_parse_json(text);

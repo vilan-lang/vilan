@@ -15,7 +15,7 @@ function $a(self, fn) {
 		$c = [ 0, fn(x) ];
 	} else {
 		const e = $b[1];
-		$c = [ 1, e ];
+		$c = [ 1, __clone(e) ];
 	}
 	return $c;
 }
@@ -26,7 +26,7 @@ function $d(self, fallback) {
 		const x = __clone($e[1]);
 		$f = x;
 	} else {
-		$f = fallback;
+		$f = __clone(fallback);
 	}
 	return $f;
 }
@@ -35,7 +35,7 @@ function $g(self, fn) {
 	let $i = null;
 	if ($h[0] === 0) {
 		const x = $h[1];
-		$i = [ 0, x ];
+		$i = [ 0, __clone(x) ];
 	} else {
 		const e = $h[1];
 		$i = [ 1, fn(e) ];
@@ -72,7 +72,7 @@ function $p(self, fn) {
 		$r = fn(x);
 	} else {
 		const e = $q[1];
-		$r = [ 1, e ];
+		$r = [ 1, __clone(e) ];
 	}
 	return $r;
 }
@@ -81,7 +81,7 @@ function $s(self, fn) {
 	let $u = null;
 	if ($t[0] === 0) {
 		const x = $t[1];
-		$u = [ 0, x ];
+		$u = [ 0, __clone(x) ];
 	} else {
 		const e = $t[1];
 		$u = fn(e);
@@ -95,7 +95,7 @@ function $v(self, fallback) {
 		const x = __clone($w[1]);
 		$x = x;
 	} else {
-		$x = fallback;
+		$x = __clone(fallback);
 	}
 	return $x;
 }
@@ -116,7 +116,7 @@ function $B(self) {
 	let $D = null;
 	if ($C[0] === 0) {
 		const x = $C[1];
-		$D = [ 0, x ];
+		$D = [ 0, __clone(x) ];
 	} else {
 		$D = [ 1 ];
 	}
@@ -131,7 +131,7 @@ function $G(self) {
 	let $I = null;
 	if ($H[0] === 1) {
 		const e = $H[1];
-		$I = [ 0, e ];
+		$I = [ 0, __clone(e) ];
 	} else {
 		$I = [ 1 ];
 	}
@@ -144,7 +144,7 @@ function $J(self, fallback) {
 		const x = __clone($K[1]);
 		$L = x;
 	} else {
-		$L = fallback;
+		$L = __clone(fallback);
 	}
 	return $L;
 }
@@ -166,7 +166,7 @@ function $P(self, b) {
 		$R = b;
 	} else {
 		const e = $Q[1];
-		$R = [ 1, e ];
+		$R = [ 1, __clone(e) ];
 	}
 	return $R;
 }
@@ -177,7 +177,7 @@ function $S(self, fallback) {
 		const x = __clone($T[1]);
 		$U = x;
 	} else {
-		$U = fallback;
+		$U = __clone(fallback);
 	}
 	return $U;
 }
@@ -186,7 +186,7 @@ function $V(self, b) {
 	let $X = null;
 	if ($W[0] === 0) {
 		const x = $W[1];
-		$X = [ 0, x ];
+		$X = [ 0, __clone(x) ];
 	} else {
 		$X = b;
 	}
@@ -199,7 +199,7 @@ function $Y(self, fallback) {
 		const x = __clone($Z[1]);
 		$aa = x;
 	} else {
-		$aa = fallback;
+		$aa = __clone(fallback);
 	}
 	return $aa;
 }
@@ -208,12 +208,12 @@ function $ab(self) {
 	let $ad = null;
 	if ($ac[0] === 0 && $ac[1][0] === 0) {
 		const x = $ac[1][1];
-		$ad = [ 0, [ 0, x ] ];
+		$ad = [ 0, [ 0, __clone(x) ] ];
 	} else if ($ac[0] === 0 && $ac[1][0] === 1) {
 		$ad = [ 1 ];
 	} else {
 		const e = $ac[1];
-		$ad = [ 0, [ 1, e ] ];
+		$ad = [ 0, [ 1, __clone(e) ] ];
 	}
 	return $ad;
 }

@@ -22,7 +22,7 @@ function set_attribute(attributes, name2, value) {
 			updated.push([ name2, value ]);
 			found = true;
 		} else {
-			updated.push(attribute);
+			updated.push(__clone(attribute));
 		}
 	}
 	if (!(found)) {
@@ -31,7 +31,7 @@ function set_attribute(attributes, name2, value) {
 	attributes.v = updated;
 }
 function place(self, parent) {
-	parent[2].v.push([ 0, self ]);
+	parent[2].v.push([ 0, __clone(self) ]);
 }
 function place2(self, parent) {
 	parent[2].v.push([ 1, self ]);
@@ -123,23 +123,23 @@ function $c(self) {
 }
 function $b(self, name2, value) {
 	apply2(value, self, name2);
-	return self;
+	return __clone(self);
 }
 function $d(self, name2, value) {
 	apply(value, self, name2);
-	return self;
+	return __clone(self);
 }
 function $e(self, content) {
 	place2(content, self);
-	return self;
+	return __clone(self);
 }
 function $f(self, content) {
 	place(content, self);
-	return self;
+	return __clone(self);
 }
 function $g(self, content) {
 	place3(content, self);
-	return self;
+	return __clone(self);
 }
 const name = $a("world & <you>");
 console.log(render($g($e($f($e($d($b(view("p"), "data-live", name), "title", "hi"), "Take "), $e(view("code"), "vilan upgrade")), " & enjoy. "), name)));

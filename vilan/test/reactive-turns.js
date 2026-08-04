@@ -59,7 +59,7 @@ function enqueue(turn, subscribers) {
 			}
 		}
 		if (!(seen)) {
-			turn[0].v.push(subscriber);
+			turn[0].v.push(__clone(subscriber));
 		}
 	}
 	if (turn[2].v && !(turn[3].v) && !(turn[1].v)) {
@@ -74,7 +74,7 @@ function enqueue(turn, subscribers) {
 function drain(turn) {
 	if (!(turn[1].v)) {
 		turn[1].v = true;
-		draining_turns.v.push(turn);
+		draining_turns.v.push(__clone(turn));
 		let budget = 100000;
 		while (!($k(turn[0].v)) && budget > 0) {
 			const wave = turn[0].v;

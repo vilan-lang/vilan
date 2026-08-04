@@ -11,7 +11,7 @@ annotation (`let xs: List<str> = [];`).
 ```vilan,fragment
 impl List<type T> {
 	fun new(): List<T>
-	fun push(&mut self, item: T)
+	fun push(&mut self, own item: T)
 	fun pop(&mut self): Option<T>
 	fun insert(&mut self, index: i32, value: T)   // panics out of bounds
 	fun remove(&mut self, index: i32): T          // panics out of bounds
@@ -26,7 +26,7 @@ impl List<type T> {
 	fun fold<B>(self, init: B, fn: |B, T| B): B
 	fun for_each(self, fn: |T| void)
 	fun reverse(self): List<T>
-	fun sort_by(self, compare: |T, T| Ordering): List<T>   // stable
+	fun sort_by(own self, compare: |T, T| Ordering): List<T>   // stable
 }
 impl List<type T: Add + Default> { fun sum(self): T }
 impl List<type T: Mul + Default> { fun product(self): T }
@@ -45,6 +45,13 @@ Indexing is `list[i]`; iterate with `for item in list` (copies) or
 The methods that take `self` by value are pure — they return a new list and
 leave the receiver alone. The mutating ones take `&mut self`: `push`, `pop`,
 `insert`, `remove`.
+
+"Leave the receiver alone" reaches the ELEMENTS, not just the spine: the list a
+pure method returns never shares element storage with the receiver, so writing
+through `xs.map(f)[0]` cannot show up in `xs[0]`. That is rule 1 (a value is
+copied when it is stored), and it is why `push` and `sort_by` are written `own`
+— they keep what they are given. A fresh value costs nothing there: `own` copies
+a *place*, and a value with no other owner moves in.
 
 ```vilan
 import std::print;

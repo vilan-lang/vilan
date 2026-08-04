@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function compare(self, b) {
 	let $h = null;
 	if (self < b) {
@@ -88,9 +94,9 @@ function $f(a, b) {
 function $k(a, b) {
 	let $l = null;
 	if (a <= b) {
-		$l = [ a, b ];
+		$l = [ __clone(a), __clone(b) ];
 	} else {
-		$l = [ b, a ];
+		$l = [ __clone(b), __clone(a) ];
 	}
 	return $l;
 }
