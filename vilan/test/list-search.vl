@@ -1,0 +1,21 @@
+import std::print;
+
+fun main() {
+	let xs = [10, 20, 30, 20];
+
+	print(xs.find(|n| n > 15).unwrap_or(0));   // 20 (the first, not the last)
+	print(xs.find(|n| n > 90).is_none());      // true
+	print(xs.contains(20));                    // true
+	print(xs.contains(25));                    // false
+	print(xs.index_of(20).unwrap_or(-1));      // 1
+	print(xs.index_of(99).is_none());          // true
+
+	let words = ["alpha", "beta"];
+	print(words.contains("beta"));             // true
+	print(words.index_of("alpha").unwrap_or(-1)); // 0
+
+	mut empty: List<i32> = [];
+	print(empty.find(|n| n > 0).is_none());    // true
+	print(empty.contains(1));                  // false
+	print(empty.index_of(1).is_none());        // true
+}

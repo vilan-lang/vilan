@@ -344,6 +344,14 @@ fn helper_source(name: &str) -> &'static str {
         "__list_pop" => {
             "function __list_pop(list) {\n\treturn list.length === 0 ? [ 1 ] : [ 0, list.pop() ];\n}"
         }
+        // `List.sort_by(cmp): List<T>` — a new list, so the sort runs on a copy
+        // and the receiver survives (`sort_by` takes `self` by value, like
+        // `map`/`filter`). `Ordering` lowers to -1/0/1, which IS the comparator
+        // contract, so the vilan closure is passed straight through. Stability
+        // comes from the host: ECMA-262 has required a stable `sort` since ES2019.
+        "__list_sort_by" => {
+            "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
+        }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
         // in place so the caller's binding sees the change. `[0, v]` -> the slot
@@ -3475,6 +3483,13 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            Intrinsic::ListSortBy => {
+                self.used_helpers.insert("__list_sort_by");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__list_sort_by".to_string())),
+                    args.collect(),
+                )
+            }
             // `opt.take()` / `opt.replace(v)` (destruction.md §6): the receiver is
             // the `&mut self` slot (a JS array, mutated in place so the caller's
             // binding sees the change). Each snapshots the old contents, rewrites
@@ -5572,6 +5587,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__shared_new",
     "__list_get",
     "__list_pop",
+    "__list_sort_by",
     "__option_take",
     "__option_replace",
     "__map_get",

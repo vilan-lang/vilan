@@ -980,6 +980,45 @@ impl Interpreter {
                     None => Ok(option_none()),
                 }
             }
+            // `List.sort_by(cmp)` — the JS side is `list.slice().sort(compare)`,
+            // whose stability ECMA-262 guarantees. `Vec::sort_by` cannot host the
+            // comparator (it is `&mut self` and fallible), so this is an explicit
+            // bottom-up merge sort, which is stable by construction: on a tie the
+            // LEFT run's element goes first.
+            "__list_sort_by" => {
+                let list = expect_array(&take(0))?;
+                let comparator = take(1);
+                let mut values: Vec<Value<'a>> = list.borrow().clone();
+                let mut width = 1;
+                while width < values.len() {
+                    let mut merged: Vec<Value<'a>> = Vec::with_capacity(values.len());
+                    let mut start = 0;
+                    while start < values.len() {
+                        let middle = (start + width).min(values.len());
+                        let end = (start + 2 * width).min(values.len());
+                        let (mut left, mut right) = (start, middle);
+                        while left < middle && right < end {
+                            let ordering = expect_number(&self.call_value(
+                                &comparator,
+                                vec![values[left].clone(), values[right].clone()],
+                            )?)?;
+                            if ordering <= 0.0 {
+                                merged.push(values[left].clone());
+                                left += 1;
+                            } else {
+                                merged.push(values[right].clone());
+                                right += 1;
+                            }
+                        }
+                        merged.extend(values[left..middle].iter().cloned());
+                        merged.extend(values[right..end].iter().cloned());
+                        start = end;
+                    }
+                    values = merged;
+                    width *= 2;
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
             // `Option.take` / `Option.replace` (destruction.md §6): snapshot the
             // slot (a structural copy — the payload MOVES out), then rewrite it in
             // place to `None` / `Some(value)`. Mirrors `__option_take` /

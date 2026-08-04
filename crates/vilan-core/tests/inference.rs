@@ -30039,3 +30039,509 @@ fn an_entry_global_does_not_satisfy_a_std_import_path() {
         "#,
     );
 }
+
+// --- I4: the std surface batch (proposal/std-surface.md) ---------------------
+//
+// The ranked gap list's v1 cut: `List`'s search (`find`/`contains`/`index_of`),
+// order (`reverse`/`sort`/`sort_by`), splice (`insert`/`remove`) and `join`
+// methods, plus `f64`/`f32.clamp`. Placement is part of the contract — every
+// method below except `join` must resolve from a program that imports nothing
+// but `print` (`the_std_surface_batch_needs_no_import` pins that), and `join`'s
+// `Display` bound forces it into `display.vl`, which the steering diagnostic
+// further down covers.
+
+#[test]
+fn list_find_returns_the_first_match() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [3, 8, 5, 9];
+            print(xs.find(|n| n > 4).unwrap_or(0));   // 8 — first, not last
+            print(xs.find(|n| n > 90).is_none());     // true
+            mut empty: List<i32> = [];
+            print(empty.find(|n| n > 0).is_none());   // true
+        }
+        "#,
+        "8\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn list_find_short_circuits_at_the_first_match() {
+    // The hand-rolled shape it replaces (proposal/std-surface.md §2.2) had no
+    // short-circuit; this one does, and the visit count proves it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [1, 2, 3, 4];
+            mut visits = 0;
+            let found = xs.find(|n| { visits += 1; n > 1 });
+            print(found.unwrap_or(0));  // 2
+            print(visits);              // 2 — stopped, did not walk 3 and 4
+        }
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn list_contains_and_index_of_compare_by_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [10, 20, 30, 20];
+            print(xs.contains(20));                 // true
+            print(xs.contains(25));                 // false
+            print(xs.index_of(20).unwrap_or(-1));   // 1 — the first
+            print(xs.index_of(30).unwrap_or(-1));   // 2
+            print(xs.index_of(99).is_none());       // true
+            let words = ["a", "b"];
+            print(words.contains("b"));             // true
+        }
+        "#,
+        "true\nfalse\n1\n2\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn list_reverse_returns_a_new_list() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [1, 2, 3];
+            let ys = xs.reverse();
+            print(ys[0]);       // 3
+            print(ys[2]);       // 1
+            print(xs[0]);       // 1 — the receiver is untouched
+            mut empty: List<i32> = [];
+            print(empty.reverse().len());  // 0
+        }
+        "#,
+        "3\n1\n1\n0\n",
+    );
+}
+
+#[test]
+fn list_sort_orders_by_ord() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [3, 1, 2];
+            let sorted = xs.sort();
+            print(sorted[0]);
+            print(sorted[1]);
+            print(sorted[2]);
+            print(xs[0]);       // 3 — the receiver is untouched
+            let words = ["pear", "apple", "fig"];
+            print(words.sort()[0]);   // apple — `str` is `Ord`
+        }
+        "#,
+        "1\n2\n3\n3\napple\n",
+    );
+}
+
+#[test]
+fn list_sort_is_not_a_lexicographic_string_sort() {
+    // The native `Array.prototype.sort` defaults to comparing STRINGIFIED
+    // elements, which would order these 1, 10, 2. `sort` passes `Ord::compare`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let sorted = [10, 2, 1].sort();
+            print(sorted[0]);
+            print(sorted[1]);
+            print(sorted[2]);
+        }
+        "#,
+        "1\n2\n10\n",
+    );
+}
+
+#[test]
+fn list_sort_by_uses_the_comparator() {
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, compare::Ordering };
+        fun main() {
+            let xs = [3, 1, 2];
+            let descending = xs.sort_by(|a, b| {
+                if a > b { Ordering::Less } else {
+                    if a < b { Ordering::Greater } else { Ordering::Equal }
+                }
+            });
+            print(descending[0]);
+            print(descending[1]);
+            print(descending[2]);
+            print(xs[0]);   // 3 — the receiver is untouched
+        }
+        "#,
+        "3\n2\n1\n3\n",
+    );
+}
+
+#[test]
+fn list_sort_by_is_stable() {
+    // proposal/std-surface.md §3.1: stability is a hard requirement, inherited
+    // from ECMA-262's stable `Array.prototype.sort` (ES2019). Two elements per
+    // key, distinct secondary data — equal keys must keep their input order.
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, compare::Ordering };
+        struct Item {
+            key: i32,
+            tag: str,
+        }
+        fun main() {
+            mut xs: List<Item> = [];
+            xs.push(Item { key = 1, tag = "a" });
+            xs.push(Item { key = 0, tag = "b" });
+            xs.push(Item { key = 1, tag = "c" });
+            xs.push(Item { key = 0, tag = "d" });
+            mut out = "";
+            for item in xs.sort_by(|a, b| a.key.compare(b.key)) {
+                out = out + item.tag;
+            }
+            print(out);   // bdac — not badc, not bdca
+        }
+        "#,
+        "bdac\n",
+    );
+}
+
+#[test]
+fn list_insert_shifts_the_tail_and_appends_at_len() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2, 4];
+            xs.insert(2, 3);
+            print(xs.len());   // 4
+            print(xs[1]);      // 2
+            print(xs[2]);      // 3
+            print(xs[3]);      // 4
+            xs.insert(4, 5);   // index == len is legal: an append
+            print(xs[4]);      // 5
+            xs.insert(0, 0);
+            print(xs[0]);      // 0
+            print(xs.len());   // 6
+        }
+        "#,
+        "4\n2\n3\n4\n5\n0\n6\n",
+    );
+}
+
+#[test]
+fn list_remove_returns_the_element_and_closes_the_gap() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [1, 2, 3];
+            print(xs.remove(1));   // 2
+            print(xs.len());       // 2
+            print(xs[0]);          // 1
+            print(xs[1]);          // 3
+            print(xs.remove(1));   // 3 — the last element
+            print(xs.len());       // 1
+        }
+        "#,
+        "2\n2\n1\n3\n3\n1\n",
+    );
+}
+
+#[test]
+fn list_remove_out_of_bounds_panics_like_the_subscript() {
+    // proposal/std-surface.md §3.2: `remove`/`insert` follow `[]`'s panic, not
+    // `get`'s `Option` — a bad INDEX is a caller bug, and the wording is `[]`'s.
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs = [1, 2, 3];
+            xs.remove(5);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 5",
+    );
+}
+
+#[test]
+fn list_remove_at_a_negative_index_panics() {
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs = [1, 2, 3];
+            xs.remove(-1);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is -1",
+    );
+}
+
+#[test]
+fn list_insert_past_len_panics() {
+    // `index == len` appends; `index > len` is the caller bug.
+    assert_run_panics(
+        r#"
+        fun main() {
+            mut xs = [1, 2, 3];
+            xs.insert(4, 9);
+        }
+        main();
+        "#,
+        "index out of bounds: the length is 3 but the index is 4",
+    );
+}
+
+#[test]
+fn list_join_renders_display_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, display::Display };
+        fun main() {
+            let words = ["alpha", "beta", "gamma"];
+            print(words.join(", "));
+            print([1, 2, 3].join("-"));
+            mut empty: List<str> = [];
+            print(empty.join(", ") == "");   // true
+            print(["solo"].join(", "));
+        }
+        "#,
+        "alpha, beta, gamma\n1-2-3\ntrue\nsolo\n",
+    );
+}
+
+#[test]
+fn list_join_renders_a_user_display_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, display::Display };
+        struct Tag {
+            name: str,
+        }
+        impl Tag with Display {
+            fun to_string(self): str {
+                i"<{self.name}>"
+            }
+        }
+        fun main() {
+            mut tags: List<Tag> = [];
+            tags.push(Tag { name = "red" });
+            tags.push(Tag { name = "blue" });
+            print(tags.join(" "));
+        }
+        "#,
+        "<red> <blue>\n",
+    );
+}
+
+#[test]
+fn floats_clamp_without_being_ord() {
+    // proposal/std-surface.md §1.4: `clamp` was `Ord`'s trait default, and the
+    // floats are deliberately not `Ord` (NaN), so they had none. Same recipe.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            print(5f.clamp(0f, 3f));      // 3
+            print((0f - 2f).clamp(0f, 3f)); // 0
+            print(1.5f.clamp(0f, 3f));    // 1.5
+            let wide = 5f.as_f32();
+            print(wide.clamp(0f.as_f32(), 3f.as_f32()));  // 3
+        }
+        "#,
+        "3\n0\n1.5\n3\n",
+    );
+}
+
+#[test]
+fn the_std_surface_batch_needs_no_import() {
+    // The placement contract (proposal/std-surface.md §1.1): a method's
+    // discoverability is decided by which std file it lives in. Everything in
+    // the batch except `join` sits in an always-loaded module, so a program
+    // that imports nothing but `print` reaches all of it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [3, 1, 2];
+            print(xs.reverse()[0]);
+            print(xs.sort()[0]);
+            print(xs.sort_by(|a, b| a.compare(b))[2]);
+            print(xs.contains(2));
+            print(xs.index_of(2).unwrap_or(-1));
+            print(xs.find(|n| n > 2).unwrap_or(0));
+            xs.insert(0, 9);
+            print(xs.remove(0));
+            print(5f.clamp(0f, 3f));
+        }
+        "#,
+        "2\n1\n3\ntrue\n2\n3\n9\n3\n",
+    );
+}
+
+// --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
+//
+// `display.vl` sits outside the always-loaded core set and outside its
+// transitive import closure, so `42.to_string()` fails with a bare "no method"
+// until the program names `Display`. The steer is a fourth appended hint at the
+// `MethodLookup::NoMethod` arm, backed by a std-wide index of trait-provided
+// method names built in the same lazy pass as the B4 import steer's.
+
+#[test]
+fn a_missing_to_string_steers_to_the_display_import() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() {
+            let x = 42;
+            print(x.to_string());
+        }
+        "#,
+        "to_string",
+        "i32 has no method 'to_string'; import std::display::Display to use it \
+         (`import std::display::Display;`)",
+    );
+}
+
+#[test]
+fn the_to_string_steer_covers_every_display_impl_subject() {
+    for (literal, type_name) in [
+        ("42", "i32"),
+        ("true", "bool"),
+        ("1.5f", "f64"),
+        ("7n", "BigInt"),
+    ] {
+        let source = format!(
+            r#"
+            fun main() {{
+                let value = {literal};
+                let _ = value.to_string();
+            }}
+            "#
+        );
+        let diagnostics = failure_diagnostics(&source);
+        assert!(
+            diagnostics.iter().any(|(message, _)| message
+                == &format!(
+                    "{type_name} has no method 'to_string'; import std::display::Display \
+                     to use it (`import std::display::Display;`)"
+                )),
+            "no steered diagnostic for {type_name}; got: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_join_miss_steers_to_the_display_import() {
+    // `join`'s `Display` bound forces it into `display.vl`, so a plain `List`
+    // program cannot see it — the steer is the mitigation the audit specified.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        fun main() {
+            let words = ["a", "b"];
+            print(words.join(", "));
+        }
+        "#,
+        "join",
+        "import std::display::Display to use it",
+    );
+}
+
+#[test]
+fn the_import_steer_does_not_survive_the_import() {
+    // B5's no-repetition spirit: once `Display` is imported the call resolves,
+    // so there is no diagnostic left to carry a hint.
+    assert_compiles_and_runs(
+        r#"
+        import std::{ print, display::Display };
+        fun main() {
+            print(42.to_string());
+        }
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a_method_no_std_trait_provides_carries_no_import_steer() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        fun main() {
+            let x = 42;
+            let _ = x.frobnicate();
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message == "i32 has no method 'frobnicate'"),
+        "expected the bare no-method error; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn the_import_steer_does_not_fire_for_a_user_type() {
+    // The index is keyed by the SUBJECT HEAD, so a user type that happens to
+    // miss a method std provides on some other type must stay unsteered.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Point {
+            x: i32,
+        }
+        fun main() {
+            let p = Point { x = 1 };
+            let _ = p.to_string();
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message == "Point has no method 'to_string'"),
+        "expected the bare no-method error; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_unsatisfied_bound_is_reported_as_a_bound_not_as_a_steered_miss() {
+    // Why the steer needs no "is that module already loaded?" guard: once
+    // `display` loads, `join` RESOLVES, so a `T` without `Display` fails on the
+    // BOUND, at the bound's own site — the "no method" arm is never reached and
+    // there is no diagnostic left to tell the reader to import what they have.
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::{ print, display::Display };
+        struct Opaque {
+            n: i32,
+        }
+        fun main() {
+            mut xs: List<Opaque> = [];
+            xs.push(Opaque { n = 1 });
+            print(xs.join(", "));
+        }
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("'Opaque' does not implement trait 'Display'")),
+        "expected the bound failure; got: {diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("has no method 'join'")),
+        "a loaded module's bounded impl must not read as a missing method; got: {diagnostics:#?}"
+    );
+}

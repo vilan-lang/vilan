@@ -1,0 +1,29 @@
+// `join` lives in `display.vl` beside the `Display` bound it needs, so — unlike
+// the rest of the `List` surface — it takes an import to reach. The analyzer
+// steers a bare `.join(..)` there ("no method 'join'; import
+// std::display::Display to use it").
+import std::{ print, display::Display };
+
+struct Tag {
+	name: str,
+}
+
+impl Tag with Display {
+	fun to_string(self): str {
+		i"<{self.name}>"
+	}
+}
+
+fun main() {
+	print(["alpha", "beta", "gamma"].join(", "));  // alpha, beta, gamma
+	print([1, 2, 3].join("-"));                    // 1-2-3
+	print(["solo"].join(", "));                    // solo
+
+	mut empty: List<str> = [];
+	print(empty.join(", ") == "");                 // true
+
+	mut tags: List<Tag> = [];
+	tags.push(Tag { name = "red" });
+	tags.push(Tag { name = "blue" });
+	print(tags.join(" "));                         // <red> <blue>
+}
