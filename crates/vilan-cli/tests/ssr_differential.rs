@@ -26,8 +26,12 @@
 //! Not exercised by THIS differential (all covered by the inference snapshot
 //! pins instead): `on_event` — present in both layers, but a handler that touches
 //! the event needs the browser-only `std::dom::Event`, so it is not part of a
-//! shared component; `style_var` — the stub no-ops `style.setProperty`, so its
-//! folded `style` attribute is not observable; `mount` — a client entry, not a view.
+//! shared component; `mount` — a client entry, not a view.
+//!
+//! `style_var` USED to be on that list, on the recorded ground that "the stub
+//! no-ops `style.setProperty`". It never did: `_upsertStyle` has folded the
+//! property into the `style` attribute since the first SSR commit, exactly the
+//! way the process twin folds it. It is in the shared component (A21).
 //!
 //! One assertion here is deliberately NOT a differential: the browser leg's
 //! second output line re-reads a `bind_styled` class after firing a click that
@@ -88,6 +92,7 @@ fun app(): View {
 	let compact = const style().padding(space(2));
 	let roomy = const style().padding(space(6));
 	let theme: Signal<Style> = Signal::new(compact);
+	let width = Signal::new("40px");
 	view("main")
 		.class("app")
 		.attr("id", "root")
@@ -104,6 +109,7 @@ fun app(): View {
 		.child(view("button").text("save").on("click", || query.set("x")))
 		.child(view("p").attr("id", "themed").bind_styled(theme).text("styled"))
 		.child(view("button").attr("id", "theme").text("theme").on("click", || theme.set(roomy)))
+		.child(view("p").attr("id", "sized").style_var("--w", width).text("sized"))
 		.child(view("svg")
 			.class("icon")
 			.attr("viewBox", "0 0 24 24")
@@ -336,6 +342,16 @@ fn ssr_process_render_matches_browser_dom_tree() {
     assert_eq!(
         styled_after_click, "AFTER s1ufvsw",
         "bind_styled did not re-set the class attribute after a signal write"
+    );
+    // `style_var` is INSIDE the differential (A21). The recorded reason it was
+    // not — "the DOM stub no-ops `style.setProperty`" — was never true of this
+    // stub: it has folded the property into the `style` attribute since the
+    // first SSR commit, exactly the way the process twin folds it. The equality
+    // above is the real assertion; this one keeps it from passing on two empty
+    // `style` attributes.
+    assert!(
+        server_markup.contains("<p id=\"sized\" style=\"--w:40px\">sized</p>"),
+        "style_var did not fold into the style attribute: {server_markup}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

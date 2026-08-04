@@ -65,7 +65,23 @@ Two verification by-products, filed rather than fixed here:
   is never handed to the ambient owner and outlives its boundary's disposal.
   Every sibling binder (`bind_text`, `bind_class`, `bind_attr`, `show`) uses
   `effect`. Not touched here — it is a reactive-ownership bug, not a styling
-  one, and it wants its own pin.
+  one, and it wants its own pin. **FIXED 2026-08-04 (A21)** — one line, the
+  `effect` every sibling uses; the SSR twin reads once and was already right.
+  Pinned in `tests/router.rs`, which already drove `swap` + disposal for
+  `bind_text`: the `style_var` page's signal is written from a button OUTSIDE
+  the swapped subtree, so the write lands well after the unmounting turn, and
+  the stub's `style.setProperty` now RECORDS instead of no-opping (it had
+  nothing to observe before). Red against the parked `let _sub`, and the only
+  assertion of the fourteen that moved.
+
+  Two corrections fell out. **`ssr.md`'s residue — "`style_var` sits outside
+  the SSR differential because the DOM stub no-ops `style.setProperty`" — was
+  never true**: that stub's `_upsertStyle` has folded the property into the
+  `style` attribute since the first SSR commit (`309e2bb`), exactly the way the
+  process twin folds it. `style_var` is in the shared component now, compared
+  byte-for-byte across both twins, non-vacuity planted. And the browser twin's
+  doc comment says what the convention is, so the next binder written by
+  copy-paste copies the right one.
 - **`view.class_name(..)` is vapor.** §2.3 and §4 below promise it for
   third-party CSS; the shipped method is `.class(..)`. The prose is corrected
   in place; no API is renamed.

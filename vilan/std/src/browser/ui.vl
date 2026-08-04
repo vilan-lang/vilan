@@ -141,10 +141,14 @@ impl View {
 
 	/// A signal-driven CSS custom property: pairs with
 	/// `width(Length::var("--w"))` in a style — dynamism through the variable,
-	/// never through runtime rule construction.
+	/// never through runtime rule construction. Registers with the nearest
+	/// enclosing boundary (an ambient `effect`), exactly like every `bind_*`:
+	/// a subscription parked in a `let _sub` outlives the view it writes to.
 	fun style_var(self, name: str, source: Signal<str>): View {
 		let element = self.element;
-		let _sub = source.sub(|value| element.set_style_property(name, value));
+		source.effect(|value| {
+			element.set_style_property(name, value);
+		});
 		self
 	}
 

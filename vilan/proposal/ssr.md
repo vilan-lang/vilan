@@ -5,7 +5,9 @@
 > full-stack e2e). **S3 (the Wire initial-state blob) stays UNBUILT by
 > decision** — demand-gated per §6c, so v1 keeps the double-fetch. Two
 > residues carried, neither blocking: `style_var` is snapshot-pinned but sits
-> outside the differential (the DOM stub no-ops `style.setProperty`), and the
+> outside the differential (the DOM stub no-ops `style.setProperty`) —
+> **CORRECTED 2026-08-04 (A21): the stub never no-opped it, and `style_var` is
+> in the differential now; see §S1's residue** — and the
 > S2 amendment's applicability question — **kolt and the walkthrough cannot
 > SSR under v1**, since their views read the live rpc client at build time,
 > handlers capture it, and browser-layer imports come with it. That factoring
@@ -140,7 +142,15 @@ tree:
    into, and requirement analysis loads it; the handler's event type stays
    generic (a discarded handler never touches it). Residue: `style_var` is
    snapshot-pinned but outside the differential (the DOM stub no-ops
-   `style.setProperty`).
+   `style.setProperty`). **CORRECTED 2026-08-04 (A21).** The premise was
+   wrong from the day it was written: this stub's `_upsertStyle` folds the
+   property into the `style` attribute — added in `309e2bb`, the very
+   commit this residue was recorded in — exactly the way the process twin
+   folds it. Nothing had to be extended; `style_var` joined the shared
+   component and both twins agree byte-for-byte (planted non-vacuous by
+   diverging the browser value). The lesson is the ordinary one about a
+   residue recorded from reading rather than running: a note that says a
+   harness cannot see something is cheap to *check*.
 2. **S2 — SHIPPED 2026-07-23**: `mount` clears before appending
    (`mount_root` inherits; the HMR teardown clear composes untouched; no
    golden churned — every existing container was empty). New
