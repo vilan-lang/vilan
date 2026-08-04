@@ -14397,6 +14397,187 @@ fn dark_prefixes_the_theme_selector() {
     );
 }
 
+/// dark × pseudo composes on ONE slot: the dark ancestor selector and the
+/// pseudo-class suffix land in the same rule, nested the way CSS nests them.
+#[test]
+fn dark_stacks_over_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().dark(style().hover(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| {
+            line.starts_with(":root[data-theme=\"dark\"] .")
+                && line.ends_with(":hover{background-color:var(--gray-700)}")
+        }),
+        "{assets:?}"
+    );
+}
+
+/// All three axes at once, media outermost. The composed line still starts
+/// with '@', so B35's numeric media ordering keeps seeing it.
+#[test]
+fn a_breakpoint_wraps_dark_over_a_pseudo_class() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().md(style().dark(style().hover(style().padding(space(6)))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        assets.iter().any(|(_, line)| line
+            == "@media (min-width: 768px){:root[data-theme=\"dark\"] .s19fbteb:hover{padding:var(--space-6)}}"),
+        "{assets:?}"
+    );
+}
+
+/// Composition has ONE spelling. dark goes outside the pseudo — the same
+/// outside-in rule that makes `md(hover(..))` legal — and the refusal names
+/// the fix rather than just saying no.
+#[test]
+fn a_pseudo_class_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("dark(hover(..)), not hover(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn dark_cannot_wrap_dark() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().dark(style().dark(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already dark-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn dark_cannot_wrap_a_breakpoint() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().dark(style().md(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("nest conditions as md(dark(..))")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The two nesting guards that shipped with the core in 2026-07-10 and were
+/// never pinned (found by the A8 tail's verification sweep).
+#[test]
+fn a_pseudo_class_cannot_wrap_a_pseudo_class() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().hover(style().focus(style().background(Color::gray(700))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("already pseudo-conditioned")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_breakpoint_cannot_wrap_a_breakpoint() {
+    let diagnostics = failure_diagnostics(
+        r#"
+        import std::style::{ style, space, Style };
+        fun s(): Style {
+            style().md(style().lg(style().padding(space(6))))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains("cannot wrap another media-conditioned style")),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The slot key gained a condition GRAMMAR, not a fourth field — so every
+/// class name minted before dark×pseudo existed is byte-identical after it.
+/// (The `style.vl` corpus golden is the broad version of this; these two are
+/// the ones the composition code could plausibly have disturbed.)
+#[test]
+fn composing_dark_leaves_the_uncomposed_class_names_untouched() {
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().background(Color::gray(50)).hover(style().background(Color::gray(100)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let lines: Vec<&str> = assets.iter().map(|(_, line)| line.as_str()).collect();
+    assert!(
+        lines.contains(&".siolu0w{background-color:var(--gray-50)}")
+            && lines.contains(&".s1c7l5ao:hover{background-color:var(--gray-100)}"),
+        "{assets:?}"
+    );
+}
+
 #[test]
 fn an_unknown_scale_step_fails_the_build() {
     let diagnostics = failure_diagnostics(

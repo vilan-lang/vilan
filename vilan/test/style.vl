@@ -1,5 +1,5 @@
 import std::print;
-import std::style::{ style, space, Style, Color, Length, Display };
+import std::style::{ Color, Display, Length, Style, space, style };
 
 // Typed atomic styles (proposal/ui-styling.md): construction inside `const`
 // via the builder chain; atomic rules and theme vars flow through the asset
@@ -7,7 +7,11 @@ import std::style::{ style, space, Style, Color, Length, Display };
 // (`+`, `class_list`) are ordinary runtime code over already-emitted rules.
 
 fun card_style(): Style {
-	style().display(Display::Flex).padding(space(4)).background(Color::gray(50)).hover(style().background(Color::gray(100)))
+	style()
+		.display(Display::Flex)
+		.padding(space(4))
+		.background(Color::gray(50))
+		.hover(style().background(Color::gray(100)))
 }
 
 fun main() {
@@ -25,5 +29,16 @@ fun main() {
 	// breakpoint wins the wide-viewport cascade tie.
 	let responsive = const style().sm(style().padding(space(2))).lg(style().padding(space(3)));
 	print(responsive.class_list());
+
+	// Conditions stack outside-in, media > dark > pseudo. The golden pins the
+	// composed selectors in bytes: the dark ancestor and the pseudo suffix in
+	// ONE rule, and the whole thing inside a media block. Note the leading
+	// byte — a composed dark rule still starts with ':', which is what keeps
+	// it in the same cascade band as every other dark rule (B35).
+	let themed = const style()
+		.dark(style().background(Color::gray(900)))
+		.dark(style().hover(style().background(Color::gray(700))))
+		.md(style().dark(style().hover(style().background(Color::gray(50)))));
+	print(themed.class_list());
 }
 main();

@@ -8,6 +8,8 @@ tracks the latest state.
 
 ## Unreleased
 
+**Dark mode stacks with hover.** `style().dark(style().hover(..))` now compiles, emitting one rule under both conditions (`:root[data-theme="dark"] .sX:hover`), and a breakpoint can wrap the pair: `md(dark(hover(..)))`. Conditions nest outside-in in the order the selector nests them — media, then dark, then the pseudo-class — and writing them in any other order stops the build with a message naming the order it wanted, rather than the flat "dark cannot wrap an already pseudo-conditioned style" refusal that used to reject both directions. Class names are unchanged: the composition rides a grammar in the existing slot key, so every rule minted before this release keeps the exact name it had. Two long-standing nesting guards (a pseudo-class wrapping a pseudo-class, a breakpoint wrapping a breakpoint) gained their first tests on the way.
+
 **A style can live in a signal.** `view.bind_styled(signal)` is the reactive twin of `styled`, exactly as `bind_class` is `class`'s: point it at a `Signal<Style>` and the element's classes follow the signal. Both styles are still built in `const`, so every rule is in the stylesheet before the page loads and the signal only chooses between class strings that already exist — the construct-in-const rule holds with a signal in the middle. Server-side it reads once, like every other `bind_*` on the SSR layer. Previously the only way to swap a whole style reactively was `bind_class(signal.map(|s| s.class_list()))`.
 
 ## v0.24.0 — 2026-08-03

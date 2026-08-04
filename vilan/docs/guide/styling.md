@@ -86,14 +86,45 @@ let button = const style()
 ```
 
 Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
-`.last`, `.dark` (dark mode via `prefers-color-scheme`), and
-`.pseudo(name, inner)` for anything else. Breakpoints work the same way:
-`.sm(inner)` (640px), `.md(inner)` (768px), `.lg(inner)` (1024px),
-`.xl(inner)` (1280px), or `.media(min_width, inner)`. All are `min-width`
-conditions, so chains are mobile-first: in
-`.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching breakpoint wins
-(the stylesheet emits media rules in ascending min-width order, which is
-what makes that true).
+`.last`, `.dark`, and `.pseudo(name, inner)` for anything else.
+Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
+(768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
+`.media(min_width, inner)`. All are `min-width` conditions, so chains are
+mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
+breakpoint wins (the stylesheet emits media rules in ascending min-width
+order, which is what makes that true).
+
+## Dark mode, and stacking conditions
+
+`.dark(inner)` applies under a `:root[data-theme="dark"]` ancestor — an
+explicit switch you set on the document, not `prefers-color-scheme`. That
+is deliberate: a server can decide the theme and write the attribute
+before a byte of JavaScript runs, and a user's toggle is one attribute
+write.
+
+Conditions **stack**, nesting outside-in in the order the CSS nests them:
+a breakpoint outside dark, dark outside the pseudo-class.
+
+```vilan,fragment
+let button = const style()
+	.background(Color::gray(100))
+	.hover(style().background(Color::gray(200)))
+	.dark(style().background(Color::gray(800)))
+	.dark(style().hover(style().background(Color::gray(700))))
+	.md(style().dark(style().hover(style().background(Color::gray(600)))));
+```
+
+Write them in any other order and the build stops and tells you which
+order it wanted — `hover(dark(..))` says to write `dark(hover(..))`. No
+axis may wrap itself, so one media, one dark and one pseudo-class is the
+whole lattice.
+
+Why the order matters beyond spelling: `dark(hover(..))` produces a
+*more specific* selector than either `dark(..)` or `hover(..)`, so it
+beats both. Between a plain `.dark(x)` and a plain `.hover(y)` on the
+same property the two are equally specific and dark wins — a theme
+shouldn't be undone by a hover — so when a dark theme needs its own
+hover colour, say so with `dark(hover(..))`.
 
 ## Dynamic values
 
@@ -160,9 +191,10 @@ request is rendered is the one served.
 > **Going deeper.** Each property-under-a-condition becomes one atomic
 > CSS rule with a generated class name, deduplicated across the whole
 > build: two styles that both say `padding(space(4))` share one class.
-> `styled` sets `class_list()`, the space-joined class names. A
-> breakpoint can't wrap another media-conditioned style (you'll get a
-> compile-time panic saying so).
+> `styled` sets `class_list()`, the space-joined class names. Each
+> combination of conditions is its own slot, so `hover(..)` and
+> `dark(hover(..))` never fight over one — they are different rules with
+> different class names, resolved by CSS specificity.
 
 ## Traps
 

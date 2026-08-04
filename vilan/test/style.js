@@ -81,3 +81,5 @@ const wide = [ [ new Map([ [ "::width", [ "::width", [ "s178hckh", "width:37px" 
 console.log(class_list(wide));
 const responsive = [ [ new Map([ [ "640px::padding", [ "640px::padding", [ "sl8ru5a", "padding:var(--space-2)" ] ] ], [ "1024px::padding", [ "1024px::padding", [ "s4x9b8s", "padding:var(--space-3)" ] ] ] ]) ] ];
 console.log(class_list(responsive));
+const themed = [ [ new Map([ [ ":dark:background-color", [ ":dark:background-color", [ "suuxkdy", "background-color:var(--gray-900)" ] ] ], [ ":dark hover:background-color", [ ":dark hover:background-color", [ "s8ww588", "background-color:var(--gray-700)" ] ] ], [ "768px:dark hover:background-color", [ "768px:dark hover:background-color", [ "s8ahr6b", "background-color:var(--gray-50)" ] ] ] ]) ] ];
+console.log(class_list(themed));

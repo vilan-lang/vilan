@@ -92,7 +92,7 @@ fun active(self, inner: Style): Style
 fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
-fun dark(self, inner: Style): Style       // prefers-color-scheme: dark
+fun dark(self, inner: Style): Style       // :root[data-theme="dark"] ancestor
 fun pseudo(self, name: str, inner: Style): Style
 
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
@@ -102,10 +102,27 @@ fun xl(self, inner: Style): Style
 fun media(self, min_width: str, inner: Style): Style
 ```
 
-A breakpoint cannot wrap an already-media-conditioned style (panics at
-compile-time evaluation). Media rules emit in ascending min-width order,
-so a chain like `.sm(x).lg(y)` is mobile-first: the widest matching
-breakpoint wins.
+### Stacking
+
+The three condition axes nest **outside-in, in the order the selector
+nests them** — media, then dark, then the pseudo-class:
+
+```vilan,fragment
+style().md(style().dark(style().hover(style().opacity(0.8))))
+// @media (min-width: 768px){:root[data-theme="dark"] .sX:hover{opacity:0.8}}
+```
+
+Every other order is a compile-time-evaluation panic naming the fix
+(`hover(dark(..))` says to write `dark(hover(..))`), and no axis can wrap
+itself — one media, one dark, one pseudo-class per slot. Media rules emit
+in ascending min-width order, so a chain like `.sm(x).lg(y)` is
+mobile-first: the widest matching breakpoint wins.
+
+`dark` is an ancestor selector, so a composed `dark(hover(..))` rule is
+more specific than either `dark(..)` or `hover(..)` alone and wins
+against both. Between an *un*composed `dark(x)` and `hover(y)` on the
+same property the two are equally specific and dark wins, so use
+`dark(hover(..))` when a dark theme needs its own hover.
 
 ## Runtime-legal operations
 
