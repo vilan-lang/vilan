@@ -24550,20 +24550,41 @@ impl<'src> Program<'src> {
         self.diagnostic_sources.push(source);
     }
 
-    /// The program's call graph, built on first use and kept.
+    /// The program's call graph: ONE build per analysis, shared by everything
+    /// that runs once the context rewrite has landed (E35, `const-eval.md`
+    /// §8.4).
     ///
-    /// **Only for consumers that run once analysis has settled** — the
-    /// post-`analyze()` checks and emission. The passes *inside* the analysis
-    /// sequence (context threading, async inference, platform coloring, const
-    /// evaluation) rewrite the tables this graph is derived from, so each of
-    /// them still builds its own; a memo shared with them would be stale by
-    /// construction. Nothing mutates entities after that sequence, which is why
-    /// the cycle check (`init_order::check_cycles`) and the transformer can
-    /// share one build — a `CallGraph::build` is ~3% of a clean compile, and
-    /// they used to pay it twice (`b33-emission-order.md` §4).
+    /// [`crate::post_analysis_passes`] builds it and [`Self::install_call_graph`]s
+    /// it here, so async inference, platform coloring, const evaluation, the
+    /// cycle check, chunk planning and emission all read the same tables. The
+    /// `get_or_init` fallback is for a program that never ran the post-passes
+    /// — a test that analyzes and transforms directly — and is correct for the
+    /// same reason the sharing is: nothing after `analyze()` mutates what
+    /// [`crate::call_graph::CallGraph::build`] reads except
+    /// `context::thread_contexts`, which owns the one graph that CANNOT be
+    /// shared.
+    ///
+    /// **That exception is the whole invariant.** `context::apply` rewrites
+    /// `entity_map`, `function_calls` and `generic_dispatch` — it deletes call
+    /// edges (a threaded `get()` becomes a local read) and mints new ones (the
+    /// hidden context argument) — so a graph built before it is stale
+    /// afterwards, and `thread_contexts` builds its own for exactly that
+    /// reason. Nothing may populate this memo before that pass has run.
     pub fn call_graph(&self) -> &crate::call_graph::CallGraph {
         self.call_graph_memo
             .get_or_init(|| crate::call_graph::CallGraph::build(self))
+    }
+
+    /// Hands the analysis tail its shared call graph. Called once, by
+    /// [`crate::post_analysis_passes`], after the passes that take the graph by
+    /// reference are done with it — from here on every consumer reads it
+    /// through [`Self::call_graph`].
+    ///
+    /// A no-op if the memo is already filled, which cannot happen on the
+    /// pipeline: reading [`Self::call_graph`] before this point would install a
+    /// graph built at an unknown moment, and the moment is the invariant.
+    pub fn install_call_graph(&self, graph: crate::call_graph::CallGraph) {
+        let _ = self.call_graph_memo.set(graph);
     }
 
     /// Every module-level `let` binding of the program: the globals of the

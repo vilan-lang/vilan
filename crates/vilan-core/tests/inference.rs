@@ -33645,6 +33645,98 @@ fn a_cycle_through_a_const_binding_cannot_form() {
     );
 }
 
+/// Analyzes `source` on a large-stack worker and reports how many
+/// `CallGraph::build` calls the whole analysis made. The counter is
+/// thread-local and zeroed on the worker, so a concurrently running test
+/// cannot contribute to it.
+fn call_graphs_built_by_one_analysis(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::call_graph::reset_build_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            // The tail's consumers read the installed graph; touching it here
+            // must not add a build, which is half of what this counts.
+            let _ = program.call_graph();
+            vilan_core::call_graph::build_count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn one_call_graph_per_analysis() {
+    // E35 (`const-eval.md` §8.4). Async inference, platform coloring, const
+    // evaluation, the cycle check, chunk planning and emission each used to
+    // build their OWN graph over the same tables; they now share the one
+    // `post_analysis_passes` builds. Only a counter can pin this: a stale
+    // rebuild and a shared build produce identical output whenever the sharing
+    // is correct, so no behaviour test can see the difference.
+    assert_eq!(
+        call_graphs_built_by_one_analysis(
+            r#"
+            import std::print;
+            let SEED: i32 = 21;
+            let DOUBLE: i32 = double(SEED);
+            fun double(value: i32): i32 { value * 2 }
+            fun main() { print(DOUBLE); }
+            "#
+        ),
+        1,
+        "a program that threads no context must build exactly ONE call graph"
+    );
+}
+
+#[test]
+fn context_threading_owns_the_one_graph_that_cannot_be_shared() {
+    // The exception that makes the rule honest. `context::apply` rewrites
+    // `entity_map` / `function_calls` / `generic_dispatch` — a threaded `get()`
+    // becomes a local read, a consumed `run` becomes `Expr::Null`, and the
+    // hidden context argument mints new call entities — so the graph the
+    // threading pass planned over does NOT describe the program afterwards and
+    // must not be handed on. Such a program pays exactly two builds: the
+    // pre-rewrite one, and the tail's.
+    //
+    // If this ever reads 1, the tail is running on a pre-rewrite graph and is
+    // missing the context arguments' edges — a correctness bug, not a saving.
+    assert_eq!(
+        call_graphs_built_by_one_analysis(
+            r#"
+            import std::print;
+            import std::context::Context;
+
+            let flavor: Context<i32> = Context::new();
+
+            fun describe(): str {
+                i"flavor {flavor.get()}"
+            }
+
+            fun main() {
+                print(flavor.run(7, || describe()));
+            }
+            "#
+        ),
+        2,
+        "a context-threading program must build the pre-rewrite graph AND the tail's"
+    );
+}
+
 #[test]
 fn the_call_graph_is_built_once_and_stays_current() {
     // B33 §4's rider. The cycle check and emission each used to build their own

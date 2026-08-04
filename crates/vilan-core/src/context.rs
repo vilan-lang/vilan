@@ -37,39 +37,55 @@ use crate::type_::Type;
 
 /// Entry point: thread every context in `program`, or record diagnostics if any
 /// context is read where its value can't be supplied.
-pub fn thread_contexts(program: &mut Program) {
+///
+/// Returns the call graph it built — but ONLY on the paths where it applied no
+/// rewrite, in which case the graph still describes the program and the rest of
+/// the analysis tail can share it instead of building a second one (E35). When
+/// [`apply`] ran, the graph is stale by construction — the rewrite deletes call
+/// edges (a threaded `get()` becomes an `Expr::Local` read, a consumed `run`
+/// becomes `Expr::Null`) and mints new ones (the hidden context argument) —
+/// and `None` says so. Returning it is unreachable on that path rather than
+/// merely discouraged, which is the point of spelling the answer as an
+/// `Option`: this is the one graph in the pipeline that cannot be shared, and
+/// a comment would not have stopped anyone.
+pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     let (Some(get_fn), Some(run_fn), Some(new_fn)) = (
         program.context_get_fn_id,
         program.context_run_fn_id,
         program.context_new_fn_id,
     ) else {
-        // `context.vl` wasn't loaded — no contexts to thread.
-        return;
+        // `context.vl` wasn't loaded — no contexts to thread, and no graph
+        // built to hand on.
+        return None;
     };
     // Absent only against an older `context.vl` without `get_safe`.
     let get_safe_fn = program.context_get_safe_fn_id;
 
-    let plan = {
-        let graph = CallGraph::build(program);
-        match analyze(program, &graph, get_fn, get_safe_fn, run_fn, new_fn) {
-            Ok(plan) => plan,
-            Err(errors) => {
-                for (error, source) in errors {
-                    program.push_diagnostic(error, source);
-                }
-                return;
+    let graph = CallGraph::build(program);
+    let plan = match analyze(program, &graph, get_fn, get_safe_fn, run_fn, new_fn) {
+        Ok(plan) => plan,
+        Err(errors) => {
+            for (error, source) in errors {
+                program.push_diagnostic(error, source);
             }
+            // Diagnostics only: the tables are untouched, so the graph stands.
+            return Some(graph);
         }
     };
 
     // Publish the context-dependent nodes (functions / `run` closures that take a
     // hidden context parameter) so `check_context_drops` can reject a `drop` body
-    // that requires an ambient context (destruction.md §8).
+    // that requires an ambient context (destruction.md §8). Not a graph input.
     program.context_dependent_functions = plan.param_nodes.iter().map(|(_, node)| *node).collect();
 
-    if !plan.is_empty() {
-        apply(program, plan);
+    if plan.is_empty() {
+        // Nothing to rewrite — the common case, since most programs create no
+        // context at all. The graph is still the program's.
+        return Some(graph);
     }
+    drop(graph);
+    apply(program, plan);
+    None
 }
 
 /// A `get()`/`get_safe()` call: the call entity, the context it reads, the
