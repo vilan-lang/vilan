@@ -34553,18 +34553,17 @@ fn b62_a_conditionally_moved_capture_is_an_r7_error() {
 // --- B62's residuals: found while pinning the split, each a DIFFERENT rule ----
 
 #[test]
-#[ignore = "B62 residual: consuming a loaned capture is not yet an error, and double-destroys"]
 fn b62_an_is_capture_consumed_by_an_own_call_is_rejected() {
     // `is` loans its subject, so the capture is a view into a value the subject
     // still owns. `own`-passing it hands a second owner the payload while the
-    // subject's scope-end teardown still fires: the program below prints
+    // subject's scope-end teardown still fires: the program below printed
     // `sink ic / drop ic / after / drop ic` — one value, TWO destructions.
     //
     // This is B60's rule (a body may only consume what it owns) in the capture
-    // position rather than the parameter position, and needs its own diagnostic
-    // and steer ("match by value, or `take`"), so it is not this arc's. The
-    // ownership split B62 pins is what makes it a bug: a loaned capture owns
-    // nothing, so it may not be consumed.
+    // position rather than the parameter position, with its own diagnostic and
+    // steer ("match by value, or `take`"). CLOSED by B65; the ownership split
+    // B62 pins is what makes it a bug: a loaned capture owns nothing, so it may
+    // not be consumed.
     assert_fails(&b62_program(
         r#"
             fun sink(own r: Res) {
@@ -34582,10 +34581,9 @@ fn b62_an_is_capture_consumed_by_an_own_call_is_rejected() {
 }
 
 #[test]
-#[ignore = "B62 residual: consuming a capture of a loaned match subject is not yet an error"]
 fn b62_a_loaned_match_capture_consumed_by_an_own_call_is_rejected() {
     // The same hole through `match &x`, which R6 defines as inspecting without
-    // consuming. Prints `sink lc / drop lc / after / drop lc` today.
+    // consuming. Printed `sink lc / drop lc / after / drop lc` before B65.
     assert_fails(&b62_program(
         r#"
             fun sink(own r: Res) {
@@ -34632,4 +34630,202 @@ fn b62_a_generic_capture_never_moved_out_is_rejected_at_a_resource_instantiation
             }
             "#,
     ));
+}
+
+// --- B65: a capture of a LOANED subject is a loan, and may not be consumed
+// (`vilan/proposal/affine-moves.md` §9.1) -------------------------------------
+
+#[test]
+fn b65_the_is_capture_diagnostic_names_the_subject_and_the_by_value_steer() {
+    // C2: the diagnostic class carries its span + message pin. The steer is
+    // deliberately NOT `LoanConsumed`'s "declare it `own x`" — a capture has no
+    // convention to redeclare, so the fix is to consume the SUBJECT. It also
+    // offers no copy: vilan has no user-facing copy spelling, and R1 forbids
+    // copying a resource at all, so "clone the payload" would name an
+    // impossible fix (diagnostics-standard B4).
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "ic" });
+                if o is Some(let held) {
+                    sink(held);
+                }
+            }
+            "#,
+        ),
+        // Occurrence 0 binds the capture; the diagnostic anchors the CONSUMING
+        // use (A1 — the narrowest span that identifies the problem).
+        "held",
+        1,
+        "cannot move the resource `held` out of this pattern: it captures from `o`, \
+         which is matched by loan",
+    );
+}
+
+#[test]
+fn b65_the_loaned_match_capture_diagnostic_steers_to_the_by_value_match() {
+    // The `match &o` form reaches the same rule through the same subject name:
+    // `pattern_subject_name` looks through the `&`, so the steer says `match o`,
+    // the spelling that actually fixes it.
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "lc" });
+                match &o {
+                    Some(let held) => sink(held),
+                    None => {}
+                }
+            }
+            "#,
+        ),
+        "held",
+        1,
+        "match `o` by value to move the payload into the capture, or restructure \
+         with `Option` + `take`",
+    );
+}
+
+#[test]
+fn b65_a_loaned_capture_that_is_only_read_stays_legal() {
+    // The load-bearing half: B65 rejects CONSUMING a loaned capture, never
+    // reading one. `is`-testing and reading the payload through the capture is
+    // the idiom `is_some_and` / `inspect` are built on (B63 §8.3), and the
+    // subject keeps ownership and drops exactly once at its own scope end.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun peek(r: &Res) {
+                print(i"peek {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "read" });
+                if o is Some(let r) {
+                    print(i"is {r.tag}");
+                    peek(&r);
+                }
+                match &o {
+                    Some(let r) => print(i"leg {r.tag}"),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "is read\npeek read\nleg read\nafter\ndrop read\n",
+    );
+}
+
+#[test]
+fn b65_the_consuming_match_form_still_moves_its_capture_onward() {
+    // The steer's own target must keep working: `match o` by value consumes the
+    // subject, so the capture OWNS the payload (B62) and `own`-passing it is a
+    // legal move, not a second owner. One `sink`, one `drop`, and no teardown
+    // of `o` — this is what B65 steers users toward, so it is pinned beside it.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let o: Option<Res> = Some(Res { tag = "owned" });
+                match o {
+                    Some(let r) => sink(r),
+                    None => {}
+                }
+                print("after");
+            }
+            "#,
+        ),
+        "sink owned\ndrop owned\nafter\n",
+    );
+}
+
+#[test]
+fn b65_a_loaned_destructure_capture_consumed_is_rejected() {
+    // The third loan form in §7.2's table, and the twin B62 fixed on the
+    // enrollment side: `let (a, b) = &pair` loans, so its captures own nothing.
+    // Pinned because a fix aimed only at `match`/`is` would leave it open.
+    assert_fails_spanning_nth(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let pair = (Res { tag = "d0" }, 1);
+                let (held, n) = &pair;
+                sink(held);
+            }
+            "#,
+        ),
+        "held",
+        1,
+        "cannot move the resource `held` out of this pattern: it captures from \
+         `pair`, which is matched by loan",
+    );
+}
+
+#[test]
+fn b65_a_consuming_destructure_capture_is_still_movable() {
+    // The consuming twin of the above — `let (r, n) = pair` consumes `pair`, so
+    // `r` owns and may be moved on. Guards the destructure half against an
+    // over-wide fix that treated every destructure capture as a loan.
+    assert_compiles_and_runs(
+        &b62_program(
+            r#"
+            fun sink(own r: Res) {
+                print(i"sink {r.tag}");
+            }
+            fun main() {
+                let pair = (Res { tag = "d1" }, 1);
+                let (r, n) = pair;
+                sink(r);
+                print("after");
+            }
+            "#,
+        ),
+        "sink d1\ndrop d1\nafter\n",
+    );
+}
+
+#[test]
+fn b65_a_loaned_capture_consumed_inside_a_generic_reports_at_the_instantiation() {
+    // B65 rides R11's per-instantiation scan unchanged, like every other rule in
+    // `scan_move` — the same predicate, the same `MoveScan`, no new plumbing.
+    // The report lands at the INSTANTIATION site (A2: user code only), with the
+    // note pointing into the generic body.
+    //
+    // `keep` is what makes the consuming use real: a closure-valued callee loans
+    // every argument (`callee_conventions` answers `None`), so only a resolvable
+    // `own` callee consumes. `steal` returns `o`, so R11's exactly-once check is
+    // satisfied and this is the ONE diagnostic.
+    assert_fails_spanning(
+        &b62_program(
+            r#"
+            fun keep<type T>(own v: T): T {
+                v
+            }
+            fun steal<type T>(own o: Option<T>): Option<T> {
+                if o is Some(let held) {
+                    keep(held);
+                }
+                o
+            }
+            fun main() {
+                let kept = steal(Some(Res { tag = "gi" }));
+            }
+            "#,
+        ),
+        "steal(Some(Res { tag = \"gi\" }))",
+        "a capture of a loaned resource-typed subject is moved out",
+    );
 }

@@ -391,6 +391,11 @@ struct MoveScan<'a> {
     resource_bindings: &'a HashSet<Id>,
     resource_value_places: &'a HashSet<Id>,
     module_level_bindings: &'a HashSet<Id>,
+    /// B65: pattern captures bound by a LOANED subject, mapped to that subject.
+    /// Whole-program (a capture's loan-ness is a property of its own pattern,
+    /// not of the scan root), so both the concrete scan and R11's
+    /// per-instantiation scan share one set.
+    loaned_captures: &'a HashMap<Id, Id>,
 }
 
 /// One arm of an `if` / `match` as the drop planner sees it (destruction.md §7):
@@ -474,6 +479,17 @@ enum ResourceMoveViolation {
     LoanConsumed {
         at: Id,
         binding: Id,
+    },
+    /// B65 — R6 read in the CAPTURE position: a consuming use of a pattern
+    /// capture whose subject was matched by LOAN (`x is Some(let r)`, `match &x`,
+    /// `let … = &x`). The subject keeps ownership and still drops at its scope
+    /// end, so consuming the capture hands the same payload a second owner. The
+    /// capture twin of `LoanConsumed`, with its own steer: the fix is to consume
+    /// the SUBJECT, not to redeclare a convention the capture does not have.
+    LoanedCaptureConsumed {
+        at: Id,
+        binding: Id,
+        subject: Id,
     },
     /// §5 loan-only corollary: a consuming use (move / `own`-pass, `drop(x)`
     /// included) of a module-level resource, which has process lifetime and can
@@ -4782,6 +4798,47 @@ impl<'src> Analyzer<'src> {
         places
     }
 
+    /// Every pattern capture bound by a LOANED subject, mapped to the subject
+    /// expression that still owns the payload (B65). R6/§7.2's other half: a
+    /// capture of a *consumed* subject owns its payload, but a capture of a
+    /// loaned one owns nothing — the subject keeps ownership and still drops.
+    /// Three loan forms, exactly the table in `affine-moves.md` §7.2:
+    ///
+    /// - `x is Some(let r)` — a *test*, never a consuming match, so its captures
+    ///   are always loans whatever the subject's own form;
+    /// - `match &x { Some(let r) => … }` — R6's inspect-without-consuming;
+    /// - `let (r, n) = &pair` — the destructure twin of the same.
+    ///
+    /// Consuming such a capture is the capture-position twin of
+    /// `binding_is_loaned_parameter`, and is rejected in `scan_move_touch`.
+    fn collect_loaned_pattern_captures(&self) -> HashMap<Id, Id> {
+        let mut loaned: HashMap<Id, Id> = HashMap::new();
+        let mut record = |pattern: &ExprPattern, subject: Id| {
+            let mut captures = Vec::new();
+            Self::collect_pattern_captures(pattern, &mut captures);
+            for capture in captures {
+                loaned.insert(capture, subject);
+            }
+        };
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                // An `is` test loans unconditionally — `is_some`'s body is
+                // exactly this shape and B60 left it free on a resource.
+                Expr::Is(subject, pattern) => record(pattern, *subject),
+                Expr::Match(subject, legs) if self.pattern_subject_is_loan(*subject) => {
+                    for leg in legs {
+                        record(&leg.pattern, *subject);
+                    }
+                }
+                Expr::Destructure(subject, pattern) if self.pattern_subject_is_loan(*subject) => {
+                    record(pattern, *subject)
+                }
+                _ => {}
+            }
+        }
+        loaned
+    }
+
     /// R1–R9 (destruction.md §4): the affine move checker. Classifies resource
     /// bindings once, scans every function and closure body for moves, then runs
     /// the R9 capture check and emits the collected violations.
@@ -4829,10 +4886,12 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .filter(|id| resource_bindings.contains(id))
             .collect();
+        let loaned_captures = self.collect_loaned_pattern_captures();
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
             resource_value_places: &resource_value_places,
             module_level_bindings: &module_level_bindings,
+            loaned_captures: &loaned_captures,
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.emit_resource_move_violations(violations);
@@ -5926,13 +5985,7 @@ impl<'src> Analyzer<'src> {
             Expr::Local(binding) => {
                 if scan.resource_bindings.contains(&binding) {
                     self.scan_move_touch(
-                        binding,
-                        expr_id,
-                        consuming,
-                        scan.module_level_bindings,
-                        flow,
-                        loop_depth,
-                        violations,
+                        binding, expr_id, consuming, scan, flow, loop_depth, violations,
                     );
                 }
             }
@@ -6218,7 +6271,7 @@ impl<'src> Analyzer<'src> {
         binding: Id,
         use_id: Id,
         consuming: bool,
-        module_level_bindings: &HashSet<Id>,
+        scan: &MoveScan<'_>,
         flow: &mut MoveFlow,
         loop_depth: u32,
         violations: &mut Vec<ResourceMoveViolation>,
@@ -6226,7 +6279,7 @@ impl<'src> Analyzer<'src> {
         // §5 loan-only corollary: a module-level resource is never moved, so a
         // consuming use is rejected here and the binding is left owned — a later
         // loan of the same global must not read as use-after-move.
-        if consuming && module_level_bindings.contains(&binding) {
+        if consuming && scan.module_level_bindings.contains(&binding) {
             violations.push(ResourceMoveViolation::ModuleLevelMove {
                 at: use_id,
                 binding,
@@ -6241,6 +6294,19 @@ impl<'src> Analyzer<'src> {
             violations.push(ResourceMoveViolation::LoanConsumed {
                 at: use_id,
                 binding,
+            });
+            return;
+        }
+        // B65, the capture twin of the above: a capture of a LOANED subject is
+        // itself a loan into a value the subject still owns, so consuming it
+        // gives that one value two owners (the subject's scope-end teardown
+        // still fires). Left owned for the same reason — a later READ of the
+        // same capture stays legal and must not cascade into use-after-move.
+        if consuming && let Some(subject) = scan.loaned_captures.get(&binding) {
+            violations.push(ResourceMoveViolation::LoanedCaptureConsumed {
+                at: use_id,
+                binding,
+                subject: *subject,
             });
             return;
         }
@@ -7017,6 +7083,21 @@ impl<'src> Analyzer<'src> {
     }
 
     /// The name of a binding entity (variable or parameter), for diagnostics.
+    /// The source-level name of a pattern subject, for B65's steer: `o` for both
+    /// `o is Some(let r)` and `match &o { … }`. `None` when the subject is not a
+    /// simple binding (a call result, a field), where the steer names no place
+    /// rather than inventing one (B4 — no speculative steer).
+    fn pattern_subject_name(&self, subject_id: Id) -> Option<&'src str> {
+        let place_id = match self.expr_id_to_expr_map.get(&subject_id) {
+            Some(Expr::Reference(operand, _)) => *operand,
+            _ => subject_id,
+        };
+        match self.expr_id_to_expr_map.get(&place_id) {
+            Some(Expr::Local(binding)) => Some(self.binding_name(*binding)),
+            _ => None,
+        }
+    }
+
     fn binding_name(&self, binding_id: Id) -> &'src str {
         self.variables
             .get(&binding_id)
@@ -7113,6 +7194,31 @@ impl<'src> Analyzer<'src> {
                         note: None,
                     }
                 }
+                // B65. Deliberately NOT the `LoanConsumed` text: there is no
+                // convention to redeclare on a capture, so `own x` is not the fix
+                // here — consuming the SUBJECT is. The advice is spellable on
+                // both counts (B4): `match o` by value is R6's consuming form,
+                // and `take` is the sanctioned partial move. It does not offer a
+                // copy: vilan has no user-facing copy spelling, and R1 forbids
+                // copying a resource anyway.
+                ResourceMoveViolation::LoanedCaptureConsumed { at, binding, subject } => {
+                    let name = self.binding_name(binding);
+                    let subject = match self.pattern_subject_name(subject) {
+                        Some(subject_name) => format!("`{subject_name}`"),
+                        None => "the subject".to_string(),
+                    };
+                    Error {
+                        span: **self.span_map.get(&at).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "cannot move the resource `{name}` out of this pattern: it captures \
+                             from {subject}, which is matched by loan — `is` and `match &` inspect \
+                             without consuming, so {subject} still owns the payload and still \
+                             drops at its scope end; match {subject} by value to move the payload \
+                             into the capture, or restructure with `Option` + `take`"
+                        ),
+                        note: None,
+                    }
+                }
                 ResourceMoveViolation::Capture {
                     reference_id,
                     binding,
@@ -7191,6 +7297,9 @@ impl<'src> Analyzer<'src> {
         }
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
         let mut enqueued: HashSet<(Id, Vec<TypeId>)> = HashSet::new();
+        // B65 rides R11 unchanged, like every other rule: a capture's loan-ness
+        // is whole-program, so the same set serves every instantiation.
+        let loaned_captures = self.collect_loaned_pattern_captures();
 
         // Seed: every call in the program, under NO known generic-resources — so
         // only a parameter bound to a CONCRETE resource seeds a check. (A call
@@ -7232,6 +7341,7 @@ impl<'src> Analyzer<'src> {
                     resource_bindings: &resource_bindings,
                     resource_value_places: &resource_value_places,
                     module_level_bindings: &no_module_level,
+                    loaned_captures: &loaned_captures,
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
@@ -7943,6 +8053,17 @@ impl<'src> Analyzer<'src> {
                         format!(
                             "in `{name}`, the loaned parameter `{binding_name}` is moved out here: \
                              a loan changes no ownership, so declare it `own {binding_name}`"
+                        ),
+                    )
+                }
+                ResourceMoveViolation::LoanedCaptureConsumed { at, binding, .. } => {
+                    let binding_name = self.binding_name(*binding);
+                    (
+                        *at,
+                        "a capture of a loaned resource-typed subject is moved out",
+                        format!(
+                            "in `{name}`, the capture `{binding_name}` is moved out here: its \
+                             subject is matched by loan, so the subject still owns the payload"
                         ),
                     )
                 }

@@ -356,7 +356,12 @@ changes no ownership and is policed by rule 4.
   drop at the declaring scope's end. Matching a loan (`match &self.state`,
   and the `x is Some(let v)` test) inspects without consuming: the subject
   keeps ownership and destroys the payload itself, so its captures own
-  nothing.
+  nothing — and, owning nothing, they may not be **consumed**. This is R3's
+  "a loan changes no ownership" read in the capture position: `own`-passing
+  a loaned capture, returning it, or matching it by value would hand a
+  second owner the payload the subject still destroys at its own scope end.
+  The fix is to consume the *subject* (`match x` without the `&`), not to
+  redeclare the capture — a capture carries no convention to change.
 - **R7: no conditional moves.** A binding must be moved on every path
   through a scope or on none; moving it on one path only is an error. This
   keeps end-of-scope ownership static: there are no runtime drop flags in
