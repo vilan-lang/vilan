@@ -135,13 +135,16 @@ returns.**
   the ADAPTATION shape (a closure with a resolved, non-void return) rather than
   on the marker. The marker is now the whole test, so `update` refuses an
   awaiting `mutate`; `signal_update_refuses_an_awaiting_closure` pins it.
-- **`Signal<resource>`**: R10 rejects a resource argument to `Shared`, and
-  `Signal<T>`'s storage *is* a `Shared<T>` — but the check keys on the
+- **`Signal<resource>`** — **closed 2026-08-04 (A19):** R10 now asks its
+  question per instantiation, descending a generic aggregate's members as
+  instantiated at the written application, so `Signal<Database>` is refused with
+  the path it took (`Signal.value`) and a note at the `Shared<T>` field. The
+  original account, for the record: R10 rejects a resource argument to `Shared`, and
+  `Signal<T>`'s storage *is* a `Shared<T>` — but the check keyed on the
   written type's head, and `Signal`'s own `Shared<T>` field is generic at its
-  declaration, so `Signal<Database>` compiles today while `Shared<Database>`
-  is refused. That is a pre-existing hole in R10's coverage, not something
-  `update` opens or widens (§8). Until it closes, `update` over a resource
-  `T` inherits whatever `Signal` does.
+  declaration, so `Signal<Database>` compiled while `Shared<Database>`
+  was refused. That was a pre-existing hole in R10's coverage, not something
+  `update` opened or widened (§8).
 
 ## 7. What this deliberately does not change
 
@@ -164,11 +167,14 @@ returns.**
   `parameter_is_closure` now. `Signal::update`'s `sync` is the only
   `sync |…| void` declaration in tree and no in-tree caller awaited, so nothing
   else moved.
-- **`Signal<resource>` slips R10.** `Shared<Database>` is refused;
+- ~~**`Signal<resource>` slips R10.** `Shared<Database>` is refused;
   `Signal<Database>` compiles. R10's check keys on the written application's
   head, so a resource reaching `Shared` only through a generic struct field
   is invisible to it. S-sized; the fix is to seed the check from
-  instantiations as well as written applications.
+  instantiations as well as written applications.~~ **Fixed 2026-08-04
+  (A19):** the check descends a generic aggregate's members as instantiated at
+  the written application, which covers any user generic with a container
+  field, not just `Signal`. `destruction.md` §R10 records the widened rule.
 - **A re-entrant `update` of the same signal** (§4) is undefined rather than
   diagnosed. If it ever needs enforcing, the device is a `Shared<bool>` on
   `Signal` in `Turn::draining`'s shape — deliberately not paid for now.

@@ -22639,6 +22639,93 @@ fn r10_option_accepts_a_resource_argument() {
     );
 }
 
+// --- A19: R10 is asked per INSTANTIATION, not per written head — a resource
+// --- reaching a container through a generic aggregate's member is still R10's.
+
+#[test]
+fn r10_refuses_a_resource_reaching_shared_through_a_generic_field() {
+    // The general case, which `Signal` is only one instance of: `Cell<T>`'s
+    // `Shared<T>` holds nothing at its declaration and a `Shared<Db>` here.
+    // The diagnostic anchors at what the user wrote (A2) and names the path the
+    // resource took to get there (B3).
+    assert_fails_spanning(
+        r#"
+        import std::shared::Shared;
+        resource struct Db { handle: i32 }
+        struct Cell<T> { value: Shared<T> }
+        fun sink(cell: Cell<Db>) {}
+        fun main() {}
+        "#,
+        "Cell<Db>",
+        "`Shared` cannot hold the resource `Db`, reached through `Cell.value`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_signal_of_a_resource() {
+    // `Signal<T>`'s storage IS a `Shared<T>` (signal-update.md §6), so
+    // `Signal<Database>` is `Shared<Database>` by another name — and used to
+    // compile clean while the direct spelling was refused.
+    assert_fails_spanning(
+        r#"
+        import std::reactive::Signal;
+        import std::db::Database;
+        fun sink(cell: Signal<Database>) {}
+        fun main() {}
+        "#,
+        "Signal<Database>",
+        "`Shared` cannot hold the resource `Database`, reached through `Signal.value`",
+    );
+}
+
+#[test]
+fn r10_leaves_a_signal_of_data_alone() {
+    // The other direction: the descent looks at the INSTANTIATED member, so a
+    // data argument reaches a `Shared<i32>` / `Shared<List<str>>` and stops.
+    assert_compiles(
+        r#"
+        import std::reactive::Signal;
+        fun main() {
+            let count: Signal<i32> = Signal::new(1);
+            let names: Signal<List<str>> = Signal::new(["a"]);
+            count.set(2);
+            names.set(["b"]);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn r10_refuses_a_resource_reaching_a_list_through_two_generic_fields() {
+    // The descent is transitive, and the path names every step it took.
+    assert_fails_spanning(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Inner<T> { items: List<T> }
+        struct Outer<T> { inner: Inner<T> }
+        fun sink(outer: Outer<Db>) {}
+        fun main() {}
+        "#,
+        "Outer<Db>",
+        "`List` cannot hold the resource `Db`, reached through `Outer.inner.items`",
+    );
+}
+
+#[test]
+fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
+    // A generic struct is not itself a container: `Holder<Db>` keeps the
+    // resource in a field, which is what R10's own steer recommends. Only a
+    // NATIVE container beneath it is refused.
+    assert_compiles(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Holder<T> { value: T }
+        fun sink(holder: Holder<Db>) {}
+        fun main() {}
+        "#,
+    );
+}
+
 // --- R12: a resource cannot coerce to `any` (argument, binding, return) --------
 
 #[test]

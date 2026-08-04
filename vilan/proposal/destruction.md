@@ -141,6 +141,11 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   arguments in v1 — their internals are host code the move checker cannot see. `Option`
   is the sanctioned container (it is a vilan enum, checkable under R11). A move-in/
   view-out `List<R>` API is the recorded v1.5 (connection registries want it eventually).
+  Asked **per instantiation** since 2026-08-04 (A19): the check descends a generic
+  aggregate's members as instantiated at the written application, so a resource
+  reaching a container through a field — `Signal<T>`'s `value: Shared<T>` — is
+  rejected too. A member whose type is already concrete is skipped: it is a written
+  application in its own right, and would otherwise report twice.
 - **R11 — generics must be move-clean per instantiation.** Instantiating a type parameter
   with a resource type re-checks the instantiated body under the affine rules (T := the
   resource): every T-typed value used at most once as a move, no captures, no copies.

@@ -511,6 +511,20 @@ pub struct Struct<'src> {
     pub resource: bool,
 }
 
+/// A native container holding a resource, found at or beneath a written type
+/// application (R10 / A19): the container's display name, the resource argument
+/// it holds, and the member chain the search took to reach it — empty when the
+/// application IS the container.
+struct ContainerResource<'src> {
+    container_name: &'static str,
+    argument: TypeId,
+    field_path: Vec<&'src str>,
+    /// The aggregate whose member completes the chain, and that member's name
+    /// span — a secondary note's anchor, and the file it lives in. `None` when
+    /// the application is the container and there is nothing to point at.
+    declared_at: Option<(Id, Span)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Field<'src> {
     pub name: &'src str,
@@ -4185,6 +4199,12 @@ impl<'src> Analyzer<'src> {
     /// sanctioned resource container, so it is deliberately absent from the reject
     /// set. Checks every written generic type application collected at
     /// `walk_type_node`, once types resolve.
+    ///
+    /// The check is per-INSTANTIATION, not per head (A19): a resource can reach a
+    /// container through a generic aggregate's field, where the container is
+    /// written generically and holds nothing yet. `Signal<T>`'s storage is a
+    /// `Shared<T>`, so `Shared<Database>` was refused while `Signal<Database>` —
+    /// the same container, holding the same resource — compiled clean.
     fn check_container_resource_arguments(&mut self) {
         let applications = std::mem::take(&mut self.generic_type_applications);
         // The resource-rejecting heads, by entity id -> display name.
@@ -4201,34 +4221,150 @@ impl<'src> Analyzer<'src> {
             containers.push((id, "Task"));
         }
         for (type_id, span) in applications {
-            let (head_id, arguments) = match type_id.get_type(self) {
-                Type::Struct(id, arguments) | Type::Enum(id, arguments) => (id, arguments),
-                _ => continue,
-            };
-            let Some((_, container_name)) =
-                containers.iter().copied().find(|(id, _)| *id == head_id)
+            let mut path = Vec::new();
+            let mut visiting = HashSet::new();
+            let Some(found) =
+                self.container_resource_in(type_id, &containers, &mut path, &mut visiting)
             else {
                 continue;
             };
-            for argument in arguments {
-                if self.type_is_resource(argument) {
-                    let rendered =
-                        self.pretty_print_type(&argument.get_type(self), &HashMap::new());
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span,
-                        msg: format!(
-                            "`{container_name}` cannot hold the resource `{rendered}`: a native \
-                             container's internals are host code the move checker cannot see (v1); \
-                             `Option` is the sanctioned resource container, or hold the resource in \
-                             a struct field"
-                        ),
-                    });
-                    // One diagnostic per application; the first resource argument
-                    // is enough to steer.
-                    break;
+            let container_name = found.container_name;
+            let rendered = self.pretty_print_type(&found.argument.get_type(self), &HashMap::new());
+            // The head the user wrote, so the path reads as they see it.
+            let reached = (!found.field_path.is_empty())
+                .then(|| {
+                    let head = self.type_head_name(type_id).unwrap_or("this type");
+                    format!(", reached through `{head}.{}`", found.field_path.join("."))
+                })
+                .unwrap_or_default();
+            // C3: one secondary note, at the member that holds the container —
+            // which for `Signal` is in `std`, so the primary stays in user code
+            // (A2) and the note names the file it points into.
+            let note = found.declared_at.map(|(owner_id, member_span)| {
+                let member = found.field_path.last().copied().unwrap_or("it");
+                let note_source = self.source_of_id(owner_id);
+                crate::error::Note {
+                    span: member_span,
+                    msg: format!("`{member}` is that `{container_name}` here"),
+                    source: (note_source != Some(self.current_source_id))
+                        .then_some(note_source)
+                        .flatten(),
                 }
+            });
+            self.diagnostics.push(Error {
+                note,
+                span,
+                msg: format!(
+                    "`{container_name}` cannot hold the resource `{rendered}`{reached}: a native \
+                     container's internals are host code the move checker cannot see (v1); \
+                     `Option` is the sanctioned resource container, or hold the resource in \
+                     a struct field"
+                ),
+            });
+        }
+    }
+
+    /// Finds a native container holding a resource at or beneath `type_id`, for
+    /// R10. The written head is asked first — the original question — and then,
+    /// for a GENERIC aggregate, each member as instantiated HERE: `Signal<T>`'s
+    /// `value: Shared<T>` is a `Shared<Database>` only at `Signal<Database>`, and
+    /// the written head alone cannot see that (A19). The descent mirrors
+    /// `compute_resource`'s, and skips a member whose substituted type is its
+    /// declared one: a concrete member is a written application in its own right,
+    /// already checked, and reporting it again would be two diagnostics for one
+    /// root cause.
+    fn container_resource_in(
+        &mut self,
+        type_id: TypeId,
+        containers: &[(Id, &'static str)],
+        path: &mut Vec<&'src str>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Option<ContainerResource<'src>> {
+        let (head_id, arguments) = match type_id.get_type(self) {
+            Type::Struct(id, arguments) | Type::Enum(id, arguments) => (id, arguments),
+            _ => return None,
+        };
+        if let Some((_, container_name)) = containers.iter().copied().find(|(id, _)| *id == head_id)
+        {
+            // One diagnostic per application; the first resource argument is
+            // enough to steer.
+            let argument = arguments
+                .into_iter()
+                .find(|argument| self.type_is_resource(*argument))?;
+            return Some(ContainerResource {
+                container_name,
+                argument,
+                field_path: path.clone(),
+                declared_at: None,
+            });
+        }
+        // A member can only hide a container behind a type ARGUMENT, and a
+        // recursive type would otherwise descend forever.
+        if arguments.is_empty() || !visiting.insert(type_id) {
+            return None;
+        }
+        // A struct's fields, or an enum's variant payloads, with the name the
+        // path should read and the span a note can anchor at.
+        let (parameters, members): (Vec<TypeId>, Vec<(&'src str, Span, TypeId)>) =
+            if let Some(struct_) = self.structs.get(&head_id) {
+                (
+                    struct_.generic_parameter_constraint_ids.clone(),
+                    struct_
+                        .fields
+                        .iter()
+                        .map(|field| (field.name, field.name_span, field.type_id))
+                        .collect(),
+                )
+            } else if let Some(enum_) = self.enums.get(&head_id) {
+                (
+                    enum_.generic_parameter_constraint_ids.clone(),
+                    enum_
+                        .variants
+                        .iter()
+                        .flat_map(|variant| {
+                            variant
+                                .data_type_ids
+                                .iter()
+                                .map(|payload| (variant.name, enum_.name_span, *payload))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect(),
+                )
+            } else {
+                visiting.remove(&type_id);
+                return None;
+            };
+        let context = Self::instantiation_context(&parameters, &arguments);
+        let mut found = None;
+        for (name, name_span, member) in members {
+            let member_type = member.get_type(self);
+            let member_type_id = self
+                .substitute_type(&member_type, &context)
+                .get_type_id(self);
+            if member_type_id == member {
+                continue;
             }
+            path.push(name);
+            found = self.container_resource_in(member_type_id, containers, path, visiting);
+            path.pop();
+            if let Some(found) = found.as_mut() {
+                // The DEEPEST frame owns the note; this one only fills it in if
+                // the container was its own member.
+                found.declared_at.get_or_insert((head_id, name_span));
+                break;
+            }
+        }
+        visiting.remove(&type_id);
+        found
+    }
+
+    /// The written name of a nominal type's head, for a diagnostic that has to
+    /// name the path a resource took through it.
+    fn type_head_name(&self, type_id: TypeId) -> Option<&'src str> {
+        match type_id.get_type(self) {
+            Type::Struct(id, _) => self.structs.get(&id).map(|struct_| struct_.name),
+            Type::Enum(id, _) => self.enums.get(&id).map(|enum_| enum_.name),
+            _ => None,
         }
     }
 
