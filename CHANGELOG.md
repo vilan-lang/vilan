@@ -6,7 +6,11 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## v0.25.0 — 2026-08-04
+## Unreleased
+
+**`Option`'s remaining combinators work on a resource — or say exactly why they cannot.** After the consuming-call change in v0.25.0, nine combinators refused an `Option<SomeResource>` outright. Six of them work now. `is_some_and`, `ok_or` and `unzip` were plain `own self` conversions. `inspect` and `or_else` are rewritten over `is` tests, which *loan* rather than consume, so `opt.inspect(|v| ..)` reads the payload and hands the option straight back. `==` between two options never actually needed a fix — it was on the refused list by mistake — and its rewrite drops the temporary pair it used to build for every comparison. The three that still refuse do so for one reason, now stated in one sentence each: `or`, `xor` and `unwrap_or` all have a path that *discards* a resource value they were handed, and a generic body has no way to destroy one. Each names the value it cannot handle — `or` names its alternative, `unwrap_or` its fallback — where before the first thing you were told was about the receiver, with a suggested fix that fixed nothing. The spellings that produce an alternative instead of taking one in, `or_else` and `unwrap_or_else`, work. **Plain data is untouched**: every one of these copies for a non-resource and behaves exactly as before, verified line by line.
+
+
 
 **A resource cannot hide in a container behind a generic.** `Shared<Database>` was refused — the native containers' internals are host code the move checker cannot see — but `Signal<Database>` compiled clean, even though a `Signal`'s storage *is* a `Shared`. The rule was being read off the type you wrote rather than the one you got: `Signal`'s `Shared<T>` field holds nothing at its declaration, and only becomes a `Shared<Database>` at the point of use. It is now read per use, descending a generic type's fields as they stand at that use, so the rule covers any generic of your own with a `List`, `Map`, `Set`, `Shared`, `Task`, `Promise`, or `Context` field — not just `Signal`. The error names the route the resource took to get there (``Shared` cannot hold the resource `Database`, reached through `Signal.value``) and points at the field it landed in. `Signal<i32>`, `Signal<List<str>>`, and holding a resource in a struct field of your own are all unaffected.
 

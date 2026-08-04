@@ -153,17 +153,35 @@ copy the value out. Iteration by view (`for e in &mut list`) binds each
 element as a view: assignment and field writes go through; `*e` reads the
 element. The parameter conventions:
 
-| Convention | Written | Meaning |
-|---|---|---|
-| bare | `x: T` | by value (a copy, rule 1) |
-| own | `own x: T` | by value, explicitly (documentation of intent) |
-| ref | `&x` / `x: &T` | readonly view |
-| ref mut | `&mut x` / `x: &mut T` | writable view |
+| Convention | Written | Data | Resource |
+|---|---|---|---|
+| bare | `x: T` | by value (a copy, rule 1) | a **loan** — no copy, no move (R3) |
+| own | `own x: T` | by value, explicitly (documentation of intent) | a **move** (R3) |
+| ref | `&x` / `x: &T` | readonly view | readonly view (a loan) |
+| ref mut | `&mut x` / `x: &mut T` | writable view | writable view (a loan) |
+
+The two columns are one rule read at two types, not two rules. **A bare
+parameter is a loan; for data a loan is indistinguishable from a copy** —
+nothing observes the difference, because the callee's copy is private and a
+resource's is forbidden — so the data column states the copy the
+implementation performs and the resource column states the ownership the
+convention carries. `own` is the same story from the other side: it is the
+convention that says "the callee takes ownership", which for data is
+performed by copying and for a resource *is* the move. R3 (below) is the
+normative statement for a resource; this table is its by-convention index.
+
+The consequence that catches people, spelled out because it is what the
+"a copy" reading hides: **a body may not move a bare parameter out** — no
+returning it, no `own`-passing it on, no consuming `match` of it — when the
+parameter is a resource. A loan changes no ownership, so ownership cannot
+leave through one.
 
 Orthogonal to the conventions, `mut x: T` marks the **binder** mutable:
 the callee may rebind and field-write its by-value copy (rule 1 copies
 an aggregate at body entry), with nothing visible to the caller. To
-mutate the *caller's* value, use `&mut`.
+mutate the *caller's* value, use `&mut`. `mut` combines with neither
+`own` nor a view — an `own` parameter is already the callee's own storage
+and is writable without it, so `mut own x` is a parse error.
 
 ## 6.4 Rule 4 — no invalidating mutation under a live view
 
@@ -311,7 +329,8 @@ changes no ownership and is policed by rule 4.
   resource.
 - **R2: overwrite drops.** Assigning onto a binding that still owns a
   resource drops the old value first, then moves the new one in.
-- **R3: parameters.** `self` / `&x` / `&mut x` are loans, unchanged; `own
+- **R3: parameters.** `self` / bare `x` / `&x` / `&mut x` are loans,
+  unchanged (§6.3's table is the by-convention index of this line); `own
   x` is a move, and for a resource *only* a move: an `own` argument that is
   not the binding's last use is an error (where a data `own` would silently
   copy). The rule reads in both directions: because a loan changes no

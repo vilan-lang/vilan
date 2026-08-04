@@ -664,6 +664,37 @@ fn assert_fails_noting(source: &str, message_part: &str, note_spanning: &str, no
     );
 }
 
+/// `assert_fails_noting` for the R11 family's shape: the error is at the
+/// instantiation site in this program and the note points into the std body
+/// being instantiated. The note's span is therefore an offset into a file this
+/// test never wrote, so it is checked by its `source` marker (present ⇒ a
+/// different file) and its text, not a range.
+///
+/// It also asserts the program produces exactly ONE diagnostic, which is the
+/// half that makes it a pin rather than a restatement: the value that genuinely
+/// cannot be handled must be the only thing reported, with no leading
+/// distraction about the receiver (B63).
+#[track_caller]
+fn assert_only_failure_noting_into_std(source: &str, message_part: &str, note_part: &str) {
+    let diagnostics = failure_diagnostics_with_notes(source);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly one diagnostic; got: {diagnostics:#?}"
+    );
+    let (message, _, note) = &diagnostics[0];
+    assert!(
+        message.contains(message_part),
+        "the diagnostic does not contain {message_part:?}: {message:?}"
+    );
+    assert!(
+        note.as_ref().is_some_and(
+            |(msg, _, from_other_source)| msg.contains(note_part) && *from_other_source
+        ),
+        "the diagnostic does not note {note_part:?} in another source; got: {note:#?}"
+    );
+}
+
 /// `assert_fails_noting`, but the note spans the Nth occurrence (0-based) of
 /// `note_spanning` — for notes that point at a declaration the diagnosed use
 /// necessarily precedes (use-before-declaration's declared-later note).
@@ -24055,6 +24086,314 @@ fn b60_a_data_option_is_unaffected_by_the_consuming_call() {
     );
 }
 
+// --- B63: Option's remaining combinators at a resource instantiation ----------
+//
+// B60 left nine rejecting. Three (`is_some_and`, `ok_or`, `unzip`) were plain
+// `own self` conversions blocked only on the share elision, which B63(a) above
+// unblocks. The other six read `self` twice — `match self { Some(_) => self }`
+// — or built a `(self, b)` tuple, which is a STORE and so a copy R1 forbids;
+// rewriting them over `is`, which LOANS, settles each on its own merits.
+//
+// Three of the six now work at a resource. Three still reject, and BECAUSE THEY
+// MUST: each has a path that discards a resource value it was handed, and a
+// generic body cannot destroy a `T` (destruction.md §6). What changed for those
+// is the diagnostic — one error naming the value that genuinely cannot be
+// handled, where before the first error named `self` and pointed at a fix that
+// does not fix it. Data behaviour is unchanged throughout: pinned below, and in
+// bytes by the corpus (`equality.js` / `generic-equality.js` lose the tuple).
+
+#[test]
+fn b63_is_some_and_at_a_resource_instantiation() {
+    // Accepted now, rejected before. The payload goes to the predicate and
+    // nothing survives the call. NOTE the absent `drop a`: a match-arm capture
+    // of a resource payload is never destroyed — B62, pre-existing on v0.24.0
+    // and shared with every combinator B60 already converted (`is_none_or`,
+    // `map_or`, `filter`, …). This pin asserts what the arc changed; B62 owns
+    // the missing line.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let slot: Option<Res> = Some(Res { tag = "a", n = 7 });
+            print(slot.is_some_and(|r| r.n == 7));
+            print("end");
+        }
+        "#,
+        "true\nend\n",
+    );
+}
+
+#[test]
+fn b63_ok_or_at_a_resource_instantiation() {
+    // The payload moves into the `Ok`, which the caller then owns and destroys
+    // exactly once — one `drop b`, after `end`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let slot: Option<Res> = Some(Res { tag = "b", n = 1 });
+            let outcome = slot.ok_or("missing");
+            print(outcome.is_ok());
+            print("end");
+        }
+        "#,
+        "true\nend\ndrop b\n",
+    );
+}
+
+#[test]
+fn b63_unzip_at_a_resource_instantiation() {
+    // The resource half of the pair lands in the returned tuple's first slot,
+    // the data half reads back correctly, and the tuple destroys the one
+    // resource once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let paired: Option<(Res, i32)> = Some((Res { tag = "p", n = 4 }, 9));
+            let unzipped = paired.unzip();
+            print(unzipped.1.unwrap_or(0));
+            print("end");
+        }
+        "#,
+        "9\nend\ndrop p\n",
+    );
+}
+
+#[test]
+fn b63_inspect_at_a_resource_instantiation() {
+    // The rewrite's clearest win. `inspect` must read the payload WITHOUT
+    // consuming it and then hand the option back; `is Some(let x)` loans, so
+    // the receiver survives the test intact and is returned by the `own`
+    // parameter's move — one value, one drop.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let slot: Option<Res> = Some(Res { tag = "c", n = 3 });
+            let back = slot.inspect(|r| print(i"saw {r.tag}"));
+            print("end");
+        }
+        "#,
+        "saw c\nend\ndrop c\n",
+    );
+}
+
+#[test]
+fn b63_or_else_at_a_resource_instantiation() {
+    // `or_else` is resource-clean where `or` is not, and the difference is
+    // exact: the fallback is PRODUCED on the `None` path rather than handed in
+    // and discarded, and a `self` that reaches that path is `None` — no payload
+    // to destroy. One resource is built and destroyed once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let empty: Option<Res> = None;
+            let filled = empty.or_else(|| Some(Res { tag = "e", n = 5 }));
+            print("end");
+        }
+        "#,
+        "end\ndrop e\n",
+    );
+}
+
+#[test]
+fn b63_eq_at_a_resource_instantiation() {
+    // NOT red at v0.25.0, and that is the finding: `affine-moves.md` §6 listed
+    // `eq` among the combinators that "reject at a resource instantiation", and
+    // it did not — the old `match (self, b)` moved nothing out of a loan, so
+    // the rule it was said to break never applied. It compiled and ran there
+    // too. This pin is the one nobody had written, and the rewrite is a shape
+    // win rather than a fix: both sides stay LOANS, read once per path, and the
+    // per-comparison tuple is gone (`equality.js`, `generic-equality.js`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with PartialEq { fun eq(self, other: Res): bool { self.n == other.n } }
+        fun sink(own o: Option<Res>) {}
+        fun main() {
+            let a: Option<Res> = Some(Res { tag = "a", n = 7 });
+            let b: Option<Res> = Some(Res { tag = "b", n = 7 });
+            print(a == b);
+            sink(a);
+            sink(b);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b63_or_at_a_resource_rejects_the_discarded_alternative() {
+    // `Some(a).or(b)` must destroy `b`, which a generic body cannot do. `b`
+    // stays a LOAN so the rejection is forced: declaring `own b` would make it
+    // COMPILE and silently leak (the every-path gap recorded in
+    // `affine-moves.md` §6). The error now names `b`, not `self`.
+    assert_only_failure_noting_into_std(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Db { handle: i32 }
+        fun main() {
+            let opt: Option<Db> = Some(Db { handle = 1 });
+            let other: Option<Db> = None;
+            let picked = opt.or(other);
+        }
+        "#,
+        "not move-clean when instantiated with a resource",
+        "the loaned parameter `b` is moved out here",
+    );
+}
+
+#[test]
+fn b63_xor_at_a_resource_rejects_the_two_some_discard() {
+    // `Some(a).xor(Some(b))` is `None` — it discards BOTH. R7 catches it on the
+    // `own` declarations: moved on one path but not all. The whole diagnostic
+    // is the single honest sentence, where before it was two errors led by a
+    // distraction about `self`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Db { handle: i32 }
+        fun main() {
+            let opt: Option<Db> = Some(Db { handle = 1 });
+            let other: Option<Db> = None;
+            let picked = opt.xor(other);
+        }
+        "#,
+        "a resource-typed value is moved on one path but not all",
+    );
+}
+
+#[test]
+fn b63_unwrap_or_at_a_resource_rejects_the_discarded_fallback() {
+    // `Some(v).unwrap_or(f)` must destroy `f`. `own self` removes the receiver
+    // from the report, leaving one error that names the fallback — and
+    // `unwrap_or_else`, which produces its fallback instead, is the spelling
+    // that works.
+    assert_only_failure_noting_into_std(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Db { handle: i32 }
+        fun main() {
+            let opt: Option<Db> = Some(Db { handle = 1 });
+            let value = opt.unwrap_or(Db { handle = 9 });
+        }
+        "#,
+        "not move-clean when instantiated with a resource",
+        "the loaned parameter `fallback` is moved out here",
+    );
+}
+
+#[test]
+fn b63_unwrap_or_else_is_the_resource_clean_fallback() {
+    // The steer `unwrap_or`'s rejection implies, pinned so the recommendation
+    // cannot rot: producing the fallback instead of handing it in is clean.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str, n: i32 }
+        impl Res with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let empty: Option<Res> = None;
+            let value = empty.unwrap_or_else(|| Res { tag = "f", n = 2 });
+            print(value.n);
+        }
+        "#,
+        "2\ndrop f\n",
+    );
+}
+
+#[test]
+fn b63_the_rewritten_combinators_are_unchanged_at_data() {
+    // Rule 1's half, over all nine: `own self` COPIES for data, and `is` tests
+    // decide exactly what the `match`es decided. Every line below is
+    // byte-identical to the v0.25.0 output.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let some: Option<i32> = Some(3);
+            let none: Option<i32> = None;
+            print(some.is_some_and(|n| n > 2));
+            print(none.is_some_and(|n| n > 2));
+            print(some.ok_or("missing").is_ok());
+            print(none.ok_or("missing").is_ok());
+            let pair: Option<(i32, str)> = Some((1, "x"));
+            let (left, right) = pair.unzip();
+            print(left.unwrap_or(0));
+            print(some.or(none).unwrap_or(0));
+            print(none.or(some).unwrap_or(0));
+            print(none.or_else(|| Some(9)).unwrap_or(0));
+            print(some.or_else(|| Some(9)).unwrap_or(0));
+            print(some.xor(none).unwrap_or(0));
+            print(some.xor(Some(4)).unwrap_or(0));
+            print(none.xor(none).unwrap_or(0));
+            print(some.inspect(|n| print(i"saw {n}")).unwrap_or(0));
+            print(some == Some(3));
+            print(some == Some(4));
+            print(some == none);
+            print(none == none);
+            print(some.unwrap_or(7));
+            print(none.unwrap_or(7));
+            print(some.is_some());
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\n1\n3\n3\n9\n3\n3\n0\n0\nsaw 3\n3\ntrue\nfalse\nfalse\ntrue\n3\n7\ntrue\n",
+    );
+}
+
+#[test]
+fn b63_a_data_option_survives_the_own_self_combinators() {
+    // The B60 companion, extended to the nine converted here: `own` copies for
+    // data, so the source binding stays readable and correct after each call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let slot: Option<i32> = Some(5);
+            print(slot.is_some_and(|n| n == 5));
+            print(slot.inspect(|n| print(n)).is_some());
+            print(slot.or(None).unwrap_or(0));
+            print(slot.unwrap_or(0));
+            print(slot.is_some());
+        }
+        "#,
+        "true\n5\ntrue\n5\n5\ntrue\n",
+    );
+}
+
 // --- R4: returns move out, through `if`/`match` tails; a diverging leg exempt ---
 
 #[test]
@@ -26546,6 +26885,48 @@ fn a_generic_own_t_moved_out_on_every_branch_is_accepted() {
             drop(choose(db, true));
         }
         "#,
+    );
+}
+
+#[test]
+#[ignore = "OPEN: two own parameters moved on DIFFERENT branches pass the every-path check; the un-moved one leaks (found by the B63 arc, pre-existing on v0.25.0)"]
+fn two_own_generics_moved_on_different_branches_is_not_every_path() {
+    // The rule says "moved out on EVERY path". `check_own_generic_exactly_once`
+    // implements it as "still owned after `plan_scope`", and `plan_branches`
+    // merges by INTERSECTION — a binding survives owned only if owned in every
+    // arm — which is the right merge for planning drops but the wrong one for
+    // finding leaks. `first` is moved in the `then` arm, `second` in the `else`,
+    // so the intersection is empty and both look moved. Neither is, on the path
+    // the other took: `pick(true, Some(a), Some(b))` returns `a` and destroys
+    // NOTHING — `b` is a resource that is simply never torn down. R7 does not
+    // cover it either, because branch TAILS are R4 move-outs, not a rejoin
+    // (`r4_return_through_if_tails_moves_each_branch`).
+    //
+    // Not fixed here, and not exploitable: `Option::or` keeps its alternative a
+    // LOAN precisely so it rejects rather than riding this (`affine-moves.md`
+    // §6). The fix is a union merge for the leak question — a second walk, or a
+    // merge mode threaded through `plan_*`.
+    //
+    // It also needs `is`-refinement, or it will reject correct code: `or_else`'s
+    // `if self is Some(_) { self } else { fn() }` leaves `self` un-moved on the
+    // else path, and that is SOUND because a `self` reaching it is `None` and
+    // has no payload to destroy (`b63_or_else_at_a_resource_instantiation`
+    // pins that it works). A path-sensitive check that cannot see the refinement
+    // would break it.
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Res { tag: str }
+        fun pick<T>(flag: bool, own first: Option<T>, own second: Option<T>): Option<T> {
+            if flag { first } else { second }
+        }
+        fun main() {
+            let kept = pick(true, Some(Res { tag = "kept" }), Some(Res { tag = "tossed" }));
+        }
+        "#,
+        "pick(true, Some(Res { tag = \"kept\" }), Some(Res { tag = \"tossed\" }))",
+        "move it out on every path, or take a concrete type",
     );
 }
 
