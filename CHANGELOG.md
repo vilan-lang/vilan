@@ -6,6 +6,18 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
+
+**It also fixes something you could not fix from outside.** Two writes in flight over one signal corrupted it. An older write that fails *after* a newer one succeeded rolled the newer value away — probe it through the free function and the screen ends up showing the value the cell started at while the server holds one from two writes later. The cell discards a superseded outcome (the newest write owns the cell, and the outcome still returns to its own caller), and a rollback lands on the last value the **server** confirmed rather than on whatever the signal happened to hold when the write began. Those are two different questions, so confirmations carry their own counter and an out-of-order reply cannot walk the recorded truth backwards.
+
+There is deliberately **no re-send on reconnect**, which is the one place this cell and `Draft` part company. A re-send is at-least-once: safe for a draft's "set this field to this value", and not safe for a one-shot *action*, which is what this cell exists for. The rollback is the recovery and the user re-issues. A cell over a **mirrored** signal is out of scope for now — the mirror writes behind the cell's back — and the reason is written down rather than left to be discovered.
+
+`optimistic` itself is untouched, byte for byte, and still pinned. Record: `proposal/optimistic-lifecycle.md`, which also carries two questions for the owner — whether the standard library should also grow the *paint-less* action-state cell the demand data actually points at, and whether the free function stays now that the cell exists.
+
+**A `Draft` publishes its status and its text together.** Editing a draft writes two signals — `local` and `state` — and anything watching both could catch the pair mid-change: the new text still claiming `Synced`, then `Dirty` a moment later. Every shipped consumer went through a UI event handler, which already wraps a dispatch in a turn and coalesced them, so nothing tripped over it; a draft driven from a node program, from SSR, or from a test published the middle. Both `push` and `adopt` now publish their transition as one wave. Under a UI turn not a byte changes.
+
 ## v0.28.0 — 2026-08-04
 
 **The phase-timing switch no longer kills warm analyses.** `VILAN_PHASE_TIMING=1` panicked on every base-cache hit (a refreshed start instant subtracted against a kept cold duration), and because the marks run inside the analysis fence, the panic surfaced as every analysis after a process's first silently producing no program. The instrument now reports honest per-phase numbers on cold and warm paths alike.

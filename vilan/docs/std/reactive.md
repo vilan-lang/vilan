@@ -10,7 +10,8 @@ import std::reactive::{
 	Signal, Source, Subscription, Disposable, combine,
 	Owner, owner_scope, get_owner, run_with_owner, comp,
 	Turn, FlushPolicy, turn_scope, turn, batch, flush,
-	optimistic, draft, Draft, DraftState,
+	optimistic, Optimistic, WriteState,
+	draft, Draft, DraftState,
 	reconcile, ReconcilePlan, RowStep,
 };
 ```
@@ -26,7 +27,8 @@ import std::reactive::{
 | `Owner` | struct | disposal bag; the lifetime unit |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
 | `turn`, `batch`, `flush`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
-| `optimistic` | fn | paint → commit → confirm-or-rollback |
+| `optimistic` | fn | paint → commit → confirm-or-rollback (one shot) |
+| `Optimistic<T>`, `WriteState` | struct/enum | the same lifecycle, observable and overlap-safe |
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
 | `reconcile`, `ReconcilePlan`, `RowStep` | fn/structs | keyed list diffing engine |
 
@@ -173,6 +175,65 @@ Paint `value` into `signal` now, await `commit`, then reconcile: the
 confirmed value on `Ok`, the previous value **rolled back** on `Err`. Returns
 the outcome for error UX. For continuous editing, use `draft` instead:
 rollback is wrong mid-typing.
+
+The one-shot spelling: one write, no state to bind, and the rollback target
+is whatever the signal held at the call. If more than one write can be in
+flight over the same signal, or anything needs to render "saving…", use the
+cell below.
+
+## Optimistic — the observable lifecycle
+
+```vilan,fragment
+[derive(PartialEq, Debug)]
+enum WriteState {
+	Confirmed,      // nothing in flight; the value is the last confirmed truth
+	Pending,        // the newest write is on the wire
+	Rejected(str),  // the newest write was refused; the cell rolled back
+}
+
+struct Optimistic<T> {
+	value: Signal<T>,           // the signal you handed to `over`; bind it
+	state: Signal<WriteState>,  // bind a spinner, a disabled button, a banner
+	…                           // internals: the confirmed shadow, two generations
+}
+
+impl Optimistic<type T> {
+	fun over(signal: Signal<T>): Optimistic<T>
+	fun write(self, value: T, commit: async || Result<T, str>): Result<T, str>
+}
+```
+
+The same lifecycle as `optimistic`, with the two things a free function has
+nowhere to keep.
+
+- **`state` is observable.** `Pending` while the commit is on the wire,
+  `Rejected(reason)` when one is refused — so a failure has somewhere to land
+  besides the return value. `write` still returns the outcome; the state is an
+  addition, not a replacement. `Rejected` is sticky until the next write.
+- **Overlapping writes are safe.** Only the **newest** write paints the cell;
+  a superseded write's outcome is discarded (it still returns to its own
+  caller). And a rollback lands on the last value the **server** confirmed,
+  not on whatever the signal happened to hold — a distinction that only shows
+  up once writes overlap, and one that gets a counter of its own so an
+  out-of-order reply cannot walk it backwards.
+- **`over` wraps an existing signal**, so adopting the cell changes no
+  binding, and it seeds the confirmed value from it.
+- **Every transition is one wave.** The value and the state are published
+  together, so an observer of both never sees "new value, still confirmed".
+- `write` awaits, like `optimistic`. Fire-and-forget is
+  `let _sent = async cell.write(..)`.
+
+The commit returns `Result<T, str>` — the confirmed value or a reason — so an
+rpc-calling closure maps its error the same way a `Draft` commit does.
+
+Unlike `Draft`, there is **no re-push on reconnect**: a re-push is
+at-least-once, which is safe for a draft's "set this field to this value" and
+unsafe for the one-shot *actions* this cell is for. The rollback is the
+recovery; the user re-issues the action.
+
+A cell over a **mirrored** signal is out of scope for now — the mirror writes
+behind the cell's back, so its confirmed value goes stale. Wrap a local
+signal (`proposal/optimistic-lifecycle.md` §8).
 
 ## Draft — local-first cells
 
