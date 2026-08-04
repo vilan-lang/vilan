@@ -4207,6 +4207,12 @@ impl<'src> Analyzer<'src> {
     /// the same container, holding the same resource — compiled clean.
     fn check_container_resource_arguments(&mut self) {
         let applications = std::mem::take(&mut self.generic_type_applications);
+        // Nothing is a resource unless something declares itself one, so the
+        // whole check — the per-instantiation descent included — is dead work
+        // for a program with no `resource` declaration anywhere.
+        if !self.any_declared_resource() {
+            return;
+        }
         // The resource-rejecting heads, by entity id -> display name.
         let mut containers: Vec<(Id, &'static str)> = Vec::new();
         for name in ["List", "Map", "Set", "Shared", "Context"] {
