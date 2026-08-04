@@ -6326,6 +6326,26 @@ impl Formatter {
         self.sequence(list, ";", 0)
     }
 
+    /// The separator two adjacent output fragments need. Normally that is just
+    /// `space`, but dropping the padding is only sound while it leaves the TOKEN
+    /// STREAM alone, and at an operator junction it does not always: `3 - -(2)`
+    /// printed tight is `3--(2)`, which JavaScript lexes as one postfix `--` and
+    /// rejects. A pair of characters that would fuse into a longer token keeps a
+    /// single space whatever the padding option says — the minimum separation,
+    /// not the configured one.
+    fn between(&self, left: &str, right: &str) -> &'static str {
+        if !self.space.is_empty() {
+            return self.space;
+        }
+        match (left.chars().next_back(), right.chars().next()) {
+            // `+ +…` and `- -…` lex as the increment and decrement operators.
+            (Some('+'), Some('+')) | (Some('-'), Some('-')) => " ",
+            // `/ /…` opens a line comment and `/ *…` a block comment.
+            (Some('/'), Some('/' | '*')) => " ",
+            _ => "",
+        }
+    }
+
     /// Renders a sequence of statements, one per line, each indented to `level`.
     /// The per-statement indent lives here (not in `node`) so `node` can render a
     /// sub-expression inline — without a leading indent — while still passing the
@@ -6502,9 +6522,16 @@ impl Formatter {
                 let parent = Self::js_binary_precedence(*op);
                 let s_lhs = self.operand(lhs, level, |child| child >= parent);
                 let s_rhs = self.operand(rhs, level, |child| child > parent);
+                // The one junction in the printer where two arbitrary fragments
+                // meet across punctuation, so the one that needs `between`.
                 format!(
                     "{}{}{}{}{}{}",
-                    s_lhs, self.space, s_op, self.space, s_rhs, terminator
+                    s_lhs,
+                    self.between(&s_lhs, s_op),
+                    s_op,
+                    self.between(s_op, &s_rhs),
+                    s_rhs,
+                    terminator
                 )
             }
             js::Node::Unary(operator, operand) => {
@@ -7638,7 +7665,44 @@ fn collect_reached_names(scope: &JsScope, reached: &mut HashSet<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::unescape_string;
+    use super::{Formatter, unescape_string};
+
+    /// The junctions where dropping the padding would change the token stream.
+    /// Only `- -` is reachable from Vilan source today (`-` is the only
+    /// arithmetic unary the language has), so the rest of the rule is stated
+    /// here or nowhere: the day a `+` unary or a regex literal arrives, the
+    /// printer must already be right rather than newly wrong.
+    #[test]
+    fn tight_printing_separates_only_the_pairs_that_would_fuse() {
+        let tight = Formatter::from_options(false, false);
+        // `3 - -(2)` must not become `3--(2)`, a postfix decrement.
+        assert_eq!(tight.between("3", "-"), "");
+        assert_eq!(tight.between("-", "-(2)"), " ");
+        // The same for the increment operator, and for both comment openers.
+        assert_eq!(tight.between("+", "+(2)"), " ");
+        assert_eq!(tight.between("/", "/(2)"), " ");
+        assert_eq!(tight.between("/", "*(2)"), " ");
+        // Everything else stays tight — a rule that always padded would be
+        // correct and would also stop minifying.
+        assert_eq!(tight.between("7", "-"), "");
+        assert_eq!(tight.between("-", "9"), "");
+        assert_eq!(tight.between("*", "-(2)"), "");
+        assert_eq!(tight.between("-", "(2)"), "");
+        assert_eq!(tight.between("===", "-(2)"), "");
+        // An empty side has no last/first character to fuse with.
+        assert_eq!(tight.between("", "-"), "");
+        assert_eq!(tight.between("-", ""), "");
+    }
+
+    /// Padded output already separates every junction, so the rule costs it
+    /// nothing and must not double a space.
+    #[test]
+    fn padded_printing_is_unchanged_by_the_fusing_rule() {
+        let padded = Formatter::from_options(true, true);
+        assert_eq!(padded.between("-", "-(2)"), " ");
+        assert_eq!(padded.between("7", "-"), " ");
+        assert_eq!(padded.between("", ""), " ");
+    }
 
     /// A string literal's value is built from the NORMALIZED source text
     /// (windows-support.md §2, spec §2): a `\r\n` in the file is one line

@@ -1,4 +1,13 @@
-//! B69 — the release preset's short-name renaming must be collision-free.
+//! The release preset's emission path, pinned per defect.
+//!
+//! `preset = "release"` changes two things about the emitted JavaScript — what
+//! the identifiers are called and how tightly the tokens are packed — and until
+//! E36's differential (`release_differential.rs`) existed, neither was gated over
+//! anything but one fixture. Both turned out to be broken. The renaming defect
+//! (B69) is below; the tight-printing one the differential found on its first
+//! run is at the end of the file.
+//!
+//! # B69 — the short-name renaming must be collision-free
 //!
 //! `preset = "release"` renames every binding to the shortest identifier free
 //! in its JavaScript scope (`transformer.rs`, "Scope-aware name allocation").
@@ -302,5 +311,54 @@ fun main() {
 }
 "#,
         "6\n",
+    );
+}
+
+// --- Tight printing ---------------------------------------------------------
+
+/// The second defect the ungated release path was hiding, found by
+/// `release_differential.rs` on its first run (`unary-minus.vl`). Release drops
+/// the padding around operators, and `3 - -2` — a subtraction of a unary
+/// negation — printed tight as `3--(2)`, which JavaScript lexes as a postfix
+/// `--` and refuses to parse at all: `SyntaxError: Invalid left-hand side
+/// expression in postfix operation`.
+///
+/// The rule the fix states is that dropping padding may not change the TOKEN
+/// stream, so the cases here are the ones where the junction can fuse and the
+/// ones where it must stay tight — a `between` that always emitted a space
+/// would pass the first three assertions and quietly stop minifying.
+#[test]
+fn tight_printing_never_fuses_two_operators_into_one_token() {
+    assert_release_matches_debug(
+        r#"
+import std::print;
+
+fun main() {
+	let n = 2;
+	print(3 - -2);
+	print(3 - -n);
+	print(3 - -(-2));
+	print(7 - 9);
+	print(3 * -2);
+}
+"#,
+        "5\n5\n1\n-2\n-6\n",
+    );
+
+    // And the packing is still tight where nothing would fuse: the fix must buy
+    // its correctness with one space at one junction, not with padding
+    // everywhere.
+    let emitted = compile(
+        "import std::print;\n\nfun main() {\n\tprint(7 - 9);\n\tprint(3 - -2);\n}\n",
+        BuildOptions::from_preset(Preset::Release),
+    )
+    .expect("the release build");
+    assert!(
+        emitted.contains("7-9"),
+        "an ordinary subtraction must still print tight:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("3- -(2)"),
+        "the fusing junction takes exactly one space:\n{emitted}"
     );
 }
