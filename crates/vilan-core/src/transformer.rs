@@ -791,6 +791,13 @@ struct Transformer<'src> {
     // `__hmr_expose` getter at the module tail. Set only by an HMR-active `run
     // --watch`; false keeps output byte-identical.
     hmr: bool,
+    // Never-silent guard (B55): functions emitted as a call target that have NO
+    // source body — a trait's signature-only requirement. Such an emission is
+    // always a resolution failure (a generic that never got bound), and its
+    // output is `function f(self) {\n}`: a clean compile whose first use of the
+    // result is a runtime `TypeError`. Collected here and turned into a hard
+    // compile error at assembly, so the class cannot recur silently.
+    bodyless_emissions: Vec<Id>,
 }
 
 /// How a resource-owning scope's tail value is used when it is restructured into
@@ -891,6 +898,7 @@ impl<'src> Transformer<'src> {
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
+            bodyless_emissions: Vec::new(),
         }
     }
 
@@ -1112,6 +1120,39 @@ impl<'src> Transformer<'src> {
                     ],
                 ));
             }
+        }
+
+        // Never-silent (B55): refuse to ship a program that emitted a body-less
+        // function as a call target. The emitted body is empty, so the call
+        // yields `undefined` and the first use of the result is a runtime
+        // `TypeError` — from a compile that reported nothing. Whatever failed to
+        // resolve upstream, it must not leave here quietly.
+        if let Some(&function_id) = self.bodyless_emissions.first() {
+            let function = self.program.functions.get(&function_id);
+            let name = function.map(|function| function.name).unwrap_or("?");
+            let declaring_trait = self
+                .program
+                .traits
+                .values()
+                .find(|trait_| trait_.declarations.values().any(|id| *id == function_id))
+                .map(|trait_| trait_.name);
+            let source = match declaring_trait {
+                Some(trait_name) => format!("`{trait_name}`'s requirement `{name}`"),
+                None => format!("`{name}`"),
+            };
+            return Err(Error {
+                note: None,
+                span: function
+                    .map(|function| function.name_span)
+                    .unwrap_or_default(),
+                msg: format!(
+                    "internal: a call resolved to {source}, which has no body — \
+                     emitting it would produce an empty function and a runtime \
+                     `TypeError`. The receiver's type could not be resolved to a \
+                     concrete implementation at this call; please report this \
+                     program"
+                ),
+            });
         }
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
@@ -2876,10 +2917,14 @@ impl<'src> Transformer<'src> {
                     // Iterator protocol: evaluate the iterator once, then loop
                     // calling `next()` until it yields `None` (variant 1); the
                     // `Some` payload (slot 1) is the element.
-                    self.ensure_function_emitted(next_id);
-                    let next_name = self.ng.name_for(next_id);
+                    let next_dispatch = self.for_each_next_dispatch(id, next_id);
                     let iterator_name = self.ng.next_name();
                     let next_value_name = self.ng.next_name();
+                    let next_call = self.emit_dispatch(
+                        next_dispatch,
+                        vec![js::Node::Local(iterator_name.clone())],
+                        None,
+                    );
                     block.push(js::Node::ConstVariable(js::Variable {
                         name: iterator_name.clone(),
                         value: Box::new(t_iterable),
@@ -2887,10 +2932,7 @@ impl<'src> Transformer<'src> {
                     let mut loop_body = vec![
                         js::Node::ConstVariable(js::Variable {
                             name: next_value_name.clone(),
-                            value: Box::new(js::Node::Call(
-                                Box::new(js::Node::Local(next_name)),
-                                vec![js::Node::Local(iterator_name.clone())],
-                            )),
+                            value: Box::new(next_call),
                         }),
                         js::Node::If(js::IfBranch::If(
                             Box::new(js::Node::Binary(
@@ -4055,6 +4097,14 @@ impl<'src> Transformer<'src> {
     }
 
     fn function_with_name(&mut self, function: &Function<'src>, name: String) -> js::Node<'src> {
+        // Never-silent (B55): every path that emits a callable funnels through
+        // here, so this is where "a call resolved to NOTHING" becomes visible. A
+        // function with no source body is a trait's signature-only requirement —
+        // it is never the answer to a call, only what a call falls back to when
+        // the receiver's generic never got bound. Record it; assembly refuses.
+        if !function.has_body {
+            self.bodyless_emissions.push(function.id);
+        }
         let parameters = function
             .parameters
             .iter()
@@ -4134,6 +4184,47 @@ impl<'src> Transformer<'src> {
             }
         }
         vec![js::Node::Try(body, finally)]
+    }
+
+    /// How a `for` loop's protocol call (`next` / `next_mut`) lowers. The loop
+    /// is a call site like any other and takes the SAME dispatch precedence as
+    /// `Expr::Call`: a generic subject re-dispatches to the concrete type its
+    /// constraint is bound to here; `self` in a trait default re-dispatches to
+    /// the type the default is being specialized for; a concrete receiver whose
+    /// impl is generic monomorphizes against the loop's recorded bindings.
+    /// Emitting by bare id — which is all this did — left a generic callee's own
+    /// parameters unbound, so ITS bounded calls resolved to the trait's empty
+    /// abstract member (B55).
+    fn for_each_next_dispatch(&mut self, for_each_id: Id, next_id: Id) -> Dispatch<'src> {
+        let member = self.program.generic_dispatch.get(&for_each_id).copied();
+        let concrete = match member {
+            Some(GenericDispatch::OnConstraint(constraint_id, _)) => {
+                self.current_substitution.get(&constraint_id).copied()
+            }
+            Some(GenericDispatch::OnType(type_id, _)) => type_id.or(self.current_self_type),
+            None => None,
+        };
+        if let Some((GenericDispatch::OnConstraint(_, member_name), type_id))
+        | Some((GenericDispatch::OnType(_, member_name), type_id)) = member.zip(concrete)
+        {
+            let preferred = self
+                .program
+                .bound_dispatch_traits
+                .get(&for_each_id)
+                .copied();
+            if let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+            {
+                return dispatch;
+            }
+        }
+        let name = match self.call_substitution(for_each_id, next_id, &[]) {
+            Some(substitution) => self.emit_instance(next_id, &substitution),
+            None => {
+                self.ensure_function_emitted(next_id);
+                self.ng.name_for(next_id)
+            }
+        };
+        Dispatch::Call(name, self.program.async_functions.contains(&next_id))
     }
 
     /// Emits a concrete (non-generic) function once, keyed by its id. Any active

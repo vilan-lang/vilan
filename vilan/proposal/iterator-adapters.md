@@ -182,6 +182,31 @@ one root cause — instantiations are not seeded for callees reached by
 re-dispatch — but that diagnosis is work, not a finding, and belongs to
 the slice. **This is the single largest item in the arc.**
 
+> **Correction, 2026-08-04 (B55 slice).** Fixed; the guess above is wrong on
+> the count. The two triggers are **two** root causes, not one, sharing a
+> symptom:
+>
+> 1. **the `for`-loop edge** — the loop emitted its `next` callee by bare id
+>    (`transformer.rs`, the `Expr::ForEach` protocol arm), which is the
+>    *concrete*-function path. A generic callee walked with no substitution
+>    left its own `U` unbound. The loop now takes the same dispatch
+>    precedence as any call site (`for_each_next_dispatch`), and the analyzer
+>    records the loop's impl bindings alongside `for_each_next`.
+> 2. **the trait-default constructor** — nothing to do with instantiation
+>    seeding. `Self` in a member's *return type* was specialized only when
+>    the return type EQUALLED the `self` parameter's type, so a `Self`
+>    nested in a type argument (`Taken<Self, T>`) stayed the abstract trait
+>    type: `Counting{}.taken(3)` typed as `Taken<Iter, i32>`, binding
+>    `Taken`'s `U` to a bare trait. Substitution is now structural
+>    (`analyzer.rs`, `infer_type_inner`'s `Expr::Call` arm, via
+>    `substitute_member_type`), and reaches a generic receiver as well as a
+>    concrete one.
+>
+> The shared symptom — a call resolving to the trait's signature-only member
+> and emitting `function f(self) {\n}` — is now a hard compile error in its
+> own right (`transformer.rs`, `function_with_name` + assembly), so this
+> CLASS cannot recur silently whatever causes it.
+
 ### P3 — `for v in self` over a generic silently becomes a native `for...of`
 
 The natural way to write a terminal is `for v in self`. Inside
@@ -194,6 +219,20 @@ fields), prints `2`, and never calls `next`. Compiles clean. The fix is
 either to extend the protocol resolution to generics bounded by an
 iterator trait, or to reject the construct — either way it must not
 silently produce a field walk.
+
+> **Correction, 2026-08-04 (B56 slice).** Fixed, and the section's account of
+> WHICH subjects miss needs one amendment: `self` inside `impl Iter<type T>`
+> *is* a `Type::Struct` and always reached the protocol guard — what it hit
+> instead was P2's bare-id emission. The subjects that genuinely fell through
+> to the native `for...of` are the other two: `self` inside a **trait
+> default** (`Type::Trait`) and a **trait-bounded generic** (`Type::Generic`,
+> e.g. `it: I` where `I: Iter<T>` — that one summed the receiver's two fields
+> rather than its three elements). Both are now resolved, and BOTH resolutions
+> were taken: the protocol is extended to those subjects (re-dispatched per
+> monomorphization through `generic_dispatch`, the same channel a method call
+> on them uses), and a generic whose bounds provide no `next` is now rejected
+> — `cannot iterate 'I': no bound on it provides 'next(&mut self): Option<T>'`
+> — where it previously emitted a native loop that threw at runtime.
 
 ### P4 — a bound on a trait's own generic parameter does not reach its default bodies
 

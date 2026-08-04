@@ -1,0 +1,79 @@
+import std::print;
+import std::option::Option::{ self, Some, None };
+
+// B55/B56: a bounded generic reached through a re-dispatched callee. The
+// adapter pulls from its upstream through a bound (`self.upstream.next()`,
+// where `upstream: U` and `U: Iter<T>`), and every entry into it —
+// the `for`-loop protocol, a trait default's own loop over `self`, a
+// constructor that is itself a trait default — has to carry the binding for
+// `U`. Emitting the callee by bare id left `U` unbound, and the inner call
+// resolved to `Iter`'s signature-only `next`: an EMPTY function body from a
+// clean compile.
+trait Iter<T> {
+	fun next(&mut self): Option<T>;
+
+	fun taken(self, count: i32): Taken<Self, T> {
+		Taken { upstream = self, remaining = count }
+	}
+
+	fun count_them(mut self): i32 {
+		mut n = 0;
+		for _v in self {
+			n = n + 1;
+		}
+		n
+	}
+}
+
+struct Counting {
+	at: i32,
+	limit: i32,
+}
+
+impl Counting with Iter<i32> {
+	fun next(&mut self): Option<i32> {
+		if self.at < self.limit {
+			self.at = self.at + 1;
+			Some(self.at)
+		} else {
+			None
+		}
+	}
+}
+
+struct Taken<U, T> {
+	upstream: U,
+	remaining: i32,
+}
+
+impl Taken<type U: Iter<T>, type T> with Iter<T> {
+	fun next(&mut self): Option<T> {
+		if self.remaining <= 0 {
+			ret None;
+		}
+		self.remaining = self.remaining - 1;
+		self.upstream.next()
+	}
+}
+
+// A `for` over a trait-bounded generic drives the protocol, not a native
+// `for...of` over the receiver's field array.
+fun sum_of<I: Iter<i32>>(mut it: I): i32 {
+	mut total = 0;
+	for v in it {
+		total = total + v;
+	}
+	total
+}
+
+fun main() {
+	// The loop protocol over a generic adapter.
+	mut taken = Counting { at = 0, limit = 5 }.taken(3);
+	for v in taken {
+		print(v); // 1, 2, 3
+	}
+	// A bounded-generic function's loop, over the same adapter.
+	print(sum_of(Counting { at = 0, limit = 5 }.taken(3))); // 6
+	// A trait default's loop over `self`, specialized for the adapter.
+	print(Counting { at = 0, limit = 9 }.taken(4).count_them()); // 4
+}
