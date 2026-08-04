@@ -15275,10 +15275,6 @@ impl<'src> Analyzer<'src> {
         type_id
     }
 
-    /// The element type of an iterable, when recoverable: a `List<T>` yields
-    /// `T`. Returns `None` for an erased `List` (no arguments) or a non-list
-    /// iterable (e.g. a custom iterator), whose element the caller treats as
-    /// `any`.
     /// The iterator-protocol method a `for` loop drives an iterable with:
     /// `next_mut` for a `for e in &mut container` (each binding a writable view),
     /// otherwise `next` (a copying iterator, or a readonly view). A built-in
@@ -15290,7 +15286,11 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    fn iterable_element_type(&self, iterable_type: &Type, next_method: &str) -> Option<Type> {
+    /// The element type of an iterable, when recoverable: a `List<T>` yields
+    /// `T`. Returns `None` for an erased `List` (no arguments) or a non-list
+    /// iterable whose protocol method can't be found, whose element the caller
+    /// treats as `any`.
+    fn iterable_element_type(&mut self, iterable_type: &Type, next_method: &str) -> Option<Type> {
         match iterable_type {
             // `List<T>` and `Set<T>` both iterate their single element type `T`
             // (a JS array / `Set` are natively iterable, yielding elements).
@@ -15328,8 +15328,93 @@ impl<'src> Analyzer<'src> {
                     _ => None,
                 }
             }
+            // `self` inside a trait default: its type is the declaring trait's
+            // abstract `Self`. The element is the payload of the trait's own
+            // `next`, with the trait's parameters bound to the arguments
+            // (`Iter<i32>::next(): Option<T>` -> `i32`).
+            Type::Trait(trait_id, arguments) => {
+                let (trait_id, arguments) = (*trait_id, arguments.clone());
+                self.trait_iterator_element(trait_id, &arguments, next_method)
+            }
+            // A trait-bounded generic (`it: I` where `I: Iter<T>`): the element
+            // comes from whichever bound provides the protocol method.
+            Type::Generic(constraint_id) => self
+                .generic_bound_traits(*constraint_id)
+                .into_iter()
+                .find_map(|(trait_id, arguments)| {
+                    self.trait_iterator_element(trait_id, &arguments, next_method)
+                }),
             _ => None,
         }
+    }
+
+    /// The element a trait's iterator method yields, when it declares one: the
+    /// `Option<T>` payload of `trait_id`'s `next` / `next_mut`, with the trait's
+    /// generic parameters substituted by `trait_arguments`. `None` when the
+    /// trait has no such member — which is what makes "this generic has no
+    /// iterator bound" detectable rather than silently native.
+    fn trait_iterator_element(
+        &mut self,
+        trait_id: Id,
+        trait_arguments: &[TypeId],
+        next_method: &str,
+    ) -> Option<Type> {
+        let next_id = self.method_member_in_trait(trait_id, next_method)?;
+        let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
+            return None;
+        };
+        let return_type = self
+            .functions
+            .get(function_id)?
+            .return_type_id?
+            .get_type(self);
+        let Type::Enum(enum_id, arguments) = return_type else {
+            return None;
+        };
+        if self.enums.get(&enum_id).map(|enumeration| enumeration.name) != Some("Option") {
+            return None;
+        }
+        let element = arguments.first()?.get_type(self);
+        let parameter_ids = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        let substitution: SubstitutionContext = parameter_ids
+            .into_iter()
+            .zip(trait_arguments.iter().copied())
+            .collect();
+        Some(self.substitute_type(&element, &substitution))
+    }
+
+    /// A `for` whose subject is a generic (or a bare trait `Self`) that no
+    /// bound gives the iterator protocol. There is nothing to drive and nothing
+    /// native to fall back to — a JS `for...of` over such a value walks the
+    /// receiver's flat FIELD array, or throws — so this is an error, not a
+    /// silent lowering (B56).
+    fn report_uniterable_for_each(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let span = **self
+            .span_map
+            .get(&iterable_id)
+            .or_else(|| self.span_map.get(&for_each_id))
+            .unwrap_or(&&EMPTY_SPAN);
+        self.diagnostics.push(Error {
+            note: None,
+            span,
+            msg: format!(
+                "cannot iterate `{rendered}`: no bound on it provides \
+                 `{next_method}(&mut self): Option<T>`, and a generic is not \
+                 natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) \
+                 or iterate a concrete container"
+            ),
+        });
     }
 
     /// If `type_` is a `List` whose element is still an unresolved inference slot
@@ -21446,36 +21531,91 @@ impl<'src> Analyzer<'src> {
         // (e.g. a `List`) stays a native `for...of`.
         for (for_each_id, iterable_id) in std::mem::take(&mut self.prepped_for_each) {
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
-            if matches!(iterable_type, Type::Struct(_, _) | Type::Enum(_, _)) {
-                // `for e in &mut container` drives a `next_mut(&mut self): Option<&mut
-                // T>` iterator (each binding a writable view); a plain `for x in
-                // container` drives `next`. A built-in `List`/`Set` has neither and
-                // falls through to the indexed/native loop.
-                let item_id = match self.expr_id_to_expr_map.get(&for_each_id) {
-                    Some(Expr::ForEach(_, item_id, _)) => *item_id,
-                    _ => None,
-                };
-                let next_method = self.for_each_next_method(item_id);
-                if let Some((next_id, impl_subject_id)) =
-                    self.method_member_impl_subject(&iterable_type, next_method)
-                {
-                    self.for_each_next.insert(for_each_id, next_id);
-                    // Bind the providing impl's generics from the receiver
-                    // (`Passthrough<Counting, i32>` against the impl's
-                    // `Passthrough<U, T>` binds `U = Counting`), keyed by the
-                    // LOOP — the callee is generic exactly as often as the
-                    // iterator is, and emitting it by bare id left `U` unbound,
-                    // so its own `self.upstream.next()` resolved to the
-                    // trait's empty abstract member (B55).
-                    let impl_subject = impl_subject_id.get_type(self);
-                    if let Some((_, bindings)) =
-                        self.reconcile_type(&impl_subject, &iterable_type, &HashMap::new())
-                        && !bindings.is_empty()
+            // `for e in &mut container` drives a `next_mut(&mut self): Option<&mut
+            // T>` iterator (each binding a writable view); a plain `for x in
+            // container` drives `next`. A built-in `List`/`Set` has neither and
+            // falls through to the indexed/native loop.
+            let item_id = match self.expr_id_to_expr_map.get(&for_each_id) {
+                Some(Expr::ForEach(_, item_id, _)) => *item_id,
+                _ => None,
+            };
+            let next_method = self.for_each_next_method(item_id);
+            match &iterable_type {
+                Type::Struct(_, _) | Type::Enum(_, _) => {
+                    if let Some((next_id, impl_subject_id)) =
+                        self.method_member_impl_subject(&iterable_type, next_method)
                     {
-                        self.method_call_substitution
-                            .insert(for_each_id, bindings.into_iter().collect());
+                        self.for_each_next.insert(for_each_id, next_id);
+                        // Bind the providing impl's generics from the receiver
+                        // (`Passthrough<Counting, i32>` against the impl's
+                        // `Passthrough<U, T>` binds `U = Counting`), keyed by the
+                        // LOOP — the callee is generic exactly as often as the
+                        // iterator is, and emitting it by bare id left `U` unbound,
+                        // so its own `self.upstream.next()` resolved to the
+                        // trait's empty abstract member (B55).
+                        let impl_subject = impl_subject_id.get_type(self);
+                        if let Some((_, bindings)) =
+                            self.reconcile_type(&impl_subject, &iterable_type, &HashMap::new())
+                            && !bindings.is_empty()
+                        {
+                            self.method_call_substitution
+                                .insert(for_each_id, bindings.into_iter().collect());
+                        }
                     }
                 }
+                // `for v in self` inside a trait default: `self` is the trait's
+                // abstract `Self`, so there is no impl to look in. Drive the
+                // trait's own protocol member and let codegen re-dispatch to
+                // whatever concrete type the default is specialized for — the
+                // same channel a `self.next()` call in a default uses. Without
+                // this the loop fell through to a native `for...of` over the
+                // struct's flat FIELD array (B56).
+                Type::Trait(trait_id, _) => {
+                    let trait_id = *trait_id;
+                    match self.method_member_in_trait(trait_id, next_method) {
+                        Some(next_id) => {
+                            self.for_each_next.insert(for_each_id, next_id);
+                            self.generic_dispatch
+                                .insert(for_each_id, GenericDispatch::OnType(None, next_method));
+                        }
+                        None => self.report_uniterable_for_each(
+                            for_each_id,
+                            iterable_id,
+                            &iterable_type,
+                            next_method,
+                        ),
+                    }
+                }
+                // A trait-bounded generic subject (`it: I` where `I: Iter<T>`):
+                // dispatch to the concrete type `I` is bound to at each
+                // monomorphization, exactly as a method call on `it` would.
+                Type::Generic(constraint_id) => {
+                    let constraint_id = *constraint_id;
+                    let resolved = self
+                        .generic_bound_traits(constraint_id)
+                        .into_iter()
+                        .find_map(|(trait_id, _)| {
+                            self.method_member_in_trait(trait_id, next_method)
+                                .map(|next_id| (trait_id, next_id))
+                        });
+                    match resolved {
+                        Some((trait_id, next_id)) => {
+                            self.for_each_next.insert(for_each_id, next_id);
+                            self.generic_dispatch.insert(
+                                for_each_id,
+                                GenericDispatch::OnConstraint(constraint_id, next_method),
+                            );
+                            self.bound_dispatch_traits.insert(for_each_id, trait_id);
+                        }
+                        None => self.report_uniterable_for_each(
+                            for_each_id,
+                            iterable_id,
+                            &iterable_type,
+                            next_method,
+                        ),
+                    }
+                }
+                _ => {}
             }
         }
 

@@ -624,11 +624,26 @@ impl<'a, 'src> Collector<'a, 'src> {
             }
             Expr::ForEach(iterable, _item, (statements, tail)) => {
                 // An iterator-protocol loop calls the resolved `next` on every
-                // pass — a real call edge, anchored at the loop itself.
+                // pass — a real call edge, anchored at the loop itself. It takes
+                // the same dispatch precedence as any call site: a loop over a
+                // trait-bounded generic (or over `self` in a trait default) is
+                // re-dispatched per monomorphized instance, so the concrete
+                // callee is not fixed here — and recording the TRAIT's
+                // signature-only `next` as a direct target would name a function
+                // with no body.
                 if let Some(&next_id) = self.program.for_each_next.get(&id) {
+                    let target = match self.program.generic_dispatch.get(&id) {
+                        Some(GenericDispatch::OnConstraint(..)) => {
+                            CallTarget::Indirect(IndirectReason::GenericMember)
+                        }
+                        Some(GenericDispatch::OnType(..)) => {
+                            CallTarget::Indirect(IndirectReason::TraitDispatch)
+                        }
+                        None => CallTarget::Function(next_id),
+                    };
                     self.calls.push(Call {
                         call_id: id,
-                        target: CallTarget::Function(next_id),
+                        target,
                     });
                 }
                 self.walk(*iterable);
