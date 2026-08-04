@@ -2749,6 +2749,81 @@ fn a_mut_capture_from_an_immutable_subject_copies() {
     );
 }
 
+// --- B63(a): the share elision's predicate is SEMANTIC, not the diagnostic one -
+//
+// `readonly_root` answers "what `declare it …` advice applies", and it owes
+// `None` for an `own` parameter because the advice would be `mut own x`, a parse
+// error. The elision's question is different — "can this place change" — and an
+// `own` parameter that nothing writes cannot. B60 reused the diagnostic helper
+// for the semantic decision, which cost every `own self` combinator its share on
+// data paths (`affine-moves.md` §5/§6); `share_subject_is_stable` splits them.
+
+#[test]
+fn an_own_parameter_capture_shares_when_nothing_writes_it() {
+    // The elision itself, which no runtime output can see: the capture's slot
+    // read emits bare. The one program-wide `__clone` site is this capture, so
+    // asserting the helper is absent entirely is exact. (`Option::map`'s
+    // monomorphized body in `vilan/test/closure-param-inference.js` is the
+    // same elision seen in bytes — it regained its pre-B60 form here.)
+    let source = r#"
+        import std::print;
+        fun peek(own pair: (List<i32>, i32)): i32 {
+            let (first, second) = pair;
+            first.len()
+        }
+        fun main() { print(peek(([ 1, 2 ], 3))); }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the `own`-parameter capture still copies:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "2\n");
+}
+
+#[test]
+fn an_own_parameter_capture_copies_when_a_method_writes_it() {
+    // The soundness boundary the split creates, and why the predicate is a
+    // WRITE SET rather than a blanket `own` admission: an `own` parameter is
+    // freely writable (`h.n = 5` inside `fun f(own h: Holder)` compiles), so a
+    // body that mutates it can observe the alias. `push` takes `&mut self`, so
+    // the receiver's root joins the write set and the capture copies — 1, not 2.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun observe(own pair: (List<i32>, i32)): i32 {
+            let (first, second) = pair;
+            pair.0.push(7);
+            first.len()
+        }
+        fun main() { print(observe(([ 1 ], 2))); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn an_own_parameter_capture_copies_when_an_assignment_writes_it() {
+    // The write set's other source, on its own pin because the two are found
+    // by different arms: a plain field assignment through the `own` parameter.
+    // The capture must not see `[ 9, 9 ]` — 1, not 2.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { xs: List<i32> }
+        fun observe(own pair: (Holder, i32)): i32 {
+            let (first, second) = pair;
+            pair.0.xs = [ 9, 9 ];
+            first.xs.len()
+        }
+        fun main() { print(observe((Holder { xs = [ 1 ] }, 2))); }
+        "#,
+        "1\n",
+    );
+}
+
 #[test]
 fn a_generic_capture_moves_a_resource_instantiation() {
     // B53 finding 2, R11 (`docs/spec/memory.md`): a capture typed by a bare

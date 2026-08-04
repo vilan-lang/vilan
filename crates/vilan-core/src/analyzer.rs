@@ -8793,9 +8793,6 @@ impl<'src> Analyzer<'src> {
         )
     }
 
-    /// If a place is a field/deref chain rooted in something immutable, its name
-    /// and the fix hint (`&mut x` for a readonly parameter, `mut` for an
-    /// immutable `let` local). `None` when the root is mutable — a `mut` local,
     /// The "declare it …" clause for an immutable-root diagnostic, from
     /// [`Self::readonly_root`]'s fix marker. A plain parameter offers BOTH
     /// spellings — `mut` (this function's copy) and `&mut` (the caller's
@@ -8812,8 +8809,18 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// or an `own` / `&mut` parameter. A bare parameter is readonly by default
-    /// (the position-default-convention flip).
+    /// **A DIAGNOSTIC helper.** If a place is a field/deref chain rooted in
+    /// something immutable, its name and the fix hint (`&mut x` for a readonly
+    /// parameter, `mut` for an immutable `let` local). `None` when the root is
+    /// mutable — a `mut` local, or an `own` / `&mut` parameter. A bare
+    /// parameter is readonly by default (the position-default-convention flip).
+    ///
+    /// Every `None` here means "no `declare it …` advice applies", which is NOT
+    /// the same question as "can this place change" — an `own` parameter is
+    /// writable and so answers `None`, yet a body that never writes it cannot
+    /// observe an alias into it. Ask [`Self::share_subject_is_stable`] for the
+    /// semantic question; this one only ever feeds a message
+    /// (`affine-moves.md` §6).
     fn readonly_root(&self, expr_id: Id) -> Option<(&'src str, &'static str)> {
         match self.expr_id_to_expr_map.get(&expr_id)? {
             Expr::Field(subject_id, _, _) | Expr::TupleIndex(subject_id, _, _) => {
@@ -8848,6 +8855,81 @@ impl<'src> Analyzer<'src> {
             }
             _ => None,
         }
+    }
+
+    /// Every binding a write in the program can reach: an assignment's place
+    /// root, an explicit `&mut place`, and any argument — the receiver
+    /// included — bound to a `&mut` parameter. A write through some OTHER name
+    /// for the same storage still lands here, because taking the `&mut` that
+    /// makes the second name is itself one of the three forms.
+    ///
+    /// Whole-program, computed once: the pass that consumes it
+    /// ([`Self::compute_capture_clone_sites`]) is whole-program too, and a
+    /// per-body split would buy nothing — a binding is local to one body.
+    fn collect_written_roots(&self) -> HashSet<Id> {
+        let mut written_places: Vec<Id> = Vec::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Assignment(target_id, _) => written_places.push(*target_id),
+                Expr::Reference(operand_id, true) => written_places.push(*operand_id),
+                Expr::Call(call_id) => {
+                    let Some(function_call) = self.function_calls.get(call_id) else {
+                        continue;
+                    };
+                    // An unresolvable callee (dispatched, generic) is
+                    // conservative: every place argument counts as written.
+                    match self.callee_conventions(function_call.subject_id) {
+                        Some(conventions) => {
+                            for (index, argument_id) in
+                                function_call.argument_ids.iter().enumerate()
+                            {
+                                if conventions.get(index).copied() == Some(Convention::RefMut) {
+                                    written_places.push(*argument_id);
+                                }
+                            }
+                        }
+                        None => written_places.extend(&function_call.argument_ids),
+                    }
+                }
+                _ => {}
+            }
+        }
+        written_places
+            .into_iter()
+            .filter_map(|place_id| self.place_root(place_id))
+            .collect()
+    }
+
+    /// The SHARE elision's predicate: whether a capture may alias this subject
+    /// instead of copying it — i.e. whether anything can write through the
+    /// place while the alias is live.
+    ///
+    /// Two ways to qualify, and splitting them is the point
+    /// (`affine-moves.md` §6). A **declared-readonly** root — a bare parameter,
+    /// a `&` view, an immutable `let` — qualifies because the compiler rejects
+    /// every write to it; that is exactly [`Self::readonly_root`] read as a
+    /// predicate. An **`own`** root qualifies when no write reaches it. `own`
+    /// is the callee's own storage (the caller copied it in, or donated a dead
+    /// one), so nothing outside can write it, and `mut own x` is a parse error
+    /// — which is *why* `readonly_root` must keep answering `None` for it: the
+    /// "declare it `mut`" advice it would owe names a fix that cannot be
+    /// spelled. The elision does not want advice, it wants the fact.
+    ///
+    /// A `mut` local that happens never to be written would qualify by the same
+    /// reasoning and is deliberately NOT admitted here: it elides copies no
+    /// resource program pays for, and widening it moves goldens for a gain
+    /// nothing has asked for.
+    fn share_subject_is_stable(&self, subject_id: Id, written_roots: &HashSet<Id>) -> bool {
+        if self.readonly_root(subject_id).is_some() {
+            return true;
+        }
+        let Some(root) = self.place_root(subject_id) else {
+            return false;
+        };
+        self.parameters
+            .get(&root)
+            .is_some_and(|parameter| parameter.convention == Convention::Own)
+            && !written_roots.contains(&root)
     }
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
@@ -12273,12 +12355,13 @@ impl<'src> Analyzer<'src> {
         }
         // Phase 2 — the type filter (second because `type_is_resource`
         // memoizes, `&mut`), then the SHARE elision: an IMMUTABLE capture
-        // from a READONLY-rooted subject that never roots a value seam
-        // shares soundly — nobody can mutate either side of the alias, and it
-        // cannot leak out. Everything else copies. The elision is what keeps
-        // read-only walkers (the SSR `render` recursion over a view tree)
-        // from deep-copying at every level; the seam check is what keeps
-        // `unwrap` honest.
+        // from a STABLE subject (`share_subject_is_stable` — nothing can
+        // write through it, whether by declaration or because no write
+        // exists) that never roots a value seam shares soundly — nobody can
+        // mutate either side of the alias, and it cannot leak out. Everything
+        // else copies. The elision is what keeps read-only walkers (the SSR
+        // `render` recursion over a view tree) from deep-copying at every
+        // level; the seam check is what keeps `unwrap` honest.
         //
         // A GENERIC-DEPENDENT capture is decided per instantiation
         // ([`CopyDecision::UnlessResource`]): std's `unwrap` binds
@@ -12287,6 +12370,7 @@ impl<'src> Analyzer<'src> {
         //
         // The SHARE decision consults no elision, so it is complete before
         // phase 3 needs it.
+        let written_roots = self.collect_written_roots();
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::new();
         for (capture_id, subject_id) in candidates {
@@ -12318,7 +12402,7 @@ impl<'src> Analyzer<'src> {
                 triggers => CopyDecision::UnlessResource(triggers),
             };
             if !capture_is_mutable
-                && self.readonly_root(subject_id).is_some()
+                && self.share_subject_is_stable(subject_id, &written_roots)
                 && !seam_roots.contains(&capture_id)
             {
                 shared.insert(capture_id);
