@@ -8,6 +8,8 @@ tracks the latest state.
 
 ## Unreleased
 
+**Destructure and `match` captures are now true copies.** Binding a piece of a value — `let (xs, n) = pair`, `Some(let inner) => …` — used to share the underlying storage with the source: growing `pair.0` showed through `xs`, mutating a `mut` capture wrote back into the source, and a returned capture (`option.unwrap()`) handed the caller a live alias into the option's payload. All three now copy, per the value-semantics rule every other binding already followed. Two elisions keep the cost where it belongs: a read-only capture from an immutable source still shares (recursive walkers like SSR rendering stay linear), and destructuring a temporary that dies on the spot moves instead of copying.
+
 **`mut` parameters.** `fun f(mut x: i32)`, `|mut list| { … }`, and `mut self` now parse and work: `mut` makes the parameter a scratch copy the body can rebind and mutate — field writes included — with nothing visible to the caller, exactly as if the body opened with `mut x = x`. It works in every parameter position, stays out of trait signatures, and refuses the combinations that would mislead (`mut own`, `mut` with a view, `mut` on an `external fun`, `mut` on a resource). The old error for assigning through a parameter steered everyone to `&mut`, which changes the caller contract; it now offers both spellings: `mut x` to mutate your copy, `&mut x` to mutate the caller's value.
 
 ---

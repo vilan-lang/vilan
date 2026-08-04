@@ -2,6 +2,12 @@ function __at(list, index) {
 	if (index >= 0 && index < list.length) return list[index];
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
@@ -56,7 +62,7 @@ function $i(self, fallback) {
 	const $j = self;
 	let $k = null;
 	if ($j[0] === 0) {
-		const x = $j[1];
+		const x = __clone($j[1]);
 		$k = x;
 	} else {
 		$k = fallback;

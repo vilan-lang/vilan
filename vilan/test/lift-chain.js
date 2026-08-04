@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function __parse_i32(text) {
 	const trimmed = text.trim();
 	const value = Number(trimmed);
@@ -51,7 +57,7 @@ function $d(self, fallback) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = $e[1];
+		const x = __clone($e[1]);
 		$f = x;
 	} else {
 		$f = fallback;
@@ -62,7 +68,7 @@ function $i(self, fallback) {
 	const $j = self;
 	let $k = null;
 	if ($j[0] === 0) {
-		const x = $j[1];
+		const x = __clone($j[1]);
 		$k = x;
 	} else {
 		$k = fallback;

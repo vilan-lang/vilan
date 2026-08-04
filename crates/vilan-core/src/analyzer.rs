@@ -11713,6 +11713,153 @@ impl<'src> Analyzer<'src> {
         sites
     }
 
+    /// B53 (rule 1): a pattern capture binding an aggregate element of a
+    /// PLACE subject copies it, exactly like `let x = place` — the
+    /// transformer wraps the capture's slot read in `__clone`. Without it
+    /// the capture aliases the source's element, observably three ways:
+    /// mutating a `mut` capture mutates the source, mutating the source
+    /// shows through an immutable capture, and a RETURNED capture leaks the
+    /// alias out of the callee (`option.unwrap()` handing back the
+    /// payload), breaking the "calls own their result" assumption the
+    /// binding-copy elision rests on. Destructuring a FRESH value (a
+    /// call's tuple, a constructed variant) binds without copying: its
+    /// elements have no other owner. Fixed-array patterns keep their
+    /// existing unconditional per-element clone.
+    fn compute_capture_clone_sites(&mut self) -> HashSet<Id> {
+        // Phase 1: candidate (capture, subject) pairs from place-subject
+        // patterns, plus the VALUE-SEAM roots — every expression whose value
+        // leaves its scope (a function/closure tail, a `ret` value, a match
+        // leg's body). A capture rooting one of those must clone even under
+        // the elision below: the alias would ride the seam out (the
+        // `unwrap` leak).
+        let mut candidates: Vec<(Id, Id)> = Vec::new();
+        let mut seam_roots: HashSet<Id> = HashSet::new();
+        for expr in self.expr_id_to_expr_map.values() {
+            match expr {
+                Expr::Destructure(value_id, pattern) => {
+                    if self.is_place_expr(*value_id) {
+                        let mut captures = HashSet::new();
+                        Self::collect_pattern_captures(pattern, &mut captures);
+                        candidates.extend(captures.into_iter().map(|id| (id, *value_id)));
+                    }
+                }
+                Expr::Match(subject_id, legs) => {
+                    for leg in legs {
+                        if let Some(root) = self.place_root(leg.body) {
+                            seam_roots.insert(root);
+                        }
+                        if self.is_place_expr(*subject_id) {
+                            let mut captures = HashSet::new();
+                            Self::collect_pattern_captures(&leg.pattern, &mut captures);
+                            candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
+                        }
+                    }
+                }
+                Expr::Is(subject_id, pattern) => {
+                    if self.is_place_expr(*subject_id) {
+                        let mut captures = HashSet::new();
+                        Self::collect_pattern_captures(pattern, &mut captures);
+                        candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for function in self.functions.values() {
+            if let Some(root) = self.place_root(function.body.1) {
+                seam_roots.insert(root);
+            }
+        }
+        let closure_tails: Vec<Id> = self
+            .closures
+            .values()
+            .map(|closure| closure.return_)
+            .collect();
+        for tail in closure_tails {
+            if let Some(root) = self.place_root(tail) {
+                seam_roots.insert(root);
+            }
+        }
+        for (_, value_id) in &self.return_sites {
+            if let Some(root) = self.place_root(*value_id) {
+                seam_roots.insert(root);
+            }
+        }
+        // Phase 2 — the type filter (second because `type_is_resource`
+        // memoizes, `&mut`), then the elision: an IMMUTABLE capture from a
+        // READONLY-rooted subject that never roots a value seam shares
+        // soundly — nobody can mutate either side of the alias, and it
+        // cannot leak out. Everything else clones. The elision is what keeps
+        // read-only walkers (the SSR `render` recursion over a view tree)
+        // from deep-copying at every level; the seam check is what keeps
+        // `unwrap` honest.
+        //
+        // A GENERIC capture clones like an aggregate: std's `unwrap` binds
+        // `Some(let v)` at type `T`, and aggregate-ness is only known per
+        // instantiation — after this pass. `__clone` is identity on scalars
+        // (the `Array` arm's precedent), so the conservative wrap is safe.
+        let repeatable = self.collect_repeatable_interiors();
+        let mut sites = HashSet::new();
+        for (capture_id, subject_id) in candidates {
+            let Some((type_id, capture_is_mutable)) = self
+                .variables
+                .get(&capture_id)
+                .map(|variable| (variable.type_id, variable.mutable))
+            else {
+                continue;
+            };
+            let capture_type = type_id.get_type(self);
+            if self.type_is_resource(type_id)
+                || !(self.is_cloneable_aggregate(&capture_type)
+                    || matches!(capture_type, Type::Generic(_)))
+            {
+                continue;
+            }
+            let shareable = !capture_is_mutable
+                && self.readonly_root(subject_id).is_some()
+                && !seam_roots.contains(&capture_id);
+            // The MOVE elision, rule 2's dead-source form: a subject that is
+            // a local read exactly once (a `?`-lift temp holding a fresh call
+            // result, say) donates its elements — the captures take
+            // ownership of a corpse, no copy needed. `is_elidable_copy`
+            // already refuses parameters (they alias the caller's value,
+            // which outlives the call — the `unwrap` leak) and loop/closure
+            // repeats.
+            let moves = self.is_elidable_copy(subject_id, &repeatable);
+            if !shareable && !moves {
+                sites.insert(capture_id);
+            }
+        }
+        sites
+    }
+
+    /// Every `Binding` capture id in a pattern tree — the candidates rule 1
+    /// obliges to copy when the subject is a place (the aggregate/resource
+    /// type filter runs in the caller).
+    fn collect_pattern_captures(pattern: &ExprPattern, captures: &mut HashSet<Id>) {
+        match pattern {
+            ExprPattern::Binding(capture_id) => {
+                captures.insert(*capture_id);
+            }
+            ExprPattern::Variant(_, _, payload) => {
+                for sub_pattern in payload {
+                    Self::collect_pattern_captures(sub_pattern, captures);
+                }
+            }
+            ExprPattern::Tuple(elements) => {
+                for (sub_pattern, _) in elements {
+                    Self::collect_pattern_captures(sub_pattern, captures);
+                }
+            }
+            ExprPattern::Array(elements) => {
+                for sub_pattern in elements {
+                    Self::collect_pattern_captures(sub_pattern, captures);
+                }
+            }
+            ExprPattern::Wildcard | ExprPattern::Literal(_) => {}
+        }
+    }
+
     /// H9 (proposal/mut-parameters.md): the runtime half of `mut x = x'`,
     /// emitted at BODY ENTRY (`compile-to-js` prepends the statements) —
     /// body entry rather than the `own`-style call site because a `mut`
@@ -22543,6 +22690,10 @@ pub struct Program<'src> {
     /// `compute_parameter_entry_clones`; scalar `mut` parameters with views
     /// ride `boxed_locals` instead).
     pub parameter_entry_clones: HashSet<Id>,
+    /// B53 (rule 1): pattern captures of aggregate type from a PLACE
+    /// subject — `compile_pattern` wraps each one's slot read in `__clone`.
+    /// Filled by `compute_capture_clone_sites`.
+    pub capture_clone_sites: HashSet<Id>,
     /// Destruction (destruction.md §5/§7): resource-typed locals still owned at
     /// their declaring scope's fall-through end. The transformer wraps the owning
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
@@ -26238,6 +26389,7 @@ fn analyze_over_world<'src>(
     analyzer.rewrite_view_assignment_targets();
     let clone_sites = analyzer.compute_clone_sites();
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
+    let capture_clone_sites = analyzer.compute_capture_clone_sites();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
     let scalar_view_refs = analyzer.compute_scalar_view_refs();
@@ -26534,6 +26686,7 @@ fn analyze_over_world<'src>(
         return_sites: analyzer.return_sites.clone(),
         clone_sites,
         parameter_entry_clones,
+        capture_clone_sites,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
         drop_glue: std::mem::take(&mut analyzer.drop_glue),

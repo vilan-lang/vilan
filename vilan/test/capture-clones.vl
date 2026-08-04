@@ -1,0 +1,43 @@
+// B53 (rule 1): pattern captures of aggregate elements copy — with two
+// elisions this golden pins in BYTES. `sum_over` is the read-only walker
+// (immutable capture, readonly-rooted subject, never a value seam): its
+// capture binds WITHOUT `__clone`, the share elision that keeps recursive
+// renderers linear. `first_or` returns its capture (the value seam), so it
+// binds WITH `__clone` — the copy that keeps a returned payload from
+// aliasing the caller's option (the `unwrap` leak).
+import std::io::print;
+import std::option::Option::{ self, Some, None };
+
+fun sum_over(entries: List<(i32, i32)>): i32 {
+	mut total = 0;
+	for entry in entries {
+		match entry {
+			(let a, let b) => {
+				total = total + a + b;
+			}
+		}
+	}
+	total
+}
+
+fun first_or(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
+	match held {
+		Some(let inner) => inner,
+		None => fallback,
+	}
+}
+
+fun main() {
+	mut entries = List::new();
+	entries.push((1, 2));
+	entries.push((10, 20));
+	print(sum_over(entries));
+	let held: Option<List<i32>> = Some([1, 2]);
+	mut got = first_or(held, List::new());
+	got.push(9);
+	print(got.len());
+	match held {
+		Some(let inner) => print(inner.len()),
+		None => print(0),
+	}
+}

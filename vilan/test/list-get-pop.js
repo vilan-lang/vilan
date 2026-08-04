@@ -14,7 +14,7 @@ function $a(self, fallback) {
 	const $b = self;
 	let $c = null;
 	if ($b[0] === 0) {
-		const x = $b[1];
+		const x = __clone($b[1]);
 		$c = x;
 	} else {
 		$c = fallback;

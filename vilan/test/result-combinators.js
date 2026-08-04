@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function default2() {
 	return 0;
 }
@@ -17,7 +23,7 @@ function $d(self, fallback) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = $e[1];
+		const x = __clone($e[1]);
 		$f = x;
 	} else {
 		$f = fallback;
@@ -86,7 +92,7 @@ function $v(self, fallback) {
 	const $w = self;
 	let $x = null;
 	if ($w[0] === 0) {
-		const x = $w[1];
+		const x = __clone($w[1]);
 		$x = x;
 	} else {
 		$x = fallback;
@@ -97,7 +103,7 @@ function $y(self, fn) {
 	const $z = self;
 	let $A = null;
 	if ($z[0] === 0) {
-		const x = $z[1];
+		const x = __clone($z[1]);
 		$A = x;
 	} else {
 		const e = $z[1];
@@ -135,7 +141,7 @@ function $J(self, fallback) {
 	const $K = self;
 	let $L = null;
 	if ($K[0] === 0) {
-		const x = $K[1];
+		const x = __clone($K[1]);
 		$L = x;
 	} else {
 		$L = fallback;
@@ -146,7 +152,7 @@ function $M(self) {
 	const $N = self;
 	let $O = null;
 	if ($N[0] === 0) {
-		const x = $N[1];
+		const x = __clone($N[1]);
 		$O = x;
 	} else {
 		$O = default2();
@@ -168,7 +174,7 @@ function $S(self, fallback) {
 	const $T = self;
 	let $U = null;
 	if ($T[0] === 0) {
-		const x = $T[1];
+		const x = __clone($T[1]);
 		$U = x;
 	} else {
 		$U = fallback;
@@ -190,7 +196,7 @@ function $Y(self, fallback) {
 	const $Z = self;
 	let $aa = null;
 	if ($Z[0] === 0) {
-		const x = $Z[1];
+		const x = __clone($Z[1]);
 		$aa = x;
 	} else {
 		$aa = fallback;

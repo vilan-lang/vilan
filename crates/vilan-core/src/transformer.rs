@@ -3604,6 +3604,25 @@ impl<'src> Transformer<'src> {
                     .get(capture_id)
                     .map(|variable| variable.mutable)
                     .unwrap_or(false);
+                // B53 (rule 1): an aggregate capture from a place subject is
+                // a value copy, like any binding of an aggregate place. The
+                // `Array` arm below cloned its element reads already — skip
+                // the second wrap when this subject is one of those.
+                let already_cloned = matches!(
+                    &subject,
+                    js::Node::Call(callee, _)
+                        if matches!(callee.as_ref(), js::Node::Local(name) if name == "__clone")
+                );
+                let subject =
+                    if self.program.capture_clone_sites.contains(capture_id) && !already_cloned {
+                        self.used_helpers.insert("__clone");
+                        js::Node::Call(
+                            Box::new(js::Node::Local("__clone".to_string())),
+                            vec![subject],
+                        )
+                    } else {
+                        subject
+                    };
                 let variable = js::Variable {
                     name,
                     value: Box::new(subject),

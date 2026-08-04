@@ -2443,9 +2443,6 @@ fn a_mut_parameter_never_takes_a_resource() {
 }
 
 #[test]
-#[ignore = "pre-existing rule-1 hole found while building H9 (backlog B53): a \
-mutable destructure capture aliases its source — `mut (xs, n) = pair; \
-xs.push(9)` grows pair.0 too. Un-ignore when Destructure captures clone."]
 fn a_mut_destructure_capture_does_not_alias_its_source() {
     assert_compiles_and_runs(
         r#"
@@ -2456,6 +2453,98 @@ fn a_mut_destructure_capture_does_not_alias_its_source() {
             xs.push(9);
             print(xs.len());
             print(pair.0.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn an_immutable_capture_is_isolated_from_source_mutation() {
+    // B53, the read direction: after `let (xs, _) = pair`, growing `pair.0`
+    // must not show through `xs` — the capture copied (subject roots a
+    // `mut` binding, so the share elision does not apply).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            let (xs, n) = pair;
+            pair.0.push(9);
+            print(xs.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_mut_match_capture_does_not_alias_the_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            match pair {
+                (mut xs, let n) => {
+                    xs.push(9);
+                    print(xs.len());
+                    print(pair.0.len());
+                }
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_returned_capture_does_not_leak_an_alias() {
+    // B53's seam case, the `unwrap` leak: a capture that IS the leg's value
+    // rides the return out of the callee — it must be a copy, or the
+    // caller's `mut got` mutates the option's payload through the alias
+    // (the "calls own their result" assumption every binding-copy elision
+    // rests on).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            let held: Option<List<i32>> = Some([1, 2]);
+            mut got = held.unwrap();
+            got.push(9);
+            print(got.len());
+            match held {
+                Some(let inner) => print(inner.len()),
+                None => print(0),
+            }
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_nested_variant_capture_does_not_alias() {
+    // The capture sits two pattern levels deep (variant payload inside a
+    // tuple) — collection recurses the whole tree, not just top level.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        fun main() {
+            mut wrapped = (Some([1, 2]), 3);
+            match wrapped {
+                (Some(mut xs), let n) => {
+                    xs.push(9);
+                    print(xs.len());
+                }
+                (None, _) => print(0),
+            }
+            match wrapped {
+                (Some(let inner), _) => print(inner.len()),
+                (None, _) => print(0),
+            }
         }
         "#,
         "3\n2\n",

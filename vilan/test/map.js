@@ -47,7 +47,7 @@ function $h(self, fallback) {
 	const $i = self;
 	let $j = null;
 	if ($i[0] === 0) {
-		const x = $i[1];
+		const x = __clone($i[1]);
 		$j = x;
 	} else {
 		$j = fallback;
@@ -86,7 +86,7 @@ function $t(self, fallback) {
 	const $u = self;
 	let $v = null;
 	if ($u[0] === 0) {
-		const x = $u[1];
+		const x = __clone($u[1]);
 		$v = x;
 	} else {
 		$v = fallback;

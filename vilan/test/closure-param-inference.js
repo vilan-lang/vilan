@@ -1,3 +1,9 @@
+function __clone(value) {
+	if (Array.isArray(value)) return value.map(__clone);
+	if (value instanceof Set) return new Set([ ...value ].map(__clone));
+	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
+	return value;
+}
 function $a(self, fn) {
 	const $b = self;
 	let $c = null;
@@ -13,7 +19,7 @@ function $d(self, fallback) {
 	const $e = self;
 	let $f = null;
 	if ($e[0] === 0) {
-		const x = $e[1];
+		const x = __clone($e[1]);
 		$f = x;
 	} else {
 		$f = fallback;

@@ -125,9 +125,10 @@ Two discoveries, recorded as pins:
   `mut x = v;` form fails identically on v0.23.5, so the desugar
   reproduces today's behavior faithfully. `set_with`-style generic
   instantiation types fine and is pinned green.
-- **A pre-existing rule-1 hole, filed as B53** (ignored pin
-  `a_mut_destructure_capture_does_not_alias_its_source`): a mutable
-  destructure capture aliases its source — `mut (xs, n) = pair;
-  xs.push(9)` grows `pair.0` on v0.23.5. Found probing whether the
-  Destructure path could host the desugar; it cannot until captures
-  clone.
+- **A pre-existing rule-1 hole, filed as B53 — FIXED same day** (pin
+  un-ignored, four siblings added): pattern captures aliased their
+  source in every form — destructure, match, `is`, and out through a
+  RETURN (`unwrap` leaked its payload). Captures now clone at
+  `compile_pattern` under a place-gated analyzer set with a share
+  elision (read-only walkers stay linear) and a move elision (dead
+  `?`-lift temps donate). See the backlog B53 entry for the full record.
