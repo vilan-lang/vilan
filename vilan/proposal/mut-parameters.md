@@ -132,3 +132,8 @@ Two discoveries, recorded as pins:
   `compile_pattern` under a place-gated analyzer set with a share
   elision (read-only walkers stay linear) and a move elision (dead
   `?`-lift temps donate). See the backlog B53 entry for the full record.
+  A second pass the same day closed five findings an adversarial review
+  raised against that fix — the `is`/guarded-leg compilation path, the
+  generic copy that deep-copied resources, the two elisions composing
+  unsoundly, a seam scan that missed braced and conditional tails, and
+  the `mut [a, b]` grammar divergence: `proposal/capture-clones.md`.

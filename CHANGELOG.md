@@ -6,6 +6,18 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`is` tests and guarded `match` legs copy their captures too.** v0.23.6 made destructure and `match` captures true copies, but only along one of the two paths the compiler uses: a capture in an `if x is (let a, let b)` test, or in a `match` leg that carries a guard, still shared storage with the subject. Growing the source showed through the capture, and a `mut` capture wrote back into it. Both now copy, on the same rules — and the copy for a guarded leg is made when the leg is entered, so a guard that rejects leaves the subject exactly as it found it.
+
+**A resource is never copied out of a generic.** `Option::unwrap` and its neighbours are written once and compiled per type they are used at. The capture inside them copied unconditionally, which for a resource meant two of them: independent state, and a destructor run for each. Resources now move out of a generic capture, as the memory rules always said they must, while every other type — numbers, lists, structs — keeps its copy. The same rule reaches through generic containers (`Wrap<T>`), not just a bare `T`.
+
+**Two copies that cancelled out.** Sharing a read-only capture is free, and moving out of a value that dies immediately is free — but a value that was shared has nothing of its own to give away, and the two together handed a `mut` binding the original's storage: `let (xs, n) = pair; mut ys = xs; ys.push(9)` grew `pair.0`. Separately, a capture returned through a braced arm (`Some(let inner) => { inner }`) or a conditional tail (`if first { a } else { b }`) escaped the check that catches a returned capture, and leaked the alias out of the function. Both now copy.
+
+**`mut [a, b]` means the same thing everywhere.** `mut` on an array binder marked its elements mutable in a `let`, but not in a `match` leg or an `is` test — where writing through them reported `cannot mutate immutable 'a'`. One keyword, one meaning: both forms now bind mutably.
+
+---
+
 ## v0.23.6 — 2026-08-03
 
 **Destructure and `match` captures are now true copies.** Binding a piece of a value — `let (xs, n) = pair`, `Some(let inner) => …` — used to share the underlying storage with the source: growing `pair.0` showed through `xs`, mutating a `mut` capture wrote back into the source, and a returned capture (`option.unwrap()`) handed the caller a live alias into the option's payload. All three now copy, per the value-semantics rule every other binding already followed. Two elisions keep the cost where it belongs: a read-only capture from an immutable source still shares (recursive walkers like SSR rendering stay linear), and destructuring a temporary that dies on the spot moves instead of copying.
