@@ -16,7 +16,7 @@ tracks the latest state.
 
 **Spreading a tuple *into* a spread parameter is not here yet.** `f(..existing)` would desugar to `f((..existing))`, and that tuple-value spread — designed in the variadic proposal, never built — has to land first. Forwarding a pack today goes through the tuple form, which needs no new syntax.
 
-29 pins in the compiler-behaviour suite, plus a parser unit test, three formatter round-trips, an LSP hover pin, three parse-differential fixtures and a corpus fixture with its golden — every mechanism planted red and restored. Two pre-existing limits the pack inherits are pinned beside their tuple-form twins rather than left to look like spread bugs: a pack that is still an abstract `T` cannot be indexed positionally, and a comprehension still needs a mapped source. Record: `proposal/variadic-generics.md` §S.
+32 pins in the compiler-behaviour suite, plus a parser unit test, three formatter round-trips, an LSP hover pin, three parse-differential fixtures and a corpus fixture with its golden — every mechanism planted red and restored. Two pre-existing limits the pack inherits are pinned beside their tuple-form twins rather than left to look like spread bugs: a pack that is still an abstract `T` cannot be indexed positionally, and a comprehension still needs a mapped source. Record: `proposal/variadic-generics.md` §S.
 
 ## v0.27.0 — 2026-08-04
 
