@@ -625,6 +625,11 @@ fn keyword_lexeme(token: &Token) -> Option<&'static str> {
 /// convention: `own x: T`, `x: &T`, `x: &mut T`, or the plain `x: T`. The `&` /
 /// `&mut` live on the convention (rule 3), not in `type_label`, so they are
 /// prepended here; `self` renders in its convention-specific self form.
+///
+/// A spread parameter renders its `...` (variadic-generics.md §S): unlike
+/// `mut`, it IS part of the signature — it is exactly what a reader of the
+/// hover needs in order to know whether to write the arguments out flat or as
+/// one tuple. It never combines with a convention.
 fn parameter_signature(parameter: &Parameter, type_label: &str) -> String {
     if parameter.name == "self" {
         return match parameter.convention {
@@ -633,6 +638,9 @@ fn parameter_signature(parameter: &Parameter, type_label: &str) -> String {
             Convention::Ref => "&self".to_string(),
             Convention::RefMut => "&mut self".to_string(),
         };
+    }
+    if parameter.spread {
+        return format!("...{}: {type_label}", parameter.name);
     }
     match parameter.convention {
         Convention::Bare => format!("{}: {type_label}", parameter.name),
@@ -4141,6 +4149,19 @@ pub(crate) mod tests {
             hover.contains("requires the `process` layer of `std` (via `write_file (std::fs)`)"),
             "{hover}"
         );
+    }
+
+    // A spread parameter's `...` rides the hover (variadic-generics.md §S):
+    // unlike `mut`, it IS part of the signature, and it is precisely what tells
+    // the reader whether to write the arguments out flat or as one tuple.
+    #[test]
+    fn hover_shows_a_spread_parameters_marker() {
+        let hover = hover_at_cursor(
+            "fun width<T: (..)>(sep: str, ...items: T): i32 {\n\t1\n}\n\nfun main() {\n\twi|dth(\"-\", 1, 2);\n}\n",
+        )
+        .expect("hovering `width` should produce a label");
+        assert!(hover.contains("...items: T"), "{hover}");
+        assert!(hover.contains("sep: str"), "{hover}");
     }
 
     // The declaration name carries the requirement too, not just call sites.

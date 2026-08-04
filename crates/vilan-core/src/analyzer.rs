@@ -8754,8 +8754,13 @@ impl<'src> Analyzer<'src> {
             if parameter.name == "self" {
                 parameters.push("self".to_string());
             } else {
+                // A spread parameter's `...` is part of the signature
+                // (variadic-generics.md §S) — it is what tells a reader whether
+                // to write the arguments out flat or as one tuple. `mut`,
+                // which is not, stays unrendered.
                 let mut label = format!(
-                    "{}: {}",
+                    "{}{}: {}",
+                    if parameter.spread { "..." } else { "" },
                     parameter.name,
                     self.declaration_type_label(parameter.type_id)
                 );
