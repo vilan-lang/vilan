@@ -3566,3 +3566,54 @@ only twin today, and the twin inventory itself is gated so std cannot grow an
 ungated one. Fired correctly the same day on the A16 S3 surfaces — its
 designed collision, resolved by allowlisting with reasons. Record: the gate
 file's own header (crates/vilan-core/tests/std_twin_parity.rs).
+
+### Moved at the v0.28.0 cut (2026-08-04)
+
+#### G3. Inferred `const` — SHIPPED 2026-08-04
+
+(M; v2 of G2; constraints recorded in `const-eval.md` §5) — fold
+`let a = 1 + 2;` without the keyword: silent fallback on any evaluation
+failure, const-only functions never infer, budgets (fuel + serialized-size
+caps), the `[build]` preset split (debug = no inference). Build-only; the
+LSP never runs the sweep. [Ship notes: the free-variable rule is the whole
+eligibility filter, decided by measurement — the span-sorted Expr::Local
+index that made the sweep affordable also closed §8.4's free_locals cost
+for the explicit pass; inferred budgets fuel 10k/depth 64/256-byte size vs
+explicit's 1M/512/uncapped; effect-producing evaluations are REFUSED for
+the invisible fold — and the probe recorded that the EXPLICIT form silently
+swallows print/exit output, a §9-recorded question for a future call;
+generic-body folding excluded after the differential caught List<T>::sum's
+T::default() folding to undefined; the differential also exposed B69, the
+pre-existing release-preset identifier collisions. Record: const-eval.md
+§9.]
+
+#### E35. one `CallGraph` per analysis — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-04 by the G2 arc) — `const_eval`, `platform_color`, and
+`init_order` each construct their own (~9.5ms measured for the const one
+alone, fixed overhead invariant of entry size). Build once, share. Not
+const-specific; a clean warm-floor slice. Record: `const-eval.md` §8's
+measurement. [Ship notes: the entry was wrong in both directions — SEVEN
+sites, not three; init_order had shared via the memo since B33 §4; the
+~9.5ms was an inferred intercept wrong ~17× (real 0.4–0.58ms/build, win
+~1–2ms). context-threading's pre-rewrite graph proven unshareable by a
+32-red plant and spelled in the type as Option<CallGraph>. BYCATCH:
+VILAN_PHASE_TIMING=1 panicked every warm analysis inside catch_unwind —
+with the switch on, every analysis after the first silently returned no
+program; fixed at root (PhaseMarks as one field), pinned in its own test
+binary. Record: const-eval.md §8.4.]
+
+#### B68. `drop(f(x))` on a call result destroys nothing — SHIPPED 2026-08-04
+
+(S–M; found 2026-08-04 by the B65-67 arc, pre-existing, reproduces with no
+branch, capture, or generic) — `drop(identity(Db{..}))` prints no drop while
+`let b = identity(..); drop(b)` does: the `drop` sink's rewrite does not
+recognise a non-place argument. Same severity as the three holes closed
+beside it. Record: `affine-moves.md` §9.4. [Ship notes: the filing was one
+case too narrow — `drop(Db{..})` is also a non-place and always worked; the
+real split is WHERE THE TYPE COMES FROM (binding type_id / resolved_types /
+nowhere for call results). Sink arguments are now typed once post-solve,
+four consumers read one answer through one recognizer, and an unresolvable
+argument is a hard error per B55's never-silent pattern. The generic
+drop-forwarding refusal now catches the previously-untyped path. Record:
+affine-moves.md §9.5.]
