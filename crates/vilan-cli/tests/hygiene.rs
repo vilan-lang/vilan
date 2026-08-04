@@ -130,6 +130,11 @@ const OWNER_STRING_ALLOWLIST: &[(&str, &str)] = &[
         "vilan/proposal/releases.md",
         "release history quotes the install one-liner as it was published",
     ),
+    (
+        "vilan/proposal/backlog.md",
+        "the historical record — ship records moved from the distilled file \
+         (2026-08-03) name the old owner as their subject, same as the F9 entry",
+    ),
 ];
 
 /// The repository moved from the maintainer's personal account to the

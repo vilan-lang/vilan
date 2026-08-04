@@ -61,7 +61,7 @@ is the historical record everything shipped gets moved into.
 | `memory-management-rev-1.md` | shipped arc (through Phase 6 essentials) | The memory-management design, revision 1 — largely superseded in turn by `claims-and-epochs.md` + `destruction.md`. |
 | `mut-parameters.md` | shipped arc (2026-08-03) | `mut` parameters — local rebindability of a callee's copy (backlog H9). |
 | `numeric-types.md` | shipped arc (2026-07-07); tail in backlog trailer | Sized numeric types (`u8`…`i64`/`f32`); native-width tail recorded, not filed as an open item. |
-| `org-migration.md` | shipped arc (migration complete 2026-07-29; tail resolved 2026-08-03) | The `ReedSyllas/vilan` → `vilan-lang/vilan` org move (F9), Pages tombstone, owner-string sweep. |
+| `org-migration.md` | shipped arc (migration complete 2026-07-29; tail resolved 2026-08-03) | The move to the `vilan-lang/vilan` org (F9), Pages tombstone, owner-string sweep. |
 | `p6-followups.md` | shipped arc (complete 2026-07-03) | The post-P6 (transport/RPC) completion ladder. |
 | `platform-coloring.md` | draft / proposed | Function-granular platform checking, successor to `platform-model.md`'s module-granular check. |
 | `platform-model.md` | shipped arc (2026-06-23) | The build model: backends, platforms, and layers. |
