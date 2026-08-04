@@ -393,6 +393,16 @@ struct MoveScan<'a> {
     module_level_bindings: &'a HashSet<Id>,
 }
 
+/// One arm of an `if` / `match` as the drop planner sees it (destruction.md §7):
+/// the pattern captures the arm OWNS at entry (a `match` leg's, when the subject
+/// was consumed — B62; an `if` arm has none), then its statements and tail. The
+/// captures are declared before every statement, so they drop last.
+struct PlanArm {
+    captures: Vec<Id>,
+    statements: Vec<Id>,
+    tail: Id,
+}
+
 /// A resource binding's move state on the path currently being scanned
 /// (destruction.md §4). Absence from the flow map = still owned. The span
 /// locates a representative move site — the use-after-move note points here.
@@ -4862,6 +4872,7 @@ impl<'src> Analyzer<'src> {
             let mut root_dropped: HashSet<Id> = HashSet::new();
             let mut root_overwrites: HashSet<Id> = HashSet::new();
             self.plan_scope(
+                &[],
                 statements,
                 *tail,
                 true,
@@ -4948,9 +4959,15 @@ impl<'src> Analyzer<'src> {
     /// Plan one lexical scope (a block / branch / loop / function body). Resource
     /// locals declared as direct statements here that are still owned once the
     /// tail has been walked drop at this scope's end (recorded in `dropped`).
+    ///
+    /// `captures` are the pattern captures this scope OWNS at entry — a consumed
+    /// `match` leg's payloads (B62). They are declared before every statement, so
+    /// they sit first in `declared_here` and (the transformer emitting in reverse)
+    /// drop last.
     #[allow(clippy::too_many_arguments)]
     fn plan_scope(
         &self,
+        captures: &[Id],
         statements: &[Id],
         tail: Id,
         consuming: bool,
@@ -4960,11 +4977,33 @@ impl<'src> Analyzer<'src> {
         overwrites: &mut HashSet<Id>,
     ) {
         let mut declared_here: Vec<Id> = Vec::new();
+        for capture in captures {
+            if resources.contains(capture) {
+                owned.insert(*capture);
+                declared_here.push(*capture);
+            }
+        }
         for statement in statements {
-            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(statement)
-                && resources.contains(variable_id)
-            {
-                declared_here.push(*variable_id);
+            match self.expr_id_to_expr_map.get(statement) {
+                Some(Expr::Variable(variable_id)) if resources.contains(variable_id) => {
+                    declared_here.push(*variable_id);
+                }
+                // `let (a, b) = value` declares its captures here too: a consumed
+                // subject hands them the payloads, so they drop at this scope's
+                // end exactly like a `let` (B62). A loaned subject (`&value`)
+                // keeps ownership and its captures own nothing.
+                Some(Expr::Destructure(value_id, pattern))
+                    if !self.pattern_subject_is_loan(*value_id) =>
+                {
+                    let mut bound = Vec::new();
+                    Self::collect_pattern_captures(pattern, &mut bound);
+                    declared_here.extend(
+                        bound
+                            .into_iter()
+                            .filter(|capture| resources.contains(capture)),
+                    );
+                }
+                _ => {}
             }
             self.plan_expr(*statement, false, resources, owned, dropped, overwrites);
         }
@@ -5024,12 +5063,22 @@ impl<'src> Analyzer<'src> {
                     owned.insert(variable_id);
                 }
             }
-            // `let (a, b) = value` consumes the value. Captures that bind resource
-            // payloads become owned locals; seeding them is S3's match/destructure
-            // move work — a captured resource that is never re-moved leaks in v1
-            // (recorded), never double-drops.
-            Expr::Destructure(value_id, _pattern) => {
+            // `let (a, b) = value` consumes the value, so its captures bind the
+            // payloads and OWN them (B62) — they drop at the declaring scope's end
+            // (`plan_scope` records them there) unless moved onward. `let (a, b) =
+            // &value` loans instead: the subject is never consumed and stays the
+            // owner, so its captures own nothing and must not enroll.
+            Expr::Destructure(value_id, pattern) => {
                 self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
+                if !self.pattern_subject_is_loan(value_id) {
+                    let mut captures = Vec::new();
+                    Self::collect_pattern_captures(&pattern, &mut captures);
+                    for capture in captures {
+                        if resources.contains(&capture) {
+                            owned.insert(capture);
+                        }
+                    }
+                }
             }
             // R2: assigning onto a binding that still owns a resource drops the
             // old value first (recorded here), then the new value moves in.
@@ -5098,6 +5147,7 @@ impl<'src> Analyzer<'src> {
             // Control flow.
             Expr::Block((statements, tail)) => {
                 self.plan_scope(
+                    &[],
                     &statements,
                     tail,
                     consuming,
@@ -5217,14 +5267,21 @@ impl<'src> Analyzer<'src> {
         overwrites: &mut HashSet<Id>,
     ) {
         let mut conditions: Vec<Id> = Vec::new();
-        let mut arms: Vec<(Vec<Id>, Id)> = Vec::new();
+        let mut arms: Vec<PlanArm> = Vec::new();
         let mut has_else = false;
         let mut current = branch;
+        // An `if` arm binds no pattern of its own: an `is` test's captures alias a
+        // subject the test never consumed (see `plan_match`), so no arm owns
+        // anything at entry.
         loop {
             match current {
                 ExprIfBranch::If(condition, (statements, tail), else_branch) => {
                     conditions.push(*condition);
-                    arms.push((statements.clone(), *tail));
+                    arms.push(PlanArm {
+                        captures: Vec::new(),
+                        statements: statements.clone(),
+                        tail: *tail,
+                    });
                     match else_branch {
                         Some(next) => current = next,
                         None => break,
@@ -5232,7 +5289,11 @@ impl<'src> Analyzer<'src> {
                 }
                 ExprIfBranch::Else((statements, tail)) => {
                     has_else = true;
-                    arms.push((statements.clone(), *tail));
+                    arms.push(PlanArm {
+                        captures: Vec::new(),
+                        statements: statements.clone(),
+                        tail: *tail,
+                    });
                     break;
                 }
             }
@@ -5246,8 +5307,17 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Plan a `match`: by-value matching consumes the subject; `match &x` loans
-    /// it. Each leg body is an arm (its captures are S3's move work, not seeded
-    /// here — see `plan_expr`'s `Destructure`).
+    /// it. Each leg body is an arm, and — B62 — a leg of a CONSUMED subject owns
+    /// its captures: R6 hands the payloads to the arm, the subject's own
+    /// scope-end teardown is suppressed by the same consuming walk, so the
+    /// capture is the payload's only owner and drops at the leg's end unless it
+    /// is moved onward.
+    ///
+    /// A LOANED subject (`match &x`) is the negative half and has to stay one:
+    /// nothing was consumed, the subject still owns the payload and still drops
+    /// it, so enrolling the capture would destroy one value twice. `x is
+    /// Some(let r)` is the same shape a level out — a test, not a consuming
+    /// match — and reaches `plan_expr`'s `Is` arm, which loans.
     #[allow(clippy::too_many_arguments)]
     fn plan_match(
         &self,
@@ -5259,10 +5329,7 @@ impl<'src> Analyzer<'src> {
         dropped: &mut HashSet<Id>,
         overwrites: &mut HashSet<Id>,
     ) {
-        let subject_is_loan = matches!(
-            self.expr_id_to_expr_map.get(&subject_id),
-            Some(Expr::Reference(_, _))
-        );
+        let subject_is_loan = self.pattern_subject_is_loan(subject_id);
         self.plan_expr(
             subject_id,
             !subject_is_loan,
@@ -5271,16 +5338,34 @@ impl<'src> Analyzer<'src> {
             dropped,
             overwrites,
         );
-        let mut arms: Vec<(Vec<Id>, Id)> = Vec::new();
+        let mut arms: Vec<PlanArm> = Vec::new();
         for leg in legs {
             if let Some(guard) = leg.guard {
                 self.plan_expr(guard, false, resources, owned, dropped, overwrites);
             }
-            arms.push((Vec::new(), leg.body));
+            let mut captures = Vec::new();
+            if !subject_is_loan {
+                Self::collect_pattern_captures(&leg.pattern, &mut captures);
+            }
+            arms.push(PlanArm {
+                captures,
+                statements: Vec::new(),
+                tail: leg.body,
+            });
         }
         self.plan_branches(
             &arms, false, consuming, resources, owned, dropped, overwrites,
         );
+    }
+
+    /// Whether a pattern's subject is matched by LOAN rather than consumed — the
+    /// `match &x` / `let (a, b) = &pair` form. R6: a loaned subject keeps
+    /// ownership, so its captures own nothing.
+    fn pattern_subject_is_loan(&self, subject_id: Id) -> bool {
+        matches!(
+            self.expr_id_to_expr_map.get(&subject_id),
+            Some(Expr::Reference(_, _))
+        )
     }
 
     /// The shared arm merge for `if`/`match` drop planning: fork the entry
@@ -5290,7 +5375,7 @@ impl<'src> Analyzer<'src> {
     #[allow(clippy::too_many_arguments)]
     fn plan_branches(
         &self,
-        arms: &[(Vec<Id>, Id)],
+        arms: &[PlanArm],
         _has_implicit_else: bool,
         consuming: bool,
         resources: &HashSet<Id>,
@@ -5300,18 +5385,19 @@ impl<'src> Analyzer<'src> {
     ) {
         let entry = owned.clone();
         let mut live_arms: Vec<HashSet<Id>> = Vec::new();
-        for (statements, tail) in arms {
+        for arm in arms {
             let mut arm_owned = entry.clone();
             self.plan_scope(
-                statements,
-                *tail,
+                &arm.captures,
+                &arm.statements,
+                arm.tail,
                 consuming,
                 resources,
                 &mut arm_owned,
                 dropped,
                 overwrites,
             );
-            if !self.block_diverges(statements, *tail) {
+            if !self.block_diverges(&arm.statements, arm.tail) {
                 live_arms.push(arm_owned);
             }
         }
@@ -5345,9 +5431,18 @@ impl<'src> Analyzer<'src> {
         if let Some(condition) = condition {
             self.plan_expr(condition, false, resources, owned, dropped, overwrites);
         }
+        // A `for` binder is a single identifier, never a pattern (`ForEach` holds
+        // an `Option<Id>`), so a loop body owns no captures at entry.
         let snapshot = owned.clone();
         self.plan_scope(
-            statements, tail, false, resources, owned, dropped, overwrites,
+            &[],
+            statements,
+            tail,
+            false,
+            resources,
+            owned,
+            dropped,
+            overwrites,
         );
         *owned = snapshot;
     }
@@ -7135,6 +7230,7 @@ impl<'src> Analyzer<'src> {
         let mut dropped: HashSet<Id> = HashSet::new();
         let mut overwrites: HashSet<Id> = HashSet::new();
         self.plan_scope(
+            &[],
             &statements,
             tail,
             true,
@@ -12232,7 +12328,7 @@ impl<'src> Analyzer<'src> {
             match expr {
                 Expr::Destructure(value_id, pattern) => {
                     if self.is_place_expr(*value_id) {
-                        let mut captures = HashSet::new();
+                        let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *value_id)));
                     }
@@ -12241,7 +12337,7 @@ impl<'src> Analyzer<'src> {
                     for leg in legs {
                         self.insert_seam_roots(leg.body, &mut seam_roots);
                         if self.is_place_expr(*subject_id) {
-                            let mut captures = HashSet::new();
+                            let mut captures = Vec::new();
                             Self::collect_pattern_captures(&leg.pattern, &mut captures);
                             candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
                         }
@@ -12249,7 +12345,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Expr::Is(subject_id, pattern) => {
                     if self.is_place_expr(*subject_id) {
-                        let mut captures = HashSet::new();
+                        let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
                     }
@@ -12398,13 +12494,14 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Every `Binding` capture id in a pattern tree — the candidates rule 1
-    /// obliges to copy when the subject is a place (the aggregate/resource
-    /// type filter runs in the caller).
-    fn collect_pattern_captures(pattern: &ExprPattern, captures: &mut HashSet<Id>) {
+    /// Every `Binding` capture id in a pattern tree, in declaration (source)
+    /// order — the candidates rule 1 obliges to copy when the subject is a place
+    /// (the aggregate/resource type filter runs in the caller), and the set B62's
+    /// drop planning enrolls when the subject was consumed.
+    fn collect_pattern_captures(pattern: &ExprPattern, captures: &mut Vec<Id>) {
         match pattern {
             ExprPattern::Binding(capture_id) => {
-                captures.insert(*capture_id);
+                captures.push(*capture_id);
             }
             ExprPattern::Variant(_, _, payload) => {
                 for sub_pattern in payload {
