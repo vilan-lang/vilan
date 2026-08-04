@@ -1,0 +1,60 @@
+import std::print;
+import std::map::Map;
+import std::reactive::{ Signal, Owner, batch };
+
+// `Signal::update` (A18, proposal/signal-update.md) — the closure receives a
+// writable view of the STORED value and the runtime notifies ONCE,
+// unconditionally, after it returns. It generalizes over every collection,
+// works for a scalar element as well as an aggregate one, and coalesces under
+// `batch` exactly like `set` (whose notify half it shares).
+fun main() {
+	let owner = Owner::new();
+
+	// In place: no copy-transform-return, and a later `get` sees the push.
+	let todos = Signal::new([1, 2]);
+	todos.update(|&mut list| { list.push(5); });
+	print(todos.get().len()); // 3
+
+	// The same method serves a `Map` — no per-container twin.
+	let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+	scores.update(|&mut entries| {
+		entries.insert("a", 1);
+		entries.insert("b", 2);
+	});
+	print(scores.get().len()); // 2
+
+	// A scalar element writes through the view (`*` reads it out).
+	let count = Signal::new(1);
+	count.update(|&mut value| { value = *value + 10; });
+	print(count.get()); // 11
+
+	// One notification per call, whatever the closure did — including nothing.
+	let watched = Signal::new([0]);
+	owner.take(watched.sub(|list| print(i"len {list.len()}"))); // len 1
+	watched.update(|&mut list| {
+		list.push(1);
+		list.push(2);
+	}); // len 3 — one notify, not two
+	watched.update(|&mut list| {}); // len 3 — unconditional
+	print("---");
+
+	// Under a turn the notification defers and coalesces like any other write.
+	batch(|| {
+		watched.update(|&mut list| { list.push(3); });
+		watched.update(|&mut list| { list.push(4); });
+		print("inside");
+	}); // len 5, once, at the boundary
+
+	// A read from INSIDE the closure observes the in-progress value: `mutate`
+	// writes storage, not a copy.
+	todos.update(|&mut list| {
+		list.push(6);
+		print(i"reentrant {todos.get().len()}"); // 4
+	});
+
+	// `set_with` is unchanged — the transform form for a scalar reads better.
+	count.set_with(|n| n + 4);
+	print(count.get()); // 15
+}
+
+main();
