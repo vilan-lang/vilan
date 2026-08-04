@@ -6623,6 +6623,37 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Every binding a closure DECLARES: its parameters (and their tuple
+    /// destructures), its `let`s, its pattern captures, and the same for
+    /// closures nested inside it. Over a place the closure hands back, the
+    /// complement is its CAPTURES — storage the enclosing frame owns and the
+    /// closure only borrows a name for (`element-clones.md` §7).
+    ///
+    /// Reuses R9's walk with an empty resource set: `scan_one_closure_captures`
+    /// wants the captured resource references and computes this set on the way,
+    /// where this wants only the set. One walk, so the two answers cannot drift.
+    fn closure_declared_bindings(&self, closure_id: Id) -> HashSet<Id> {
+        let mut declared_inside: HashSet<Id> = HashSet::new();
+        let Some(closure) = self.closures.get(&closure_id) else {
+            return declared_inside;
+        };
+        for parameter in closure
+            .parameters
+            .iter()
+            .chain(&closure.parameter_destructures)
+        {
+            declared_inside.insert(*parameter);
+        }
+        self.scan_capture_body(
+            closure.return_,
+            &HashSet::new(),
+            &mut declared_inside,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+        );
+        declared_inside
+    }
+
     /// Walk a closure body accumulating resource-binding references (`captured`)
     /// and the bindings declared inside it (`declared_inside`) — parameters seeded
     /// by the caller, `let`s and pattern captures added here, nested closures'
@@ -6743,7 +6774,13 @@ impl<'src> Analyzer<'src> {
                     recurse!(*value);
                 }
             }
-            Expr::Is(subject, _pattern) => recurse!(subject),
+            Expr::Is(subject, pattern) => {
+                // An `is` capture is declared by the test that binds it, exactly
+                // like a `match` leg's — omitting it read a closure's own `is`
+                // capture as a capture from the frame around it.
+                self.collect_pattern_binding_ids(&pattern, declared_inside);
+                recurse!(subject);
+            }
             Expr::Lift(subject, _binder, continuation) => {
                 recurse!(subject);
                 recurse!(continuation);
@@ -12222,35 +12259,65 @@ impl<'src> Analyzer<'src> {
     /// excluded by the type filter — a `borrows` projection returns an alias on
     /// purpose (rule 3).
     ///
+    /// **Both local elisions rest on "the returning frame owns this", and inside
+    /// a CLOSURE that is false for anything the closure did not declare** (B64,
+    /// `element-clones.md` §7). `mut xs = [1, 2]; let get = || xs;` hands out
+    /// `xs`'s live storage, and `fun make(own items: L): || L { || items }` hands
+    /// out the same storage on every call — the closure's frame dies at each
+    /// return, but the capture's does not, and a closure runs many times where a
+    /// body runs once. So a returned place rooted at a binding OUTSIDE the
+    /// closure copies, whatever convention that binding carries; the parameter
+    /// elisions apply only to the closure's own parameters.
+    ///
     /// Keyed by the LEAF expression, not the return value: a tail can be an
     /// `if`/`match` whose arms return different things, and only the arms that
     /// hand back a parameter's storage owe a copy. Leaf ids never collide with
     /// `clone_sites`' — an expression occupies exactly one syntactic position,
     /// and a return leaf is not also an initializer or an argument.
     fn compute_return_clone_sites(&mut self) -> HashMap<Id, CopyDecision> {
-        let mut seams: Vec<Id> = self
+        // Each seam with the closure it belongs to, if any: the capture question
+        // only exists inside one, and its answer needs that closure's bindings.
+        let mut seams: Vec<(Id, Option<Id>)> = self
             .closures
             .values()
-            .map(|closure| closure.return_)
+            .map(|closure| (closure.return_, Some(closure.id)))
             .collect();
-        seams.extend(self.return_sites.iter().map(|(_, value_id)| *value_id));
+        seams.extend(
+            self.return_sites
+                .iter()
+                .map(|(_, value_id)| (*value_id, None)),
+        );
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
-        for seam in seams {
+        for (seam, closure_id) in seams {
+            let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
             self.collect_tail_leaves(seam, &mut leaves);
             for leaf in leaves {
-                // Rooted at a BY-VALUE parameter: the caller's storage, which
-                // outlives the call. An `own` parameter is the callee's own —
-                // the caller already copied it in (or donated a dead one), so
-                // handing it back is handing back what this body owns, and a
-                // fluent builder (`fun with(own self, …): Self { … self }`)
-                // stays free. A `&`/`&mut` one is a borrow: returning through
-                // it is rule 3's `borrows` projection, deliberately an alias.
-                let owned_by_callee = self
-                    .place_root(leaf)
-                    .and_then(|root| self.parameters.get(&root))
-                    .map(|parameter| parameter.convention);
-                if !matches!(owned_by_callee, Some(Convention::Bare)) {
+                let Some(root) = self.place_root(leaf) else {
+                    continue;
+                };
+                // Storage the returning frame does not own outlives the return
+                // and must be copied. Three ways that happens:
+                let owes_copy = match self.parameters.get(&root).map(|it| it.convention) {
+                    // A `&`/`&mut` parameter is a borrow — returning through it
+                    // is rule 3's `borrows` projection, deliberately an alias.
+                    Some(Convention::Ref | Convention::RefMut) => false,
+                    // A bare parameter is the CALLER's storage, which outlives
+                    // the call.
+                    Some(Convention::Bare) => true,
+                    // An `own` parameter is the callee's own (the caller copied
+                    // it in, or donated a dead one), and a local is a dead owner
+                    // at the return — so a fluent builder
+                    // (`fun with(own self, …): Self { … self }`) and every
+                    // `mut result = …; result` stay free. Unless a CLOSURE is
+                    // returning it and it belongs to the frame around the
+                    // closure, which does not die here and can be handed the
+                    // same storage again on the next call.
+                    Some(Convention::Own) | None => declared_inside
+                        .as_ref()
+                        .is_some_and(|declared| !declared.contains(&root)),
+                };
+                if !owes_copy {
                     continue;
                 }
                 // Rule 3 again: a returned view is a `borrows` projection.

@@ -3385,6 +3385,137 @@ fn a_returned_local_still_moves() {
     );
 }
 
+// --- B64: a CLOSURE returns from a frame it does not own ----------------------
+//
+// The return rule's two free cases — a local (a dead owner at the tail) and an
+// `own` parameter (the callee's own storage) — both rest on "the returning frame
+// owns this". Inside a closure that is false for anything the closure did not
+// declare: the capture's frame does not die at the closure's return, and a
+// closure runs many times where a body runs once. `element-clones.md` §7 filed
+// the local half; the `own`-parameter half fell out of the same walk.
+
+#[test]
+fn a_closure_returning_a_captured_local_does_not_alias_it() {
+    // §7's repro. `|| xs` handed out `xs`'s live storage, so pushing to the
+    // result grew `xs` — the same leak `fun identity(c) { c }` had before the
+    // parameter half of this rule, spelled inline.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut xs = [ 1, 2 ];
+            let get = || xs;
+            mut got = get();
+            got.push(9);
+            print(got.len());
+            print(xs.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_closure_returning_a_captured_own_parameter_does_not_alias_it() {
+    // The half §7 did not name, and the reason the fix is not "captures behave
+    // like bare parameters": an `own` parameter IS free to return directly (the
+    // callee owns it — that is the fluent-builder elision), but a closure over
+    // it hands out the SAME storage on every call. Two calls, two independent
+    // lists. The bare-parameter twin already worked and is the control.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make_bare(items: List<i32>): || List<i32> { || items }
+        fun make_own(own items: List<i32>): || List<i32> { || items }
+        fun main() {
+            let bare = make_bare([ 1, 2 ]);
+            mut first = bare();
+            first.push(9);
+            print(bare().len());
+            let owned = make_own([ 1, 2 ]);
+            mut second = owned();
+            second.push(9);
+            print(owned().len());
+        }
+        "#,
+        "2\n2\n",
+    );
+}
+
+#[test]
+fn a_closure_returning_its_own_local_still_moves() {
+    // The elision the capture rule must NOT eat: a closure's own local is a
+    // dead owner at ITS tail, exactly like a function's. Behaviour cannot see
+    // the difference — a copy would be correct too — so the proof is the
+    // emitted bytes, and the program below has no other `__clone` site.
+    let source = r#"
+        import std::print;
+        fun main() {
+            let build = || {
+                mut result = [ 1, 2 ];
+                result.push(3);
+                result
+            };
+            mut first = build();
+            first.push(9);
+            print(first.len());
+            print(build().len());
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the closure's own local no longer donates:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "4\n3\n");
+}
+
+#[test]
+fn a_closure_returning_a_captured_field_does_not_alias_it() {
+    // Keyed by the place's ROOT, so a projection out of a captured aggregate
+    // copies on the same rule — the `map`-closure shape, one frame in.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        fun main() {
+            mut holder = Holder { items = [ 1, 2 ] };
+            let items_of = || holder.items;
+            mut got = items_of();
+            got.push(9);
+            print(got.len());
+            print(holder.items.len());
+        }
+        "#,
+        "3\n2\n",
+    );
+}
+
+#[test]
+fn a_closures_own_is_capture_is_not_a_resource_capture() {
+    // Found on the way, pre-existing on v0.25.0 and fixed by the same walk: R9
+    // built its declared-inside set without the bindings an `is` pattern
+    // introduces, so a closure testing its OWN parameter reported the capture
+    // it had just bound as a resource captured from the frame around it. The
+    // `match` twin was always fine — only the `is` arm was missing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        resource struct Db { handle: i32 }
+        fun main() {
+            let read = |o: Option<Db>| {
+                if o is Some(let d) { d.handle } else { 0 }
+            };
+            print(read(Some(Db { handle = 4 })));
+        }
+        "#,
+        "4\n",
+    );
+}
+
 #[test]
 fn a_guard_that_lifts_emits_its_temporary() {
     // B59, the `?` shape: the lift compiles to a temp plus an `if` over the
