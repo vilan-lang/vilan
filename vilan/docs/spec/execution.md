@@ -98,6 +98,33 @@ The explicit forms:
 - `await expr`: suspend until the `Task<T>` (or raw host `Promise<T>`)
   operand settles; yields `T`.
 
+**`Task` does not nest.** A task settles with a *value*, and a task is not
+one: spawning a computation that produces a task yields `Task<T>`, not
+`Task<Task<T>>`, and one `await` reaches the value. This holds however the
+type arises — including a generic `T` that instantiates at a task — so
+`Task<..>` is idempotent: `Task<Task<T>>` is not a type any expression has.
+
+```vilan
+import std::print;
+import std::task::Task;
+
+fun wrap<T>(value: T): Task<T> {
+	async { value }
+}
+
+fun main() {
+	let inner: Task<i32> = async { 7 };
+	let outer: Task<i32> = async { inner };   // not `Task<Task<i32>>`
+	let value: i32 = await outer;             // one `await`, not two
+	print(value + await wrap(inner));         // generic `T` = `Task<i32>`: same rule
+}
+```
+
+The rule follows the host rather than being imposed on it: a task is a
+host thenable, and the promise resolution procedure *adopts* a thenable
+result instead of boxing it. A nested task is unrepresentable at runtime,
+so the type says so too.
+
 A spawned computation runs to its first suspension synchronously, then
 interleaves with its spawner per the host event loop. Dropping a task
 abandons nothing: the computation still runs; only its result is

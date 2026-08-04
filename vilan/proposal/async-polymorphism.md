@@ -297,9 +297,8 @@ Implementation deltas from the design below:
   with no `get_safe` in the program); spec §7.1's exit claim corrected
   (the host exits when no live handles remain, not "when `main`
   completes").
-- **Still open**: `Task<Task<T>>` assimilation (JS thenables flatten —
-  same divergence Promise always had, typed one level deeper than
-  runtime); per-task cancel handles (race composes from nursery-scoped
+- **Still open**: ~~`Task<Task<T>>` assimilation~~ (**SHIPPED 2026-08-04**
+  — see below); per-task cancel handles (race composes from nursery-scoped
   cancel, so deferred until a real need); the free-spawn lint (std's own
   audit found NOTHING to migrate — every std spawn is either a returned
   `Task` or object-lifetime work a function-scoped nursery cannot own,
@@ -307,6 +306,59 @@ Implementation deltas from the design below:
   resource-owner story). The abort-in-flight `fetch` e2e is CLOSED:
   `crates/vilan-cli/tests/cancellation.rs` cancels a fetch against a
   hanging endpoint and joins in ~3s instead of 60.
+
+### `Task<Task<T>>` assimilation — SHIPPED 2026-08-04
+
+**The rule: `Task<..>` is IDEMPOTENT as a type constructor.** A task settles
+with a value, and a task is not one — the host's promise resolution procedure
+adopts a thenable result instead of boxing it, recursively — so `Task<Task<T>>`
+describes nothing any expression can hold. It is no longer a type any expression
+has.
+
+**The seam is FORMATION, not `await`.** Assimilating at `await` was the obvious
+move and the wrong one: it makes the unwrap agree with the runtime while leaving
+the mistyped handle in circulation, so a combinator over it (`Task::settle_all`,
+`Task::race`) still reads `List<Task<T>>` where the host will hand back
+`List<T>`. Normalizing where a `Task<..>` is BUILT fixes both, and leaves
+`await`'s single unwrap exact rather than making it a loop. Two sites form one
+(`analyzer.rs`), sharing `assimilated_task_payload`:
+
+1. **`Expr::Async`** — the only way a task value arises at all (`task.vl`: "a
+   task only ever arises from `async`"). A body that is already a handle
+   contributes no layer.
+2. **`substitute_type`'s `Type::Struct` arm** — the generic instantiation. This
+   is the sharp edge the item was filed with, and it turned out to be the same
+   bug rather than a deeper one: `fun wrap<T>(value: T): Task<T>` called with a
+   task substituted `T := Task<i32>` into the declared return and minted
+   `Task<Task<i32>>` from a function whose body was already assimilated. The
+   runtime was probed first and is unambiguous — `wrap(task)` settles with the
+   `i32` — so the type follows it.
+
+The strip loop is bounded by the payload ids it has seen, so a self-referential
+payload stops instead of regressing; honest chains collapse in one pass because
+each layer's id is distinct. An ERASED handle (`Task` with no argument) is left
+alone — there is no payload to promote and inventing one would be a guess.
+Non-`Task` nesting is untouched by construction: the normalization is gated on
+the handle's own id.
+
+**RESIDUAL (recorded, pinned `#[ignore]`d):** an `async fun` whose DECLARED
+return is itself a `Task` — `async fun make(): Task<i32>` — still types one level
+deeper than it runs. Its calls are implicitly awaited, so the host assimilates
+the returned handle and the call site receives the `i32` (verified: the program
+prints `7`, not a handle), while the call types as `Task<i32>`. This fix cannot
+reach that seam: async-ness is a whole-program fixpoint over the call graph
+(`async_infer::infer`), run AFTER type inference, so while a call's type is being
+decided the analyzer does not yet know whether its callee is async and its result
+therefore assimilated. Closing it wants the two passes interleaved, or an
+`Awaited<T>` type-level operator — more than this item. Pinned both ways in
+`crates/vilan-core/tests/inference.rs`
+(`an_async_function_returning_a_task_is_assimilated_at_runtime_only` holds the
+honest current behavior; `..._should_type_as_the_value` is the `#[ignore]`d
+desired end state).
+
+Gates: 14 pins in `inference.rs`, red-first (`await` on a nested task typed
+`Task<i32>` over a runtime `7`); spec §7.3 states the rule with a compiled fence;
+corpus byte-identical.
 
 Original direction (decisions recorded 2026-07-18, all implemented):
 
