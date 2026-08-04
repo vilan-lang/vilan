@@ -55,13 +55,15 @@ use crate::type_::{Type, TypeId};
 /// instantiation actually selects. `save_it(MemStore { .. })` no longer
 /// charges `DiskStore`'s impl just because it exists. An unresolvable
 /// binding falls back to every candidate — over-approximate but sound.
-pub fn check(program: &mut Program, platform: Platform) {
-    let graph = CallGraph::build(program);
+/// Takes the analysis tail's shared call graph rather than building its own
+/// (E35): this pass writes nothing but diagnostics, so its view of the program
+/// is bit-for-bit the one it used to build.
+pub fn check(program: &mut Program, platform: Platform, graph: &CallGraph) {
     // Declared fences check on EVERY compile, entry or not — fencing library
     // code is their point (platform-coloring.md §3.7).
-    let mut diagnostics = check_fences(program, &graph);
+    let mut diagnostics = check_fences(program, graph);
     if let Some(entry) = entry_function(program) {
-        let mut traversal = Traversal::new(program, &graph, Some(platform));
+        let mut traversal = Traversal::new(program, graph, Some(platform));
         traversal.walk(entry, &SubstitutionContext::new(), None);
         diagnostics.extend(traversal.diagnostics);
     }
@@ -457,8 +459,13 @@ fn edges(program: &Program, graph: &CallGraph, node: Id) -> Vec<(Id, Option<(Spa
 /// the label through, so following those witnesses callee-ward yields a
 /// *shortest* via-chain down to the layer. A seeded node's own line carries
 /// no chain. Multiple layers render one line each, in label order.
+///
+/// Reads the analysis tail's shared call graph (E35). The LSP calls this after
+/// `analyze_source` has returned, i.e. after the post-passes installed it, so
+/// this is the same build the admission walk used — and this pass writes
+/// nothing at all, taking `&Program`.
 pub fn requirements(program: &Program) -> HashMap<Id, String> {
-    let graph = CallGraph::build(program);
+    let graph = program.call_graph();
 
     // The node universe: every code-bearing node, every extern (a leaf that
     // can seed a requirement), and every module-level binding (whose
@@ -469,7 +476,7 @@ pub fn requirements(program: &Program) -> HashMap<Id, String> {
 
     let mut callers: HashMap<Id, Vec<Id>> = HashMap::new();
     for id in &universe {
-        for (callee, _) in edges(program, &graph, *id) {
+        for (callee, _) in edges(program, graph, *id) {
             callers.entry(callee).or_default().push(*id);
         }
     }

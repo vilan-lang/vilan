@@ -32,8 +32,12 @@ use crate::id::Id;
 use crate::type_::{Type, TypeId};
 
 /// Computes the async set and stores it on the program.
-pub fn infer(program: &mut Program) {
-    let graph = CallGraph::build(program);
+///
+/// Takes the analysis tail's shared call graph rather than building its own
+/// (E35): it writes only `async_functions` / `async_values` / `awaited_calls` /
+/// `adapted_instances` and diagnostics, none of which the graph is derived
+/// from, so its view of the program is bit-for-bit the one it used to build.
+pub fn infer(program: &mut Program, graph: &CallGraph) {
     let mut async_set: HashSet<Id> = HashSet::new();
 
     // Every value each binding ever holds — its initializer plus every
@@ -87,9 +91,9 @@ pub fn infer(program: &mut Program) {
     // in turn create new adapted instances. Both are monotone over
     // `async_set`, so this terminates.
     let adaptation = loop {
-        base_fixpoint(program, &graph, &held_values, &mut async_set);
+        base_fixpoint(program, graph, &held_values, &mut async_set);
         let before = async_set.len();
-        let adaptation = compute_adaptation(program, &graph, &held_values, &mut async_set);
+        let adaptation = compute_adaptation(program, graph, &held_values, &mut async_set);
         if async_set.len() == before {
             break adaptation;
         }
@@ -291,7 +295,7 @@ pub fn infer(program: &mut Program) {
     // with no user `main` (a library, a fragment) every binding is checked,
     // since each runs in some dependent program.
     let running_bindings = crate::platform_color::entry_function(program)
-        .map(|entry| crate::platform_color::reachable_bindings(program, &graph, entry, &[]));
+        .map(|entry| crate::platform_color::reachable_bindings(program, graph, entry, &[]));
     let initializer_adaptive = adaptive_params_of(program);
     let mut initializer_awaits: Vec<(crate::error::Error, SourceId)> = Vec::new();
     for binding in program.module_level_bindings() {

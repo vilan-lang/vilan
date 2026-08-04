@@ -16,9 +16,6 @@ mod upgrade;
 
 use job::ManagedChild;
 use vilan_core::analyzer::{Program, SourceId, analyze, check_library_contract};
-use vilan_core::async_infer;
-use vilan_core::call_graph::CallGraph;
-use vilan_core::context;
 use vilan_core::manifest::Package;
 use vilan_core::transformer::{EmittedChunk, transform};
 use vilan_core::{Backend, BuildOptions, Manifest, Platform, Workspace};
@@ -2486,41 +2483,17 @@ fn compile_to_js(
 
         let mut program = analyze(root, source_ref, &std, pkg_root, file, platform, workspace);
 
-        // Thread `std::context::Context` values as hidden parameters (a no-op
-        // unless the program creates a context).
-        context::thread_contexts(&mut program);
-
-        // Infer which functions/closures are async (drives `async`/`await`
-        // code generation).
-        async_infer::infer(&mut program);
-        // Reject an async `drop` body now that asyncness is settled
-        // (destruction.md §5): teardown must be synchronous in v1. An awaiting
-        // body is async only by inference, so this runs after `async_infer`.
-        vilan_core::analyzer::check_async_drops(&mut program);
-        // Teardown must be context-free (destruction.md §8): a `drop` body whose
-        // call sites (scope exits) can thread no context is rejected. Runs after
-        // `thread_contexts` fills `context_dependent_functions`.
-        vilan_core::analyzer::check_context_drops(&mut program);
-        vilan_core::platform_color::check(&mut program, platform);
-
-        // Evaluate `const` expressions (proposal/const-eval.md); the results
-        // serialize in place at transform time, the failures are ordinary
-        // diagnostics.
-        let (const_results, const_assets, const_errors) = vilan_core::const_eval::evaluate(
-            &program,
+        // The whole-program passes that follow analysis — context threading,
+        // async inference, the drop checks, platform coloring, const
+        // evaluation, the initializer-cycle check — and the ONE call graph
+        // they share. Defined once in `vilan_core` and called by both
+        // pipelines: this sequence was written out twice, and a pass added to
+        // only one of them is a check the other silently skips.
+        vilan_core::post_analysis_passes(
+            &mut program,
+            platform,
             &vilan_core::options::BuildOptions::default(),
         );
-        program.const_results = const_results;
-        program.const_assets = const_assets;
-        for (error, source) in const_errors {
-            program.push_diagnostic(error, source);
-        }
-
-        // A dependency cycle among module-level initializers has no valid
-        // declaration order (b33-emission-order.md §3), so it is an error
-        // rather than a load-time `ReferenceError`. Runs last: the relation is
-        // only meaningful for a program that analyzed cleanly.
-        vilan_core::init_order::check_cycles(&mut program);
 
         for (index, error) in program.diagnostics.iter().enumerate() {
             let source = program.diagnostic_source(index);
@@ -2571,8 +2544,13 @@ fn compile_to_js(
 
         if emit_debug {
             write_debug(file, "analyze.out", &format!("{program:#?}"));
-            let call_graph = CallGraph::build(&program);
-            write_debug(file, "callgraph.out", &call_graph.debug_dump(&program));
+            // The shared graph the post-passes installed — the `-d` dump
+            // describes what the compiler actually used, not a lookalike.
+            write_debug(
+                file,
+                "callgraph.out",
+                &program.call_graph().debug_dump(&program),
+            );
         }
 
         if analyzer_errors.is_empty() && noted_errors == 0 {

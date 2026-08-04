@@ -117,9 +117,37 @@ pub struct CallGraph {
     initializer_closures: HashMap<Id, Vec<Id>>,
 }
 
+thread_local! {
+    /// How many graphs this thread has built since [`reset_build_count`]. A
+    /// test instrument for the one-build-per-analysis invariant (E35): the
+    /// tail of an analysis shares a single graph, and nothing but a counter
+    /// can prove a rebuild did not creep back in — the outputs of a stale
+    /// rebuild and a shared build are identical whenever the sharing is
+    /// correct, so behaviour tests cannot see the difference.
+    ///
+    /// Thread-local, not a global atomic, because the suite runs analyses
+    /// concurrently under plain `cargo test` (nextest gives each test its own
+    /// process, but the plain runner does not) and an analysis is
+    /// single-threaded. One relaxed cell bump per build, against a build that
+    /// walks the whole program — unmeasurable.
+    static BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`CallGraph::build`] calls on this thread since the last
+/// [`reset_build_count`]. See [`BUILD_COUNT`].
+pub fn build_count() -> usize {
+    BUILD_COUNT.with(std::cell::Cell::get)
+}
+
+/// Zeroes this thread's [`build_count`].
+pub fn reset_build_count() {
+    BUILD_COUNT.with(|count| count.set(0));
+}
+
 impl CallGraph {
     /// Builds the call graph for a fully analyzed program.
     pub fn build(program: &Program) -> CallGraph {
+        BUILD_COUNT.with(|count| count.set(count.get() + 1));
         let mut graph = CallGraph::default();
         // Built once and reused below — the vector is not free to rebuild
         // (`b33-emission-order.md` §4).

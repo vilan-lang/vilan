@@ -431,37 +431,11 @@ fn analyze_source_unfenced(
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut program = analyze(root, source, std, pkg_root, entry_path, platform, workspace);
         let phase_post_start = crate::PhaseClock::now();
-        context::thread_contexts(&mut program);
-        async_infer::infer(&mut program);
-        // `drop` must be synchronous (destruction.md §5): reject an async drop
-        // body now that `async_functions` is settled — an awaiting body is async
-        // only by inference, so this cannot run inside `analyze`.
-        analyzer::check_async_drops(&mut program);
-        // And teardown must be context-free (destruction.md §8): a `drop` body
-        // whose call sites (scope exits) can thread no context is rejected. Runs
-        // after `thread_contexts` fills `context_dependent_functions`.
-        analyzer::check_context_drops(&mut program);
-        platform_color::check(&mut program, platform);
-        // The const pass (proposal/const-eval.md): evaluate `const`-marked
-        // expressions in dependency order; results serialize in place at
-        // transform time, failures are ordinary diagnostics. Runs here so
-        // `check`, the LSP, and every build path agree.
-        let (const_results, const_assets, const_errors) =
-            const_eval::evaluate(&program, &options::BuildOptions::default());
-        program.const_results = const_results;
-        program.const_assets = const_assets;
-        for (error, source) in const_errors {
-            program.push_diagnostic(error, source);
-        }
-        // A dependency cycle among module-level initializers has no valid
-        // declaration order (b33-emission-order.md §3), so it is an error
-        // rather than a load-time `ReferenceError`. Runs last: the relation is
-        // only meaningful for a program that analyzed cleanly.
-        init_order::check_cycles(&mut program);
+        post_analysis_passes(&mut program, platform, &options::BuildOptions::default());
         // The post-pass half of the `VILAN_PHASE_TIMING` split. This line
         // prints only on the `analyze_source` path (LSP, wasm, the test
-        // harnesses) — the CLI calls `analyze` directly and runs its own
-        // post-passes, so a CLI build shows the in-analyze line alone.
+        // harnesses) — the CLI calls `analyze` directly and runs the same
+        // post-passes itself, so a CLI build shows the in-analyze line alone.
         if phase_timing_enabled() {
             eprintln!(
                 "[vilan phase] post-passes {:.1}ms",
@@ -477,6 +451,76 @@ fn analyze_source_unfenced(
         }
         Err(_) => (None, diagnostics),
     }
+}
+
+/// The whole-program passes that run after `analyze()` returns, in order, and
+/// the ONE call graph they share.
+///
+/// This sequence used to be written out twice — here for `analyze_source`
+/// (tests, LSP, wasm) and again in the CLI's `main.rs` — which is the standing
+/// trap that a pass added to one pipeline is silently skipped by the other.
+/// One definition, both callers.
+///
+/// **The call graph is built once, here, and that placement is the invariant**
+/// (E35, `const-eval.md` §8.4). `context::thread_contexts` is the last thing
+/// that rewrites the tables `CallGraph::build` reads — its `apply` deletes call
+/// edges (a threaded `get()` becomes a local read) and mints new ones (the
+/// hidden context argument) — so it owns the one graph that cannot be shared,
+/// builds its own, and hands it back only when it applied no rewrite. Every
+/// pass from here on writes only diagnostics and its own result tables:
+///
+/// - `async_infer::infer` → `async_functions`, `async_values`, `awaited_calls`,
+///   `adapted_instances`;
+/// - `check_async_drops` / `check_context_drops` → diagnostics only;
+/// - `platform_color::check` → diagnostics only;
+/// - `const_eval::evaluate` → takes `&Program` and returns its results;
+/// - `init_order::check_cycles` and everything downstream (chunk planning,
+///   emission, the LSP's `platform_color::requirements`) → read it back off the
+///   program.
+///
+/// None of those fields is a graph input, so every consumer sees the identical
+/// graph it would have built for itself. This is a SHARE, not a narrowing:
+/// `CallGraph::build` takes no scope, filter or edge-kind options — there is
+/// one whole-program graph with one edge vocabulary, and per-pass views are
+/// taken downstream of it (`CallGraph::successors`, `reachable_bindings`),
+/// unchanged.
+pub fn post_analysis_passes(
+    program: &mut Program,
+    platform: Platform,
+    options: &options::BuildOptions,
+) {
+    let call_graph =
+        context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
+    async_infer::infer(program, &call_graph);
+    // `drop` must be synchronous (destruction.md §5): reject an async drop
+    // body now that `async_functions` is settled — an awaiting body is async
+    // only by inference, so this cannot run inside `analyze`.
+    analyzer::check_async_drops(program);
+    // And teardown must be context-free (destruction.md §8): a `drop` body
+    // whose call sites (scope exits) can thread no context is rejected. Runs
+    // after `thread_contexts` fills `context_dependent_functions`.
+    analyzer::check_context_drops(program);
+    platform_color::check(program, platform, &call_graph);
+    // The const pass (proposal/const-eval.md): evaluate `const`-marked
+    // expressions in dependency order; results serialize in place at
+    // transform time, failures are ordinary diagnostics. Runs here so
+    // `check`, the LSP, and every build path agree.
+    let (const_results, const_assets, const_errors) =
+        const_eval::evaluate(program, options, &call_graph);
+    program.const_results = const_results;
+    program.const_assets = const_assets;
+    for (error, source) in const_errors {
+        program.push_diagnostic(error, source);
+    }
+    // The last pass to want it by reference is done, so the graph moves onto
+    // the program: the cycle check below, chunk planning, emission and the
+    // LSP's requirement hover all read it through `Program::call_graph`.
+    program.install_call_graph(call_graph);
+    // A dependency cycle among module-level initializers has no valid
+    // declaration order (b33-emission-order.md §3), so it is an error
+    // rather than a load-time `ReferenceError`. Runs last: the relation is
+    // only meaningful for a program that analyzed cleanly.
+    init_order::check_cycles(program);
 }
 
 /// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value

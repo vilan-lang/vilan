@@ -17,9 +17,14 @@ use crate::options::BuildOptions;
 use crate::span::Span;
 use crate::transformer;
 
+/// Takes the analysis tail's shared call graph rather than building its own
+/// (E35). This pass writes nothing to the program at all — it takes `&Program`
+/// and RETURNS its results for the caller to store — so the graph it is handed
+/// is bit-for-bit the one it used to build.
 pub fn evaluate(
     program: &Program,
     options: &BuildOptions,
+    graph: &CallGraph,
 ) -> (
     HashMap<Id, ConstValue>,
     Vec<(String, String)>,
@@ -43,7 +48,7 @@ pub fn evaluate(
         in_progress: HashSet::new(),
         errors: Vec::new(),
     };
-    state.check_const_only();
+    state.check_const_only(graph);
     for &expr_id in &program.const_exprs {
         state.evaluate_one(expr_id);
     }
@@ -277,11 +282,10 @@ impl<'p, 'src> State<'p, 'src> {
     /// referenced as a function value, or an escaping R closure, outside every
     /// `const` subtree. Without it the escape is silent and the emitted JS
     /// carries a live `__emit_asset` call with no runtime binding.
-    fn check_const_only(&mut self) {
+    fn check_const_only(&mut self, graph: &CallGraph) {
         let Some(emit_id) = self.program.asset_emit_fn_id else {
             return;
         };
-        let graph = CallGraph::build(self.program);
         let main_id = self
             .program
             .scopes
@@ -370,7 +374,7 @@ impl<'p, 'src> State<'p, 'src> {
             ));
         }
 
-        self.check_value_escapes(&graph, &in_r, emit_id);
+        self.check_value_escapes(graph, &in_r, emit_id);
     }
 
     /// The value-escape half of §2's rule. Two shapes make a runtime function

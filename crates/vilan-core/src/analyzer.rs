@@ -24844,20 +24844,41 @@ impl<'src> Program<'src> {
         self.diagnostic_sources.push(source);
     }
 
-    /// The program's call graph, built on first use and kept.
+    /// The program's call graph: ONE build per analysis, shared by everything
+    /// that runs once the context rewrite has landed (E35, `const-eval.md`
+    /// §8.4).
     ///
-    /// **Only for consumers that run once analysis has settled** — the
-    /// post-`analyze()` checks and emission. The passes *inside* the analysis
-    /// sequence (context threading, async inference, platform coloring, const
-    /// evaluation) rewrite the tables this graph is derived from, so each of
-    /// them still builds its own; a memo shared with them would be stale by
-    /// construction. Nothing mutates entities after that sequence, which is why
-    /// the cycle check (`init_order::check_cycles`) and the transformer can
-    /// share one build — a `CallGraph::build` is ~3% of a clean compile, and
-    /// they used to pay it twice (`b33-emission-order.md` §4).
+    /// [`crate::post_analysis_passes`] builds it and [`Self::install_call_graph`]s
+    /// it here, so async inference, platform coloring, const evaluation, the
+    /// cycle check, chunk planning and emission all read the same tables. The
+    /// `get_or_init` fallback is for a program that never ran the post-passes
+    /// — a test that analyzes and transforms directly — and is correct for the
+    /// same reason the sharing is: nothing after `analyze()` mutates what
+    /// [`crate::call_graph::CallGraph::build`] reads except
+    /// `context::thread_contexts`, which owns the one graph that CANNOT be
+    /// shared.
+    ///
+    /// **That exception is the whole invariant.** `context::apply` rewrites
+    /// `entity_map`, `function_calls` and `generic_dispatch` — it deletes call
+    /// edges (a threaded `get()` becomes a local read) and mints new ones (the
+    /// hidden context argument) — so a graph built before it is stale
+    /// afterwards, and `thread_contexts` builds its own for exactly that
+    /// reason. Nothing may populate this memo before that pass has run.
     pub fn call_graph(&self) -> &crate::call_graph::CallGraph {
         self.call_graph_memo
             .get_or_init(|| crate::call_graph::CallGraph::build(self))
+    }
+
+    /// Hands the analysis tail its shared call graph. Called once, by
+    /// [`crate::post_analysis_passes`], after the passes that take the graph by
+    /// reference are done with it — from here on every consumer reads it
+    /// through [`Self::call_graph`].
+    ///
+    /// A no-op if the memo is already filled, which cannot happen on the
+    /// pipeline: reading [`Self::call_graph`] before this point would install a
+    /// graph built at an unknown moment, and the moment is the invariant.
+    pub fn install_call_graph(&self, graph: crate::call_graph::CallGraph) {
+        let _ = self.call_graph_memo.set(graph);
     }
 
     /// Every module-level `let` binding of the program: the globals of the
@@ -26542,8 +26563,37 @@ struct World<'src> {
     // own CLONE and expands against it, post-snapshot, on hit and miss
     // alike.
     macro_registry: crate::macros::MacroRegistry,
-    phase_analyze_start: crate::PhaseClock,
-    phase_base: std::time::Duration,
+    phase_marks: PhaseMarks,
+}
+
+/// The `VILAN_PHASE_TIMING` marks that belong to ONE analysis: when it
+/// started, and what its own base resolution cost. A base-cache HIT restores
+/// someone else's world, so both must be replaced together — the hit paid no
+/// base cost at all.
+///
+/// They are one field because they were two, and the hit path refreshed only
+/// the start instant: a warm analysis then printed `load+walk` as a fresh
+/// (small) elapsed MINUS a cold (large) cached base, and `Duration`'s
+/// subtraction panics on underflow. The marks run inside `analyze_source`'s
+/// `catch_unwind`, so the whole analysis returned `None` — with the
+/// instrument on, every analysis after the first in a process silently
+/// produced no program. Refreshing half of a pair is the bug this shape
+/// makes unrepresentable.
+#[derive(Clone, Copy)]
+struct PhaseMarks {
+    started: crate::PhaseClock,
+    base: std::time::Duration,
+}
+
+impl PhaseMarks {
+    /// The marks for an analysis starting now that has resolved no base of
+    /// its own — a base-cache hit, whose world came ready-made.
+    fn started_at(started: crate::PhaseClock) -> PhaseMarks {
+        PhaseMarks {
+            started,
+            base: std::time::Duration::ZERO,
+        }
+    }
 }
 
 pub fn analyze<'src>(
@@ -26634,7 +26684,7 @@ fn analyze_inner<'src>(
         world.sources[0] = entry_path.to_path_buf();
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
-        world.phase_analyze_start = phase_analyze_start;
+        world.phase_marks = PhaseMarks::started_at(phase_analyze_start);
         if expand_entry_over_world(&mut world, nodes, entry_source, entry_path, std, workspace) {
             // Generated code demands a module this world never loaded:
             // rebuild fresh, with the load-region expansion restored.
@@ -27856,8 +27906,10 @@ fn analyze_inner<'src>(
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_struct_id,
-        phase_analyze_start,
-        phase_base,
+        phase_marks: PhaseMarks {
+            started: phase_analyze_start,
+            base: phase_base,
+        },
     };
     if base_cacheable && !entry_is_module {
         base_cache_store(platform, entry_seed_names, &world);
@@ -27909,8 +27961,7 @@ fn analyze_over_world<'src>(
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_struct_id,
-        phase_analyze_start,
-        phase_base,
+        phase_marks,
     } = world;
     if !entry_is_module {
         analyzer.set_current_source(SourceId(0));
@@ -27931,7 +27982,7 @@ fn analyze_over_world<'src>(
     // Constraint resolution and the post-passes attribute their diagnostics per
     // anchor; anything unattributed defaults to the entry file.
     analyzer.set_current_source(SourceId(0));
-    let phase_load_walk = phase_analyze_start.elapsed();
+    let phase_load_walk = phase_marks.started.elapsed();
     let phase_build_start = crate::PhaseClock::now();
     analyzer.build();
     let phase_build = phase_build_start.elapsed();
@@ -28564,8 +28615,8 @@ fn analyze_over_world<'src>(
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
             "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
-            (phase_load_walk - phase_base).as_secs_f64() * 1000.0,
-            phase_base.as_secs_f64() * 1000.0,
+            (phase_load_walk - phase_marks.base).as_secs_f64() * 1000.0,
+            phase_marks.base.as_secs_f64() * 1000.0,
             phase_build.as_secs_f64() * 1000.0,
             phase_checks_start.elapsed().as_secs_f64() * 1000.0,
         );
