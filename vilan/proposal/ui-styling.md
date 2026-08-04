@@ -1,11 +1,11 @@
 # UI styling — typed atomic styles, compiled
 
-Status: **CORE SHIPPED 2026-07-10; TAIL SHIPPED 2026-08-04 except the
-A7/G2-entangled pieces** — §0bis is the live status and supersedes the
-"Remaining" list at the end of this paragraph, which is kept as the historical
-record of what the core's authors expected to be left. What remains open:
-critical CSS (A7), liveness-tied dead-style elimination (G2), and the property
-tail's VALUE-TYPE half (§0bis.1).
+Status: **CORE SHIPPED 2026-07-10; TAIL SHIPPED 2026-08-04, including the
+value types** — §0bis is the live status and supersedes the "Remaining" list
+at the end of this paragraph, which is kept as the historical record of what
+the core's authors expected to be left. What remains open: critical CSS (A7)
+and liveness-tied dead-style elimination (G2), both entangled elsewhere. The
+property tail's VALUE-TYPE half closed with §0bis.3.
 
 The original core record, unedited: **CORE SHIPPED 2026-07-10** — `std::style`
 (same day as the whole
@@ -53,7 +53,7 @@ record; the sections it points at carry the design.
 | dark×pseudo composition | **VERIFIED OPEN → SHIPPED 2026-08-04** | Implemented per §0bis.2: the condition grammar, `dark` with its own body, `pseudo` rejecting the reverse order with a message naming the fix, `media` composing for free. **Every pre-existing class name is byte-identical** — the corpus `.css` golden grew ten lines and changed none. 9 pins (composition, all-three-axes, the four refusals, and the two pre-existing nesting guards that shipped in 2026-07-10 and had never been pinned at all — `grep "cannot wrap" crates/` returned nothing), plus the corpus golden's composed selectors in bytes. Non-vacuity planted. Verification evidence: `Style::pseudo` panicked on `parts[1] != ""`, refusing **both** nesting directions (`dark(hover(..))` and `hover(dark(..))`). Cause was structural, not a missing case: the slot key `media:pseudo:property` has no third position and `dark` occupied the pseudo slot. `style.vl`'s semantics were unchanged since `ad691a7` (2026-07-10) — the only later commits are a reflow and doc comments. |
 | the html `<link>` scaffold | **VERIFIED OPEN → SHIPPED 2026-08-04** | Both `vilan init` browser-bearing templates carry the `<link>`, and both scaffolds now build a style so the link is live (the `cfeb585` move — the todo example dropping handwritten CSS for `std::style` — applied to the scaffolds); the fullstack template also gained the `/client.css` route, guarded with `fs::exists` so deleting every style doesn't crash the server at boot. `examples/reactive-ui` gained the link it was missing. 3 pins: init asserts emitted-AND-linked for the browser template, and asserts the served page links `/client.css` AND that the route returns the rules for the fullstack one; the examples gate grew a GENERAL rule — every emitted stylesheet must be linked by one of the example's pages, stated over what the build produced so a new example is covered the day it lands — proven non-vacuous by deleting reactive-ui's link. Verification evidence: emission shipped: `write_assets` (`crates/vilan-cli/src/main.rs`) writes `<out>.css` on `build`, `run`, `run --watch`, workspace and HMR paths. The *link* half existed only as hand-written bytes in two examples. No template linked it, and `examples/reactive-ui` **emitted `app.css` (pinned in `tests/examples.rs`) while its `index.html` never loaded it** — const styles compiled and then thrown away, the sharpest evidence the hookup was unfinished. |
 | `vilan fmt` chain splitting | **VERIFIED SHIPPED** — `9a3d9af`, 2026-07-28 | "vilan fmt splits method chains over 100 columns"; extended by the 2026-08-01 formatter arc (backlog 42–49, notably `bad9510`'s width-independent `})` seam rule). `formatter.rs` carries `LINE_BUDGET = 100`, `is_breakable_chain`, and style-chain pins including a literal `const style().display(..).flex_direction(..).gap(..)` case. Probed with the worktree binary: a 128-column style chain splits one link per line. **The "(or preserve)" half of §1's note is rejected by design, not open** — the formatter has one canonical output and no width knob, and `an_under_width_hand_split_chain_collapses` pins the rejoin. §1's note is corrected in place. |
-| the property long tail | **VERIFIED OPEN → FIRST SLICE SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. The item stays OPEN for the §3b half — the value types. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
+| the property long tail | **VERIFIED OPEN → BOTH SLICES SHIPPED 2026-08-04** | 28 property methods → **46**, plus `Length::em`/`vh`/`vw`/`calc` and the `WhiteSpace`/`UserSelect` enums. Exactly the ≥5-site head of the sweep, with two named exceptions (below). 4 pins, table-shaped so each method's exact declaration is asserted by name; non-vacuity planted. **The §3b half — the value types — then shipped the same day (§0bis.3):** `Color::rgba`/`.alpha`, the `Gradient` type on the `background-image` slot, `border_none()` and the four border edges, the eight `padding_*`/`margin_*` edges, `Display::InlineFlex`/`InlineGrid`. 8 more pins, all planted (one caught vacuous and rewritten), the corpus `.css` golden **13 lines added and none changed**, and five real `raw` sites in the examples converted with both stylesheets coming out byte-identical. The item CLOSES here; what remains under A8 is only the A7/G2-entangled pieces. Verification evidence: supply was 28 property methods over 32 CSS properties. Demand, swept across the website (the one real consumer — 2926 lines of vilan), the examples, and the docs: **341 `raw(..)` calls against ~350 typed property calls.** The escape hatch was carrying half the styling done in the language. |
 | critical CSS | **OPEN, out of this arc's scope** | A7-entangled; still §6 slice 6, proposal-only. Left filed. |
 | liveness-tied dead-style elimination | **OPEN, out of this arc's scope** | Rides G2's liveness-tied emission. Left filed. |
 
@@ -450,7 +450,8 @@ atomic rule with the condition baked in:
 
 The typed property surface covers the core that styles 90% of real UI
 (layout, spacing, color, typography, borders, radius, shadow, transition — 28
-methods in v1, 46 after the 2026-08-04 demand-led slice, §0bis.1). The tail
+methods in v1, 46 after the 2026-08-04 demand-led property slice (§0bis.1),
+60 after the value-type slice the same day (§0bis.3)). The tail
 does not block: `raw("mask-image", "linear-gradient(..)")` lowers to an atomic rule
 like any other, minus value validation. Plain string classes coexist
 untouched (`view.class("leaflet-container")` — the method shipped as `class`,
