@@ -1,10 +1,11 @@
 # Bundle splitting — route chunks from whole-program reachability (A16)
 
-> **Status: PROPOSAL, drafted 2026-08-03** (user request 2026-07-24;
-> proposal-first per the house rules). Ground truth gathered from the
-> router/reachability machinery and the emission/HMR/SSR/playground
-> consumers; every constraint cited below was verified in source, not
-> assumed. Nothing here is implemented.
+> **Status: SHIPPED — arc complete, 2026-08-04** (drafted 2026-08-03; user
+> request 2026-07-24). S1 (the partition, §7), S2 (emission and the gate,
+> §8), S3 (the loading story, §9) and S4 (the consumer sweep, §10) are all
+> in. What is NOT in is §5's list of v1 non-goals, unchanged and still
+> deliberate; §11 states what a v2 would take up and what this arc leaves
+> standing.
 
 ## 0. The problem and the thesis
 
@@ -333,3 +334,186 @@ crossed: it is the one name here that user code binds.
 
 S4 (the consumer sweep) is untouched: `chunks.json` is emitted and
 documented, and no example serves it yet.
+
+## 9. S3 shipped — the loading story (2026-08-04)
+
+§8's five-item residue, closed. Each behaviour is pinned in the split
+fixture's node harness (§8 asked whether S3 would build the headless-CDP
+harness §6 named or state that the node harness is the bar: **the node
+harness is the bar**, and it turned out to be a better instrument than a
+browser would have been, because the fetch is CONTROLLABLE there — see the
+generation pin below). Every pin was planted red first.
+
+**The boot preload — the earliest point the arm is knowable, which is not
+where §2 hoped.** §2 wanted the emitter to "mark it for preload in the chunk
+map so the fetch overlaps module evaluation". It cannot: the boot arm is
+`parse(location.pathname)` for the app's own `parse`, both runtime values,
+and no map the emitter can write knows either. What the emitter CAN do is
+notice where the fetch was actually being issued. `swap_split` is the LAST
+call in the view chain that mounts it, so its arguments — the entire shell
+subtree among them — were all evaluated before the gate ever looked at the
+route. `std::ui::chunk_preload(source)` starts the fetch without waiting,
+and the emitter plants a call to it immediately before the statement that
+mounts the swap: the route value is that statement's own argument, so it is
+in scope there by construction, and nothing of the view has been built yet.
+The planting runs BEFORE the rename, so the route signal's name travels with
+every other reference to it; it only fires when the swap's source is a plain
+name (the canonical shape), and any other shape simply gets S2's behaviour.
+Node-stub observable: the harness records whether a chunk fetch was already
+in flight when the FIRST element was created.
+
+The ceiling is worth recording: this overlaps the fetch with the shell
+BUILD, not with the eager bundle's own download. Overlapping with the
+download needs a `<link rel="modulepreload">` in the HTML, which the
+compiler does not write — but an SSR server can, and now has `chunks.json`
+to write it from (§10). That is the real first-paint fix and it is a page's
+decision, not a compiler's.
+
+**The error hook — and the bug behind it.** Probing "what actually happens
+when a fetch fails" found worse than the recorded story: the console did
+report, and the route did stay put, but `chunk_pending_signal` was set true
+before the fetch and cleared only on the SUCCESS path, so a failed fetch
+left `router::pending()` **stuck true forever** — every spinner in the app
+on, permanently. `__chunk_load` now carries the reason back through a third
+callback, `std::router::chunk_error(): Signal<Option<str>>` publishes it
+beside `pending()`, and the flag comes down on both paths. The retry
+mechanism is that there is none to write: a failed attempt is not remembered
+as in flight, and the error clears when the next navigation starts, so
+clicking the link again refetches. Pinned by pointing an arm's entry in the
+embedded map at a file that is not there — the same failure a 404 produces,
+and the only knob it takes.
+
+**Latest wins by generation.** `Draft::push`'s guard, same shape: each value
+taken from the route signal claims the next generation, and a continuation
+applies only if it is still the latest. Without it, navigating A→B while A
+was in flight left A on screen when it landed. Two consequences fell out of
+the guard rather than out of the ticket: navigating back to already-loaded
+code must also lower `pending()` (the fetch it supersedes can no longer land
+to lower it), and `pending`/`chunk_error` now publish only on a real change,
+so an ordinary navigation over loaded code notifies nothing. The pin seeds
+the registry's pending slot with a promise the harness resolves by hand —
+`__chunk_load` joins an existing in-flight promise rather than opening a
+second, so the harness's promise IS the arm's fetch.
+
+**`--watch` strays — closed at the root, one level up from where §8 filed
+it.** The residue was "a watch round leaves the previous build's chunk files
+beside the whole bundle it wrote". The general statement is that **a leg's
+chunk namespace belongs to its LAST build**: `<leg>.<arm>.js` and
+`<leg>.chunks.json` are swept on every write of the leg, chunks or none. So
+a renamed route arm does not leave the old arm's file behind, dropping
+`split` takes the manifest with it (a manifest outliving its chunks is one
+that LIES, and §10's server would serve from it), and a watch round clears
+what a `vilan build` left. The `<leg>.` prefix plus a non-empty arm segment
+is a safe discriminator for exactly the reason §8 gave for
+`reject_output_collisions`: a leg name is a manifest-checked identifier and
+so holds no `.`.
+
+**The split-cost warning — measured, not quoted, and the constant
+recomputed.** §8 asked for a note when the lazy mass is below break-even and
+suggested a threshold. A threshold would be a remembered measurement, and
+this arc is exactly the demonstration of how fast it goes stale (below). So
+the toolchain measures instead: `transform_split` emits the entry BOTH ways
+and reports what the same program weighs as one file, `vilan build` warns
+with the leg's own numbers when the eager bundle came out no smaller, and
+`--print-chunks` prints the same verdict line from the same computation. The
+cost is one extra emission over an already-analyzed program, paid only by a
+leg that asked to split or asked to be measured, and it buys an EXACT answer
+that cannot drift.
+
+**The recomputed constant.** Measured on the current emitter, over three
+programs (the fixture, `examples/router`, `examples/walkthrough` built
+split), where *fixed cost* = the bytes the split adds to first load plus the
+bytes of function declarations it moved out:
+
+| leg | chunks | deferred | moved | added to first load | fixed cost |
+| --- | --- | --- | --- | --- | --- |
+| fixture | 3 | 1019 | 438 | +4957 | 5395 |
+| examples/router | 3 | 1987 | 1131 | +4694 | 5825 |
+| examples/walkthrough | 3 | 6802 | 4403 | +1720 | 6123 |
+
+**The fixed cost of splitting a leg is ~5.4–6.1 KB on this emitter, so the
+break-even is roughly 6 KB of emitted per-route code** (about 6–8.5 KB of
+deferred mass, since each chunk carries its own registry preamble and
+registrations). §8 measured ~2.5 KB added and put break-even at "roughly
+3–4 KB". **That number more than doubled in one slice** — the preload, the
+`Option<str>` error signal, the generation guard and the two
+publish-on-change helpers all ride in the gate — which is precisely why the
+constant is now recorded as a measurement of a moment rather than compiled
+in as a rule. `examples/walkthrough` remains the largest app in the tree and
+is still a net loss at +1720 B: **no example in this repository should
+declare `split = true`**, and the warning now says so on any that tries.
+
+## 10. S4 shipped — the consumer sweep, and the decisions (2026-08-04)
+
+**HMR × split: `run` ignores `split`, in every form, and says so once.**
+The investigation found the real defect was not the missing decision but an
+existing inconsistency: `vilan run` and `run --watch --no-hmr` went through
+`build_workspace_artifacts` and DID split, while an HMR-active watch round
+passed `None` and did not — the same project built two different ways
+depending on a flag about hot reloading. All three now emit whole bundles.
+
+The reasoning, recorded because the alternative was live: refusing the
+combination with a message steering to "unsplit dev + split build" reads
+tidy and is worse, because `run --watch` is how one develops and a project
+that ships split would then be undevelopable without editing its manifest.
+Per-file HMR was the other option and is not worth building: HMR classifies
+by whole-bundle byte diff and swaps a whole blob with a per-leg version
+counter (hmr.md), so per-chunk swapping needs per-chunk versions, a
+classifier per file and a re-registration story — and §9's measurement says
+the mode being optimized is a net LOSS at every scale in this tree. The
+doctrine holds it together: single-file emission is first-class forever;
+`split` is a `vilan build` decision and nothing else. This is also what
+would have mooted item 4 — but item 4's sweep is the more general statement
+and is what makes `dist/` honest after the mode change, so both shipped.
+
+**SSR servers and `chunks.json`.** `examples/fullstack`'s server reads
+`dist/client.chunks.json` at boot and serves every file it names, so nothing
+in it names a route: adding, renaming or removing an arm needs no server
+change. A leg that does not split writes no manifest, so the list is empty
+and the arm never matches — the same server works either way, which is why
+the example could adopt the pattern WITHOUT adopting `split` (which §9's
+measurement says it must not). The docs carry the manifest's shape and the
+static-host case ("serve `dist/`"). Pinned by an e2e that builds a split
+leg, serves it through exactly that code, and fetches every chunk back
+byte-identical over HTTP.
+
+**The playground: structurally out of reach, and now guarded.** `split`
+has nowhere to be written (no manifest, no `[entry.<name>]` table),
+`CompileResult` is one string, and a chunk's relative `import()` cannot
+resolve in an opaque-origin `srcdoc` frame — the constraint that made §3
+choose a runtime registry over ESM in the first place. Two pins: a
+router-shaped program still compiles to one bundle with no chunk machinery
+in it, and `crates/vilan-wasm/src/lib.rs` may not name `transform_split`.
+The second carries the weight, because the first cannot fail today for a
+reason worth writing down (§11).
+
+## 11. What is left, precisely
+
+Nothing of A16. The v1 non-goals in §5 stand as written; the extensions §8
+named are unchanged and unstarted (nested-match splitting, multi-site
+splitting — which wants a site key passed to the gate — and shared chunks
+between sibling routes). Nothing suggests taking them up: the measurement in
+§9 says the mechanism does not pay at this tree's scale, and a v2 would be
+adding capability to a mode that currently costs bytes. **The instrument to
+watch is `--print-chunks`' verdict on a real consumer app**; when one goes
+positive, that is the signal.
+
+Three things this arc touched and did not close, each outliving it:
+
+- **Nothing structurally holds the two `ui` layers' surfaces against each
+  other.** S2 found it; S3 paid it again (`chunk_failure` had to be added to
+  the process twin by hand or `std::router` stops compiling for a process
+  build). The existing layer-requirement and SSR-import pins catch it, but
+  only after the fact.
+- **The playground's `Program::std_sources` is EMPTY.** `embedded_std_spec`
+  hand-builds its package spec and never marks std, so `View` does not read
+  as std-resident and `chunks::plan` recognizes no site there. Harmless
+  today (the playground never calls the split emitter), but every residence
+  rule in `chunks.rs` — "std is never chunked" above all — reads the wrong
+  way under it, so the day that spec learns to mark std, a playground wired
+  to splitting would start chunking the standard library. Hence the
+  source-level guard rather than an output-only one.
+- **`reject_output_collisions` over `dist/`**, unchanged from §8: chunk
+  names are unrepresentable as collisions, but a leg whose entry file stem
+  collides with another package's is still the pre-existing hole, and it is
+  not a splitting problem.

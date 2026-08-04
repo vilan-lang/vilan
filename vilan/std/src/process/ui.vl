@@ -22,6 +22,7 @@
 // Only available when building for a process platform (node).
 
 import pkg::compare::PartialEq;
+import pkg::option::Option::{ None, self };
 import pkg::reactive::{ Draft, Owner, Signal, owner_scope, run_with_owner, turn_scope };
 import pkg::shared::Shared;
 import pkg::style::Style;
@@ -389,14 +390,20 @@ fun render(view: View): str {
 	out + "</" + view.tag + ">"
 }
 
-/// The browser layer's route-chunk loading hook, in its server form
-/// (proposal/bundle-splitting.md §2). A server render is one pass over code
-/// that is already loaded, so nothing is ever in flight: this is always false.
-/// It exists because `std::router::pending` re-exports it, and the two `ui`
-/// layers declare the same surface — a component that binds it renders on
-/// both sides.
+/// The browser layer's route-chunk hooks, in their server form
+/// (proposal/bundle-splitting.md §2/§S3). A server render is one pass over code
+/// that is already loaded, so nothing is ever in flight and nothing can fail to
+/// arrive: these are always `false` and `None`. They exist because
+/// `std::router::pending`/`chunk_error` re-export them, and the two `ui` layers
+/// declare the same surface — a component that binds one renders on both sides.
+/// KEEP IN STEP with the browser twin (browser/ui.vl).
 let chunk_pending_signal: Signal<bool> = Signal::new(false);
+let chunk_error_signal: Signal<Option<str>> = Signal::new(None);
 
 fun chunk_pending(): Signal<bool> {
 	chunk_pending_signal
+}
+
+fun chunk_failure(): Signal<Option<str>> {
+	chunk_error_signal
 }

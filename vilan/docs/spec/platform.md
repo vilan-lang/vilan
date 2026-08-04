@@ -101,7 +101,10 @@ functions exactly one arm of the entry's route `match` can reach. A
 `dist/<name>.chunks.json` lists them. Chunks are fetched when a
 navigation first reaches their arm, and the route value does not advance
 until one arrives; which functions land where is implementation-defined
-beyond that rule. `split` on a non-`browser` entry is a manifest error.
+beyond that rule. Overlapping navigations resolve by order of DEPARTURE,
+not of arrival: a chunk that lands after a later navigation began does not
+advance the route value. A fetch that fails leaves the route value where it
+was and is not remembered, so a later navigation to that arm fetches again. `split` on a non-`browser` entry is a manifest error.
 `vilan run` builds all entries and starts one `@process` entry: the
 only one, the designated `default-entry`, or the one `--entry` names;
 `vilan check` checks every entry, always. The emitted text beyond

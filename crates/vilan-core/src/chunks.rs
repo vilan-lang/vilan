@@ -59,6 +59,11 @@ pub struct Gate {
     /// `View.swap_split` — what they resolve to in a split build. Same shape,
     /// so the call's own type binding carries over by position.
     pub swap_split: Id,
+    /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
+    /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
+    /// the same generics as `swap_split` in the same order, so the gate call's
+    /// type argument rebinds onto it by position too.
+    pub preload: Id,
 }
 
 impl ChunkPlan {
@@ -213,17 +218,71 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
-    let gate = view_method(program, "swap_split").map(|swap_split| Gate {
-        calls: sites.iter().map(|site| site.call).collect(),
-        swap: swap_fn,
-        swap_split,
-    });
+    let gate = view_method(program, "swap_split")
+        .zip(std_function(program, "chunk_preload"))
+        .map(|(swap_split, preload)| Gate {
+            calls: sites.iter().map(|site| site.call).collect(),
+            swap: swap_fn,
+            swap_split,
+            preload,
+        });
     ChunkPlan {
         sites: sites.len(),
         eager_functions,
         shared_functions: shared,
         chunks,
         gate,
+    }
+}
+
+/// What a split cost this leg, in emitted bytes (`bundle-splitting.md` §S3,
+/// item 5). S2's measurement showed the gate is NOT free — `swap_split`'s body,
+/// the `__chunk_*` helpers, the extra signal instances, the forwarders, the
+/// registrations and the url map are a fixed cost per split leg — so a leg with
+/// little per-route code ships MORE on first load than it would whole. The
+/// toolchain now measures that per leg rather than quoting a constant: a split
+/// build emits the same entry both ways and compares, which is exact and needs
+/// no threshold at all.
+pub struct SplitCost {
+    /// The eager bundle a split build writes — what the first load pays.
+    pub eager: usize,
+    /// The chunk files' total — what the first load does NOT pay.
+    pub deferred: usize,
+    /// The same entry emitted as one file — what the first load would pay
+    /// without `split`.
+    pub whole: usize,
+}
+
+impl SplitCost {
+    /// Bytes the split ADDS to the first load. Negative is the win.
+    pub fn added(&self) -> i64 {
+        self.eager as i64 - self.whole as i64
+    }
+
+    /// Whether splitting this leg made the first load bigger — the condition
+    /// the build warns on.
+    pub fn is_a_loss(&self) -> bool {
+        self.added() >= 0
+    }
+
+    /// The verdict in one sentence, shared by `--print-chunks` and the build
+    /// warning so the two can never disagree.
+    pub fn verdict(&self) -> String {
+        let added = self.added();
+        if added >= 0 {
+            format!(
+                "splitting adds {added} bytes to the first load and defers only {} — \
+                 the route gate, the forwarders and the chunk map cost more than this \
+                 leg's per-route code saves ({} bytes split against {} whole)",
+                self.deferred, self.eager, self.whole,
+            )
+        } else {
+            format!(
+                "splitting saves {} bytes on the first load and defers {} \
+                 ({} bytes split against {} whole)",
+                -added, self.deferred, self.eager, self.whole,
+            )
+        }
     }
 }
 
@@ -244,6 +303,21 @@ fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
         .then(|| implementation.declarations.get(name).copied())
         .flatten()
     })
+}
+
+/// A free std function by name — restricted to std sources, so an app function
+/// of the same name can never be mistaken for the one the gate wires.
+fn std_function(program: &Program<'_>, name: &str) -> Option<Id> {
+    program
+        .functions
+        .iter()
+        .find(|(id, function)| {
+            function.name == name
+                && program
+                    .source_of(**id)
+                    .is_some_and(|source| program.std_sources.contains(&source))
+        })
+        .map(|(id, _)| *id)
 }
 
 /// One recognized `.swap(signal, |current| match current { .. })` site.

@@ -11,12 +11,14 @@
 //   - a chunked page reading a module binding (`LABEL`) -> the chunk reaches
 //     the eager scope through the registry;
 //   - `router::pending()` bound into the shell -> the loading hook is live
-//     while a chunk is in flight.
+//     while a chunk is in flight;
+//   - `router::chunk_error()` bound beside it -> a failed fetch is observable
+//     to the app, with its reason.
 
 import std::io::print;
 import std::option::Option::{ None, Some, self };
 import std::reactive::Signal;
-import std::router::{ Routable, current_path, link, pending, segments };
+import std::router::{ Routable, chunk_error, current_path, link, pending, segments };
 import std::ui::{ View, mount_root, view };
 
 // === The route space =========================================================
@@ -100,9 +102,17 @@ fun app(route: Signal<Route>): View {
 		.child(view("nav")
 			.child(link("Home", Route::Home))
 			.child(link("Docs", Route::Docs(1))))
-		// The loading story's one hook: true while a route chunk is fetching,
-		// with the previous page still on screen behind it.
+		// The loading story's two hooks: true while a route chunk is fetching,
+		// with the previous page still on screen behind it — and the reason the
+		// last fetch failed, if one did. The failure renders `!` rather than the
+		// host's own message so the pin stays stable, but it renders it only
+		// when the reason is a non-empty string, so the message really did
+		// travel from the fetch to the app.
 		.child(view("p").class("pending").bind_text(pending().map(|busy| if busy { "..." } else { "" })))
+		.child(view("p").class("failed").bind_text(chunk_error().map(|reason| match reason {
+			Some(let text) => if text.len() > 0 { "!" } else { "?" },
+			None => "",
+		})))
 		.swap(route, |current| match current {
 			Route::Home => home_page(),
 			Route::Docs(let page) => docs_page(page),

@@ -676,6 +676,7 @@ fn hmr_round(
             next.push(prior.clone());
             continue;
         }
+        note_split_ignored(unit);
         let mut overlay_text = String::new();
         let (javascript, assets, sources) = match compile_unit(
             unit,
@@ -684,7 +685,9 @@ fn hmr_round(
             matches!(platform, Platform::Browser),
             Some(&mut overlay_text),
             // Dev builds ignore `split` (`bundle-splitting.md` §4): HMR
-            // classifies and swaps whole bundles.
+            // classifies and swaps whole bundles. The leg's chunk namespace is
+            // swept below, so a `vilan build` before this one leaves nothing
+            // behind describing a split that is no longer on disk.
             None,
         ) {
             Ok(compiled) => compiled,
@@ -770,6 +773,9 @@ fn hmr_round(
                 bundle_path.display()
             );
         }
+        // This round emitted the leg whole, so nothing of a previous split
+        // build of it may remain (`bundle-splitting.md` §S3, item 4).
+        sweep_stale_chunks(&bundle_path, &[]);
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
             if let Err(error) = fs::write(&css_path, css) {
@@ -979,7 +985,7 @@ fn build_and_spawn_run(
                     return None;
                 }
             };
-            if build_workspace_artifacts(&root, &members, false).is_err() {
+            if build_workspace_artifacts(&root, &members, false, Emission::WholeBundles).is_err() {
                 return None;
             }
             launch(
@@ -1740,16 +1746,56 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
 /// Members build in declaration order (the client before the server, so the
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
 fn build_workspace(root: &Path, members: &[(Unit, Platform)], debug: bool) -> ExitCode {
-    match build_workspace_artifacts(root, members, debug) {
+    match build_workspace_artifacts(root, members, debug, Emission::AsDeclared) {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
+}
+
+/// Whether a build honours a browser leg's `[entry.<name>] split`
+/// (`bundle-splitting.md` §4, §S4 item 6). `vilan build` does; every `run` form
+/// does not, watched or not.
+///
+/// The doctrine is that single-file emission is first-class forever and
+/// splitting is a BUILD optimization: HMR classifies by whole-bundle byte diff
+/// and swaps a whole blob, `run --watch` is the only way to develop, and a
+/// refusal would mean a project that ships split could not be developed without
+/// editing its manifest. So `run` emits one file per leg, says so once, and the
+/// leg's chunk namespace is swept clean by [`write_chunks`] so `dist/` never
+/// describes a build that is no longer there.
+#[derive(Clone, Copy, PartialEq)]
+enum Emission {
+    AsDeclared,
+    WholeBundles,
+}
+
+/// Says, once per process, that a `run` is passing over a leg's `split`. Once,
+/// not once per watch round: a watcher lives for hours.
+fn note_split_ignored(unit: &Unit) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    if !unit.split {
+        return;
+    }
+    NOTED.call_once(|| {
+        eprintln!(
+            "{}",
+            paint::err(
+                paint::Style::DIM,
+                &format!(
+                    "run: `{}` emits as one file — `split` is a `vilan build` optimization \
+                     (the dev loop hot-swaps whole bundles). `vilan build` writes its route chunks.",
+                    unit.name
+                )
+            )
+        );
+    });
 }
 
 fn build_workspace_artifacts(
     root: &Path,
     members: &[(Unit, Platform)],
     debug: bool,
+    emission: Emission,
 ) -> Result<(), ExitCode> {
     let dist = root.join("dist");
     if let Err(error) = fs::create_dir_all(&dist) {
@@ -1764,17 +1810,17 @@ fn build_workspace_artifacts(
         if platform.is_none() {
             continue;
         }
+        if emission == Emission::WholeBundles {
+            note_split_ignored(unit);
+        }
         let mut chunks = Vec::new();
-        let (javascript, assets, _sources) = compile_unit(
-            unit,
-            *platform,
-            debug,
-            false,
-            None,
-            Some((&unit.name, &mut chunks)),
-        )?;
+        let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
+        let (javascript, assets, _sources) =
+            compile_unit(unit, *platform, debug, false, None, sink)?;
         let output = dist.join(format!("{}.js", unit.name));
         write_assets(&output, &assets);
+        // Unconditional: this is also where a previous build's chunks are swept
+        // when this one wrote none.
         write_chunks(&output, &chunks)?;
         if let Err(error) = fs::write(&output, javascript) {
             eprintln!(
@@ -1908,7 +1954,7 @@ fn run_workspace(
             return ExitCode::FAILURE;
         }
     };
-    if let Err(code) = build_workspace_artifacts(root, members, false) {
+    if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles) {
         return code;
     }
     // Run from the project root so the server reads sibling `dist/*.js`; the script
@@ -2168,17 +2214,28 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
 /// Writes a split leg's route chunks beside its bundle, plus the
 /// `<leg>.chunks.json` sidecar listing every artifact — the manifest a
 /// hand-written server iterates instead of hard-coding one route per file
-/// (`bundle-splitting.md` §3; the SSR/todo examples adopt it in S4).
+/// (`bundle-splitting.md` §3, adopted by the fullstack example in S4).
 ///
 /// Chunk names are `<leg>.<arm>.js`, and a leg name is a manifest-checked
 /// identifier (no `.`), so a chunk can never collide with another leg's
 /// `dist/<leg>.js` — which is why `reject_output_collisions` needs no chunk
-/// pass of its own.
+/// pass of its own. That same shape is what makes the sweep below safe: every
+/// `<leg>.<anything>.js` beside the bundle is this leg's chunk and nobody
+/// else's.
+///
+/// EVERY write of a leg goes through here, `chunks` empty or not, because the
+/// leg's chunk namespace belongs to its LAST build (`bundle-splitting.md` §S3,
+/// item 4): renaming a route arm, dropping `split`, or a `--watch` round — which
+/// emits the whole bundle by design — must not leave the previous build's chunk
+/// files lying beside it. They would be inert (a whole bundle names no chunk)
+/// but a `chunks.json` that outlived its chunks is a manifest that lies, and a
+/// server iterating it would serve code the bundle no longer knows about.
 fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<(), ExitCode> {
+    let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
+    sweep_stale_chunks(output_js, chunks);
     if chunks.is_empty() {
         return Ok(());
     }
-    let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     for chunk in chunks {
         let path = directory.join(&chunk.file);
         if let Err(error) = fs::write(&path, &chunk.source) {
@@ -2231,6 +2288,47 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
         paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
     );
     Ok(())
+}
+
+/// Removes the chunk artifacts of `output_js`'s leg that this build did not
+/// write. `<leg>.<arm>.js` and `<leg>.chunks.json` are the leg's own namespace
+/// (a leg name is an identifier, so it holds no `.`), and the last build of the
+/// leg owns all of it. A failed removal is reported and otherwise ignored: a
+/// stray is a tidiness problem, never a correctness one, and it must not fail a
+/// build that otherwise succeeded.
+fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk]) {
+    let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
+    let Some(leg) = output_js.file_stem().map(|stem| stem.to_string_lossy()) else {
+        return;
+    };
+    let manifest = format!("{leg}.chunks.json");
+    let keep: Vec<&str> = wrote.iter().map(|chunk| chunk.file.as_str()).collect();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `<leg>.<arm>.js`, with a non-empty arm — which `<leg>.js` itself, the
+        // bundle this is called to protect, does not match.
+        let is_chunk = name
+            .strip_prefix(&format!("{leg}."))
+            .and_then(|rest| rest.strip_suffix(".js"))
+            .is_some_and(|arm| !arm.is_empty());
+        let is_manifest = name == manifest;
+        if (!is_chunk && !is_manifest) || keep.contains(&name.as_str()) {
+            continue;
+        }
+        if is_manifest && !wrote.is_empty() {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(entry.path()) {
+            eprintln!(
+                "{} cannot remove the stale chunk {}: {error}",
+                paint::warning_prefix(),
+                entry.path().display()
+            );
+        }
+    }
 }
 
 /// A JSON string literal. Chunk arms and file names come from vilan identifiers
@@ -2482,9 +2580,30 @@ fn compile_to_js(
             // build would chunk. Analysis-only — the emitted JavaScript below
             // is untouched — and gated on a clean analysis, so a failing build
             // reports its diagnostics, never a plan over a broken program.
+            // The leg a split would name its chunks after — the entry's own
+            // name when one asked to split, the source stem otherwise (which is
+            // what `--print-chunks` measures against on a leg that has not).
+            let leg_name = split
+                .as_ref()
+                .map(|(leg, _)| (*leg).to_string())
+                .unwrap_or_else(|| {
+                    file.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
             if PRINT_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
                 let chunk_plan = vilan_core::chunks::plan(&program);
                 print!("{}", vilan_core::chunks::render(&chunk_plan, &filename));
+                // The verdict (`bundle-splitting.md` §S3, item 5): the plan is
+                // the numerator, and the denominator is what the same entry
+                // weighs emitted whole — so the report measures rather than
+                // quotes. Emission only, discarded; the flag stays analysis-only
+                // in the sense that matters, which is that it writes nothing.
+                if !chunk_plan.chunks.is_empty()
+                    && let Ok(measured) = vilan_core::transform_split(&program, options, &leg_name)
+                {
+                    println!("  verdict: {}", measured.cost().verdict());
+                }
             }
             // A `split = true` leg emits through the same walk and the same
             // rename; `transform_split` returns the eager bundle where
@@ -2492,6 +2611,20 @@ fn compile_to_js(
             let emitted = match split {
                 Some((leg, sink)) => {
                     vilan_core::transform_split(&program, options, leg).map(|split_program| {
+                        // Splitting is not free, and below a few KB of
+                        // per-route code it is a NET LOSS on first load (S2's
+                        // measurement). Say so, with this leg's own numbers,
+                        // rather than leaving the author to discover it.
+                        let cost = split_program.cost();
+                        if cost.is_a_loss() {
+                            eprintln!(
+                                "{} `split` on `{leg}`: {}. Consider dropping it, or splitting a \
+                                 leg with more per-route code (`vilan build --print-chunks` \
+                                 reports what each route would carry)",
+                                paint::warning_prefix(),
+                                cost.verdict(),
+                            );
+                        }
                         sink.extend(split_program.chunks);
                         split_program.main
                     })

@@ -115,6 +115,22 @@ pub struct EmittedChunk {
 pub struct SplitProgram {
     pub main: String,
     pub chunks: Vec<EmittedChunk>,
+    /// The same entry emitted as ONE file — the denominator of the split's
+    /// verdict (`bundle-splitting.md` §S3, item 5). Measured rather than
+    /// estimated: the fixed cost of the gate is not a constant the emitter can
+    /// be trusted to remember, so a split build emits both ways and compares.
+    pub whole_bytes: usize,
+}
+
+impl SplitProgram {
+    /// What this split cost, in emitted bytes.
+    pub fn cost(&self) -> crate::chunks::SplitCost {
+        crate::chunks::SplitCost {
+            eager: self.main.len(),
+            deferred: self.chunks.iter().map(|chunk| chunk.source.len()).sum(),
+            whole: self.whole_bytes,
+        }
+    }
 }
 
 /// The registry the eager bundle and its chunks meet at. Not an ESM export:
@@ -142,21 +158,27 @@ pub fn transform_split<'src>(
     if plan.chunks.is_empty() {
         // Nothing splittable: the entry is a single file, exactly as if the
         // flag were absent. Reported by `--print-chunks`, not by a failure.
+        let main = transform(program, options)?;
         return Ok(SplitProgram {
-            main: transform(program, options)?,
+            whole_bytes: main.len(),
+            main,
             chunks: Vec::new(),
         });
     }
+    // The denominator of the verdict below: the same program as one file. A
+    // second walk over an already-analyzed program, paid only by a leg that
+    // asked to split, and it buys an EXACT answer where a compiled-in threshold
+    // would only ever be a remembered measurement.
+    let whole_bytes = transform(program, options)?.len();
 
     let mut transformer = Transformer::new(program, options);
     transformer.chunk_members = plan.members();
     transformer.chunk_count = plan.chunks.len();
-    transformer.chunk_gate = plan.gate.as_ref().map(|gate| {
-        (
-            gate.swap,
-            gate.swap_split,
-            gate.calls.iter().copied().collect::<HashSet<Id>>(),
-        )
+    transformer.chunk_gate = plan.gate.as_ref().map(|gate| ChunkGate {
+        swap: gate.swap,
+        swap_split: gate.swap_split,
+        preload: gate.preload,
+        calls: gate.calls.iter().copied().collect::<HashSet<Id>>(),
     });
     transformer.used_helpers.insert("__chunk_registry");
     let formatter = transformer.formatter.clone();
@@ -287,6 +309,7 @@ pub fn transform_split<'src>(
 
     Ok(SplitProgram {
         main,
+        whole_bytes,
         chunks: plan
             .chunks
             .iter()
@@ -330,6 +353,171 @@ fn chunk_forwarder<'src>(function: &js::Function<'src>) -> js::Node<'src> {
         )))],
         is_async: function.is_async,
     })
+}
+
+/// Plants `__chunk_preload(<route signal>)` ahead of every statement that
+/// mounts a recognized route swap (`bundle-splitting.md` §S3), and reports the
+/// indices it inserted at in `body` itself so a caller holding a position into
+/// that vector can adjust it.
+///
+/// The swap is the last call in its view chain, so its arguments — the shell
+/// subtree among them — are all evaluated before the gate ever looks at the
+/// route. A statement of its own, before that one, is the earliest point in the
+/// program where the boot arm is known: the route value exists (it is the
+/// statement's own argument), and nothing of the view has been built yet.
+///
+/// `gates` are the emitted names the gate's calls resolved to, and the preload's
+/// argument is the swap's SOURCE argument — planted only when that argument is a
+/// plain name, which is in scope at the statement by construction. Any other
+/// shape (a route signal derived inline at the call) simply gets no preload,
+/// which is the behaviour that shipped with S2.
+fn plant_boot_preloads<'src>(
+    body: &mut Vec<js::Node<'src>>,
+    gates: &BTreeMap<String, String>,
+    total: &mut usize,
+) -> Vec<usize> {
+    if gates.is_empty() {
+        return Vec::new();
+    }
+    // Descend first, so a swap inside a nested body is planted beside the
+    // statement in ITS list rather than the outer one.
+    for node in body.iter_mut() {
+        descend_for_preload(node, gates, total);
+    }
+    let mut planted = Vec::new();
+    let mut index = 0;
+    while index < body.len() {
+        match gate_source_name(&body[index], gates) {
+            Some((preload, source)) => {
+                body.insert(
+                    index,
+                    js::Node::Call(
+                        Box::new(js::Node::Local(preload)),
+                        vec![js::Node::Local(source)],
+                    ),
+                );
+                planted.push(index);
+                *total += 1;
+                index += 2;
+            }
+            None => index += 1,
+        }
+    }
+    planted
+}
+
+/// Recurses into every statement list `node` contains — a function or closure
+/// body wherever it sits, and the block forms — planting there.
+fn descend_for_preload<'src>(
+    node: &mut js::Node<'src>,
+    gates: &BTreeMap<String, String>,
+    total: &mut usize,
+) {
+    match node {
+        js::Node::Function(function) => {
+            plant_boot_preloads(&mut function.body, gates, total);
+        }
+        js::Node::Closure(closure) => {
+            plant_boot_preloads(&mut closure.body, gates, total);
+        }
+        js::Node::ForOf(_, iterable, block) => {
+            descend_for_preload(iterable, gates, total);
+            plant_boot_preloads(block, gates, total);
+        }
+        js::Node::While(condition, block) => {
+            descend_for_preload(condition, gates, total);
+            plant_boot_preloads(block, gates, total);
+        }
+        js::Node::If(branch) => descend_if_for_preload(branch, gates, total),
+        js::Node::Try(block, finally) => {
+            plant_boot_preloads(block, gates, total);
+            plant_boot_preloads(finally, gates, total);
+        }
+        js::Node::Call(subject, arguments) => {
+            descend_for_preload(subject, gates, total);
+            for argument in arguments {
+                descend_for_preload(argument, gates, total);
+            }
+        }
+        js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+            descend_for_preload(&mut variable.value, gates, total)
+        }
+        js::Node::Assignment(left, right)
+        | js::Node::Binary(_, left, right)
+        | js::Node::PropertyIndex(left, right) => {
+            descend_for_preload(left, gates, total);
+            descend_for_preload(right, gates, total);
+        }
+        js::Node::Await(inner)
+        | js::Node::Unary(_, inner)
+        | js::Node::Return(inner)
+        | js::Node::Throw(inner)
+        | js::Node::Spread(inner)
+        | js::Node::Property(inner, _) => descend_for_preload(inner, gates, total),
+        js::Node::Array(items) => {
+            for item in items {
+                descend_for_preload(item, gates, total);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn descend_if_for_preload<'src>(
+    branch: &mut js::IfBranch<'src>,
+    gates: &BTreeMap<String, String>,
+    total: &mut usize,
+) {
+    match branch {
+        js::IfBranch::If(condition, block, else_branch) => {
+            descend_for_preload(condition, gates, total);
+            plant_boot_preloads(block, gates, total);
+            if let Some(else_branch) = else_branch {
+                descend_if_for_preload(else_branch, gates, total);
+            }
+        }
+        js::IfBranch::Else(block) => {
+            plant_boot_preloads(block, gates, total);
+        }
+    }
+}
+
+/// The route signal one statement's gate call reads, when the statement makes
+/// such a call with a plainly-named source. Deliberately does NOT descend into
+/// function or closure bodies or into block forms: those are statement lists of
+/// their own, and [`plant_boot_preloads`] has already planted in them.
+fn gate_source_name(node: &js::Node, gates: &BTreeMap<String, String>) -> Option<(String, String)> {
+    match node {
+        js::Node::Call(subject, arguments) => {
+            if let js::Node::Local(name) = subject.as_ref()
+                && let Some(preload) = gates.get(name)
+                && let Some(js::Node::Local(source)) = arguments.get(1)
+            {
+                return Some((preload.clone(), source.clone()));
+            }
+            gate_source_name(subject, gates).or_else(|| {
+                arguments
+                    .iter()
+                    .find_map(|node| gate_source_name(node, gates))
+            })
+        }
+        js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+            gate_source_name(&variable.value, gates)
+        }
+        js::Node::Assignment(left, right)
+        | js::Node::Binary(_, left, right)
+        | js::Node::PropertyIndex(left, right) => {
+            gate_source_name(left, gates).or_else(|| gate_source_name(right, gates))
+        }
+        js::Node::Await(inner)
+        | js::Node::Unary(_, inner)
+        | js::Node::Return(inner)
+        | js::Node::Throw(inner)
+        | js::Node::Spread(inner)
+        | js::Node::Property(inner, _) => gate_source_name(inner, gates),
+        js::Node::Array(items) => items.iter().find_map(|item| gate_source_name(item, gates)),
+        _ => None,
+    }
 }
 
 /// The names one file's top level declares — what the other side of the split
@@ -511,6 +699,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_arm",
         "__chunk_ready",
         "__chunk_load",
+        "__chunk_preload",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -600,10 +789,13 @@ fn helper_source(name: &str) -> &'static str {
         }
         // A failed fetch reports and does NOT continue: the route signal never
         // advances, so the previous view stays and the navigation simply did not
-        // happen (`bundle-splitting.md` §2). The in-flight promise is dropped on
-        // failure so the next attempt refetches.
+        // happen (`bundle-splitting.md` §2). `failed` carries the reason to
+        // `std::router::chunk_error` (§S3) — without it a failure left
+        // `pending()` stuck true forever, since only the success path cleared
+        // it. The in-flight promise is dropped on failure so the next attempt
+        // refetches.
         "__chunk_load" => {
-            "function __chunk_load(arm, then) {\n\
+            "function __chunk_load(arm, then, failed) {\n\
              \tconst chunks = __chunk_registry();\n\
              \tif (chunks.url[arm] === undefined || chunks.loaded[arm] === true) {\n\
              \t\tthen();\n\
@@ -615,6 +807,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\tconst specifier = chunks.base === \"\" ? \"./\" + url : new URL(url, chunks.base).href;\n\
              \t\tinflight = import(specifier).then(() => {\n\
              \t\t\tchunks.loaded[arm] = true;\n\
+             \t\t\tdelete chunks.pending[arm];\n\
              \t\t}, (error) => {\n\
              \t\t\tdelete chunks.pending[arm];\n\
              \t\t\tconsole.error(\"[vilan] route chunk \" + url + \" failed to load\", error);\n\
@@ -622,7 +815,18 @@ fn helper_source(name: &str) -> &'static str {
              \t\t});\n\
              \t\tchunks.pending[arm] = inflight;\n\
              \t}\n\
-             \tinflight.then(then, () => {});\n\
+             \tinflight.then(then, (error) => {\n\
+             \t\tfailed(String(error));\n\
+             \t});\n\
+             }"
+        }
+        // The boot preload's fire-and-forget half (`bundle-splitting.md` §S3);
+        // `std::ui::chunk_preload` computes the arm and calls this. Failure is
+        // silent — `__chunk_load` has already reported it, and the gate's own
+        // load surfaces it on `chunk_error()`.
+        "__chunk_preload" => {
+            "function __chunk_preload(arm) {\n\
+             \t__chunk_load(arm, () => {}, () => {});\n\
              }"
         }
         "__random_int" => {
@@ -1218,9 +1422,23 @@ struct Transformer<'src> {
     // the partition is the ONLY thing this feature adds to the walk.
     chunk_members: HashMap<Id, usize>,
     chunk_count: usize,
-    // The route gate: `(View.swap, View.swap_split, the recognized call ids)`.
-    // `None` for every build that is not splitting.
-    chunk_gate: Option<(Id, Id, HashSet<Id>)>,
+    // The route gate. `None` for every build that is not splitting.
+    chunk_gate: Option<ChunkGate>,
+    // The emitted name each gate call resolved to, paired with the name of the
+    // boot preload for the same route type (`bundle-splitting.md` §S3). Recorded
+    // at emission, so these are PRE-rename names — which is what the planting
+    // pass, which runs before the rename, matches against.
+    gate_call_names: BTreeMap<String, String>,
+}
+
+/// What a split build's route gate rewires: `View.swap` becomes
+/// `View.swap_split` at the recognized calls, and `std::ui::chunk_preload` is
+/// planted ahead of the statement that mounts each one.
+struct ChunkGate {
+    swap: Id,
+    swap_split: Id,
+    preload: Id,
+    calls: HashSet<Id>,
 }
 
 /// One entry's emission, partitioned. `chunks` is empty unless the transformer
@@ -1352,6 +1570,7 @@ impl<'src> Transformer<'src> {
             chunk_members: HashMap::new(),
             chunk_count: 0,
             chunk_gate: None,
+            gate_call_names: BTreeMap::new(),
         }
     }
 
@@ -1441,7 +1660,7 @@ impl<'src> Transformer<'src> {
         let gate_roots: Vec<Id> = self
             .chunk_gate
             .as_ref()
-            .map(|(_, swap_split, _)| vec![*swap_split])
+            .map(|gate| vec![gate.swap_split, gate.preload])
             .unwrap_or_default();
         let reachable_bindings = crate::platform_color::reachable_bindings(
             self.program,
@@ -1661,6 +1880,34 @@ impl<'src> Transformer<'src> {
         // riding along.
         let t_instances = self.monomorphized.into_iter();
 
+        let mut nodes = t_functions.collect::<Vec<_>>();
+        // Each chunk's declarations occupy one contiguous run, recorded so the
+        // rename below can see the whole program in one scope tree and the runs
+        // can then be lifted out intact.
+        let mut chunk_ranges: Vec<(usize, usize)> = Vec::with_capacity(chunked.len());
+        for bucket in chunked {
+            let start = nodes.len();
+            nodes.extend(bucket);
+            chunk_ranges.push((start, nodes.len()));
+        }
+        nodes.extend(t_instances);
+        nodes.extend(t_global_variables);
+        nodes.extend(hmr_expose);
+        let mut main_body_start = nodes.len();
+        nodes.extend(t_main_fn_body);
+
+        // The boot preload (`bundle-splitting.md` §S3). The gate's chunk fetch
+        // is issued when `swap_split` runs, and `swap_split` is the LAST call in
+        // the view chain that mounts it — so today the whole shell subtree is
+        // built before the boot route's chunk is even asked for. Planting
+        // `__chunk_preload(<route signal>)` immediately before that statement
+        // puts the fetch on the wire first and the shell build in its shadow.
+        // Runs before the rename, so the planted names are renamed with every
+        // other reference to the same binding.
+        let mut preloads = 0usize;
+        let planted = plant_boot_preloads(&mut nodes, &self.gate_call_names, &mut preloads);
+        main_body_start += planted.iter().filter(|at| **at < main_body_start).count();
+
         // Host imports (`import { a, b } from "module";`) from `[extern]` calls,
         // then runtime helpers (`__scan`, ...) — both a prelude before the body.
         let imports = self
@@ -1685,21 +1932,6 @@ impl<'src> Transformer<'src> {
             helpers.sort();
         }
 
-        let mut nodes = t_functions.collect::<Vec<_>>();
-        // Each chunk's declarations occupy one contiguous run, recorded so the
-        // rename below can see the whole program in one scope tree and the runs
-        // can then be lifted out intact.
-        let mut chunk_ranges: Vec<(usize, usize)> = Vec::with_capacity(chunked.len());
-        for bucket in chunked {
-            let start = nodes.len();
-            nodes.extend(bucket);
-            chunk_ranges.push((start, nodes.len()));
-        }
-        nodes.extend(t_instances);
-        nodes.extend(t_global_variables);
-        nodes.extend(hmr_expose);
-        let mut main_body_start = nodes.len();
-        nodes.extend(t_main_fn_body);
         // Re-allocate names over the JS scope tree so disjoint scopes share them
         // (readable: both sibling `value`s stay `value`; release: reuse short
         // names per function).
@@ -2523,18 +2755,32 @@ impl<'src> Transformer<'src> {
                         // letting the view advance (`bundle-splitting.md` §2).
                         // Same shape, so the call's own type binding carries
                         // over by position; every argument is emitted unchanged.
-                        if let Some(gate_target) = self.split_gate_target(*id, target_id) {
-                            let substitution = self
-                                .call_substitution(
-                                    *id,
-                                    target_id,
-                                    &function_call.generic_argument_ids,
-                                )
+                        if let Some((gate_target, preload)) = self.split_gate_target(*id, target_id)
+                        {
+                            let call_substitution = self.call_substitution(
+                                *id,
+                                target_id,
+                                &function_call.generic_argument_ids,
+                            );
+                            let substitution = call_substitution
+                                .as_ref()
                                 .map(|substitution| {
-                                    self.rebind_by_position(target_id, gate_target, &substitution)
+                                    self.rebind_by_position(target_id, gate_target, substitution)
                                 })
                                 .unwrap_or_default();
+                            // The boot preload takes the same route type, and
+                            // `plant_boot_preloads` needs its emitted name — so
+                            // it is instantiated here, beside the gate call it
+                            // will be planted in front of.
+                            let preload_substitution = call_substitution
+                                .as_ref()
+                                .map(|substitution| {
+                                    self.rebind_by_position(target_id, preload, substitution)
+                                })
+                                .unwrap_or_default();
+                            let preload_name = self.emit_instance(preload, &preload_substitution);
                             let name = self.emit_instance(gate_target, &substitution);
+                            self.gate_call_names.insert(name.clone(), preload_name);
                             return Some(js::Node::Call(Box::new(js::Node::Local(name)), args));
                         }
                         // An external std intrinsic lowers to native JS or a
@@ -4797,9 +5043,10 @@ impl<'src> Transformer<'src> {
     /// The gate this call is retargeted to, if it is one of the split build's
     /// recognized route matches. `None` for every other call in every other
     /// build — which is why a flagless build emits exactly what it always did.
-    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<Id> {
+    fn split_gate_target(&self, call_id: Id, target_id: Id) -> Option<(Id, Id)> {
         let gate = self.chunk_gate.as_ref()?;
-        (target_id == gate.0 && gate.2.contains(&call_id)).then_some(gate.1)
+        (target_id == gate.swap && gate.calls.contains(&call_id))
+            .then_some((gate.swap_split, gate.preload))
     }
 
     /// Re-keys a type substitution from one function's generic parameters onto
