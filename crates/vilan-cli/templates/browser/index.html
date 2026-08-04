@@ -4,6 +4,11 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>{{name}}</title>
+		<!-- Every `const style()` in the app compiles into this sidecar, which
+		     `vilan build .` writes beside app.js. Keep the link: without it the
+		     styles are emitted and never loaded. -->
+		<link rel="stylesheet" href="app.css" />
+		<!-- The page frame is not the app's business, so it stays plain CSS. -->
 		<style>
 			body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; }
 		</style>

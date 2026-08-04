@@ -37,6 +37,30 @@ fun main() {
   are emitted during the build.
 - `view.styled(card)` puts the style's classes on the element.
 
+## Getting the stylesheet onto the page
+
+The build writes every emitted rule into a sidecar beside the bundle —
+`app.js` gets `app.css`, `dist/client.js` gets `dist/client.css` — and
+**your page has to link it**. Nothing injects the tag for you: the HTML
+shell is yours, not the compiler's.
+
+```text
+<link rel="stylesheet" href="app.css" />
+```
+
+Both `vilan init` browser templates already carry the line, and the
+fullstack one also carries the route that serves it:
+
+```vilan,fragment
+"/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
+```
+
+Miss the link and nothing announces it — the app runs, unstyled, while
+the compiler faithfully rebuilds a stylesheet nobody loads. A `<link>`
+(rather than an inlined `<style>`) is also what lets `--watch` hot-swap
+CSS without reloading the page; see
+[the dev loop](dev-loop.md#the-css-link-idiom).
+
 At runtime you can still *select and combine* styles you already built.
 `a + b` merges two styles (per property, the right side wins), and
 picking one of two styles in an `if` is fine. What you can't do is

@@ -147,6 +147,25 @@ fn the_browser_template_builds_a_browser_bundle() {
         "index.html should carry the mount point:\n{page}"
     );
 
+    // The style sidecar must be BOTH emitted and linked. Scaffolding a page
+    // that never loads the CSS the build writes is the failure mode this
+    // asserts against (A8's `<link>` scaffold): the compiled styles would be
+    // produced on every build and silently thrown away.
+    let stylesheet = project.join("app.css");
+    assert!(
+        stylesheet.is_file(),
+        "missing app.css — the scaffold's const styles emitted nothing"
+    );
+    assert!(
+        page.contains("href=\"app.css\""),
+        "index.html should link the emitted stylesheet:\n{page}"
+    );
+    let css = std::fs::read_to_string(&stylesheet).expect("app.css");
+    assert!(
+        css.contains("{display:flex}") && css.contains(":root{--space-4:1rem}"),
+        "app.css should carry the scaffold's compiled rules and theme vars:\n{css}"
+    );
+
     // A browser bundle reaches DOM globals and no node host import.
     let javascript = std::fs::read_to_string(&bundle).expect("app.js");
     assert!(
@@ -184,6 +203,10 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
             project.join("dist/server.js").is_file(),
             "missing dist/server.js"
         );
+        assert!(
+            project.join("dist/client.css").is_file(),
+            "missing dist/client.css — the scaffold's const styles emitted nothing"
+        );
 
         // The server runs from the project root: it reads `dist/client.js` and
         // `src/app.html` by relative path, exactly as `vilan run .` runs it.
@@ -212,6 +235,19 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
             assert!(
                 page.contains("id=\"app\"") && page.contains("/client.js"),
                 "the served page should be the shell with the client mount point:\n{page}"
+            );
+            // The full `<link>` loop: the shell links the stylesheet AND the
+            // scaffold's server actually has a route that serves it. Either
+            // half alone leaves the compiled styles unreachable.
+            assert!(
+                page.contains("href=\"/client.css\""),
+                "the served page should link the client stylesheet:\n{page}"
+            );
+            let stylesheet = String::from_utf8_lossy(&http_get(port, "/client.css")).into_owned();
+            assert!(
+                stylesheet.contains("{display:flex}"),
+                "the /client.css route should serve the compiled styles:\n{}",
+                &stylesheet[..stylesheet.len().min(400)]
             );
             let bundle = String::from_utf8_lossy(&http_get(port, "/client.js")).into_owned();
             assert!(

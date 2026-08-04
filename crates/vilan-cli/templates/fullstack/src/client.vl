@@ -5,15 +5,31 @@
 //
 // `count.map(..)` derives a reactive source and `bind_text` keeps the text in
 // step with it; the i-string renders the number by host coercion.
+//
+// The `const` style chain is evaluated at build time into dist/client.css,
+// which src/server.vl serves and src/app.html links.
 
 import std::reactive::Signal;
+import std::style::{ Color, Display, FlexDirection, Style, space, style };
 import std::ui::{ mount_root, view };
 import pkg::shared::greeting;
 
+fun card_style(): Style {
+	style()
+		.display(Display::Flex)
+		.flex_direction(FlexDirection::Column)
+		.gap(space(3))
+		.padding(space(4))
+		.radius(space(2))
+		.background(Color::gray(100))
+}
+
 fun main() {
+	let card = const card_style();
 	let _root = mount_root("app", || {
 		let count = Signal::new(0);
 		view("main")
+			.styled(card)
 			.child(view("h1").text(greeting()))
 			.child(view("p").bind_text(count.map(|n| i"clicked {n} times")))
 			.child(view("button").text("click me").on("click", || count.set_with(|n| n + 1)))
