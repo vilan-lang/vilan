@@ -186,14 +186,17 @@ enum DraftState {
 struct Draft<T> {
 	local: Signal<T>,           // bind inputs to this; read like any signal
 	state: Signal<DraftState>,  // bind a status label to this
-	…                           // internals: synced value, generation counter
+	…                           // internals: synced value, generation, debounce window
 }
 
 fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T>
 
 impl Draft<type T: PartialEq> {
-	fun push(self, value: T)    // set local + SPAWN the commit (returns immediately)
-	fun adopt(self, remote: T)  // fold in a remote value
+	fun push(self, value: T)              // set local + SPAWN the commit (returns immediately)
+	fun adopt(self, remote: T)            // fold in a remote value
+	fun debounce(self, millis: i32): Draft<T>  // coalesce pushes; returns self for chaining
+	fun commit(self)                      // send now, cancelling any pending window
+	fun repush(self)                      // re-send iff local != synced (the reconnect path)
 }
 ```
 
@@ -210,7 +213,46 @@ impl Draft<type T: PartialEq> {
 - On failure, `state` carries the reason and `local` keeps the user's text;
   the next `push` retries naturally.
 
+### debounce — one commit per burst
+
+`debounce(millis)` coalesces pushes: the commit fires `millis` after the
+**last** one, carrying the value as of that moment. `0` (the default) commits
+on every push.
+
+- **Local-first is unaffected.** `local` and the `Dirty` state are still set
+  synchronously inside `push`; only the commit waits out the window.
+- **Trailing edge.** Three keystrokes inside the window produce one commit.
+- `commit()` — the explicit save (a blur, a Save button) — cancels a pending
+  window and sends now. Exactly one commit results, not two.
+- The window belongs to the cell, so every copy of a draft agrees about it.
+
+### repush — recover the edits an outage swallowed
+
+`repush()` re-sends the local value **iff `local != synced`** — an edit whose
+commit never left, or one caught in flight by a drop (a failed commit keeps
+the local value and does not advance `synced`). A clean draft sends nothing.
+A pending debounce window is cancelled and the value goes immediately.
+
+Wire it to a transport's reconnect hook and a dropped connection stops
+losing work; it is also the "retry" behind a failure banner's button:
+
+```vilan,fragment
+client.transport.on_reconnect(|| title.repush());
+```
+
+- **Delivery is at-least-once.** A commit the server applied but could not
+  acknowledge before the socket died is indistinguishable here from one that
+  never arrived, so the server may see it twice. `Draft`'s own reconcile
+  absorbs the duplicate (`adopt` no-ops on an echo; the generation counter
+  discards the superseded commit's outcome), but **your commit closure must
+  tolerate a repeat**: "set the remote to this value" does, "append this
+  entry" does not.
+- **A failed re-push is not retried on a timer.** It settles `Failed`, keeps
+  `local`, and the next reconnect sends it again — so a value the server is
+  permanently refusing cannot spin.
+
 UI wiring: `View.bind_draft(draft)`; see the [browser reference](browser.md).
+The reconnect hook is in the [rpc reference](rpc.md#connection-state).
 
 ## reconcile: keyed list diffing
 

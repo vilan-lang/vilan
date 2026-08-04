@@ -3,6 +3,7 @@ import pkg::context::Context;
 import pkg::option::Option::{ None, Some, self };
 import pkg::result::Result::{ Err, Ok, self };
 import pkg::shared::Shared;
+import pkg::time::Timer;
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
 /// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.
@@ -566,6 +567,12 @@ fun reconcile<T: PartialEq, K: PartialEq>(
 // one-shot actions, hostile mid-typing); the next push retries naturally.
 // Conflicts are last-write-wins: a dirty local survives remote adoption, and
 // its eventual push overwrites the remote edit.
+//
+// Two opt-in behaviours ride on top (`proposal/draft-reconnect.md`, A14):
+// `repush()` re-sends edits the remote never accepted — wire it to a
+// transport's reconnect and a dropped connection stops losing the user's
+// work — and `debounce(millis)` coalesces a burst of keystrokes into one
+// commit instead of one per edit. Both are off unless asked for.
 
 /// The sync status a UI can bind ("saved" / "unsaved" / the failure).
 [derive(PartialEq, Debug)]
@@ -587,6 +594,13 @@ struct Draft<T> {
 	// Discards stale completions when pushes overlap (fast typing over a
 	// slow wire): only the newest push settles the state.
 	generation: Shared<i32>,
+	// The coalescing window in milliseconds; 0 (the default) commits on every
+	// `push`. A CELL, like every other field, so copying a draft can never
+	// produce two values that disagree about their own window.
+	debounce_millis: Shared<i32>,
+	// The outstanding coalescing timer, when a debounced push is waiting out
+	// its window. Cancelled by a newer push, by `commit`, and by `repush`.
+	pending: Shared<Option<Timer>>,
 	/// `None` = success, `Some(reason)` = failure. Calls through the field
 	/// await (a sync commit just resolves).
 	commit: async |T| Option<str>,
@@ -602,6 +616,8 @@ fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T> {
 		state = Signal::new(DraftState::Synced),
 		synced = Shared::new(initial),
 		generation = Shared::new(0),
+		debounce_millis = Shared::new(0),
+		pending = Shared::new(None),
 		commit,
 	}
 }
@@ -610,16 +626,121 @@ impl Draft<type T: PartialEq> {
 	/// Set locally and commit — the per-keystroke path. LOCAL-FIRST: the
 	/// commit is spawned, never awaited, so `push` (and the input handler
 	/// calling it) returns without riding the wire.
+	///
+	/// Under a `debounce(millis)` window the LOCAL half is unchanged — the
+	/// value and the `Dirty` state land synchronously, exactly as here — and
+	/// only the commit waits out the window, coalescing a burst of pushes
+	/// into one.
 	fun push(self, value: T) {
 		self.local.set(value);
 		self.state.set(DraftState::Dirty);
+		if self.debounce_millis.read() > 0 {
+			self.arm();
+		} else {
+			self.send(value);
+		}
+	}
+
+	/// Commit `value` now, unconditionally: claim the newest generation (so
+	/// any older in-flight commit's outcome is discarded) and spawn the
+	/// in-flight half.
+	///
+	/// Deliberately unstructured (no nursery): the in-flight commit is owned
+	/// by the draft CELL, not by any function's extent — the caller
+	/// returning is the point. `settle` resolves every outcome into the
+	/// draft's state; a panic escaping it surfaces as the task report.
+	fun send(self, value: T) {
 		let mine = self.generation.read() + 1;
 		self.generation.write() = mine;
-		// Deliberately unstructured (no nursery): the in-flight commit is
-		// owned by the draft CELL, not by any function's extent — `push`
-		// returning is the point. `settle` resolves every outcome into the
-		// draft's state; a panic escaping it surfaces as the task report.
 		let _in_flight = async self.settle(value, mine);
+	}
+
+	/// Start (or restart) the coalescing window: call off whatever was
+	/// waiting and park a fresh timer. Trailing-edge — the commit happens
+	/// `debounce_millis` after the LAST push, not the first.
+	fun arm(self) {
+		self.cancel_pending();
+		let timer = Timer::after(self.debounce_millis.read());
+		self.pending.write() = Some(timer);
+		let _waiting = async self.fire(timer);
+	}
+
+	/// The trailing edge. `wait` settles `true` only if the window ran out;
+	/// a `cancel` — a newer push, a manual `commit`, a `repush` — settles it
+	/// `false` and this task retires without touching the wire. The value
+	/// sent is the LATEST local one, which is the point of coalescing.
+	fun fire(self, timer: Timer) {
+		if timer.wait() {
+			self.pending.write() = None;
+			self.send(self.local.get());
+		}
+	}
+
+	/// Call off any outstanding coalescing timer. Idempotent (`Timer.cancel`
+	/// is, and a settled timer is untouched), so this is safe to call on a
+	/// draft that has no window and never armed one.
+	fun cancel_pending(self) {
+		match self.pending.read() {
+			Some(let timer) => timer.cancel(),
+			None => {},
+		}
+		self.pending.write() = None;
+	}
+
+	/// Coalesce pushes into one commit per `millis` of quiet — the fix for
+	/// one wire frame per keystroke. Returns the draft for chaining:
+	///
+	///     let title = draft(page.title, commit).debounce(300);
+	///
+	/// `0` restores the default, a commit on every `push`. The window is a
+	/// cell shared by every copy of the draft, so this is a property of the
+	/// CELL and not of the value you happen to be holding.
+	fun debounce(self, millis: i32): Draft<T> {
+		self.debounce_millis.write() = millis;
+		self
+	}
+
+	/// Commit the current local value NOW, cancelling any pending debounce
+	/// window — the explicit save (a blur handler, a Save button, a submit).
+	/// Exactly one commit results: the cancelled timer's parked task retires
+	/// without sending.
+	fun commit(self) {
+		self.cancel_pending();
+		self.send(self.local.get());
+	}
+
+	/// Re-send local edits the remote never accepted — the reconnect path
+	/// (`proposal/draft-reconnect.md`). Wire it to a transport's reconnect
+	/// hook and a dropped connection stops losing the user's work:
+	///
+	///     client.transport.on_reconnect(|| title.repush());
+	///
+	/// It is also the "retry" button in a failure banner.
+	///
+	/// A no-op unless `local` differs from `synced` — that test covers both
+	/// an edit whose commit never left and one caught in flight by the drop
+	/// (a failed commit KEEPS the local value and does not advance `synced`),
+	/// and it means a screen of untouched drafts costs nothing on reconnect.
+	/// A pending debounce is cancelled and the value goes immediately:
+	/// recovery is not typing, and there is no burst to coalesce.
+	///
+	/// DELIVERY IS AT-LEAST-ONCE. A commit that reached the server and
+	/// succeeded, whose reply was lost with the connection, is
+	/// indistinguishable here from one that never arrived — so the server
+	/// may see it twice. `Draft`'s own reconcile is idempotent (`adopt`
+	/// no-ops on an echo; the generation guard discards the superseded
+	/// commit's outcome), but the commit CLOSURE is yours: "set the remote to
+	/// this value" repeats harmlessly, "append this" does not.
+	///
+	/// A re-push that fails settles `Failed` like any other and is NOT
+	/// retried on a timer — `local` still differs from `synced`, so the next
+	/// reconnect sends it again. A draft the server is permanently refusing
+	/// must not spin.
+	fun repush(self) {
+		if self.local.get().ne(self.synced.read()) {
+			self.cancel_pending();
+			self.send(self.local.get());
+		}
 	}
 
 	/// The in-flight half of a push: await the commit, then resolve the

@@ -533,6 +533,28 @@ impl SocketTransport {
 	fun connection_state(self): Signal<ConnectionState> {
 		self.duplex.state
 	}
+
+	/// Run `hook` after each successful re-dial. Hooks are awaited IN ORDER,
+	/// and the generated client registers its own mirror re-attach when it
+	/// connects — so a hook registered by app code runs after the mirrors
+	/// have resynced, which is the only "reconnected AND resynced" moment in
+	/// the system. `connection_state` deliberately flips a beat earlier
+	/// (`proposal/transport-robustness.md` §2.5: the re-attach's own rpc call
+	/// needs a usable transport), so it is the wrong signal for anything that
+	/// wants current mirrors.
+	///
+	/// The first consumer is a local-first cell re-sending edits the outage
+	/// swallowed (`proposal/draft-reconnect.md`):
+	///
+	///     client.transport.on_reconnect(|| title.repush());
+	///
+	/// Hooks run in the reconnect loop's OWN extent and are awaited before it
+	/// finishes, so keep one short: it should start work (spawn a re-push,
+	/// re-arm a subscription), not ride a long round-trip that holds the
+	/// reconnect open behind it.
+	fun on_reconnect(self, hook: async || void) {
+		self.duplex.on_reconnect.write().push(hook);
+	}
 }
 
 /// Route one inbound TEXT socket message by its channel prefix. `r:<id>:<frame>`

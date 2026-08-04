@@ -116,6 +116,16 @@ handshake forever). The generated `connect` propagates it (`!`).
 (`on_disconnect`), and a reconnect is just a new connection that attaches
 fresh channels. The mirrors' resync is the ordinary subscribe path.
 
+## 3bis. The reconnect hook became public (2026-08-04)
+
+`SocketDuplex.on_reconnect` was an internal field carrying exactly one
+entry, the generated client's `reattach_mirrors`. It is now also reachable
+as `SocketTransport.on_reconnect(hook)`, because a *later* registration is
+the only place in the system that observes "reconnected AND resynced" — the
+state signal flips a beat earlier by design (§2.5), which is the wrong
+moment for anything that wants current mirrors. Its first consumer is
+`Draft.repush()`; record: `draft-reconnect.md`. `handle_drop` is unchanged.
+
 ## 4. Beyond v1 (recorded)
 
 - Backoff jitter; configurable schedule/budget on the generated `connect`.
