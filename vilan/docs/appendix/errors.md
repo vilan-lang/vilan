@@ -77,6 +77,14 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
+**"parameter '…' has bare trait type '…': a trait is not a value type (vilan has no trait objects)"**
+A parameter was declared with a trait as its type, and called with a
+value that implements it. Traits are **bounds**, not types, so the
+parameter can never accept a concrete value — the impl is fine, the
+signature is not. Write the generic the message spells out:
+`fun show<T: A>(v: T)`. The note points at the declaration to change.
+→ [Data and traits](../tour/data-and-traits.md)
+
 **"'…' is already defined for '…'; remove or rename this one"**
 Two impls declare the same name for the same type, and neither name
 belongs to a trait. Nothing ranks them, so one of the two would simply

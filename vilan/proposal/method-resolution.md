@@ -589,3 +589,84 @@ So the survey's headline holds under the compiler's own type-aware
 machinery, and is if anything narrower than §2.1 predicted: the one live
 site is not a *resolution* change at all — both rules pick std's `unzip` —
 it is a duplicate the old rule could not see.
+
+## 10. B72: why a bare-trait parameter gets a steer, not an implementation
+
+B57's §9(5) recorded the gap in passing — `reconcile_type(Trait, Struct)`
+has no arm, so `fun show(v: SomeTrait)` rejects a concrete implementing
+value — and filed it as B72. Taking it up, the question was whether a
+bare-trait parameter should be made to WORK (as sugar for a bounded
+generic, monomorphized per call site) or be steered away from. It is
+steered away from. The evidence, in the order it settled the question:
+
+**(1) The language already answered, in code and in the spec.** The
+analyzer carries a named lookup outcome, `MethodLookup::BareTraitValue`,
+whose whole job is this refusal: *"a trait is not a value type (vilan has
+no trait objects). Use a generic parameter (`<T: A>`) or a concrete
+type."* The spec says the same normatively — `spec/types.md` §5.5
+("Traits are used as **bounds**; a trait is not a type") and §5.11, which
+lists "Using a trait as a type" first among the rejection cases — and the
+tour repeats it. Making a bare-trait parameter mean "generic" would put
+one position at odds with a rule stated in three places.
+
+**(2) Accepting it routes a value into a compiler internal error.** The
+decisive measurement. Adding the missing direction as an *acceptance*
+(symmetric with the existing `(Struct|Enum, Trait)` arm) lets the value
+flow onward, and the moment it reaches a bounded generic the monomorphizer
+has no concrete implementation to select. It lands on B55's never-silent
+guard:
+
+    internal: a call resolved to `A`'s requirement `name`, which has no
+    body — emitting it would produce an empty function and a runtime
+    `TypeError`. … please report this program
+
+That is not a trait object half-built; it is a value the compiler cannot
+finish compiling. A bare-trait parameter has no implementation short of
+B4's `(value, vtable)` representation, which is exactly what B4 exists to
+design.
+
+**(3) The narrow, real root cause.** A CALL is the only position that
+reconciles PARAMETER-FIRST — deliberately, so bindings key on the callee's
+generics (`f<U>(u: U)` must bind `U = T`, not `T = U`). It is therefore
+the only position that ever asks `reconcile_type(Trait, Concrete)`. Every
+other position — `let` annotation, return, struct field, closure
+parameter, enum-variant payload, and a METHOD's parameter — reconciles
+value-first and lands on the `(Struct|Enum, Trait)` arm, which accepts.
+So the asymmetry B72 reports is one site wide, and the fix is that site's
+message.
+
+Shipped: at the parameter-first mismatch, a parameter whose declared type
+is a bare trait and whose argument *does* implement it gets the steer,
+with a note at the parameter's declaration (carrying its own `SourceId`,
+so it renders across modules). An argument that does NOT implement the
+trait keeps `Expected A, but got Bag instead` — there the likelier mistake
+is the missing impl, and naming the type it failed to match is the more
+useful report.
+
+### What this deliberately leaves open (B4's, not a diagnostic's)
+
+A bare trait remains **accepted** in every value-first position: `let x: A
+= bag`, a trait-typed field, a trait-typed return, and a method's
+trait-typed parameter all compile today, and only *using* such a value
+fails. The spec says the annotation itself should be rejected
+(`types.md` §5.11); the implementation refuses the use, not the
+declaration. Closing that gap means making a trait type illegal in every
+value position, which is a language change with at least one std
+dependency to answer for first: `std/src/iterator.vl`'s
+
+    impl Iterator<type T> with Iterable<T> {
+        fun iter(self): Iterator<T> { self }
+    }
+
+returns a bare trait, and is pinned
+(`a_trait_typed_self_returns_through_a_trait_typed_signature`). Whoever
+takes B4 up owns that call; the positions are pinned in both directions
+under `b72_*` so the current state is described rather than assumed.
+
+### Bycatch, filed separately
+
+Reaching a bounded generic with a bare-trait-typed value produces the
+`internal: … please report this program` guard above on a plain user
+program — reachable today through `let x: A = bag; use_it(x)` with no
+change from this arc. It is a wrong diagnostic (an internal-error shape
+for a user-level mistake), not a miscompile, and belongs with B4.

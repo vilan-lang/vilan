@@ -40525,6 +40525,215 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     );
 }
 
+// --- B72: a bare-trait parameter steers to the bound (method-resolution.md
+// --- §10) -------------------------------------------------------------------
+//
+// `fun show(v: A)` called with a `Bag` that implements `A` failed with
+// "Expected A, but got Bag instead" — which reads as though the impl were
+// missing. It is not. A trait is a BOUND, not a type (`spec/types.md` §5.5,
+// §5.11) and vilan has no trait objects, so the parameter can never accept a
+// concrete value and the declaration is what has to change.
+//
+// A call is the one position that reconciles PARAMETER-FIRST, so it is the one
+// position that ever asks `reconcile_type(Trait, Concrete)` — the direction
+// with no arm. Every other position reconciles value-first and lands on the
+// `(Struct|Enum, Trait)` arm, which accepts; those are pinned below as the
+// standing inconsistency they are, and belong to B4.
+
+#[test]
+fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
+    // The filed shape. The steer names the trait, the parameter, and the
+    // declaration to write.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A': a trait is not a value type",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_names_the_generic_to_write() {
+    // The actionable half — without it the message diagnoses without directing.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "`<T: A>` with 'v: T'",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
+    // The fix belongs at the DECLARATION, not at the call the error anchors on
+    // — so the note points there (and carries its own source, so it renders
+    // when the callee lives in another module).
+    assert_fails_noting(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(subject: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "has bare trait type 'A'",
+        "subject",
+        "is declared with the trait as its type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
+    // The second surface that reaches the parameter-first reconcile: an
+    // associated function called as `Type::member(..)`. Same path, same steer —
+    // which is the point of fixing the message at the shared site rather than
+    // at the free-function call.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun make(v: A): i32 { 1 } }
+        fun main() { let n = Holder::make(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A'",
+    );
+}
+
+#[test]
+fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
+    // The steer is for the author who wrote a correct impl and the wrong
+    // signature. When the value does NOT implement the trait, the missing impl
+    // is the likelier mistake, so naming the type it failed to match stays the
+    // more useful report.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "Expected A, but got Other instead.",
+    );
+}
+
+#[test]
+fn b72_the_bound_generic_form_is_what_works() {
+    // The steer has to point at something that compiles AND runs — otherwise it
+    // is advice, not a fix. This is the program the message asks for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b72_a_generic_parameter_is_untouched_by_the_steer() {
+    // The steer must not reach a GENERIC parameter whose constraint resolves to
+    // a trait — `Type::Generic(c)` where `c` is the bound's type id is the
+    // normal, working case, and it is one arm away in `reconcile_type`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "does not implement trait 'A'",
+    );
+}
+
+// The positions that ACCEPT a bare trait today, pinned as the standing
+// inconsistency they are rather than left undescribed. Each reconciles
+// value-first, so each lands on `reconcile_type`'s `(Struct|Enum, Trait)` arm.
+// Refusing them is a language change (a trait type would become illegal in
+// every value position), which is B4's to make — and std itself depends on one
+// of them: `iterator.vl`'s `fun iter(self): Iterator<T>` returns a bare trait.
+
+#[test]
+fn b72_a_bare_trait_let_annotation_is_still_accepted() {
+    // `let x: A = bag` compiles; only USING it fails. The spec says this should
+    // be rejected at the annotation (`types.md` §5.11); it is not, and closing
+    // that gap is B4's, not a diagnostic's.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_value_still_cannot_be_used() {
+    // The refusal that DOES exist, and the one the new steer is worded to
+    // match: the body-side rule, from inside `show`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; let s = x.name(); }
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_method_parameter_is_still_accepted() {
+    // A METHOD's bare-trait parameter reconciles value-first, so it accepts
+    // where the free function refuses. The asymmetry is real and pinned; see
+    // `method-resolution.md` §10.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun take(self, v: A): i32 { 1 } }
+        fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_return_is_still_accepted() {
+    // std depends on this one: `impl Iterator<type T> with Iterable<T>` returns
+    // `Iterator<T>`, a bare trait. Any refusal of trait types in value position
+    // has to answer for it first.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun main() { let v = make(); }
+        "#,
+    );
+}
+
 // --- B74: the duplicate check reaches statics (method-resolution.md §9) -----
 //
 // B57's duplicate-inherent check filtered `is_self_method`, per its own scope,

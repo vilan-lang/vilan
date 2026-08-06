@@ -19748,6 +19748,70 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
+    /// The diagnostic for an argument that does not fit its declared parameter
+    /// — with the BARE TRAIT case steered (B72).
+    ///
+    /// A parameter declared as a bare trait can never accept a concrete value,
+    /// and "Expected A, but got Bag instead" of a `Bag` that plainly `impl`s `A`
+    /// reads as though the impl were missing or wrong. It is neither: a trait is
+    /// a BOUND, not a type — `spec/types.md` §5.5 ("a trait is not a type") and
+    /// §5.11, which lists using one as a type as a normative rejection case —
+    /// and vilan has no trait objects. That is the same rule
+    /// `MethodLookup::BareTraitValue` already states from inside the body; the
+    /// call site simply had no version of it.
+    ///
+    /// Why only here: a CALL is the one position that reconciles
+    /// parameter-first (so bindings key on the callee's generics), which makes
+    /// it the one position that ever asks `reconcile_type(Trait, Concrete)`.
+    /// Every other position — a `let` annotation, a return, a field, a method
+    /// argument — reconciles value-first and lands on the `(Struct|Enum, Trait)`
+    /// arm, which ACCEPTS. Making those agree is a language question (B4), not a
+    /// message question; see `method-resolution.md` §10.
+    fn argument_mismatch(
+        &self,
+        parameter_name: &str,
+        parameter_id: Id,
+        parameter_type: &Type,
+        argument_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> (String, Option<crate::error::Note>) {
+        let expected = self.pretty_print_type(parameter_type, substitution_context);
+        let got = self.pretty_print_type(argument_type, substitution_context);
+        let plain = format!("Expected {expected}, but got {got} instead.");
+        let Type::Trait(trait_id, _) = parameter_type else {
+            return (plain, None);
+        };
+        // Steer only when the value really does implement the trait. When it
+        // does not, the author's mistake is plausibly the missing impl, and
+        // naming the type it failed to match is the more useful report.
+        if !self.type_implements_trait(argument_type, *trait_id) {
+            return (plain, None);
+        }
+        let trait_name = self
+            .traits
+            .get(trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or("trait");
+        // The fix belongs at the DECLARATION, which may be in another file.
+        let note = self
+            .span_map
+            .get(&parameter_id)
+            .map(|span| crate::error::Note {
+                span: **span,
+                msg: format!("'{parameter_name}' is declared with the trait as its type"),
+                source: self.source_of_id(parameter_id),
+            });
+        (
+            format!(
+                "parameter '{parameter_name}' has bare trait type '{trait_name}': a trait is \
+                 not a value type (vilan has no trait objects), so it cannot accept {got}. \
+                 Declare a generic parameter bounded by the trait instead — `<T: \
+                 {trait_name}>` with '{parameter_name}: T'."
+            ),
+            note,
+        )
+    }
+
     /// The "not callable" message for a call subject that isn't one.
     ///
     /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
@@ -20257,6 +20321,7 @@ impl<'src> Analyzer<'src> {
                     }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
+                        let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
                         let argument_type =
@@ -20300,14 +20365,17 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                             None => {
-                                let expected =
-                                    self.pretty_print_type(&parameter_type, &substitution_context);
-                                let got =
-                                    self.pretty_print_type(&argument_type, &substitution_context);
+                                let (msg, note) = self.argument_mismatch(
+                                    parameter_name,
+                                    *parameter_id,
+                                    &parameter_type,
+                                    &argument_type,
+                                    &substitution_context,
+                                );
                                 self.diagnostics.push(Error {
-                                    note: None,
+                                    note,
                                     span: **self.span_map.get(&argument_id).unwrap(),
-                                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                                    msg,
                                 });
                             }
                         }
