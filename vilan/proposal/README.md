@@ -101,6 +101,7 @@ is the historical record everything shipped gets moved into.
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
 | `capture-clones.md` | shipped arc (2026-08-03) | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
+| `backed-enums.md` | draft — awaiting review | A variant carries the value the host speaks (`= "start"`) as a generalization of the integer discriminant (B76); the survey found three silent holes in the discriminant grammar it extends. |
 
 **Not yet in this directory, in flight:** `optimistic-lifecycle.md` (A14's
 remaining "optimistic-write → reconcile lifecycle" bullet) is drafted on the

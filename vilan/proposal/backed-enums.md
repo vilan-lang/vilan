@@ -1,0 +1,927 @@
+# Backed enums — a variant carries the value the host speaks (B76)
+
+> Status: DRAFT (awaiting owner review) — filed from backlog B76; the owner's own question from the E31 review.
+>
+> Origin: OWNER NOTE 1 on `bindgen.md` (§9.4), recorded 2026-08-06 during the
+> E31 review and deliberately *not* settled inside bindgen — "record that as
+> its own language question rather than deciding it inside bindgen". This is
+> that question. Proposal-first per the house rules; nothing here is
+> implemented, and the paper recommends nothing land in the compiler until it
+> is ratified.
+>
+> Every claim below about what the compiler does today was checked against
+> source **or run through the repo compiler** as a probe. The probes are
+> called out inline (P1…P9), because four of them found defects that change
+> the design — the discriminant grammar the feature would extend is not
+> validated at all, and one of its holes is a live miscompile in shipping
+> code (§1.7). Probes ran against `target/debug/vilan` built in this
+> worktree from `next @c2b9c7c`. §7 is the open-questions set; everything
+> before it is a recommendation, not a ratification.
+
+## 0. The problem and the thesis
+
+A vilan enum variant can carry an integer. It cannot carry a string:
+
+```
+enum Align { Start = "start", End = "end" }
+        → Error: found '=' expected ',' or '}'
+```
+
+The grammar is `= (-)? integer` and nothing else (`parse_discriminant`,
+`crates/vilan-core/src/parsing.rs:3307-3318`). That one gap is why
+`std/src/style.vl` contains eleven hand-written functions whose entire job is
+to turn an enum back into the string CSS wanted all along, why `bindgen`
+emits a private `_raw` extern plus a generated match-wrapper for every
+closed string set it meets, and why thirteen further `external` declarations
+in std take a bare `str` for a vocabulary the host has closed.
+
+**Thesis: this is not a new language feature. It is the removal of an
+arbitrary restriction on a feature that already exists, already lowers
+correctly, and already crosses a host boundary in exactly the shape the
+string case needs.** A C-like enum today compiles to its **bare
+discriminant** — `Ordering::Greater` is the JavaScript number `1`, not a
+tagged array (P1) — and that bare value passes through an `external fun` to
+the host unchanged (P4). A string-backed enum lowering to its bare string
+would make the enum *be* the host's string. Every wrapper in the previous
+paragraph is machinery for translating between two representations that
+would then be the same representation.
+
+The survey found the demand is real and concentrated: **eleven of the
+fifteen payload-free enums in the whole standard library exist only to be
+converted to a host string** (§2.1), all in one file, 63 lines of `match`
+arms that delete outright. It also found the feature this extends is in
+worse shape than anyone assumed: duplicate discriminants are accepted and
+silently miscompile (P5), a discriminant on a payload variant is accepted
+and silently ignored (P6), and `= 1.5` and `= 99999999999999999999` are both
+accepted and silently become something else (P7). Those three want fixing
+whether or not backed enums land, and §5 recommends they land first.
+
+## 1. Ground truth — what the language does today
+
+### 1.1 The grammar, and where it stops
+
+```rust
+/// `= (-)? integer` — an explicit enum discriminant, or `None` (backtracking)
+/// when no `=` follows. The magnitude is parsed as `i64` (0 on overflow,
+/// matching chumsky's `unwrap_or(0)`).
+fn parse_discriminant(&mut self) -> Option<i64> {
+    self.attempt(|parser| {
+        parser.expect_op("=")?;
+        let negative = parser.eat_op("-");
+        let whole = parser.eat_integer()?;
+        let magnitude = whole.parse::<i64>().unwrap_or(0);
+        Some(if negative { -magnitude } else { magnitude })
+    })
+}
+```
+`crates/vilan-core/src/parsing.rs:3307-3318`
+
+The spec agrees, and is unusually terse about it — `grammar.md:117-118`
+gives `variant = NAME [ "(" … ")" ] [ "=" [ "-" ] NUMBER ]`, with one
+sentence of prose at `grammar.md:122-123`: *"An explicit variant
+discriminant (`= 0`, `= -1`) fixes the variant's integer tag."* The
+production says `NUMBER`; the parser accepts only an integer. That
+disagreement is the seed of §1.7's third hole.
+
+The analyzer records one derived bit per enum:
+
+```rust
+is_numeric: all_data_less && any_explicit_discriminant,
+```
+`crates/vilan-core/src/analyzer.rs:15723`
+
+Note the **conjunction**, which matters more than it looks: an enum is
+bare-lowered only if every variant is data-less *and at least one carries an
+explicit discriminant*. `enum Plain { A, B, C }` is not numeric.
+
+### 1.2 The two lowerings (P1)
+
+> **P1.** `enum Ordering { Less = -1, Equal = 0, Greater = 1 }` beside
+> `enum Plain { A, B, C }`, one `match` over each, compiled with the worktree
+> binary.
+
+```js
+const g = 1;              // Ordering::Greater — the bare discriminant
+const p = [ 1 ];          // Plain::B          — the [index, ...data] array
+
+const $a = g;             // match over the numeric enum
+let $b = null;
+if ($a === -1)      { $b = "less"; }
+else if ($a === 0)  { $b = "equal"; }
+else                { $b = "greater"; }
+
+const $c = p;             // match over the array-form enum
+let $d = null;
+if ($c[0] === 0)      { $d = "a"; }
+else if ($c[0] === 1) { $d = "b"; }
+else                  { $d = "c"; }
+```
+
+Both programs run and print correctly. The machinery is
+`variant_value` (`transformer.rs:4280-4299`), `numeric_enum_discriminant`
+(`:4303-4314`) and `scalar_variant_test` (`:4317-4340`); `compares_natively`
+(`:6246-6262`) is what lets `==` on a numeric enum stay native `===` instead
+of dispatching to `PartialEq`.
+
+The asymmetry deserves stating plainly, because a reader meeting backed
+enums will trip on it: **adding `= 0` to one variant changes the runtime
+representation of the entire enum.** That is true today, undocumented, and
+§3.1 recommends keeping it.
+
+### 1.3 The bare lowering already crosses a host boundary (P4)
+
+This is the load-bearing evidence, and it is worth its own probe rather than
+an inference from §1.2.
+
+> **P4.** Does a numeric enum reach the host as its bare value, or does
+> something re-wrap it at the boundary?
+>
+> ```vilan
+> enum Code { Ok = 200, NotFound = 404 }
+> [extern("String")]
+> external fun to_host_string(value: Code): str;
+> fun main() { print(to_host_string(Code::NotFound)); }
+> ```
+>
+> Emits `console.log(String(404));`. Prints `404`.
+
+Nothing wraps, nothing translates, no wrapper function is generated: the
+enum *is* the number, all the way into the host call. A string-backed enum
+would be the string, all the way into the host call — which is precisely
+what every wrapper in §2 is hand-written to simulate.
+
+### 1.4 What `match` compiles to, and the performance question
+
+The lowering question B76 raises — "what does `match` compile to then, and
+does the string comparison change performance shape?" — has a clean answer,
+because the comparison target already exists in the language.
+
+> **P2.** `match` over a raw `str`:
+>
+> ```vilan
+> fun classify(s: str): i32 { match s { "start" => 0, "end" => 1, _ => 2 } }
+> ```
+> ```js
+> const $a = s;
+> let $b = null;
+> if ($a === "start")    { $b = 0; }
+> else if ($a === "end") { $b = 1; }
+> else                   { $b = 2; }
+> ```
+
+Set that beside P1's numeric-enum chain and they are the same emission,
+character for character apart from the compared constant. A string-backed
+enum's `match` needs **no new codegen path at all** — it is `scalar_variant_test`
+with a `js::Node::Str` where the `js::Node::Number` is.
+
+On performance the honest answer is: the *shape* does not change, and the
+constant barely does. Both forms are a linear `else if` chain over `===`
+(neither is a jump table today, for numbers either). JS `===` on two string
+primitives is a pointer comparison when both are interned, and every string
+in the emitted chain is a source literal, so the compiler-side operand is
+interned by construction; the subject may not be if it arrived from a host
+call that built it dynamically, in which case the engine falls back to a
+length check and a memcmp over a short keyword. That is a constant-factor
+difference on an operation that is already not on any hot path this project
+has measured. **This is not a performance argument in either direction, and
+the proposal does not make one.** What it does buy is on the other side of
+the ledger: today's wrapper runs the `===` chain *anyway* (§2.1's `match`
+arms are exactly that chain) and then makes a call; a backed enum runs
+nothing.
+
+> **P8.** The scalar operators on a numeric enum, one program each:
+>
+> | source | emitted |
+> |---|---|
+> | `if c is Code::Ok` where `Code::Ok = 200` | `if ($a === 200)` |
+> | `Level::Low == Level::High` | `0 === 1` |
+> | `Level::Low < Level::High` | `0 < 1` |
+>
+> All three check clean. The third matters in §3.6.
+
+So `is` and `==` fold to the same `===` a `match` arm produces — no separate
+path to widen for strings.
+
+### 1.5 Exhaustiveness is checked on variants, not on values (P3)
+
+> **P3.** A `match` over `Ordering` missing the `Greater` arm:
+> `Error: match is not exhaustive: missing 'Greater'`.
+
+Exhaustiveness runs on the variant set, by name, in the analyzer, before
+anything knows about lowering. Backing values do not enter it and would not
+need to. This is the cheapest answer in the paper: **exhaustiveness needs no
+change whatsoever.**
+
+The one interaction worth recording is on the other side: a numeric enum's
+`match` cannot be written against raw values —
+
+```
+match g { 1 => "one", _ => "other" }
+    → Error: literal pattern of type i32 cannot match type Ordering
+```
+
+— which is correct and should stay correct for strings. `match align {
+"start" => … }` must remain an error; the backing value is a
+representation, not a second spelling of the variant.
+
+### 1.6 What `Wire` does with an enum today (P9)
+
+The derived `Wire` impls for an enum are generated as vilan source by
+`enum_wire_visitor_impls` (`analyzer.rs:26813-26895`), and they key on the
+**variant name**: `serializer.begin_variant("{name}", {arity})`,
+`rebuild` matching `deserializer.variant_tag()` against `"{name}"`.
+`is_numeric` is never consulted.
+
+> **P9.** `[derive(Wire)]` on a numeric enum, a plain enum, and a payload
+> enum, encoded with `std::json::encode_json`:
+>
+> | value | JSON |
+> |---|---|
+> | `Ordering::Greater` (discriminant `1`) | `"Greater"` |
+> | `Plain::B` | `"B"` |
+> | `Payload::Text("hi")` | `{"Text":"hi"}` |
+
+So the discriminant is **already** invisible to serialization: `Ordering`
+goes on the wire as `"Greater"`, not `1`. That is the fact §3.9 has to
+reckon with, and it inverts the naive expectation — making a backed enum
+serialize as its backing value is a *divergence* from current behavior, not
+an extension of it.
+
+Free of charge, the survey establishes that the divergence costs nothing
+today: there is **no `[derive(Wire)]` enum anywhere in `vilan/std/src/`** —
+the only derive sites are `arena.vl:22` (a struct) and doc-comment
+references in `wire.vl:4` / `jwt.vl:4`. Nothing in std's wire format changes.
+
+### 1.7 Three silent holes in the discriminant grammar as it stands
+
+The survey went looking for how the existing feature validates its input.
+It does not.
+
+**(a) Duplicate discriminants silently miscompile (P5).** This is a live
+bug, not a design gap.
+
+> **P5.**
+> ```vilan
+> enum Dup { A = 1, B = 1, C = 2 }
+> fun main() {
+>     let d = Dup::B;
+>     print(match d { Dup::A => "a", Dup::B => "b", Dup::C => "c" });
+> }
+> ```
+> Compiles with **no diagnostic**. Emits:
+> ```js
+> const d = 1;
+> if ($a === 1)      { $b = "a"; }
+> else if ($a === 1) { $b = "b"; }   // unreachable
+> else               { $b = "c"; }
+> ```
+> Prints **`a`**.
+
+A `Dup::B` value matches the `Dup::A` arm. Two distinct variants are one
+runtime value, the second arm is dead, and the program is exhaustively
+matched and wrong. Nothing in the analyzer checks discriminant uniqueness.
+
+**(b) A discriminant on a mixed enum is accepted and dropped (P6).**
+`enum Mixed { A = 1, B(str) }` compiles clean. Because `is_numeric` requires
+`all_data_less`, the enum takes the array form and the `= 1` is inert — it
+parsed, it was stored in `EnumVariantDeclaration::discriminant`, and nothing
+will ever read it. A user who writes it is expressing an intent the compiler
+silently discards.
+
+**(c) A non-integer discriminant is accepted and silently changed (P7).**
+
+> **P7.** Two programs, both `no errors`:
+>
+> | source | actual discriminant | emitted |
+> |---|---|---|
+> | `enum A { X = 1.5, Y = 7 }` | `X` → `1` | `1 === 7` |
+> | `enum B { X = 99999999999999999999, Y = 1 }` | `X` → `0` | `0 === 1` |
+
+The float truncates; the overflow becomes `0` via the documented
+`unwrap_or(0)` at `parsing.rs:3315` — a behavior the comment attributes to
+matching chumsky, i.e. inherited from the pre-`frontend.md` parser and never
+revisited. The overflow case is the worse of the two, because `0` is a
+perfectly ordinary discriminant that a sibling variant may legitimately hold,
+which routes it straight into hole (a).
+
+These are not incidental to this proposal. A string backing makes (a)
+dramatically more likely to be hit — two CSS keywords colliding is a typo,
+not an exotic input, and std already writes `Display::Hidden => "none"` and
+`UserSelect::Off => "none"` (in different enums, which is fine, but shows how
+near the shape is). **Recommendation: all three get closed, as their own
+slice, landing before the backed-enum work and independently valuable
+without it.** They reject only programs that are already miscompiling.
+
+## 2. The demand side
+
+### 2.1 std — eleven of fifteen payload-free enums exist only to become a string
+
+A sweep of `vilan/std/src/` found **27 `enum` declarations, 15 of them
+payload-free**. Eleven of those fifteen are CSS keyword enums in
+`std/src/style.vl`, and every one is paired with a hand-written function
+whose whole body is a `match` from the variant to the string the host wanted:
+
+```vilan
+fun display(self, value: Display): Style {
+    self.raw("display", match value {
+        Display::Flex        => "flex",
+        Display::Grid        => "grid",
+        Display::Block       => "block",
+        Display::Inline      => "inline",
+        Display::InlineBlock => "inline-block",
+        Display::InlineFlex  => "inline-flex",
+        Display::InlineGrid  => "inline-grid",
+        Display::Hidden      => "none",
+    })
+}
+```
+`std/src/style.vl:658-669`
+
+With a backed enum that is:
+
+```vilan
+fun display(self, value: Display): Style {
+    self.raw("display", value.value())
+}
+```
+
+The full inventory (`match`-block line range, arms, lines that delete
+outright — the `match value {` line survives as the rewritten call, the arms
+and the closing `})` do not):
+
+| enum | wrapper | `match` block | arms | deletes |
+|---|---|---|---|---|
+| `RadialExtent` | `Gradient::radial` | 326–331 | 4 | 5 |
+| `Display` | `Style::display` | 659–668 | 8 | 9 |
+| `Position` | `Style::position` | 672–678 | 5 | 6 |
+| `FlexDirection` | `Style::flex_direction` | 682–687 | 4 | 5 |
+| `AlignItems` | `Style::align_items` | 691–697 | 5 | 6 |
+| `JustifyContent` | `Style::justify_content` | 701–708 | 6 | 7 |
+| `Overflow` | `Style::overflow` | 911–916 | 4 | 5 |
+| `WhiteSpace` | `Style::white_space` | 992–998 | 5 | 6 |
+| `UserSelect` | `Style::user_select` | 1002–1007 | 4 | 5 |
+| `TextAlign` | `Style::text_align` | 1026–1030 | 3 | 4 |
+| `Cursor` | `Style::cursor` | 1034–1039 | 4 | 5 |
+| | | **74 lines** | **52** | **63** |
+
+All eleven in one file. `RadialExtent` is the only one that is not a `Style`
+method — its `match` sits inline in a struct literal (`geometry = match
+extent { … },`) and collapses to `geometry = extent.value(),`, which is
+worth noting because it shows the conversion wants to be an *expression*,
+not a method the wrapper pattern happens to admit.
+
+**The strongest single fact in the sweep is a negative one.** These strings
+are not derivable from the variant names:
+
+| variant | backing value |
+|---|---|
+| `AlignItems::Start` | `"flex-start"` |
+| `AlignItems::End` | `"flex-end"` |
+| `JustifyContent::Between` | `"space-between"` |
+| `Display::Hidden` | `"none"` |
+| `UserSelect::Off` | `"none"` |
+
+`Hidden` and `Off` are named as they are *deliberately*, to stay clear of
+`Option::None` at use sites — the comments at `style.vl:375` and
+`style.vl:443-444` say so. So the cheap alternative design — derive the
+string from the variant name by a case convention, the `serde(rename_all)`
+move — **is disqualified by the demand it would serve**. A rule that is
+right for six of eleven std enums and wrong for five is worse than no rule,
+because being wrong is silent. The backing value is arbitrary text and must
+be written.
+
+### 2.2 The reverse direction, in its degraded form
+
+`std/src/json.vl:110-130`. `JsonValue::kind()` is an intrinsic returning a
+closed set, and its doc comment says so:
+
+```vilan
+/// The normalized JSON type — `"number"`/`"string"`/`"boolean"`/`"array"`/
+/// `"object"`/`"null"` (an intrinsic: `typeof` mis-buckets arrays and null).
+external fun kind(self): str;
+
+fun is_number(self): bool { self.kind() == "number" }
+fun is_string(self): bool { self.kind() == "string" }
+fun is_bool(self): bool   { self.kind() == "boolean" }
+fun is_array(self): bool  { self.kind() == "array" }
+```
+
+Six members in the documented set; four predicates. `"object"` and `"null"`
+never got one. That is the failure mode a closed type prevents and a doc
+comment does not — **the set is closed in prose and open in the type
+system**, so nothing noticed the two missing cases. 15 lines, 4 functions,
+13 call sites across std.
+
+This direction is also where the language has *nothing* to offer today: the
+sweep found **not one function in `vilan/std/src/` that takes a host `str`
+and returns an `Option<SomeEnum>`.** The conversion is one-directional
+throughout std. That is not because nobody wants it; it is because writing
+it by hand costs a `match` with a `_ =>` arm per enum and nobody paid.
+
+### 2.3 The thirteen sites that stayed untyped
+
+Where the wrapper was not worth writing, std simply passes `str` for a
+vocabulary the host has closed. These delete nothing — they are the safety
+the feature would buy rather than the lines it would save, and they are the
+better measure of the cost:
+
+`browser/dom.vl:94,101` (`on`/`on_event`, DOM event names),
+`browser/dom.vl:143` (`key()`, `KeyboardEvent.key`),
+`browser/dom.vl:25` (`create_element_ns`, XML namespace URIs),
+`browser/router.vl:31,45` (window event names),
+`fetch.vl:114` (`set_method`, HTTP verbs — with the verb literals loose at
+`fetch.vl:145,150,157,176` and `Request.method: str` at `:138`),
+`process/http.vl:49` (`method()`, inbound verbs),
+`process/http.vl:31,71,75,112` (node stream event names),
+`process/fs.vl:30` (node encodings — `read_file_to_str` at `:42-44` is a
+three-line wrapper whose only job is passing `"utf8"`),
+`process/rpc_server.vl:41,43` (digest algorithms and output encodings, with
+`"sha1"`/`"base64"` hardcoded at `:47`),
+`rpc.vl:337` (`set_binary_type` — the host accepts exactly `"blob"` |
+`"arraybuffer"`),
+`rpc.vl:325` (`host_kind`, `Object.prototype.toString` tags, string-compared
+at `rpc.vl:610`),
+`asset.vl:24` (`emit(kind, line)` — every std call site passes `"css"`).
+
+### 2.4 bindgen's generated match-wrapper (P0)
+
+> **P0.** `vilan bindgen` on a four-line `.d.ts` declaring
+> `type Align = "start" | "end" | "center"` plus one method taking it, one
+> returning it, and one free function taking two.
+
+The generated file today (abridged — the emission is
+`bindgen.rs:1259-1321`):
+
+```vilan
+enum Align { Start, End, Center }
+
+[extern(method, "setAlign")]
+[doc(hidden)]
+[platform("browser")]
+external fun set_align_raw(self, value: str): void;
+
+/// `set_align` — `set_align_raw` with its closed string sets spoken as enums.
+fun set_align(self, value: Align): void {
+    self.set_align_raw(match value {
+        Align::Start => "start",
+        Align::End => "end",
+        Align::Center => "center",
+    })
+}
+
+// TODO(bindgen): returns the closed string set `Align` — the raw `str` is
+// bound because the host may return a value outside the set; match it to
+// `Align` by hand
+[extern(method, "getAlign")]
+[platform("browser")]
+external fun get_align(self): str;
+```
+
+Three things to read out of that. The wrapper is real generated *logic* —
+"new territory for bindgen relative to every other row in this table
+(everything else emits signatures only, never bodies)", as `bindgen.md`
+§3.3 puts it. It is emitted **per parameter, per binding**, so the free
+function taking two `Align`s gets the arm block twice. And the **return
+direction has no wrapper at all** — it is a TODO, because there is no
+spelling for string → variant. On the `lib.dom.d.ts` probe that is
+**375 TODOs** of construct class "string-literal union property"
+(`bindgen.md` §10.1), every one of them a getter bindgen had to give up on.
+
+## 3. The design
+
+### 3.1 Syntax — a generalization of the discriminant, not a new kind of enum
+
+**Recommendation: generalize.** The grammar becomes
+
+```text
+variant = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+          [ "=" ( [ "-" ] INTEGER | STRING ) ] ;
+```
+
+and the analyzer's `is_numeric: bool` becomes `backing: Option<Backing>` with
+`Backing::Int` / `Backing::Str`, `EnumVariantDeclaration::discriminant: i64`
+becoming a `BackingValue` of the same two shapes. No new keyword, no
+`enum Align: str { … }` header form, no second concept in the type system.
+
+The case for this is that the semantics are already identical and were
+designed once: *a payload-free variant may carry a compile-time-constant
+scalar, and an enum whose variants carry one lowers to that scalar bare.*
+Everything in §1.2's machinery — `variant_value`, `numeric_enum_discriminant`,
+`scalar_variant_test`, `compares_natively` — is written against that sentence
+and needs its `i64` widened, not its structure changed. A separate "backed
+enum" kind would fork all four and leave the language with two names for one
+idea.
+
+Two sub-rules fall out:
+
+**(a) A string backing must be explicit on every variant.** C-style
+auto-increment is meaningful for integers (`enum X { A = 5, B }` gives `B`
+the value 6, and today's `next_discriminant` at `analyzer.rs:15697` does
+exactly that). There is no successor of `"start"`. So: if any variant carries
+a string, every variant must, and a missing one is an error naming the
+variant. Deriving it from the name is rejected on §2.1's evidence.
+
+**(b) The `all_data_less && any_explicit_discriminant` asymmetry stays.**
+An enum is bare-lowered iff it is payload-free *and* at least one variant is
+explicit; `enum Plain { A, B }` keeps its `[0]`/`[1]` array form (P1). This
+is a wart — adding `= 0` to one variant silently changes the representation
+of the whole type — but changing it would change the runtime representation
+of every payload-free enum in every existing program, and the array form is
+what `Wire`'s derive, pattern matching, and the `Hashable` story all
+currently assume. **Recommendation: preserve it exactly, and document it in
+`grammar.md`, which today says nothing about representation at all.**
+
+### 3.2 Mixed backings in one enum — reject
+
+`enum X { A = 1, B = "two" }`. **Recommendation: hard error.**
+
+This is not a taste call. An enum has **one** runtime representation. A mixed
+enum could only lower to the tagged-array form, which discards the entire
+point of the feature, or to a JS value that is sometimes a number and
+sometimes a string, which no vilan type can describe and which would make
+`.value()` (§3.8) have no return type. The backing type is fixed by the first
+explicit value in declaration order; every later value must agree, and a
+disagreement is an error naming both variants and both spellings.
+
+### 3.3 Payload variants in a backed enum — reject, and close the existing hole
+
+`enum X { A = "a", B(str) }`. **Recommendation: hard error**, and the same
+error for the integer case, which today is P6's silent drop.
+
+The bindgen use case needs no payloads: `bindgen.md` §3.3 routes
+discriminated unions to a *different*, unbacked enum with per-variant payload
+structs, and closed string unions to a payload-free one. std's eleven are all
+payload-free. Nothing in the demand asks for a hybrid, and a hybrid has no
+coherent lowering — a bare backing value has nowhere to put a payload.
+
+So: a variant carrying a payload may not carry a backing value, and an enum
+containing any payload variant may not have any backing values. The
+diagnostic should name the offending variant and say which of the two rules
+it broke. **This rejects `enum Mixed { A = 1, B(str) }`, which compiles
+today** — see §5 on why that is a fix rather than a break.
+
+### 3.4 Which backing types — `str` and the existing integers, nothing else
+
+**Recommendation: `str` plus the integer form that already exists. Not
+floats, not `bool`.**
+
+- **`str`** — the entire motivation (§2).
+- **integers** — already shipped, already used (`compare.vl:13-17`), must
+  keep working unchanged.
+- **floats — reject.** No demand: the `lib.dom.d.ts` probe's TODO table
+  (`bindgen.md` §10.1) shows 375 string-literal union properties and no
+  numeric-literal union class at all. And the semantics are hostile — the
+  lowering is `===`, so `0.1 + 0.2` is a footgun on a value the user never
+  computes but the *host* might, and `NaN !== NaN` breaks both the duplicate
+  check (§3.7) and any variant test. Revisit on a real driver application,
+  not before. This also finally makes P7's `= 1.5` an error instead of a
+  silent truncation.
+- **`bool` — reject.** `bool` is itself an enum in std (`boolean.vl:6-9`)
+  that already lowers to native `true`/`false` via the `bool_enum_id`
+  special case (`transformer.rs:4290-4292`). A two-variant bool-backed enum
+  is `bool` with extra steps and a worse `match`.
+
+### 3.5 Lowering — the bare backing value, per the precedent
+
+**Recommendation: `Align::Start` compiles to `"start"`.** Exactly as
+`Ordering::Greater` compiles to `1` (P1) and reaches the host as `404`
+(P4). `variant_value` gains a `js::Node::Str` arm beside its
+`js::Node::Number` one; `scalar_variant_test` likewise; `compares_natively`
+returns true for a string-backed enum for the same reason it does for a
+numeric one, and for `str` itself (`transformer.rs:6249-6250` already lists
+`"str"` among the natively-comparing struct names).
+
+`match` needs no new path (§1.4). Performance shape is unchanged and the
+paper makes no claim beyond that.
+
+### 3.6 Ordering operators on a string backing — reject
+
+Not asked in the charter, but the survey forced it. `<` works on a numeric
+enum today — `Level::Low < Level::High` emits `0 < 1` and checks clean
+(P8) — and std's `PartialOrd` **defaults depend on it**: `compare.vl:22-36`
+implements `lt`/`le`/`gt`/`ge` as comparisons against `Ordering::Equal`.
+
+On a string backing, `<` would lower to JavaScript's lexicographic string
+comparison over the *backing value*, so `Size::Large < Size::Small` would be
+true because `"lg" < "sm"`. That is essentially never what a reader means,
+and the thing they *do* mean — order by declaration index — cannot be
+provided, because bare lowering erases the index at runtime.
+
+**Recommendation: `<`, `<=`, `>`, `>=` are rejected on a string-backed enum,
+with a diagnostic that says the backing value is not an order and points at
+writing an explicit `impl Ord` or using an integer backing.** `==` and `!=`
+stay. The integer form is untouched.
+
+### 3.7 Exhaustiveness (unchanged) and duplicate backing values (reject)
+
+**Exhaustiveness: no change.** It is checked on the variant set by name,
+before lowering (P3), and backing values are irrelevant to it. Matching a
+backed enum against a raw literal stays an error, as it is for integers
+today (§1.5).
+
+**Duplicates: hard error, for both backings.** `enum Align { Start = "a", End
+= "a" }` is rejected naming both variants and the shared value. So is
+`enum Dup { A = 1, B = 1 }`, which today compiles and miscompiles (P5).
+
+The argument is P5's output. Two variants sharing a backing value are one
+runtime value: the second `match` arm is unreachable, `Dup::B == Dup::A` is
+true, and an exhaustive `match` returns the wrong answer with exit 0. There
+is no legitimate use — a variant that should be indistinguishable from
+another is the same variant. This is the one recommendation in the paper
+that fixes a bug rather than adding a capability, and §5 recommends it land
+on its own regardless of what happens to the rest.
+
+### 3.8 Conversions — `.value()` out, `Enum::parse` back
+
+Two directions, both synthesized by the compiler on every backed enum.
+
+**(a) Variant → backing value: an inherent method `value()`.**
+
+```vilan
+Align::Start.value()      // "start"
+Ordering::Greater.value() // 1
+```
+
+Return type is the enum's backing type. It lowers to the **identity** — the
+receiver already *is* the backing value at runtime — so it costs nothing and
+emits nothing; `value.value()` in a rewritten `style.vl` compiles to `value`.
+
+Naming. The runner-up was `.raw()`, which has the advantage that bindgen
+already uses `_raw` for this exact concept. It is rejected because in this
+codebase `raw` consistently means *the escape hatch that bypasses the typed
+surface* — `Style::raw(property, value)` (`style.vl`), and bindgen's `_raw`
+externs are `[doc(hidden)]` precisely because they are the thing you are not
+supposed to call. `.value()` is total, safe, and first-class; nothing is
+being bypassed, and it should not borrow the vocabulary of bypassing.
+`.backing()` is accurate and reads like compiler-internals at a call site.
+
+Collision. If a user declares their own `fun value(self)` on a backed enum,
+**recommendation: hard error, naming the synthesized member.** Silently
+preferring one is exactly the class of bug B57 was ratified to kill
+(`method-resolution.md`: duplicate-inherent is a hard error), and a
+synthesized member that quietly loses is worse than a user-visible name
+clash.
+
+**(b) Backing value → variant: a static `Enum::parse`, returning `Option`.**
+
+```vilan
+Align::parse("start")   // Some(Align::Start)
+Align::parse("middle")  // None
+```
+
+Return type is `Option<Self>`. This matches the house form for a fallible
+parse exactly — `str::parse_i32(): Option<i32>` and `str::parse_f64():
+Option<f64>` (`option.vl:294,299`), `str::try_parse_json():
+Option<JsonValue>` (`json.vl:91`) — all three of which return `Option`, not
+`Result`. `Result` is rejected because there is exactly one failure mode and
+its error string would carry nothing the caller does not already have;
+`from_json` earns `Result` because decoding has many.
+
+A static rather than a method on `str` is forced: a per-enum method would
+pollute `str` with one name per backed enum in scope, and vilan has no
+turbofish to disambiguate a generic `text.parse()`.
+
+Lowering is the `===` chain in reverse. For a large variant set a
+module-level lookup object (`{"start": …}`) is the better emission; that is
+an implementation choice, not a semantic one, and the paper does not fix a
+threshold.
+
+Deliberately **not** recommended for v1: a compiler-derived `impl Align with
+Into<str>` or `with Display`. Both are the natural-looking answer and both
+are premature while backlog item 73 is open — `impl type T with Into<T>` in
+`std/src/into.vl` is a blanket impl that matches every subject and wins by
+declaration order, so a user's own `impl Align with Into<str>` already loses
+to it today. Hanging a synthesized impl off that machinery is asking for a
+resolution bug in a feature whose entire value proposition is that it is
+simple. A plain inherent method sidesteps it. Layer the trait impls on
+later, once B73 has a specificity rule.
+
+### 3.9 `Wire` and JSON — serialize as the backing value
+
+**Recommendation: a backed enum serializes as its backing value, for both
+string and integer backings, and `rebuild` accepts that value.**
+
+`Align::Start` encodes as `"start"`, not `"Start"`. `Ordering::Greater`
+encodes as `1`, not `"Greater"`.
+
+This is the point of the feature: the JSON on the wire is the value the host
+speaks, and it round-trips through `parse`. But §1.6 established it is a
+**divergence** — today's derive keys on the variant name and ignores the
+discriminant entirely (P9), so this changes the meaning of `[derive(Wire)]`
+on an enum that has explicit backing values.
+
+What breaks, checked rather than assumed: **nothing on disk.** There is no
+`[derive(Wire)]` enum anywhere in `vilan/std/src/`; the derive's only std
+uses are on structs. `Ordering` — the one integer-backed enum in std — does
+not derive `Wire`. So the divergence is free today and should be taken now,
+while it is free, rather than after the first user ships a format.
+
+Two consequences to write down rather than mechanize:
+
+- **Adding a backing value to an existing `[derive(Wire)]` enum is a wire
+  format break.** So is removing one. This deserves a sentence in
+  `docs/std/encoding.md`, not a compiler mechanism.
+- The `rebuild` unknown-tag path already exists and already does the right
+  thing — `deserializer.fail(i"unknown variant '{tag}'")` plus a poisoned
+  zero-construction (`analyzer.rs:26880-26886`) — so a host sending a value
+  outside the set decodes to `Err`, not to garbage. No change needed there.
+
+## 4. What this deletes
+
+### 4.1 bindgen §3.3
+
+The generated output for P0's input becomes:
+
+```vilan
+/// `Align` — the closed string set `"start" | "end" | "center"`.
+enum Align { Start = "start", End = "end", Center = "center" }
+
+[extern(method, "setAlign")]
+[platform("browser")]
+external fun set_align(self, value: Align): void;
+
+/// The host may return a value outside the set — `parse` is the guard.
+[extern(method, "getAlign")]
+[doc(hidden)]
+[platform("browser")]
+external fun get_align_raw(self): str;
+fun get_align(self): Option<Align> { Align::parse(self.get_align_raw()) }
+```
+
+The **parameter** direction loses its wrapper entirely — the extern takes the
+enum, because the enum is the string. Deleted from
+`crates/vilan-core/src/bindgen.rs`:
+
+- the wrapper-emission block in `emit_one_binding` — `has_wrapper`,
+  `raw_name`, the `[doc(hidden)]` line, the arm-rendering `match`, the
+  assembled wrapper pushed to `extra` (**1259–1321, ~62 lines**);
+- `ParameterForm` and its two variants, and `render_parameters`'s
+  string-enum arm (**1875–1900, ~26 lines**);
+- the `string_enum: Option<String>` field threaded through `Mapped`
+  (`:317`) and `RenderedParameter` (`:1875`) and initialized at eleven
+  further sites — **27 references** in all.
+
+What **stays** is the part that was never the problem: the `StringEnum`
+collection (`:343-345`, `:411-414`) and the alias→enum emission
+(`:568-592`), now writing `Start = "start"` instead of `Start,`.
+
+The **return** direction is the bigger win and it is not a deletion at all —
+it is 375 TODOs on `lib.dom.d.ts` (`bindgen.md` §10.1, construct class
+"string-literal union property") becoming real bindings, because `parse`
+gives the generator a spelling it does not have today. §3.3's own summary of
+the wrapper as "real generated logic beyond a bare declaration, which is new
+territory for bindgen relative to every other row in this table" resolves the
+right way: bindgen goes back to emitting signatures only, plus one
+one-line `parse` forwarder in return position.
+
+`crates/vilan-core/tests/bindgen.rs:866-885`
+(`a_vilan_enum_cannot_carry_a_string_backing_value`) goes red on the day
+this lands, by construction — it asserts the parse error. It should be
+replaced, not deleted: invert it to assert the backed form compiles and the
+generated output contains no `_raw` wrapper for a parameter.
+
+### 4.2 std
+
+| file | what | lines |
+|---|---|---|
+| `style.vl` | 11 enum→string wrappers, 52 `match` arms | **−63** |
+| `json.vl:110-130` | `kind(): JsonKind` + 4 predicates deleted | **−15** |
+| | | **−78, 15 functions** |
+
+`style.vl` is mechanical: each of the eleven enums gains its strings and each
+wrapper collapses to one line (§2.1). The strings move from the wrapper to
+the declaration, so the *file* loses 63 lines and the *type* gains the
+information — `enum AlignItems { Start = "flex-start", … }` says at the
+declaration what today is only discoverable by reading a function 300 lines
+away.
+
+`json.vl` depends on a backed enum being legal as an `external fun`'s return
+type (§7.2). If it is, `external fun kind(self): JsonKind` replaces the `str`
+version, the four predicates delete, and their 13 call sites become
+`v.kind() == JsonKind::Number` — with `"object"` and `"null"`, which never
+got predicates, covered for free by exhaustiveness.
+
+The thirteen `external` sites in §2.3 delete nothing. They are the reason to
+do this anyway.
+
+## 5. Migration and back-compat
+
+**Existing integer-discriminant enums do not change meaning.** The grammar is
+widened, not altered; `Backing::Int` behaves exactly as `is_numeric` does
+today; lowering, `match`, `==`, and ordering are all untouched for integers.
+`Ordering` and every user enum with discriminants compile identically and
+emit identical JavaScript. The corpus goldens (`vilan/test/*.js`, a
+byte-identical gate) should not move at all for the integer path, and that
+is the check to run first.
+
+Three of the recommendations **reject programs that compile today**:
+
+| rejects | today | §5 verdict |
+|---|---|---|
+| duplicate backing values (§3.7) | compiles, **miscompiles** (P5) | fix |
+| backing value on a payload variant (§3.3) | compiles, value silently dropped (P6) | fix |
+| non-integer numeric backing (§3.4) | compiles, silently truncated / zeroed (P7) | fix |
+
+All three currently produce code that does something other than what was
+written. Rejecting them is a strict improvement, not a break, and none has
+a legitimate use to preserve.
+
+**Recommendation: land those three as their own slice, first and
+independently.** They are small, they are valuable without backed enums, and
+they make the backed-enum slice's validation a widening of an existing check
+rather than a new one. The house rule that a fix needs a pin per case applies:
+three pins, one per hole, each proven non-vacuous by planting the bug.
+
+The one genuine format change is `Wire` (§3.9), and §1.6 checked that it
+costs nothing in the tree today.
+
+## 6. Slices
+
+1. **Validate the discriminant that exists.** Duplicate check, payload-variant
+   check, non-integer rejection. Three diagnostics, three pins in
+   `inference.rs`. Independent of everything below; ships on its own.
+2. **The grammar and the type.** `parse_discriminant` accepts a string;
+   `is_numeric` → `backing: Option<Backing>`; `discriminant: i64` →
+   `BackingValue`. §3.1's rules (a) and (b), §3.2's one-backing-per-enum,
+   §3.4's type set. No codegen yet — an enum parses and checks, and lowering
+   still refuses. `grammar.md` and `types.md` updated in the same commit.
+3. **Lowering.** `variant_value`, `scalar_variant_test`, `compares_natively`.
+   §3.6's ordering rejection. Corpus goldens verified unmoved for integers.
+4. **Conversions.** Synthesized `value()` and `Enum::parse`, §3.8's collision
+   error.
+5. **`Wire`.** §3.9, plus the `docs/std/encoding.md` note.
+6. **std adoption.** `style.vl`'s eleven; `json.vl`'s `JsonKind` if §7.2
+   resolves in favor. Docs pages for `std::style` updated in the same commit.
+7. **bindgen.** §4.1's deletions, the return-direction `parse` forwarder, and
+   the inverted pin.
+
+## 7. Open questions
+
+### 7.1 Does a backed enum become `Hashable`? — recommend: out of scope, but raise it
+
+> **P10.** `Map<Level, str>` where `enum Level { Low = 0, High = 1 }`:
+> `Error: 'Level' does not implement trait 'Hashable', required by a generic
+> bound of this call`.
+
+A numeric enum lowers to a plain JS number and a string-backed one to a plain
+JS string — both of which the host `Map` keys natively — and neither is
+`Hashable` today. The feature makes this considerably more glaring, because
+"the enum *is* the string" is the whole pitch and the first thing a user will
+try is keying a map by it.
+
+**Recommendation: do not solve it here.** It belongs to `hashable-keys.md`
+(draft, backlog-tracked) and solving it for bare-lowered enums only would
+create a rule that half the enums in a program satisfy for reasons invisible
+at their declaration. But this proposal is the strongest case yet for a
+compiler-derived `Hashable` on bare-lowered enums, and it should be recorded
+against `hashable-keys.md` when this is reviewed. Left open because it is
+genuinely a different paper's call, not because the answer is unclear.
+
+### 7.2 May an `external fun` return a backed enum? — recommend: yes, with a caveat I am not fully comfortable with
+
+The parameter direction is safe: vilan constructs the value, so it is always
+in the set. The return direction is not — the host can return `"middle"` for
+an `Align`, and nothing checks.
+
+What happens then is the uncomfortable part, and it is a fact about today's
+lowering rather than a new risk: an exhaustive `match` compiles its last arm
+to a bare `else` (P1, P2 — there is no "impossible" trap arm), so a bogus
+value silently takes whichever arm happens to be last. The value is not
+detectably wrong; it is confidently the wrong variant.
+
+**Recommendation: allow it.** `external` is already a trust boundary in
+exactly this way — `external fun f(): i32` returning `"hello"` is equally
+unchecked and equally silent, and the language has never pretended
+otherwise. Adding a runtime guard here and nowhere else would be
+inconsistent, and adding it everywhere is a different and much larger
+proposal. But **bindgen must not generate it** (§4.1 generates the `parse`
+form), and std should use it only where the host's set is genuinely closed by
+the platform rather than by convention — `json.vl`'s `kind()` qualifies (the
+intrinsic is std's own code), `fetch.vl`'s inbound HTTP verb does not.
+
+Recorded as open rather than settled because the "confidently the wrong
+variant" behavior is the one outcome in this paper I would want the owner to
+look at directly. If the ruling is to forbid it, §4.2 loses `json.vl`'s 15
+lines and nothing else in the paper changes.
+
+### 7.3 Should `value()` and `parse` be synthesized, or written by a derive? — recommend: synthesized
+
+`[derive(Backed)]` would make the two members opt-in and visible at the
+declaration, matching how `Wire` works. Synthesizing them unconditionally
+makes them always available, which is what a user who wrote `= "start"`
+plainly wants, and avoids a second thing to remember.
+
+**Recommendation: synthesize.** The backing value is already the opt-in — you
+do not accidentally write `= "start"` — so a derive would be a second switch
+for the same decision. Left in the open section only because it is the one
+place the paper adds compiler-synthesized members to a user type without a
+`derive` marker, and that is a precedent worth the owner seeing rather than
+inheriting.
+
+### 7.4 Does `str` remain the only string backing if sized string types ever land? — recommend: revisit then, not now
+
+`numeric-types.md` shipped sized integers and left a native-width tail; there
+is no analogous string story and no proposal for one. If one appears, the
+backing set widens by the same argument that admits `str`. Nothing to decide
+today. Noted only so a future reader does not mistake §3.4's list for a
+closed set on principle rather than on demand.
