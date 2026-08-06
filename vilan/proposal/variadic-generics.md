@@ -831,3 +831,69 @@ length check, so `(i32, str)` reconciles against `(i32, str, bool)` and yields a
 concatenation exercises this path harder than the tuple form did — but no
 observed failure came out of it, so it is recorded here rather than fixed
 speculatively as part of a feature slice.
+
+### The fix (2026-08-06, B70) — and where it departs from the record above
+
+Shipped. The diagnosis above is right about the cause and wrong about the
+remedy, in a way worth writing down because the wrong remedy was tried twice
+before the right one.
+
+**The record said "type every expression into the cache". Two attempts show why
+that is not the fix.**
+
+- *Widening the cache by re-inferring, post-solve, every expression that stores
+  no type.* 33 red. Inference is **context-sensitive and diagnostic-producing**:
+  an unconstrained `["write the pilot", 0]` is not the `List<any>` its parameter
+  made it, and re-asking reports the heterogeneous-literal error a second time,
+  at analysis, on a program that was clean.
+- *Recording, at inference's choke point, the answer already computed — no
+  re-inference, so none of the above.* Still 31 red, and the reason is
+  structural: **types are deliberately not interned** (`type_id_for_type` mints
+  a fresh id per call, and says why). A type re-derived anywhere is a *new*
+  `TypeId`, structurally equal and identity-distinct, so every consumer keyed by
+  type identity misses — the resource classification, the drop glue, const
+  evaluation. Widening a shared cache with fresh ids silently unhooks them.
+
+**What shipped instead: the tuple's own type rule keeps the type it already
+computed for each element** (`tuple_element_types`), and the splice test
+consults that where the general cache is silent. No inference re-runs, no id is
+minted, no consumer's identity changes. It is still a coverage fix and still
+general over FORMS — the rule types every element whatever it is written as,
+which is the axis the bug is on — but it is scoped to the position that needs
+the answer, the shape B68's `drop_sink_value_types` already established.
+
+**The form list was longer than "a call or an `if`".** Broken and now fixed: a
+call, a method call, an associated call, a call through a closure value, an
+`if`, an `else if` chain, a `{ block }`, an `await`, a `*view`, a `const`
+element — and a bare **parameter**, which is a plain name and still lost its
+splice, because the general cache's place fallback resolves a variable and not a
+parameter. Never broken (they store a type): a name bound by `let`/`mut`, a
+tuple literal, a `match`, a field read, an index read, a tuple projection, a `!`
+receiver.
+
+**One boundary the record did not anticipate.** An element whose type is still a
+generic parameter must NOT splice, even at an instantiation binding it to a
+tuple. `tuple_flat_width` counts a generic element as one slot — deliberately,
+and it says so — and a generic body is walked once for every instantiation, so
+the `.n` offsets baked into that walk assume the nesting. Splicing per
+instantiation moves every offset past it (`wrap((4, 5), 6)` returned 5). So the
+element entry is read **unresolved**, unlike the general one, and only the
+unsubstituted walk records — which also keeps the entry deterministic rather
+than whichever instantiation inferred last.
+
+**The `reconcile_type` tuple arm was fixed too, and "arity is caught elsewhere"
+was wrong.** Seven positions accepted a mismatched arity silently: an annotated
+binding (`let t: (i32, str, bool) = (1, "x")` compiled clean), an argument, a
+return, an assignment, two `match` legs, a list literal's elements, and one
+generic bound from two arguments. `compare_type_rigid` — the trait-conformance
+comparison — had the identical hole, with its own closure arm checking arity a
+screen below; an impl returning or taking a tuple of the wrong arity was
+accepted.
+
+**Pins: 30** (16 for the splice, one per form plus the mixed, nested,
+spread-alongside and generic-boundary cases; 9 for the arity, one per position
+plus the matching case; 5 for B71 alongside). Every mechanism planted red and
+restored: dropping the element lookup takes **14**, resolving that lookup
+through the monomorphization takes the generic-boundary pin, restoring the
+truncating zip takes **9**. No corpus golden moved — as the record predicted,
+nothing in the corpus writes this shape, because it did not work.
