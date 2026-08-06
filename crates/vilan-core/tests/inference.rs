@@ -39475,3 +39475,547 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
         }
     }
 }
+
+// --- I3 S4: the adapters (proposal/iterator-adapters.md §3) -------------------
+// Trait defaults on the repaired `Iterator<T>`, each returning a named concrete
+// struct that holds its upstream by value. Terminals arrive in S5, so these
+// drive the chains with a `for` loop — which also pins that the loop protocol
+// reaches an adapter, per instantiation.
+
+/// The source every adapter pin composes over: a stateful conformer that only
+/// works because `next` takes `&mut self`, and an UNBOUNDED one, so a pin that
+/// forgets to short-circuit hangs rather than passing.
+fn adapter_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{{ self, Some, None }};
+        import std::range::Range;
+
+        struct Naturals {{ at: i32 }}
+
+        impl Naturals with Iterator<i32> {{
+            fun next(&mut self): Option<i32> {{
+                self.at = self.at + 1;
+                Some(self.at)
+            }}
+        }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn map_applies_its_closure_to_every_value() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut doubled = [1, 2, 3].iter().map(|n| n * 2);
+                for value in doubled {
+                    print(value);
+                }
+                mut single = [7].iter().map(|n| n + 1);
+                for value in single {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "2\n4\n6\n8\n",
+    );
+}
+
+#[test]
+fn map_over_an_empty_source_yields_nothing() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let empty: List<i32> = [];
+                mut mapped = empty.iter().map(|n| n * 2);
+                mut seen = 0;
+                for _value in mapped {
+                    seen = seen + 1;
+                }
+                print(seen);
+            }
+            "#,
+        ),
+        "0\n",
+    );
+}
+
+#[test]
+fn map_changes_the_element_type() {
+    // `Mapped<Self, T, U>` carries both, so a chain may change type mid-way and
+    // stay concrete — the property B4 makes load-bearing.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut labelled = [1, 2].iter().map(|n| i"n={n}");
+                for label in labelled {
+                    print(label);
+                }
+            }
+            "#,
+        ),
+        "n=1\nn=2\n",
+    );
+}
+
+#[test]
+fn an_adapter_pulls_nothing_until_it_is_pulled() {
+    // Laziness, stated as an observation rather than a claim: constructing the
+    // chain runs no closure, and one `next` runs exactly one.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut pulled = 0;
+                mut mapped = [1, 2, 3].iter().map(|n| {
+                    pulled = pulled + 1;
+                    n * 2
+                });
+                print(pulled);
+                print(mapped.next().unwrap_or(-1));
+                print(pulled);
+            }
+            "#,
+        ),
+        "0\n2\n1\n",
+    );
+}
+
+#[test]
+fn filter_keeps_only_what_the_predicate_holds_for() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut evens = [1, 2, 3, 4, 5].iter().filter(|n| n % 2 == 0);
+                for value in evens {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "2\n4\n",
+    );
+}
+
+#[test]
+fn a_filter_that_rejects_everything_is_exhausted_not_stuck() {
+    // The loop inside `filter`'s `next` has to end on the upstream's `None`,
+    // not on a match — a predicate nothing satisfies is the case that proves it.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut none = [1, 2, 3].iter().filter(|n| n > 100);
+                mut seen = 0;
+                for _value in none {
+                    seen = seen + 1;
+                }
+                print(seen);
+                let empty: List<i32> = [];
+                print(empty.iter().filter(|n| n > 0).next().is_none());
+            }
+            "#,
+        ),
+        "0\ntrue\n",
+    );
+}
+
+#[test]
+fn take_stops_at_its_budget() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut first2 = [1, 2, 3, 4].iter().take(2);
+                for value in first2 {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut nothing = [1, 2, 3].iter().take(0);
+                print(nothing.next().is_none());
+                mut negative = [1, 2, 3].iter().take(-4);
+                print(negative.next().is_none());
+                mut over = [1, 2].iter().take(9);
+                mut seen = 0;
+                for _value in over {
+                    seen = seen + 1;
+                }
+                print(seen);
+            }
+            "#,
+        ),
+        "true\ntrue\n2\n",
+    );
+}
+
+#[test]
+fn take_short_circuits_an_unbounded_source() {
+    // The pin the whole laziness argument rests on: `Naturals` never answers
+    // `None`, so this terminates only because `take` stops pulling. A `take`
+    // that consumed its upstream eagerly would hang the test binary.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut first3 = Naturals { at = 0 }.take(3);
+                for value in first3 {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn skip_drops_the_first_values() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut rest = [1, 2, 3, 4].iter().skip(2);
+                for value in rest {
+                    print(value);
+                }
+                mut all = [1, 2].iter().skip(0);
+                for value in all {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "3\n4\n1\n2\n",
+    );
+}
+
+#[test]
+fn skipping_past_the_end_leaves_an_exhausted_iterator() {
+    // The upstream runs out DURING the skip, which is the case a naive `skip`
+    // gets wrong by then pulling once more and answering with a stale value.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut gone = [1, 2].iter().skip(5);
+                print(gone.next().is_none());
+                print(gone.next().is_none());
+                let empty: List<i32> = [];
+                print(empty.iter().skip(3).next().is_none());
+            }
+            "#,
+        ),
+        "true\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn skip_pays_its_cost_on_the_first_pull_not_at_construction() {
+    // An adapter that consumed its upstream when it was BUILT would not be
+    // lazy — and over `Naturals` it would not return at all.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut later = Naturals { at = 0 }.skip(2).take(2);
+                for value in later {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn enumerate_pairs_each_value_with_its_position() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut indexed = ["a", "b", "c"].iter().enumerate();
+                for pair in indexed {
+                    print(i"{pair.0}:{pair.1}");
+                }
+                let empty: List<str> = [];
+                print(empty.iter().enumerate().next().is_none());
+            }
+            "#,
+        ),
+        "0:a\n1:b\n2:c\ntrue\n",
+    );
+}
+
+#[test]
+fn enumerate_counts_its_own_output_not_the_upstreams() {
+    // Over a `filter`, the index must number what SURVIVES — the classic
+    // off-by-provenance bug, where the position comes from the source instead.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut indexed = [1, 2, 3, 4].iter().filter(|n| n % 2 == 0).enumerate();
+                for pair in indexed {
+                    print(i"{pair.0}:{pair.1}");
+                }
+            }
+            "#,
+        ),
+        "0:2\n1:4\n",
+    );
+}
+
+#[test]
+fn zip_stops_with_the_shorter_side() {
+    // Both directions, because they take different paths through `next`: a
+    // short LEFT never asks the right side, a short RIGHT drops a left value.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut short_right = [1, 2, 3].iter().zip(["x", "y"].iter());
+                for pair in short_right {
+                    print(i"{pair.0}{pair.1}");
+                }
+                mut short_left = [1].iter().zip(["x", "y", "z"].iter());
+                for pair in short_left {
+                    print(i"{pair.0}{pair.1}");
+                }
+                let empty: List<i32> = [];
+                print(empty.iter().zip([1, 2].iter()).next().is_none());
+                print([1, 2].iter().zip(empty.iter()).next().is_none());
+            }
+            "#,
+        ),
+        "1x\n2y\n1x\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn zip_bounds_an_unbounded_side() {
+    // `zip` over `Naturals` terminates because the finite side ends it —
+    // the same short-circuit property as `take`, reached differently.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut numbered = Naturals { at = 0 }.zip(["p", "q"].iter());
+                for pair in numbered {
+                    print(i"{pair.0}{pair.1}");
+                }
+            }
+            "#,
+        ),
+        "1p\n2q\n",
+    );
+}
+
+#[test]
+fn chain_yields_the_left_side_then_the_right() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut both = [1, 2].iter().chain([3, 4].iter());
+                for value in both {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn chain_handles_an_empty_side_on_either_end() {
+    // And, once the left is exhausted, it is never asked again — the latch.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let empty: List<i32> = [];
+                mut right_only = empty.iter().chain([5, 6].iter());
+                for value in right_only {
+                    print(value);
+                }
+                mut left_only = [7].iter().chain(empty.iter());
+                for value in left_only {
+                    print(value);
+                }
+                print(empty.iter().chain(empty.iter()).next().is_none());
+            }
+            "#,
+        ),
+        "5\n6\n7\ntrue\n",
+    );
+}
+
+#[test]
+fn adapters_of_different_kinds_compose_into_one_chain() {
+    // Four stages over a `List`, each a different adapter, each holding the
+    // previous BY VALUE — the "adapter over adapter over adapter" case, where a
+    // dispatch that lost its instantiation used to emit an empty body (B55).
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut pipeline = [1, 2, 3, 4, 5, 6]
+                    .iter()
+                    .filter(|n| n % 2 == 0)
+                    .map(|n| n * 10)
+                    .skip(1)
+                    .take(2);
+                for value in pipeline {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "40\n60\n",
+    );
+}
+
+#[test]
+fn a_stateful_custom_conformer_drives_the_whole_adapter_set() {
+    // The arc's point, end to end: a user type whose `next` mutates its OWN
+    // state — impossible before I5 — reaching every adapter through the trait's
+    // defaults, with `Range` zipped in as a second std source.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut squares = Naturals { at = 0 }
+                    .map(|n| n * n)
+                    .filter(|n| n % 2 == 1)
+                    .zip(Range::new(10, 13))
+                    .take(2)
+                    .map(|pair| pair.0 + pair.1);
+                for value in squares {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "11\n20\n",
+    );
+}
+
+#[test]
+fn an_adapter_chain_leaves_its_source_list_alone() {
+    // The memory-model half: `iter()` snapshots (rule 1), and every adapter
+    // holds its upstream by value, so the whole pipeline is pure with respect
+    // to the list it started from — including under a `map` that would
+    // otherwise write through a shared element.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut source = [1, 2, 3];
+                mut doubled = source.iter().map(|n| n * 2);
+                mut total = 0;
+                for value in doubled {
+                    total = total + value;
+                }
+                print(total);
+                print(source.len());
+                print(source[0]);
+                source.push(4);
+                print(source.len());
+            }
+            "#,
+        ),
+        "12\n3\n1\n4\n",
+    );
+}
+
+// --- Found while building I3 S4: the protocol loop drops a TUPLE element's
+// --- type when the iterator's element is its own generic parameter -----------
+
+/// `for value in it` types `value` as the bare generic parameter (or as `any`)
+/// when `it`'s element type IS that parameter — so a tuple element cannot be
+/// projected: `pair.0` is "cannot access field '0' on type T". The same
+/// iterator pulled by hand is fine, which is what makes this the LOOP's bug
+/// rather than the iterator's:
+///
+/// ```text
+/// if cursor.step() is Some(let pair) { print(pair.0); }   // 1
+/// for pair in cursor { print(pair.0); }                   // cannot access field '0'
+/// ```
+///
+/// It is not std's and not this arc's — the repro below defines its own trait
+/// and its own cursor, and the native `for pair in [(1, "a")]` over a plain
+/// `List` (a different arm entirely) has always worked. What the arc DID is
+/// make the shape reachable: `List::iter()` is the first generically-elemented
+/// iterator in std, so `[(1, "a")].iter().filter(p)` now hits it. An adapter
+/// that names the tuple STRUCTURALLY in its `with` clause is unaffected —
+/// `enumerate` (`Iterator<(i32, T)>`) and `zip` (`Iterator<(T, U)>`) both
+/// project fine — so the defect is exactly the substitution of the loop
+/// binding, not tuples in the protocol.
+///
+/// `#[ignore]`d: it asserts the desired outcome and fails today.
+#[test]
+#[ignore]
+fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Walk<T> {
+            fun step(&mut self): Option<T>;
+        }
+
+        struct Cursor<T> {
+            items: List<T>,
+            index: i32,
+        }
+
+        impl Cursor<type T> with Walk<T> {
+            fun step(&mut self): Option<T> {
+                if self.index < self.items.len() {
+                    let value = self.items[self.index];
+                    self.index = self.index + 1;
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut pulled = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
+            if pulled.step() is Some(let pair) {
+                print(pair.0);
+            }
+            mut looped = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
+            for pair in looped {
+                print(pair.1);
+            }
+        }
+        "#,
+        "1\na\nb\n",
+    );
+}

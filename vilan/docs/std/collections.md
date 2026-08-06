@@ -295,5 +295,84 @@ fun main() {
 
 One thing to know about the loop: `for` resolves the protocol on the *method
 name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
-not it declares the trait. Declaring it is what buys the adapters and the
-terminations — and what lets a generic bound accept your type.
+not it declares the trait. Declaring it is what buys the adapters below — and
+what lets a generic bound accept your type.
+
+### Adapters
+
+Every `Iterator` gets these, as trait defaults — implement `next` and you have
+all of them:
+
+```vilan,fragment
+fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
+fun filter(self, predicate: |T| bool): Filtered<Self, T>
+fun take(self, count: i32): Taken<Self, T>
+fun skip(self, count: i32): Skipped<Self, T>
+fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
+fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
+fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
+```
+
+They are **lazy**: each returns a small struct holding its upstream, and nothing
+runs until something pulls. So a chain makes one pass over the source and builds
+no intermediate lists.
+
+```vilan
+import std::print;
+
+fun main() {
+	mut pipeline = [1, 2, 3, 4, 5, 6]
+		.iter()
+		.filter(|n| n % 2 == 0)
+		.map(|n| n * 10)
+		.take(2);
+	for value in pipeline {
+		print(value);   // 20, 40
+	}
+}
+```
+
+Laziness is what makes `take` more than a convenience: it never pulls past its
+budget, so it bounds a source that has no end.
+
+```vilan
+import std::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, Some, None };
+
+struct Naturals {
+	at: i32,
+}
+
+impl Naturals with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		self.at += 1;
+		Some(self.at)
+	}
+}
+
+fun main() {
+	mut squares = Naturals { at = 0 }.map(|n| n * n).take(3);
+	for value in squares {
+		print(value);   // 1, 4, 9
+	}
+}
+```
+
+`zip` stops with the **shorter** side, and `enumerate` numbers what reaches it —
+put it after a `filter` and you get the positions in the *output*, not in the
+source.
+
+The adapter types are named in the past participle — `Mapped`, `Taken`,
+`Filtered` — while the methods keep the plain names. That is deliberate: `Map`
+is already a std type, and vilan's method resolution picks by registration order
+rather than reporting a collision, so the type names stay out of each other's
+way.
+
+**One rough edge to know about.** If an iterator's element type is its own
+generic parameter and you instantiate it at a *tuple*, the `for` binding loses
+the tuple: `for pair in [(1, "a")].iter() { pair.0 }` is rejected with "cannot
+access field '0' on type T". Pull by hand instead —
+`if cursor.next() is Some(let pair) { pair.0 }` — or iterate the `List`
+directly, both of which work. `enumerate` and `zip` are not affected, because
+they name their tuple element structurally.

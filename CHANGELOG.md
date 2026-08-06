@@ -28,6 +28,40 @@ since every adapter is stateful by construction. If you implemented `Iterator`
 by mutating something outside the iterator (a module-level counter — the only
 way that worked), the receiver is the one line to change.
 
+**`List` has a cursor, and every iterator has adapters.** `xs.iter()` returns a
+`ListIterator<T>`, and `map`, `filter`, `take`, `skip`, `enumerate`, `zip` and
+`chain` arrive as trait *defaults* on `Iterator` — so implementing `next` gets
+you all seven, on your own types as much as on std's. They are lazy: each one is
+a small struct holding its upstream, nothing runs until something pulls, and a
+chain makes **one** pass over the source with no intermediate lists.
+`[1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).map(|n| n * 10).take(2)` walks
+the six values once and touches four of them.
+
+Laziness is what makes `take` more than shorthand: it never pulls past its
+budget, so it bounds a source with no end. An iterator whose `next` always
+answers `Some` is now a normal thing to write, and `.take(3)` terminates it.
+`zip` stops with the shorter side; `enumerate` numbers what reaches *it*, so
+after a `filter` you get positions in the output rather than in the source.
+
+`xs.iter()` takes a **snapshot**. That is rule 1 rather than a policy — the
+cursor stores the list in a slot that outlives the call, so the storage copies —
+and it means a `push` after `iter()` is not walked, and that `iter()` itself
+costs a copy of the list. The eager `List` methods that only need one pass still
+take one.
+
+The adapter *types* are past participles — `Mapped`, `Taken`, `Filtered` — while
+the methods keep the plain names. `Map` is already a std type, and vilan's method
+resolution picks by registration order rather than reporting a collision, so the
+names are kept apart deliberately rather than arbitrated.
+
+One rough edge is documented rather than hidden: if an iterator's element type is
+its own generic parameter and you instantiate it at a *tuple*, the `for` binding
+loses the tuple — `for pair in [(1, "a")].iter() { pair.0 }` is rejected with
+"cannot access field '0' on type T". Pulling by hand works, iterating the `List`
+works, and `enumerate`/`zip` are unaffected because they name their tuple element
+structurally. It is a pre-existing defect in the loop's substitution that nothing
+in std could reach until `List::iter` existed; it is pinned.
+
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
 
 **It also fixes something you could not fix from outside.** Two writes in flight over one signal corrupted it. An older write that fails *after* a newer one succeeded rolled the newer value away — probe it through the free function and the screen ends up showing the value the cell started at while the server holds one from two writes later. The cell discards a superseded outcome (the newest write owns the cell, and the outcome still returns to its own caller), and a rollback lands on the last value the **server** confirmed rather than on whatever the signal happened to hold when the write began. Those are two different questions, so confirmations carry their own counter and an out-of-order reply cannot walk the recorded truth backwards.
