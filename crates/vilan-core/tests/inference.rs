@@ -19858,6 +19858,320 @@ fn an_imported_function_coerces_across_modules() {
     );
 }
 
+// --- B75: calling a fn-typed binding (fn-coercion.md §4) --------------------
+//
+// `let f = helper; f(1)` used to fail with "cannot call this as a function: it
+// is fn helper(i32): i32". `fn-coercion.md` §4 recorded the opposite ("calling
+// such a binding works as before"), so this was a hole, not a refusal: the call
+// resolver dispatched on the subject's ENTITY (a binding, not a declaration) and
+// never read its TYPE. It reads it now, through the same eligibility predicate
+// B20's coercion uses — one rule for what a `fun` value is, so the two can never
+// disagree. Emission needed nothing: a fn reference already emits as its own
+// (mangled) name, which is why the ANNOTATED form already worked.
+
+#[test]
+fn a_fn_typed_binding_calls() {
+    // The filed shape, end to end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            print(f(1));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_nested_fn_typed_binding_calls() {
+    // A `fun` declared inside another function (B71's neighbourhood, where this
+    // was found) is the same value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            fun helper(i: i32): i32 {
+                i * 3
+            }
+            let f = helper;
+            print(f(4));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_calls_at_every_arity() {
+    // Arity is the parameter list of the DECLARATION, so zero-, one- and
+    // multi-parameter forms all have to come through the one path — and a
+    // void-returning one has no declared return to read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun nothing(): i32 {
+            7
+        }
+
+        fun two(a: i32, b: i32): i32 {
+            a * b
+        }
+
+        fun shout(text: str) {
+            print(text);
+        }
+
+        fun main() {
+            let n = nothing;
+            let t = two;
+            let s = shout;
+            print(n());
+            print(t(3, 4));
+            s("hi");
+        }
+        main();
+        "#,
+        "7\n12\nhi\n",
+    );
+}
+
+#[test]
+fn a_rebound_fn_typed_binding_still_calls() {
+    // The type rides through a chain of bindings — each `let` copies
+    // `Type::Function(id)`, so the last one resolves the same declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 10
+        }
+
+        fun main() {
+            let f = helper;
+            let g = f;
+            let h = g;
+            print(h(5));
+        }
+        main();
+        "#,
+        "15\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_composes_with_the_b20_coercion() {
+    // The two directions must compose: bind a `fun` unannotated, CALL it, and
+    // also hand the same binding to a closure-typed parameter (where B20's
+    // coercion converts it). One value, both uses, in one program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            transform(value)
+        }
+
+        fun main() {
+            let f = double;
+            print(f(4));
+            print(apply(f, 5));
+        }
+        main();
+        "#,
+        "8\n10\n",
+    );
+}
+
+#[test]
+fn a_closure_typed_parameter_rebinds_and_calls() {
+    // The receiving end: a closure-typed parameter rebound to a plain `let` and
+    // called through the copy. This one always worked (the parameter's declared
+    // type is `Type::Closure`); it pins that widening the call operator did not
+    // disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            let inner = transform;
+            inner(value)
+        }
+
+        fun main() {
+            print(apply(double, 6));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arguments() {
+    // Resolving through the declaration is what buys the ordinary checks: a
+    // wrong argument TYPE through a binding reports like any other call.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f("text");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arity() {
+    // The arity check comes from the same path, so it reports the declaration's
+    // parameter count rather than silently accepting.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f(1, 2);
+        }
+        "#,
+        "Expected 1 argument, but got 2 instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_types_its_result() {
+    // The call's TYPE is the declaration's return type, not `Unknown`: a `str`
+    // result used as an `i32` has to fail.
+    assert_fails_with(
+        r#"
+        fun name(): str {
+            "x"
+        }
+
+        fun main() {
+            let f = name;
+            let n: i32 = f();
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+// The four functions with no value form (`fn-coercion.md` §1 rules 1-4,
+// `spec/types.md` §5.8). Each is DEFERRED there with its own reason, so a
+// binding cannot hold one to call either — pinned so that widening the call
+// operator can never quietly widen the value form with it. Each message names
+// the disqualifying property, which is what the tour promises ("the compiler
+// will tell you when you hit one").
+
+#[test]
+fn a_generic_fn_typed_binding_does_not_call() {
+    // Rule 2. Left open, this MISCOMPILED: the binding emits the declaration's
+    // name, monomorphization mints instance names from a disjoint pool, and the
+    // call reached a name specialization never produced (`$a is not defined`).
+    assert_fails_with(
+        r#"
+        fun identity<T>(x: T): T {
+            x
+        }
+
+        fun main() {
+            let f = identity;
+            let n = f(1);
+        }
+        "#,
+        "a generic function has no single value",
+    );
+}
+
+#[test]
+fn an_async_fn_typed_binding_does_not_call() {
+    // Rule 4. Left open, this compiled and printed `Promise { 2 }`: a call
+    // through a value is not awaited (the J2 gap), so the promise leaks.
+    assert_fails_with(
+        r#"
+        async fun fetchy(i: i32): i32 {
+            i + 1
+        }
+
+        async fun main() {
+            let f = fetchy;
+            let n = f(1);
+        }
+        "#,
+        "an `async` function has no value form",
+    );
+}
+
+#[test]
+fn a_method_fn_typed_binding_does_not_call() {
+    // Rule 3 — `x.method` as a value means receiver capture, deferred there.
+    // `Bag::bump` types as `fn bump(Bag): i32`, so without the gate it would
+    // have become callable as a side effect of this change.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+
+        impl Bag {
+            fun bump(self): i32 {
+                self.n + 1
+            }
+        }
+
+        fun main() {
+            let f = Bag::bump;
+            let b = Bag { n = 1 };
+            let n = f(b);
+        }
+        "#,
+        "a method has no value form",
+    );
+}
+
+#[test]
+fn an_external_fn_typed_binding_does_not_call() {
+    // Rule 1 — an extern's binding forms are call-shaped, so there is no sound
+    // value to hold.
+    assert_fails_with(
+        r#"
+        [extern("parseInt")]
+        external fun parse_int(text: str): i32;
+
+        fun main() {
+            let f = parse_int;
+            let n = f("12");
+        }
+        "#,
+        "an `external` function has no value form",
+    );
+}
+
 // --- K5: `std::time` + i53 on the wire (kolt-migration.md §2.5) --------------
 //
 // The runtime surface (arithmetic, describe, ISO, codec round-trips, sleep) is
@@ -40208,6 +40522,421 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
         "#,
         "Box { y = 2 }",
         "does not implement 'A'",
+    );
+}
+
+// --- B72: a bare-trait parameter steers to the bound (method-resolution.md
+// --- §10) -------------------------------------------------------------------
+//
+// `fun show(v: A)` called with a `Bag` that implements `A` failed with
+// "Expected A, but got Bag instead" — which reads as though the impl were
+// missing. It is not. A trait is a BOUND, not a type (`spec/types.md` §5.5,
+// §5.11) and vilan has no trait objects, so the parameter can never accept a
+// concrete value and the declaration is what has to change.
+//
+// A call is the one position that reconciles PARAMETER-FIRST, so it is the one
+// position that ever asks `reconcile_type(Trait, Concrete)` — the direction
+// with no arm. Every other position reconciles value-first and lands on the
+// `(Struct|Enum, Trait)` arm, which accepts; those are pinned below as the
+// standing inconsistency they are, and belong to B4.
+
+#[test]
+fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
+    // The filed shape. The steer names the trait, the parameter, and the
+    // declaration to write.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A': a trait is not a value type",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_names_the_generic_to_write() {
+    // The actionable half — without it the message diagnoses without directing.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "`<T: A>` with 'v: T'",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
+    // The fix belongs at the DECLARATION, not at the call the error anchors on
+    // — so the note points there (and carries its own source, so it renders
+    // when the callee lives in another module).
+    assert_fails_noting(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(subject: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "has bare trait type 'A'",
+        "subject",
+        "is declared with the trait as its type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
+    // The second surface that reaches the parameter-first reconcile: an
+    // associated function called as `Type::member(..)`. Same path, same steer —
+    // which is the point of fixing the message at the shared site rather than
+    // at the free-function call.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun make(v: A): i32 { 1 } }
+        fun main() { let n = Holder::make(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A'",
+    );
+}
+
+#[test]
+fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
+    // The steer is for the author who wrote a correct impl and the wrong
+    // signature. When the value does NOT implement the trait, the missing impl
+    // is the likelier mistake, so naming the type it failed to match stays the
+    // more useful report.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "Expected A, but got Other instead.",
+    );
+}
+
+#[test]
+fn b72_the_bound_generic_form_is_what_works() {
+    // The steer has to point at something that compiles AND runs — otherwise it
+    // is advice, not a fix. This is the program the message asks for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b72_a_generic_parameter_is_untouched_by_the_steer() {
+    // The steer must not reach a GENERIC parameter whose constraint resolves to
+    // a trait — `Type::Generic(c)` where `c` is the bound's type id is the
+    // normal, working case, and it is one arm away in `reconcile_type`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "does not implement trait 'A'",
+    );
+}
+
+// The positions that ACCEPT a bare trait today, pinned as the standing
+// inconsistency they are rather than left undescribed. Each reconciles
+// value-first, so each lands on `reconcile_type`'s `(Struct|Enum, Trait)` arm.
+// Refusing them is a language change (a trait type would become illegal in
+// every value position), which is B4's to make — and std itself depends on one
+// of them: `iterator.vl`'s `fun iter(self): Iterator<T>` returns a bare trait.
+
+#[test]
+fn b72_a_bare_trait_let_annotation_is_still_accepted() {
+    // `let x: A = bag` compiles; only USING it fails. The spec says this should
+    // be rejected at the annotation (`types.md` §5.11); it is not, and closing
+    // that gap is B4's, not a diagnostic's.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_value_still_cannot_be_used() {
+    // The refusal that DOES exist, and the one the new steer is worded to
+    // match: the body-side rule, from inside `show`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; let s = x.name(); }
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_method_parameter_is_still_accepted() {
+    // A METHOD's bare-trait parameter reconciles value-first, so it accepts
+    // where the free function refuses. The asymmetry is real and pinned; see
+    // `method-resolution.md` §10.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun take(self, v: A): i32 { 1 } }
+        fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_return_is_still_accepted() {
+    // std depends on this one: `impl Iterator<type T> with Iterable<T>` returns
+    // `Iterator<T>`, a bare trait. Any refusal of trait types in value position
+    // has to answer for it first.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun main() { let v = make(); }
+        "#,
+    );
+}
+
+// --- B74: the duplicate check reaches statics (method-resolution.md §9) -----
+//
+// B57's duplicate-inherent check filtered `is_self_method`, per its own scope,
+// so two impls declaring the same `fun new()` for one subject stayed a silent
+// pick — the same dead-declaration hazard one receiver position away. An impl's
+// `declarations` is ONE map keyed by name, so receiver position was never part
+// of a member's identity; the filter was doing double duty as "methods only"
+// and "same namespace only", and only the first was meant. The sweep that ran
+// before this landed found ZERO live collisions across std, the corpus, every
+// example and every compiled docs fence — the entire blast radius is the shapes
+// pinned here.
+
+#[test]
+fn b74_two_static_declarations_of_one_name_are_an_error() {
+    // The filed shape. Before this, `Bag::new()` silently took the first.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::new(); }
+        "#,
+        "new",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_the_duplicate_static_error_notes_the_first_declaration() {
+    // The same cross-file-capable note B57 ships for methods (§9(4)): the
+    // second declaration is the anchor, the first gets the note.
+    assert_fails_noting(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 1 } } }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::spawn_here(); }
+        "#,
+        "is already defined for 'Bag'",
+        "spawn_here",
+        "is already defined here",
+    );
+}
+
+#[test]
+fn b74_a_static_and_a_method_of_one_name_collide() {
+    // The truth about namespaces, pinned: there is only ONE. `declarations` is
+    // keyed by name alone, and the static is the declaration that dies —
+    // `Bag::tag()` resolves the inherent METHOD first and then fails on arity
+    // ("Expected 1 argument, but got 0"), a report of a declaration that was
+    // never reachable by either call form. So they collide, and the error lands
+    // where the fix does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun tag(): str { "static" } }
+        impl Bag { fun tag(self): str { "method" } }
+        fun main() { let bag = Bag { n = 1 }; }
+        "#,
+        "tag",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_an_extra_static_in_a_trait_impl_block_counts_as_inherent() {
+    // §9(2): "inherent" is a property of the MEMBER. A static written inside a
+    // `with`-clause block that the trait does not declare is the type's own,
+    // and collides with a plain inherent block's same name — the static twin of
+    // `b57_an_extra_method_in_a_trait_impl_block_counts_as_inherent`.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        impl Bag with Marker {
+            fun mark(self): str { "m" }
+            fun make(): Bag { Bag { n = 1 } }
+        }
+        impl Bag { fun make(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::make(); }
+        "#,
+        "make",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
+    // The load-bearing negative, and the reason the widening is a filter change
+    // rather than a filter deletion. A trait's STATIC is homed by its trait, so
+    // it never enters the inherent tier: one inherent declaration is left, and
+    // one does not collide. `member_home_trait` reads the trait's declaration
+    // map directly with no receiver filter, which is what makes it home a
+    // static as readily as a method.
+    //
+    // Proven load-bearing against the tree, not by argument: with the homing
+    // guard removed, `vilan/std/src/time.vl`'s inherent `Duration::describe`
+    // collides with the `Wire` trait's `describe` and the corpus goes red.
+    //
+    // NOTE, deliberately not pinned here: `Bag::default()` on this program
+    // resolves to the TRAIT's static (7), not the inherent one — the static
+    // accessor path never got B57's tiering (method-resolution.md §S2's
+    // residue; it is still a `find_map` in impl-registration order). That is a
+    // resolution bug, separate from this duplicate check, so this pin asserts
+    // only what B74 claims: these two are not a duplicate.
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag with Default {
+            fun default(): Bag { Bag { n = 7 } }
+        }
+
+        impl Bag {
+            fun default(): Bag { Bag { n = 1 } }
+        }
+
+        fun main() {
+            print(Bag::default().n);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b74_the_same_static_name_on_two_types_is_not_a_duplicate() {
+    // Subject compatibility still gates the pair: `new` on two distinct types
+    // is two declarations, not a duplicate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        struct Box { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Box { fun new(): Box { Box { n = 2 } } }
+        fun main() { print(Bag::new().n); print(Box::new().n); }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b74_a_duplicate_static_on_a_generic_subject_is_an_error() {
+    // Subjects are compared with `compare_type`, so an impl with `type` binders
+    // collides with its twin exactly as a concrete one does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        fun main() { let cell = Cell::of(1); }
+        "#,
+        "of",
+        1,
+        "is already defined for",
+    );
+}
+
+#[test]
+fn b74_three_static_declarations_produce_two_errors() {
+    // Each later declaration reports against the FIRST compatible one before
+    // it, so the count follows the declarations, not the pairs.
+    let source = r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        impl Bag { fun new(): Bag { Bag { n = 3 } } }
+        fun main() { let bag = Bag::new(); }
+        "#;
+    match compile(source) {
+        Ok(_) => panic!("expected two duplicate-static errors, but it compiled"),
+        Err(errors) => {
+            let duplicates = errors
+                .iter()
+                .filter(|error| error.contains("is already defined for 'Bag'"))
+                .count();
+            assert_eq!(duplicates, 2, "expected two duplicates; got: {errors:#?}");
+        }
+    }
+}
+
+#[test]
+fn b74_a_static_still_resolves_when_it_is_the_only_one() {
+    // The check must not disturb the ordinary path: one static, one home.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        impl Bag {
+            fun new(n: i32): Bag { Bag { n = n } }
+            fun tag(self): str { "bag" }
+        }
+        fun main() { let bag = Bag::new(4); print(bag.n); print(bag.tag()); }
+        main();
+        "#,
+        "4\nbag\n",
     );
 }
 

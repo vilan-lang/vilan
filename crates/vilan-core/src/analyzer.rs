@@ -3478,12 +3478,22 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Duplicate inherent members (B57, `proposal/method-resolution.md` §3/§4):
-    /// two impls that declare the same method name for the same subject, with
-    /// neither name belonging to a trait, leave one of the two declarations
-    /// dead — and which one dies is decided by the order the modules happened
-    /// to load in. Precedence cannot rank them (they are both the type's own),
-    /// so this is a definition-site error, like Rust's E0592: it does not wait
-    /// for a call site to observe it.
+    /// two impls that declare the same name for the same subject, with neither
+    /// name belonging to a trait, leave one of the two declarations dead — and
+    /// which one dies is decided by the order the modules happened to load in.
+    /// Precedence cannot rank them (they are both the type's own), so this is a
+    /// definition-site error, like Rust's E0592: it does not wait for a call
+    /// site to observe it.
+    ///
+    /// **Receiver position is not part of the identity (B74).** An impl's
+    /// `declarations` is one map keyed by name, so a subject has ONE surface: a
+    /// static `fun new()` and a method `fun new(self)` cannot both be reached,
+    /// and today the static is the one that dies — `Bag::new()` resolves the
+    /// inherent method first and then fails on arity, which is a confusing
+    /// report of a declaration that was never reachable. So every inherent
+    /// declaration competes, whatever its receiver. The original check filtered
+    /// `is_self_method` for B57's scope; that filter was doing double duty as
+    /// "methods only" and "same namespace only", and only the first was meant.
     ///
     /// A definition-site check, so it joins the family that skips frozen std
     /// entities (S1): a duplicate whose second declaration is std's own is
@@ -3505,16 +3515,19 @@ impl<'src> Analyzer<'src> {
             }
             // Only inherent declarations compete. A trait's member is RANKED
             // against the type's own, not duplicated (§3), and a `[trait_only]`
-            // one never reaches the type's surface at all.
+            // one never reaches the type's surface at all. Both tests read the
+            // trait's declaration map directly, so they home a trait's STATIC
+            // (`Default::default`, `Wire::rebuild`) exactly as they home a
+            // method — which is what keeps two impls of one trait from
+            // colliding here now that statics compete.
             let mut inherent: Vec<(Id, TypeId)> = implementation_indices
                 .iter()
                 .filter_map(|index| {
                     let implementation = &self.implementations[*index];
                     let member_id = *implementation.declarations.get(member_name)?;
-                    (self.is_self_method(member_id)
-                        && self
-                            .member_home_trait(implementation, member_name)
-                            .is_none()
+                    (self
+                        .member_home_trait(implementation, member_name)
+                        .is_none()
                         && !self.member_is_trait_only(implementation, member_name))
                     .then_some((member_id, implementation.subject))
                 })
@@ -19764,6 +19777,143 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
+    /// The diagnostic for an argument that does not fit its declared parameter
+    /// — with the BARE TRAIT case steered (B72).
+    ///
+    /// A parameter declared as a bare trait can never accept a concrete value,
+    /// and "Expected A, but got Bag instead" of a `Bag` that plainly `impl`s `A`
+    /// reads as though the impl were missing or wrong. It is neither: a trait is
+    /// a BOUND, not a type — `spec/types.md` §5.5 ("a trait is not a type") and
+    /// §5.11, which lists using one as a type as a normative rejection case —
+    /// and vilan has no trait objects. That is the same rule
+    /// `MethodLookup::BareTraitValue` already states from inside the body; the
+    /// call site simply had no version of it.
+    ///
+    /// Why only here: a CALL is the one position that reconciles
+    /// parameter-first (so bindings key on the callee's generics), which makes
+    /// it the one position that ever asks `reconcile_type(Trait, Concrete)`.
+    /// Every other position — a `let` annotation, a return, a field, a method
+    /// argument — reconciles value-first and lands on the `(Struct|Enum, Trait)`
+    /// arm, which ACCEPTS. Making those agree is a language question (B4), not a
+    /// message question; see `method-resolution.md` §10.
+    fn argument_mismatch(
+        &self,
+        parameter_name: &str,
+        parameter_id: Id,
+        parameter_type: &Type,
+        argument_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> (String, Option<crate::error::Note>) {
+        let expected = self.pretty_print_type(parameter_type, substitution_context);
+        let got = self.pretty_print_type(argument_type, substitution_context);
+        let plain = format!("Expected {expected}, but got {got} instead.");
+        let Type::Trait(trait_id, _) = parameter_type else {
+            return (plain, None);
+        };
+        // Steer only when the value really does implement the trait. When it
+        // does not, the author's mistake is plausibly the missing impl, and
+        // naming the type it failed to match is the more useful report.
+        if !self.type_implements_trait(argument_type, *trait_id) {
+            return (plain, None);
+        }
+        let trait_name = self
+            .traits
+            .get(trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or("trait");
+        // The fix belongs at the DECLARATION, which may be in another file.
+        let note = self
+            .span_map
+            .get(&parameter_id)
+            .map(|span| crate::error::Note {
+                span: **span,
+                msg: format!("'{parameter_name}' is declared with the trait as its type"),
+                source: self.source_of_id(parameter_id),
+            });
+        (
+            format!(
+                "parameter '{parameter_name}' has bare trait type '{trait_name}': a trait is \
+                 not a value type (vilan has no trait objects), so it cannot accept {got}. \
+                 Declare a generic parameter bounded by the trait instead — `<T: \
+                 {trait_name}>` with '{parameter_name}: T'."
+            ),
+            note,
+        )
+    }
+
+    /// The "not callable" message for a call subject that isn't one.
+    ///
+    /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
+    /// reads as a compiler mistake: the thing is spelled `fun` and the user just
+    /// called it. What is actually missing is a VALUE FORM — only the coercible
+    /// set (`fn-coercion.md` §1, `spec/types.md` §5.8) has one, and a binding can
+    /// hold and call exactly those. So name the disqualifying property and the
+    /// fix the docs already promise ("write the small wrapping closure. The
+    /// compiler will tell you when you hit one").
+    fn not_callable_message(&self, subject_type: &Type) -> String {
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let base = format!("cannot call this as a function: it is {rendered}");
+        let Type::Function(function_id) = subject_type else {
+            return base;
+        };
+        let Some(function) = self.functions.get(function_id) else {
+            // Not in `functions` at all: an `external fun`, whose binding forms
+            // are call-shaped (a dotted global loses its `this` when detached).
+            return match self.external_functions.get(function_id) {
+                Some(external) => format!(
+                    "{base}; an `external` function has no value form — call \
+                     '{}' directly, or wrap it in a closure",
+                    external.name
+                ),
+                None => base,
+            };
+        };
+        let reason = if !function.generic_parameter_constraint_ids.is_empty() {
+            "a generic function has no single value — which instantiation is meant \
+             would have to be chosen where the value is bound, not where it is called"
+        } else if function.is_async {
+            "an `async` function has no value form — a call through a value is not \
+             awaited, so the call would hand back an unawaited promise"
+        } else if function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))
+            .is_some_and(|parameter| parameter.name == "self")
+        {
+            "a method has no value form — one would have to capture a receiver"
+        } else {
+            return base;
+        };
+        format!(
+            "{base}; {reason}. Call '{}' directly, or wrap it in a closure",
+            function.name
+        )
+    }
+
+    /// A callable's parameters and own generics, by declaration id. One id
+    /// space serves plain and `external` functions, and a call resolves the
+    /// same way through either — whether it names the declaration
+    /// (`helper(1)`) or reaches it through a function-typed value
+    /// (`let f = helper; f(1)`).
+    fn callable_signature(&self, function_id: Id) -> Option<(Vec<Id>, Vec<TypeId>)> {
+        self.functions
+            .get(&function_id)
+            .map(|function| {
+                (
+                    function.parameters.clone(),
+                    function.generic_parameter_constraint_ids.clone(),
+                )
+            })
+            .or_else(|| {
+                self.external_functions.get(&function_id).map(|external| {
+                    (
+                        external.parameters.clone(),
+                        external.generic_parameter_constraint_ids.clone(),
+                    )
+                })
+            })
+    }
+
     fn wire_call(
         &mut self,
         call_id: Id,
@@ -20115,24 +20265,40 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Resolved;
                 }
                 let function_data = match &target {
-                    Expr::Function(function_id) => {
-                        self.functions.get(function_id).map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        })
+                    Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
+                        self.callable_signature(*function_id)
                     }
-                    Expr::ExternalFunction(external_function_id) => self
-                        .external_functions
-                        .get(external_function_id)
-                        .map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        }),
-                    _ => None,
+                    // A binding that HOLDS a function (`let f = helper; f(1)` —
+                    // B75). The target is the binding, not the declaration, so
+                    // the arm above finds nothing; the subject's TYPE names the
+                    // function it holds. `fn-coercion.md` §4 already promised
+                    // this ("calling such a binding works as before") — it never
+                    // did, because nothing taught the call operator to read the
+                    // type. Resolving through the declaration is what keeps it a
+                    // call rather than a second, weaker calling convention:
+                    // arity, spread collection and the argument check all come
+                    // from the one path below.
+                    //
+                    // Eligibility is B20's, deliberately: ONE predicate decides
+                    // whether a `fun` is a value at all (`fn-coercion.md` §1), so
+                    // the coercion and the call can never disagree about which
+                    // functions those are. Each exclusion is load-bearing here,
+                    // not inherited ceremony — a generic `fun` has no single
+                    // value to call (the binding, not the call, would have to
+                    // monomorphize, and the emitted reference names a function
+                    // that specialization never produced), and an `async` one
+                    // would hand back an unawaited promise, since a call through
+                    // a value is not awaited (§1 rule 4, the J2 gap). Both keep
+                    // today's error, as do `external` and `self` methods (§1
+                    // rules 1 and 3, both deferred there with their own reasons).
+                    _ => match &subject_type {
+                        Type::Function(function_id)
+                            if self.coercible_function_signature(*function_id).is_some() =>
+                        {
+                            self.callable_signature(*function_id)
+                        }
+                        _ => None,
+                    },
                 };
 
                 if let Some((parameters, generic_parameter_constraint_ids)) = function_data {
@@ -20184,6 +20350,7 @@ impl<'src> Analyzer<'src> {
                     }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
+                        let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
                         let argument_type =
@@ -20227,14 +20394,17 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                             None => {
-                                let expected =
-                                    self.pretty_print_type(&parameter_type, &substitution_context);
-                                let got =
-                                    self.pretty_print_type(&argument_type, &substitution_context);
+                                let (msg, note) = self.argument_mismatch(
+                                    parameter_name,
+                                    *parameter_id,
+                                    &parameter_type,
+                                    &argument_type,
+                                    &substitution_context,
+                                );
                                 self.diagnostics.push(Error {
-                                    note: None,
+                                    note,
                                     span: **self.span_map.get(&argument_id).unwrap(),
-                                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                                    msg,
                                 });
                             }
                         }
@@ -20288,8 +20458,7 @@ impl<'src> Analyzer<'src> {
                     let non_function_message = {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                        let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-                        format!("cannot call this as a function: it is {rendered}")
+                        self.not_callable_message(&subject_type)
                     };
                     self.diagnostics.push(Error { note: None,
                         // The SUBJECT is what isn't callable (A1).
@@ -20320,12 +20489,12 @@ impl<'src> Analyzer<'src> {
             }
             _ => {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+                let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot call this as a function: it is {rendered}"),
+                    msg,
                 });
                 Resolution::Failed
             }
