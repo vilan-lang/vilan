@@ -327,13 +327,19 @@ asks `is_capture_subject_place`, which is `is_place_expr` plus `Dereference`.
 rule 3 (`assignment_target_is_view` — a forwarded view stays the same view, on
 purpose), a different question from the one a pattern subject asks.
 
+This half reaches past the alias path, because the capture pass gates
+`Expr::Destructure` on the same predicate: `let (xs, n) = *view` never copied
+either, and growing the element through the view grew the capture. Nothing to
+do with reading late — plain aliasing, §1's original bug, surviving in the one
+spelling the predicate could not see.
+
 ### 6.5 Pins, goldens, and what is left open
 
-Twelve pins in `inference.rs`, covering the value / List / resource payloads,
-nested patterns, guarded legs, unguarded `match`, both write orders, `&mut
-self`, a `&mut` parameter, a `*view` local, the `mut`-parameter twin, the place
-twin, and the `&self` line. Non-vacuity by three plants: materialization out
-(8 red), the deref widening out (1 red), and the copy out (1 red, on the pin
+Thirteen pins in `inference.rs`, covering the value / List / resource payloads,
+nested patterns, guarded legs, unguarded `match`, a `let` destructure, both
+write orders, `&mut self`, a `&mut` parameter, a `*view` local, the
+`mut`-parameter twin, the place twin, and the `&self` line. Non-vacuity by three plants: materialization out
+(8 red), the deref widening out (2 red), and the copy out (1 red, on the pin
 that carries both shapes). The four that stay green under every plant are
 exactly the four that pin UNCHANGED behavior — the `mut`-parameter twin, the
 unguarded leg, the place-subject resource, and `&self`. `capture-clones.vl` gains `step`, `width` and

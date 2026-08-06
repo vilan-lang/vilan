@@ -3250,6 +3250,30 @@ fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
 }
 
 #[test]
+fn a_destructure_of_a_dereferenced_view_copies_its_captures() {
+    // The deref seam is not confined to the alias path — the capture pass
+    // gates `Expr::Destructure` on the same predicate, so `let (xs, n) =
+    // *view` collected no candidates either and B53's copy never fired. This
+    // one has nothing to do with reading late: `xs` simply aliased the
+    // subject's element, and growing it through the view grew the capture.
+    // Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            let view = &mut pair;
+            let (xs, n) = *view;
+            view.0.push(9);
+            print(xs.len());
+            print(n);
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
 fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
     // A guard puts the leg on the alias path too, so it carries the same hole
     // — and it is the ordering-sensitive one: `materialize_captures` runs
