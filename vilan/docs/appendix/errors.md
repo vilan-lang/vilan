@@ -78,11 +78,15 @@ demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is already defined for '…'; remove or rename this one"**
-Two impls declare the same method name for the same type, and neither
-name belongs to a trait. Nothing ranks them, so one of the two would
-simply never run — the note points at the other declaration. Delete the
-copy you don't want, or rename it. It is reported where it is defined,
-not where it is called.
+Two impls declare the same name for the same type, and neither name
+belongs to a trait. Nothing ranks them, so one of the two would simply
+never run — the note points at the other declaration. Delete the copy
+you don't want, or rename it. It is reported where it is defined, not
+where it is called.
+
+A type has one namespace, so **receiver position is not part of the
+name**: a static `fun new()` and a method `fun new(self)` for the same
+type collide with each other too. Give one of them a different name.
 → [Names, modules, and packages](../spec/names.md)
 
 **"'…' is ambiguous on '…': both '…' and '…' provide it; call '…' to pick one"**

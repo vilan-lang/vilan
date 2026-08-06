@@ -3478,12 +3478,22 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Duplicate inherent members (B57, `proposal/method-resolution.md` §3/§4):
-    /// two impls that declare the same method name for the same subject, with
-    /// neither name belonging to a trait, leave one of the two declarations
-    /// dead — and which one dies is decided by the order the modules happened
-    /// to load in. Precedence cannot rank them (they are both the type's own),
-    /// so this is a definition-site error, like Rust's E0592: it does not wait
-    /// for a call site to observe it.
+    /// two impls that declare the same name for the same subject, with neither
+    /// name belonging to a trait, leave one of the two declarations dead — and
+    /// which one dies is decided by the order the modules happened to load in.
+    /// Precedence cannot rank them (they are both the type's own), so this is a
+    /// definition-site error, like Rust's E0592: it does not wait for a call
+    /// site to observe it.
+    ///
+    /// **Receiver position is not part of the identity (B74).** An impl's
+    /// `declarations` is one map keyed by name, so a subject has ONE surface: a
+    /// static `fun new()` and a method `fun new(self)` cannot both be reached,
+    /// and today the static is the one that dies — `Bag::new()` resolves the
+    /// inherent method first and then fails on arity, which is a confusing
+    /// report of a declaration that was never reachable. So every inherent
+    /// declaration competes, whatever its receiver. The original check filtered
+    /// `is_self_method` for B57's scope; that filter was doing double duty as
+    /// "methods only" and "same namespace only", and only the first was meant.
     ///
     /// A definition-site check, so it joins the family that skips frozen std
     /// entities (S1): a duplicate whose second declaration is std's own is
@@ -3505,16 +3515,19 @@ impl<'src> Analyzer<'src> {
             }
             // Only inherent declarations compete. A trait's member is RANKED
             // against the type's own, not duplicated (§3), and a `[trait_only]`
-            // one never reaches the type's surface at all.
+            // one never reaches the type's surface at all. Both tests read the
+            // trait's declaration map directly, so they home a trait's STATIC
+            // (`Default::default`, `Wire::rebuild`) exactly as they home a
+            // method — which is what keeps two impls of one trait from
+            // colliding here now that statics compete.
             let mut inherent: Vec<(Id, TypeId)> = implementation_indices
                 .iter()
                 .filter_map(|index| {
                     let implementation = &self.implementations[*index];
                     let member_id = *implementation.declarations.get(member_name)?;
-                    (self.is_self_method(member_id)
-                        && self
-                            .member_home_trait(implementation, member_name)
-                            .is_none()
+                    (self
+                        .member_home_trait(implementation, member_name)
+                        .is_none()
                         && !self.member_is_trait_only(implementation, member_name))
                     .then_some((member_id, implementation.subject))
                 })

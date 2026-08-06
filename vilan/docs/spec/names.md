@@ -116,6 +116,11 @@ variants, the static functions of the type's impls (those without `self`),
 and the type's own `self`-methods. Generic statics take their arguments at
 the path head: `List<str>::new()`.
 
+A type has **one** namespace, and receiver position is not part of a
+name. Two impls of one type declaring the same name — two statics, two
+methods, or one of each — are a compile error at the declaration, since
+nothing ranks them and one would simply never be reachable.
+
 `value.member` resolves against the value's type: fields first, then
 methods, by a **precedence rule** — not by the order the impl blocks
 happen to be written or the modules happen to load:

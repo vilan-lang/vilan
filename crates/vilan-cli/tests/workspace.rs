@@ -494,6 +494,49 @@ fn a_parse_error_inside_a_package_module_fails_the_build_loudly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// B74: a duplicate inherent STATIC across two modules. The cross-file half of
+// the diagnostic — the `by module '…'` clause and the note that carries its own
+// source — needs two files to be observable at all, so it lives here rather
+// than beside the single-source pins in `inference.rs`. This is also the shape
+// the hazard actually takes in the wild: nobody writes two colliding `new`s on
+// one screen, they write one in each of two modules and never see that one is
+// dead.
+#[test]
+fn a_duplicate_static_across_modules_names_the_other_module() {
+    let dir = temp_project("duplicate-static");
+    write(dir.as_path(), "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        dir.as_path(),
+        "src/shape.vl",
+        "struct Bag { n: i32 }\n\nimpl Bag {\n\tfun new(): Bag { Bag { n = 1 } }\n}\n",
+    );
+    write(
+        dir.as_path(),
+        "src/main.vl",
+        "import pkg::shape::Bag;\n\nimpl Bag {\n\tfun new(): Bag { Bag { n = 2 } }\n}\n\n\
+         fun main() { let bag = Bag::new(); }\n",
+    );
+    let build = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(
+        !build.status.success(),
+        "two impls declaring `new` for one subject must not build"
+    );
+    let output = combined(&build);
+    assert!(
+        output.contains("'new' is already defined for 'Bag'"),
+        "the duplicate should be reported: {output}"
+    );
+    assert!(
+        output.contains("by module 'shape'"),
+        "the message should say which module holds the other one: {output}"
+    );
+    assert!(
+        output.contains("'new' is already defined here"),
+        "the note should point at the first declaration: {output}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Block-scoped imports (backlog H2), the multi-package path: a dependency and a
 // `pkg::` sibling referenced ONLY inside function bodies must still seed the
 // loader's reachable set — `collect_module_refs` finds references at any depth.

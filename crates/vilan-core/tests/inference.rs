@@ -40525,6 +40525,212 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     );
 }
 
+// --- B74: the duplicate check reaches statics (method-resolution.md §9) -----
+//
+// B57's duplicate-inherent check filtered `is_self_method`, per its own scope,
+// so two impls declaring the same `fun new()` for one subject stayed a silent
+// pick — the same dead-declaration hazard one receiver position away. An impl's
+// `declarations` is ONE map keyed by name, so receiver position was never part
+// of a member's identity; the filter was doing double duty as "methods only"
+// and "same namespace only", and only the first was meant. The sweep that ran
+// before this landed found ZERO live collisions across std, the corpus, every
+// example and every compiled docs fence — the entire blast radius is the shapes
+// pinned here.
+
+#[test]
+fn b74_two_static_declarations_of_one_name_are_an_error() {
+    // The filed shape. Before this, `Bag::new()` silently took the first.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::new(); }
+        "#,
+        "new",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_the_duplicate_static_error_notes_the_first_declaration() {
+    // The same cross-file-capable note B57 ships for methods (§9(4)): the
+    // second declaration is the anchor, the first gets the note.
+    assert_fails_noting(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 1 } } }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::spawn_here(); }
+        "#,
+        "is already defined for 'Bag'",
+        "spawn_here",
+        "is already defined here",
+    );
+}
+
+#[test]
+fn b74_a_static_and_a_method_of_one_name_collide() {
+    // The truth about namespaces, pinned: there is only ONE. `declarations` is
+    // keyed by name alone, and the static is the declaration that dies —
+    // `Bag::tag()` resolves the inherent METHOD first and then fails on arity
+    // ("Expected 1 argument, but got 0"), a report of a declaration that was
+    // never reachable by either call form. So they collide, and the error lands
+    // where the fix does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun tag(): str { "static" } }
+        impl Bag { fun tag(self): str { "method" } }
+        fun main() { let bag = Bag { n = 1 }; }
+        "#,
+        "tag",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_an_extra_static_in_a_trait_impl_block_counts_as_inherent() {
+    // §9(2): "inherent" is a property of the MEMBER. A static written inside a
+    // `with`-clause block that the trait does not declare is the type's own,
+    // and collides with a plain inherent block's same name — the static twin of
+    // `b57_an_extra_method_in_a_trait_impl_block_counts_as_inherent`.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        impl Bag with Marker {
+            fun mark(self): str { "m" }
+            fun make(): Bag { Bag { n = 1 } }
+        }
+        impl Bag { fun make(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::make(); }
+        "#,
+        "make",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
+    // The load-bearing negative, and the reason the widening is a filter change
+    // rather than a filter deletion. A trait's STATIC is homed by its trait, so
+    // it never enters the inherent tier: one inherent declaration is left, and
+    // one does not collide. `member_home_trait` reads the trait's declaration
+    // map directly with no receiver filter, which is what makes it home a
+    // static as readily as a method.
+    //
+    // Proven load-bearing against the tree, not by argument: with the homing
+    // guard removed, `vilan/std/src/time.vl`'s inherent `Duration::describe`
+    // collides with the `Wire` trait's `describe` and the corpus goes red.
+    //
+    // NOTE, deliberately not pinned here: `Bag::default()` on this program
+    // resolves to the TRAIT's static (7), not the inherent one — the static
+    // accessor path never got B57's tiering (method-resolution.md §S2's
+    // residue; it is still a `find_map` in impl-registration order). That is a
+    // resolution bug, separate from this duplicate check, so this pin asserts
+    // only what B74 claims: these two are not a duplicate.
+    assert_compiles(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag with Default {
+            fun default(): Bag { Bag { n = 7 } }
+        }
+
+        impl Bag {
+            fun default(): Bag { Bag { n = 1 } }
+        }
+
+        fun main() {
+            print(Bag::default().n);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b74_the_same_static_name_on_two_types_is_not_a_duplicate() {
+    // Subject compatibility still gates the pair: `new` on two distinct types
+    // is two declarations, not a duplicate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        struct Box { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Box { fun new(): Box { Box { n = 2 } } }
+        fun main() { print(Bag::new().n); print(Box::new().n); }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b74_a_duplicate_static_on_a_generic_subject_is_an_error() {
+    // Subjects are compared with `compare_type`, so an impl with `type` binders
+    // collides with its twin exactly as a concrete one does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        fun main() { let cell = Cell::of(1); }
+        "#,
+        "of",
+        1,
+        "is already defined for",
+    );
+}
+
+#[test]
+fn b74_three_static_declarations_produce_two_errors() {
+    // Each later declaration reports against the FIRST compatible one before
+    // it, so the count follows the declarations, not the pairs.
+    let source = r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        impl Bag { fun new(): Bag { Bag { n = 3 } } }
+        fun main() { let bag = Bag::new(); }
+        "#;
+    match compile(source) {
+        Ok(_) => panic!("expected two duplicate-static errors, but it compiled"),
+        Err(errors) => {
+            let duplicates = errors
+                .iter()
+                .filter(|error| error.contains("is already defined for 'Bag'"))
+                .count();
+            assert_eq!(duplicates, 2, "expected two duplicates; got: {errors:#?}");
+        }
+    }
+}
+
+#[test]
+fn b74_a_static_still_resolves_when_it_is_the_only_one() {
+    // The check must not disturb the ordinary path: one static, one home.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        impl Bag {
+            fun new(n: i32): Bag { Bag { n = n } }
+            fun tag(self): str { "bag" }
+        }
+        fun main() { let bag = Bag::new(4); print(bag.n); print(bag.tag()); }
+        main();
+        "#,
+        "4\nbag\n",
+    );
+}
+
 // --- I5: `Iterator::next` takes `&mut self` (proposal/iterator-adapters.md P1,
 // --- slice S1) --------------------------------------------------------------
 // The trait shipped declaring `fun next(self): Option<T>`, and B29's receiver-
