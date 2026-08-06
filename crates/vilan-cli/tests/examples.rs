@@ -150,6 +150,7 @@ fn post_build(directory: &str) -> PostBuild {
             ),
         },
         "browser" => PostBuild::Artifacts(&["client.js"]),
+        "canvas" => PostBuild::Artifacts(&["board.js"]),
         "reactive-ui" => PostBuild::Artifacts(&["app.js", "app.css"]),
         "router" => PostBuild::Artifacts(&["app.js"]),
         "todo" => PostBuild::Artifacts(&["dist/server.js", "dist/client.js", "dist/client.css"]),
