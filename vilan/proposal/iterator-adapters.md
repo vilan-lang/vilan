@@ -864,6 +864,19 @@ hiding a defect every future same-named pair would hit again.
    the first in a process and always serves the clean world, so a loop that
    does not clear the cache is vacuous.
 
+   **Fixed 2026-08-06 (B77).** The cause is not in the arc's territory at
+   all: a constraint id does not identify one declaring FILE. `impl
+   Subject<type T>` inherits the subject's constraint id on purpose
+   (`register_subject_binders`), so a user's `impl List<type T>` *is*
+   `list.vl`'s `T`. The residual-generic leak check collapsed that
+   many-to-one relation into a `HashMap<TypeId, SourceId>` with `.collect()`
+   — last write wins over a randomly-seeded hash iteration — so the recorded
+   declaring file flipped run to run, and half the time the entry won and
+   every `List<T>` inside `list.vl` read as foreign. The check now keeps the
+   SET of declaring files and asks whether the binding's own file is among
+   them. The arc's contribution was reachability: `impl List<type T>` is a
+   natural thing to write only once `List` has an iterator worth extending.
+
 2. **The protocol loop drops a tuple element's type when the iterator's
    element IS its own generic parameter.** `for pair in [(1, "a")].iter()`
    gives "cannot access field '0' on type T", while the same iterator pulled

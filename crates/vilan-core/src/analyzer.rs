@@ -24534,16 +24534,31 @@ impl<'src> Analyzer<'src> {
         // binders); one declared in ANOTHER file (`Map::new`'s `K` reaching a
         // user binding) can never ground there. A generic with no recorded
         // declaration stays lenient.
-        let generic_declaration_sources: HashMap<TypeId, SourceId> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter_map(|(entity_id, expr)| match expr {
-                Expr::Generic(constraint_id) => self
-                    .source_of_id(*entity_id)
-                    .map(|source| (*constraint_id, source)),
-                _ => None,
-            })
-            .collect();
+        //
+        // One constraint id can be declared in SEVERAL files, so this is a
+        // set per constraint and not a single source (B77). An impl binder
+        // written `impl Subject<type T>` deliberately *inherits* the
+        // subject's own constraint id (`register_subject_binders`) so that
+        // the binder is identical to having written the subject's bound out
+        // — which makes a user's `impl List<type T>` share the exact id of
+        // `list.vl`'s `struct List<T>`. Collapsing that many-to-one relation
+        // into one source is not merely lossy, it is *unstable*: the winner
+        // was whichever entity a randomly-seeded `HashMap` iteration reached
+        // last, so a user's impl block un-froze std's own `List::map` on
+        // roughly half of otherwise identical cold compiles.
+        let mut generic_declaration_sources: HashMap<TypeId, Vec<SourceId>> = HashMap::new();
+        for (entity_id, expr) in &self.expr_id_to_expr_map {
+            if let Expr::Generic(constraint_id) = expr
+                && let Some(source) = self.source_of_id(*entity_id)
+            {
+                let declared_in = generic_declaration_sources
+                    .entry(*constraint_id)
+                    .or_default();
+                if !declared_in.contains(&source) {
+                    declared_in.push(source);
+                }
+            }
+        }
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -24572,10 +24587,16 @@ impl<'src> Analyzer<'src> {
             let Some(source) = self.source_of_id(variable_id) else {
                 continue;
             };
+            // A residual leaks when the parameter is declared somewhere and
+            // NOWHERE is this binding's own file: `Map::new`'s `K` reaching
+            // user code. If any declaration of it is in this file, the
+            // binding sits inside a scope that can still bind it and the
+            // residual is legitimate — which is order-independent, unlike
+            // asking which single file declared it.
             let leaked = residuals.iter().any(|residual| {
                 generic_declaration_sources
                     .get(residual)
-                    .is_some_and(|declared_in| *declared_in != source)
+                    .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
                 let name = self

@@ -40454,35 +40454,49 @@ fn list_iter_satisfies_an_iterator_bound() {
     );
 }
 
-// --- Found while building I3 S3: a user `impl List<type T>` makes std's own
-// --- `List` methods report, nondeterministically ------------------------------
+// --- B77: a user `impl List<type T>` made std's own `List` methods report,
+// --- nondeterministically (FIXED) ---------------------------------------------
+//
+// A constraint id does NOT identify one declaring file. `impl Subject<type T>`
+// deliberately inherits the SUBJECT's constraint id (`register_subject_binders`),
+// so a user's `impl List<type T>` is the same id as `list.vl`'s `struct List<T>`
+// — by design, so the binder means exactly what writing the subject's bound out
+// would mean. The residual-generic leak check collapsed that many-to-one
+// relation into a `HashMap<TypeId, SourceId>` via `.collect()`, i.e. last write
+// wins over a randomly-seeded `HashMap` iteration. Whichever entity came last
+// became "the" declaring file, so on ~half of cold compiles the user's file won
+// and every `List<T>` residual inside `list.vl` read as declared elsewhere. The
+// check now keeps the SET of declaring files and asks whether the binding's own
+// file is among them, which is the question the rule always meant to ask and is
+// order-independent.
 
-/// A user-declared `impl List<type T>` block makes the entry-scoped checks
-/// report against std's OWN `List::map` / `List::filter` bodies — "the type of
-/// 'result' is never fully determined" against `mut result = List::new()` in
-/// `list.vl` — on roughly half of otherwise identical compiles of the SAME
-/// source. Two things are wrong at once:
+/// A user-declared `impl List<type T>` block must not make the entry-scoped
+/// checks report against std's OWN `List::map` / `List::filter` bodies — "the
+/// type of 'result' is never fully determined" against `mut result =
+/// List::new()` in `list.vl`. Two things were wrong at once:
 ///
-/// 1. the diagnostic is **spurious**: `result` is fixed by the `result.push(..)`
+/// 1. the diagnostic was **spurious**: `result` is fixed by the `result.push(..)`
 ///    below it and by the declared return type, which is why the other half of
-///    the runs are clean; and
-/// 2. it points into **std**, whose definition-site diagnostics are meant to be
-///    frozen (`analysis-reuse.md` §6) — so a user's impl block is un-freezing
+///    the runs were clean; and
+/// 2. it pointed into **std**, whose definition-site diagnostics are meant to be
+///    frozen (`analysis-reuse.md` §6) — so a user's impl block was un-freezing
 ///    entities it does not own.
 ///
 /// The order-dependence is what makes it worth its own pin: a single compile
-/// proves nothing. It is also **cold-path only** — the base cache
-/// (`analysis-reuse.md` §6.10) serves every compile after the first in a
+/// proves nothing, so this counts. It is also **cold-path only** — the base
+/// cache (`analysis-reuse.md` §6.10) serves every compile after the first in a
 /// process, and a served world is always the clean one, which is why a naive
-/// loop passes 300/300 and proves nothing either. So each attempt clears the
-/// cache first. Measured that way it fails roughly half the time, here and on
-/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predates this arc;
-/// `#[ignore]`d until the cause is found.
+/// loop passed 300/300 and proved nothing either. So each attempt clears the
+/// cache first. Measured that way it failed roughly half the time, here and on
+/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predated the I3 arc
+/// that found it. It is 30/30 clean now, and goes red at ~15/30 if the leak
+/// check is put back on a single declaring source.
 ///
-/// `base_cache_clear` is process-global, which is a second reason this stays
-/// ignored rather than joining the suite.
+/// `base_cache_clear` is process-global. Under nextest each test is its own
+/// process; under plain `cargo test` the worst it does to a concurrent test is
+/// cost it a cold analysis, since the base cache is a reuse cache and no answer
+/// may depend on a hit.
 #[test]
-#[ignore]
 fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
     let source = r#"
         import std::print;
@@ -40497,10 +40511,87 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
             print([1, 2, 3].second_len());
         }
         "#;
-    for attempt in 0..20 {
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
         vilan_core::analyzer::base_cache_clear();
         if let Err(errors) = compile(source) {
-            panic!("attempt {attempt} reported against std: {errors:#?}");
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles reported against std; the first said: {first_report:#?}"
+    );
+}
+
+/// The other half of B77's rule, and the guard that the fix is not a
+/// suppression: sharing a constraint id across files makes a residual legal in
+/// EVERY file that declares it, not in none of them. The user's own impl body
+/// binds `T`, so a `List<T>` binding inside it is as legitimate as the identical
+/// binding inside `list.vl` — and both must stay clean on the same cold compile.
+/// This went red on ~half of cold attempts before the fix, in the runs where
+/// `list.vl` rather than the entry won the collapse.
+#[test]
+fn a_generic_residual_is_legal_in_every_file_that_declares_its_parameter() {
+    let source = r#"
+        import std::print;
+
+        impl List<type T> {
+            fun doubled(self): List<T> {
+                mut copy = List::new();
+                for item in self {
+                    copy.push(item);
+                    copy.push(item);
+                }
+                copy
+            }
+        }
+
+        fun main() {
+            print([1, 2].doubled().len());
+        }
+        "#;
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
+        vilan_core::analyzer::base_cache_clear();
+        if let Err(errors) = compile(source) {
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles rejected a legitimate residual; \
+         the first said: {first_report:#?}"
+    );
+}
+
+/// B77's fix must not soften the B16 rule it lives inside: a parameter declared
+/// ONLY in another file still leaks. `Map::new`'s `K`/`V` are declared in
+/// `map.vl` and nowhere in the entry, so the set never contains the entry and
+/// the annotate steer still lands — on the cold path, where B77 lived.
+#[test]
+fn a_leaked_generic_still_reports_on_the_cold_path() {
+    let source = r#"
+        import std::map::Map;
+        fun main() {
+            mut table = Map::new();
+            table.insert("k", 1);
+        }
+        "#;
+    for attempt in 0..5 {
+        vilan_core::analyzer::base_cache_clear();
+        match compile(source) {
+            Ok(_) => panic!("attempt {attempt}: the leaked `Map::new` residual went unreported"),
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("never fully determined")),
+                "attempt {attempt}: wrong diagnostic: {errors:#?}"
+            ),
         }
     }
 }

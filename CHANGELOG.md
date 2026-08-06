@@ -6,6 +6,14 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Writing `impl List<type T>` in your own file no longer makes the compiler complain about std's `List`.** Roughly half the time — the same file, the same compiler, a different answer per run — a user impl block on a std container produced "the type of 'result' is never fully determined", pointing at a `mut result = List::new()` line inside `list.vl` that you did not write and cannot annotate. The other half of the runs were clean, which is the tell: the diagnostic was never about your program.
+
+The residual-generic check asks whether a binding's leftover type parameter is declared in the binding's own file — legitimate inside a generic function's body, a real leak when it is some callee's parameter arriving from elsewhere. It answered that by recording one declaring file per parameter. But a parameter can honestly be declared in several: `impl Subject<type T>` deliberately *inherits* the subject type's own parameter identity, so that writing the binder means exactly what writing the subject's bound out means — and your `impl List<type T>` therefore **is** `list.vl`'s `T`. Recording one file for it collapsed a set into a coin flip, and the coin was a randomly seeded hash table's iteration order, so which file "declared" `T` changed run to run. When your file won, every `List<T>` inside `list.vl` read as a foreign leak.
+
+The check now keeps the set of declaring files and asks whether the binding's own file is among them, which is the question the rule always meant to ask and does not depend on iteration order. The leak it exists to catch is untouched — an unannotated `Map::new()` or `Set::new()` still requires its annotation, including in a file that also writes `impl Map<type K, type V>`, because a static's own parameters are not the struct's. Only the first compile in a process could ever show this: every later one is served from the reuse cache, which always held the clean world. Pinned at 30 cold compiles with the cache cleared per attempt, in both directions.
+
 ## v0.30.0 — 2026-08-06
 
 **Which method a `value.method()` call runs is now a rule, not an accident of where you typed the impl block.** Resolution scanned every impl of the receiver's type and took the first hit, in registration order — so an inherent method and a trait's could swap places by moving two blocks in one file, or by renaming a module so it sorted differently, with exit 0 both times and nothing said. The rule now: an **inherent** method — one declared by an impl of the type whose `with` clause does not declare that name — always beats a trait's, whatever the text order and whichever module loaded first. Otherwise the method a trait provides, whether the impl declares it or inherits the trait's default.
