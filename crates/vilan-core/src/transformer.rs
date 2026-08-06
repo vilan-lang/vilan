@@ -2650,9 +2650,18 @@ impl<'src> Transformer<'src> {
             Expr::Generic(_) => {
                 return None;
             }
-            Expr::Function(id) => {
-                let function = self.program.functions.get(id).unwrap();
-                self.function(function)
+            // A `fun` DECLARATION, like the `struct`/`enum`/`trait`/`impl`
+            // declarations above it — including one nested in another function's
+            // body, which is the only way a `fun` reaches this walk. Emission is
+            // demand-driven from the roots: a call to it (or a reference to it
+            // as a value, through `Expr::Local` below) emits it once, at module
+            // level, keyed on its id. Emitting the body here too produced the
+            // same function TWICE (B71) — nested and hoisted, identical bodies,
+            // the inner shadowing the outer. A `fun` captures nothing, so where
+            // it is written is a scoping question the name generator already
+            // answers and not an emission one.
+            Expr::Function(_) => {
+                return None;
             }
             // An enum value is an array whose first element identifies the
             // variant; a bare (data-less) variant is just `[index]`. `bool` is
@@ -6153,13 +6162,37 @@ impl<'src> Transformer<'src> {
     /// flat array whose slots splice into a constructed tuple. A tuple literal is
     /// recognized structurally (its own id carries no stored type); anything else
     /// is decided by its resolved type.
+    ///
+    /// B70 (variadic-generics.md §T.8): the general cache answers only for the
+    /// forms that *store* a type. An element written as a call, an `if`, a
+    /// block, an `await`, a method call, a `*view` or a plain parameter is typed
+    /// on demand and stored nowhere, so this read came back silent and the
+    /// element nested instead of splicing — flat storage broken, every read past
+    /// it `undefined`. `tuple_element_types` is the type the tuple rule computed
+    /// for that very element and it covers every form; it is consulted second so
+    /// an expression that already answered keeps its answer byte for byte.
+    ///
+    /// The element entry is read UNRESOLVED, unlike the general one. The
+    /// analyzer bakes a `.n` read's flat offset into the AST from
+    /// `tuple_flat_width`, which counts a still-generic element as one slot
+    /// because a generic body is walked once for every instantiation — so
+    /// splicing one would move every offset past it. Reading the entry as
+    /// written keeps emission and those offsets on the same layout.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
             return true;
         }
-        self.expr_type_id(expr_id)
-            .map(|type_id| self.resolve_type_id(type_id))
-            .and_then(|type_id| self.program.type_id_to_type_map.get(&type_id))
+        if let Some(type_id) = self.expr_type_id(expr_id) {
+            return self
+                .program
+                .type_id_to_type_map
+                .get(&self.resolve_type_id(type_id))
+                .is_some_and(|type_| matches!(type_, Type::Tuple(_)));
+        }
+        self.program
+            .tuple_element_types
+            .get(&expr_id)
+            .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
@@ -7481,19 +7514,20 @@ fn allocate_scope(
     let mut holder = holder.clone();
     for old in &scope.declarations {
         // One generated name is one binding, even where the emitter writes that
-        // binding out more than once — every instance of a monomorphized generic
-        // repeats its body's names, and a free `fun` nested in a member body is
-        // emitted both nested AND at module level. The rename map is keyed by
-        // NAME, so all of a binding's emission sites must land on one answer:
-        // take the allocation already made rather than minting a second,
-        // disagreeing one, which would rewrite the earlier site to a name chosen
-        // against a scope it is not in.
+        // binding out more than once: every instance of a monomorphized generic
+        // repeats its body's names. The rename map is keyed by NAME, so all of a
+        // binding's emission sites must land on one answer: take the allocation
+        // already made rather than minting a second, disagreeing one, which
+        // would rewrite the earlier site to a name chosen against a scope it is
+        // not in. (This branch also covered a nested free `fun`, which was
+        // emitted both nested and at module level until B71 stopped the item
+        // walk visiting it twice. The generic instances keep it live.)
         if let Some(allocated) = rename.get(old).cloned() {
-            // Meeting the name again is expected when the binding meets ITSELF:
-            // the nested copy of a hoisted `fun` shadows the module-level one,
-            // and the two are the same function. Two DIFFERENT bindings under
-            // one name is the collision this pass exists to prevent, and there
-            // is no name a name-keyed rename could give them both.
+            // Meeting the name again is expected when the binding meets ITSELF —
+            // two instances of one generic body are the same bindings written
+            // twice. Two DIFFERENT bindings under one name is the collision this
+            // pass exists to prevent, and there is no name a name-keyed rename
+            // could give them both.
             debug_assert!(
                 !used.contains(&allocated)
                     || holder.get(&allocated).map(String::as_str) == Some(old.as_str()),

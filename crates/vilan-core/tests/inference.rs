@@ -25225,8 +25225,9 @@ fn a_concatenation_destructures() {
 }
 
 /// §T.5 — the splice comes from the MARK, so an operand whose expression caches
-/// no type of its own (a call, an `if`) still splices. The nested tuple form
-/// does not, and that PRE-EXISTING bug is pinned below.
+/// no type of its own (a call, an `if`) still splices. This form was immune to
+/// the §T.8 bug the nested form had, and stays immune now that the nested form
+/// is fixed: it asks for no type lookup at all.
 #[test]
 fn a_spread_of_a_call_result_still_splices() {
     assert_compiles_and_runs(
@@ -25423,16 +25424,21 @@ fn three_dots_in_a_value_position_steers_to_two() {
     );
 }
 
-/// §T.8 — a PRE-EXISTING bug, in the TUPLE form and not the spread: a
-/// tuple-typed element whose expression caches no type of its own loses its
-/// splice, so the construction silently nests and the read past it (at the flat
-/// offset the type says) is `undefined`. Reproduces on the released v0.28.0
-/// binary; needs no `..`. Un-ignore when the type cache covers every
-/// expression. The spread form is NOT affected — `a_spread_of_a_call_result_
-/// still_splices` above is the same program with a `..`, and it passes — which
-/// is why §T.5 drives the spread's splice from the mark.
+// --- B70 (§T.8): a tuple element splices by its TYPE, whatever FORM it is
+// --- written in. The splice test read the general type cache, which stores a
+// --- type only where one is *produced* — a binding, a literal, a projection, a
+// --- match — so an element typed on demand (a call, an `if`, a block, an
+// --- `await`, a `*view`, a bare parameter) read as untyped, nested instead of
+// --- splicing, and every read past it came back `undefined`. The tuple rule
+// --- now keeps the type it computes per element, so the coverage is by form
+// --- and not by accident. One pin per form.
+
+/// §T.8 — the filed repro, and the bug's root form. Was `#[ignore]`d;
+/// reproduced on the released v0.28.0 binary and needs no `..`. The spread form
+/// was never affected — `a_spread_of_a_call_result_still_splices` above is the
+/// same program with a `..` — which is why §T.5 drives the spread's splice from
+/// the mark.
 #[test]
-#[ignore = "pre-existing: a call-valued tuple element loses its splice (§T.8)"]
 fn a_nested_tuple_element_that_is_a_call_should_still_splice() {
     assert_compiles_and_runs(
         r#"
@@ -25446,6 +25452,639 @@ fn a_nested_tuple_element_that_is_a_call_should_still_splice() {
         }
         "#,
         "6\n",
+    );
+}
+
+/// §T.8 — the other form the filed entry names. An `if` is an expression here,
+/// and its value is the tuple its taken leg produced.
+#[test]
+fn a_nested_tuple_element_that_is_a_conditional_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pick = true;
+            let n = (if pick { (4, 5) } else { (7, 8) }, 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — an `else if` chain is a nested `ExprIfBranch`, so the type is reached
+/// through one more level than the two-leg form above.
+#[test]
+fn a_nested_tuple_element_that_is_an_else_if_chain_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let k = 2;
+            let n = (if k == 1 { (4, 5) } else if k == 2 { (7, 8) } else { (9, 9) }, 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — a block's value is its trailing expression, and the block itself
+/// stores no type.
+#[test]
+fn a_nested_tuple_element_that_is_a_block_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let n = ({ let inner = (4, 5); inner }, 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — a method call. Its own dispatch is a different path from a free
+/// call's, and it stored no type either.
+#[test]
+fn a_nested_tuple_element_that_is_a_method_call_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Maker { seed: i32 }
+        impl Maker {
+            fun pair(self): (i32, i32) { (4, 5) }
+        }
+        fun main() {
+            let maker = Maker { seed = 1 };
+            let n = (maker.pair(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — an associated (static) call, reached through the type rather than a
+/// receiver.
+#[test]
+fn a_nested_tuple_element_that_is_a_static_call_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Maker { seed: i32 }
+        impl Maker {
+            fun pair(): (i32, i32) { (4, 5) }
+        }
+        fun main() {
+            let n = (Maker::pair(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — calling a CLOSURE-typed value: the callee is a binding, not a
+/// function entity, so the return type comes from the closure type.
+#[test]
+fn a_nested_tuple_element_that_is_a_closure_call_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let make = || (4, 5);
+            let n = (make(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — an `await`: the element's type is the awaited call's, unwrapped, and
+/// the `await` node stores nothing of its own.
+#[test]
+fn a_nested_tuple_element_that_is_an_await_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        async fun make(): (i32, i32) {
+            (4, 5)
+        }
+        async fun main() {
+            let n = (await make(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — a read through a view. `*view` is a place expression whose type is
+/// the pointee's, and it stored none.
+#[test]
+fn a_nested_tuple_element_that_is_a_dereference_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            let pair = (4, 5);
+            let view = &pair;
+            let n = (*view, 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — a bare PARAMETER. Its type lives on the parameter binding, and the
+/// general cache's place fallback resolves a variable but not a parameter, so
+/// this form read as untyped too. The one form that is a plain name and still
+/// lost its splice.
+#[test]
+fn a_nested_tuple_element_that_is_a_parameter_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun wrap(pair: (i32, i32)): i32 {
+            let n = (pair, 6);
+            n.1
+        }
+        fun main() {
+            print(wrap((4, 5)));
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — a `const`-marked element. Its value is folded at compile time, and
+/// the folded result has to land in the same flat layout the type describes.
+#[test]
+fn a_nested_tuple_element_that_is_a_const_call_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (4, 5)
+        }
+        fun main() {
+            let n = (const make(), 6);
+            print(n.1);
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// §T.8 — the forms that already stored a type keep splicing: a `match`, a
+/// struct field, a list index, and a tuple projection. The fix consults the
+/// element table only where the general cache is silent, so these must still
+/// take the old path and answer the same.
+#[test]
+fn the_tuple_element_forms_that_already_stored_a_type_still_splice() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun main() {
+            let k = 1;
+            print((match k { 1 => (4, 5), _ => (7, 8) }, 6).1);
+            let holder = Holder { pair = (4, 5) };
+            print((holder.pair, 6).1);
+            let pairs = [(4, 5), (7, 8)];
+            print((pairs[0], 6).1);
+            let nested = ((4, 5), 9);
+            print((nested.0, 6).1);
+        }
+        "#,
+        "6\n6\n6\n6\n",
+    );
+}
+
+/// §T.8, mixed — one construction whose elements are a call, an `if`, a name and
+/// a scalar, read at every offset. The widths only line up if each element
+/// spliced or nested exactly as its own type says.
+#[test]
+fn a_construction_mixing_every_element_form_reads_at_every_offset() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (1, 2)
+        }
+        fun main() {
+            let named = (5, 6);
+            let n = (0, make(), if true { (3, 4) } else { (9, 9) }, named, 7);
+            print(n.0);
+            print(n.1.1);
+            print(n.2.0);
+            print(n.3.1);
+            print(n.4);
+        }
+        "#,
+        "0\n2\n3\n6\n7\n",
+    );
+}
+
+/// §T.8, nested — a call-valued element inside a construction that is ITSELF an
+/// element. The inner construction's own type carries the flat widths, so the
+/// outer offsets are only right if the inner splice happened.
+#[test]
+fn a_call_valued_element_of_a_nested_construction_splices() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (1, 2)
+        }
+        fun main() {
+            let n = ((make(), 3), 4);
+            print(n.0.0.1);
+            print(n.0.1);
+            print(n.1);
+        }
+        "#,
+        "2\n3\n4\n",
+    );
+}
+
+/// §T.8, the spread twin — a construction holding BOTH a `..` element and a
+/// call-valued one. The mark drives the first and the type drives the second;
+/// they have to agree on the same flat layout.
+#[test]
+fn a_construction_holding_a_spread_and_a_call_element_splices_both() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun make(): (i32, i32) {
+            (3, 4)
+        }
+        fun main() {
+            let head = (1, 2);
+            let n = (..head, make(), 5);
+            print(n.0);
+            print(n.1);
+            print(n.2.1);
+            print(n.3);
+        }
+        "#,
+        "1\n2\n4\n5\n",
+    );
+}
+
+/// §T.8, the generic boundary — an element whose type is still a generic
+/// parameter must NOT splice, even at an instantiation that binds it to a
+/// tuple. A generic body is walked once and emitted per instantiation, and the
+/// `.n` offsets baked into that single walk count a generic element as ONE slot
+/// (`tuple_flat_width`); splicing it per instantiation would move every offset
+/// past it. This is why the element table is read as written rather than
+/// resolved through the active monomorphization.
+#[test]
+fn a_generic_valued_tuple_element_stays_nested_so_its_offsets_hold() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun wrap<T>(value: T, tail: i32): i32 {
+            let n = (value, tail);
+            n.1
+        }
+        fun main() {
+            print(wrap((4, 5), 6));
+            print(wrap(9, 6));
+        }
+        "#,
+        "6\n6\n",
+    );
+}
+
+// --- B70 tail (§T.8): a tuple's ARITY is part of its type. `reconcile_type`'s
+// --- tuple arm zipped without a length check — unlike the array arm beside it,
+// --- which unifies only at the same length, and the closure arm, which unifies
+// --- only at the same parameter count — so it compared the common prefix and
+// --- called `(i32, str)` a match for `(i32, str, bool)`, yielding a 2-tuple
+// --- nobody wrote. Every position that reaches the reconciler accepted one
+// --- silently. One pin per position.
+
+/// §T.8 tail — an annotated binding. The plainest form: the write says three
+/// slots and the value has two, and it compiled clean.
+#[test]
+fn an_annotated_binding_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let t: (i32, str, bool) = (1, "x");
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — an argument against a declared parameter type.
+#[test]
+fn an_argument_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun need(t: (i32, str, bool)) {
+            print(t.0);
+        }
+        fun main() {
+            need((1, "x"));
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — a body reconciled against its declared return type.
+#[test]
+fn a_return_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun make(): (i32, str, bool) {
+            (1, "x")
+        }
+        fun main() {
+            print(make().0);
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — an assignment to an already-typed binding.
+#[test]
+fn an_assignment_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (1, 2);
+            t = (1, 2, 3);
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, i32), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — two `match` legs reconciled against each other.
+#[test]
+fn match_legs_reject_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let k = 1;
+            let t = match k { 1 => (1, 2), _ => (1, 2, 3) };
+            print(t.0);
+        }
+        "#,
+        "match legs have mismatched types",
+    );
+}
+
+/// §T.8 tail — a list literal's elements, unified against the first one's type.
+#[test]
+fn a_list_literal_rejects_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [(1, 2), (1, 2, 3)];
+            print(xs.len());
+        }
+        "#,
+        "Expected (i32, i32) (this literal's element type), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — one generic parameter bound from two arguments. The reconciler is
+/// what decides they are the same `T`, so a truncating zip made two different
+/// tuple types agree.
+#[test]
+fn one_generic_bound_from_two_arguments_rejects_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun pick<T>(a: T, b: T): T {
+            a
+        }
+        fun main() {
+            let t = pick((1, 2), (1, 2, 3));
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, i32), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — trait conformance (B29) compares through `compare_type_rigid`,
+/// whose tuple arm zipped the same way. An impl returning a tuple of a different
+/// arity than the trait declares was accepted.
+#[test]
+fn a_conformance_return_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        trait Pairs {
+            fun make(self): (i32, i32);
+        }
+        struct S { n: i32 }
+        impl S with Pairs {
+            fun make(self): (i32, i32, i32) { (1, 2, 3) }
+        }
+        fun main() {
+            let s = S { n = 1 };
+            print(s.make().0);
+        }
+        "#,
+        "`S`'s `make` returns `(i32, i32, i32)`, but `Pairs` declares `(i32, i32)`",
+    );
+}
+
+/// §T.8 tail — the same through a conformance PARAMETER position, which is the
+/// other `compare_type_rigid` call site.
+#[test]
+fn a_conformance_parameter_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        trait Takes {
+            fun take(self, p: (i32, i32)): i32;
+        }
+        struct S { n: i32 }
+        impl S with Takes {
+            fun take(self, p: (i32, i32, i32)): i32 { p.0 }
+        }
+        fun main() {
+            let s = S { n = 1 };
+            print(s.take((1, 2, 3)));
+        }
+        "#,
+        "parameter 1 of `S`'s `take` is `(i32, i32, i32)`, but `Takes` declares `(i32, i32)`",
+    );
+}
+
+/// §T.8 tail — the arity check must not cost the MATCHING case anything: same
+/// arity still unifies, still binds a generic element, and still runs.
+#[test]
+fn tuples_of_the_same_arity_still_reconcile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pick<T>(a: T, b: T): T {
+            b
+        }
+        fun main() {
+            let t: (i32, str) = (1, "x");
+            print(t.0);
+            let picked = pick((1, 2), (3, 4));
+            print(picked.1);
+        }
+        "#,
+        "1\n4\n",
+    );
+}
+
+// --- B71: a nested free `fun` is emitted ONCE. Emission is demand-driven from
+// --- the roots — a call emits the callee at module level, keyed on its id — but
+// --- the body walk ALSO emitted a `fun` declaration inline where it was
+// --- written, so a nested one came out twice with identical bodies, the inner
+// --- shadowing the outer. Harmless at runtime, which is why it went unseen; it
+// --- is dead output no reader of the JS can account for, and any change to
+// --- which copy a call resolves to would make it live. A count, not a run: the
+// --- duplicate is invisible to `assert_compiles_and_runs`.
+
+/// How many times `needle` appears in a clean compile's emitted JS.
+#[track_caller]
+fn emitted_occurrences(source: &str, needle: &str) -> usize {
+    match compile(source) {
+        Ok(js) => js.matches(needle).count(),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+/// B71 — the filed shape: a nested `fun` inside an IMPL METHOD's body.
+#[test]
+fn a_nested_fun_inside_an_impl_method_emits_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            struct S { n: i32 }
+            impl S {
+                fun run(self): i32 {
+                    fun helper(x: i32): i32 { x + 4242 }
+                    helper(self.n)
+                }
+            }
+            fun main() {
+                let s = S { n = 1 };
+                print(s.run());
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — the same in a plain function's body. The filed entry named the impl
+/// method; the double visit is the item walk's and has nothing to do with
+/// `impl`, so a free function's nested `fun` doubled identically.
+#[test]
+fn a_nested_fun_inside_a_free_function_emits_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun helper(x: i32): i32 { x + 4242 }
+                helper(n)
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — two nested `fun`s, one calling the other. Each emits once, and the
+/// inner call still resolves.
+#[test]
+fn two_nested_funs_each_emit_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun first(x: i32): i32 { x + 4242 }
+                fun second(x: i32): i32 { first(x) + 1 }
+                second(n)
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — an uncalled nested `fun` emits NOTHING, which is what demand-driven
+/// emission means and what the inline copy was quietly overriding: it was
+/// emitted for having been written, not for being reached.
+#[test]
+fn an_uncalled_nested_fun_emits_nothing() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun helper(x: i32): i32 { x + 4242 }
+                n
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        0,
+    );
+}
+
+/// B71 — a nested `fun` that SHADOWS a module-level one of the same name. Both
+/// emit, once each, under distinct generated names, and each call reaches the
+/// one its scope names.
+#[test]
+fn a_nested_fun_shadowing_a_module_level_one_keeps_both_calls_right() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun helper(x: i32): i32 { x + 100 }
+        fun run(n: i32): i32 {
+            fun helper(x: i32): i32 { x + 1 }
+            helper(n)
+        }
+        fun main() {
+            print(run(1));
+            print(helper(1));
+        }
+        "#,
+        "2\n101\n",
     );
 }
 

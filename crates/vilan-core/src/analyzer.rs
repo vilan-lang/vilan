@@ -1677,6 +1677,34 @@ pub struct Analyzer<'src> {
     prepped_type_static_accessors: Vec<(TypeId, TypeId, &'src str, Span)>,
     reference_count: HashMap<Id, u32>,
     resolved_types: HashMap<Id, TypeId>,
+    // B70 (`variadic-generics.md` §T.8): the type of every ELEMENT of a tuple
+    // construction, keyed by the element's expr id — the type the tuple rule
+    // computed for it, in context, and until now threw away.
+    //
+    // The two authoritative maps above store a type where one is *produced* —
+    // a binding, a literal, a field/index/tuple projection, a match — and
+    // nowhere else, because every other form is typed **on demand** and the
+    // answer discarded. So the cache is silent for a call, an `if`, a block, an
+    // `await`, a method call, a `*view`; the splice test read it to decide
+    // whether an element's value is a flat tuple array to splice, read silence
+    // as "not a tuple", and nested the element instead — §T.8's silent
+    // miscompile, where `(make(), 6).1` evaluates to `undefined`.
+    //
+    // Recorded HERE rather than by widening the general cache, for two reasons
+    // the alternatives proved: types are deliberately not interned
+    // (`type_id_for_type`), so a type re-derived anywhere else mints a fresh
+    // `TypeId` and misses every consumer keyed by type IDENTITY (the resource
+    // classification, drop glue, const evaluation); and re-running inference
+    // out of context computes a different type and reports diagnostics of its
+    // own (an unconstrained `["a", 0]` is not the `List<any>` its parameter
+    // made it). The tuple rule already has the right type and the id it put in
+    // the construction's own `Type::Tuple` — this keeps it instead of
+    // discarding it, so no inference re-runs and no id is minted.
+    //
+    // Covers every expression FORM by construction: the rule types each
+    // element whatever it is written as. A `..e` element has no entry and needs
+    // none — its splice is mark-driven (§T.5).
+    tuple_element_types: HashMap<Id, TypeId>,
     scope_id: u32,
     scopes: IndexMap<Id, Scope<'src>>,
     span_map: HashMap<Id, &'src Span>,
@@ -2121,6 +2149,7 @@ impl<'src> Analyzer<'src> {
             prepped_uses: Vec::new(),
             reference_count: HashMap::new(),
             resolved_types: HashMap::new(),
+            tuple_element_types: HashMap::new(),
             scope_id: 0,
             scopes: IndexMap::new(),
             span_map: HashMap::new(),
@@ -17860,7 +17889,32 @@ impl<'src> Analyzer<'src> {
                     if matches!(inferred, Type::Unresolved) {
                         return Type::Unresolved;
                     }
-                    items.push(inferred.get_type_id(self));
+                    let item_type_id = inferred.get_type_id(self);
+                    // B70 (§T.8): keep the element's type, don't just fold it
+                    // into the construction's. Emission has to know whether an
+                    // element's value is a flat tuple array (splice its slots)
+                    // or a single slot, and this is the one place the answer is
+                    // computed for EVERY form the element can take — a call, an
+                    // `if`, a block, an `await`, a `*view`, a parameter, none of
+                    // which store a type on their own id. Reading it back from
+                    // the general cache lost the splice for exactly those, and
+                    // the flat layout with it.
+                    //
+                    // Only the UNSUBSTITUTED walk records, so what lands here
+                    // is one well-defined thing rather than whichever inference
+                    // ran last. One expr id is one entry, but a generic body is
+                    // walked once and emitted per instantiation, so an element
+                    // typed under a substitution describes that instantiation
+                    // alone: `(key, value)` in `Map<K, V>::insert` is
+                    // `(str, (str, str))` under one and `(str, str)` under the
+                    // next. Recording the abstract type keeps this entry on the
+                    // same walk the `.n` offsets were baked from. A construction
+                    // only ever typed under a substitution records nothing and
+                    // keeps the old nesting, which is consistent either way.
+                    if substitution_context.is_empty() {
+                        self.tuple_element_types.insert(*id, item_type_id);
+                    }
+                    items.push(item_type_id);
                 }
                 Type::Tuple(items)
             }
@@ -18701,7 +18755,14 @@ impl<'src> Analyzer<'src> {
                 }
                 (a.clone(), bindings)
             }
-            (Type::Tuple(l_items), Type::Tuple(r_items)) => {
+            // Two tuples unify only at the SAME arity — the arity is part of the
+            // type, exactly as an array's length is (the arm below) and a
+            // closure's parameter count is. A mismatch falls through to the
+            // no-reconcile path, so `(i32, str)` and `(i32, str, bool)` are
+            // distinct. It used to zip, which silently truncated to the shorter
+            // side and yielded a 2-tuple for that pair — an arity the write
+            // never named (B70 tail, variadic-generics.md §T.8).
+            (Type::Tuple(l_items), Type::Tuple(r_items)) if l_items.len() == r_items.len() => {
                 let mut result_items = Vec::with_capacity(l_items.len());
                 let mut all_bindings = Vec::new();
                 for (l_item_id, r_item_id) in l_items.iter().zip(r_items.iter()) {
@@ -18928,15 +18989,19 @@ impl<'src> Analyzer<'src> {
             (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, _)) => {
                 self.type_implements_trait(a, *trait_id)
             }
+            // Arity first, like the closure arm below and like `reconcile_type`'s
+            // tuple arm: a bare `zip` compares the common prefix and calls
+            // `(i32, str)` compatible with `(i32, str, bool)`.
             (Type::Tuple(l_items), Type::Tuple(r_items)) => {
-                l_items
-                    .iter()
-                    .zip(r_items.iter())
-                    .all(|(l_item_id, r_item_id)| {
-                        let l = l_item_id.get_type(self);
-                        let r = r_item_id.get_type(self);
-                        self.compare_type_rigid(&l, &r, substitution_context, rigid)
-                    })
+                l_items.len() == r_items.len()
+                    && l_items
+                        .iter()
+                        .zip(r_items.iter())
+                        .all(|(l_item_id, r_item_id)| {
+                            let l = l_item_id.get_type(self);
+                            let r = r_item_id.get_type(self);
+                            self.compare_type_rigid(&l, &r, substitution_context, rigid)
+                        })
             }
             // Same nominal type: compatible when the arguments are (a side with
             // no arguments is an erased/abstract `List`/`Option`, compatible with
@@ -25414,6 +25479,14 @@ pub struct Program<'src> {
     // layout — which elements are themselves tuples (and so are spread, not nested)
     // — resolving any generic element through the active monomorphization.
     pub expr_type_ids: HashMap<Id, TypeId>,
+    /// B70 (variadic-generics.md §T.8): the type of every ELEMENT of a tuple
+    /// construction, as the tuple's type rule computed it — the coverage
+    /// `expr_type_ids` cannot give, because it holds a type only where one is
+    /// *produced* and an element written as a call, an `if`, a block, an
+    /// `await` or a `*view` is typed on demand and stored nowhere. Emission
+    /// consults it to decide the flat-storage splice; silence there nested the
+    /// element and made every read past it `undefined`.
+    pub tuple_element_types: HashMap<Id, TypeId>,
     /// Element expressions written as a tuple-value spread `..e`
     /// (variadic-generics.md §T). Such an element splices because it was
     /// WRITTEN as one — the type rule already proved its operand a tuple — so
@@ -29546,6 +29619,7 @@ fn analyze_over_world<'src>(
         expr_types,
         declaration_labels,
         expr_type_ids,
+        tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::new(),
