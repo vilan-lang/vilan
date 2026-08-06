@@ -3865,3 +3865,151 @@ the I3 proposal round) before any adapter layer can exist. Evidence:
 `iterator-adapters.md` (P1).
 [Ship notes: `next` takes `&mut self`; every conformer migrated; Range
 now carries `with Iterator<i32>` — the clause it existed to sidestep.]
+
+### Moved at the v0.31.0 cut (2026-08-06)
+
+#### A17. HTML canvas layer — DISSOLVED INTO GENERATED BINDINGS, CLOSED 2026-08-06
+
+(M; user request 2026-08-03) — `std::browser`
+has dom/ui/router/storage/dev and no canvas at all (verified: zero
+canvas hits under `vilan/std/src/`). The ask: a `std::browser::canvas`
+module — element acquisition through the `view` chain, a typed 2D
+context (paths, fills, strokes, text, images, transforms), and the
+resize/DPR story. Design questions to settle at take-up: immediate-mode
+calls vs a retained display list (the reactive model favors a
+`Signal`-driven redraw hook — an `effect` that repaints); whether the
+context is a `[platform(Browser)]` external struct over the host API
+(the fetch/ws precedent) or a drawn abstraction; and how a canvas
+subtree interacts with `swap`/disposal (A10). WebGL is explicitly out
+of scope for v1.
+[Ship notes: never implemented, and that is the victory. The owner
+deferred it 2026-08-04 behind one question — can bindgen chew the
+global TypeScript declarations? — and the answer came back yes twice:
+the v1 probe bound 99.8% of lib.dom's members, and v2's constructor
+idiom plus `--only` shipped `examples/canvas`: 345 generated lines,
+11/11 declarations, a real board drawing fills, arcs, text, and
+click-repaint through bindings nobody typed, with ONE hand-written
+entry-point extern (`document.getElementById` — a genuine global read,
+the language question E37 still carries). The tester's problem is
+solved "for good": a missing host API is now a bindgen invocation, not
+a std module. canvas.md's design stands as the record of what would
+have been built.]
+
+#### B72. a trait-typed parameter rejects a concrete implementing value — SHIPPED 2026-08-06 as the steer
+
+(M; found while wiring `Trait::member`) — `fun show(v: A): str` called
+with a `Bag` that implements `A` fails with "Expected A, but got Bag
+instead": the call path reconciles parameter-first, hitting
+`reconcile_type(Trait, Struct)`, and only the `(Struct|Enum, Trait)`
+arm exists. It is what forced B57's `Trait::member` disambiguation to
+re-wire through `wire_method_call`. Interacts with B4 — the fix must
+not accidentally widen trait-object semantics.
+[Ship notes: outcome (ii), decisively. The lane BUILT outcome (i) far
+enough to measure: the accepted value flows to a bounded generic, the
+monomorphizer has nothing to select, and B55's never-silent guard
+fires — acceptance is trait objects' question. The spec had refused
+twice already (§5.5, §5.11) and MethodLookup::BareTraitValue was the
+same refusal from inside a body. The steer names the generic spelling
+with a note at the declaration, renders cross-module, and leaves the
+plain mismatch for genuinely-unimplementing arguments. The narrow
+cause is recorded: a call is the ONLY position that reconciles
+parameter-first, so it was the only position with no rule. 11 pins.]
+
+#### B74. duplicate statics escape the duplicate-inherent check — SHIPPED 2026-08-06
+
+(S–M; found by B57's arc) — two impls declaring the same `fun new()`
+for one subject are still a silent pick — the same dead-code hazard
+B57 closed for methods, one receiver-position away.
+[Ship notes: the sweep found ZERO live collisions (std's 115 statics,
+corpus, examples, docs fences) — nothing in-tree flipped. The filed
+"different namespaces" guess was WRONG and the truth is pinned:
+statics and methods share ONE namespace (`declarations` is one map
+keyed by name; `is_self_method` was doing double duty), and the mixed
+static/method pair was the worst case — a static `tag()` and method
+`tag(self)` both compiled, and `Bag::tag()` resolved the method then
+failed on ARITY for a declaration no call form could reach. The
+trait-homing guard was proven load-bearing empirically: removing it
+turns std's `Duration::describe` red. 10 pins across two files.]
+
+#### B75. calling a fn-typed binding is rejected — SHIPPED 2026-08-06
+
+(S–M; found by B71's arc; pre-existing, unrelated to nesting) —
+`let f = helper; f(1)` → "cannot call this as a function: it is fn
+helper(i32): i32" — a top-level `fun` behaves identically. NOT covered
+by B20.
+[Ship notes: BUILT, not design-refused — fn-coercion.md §4's "calling
+such a binding works as before" was a mis-record (the B20 commit lists
+fn-typed bindings as deferred tail); the proposal is corrected. The
+call resolver dispatched on what the subject WAS (a binding) and never
+looked at its type; it resolves through the declaration now, so arity,
+types, and emission share the direct-call path. Emission needed
+nothing — a fn reference already emits its own mangled name. B20's
+four exclusions (generic, async, methods, external) are kept and
+proven load-bearing: ungated, a generic binding MISCOMPILED
+(ReferenceError — names minted from a disjoint pool) and an async one
+returned an unawaited Promise. Refusals now name their rule. 13 pins.]
+
+#### B77. a user `impl List<type T>` makes cold compiles spuriously report against std's own List — FIXED 2026-08-06
+
+(M; found by I3's arc; ~50% of cold attempts) — checks report "never
+fully determined" against std's `List::map`/`filter` — spurious,
+nondeterministic, leaking diagnostics out of frozen std territory.
+Wants a root-cause hunt in the solver's ordering, not a suppression.
+[Ship notes: NOT solver ordering — the residual-generic leak check
+collapsed "which file declares this constraint" into a
+HashMap<TypeId, SourceId> built last-write-wins over randomly-seeded
+iteration. `impl Subject<type T>` deliberately INHERITS the subject's
+constraint id, so one id honestly has several declaring files; the
+user's `impl List<type T>` literally IS list.vl's `T`. The fix keeps
+the SET of declaring files. Determinism proof: 0/30 spurious over 30
+cold attempts on both repros; the planted collapse goes 8/30 and
+30/30 red. The fix stays inside the pre-existing file-granularity
+approximation (a scope-precise rule is noted as strictly better). The
+hunt's tree-wide survey of the same iteration-order class filed as
+E38 — three answer-flipping shapes and eleven C1 violations.]
+
+#### B78. the protocol loop drops a tuple element's type when the element IS the generic parameter — FIXED 2026-08-06
+
+(M; found by I3's arc) — `for pair in [(1, "a")].iter()` → "cannot
+access field '0' on type T" — the iterator's element type is its own
+generic parameter and the loop's binding never resolves it.
+enumerate/zip unaffected.
+[Ship notes: NOT a tuple defect — a BARE-PARAMETER defect. The
+struct/enum subject arm read the element off `next`'s declared return
+type verbatim, without instantiating against the receiver — the Trait
+arm beside it always instantiated, which is why bounded-generic loops
+never had it. Struct fields, nested containers, Option methods,
+closure-element calls, `next_mut` over a generic container, enum
+subjects, and adapter chains were ALL red pre-fix; 8 pins, 6 red on
+revert, the 2 green being exactly the documented-unaffected pair
+(enumerate/zip — STRUCTURAL payloads, abstract parts project fine),
+which is why the whole I3 arc never saw it. Bycatch: B80 (a concrete
+struct with no `next` silently for...of's its field array), B82 (an
+`is` pattern on bare `T` checks vacuously), B81 (viewed-subject
+captures alias — verified at the cut).]
+
+#### E37. bindgen v2 — (a)(b)(e) SHIPPED 2026-08-06
+
+(M–L; filed 2026-08-06 from the E31 probe) — the probe's residue: (a)
+the `declare var X: { new(): X }` constructor idiom — 641 of the 824
+unbound lib.dom declarations, one syntactic shape onto
+`[extern(new, …)]`; (b) an `--only <Type>` transitive-closure filter;
+(c) the oxc swap-in seam; (d) the override-table direction; (e) §4's
+attribute-order note. The declare-var ruling was the owner's — granted
+2026-08-06.
+[Ship notes: (a)+(b)+(e) shipped; (c)/(d) stay unscheduled. The
+re-probe: 92.3% of declarations, 99.9% of members — §10.3's ~92%
+prediction exact. The residue is 186 declarations in three honest
+shapes, 183 of them GENUINE global values (`document`, `window`,
+`navigator`) needing a language-level "read a global" form — a
+language question, not a bindgen one. `--only`'s honest number: it
+cut lib.dom 80% with a provably complete closure, but the DOM's
+element types are ONE strongly-connected component (~900 declarations
+through Node.ownerDocument and UIEvent.view), so a reviewable DOM
+slice needs §11.6's unbuilt shallow mode — for the third-party
+libraries bindgen targets, closures are a handful of types. The
+constructor recognizer refuses three near-misses by name rather than
+guessing. One latent bug found by the non-vacuity discipline itself:
+emit_constructor_globals ignored --only (fixed). 26 pins; zero new
+dependencies. The canvas example rides examples/canvas, gated by the
+examples suite the moment it landed.]
