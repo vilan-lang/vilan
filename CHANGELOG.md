@@ -6,7 +6,27 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## v0.29.0 — 2026-08-04
+## Unreleased
+
+**`Iterator` is a trait you can actually implement.** It declared
+`fun next(self): Option<T>` — by value — and a by-value receiver cannot advance
+anything, so every stateful iterator (a cursor, a counter, anything holding a
+position) hit the conformance error `match the receiver convention` and had to
+give up on the trait. `Range`, the one real lazy iterator in the standard
+library, was written that way: a bare inherent `next(&mut self)` and no `with
+Iterator<i32>` clause, because the clause was not available to it. `next` now
+takes `&mut self`, which is what advancing an iterator has always been, and
+`Range` carries the clause. The documentation's claim that "`Range` is one such
+type" is true for the first time.
+
+Nothing about `for … in` changed: the loop resolves the protocol on the *method
+name*, so a type with a `next(&mut self): Option<T>` has always driven a loop
+whether or not it declared the trait, and still does. What the repair buys is
+the trait as a **bound** — `fun total<I: Iterator<i32>>(mut source: I)` accepts a
+`Range` now — and it is the enabling change for everything else in this arc,
+since every adapter is stateful by construction. If you implemented `Iterator`
+by mutating something outside the iterator (a module-level counter — the only
+way that worked), the receiver is the one line to change.
 
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
 

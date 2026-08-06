@@ -235,10 +235,45 @@ fun main() {
 The protocol `for` consumes, and the seam for custom sequences:
 
 ```vilan,fragment
-trait Iterator<T> { fun next(self): Option<T>; }
-trait Iterable<T> { fun iter(self): Iterator<T>; }
+trait Iterator<T> { fun next(&mut self): Option<T>; }
 Iterator::from_fn(fn: || Option<T>): IteratorFromFn<T>   // an iterator from a closure
 ```
 
-Anything implementing `Iterator`/`Iterable` works in a `for` loop.
-`Range` is one such type.
+`next` takes `&mut self` because advancing *is* a mutation of the iterator's own
+state — a cursor, a counter, a running total. Implement it on a struct of yours
+and the type works in a `for` loop, and satisfies an `I: Iterator<T>` bound:
+
+```vilan
+import std::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, Some, None };
+
+struct Countdown {
+	remaining: i32,
+}
+
+impl Countdown with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		if self.remaining <= 0 {
+			None
+		} else {
+			self.remaining -= 1;
+			Some(self.remaining)
+		}
+	}
+}
+
+fun main() {
+	mut countdown = Countdown { remaining = 3 };
+	for n in countdown {
+		print(n);   // 2, 1, 0
+	}
+}
+```
+
+`Range` implements `Iterator<i32>`, and so does every adapter below.
+
+One thing to know about the loop: `for` resolves the protocol on the *method
+name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
+not it declares the trait. Declaring it is what buys the adapters and the
+terminations — and what lets a generic bound accept your type.

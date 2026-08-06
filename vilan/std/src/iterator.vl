@@ -1,7 +1,11 @@
 import pkg::option::Option::{ self };
 
+/// The lazy-sequence protocol. `next` advances the iterator's own state, so it
+/// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter
+/// holding an upstream — is exactly what this trait is for, and a by-value
+/// receiver made every one of them unconformable (I5).
 trait Iterator<T> {
-	fun next(self): Option<T>;
+	fun next(&mut self): Option<T>;
 }
 
 struct IteratorFromFn<T> {
@@ -9,7 +13,7 @@ struct IteratorFromFn<T> {
 }
 
 impl IteratorFromFn<type T> with Iterator<T> {
-	fun next(self) {
+	fun next(&mut self) {
 		(self.fn)()
 	}
 }

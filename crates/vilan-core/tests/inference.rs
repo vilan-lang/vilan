@@ -19253,7 +19253,7 @@ fn an_iterator_protocols_next_call_colors_the_loop() {
         struct Audited { limit: i32 }
 
         impl Audited with Iterator<i32> {
-            fun next(self): Option<i32> {
+            fun next(&mut self): Option<i32> {
                 write_file("audit.log", "tick");
                 produced = produced + 1;
                 if produced <= self.limit {
@@ -39179,5 +39179,131 @@ fn b65_a_loaned_capture_consumed_inside_a_generic_reports_at_the_instantiation()
         ),
         "steal(Some(Res { tag = \"gi\" }))",
         "a capture of a loaned resource-typed subject is moved out",
+    );
+}
+
+// --- I5: `Iterator::next` takes `&mut self` (proposal/iterator-adapters.md P1,
+// --- slice S1) --------------------------------------------------------------
+// The trait shipped declaring `fun next(self): Option<T>`, and B29's receiver-
+// convention conformance rightly rejected the `&mut self` every stateful
+// iterator needs — so the trait was unconformable as declared, and `Range`, the
+// one real lazy iterator in std, deliberately did not implement it. `next` is
+// now `&mut self`; these pin that the trait is implementable, that std's own
+// conformers work, and that the by-value declaration is gone for good.
+
+#[test]
+fn i5_a_stateful_iterator_conforms_to_the_repaired_trait() {
+    // The shape the by-value receiver made impossible: state on the ITERATOR,
+    // advanced by `next`. Pre-repair this was
+    // "`Counting`'s `next` receives `&mut self`, but `Iterator` declares `self`".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        struct Counting { at: i32, limit: i32 }
+
+        impl Counting with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit {
+                    self.at = self.at + 1;
+                    Some(self.at)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut counting = Counting { at = 0, limit = 3 };
+            for value in counting {
+                print(value);
+            }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn i5_a_by_value_next_no_longer_conforms() {
+    // The other direction, and the pin that keeps the repair honest: a conformer
+    // declaring the OLD by-value receiver is now the conformance error. Without
+    // it, re-widening `next` back to `self` would go unnoticed.
+    assert_fails_with(
+        r#"
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        struct Fixed { value: i32 }
+
+        impl Fixed with Iterator<i32> {
+            fun next(self): Option<i32> {
+                Some(self.value)
+            }
+        }
+
+        fun main() {}
+        "#,
+        "match the receiver convention",
+    );
+}
+
+#[test]
+fn i5_range_implements_the_iterator_trait() {
+    // `Range` gains the `with Iterator<i32>` clause it has always deserved, so
+    // the docs' "`Range` is one such type" is true for the first time. The
+    // `for` protocol is name-resolved and worked either way — what is new is
+    // that a bound `I: Iterator<i32>` accepts a `Range`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self };
+        import std::range::Range;
+
+        fun total<I: Iterator<i32>>(mut source: I): i32 {
+            mut sum = 0;
+            for value in source {
+                sum = sum + value;
+            }
+            sum
+        }
+
+        fun main() {
+            print(total(Range::new(1, 5)));
+            mut range = Range::new(0, 3);
+            print(range.next().unwrap_or(-1));
+            print(range.next().unwrap_or(-1));
+        }
+        "#,
+        "10\n0\n1\n",
+    );
+}
+
+#[test]
+fn i5_iterator_from_fn_follows_the_repaired_receiver() {
+    // std's other conformer. `from_fn`'s closure carries the state, so the
+    // receiver change is invisible at the call site EXCEPT that the binding must
+    // now be `mut` — which is the honest reading: pulling advances it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut produced = 0;
+            mut naturals = Iterator::from_fn(|| {
+                produced = produced + 1;
+                if produced <= 2 { Some(produced) } else { None }
+            });
+            print(naturals.next().unwrap_or(-1));
+            print(naturals.next().unwrap_or(-1));
+            print(naturals.next().unwrap_or(-1));
+        }
+        "#,
+        "1\n2\n-1\n",
     );
 }
