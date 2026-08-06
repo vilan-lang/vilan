@@ -1,8 +1,45 @@
+function __at(list, index) {
+	if (index >= 0 && index < list.length) return list[index];
+	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+}
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
+}
+function step(self) {
+	const $n = self;
+	const items = __clone($n[1]);
+	const at = $n[2];
+	if ($n[0] === 0) {
+		Object.assign(self, [ 0, __clone(items), at + 1 ]);
+		return __at(items, at);
+	}
+	return "-";
+}
+function width(self) {
+	const $o = self;
+	if ($o[0] === 0) {
+		return $o[1].length + $o[2];
+	}
+	return 0;
+}
+function viewed_guarded(pair2) {
+	const $p = pair2;
+	let $q = null;
+	let $r = false;
+	const cells = __clone($p[0]);
+	const weight = $p[1];
+	if (weight > 0) {
+		$r = true;
+		pair2[1] = 9;
+		$q = cells.length + weight;
+	}
+	if (!($r)) {
+		$q = 0;
+	}
+	return $q;
 }
 function sum_over(entries2) {
 	let total = 0;
@@ -104,3 +141,10 @@ $l;
 const pair = [ [ 1, 2 ], 3 ];
 console.log(grow_first(pair));
 console.log(pair[0].length);
+let feed = [ 0, [ "a", "b", "c" ], 0 ];
+console.log(step(feed));
+console.log(step(feed));
+console.log(width(feed));
+let viewed = [ [ 1, 2 ], 3 ];
+console.log(viewed_guarded(viewed));
+console.log(viewed[1]);
