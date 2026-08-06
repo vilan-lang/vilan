@@ -822,6 +822,29 @@ its own blanket impl. The collections page stops claiming it works. The
 two-parameter `Iterable<T, I: Iterator<T>>` that S6 wants is unaffected by
 anything here.
 
+### A compiler fix the arc had to make: `all` collided with `Promise::all`
+
+`Iterator::all` is in §3's table. Adding it colored every caller of
+`xs.iter().all(p)` **async**, down to an `async` `main`, for a program with
+nothing async in it — and the const-eval interpreter then refused such a
+program outright ("async (macro bodies are synchronous)"), which is how the
+corpus gate found it.
+
+The cause is `async_infer::dispatch_candidates`. An `OnType` re-dispatch does
+not carry its trait, so it falls back to every member with the call's name and
+takes the caller async if any is — sound and deliberately over-approximate.
+STATICS were in that set. `std::promise::Promise::all` is an `async external`
+static and `promise` is a force-loaded core module, so the name alone was
+enough. A dispatched `receiver.name()` can never select a member with no
+receiver, so the scan now keeps only members whose first parameter is `self`
+(`is_self_method`, the post-analysis twin of the analyzer's own). It is a
+narrowing of an over-approximation, not a change of contract; no corpus golden
+outside this arc's own moved a byte. Pinned in both directions, including that
+a genuinely async dispatched member still colors its caller.
+
+The alternative was renaming `all`, which would have been a spec deviation
+hiding a defect every future same-named pair would hit again.
+
 ### Two defects found on the way, both pre-existing, both pinned `#[ignore]`d
 
 1. **A user `impl List<type T>` block makes the checks report against std's

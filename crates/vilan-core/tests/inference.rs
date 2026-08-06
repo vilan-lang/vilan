@@ -40396,3 +40396,142 @@ fn an_async_closure_adapts_through_an_adapter_chain() {
         "2\n4\n[ 2, 4 ]\n",
     );
 }
+
+// --- Found while building I3 S5: a dispatched method call was colored by a
+// --- same-named STATIC (async_infer's candidate set) --------------------------
+// `dispatch_candidates` over-approximates on purpose — an `OnType` re-dispatch
+// does not carry its trait, so it falls back to every member with the call's
+// name. Statics were in that set, and they cannot be: `receiver.name()` never
+// selects a member with no receiver. Leaving them in was not merely imprecise.
+// `std::promise::Promise::all` is an `async external` STATIC and `promise` is a
+// force-loaded core module, so the moment std grew an `Iterator::all` trait
+// default, every `xs.iter().all(p)` colored its whole caller async — down to an
+// `async` `main`, which the const-eval interpreter then refuses outright
+// ("async (macro bodies are synchronous)"). The candidate scan now keeps only
+// members whose first parameter is `self`.
+
+/// Compile and assert the emitted JS contains no `async` — the shape a
+/// miscoloring produces, and one no assertion on stdout can see.
+#[track_caller]
+fn assert_compiles_without_async(source: &str) {
+    match compile(source) {
+        Ok(javascript) => assert!(
+            !javascript.contains("async"),
+            "the program was colored async:\n{javascript}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+#[test]
+fn a_dispatched_call_is_not_colored_by_a_same_named_async_static() {
+    // The user-level shape, with no std collision involved: an async STATIC and
+    // a sync trait DEFAULT sharing one name. The call is a method call, so the
+    // static is not reachable from it and must not color the caller.
+    assert_compiles_without_async(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Gate {}
+
+        impl Gate {
+            async fun scan(items: List<i32>): i32 {
+                items.len()
+            }
+        }
+
+        trait Walk<T> {
+            fun next(&mut self): Option<T>;
+
+            fun scan(mut self, predicate: |T| bool): bool {
+                for value in self {
+                    if predicate(value) {
+                        ret true;
+                    }
+                }
+                false
+            }
+        }
+
+        struct Counting { at: i32, limit: i32 }
+
+        impl Counting with Walk<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit {
+                    self.at = self.at + 1;
+                    Some(self.at)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            print(Counting { at = 0, limit = 3 }.scan(|n| n == 2));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn iterator_all_does_not_color_its_caller_async_through_promise_all() {
+    // The std instance, and the one users actually meet: `Iterator::all` shares
+    // its name with `Promise::all`, an `async external` static in a force-loaded
+    // module. Before the narrowing this emitted `(async () => { … })()` for a
+    // program with nothing async in it.
+    assert_compiles_without_async(
+        r#"
+        import std::print;
+
+        fun main() {
+            print([1, 2, 3].iter().all(|n| n > 0));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
+    // The other direction, so the narrowing cannot go too far. `describe` is a
+    // trait default calling `self.label()` — an `OnType` re-dispatch, which is
+    // exactly the path that falls back to the same-named scan — and `label` is
+    // inferred async on the one impl. The caller must still be colored, and
+    // its output settled rather than a promise. Dropping every candidate takes
+    // this red, which is what makes the narrowing above a narrowing and not a
+    // deletion.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+        import std::option::Option::{ self, Some, None };
+
+        trait Walk<T> {
+            fun next(&mut self): Option<T>;
+            fun label(self): str;
+
+            fun describe(mut self): str {
+                self.label()
+            }
+        }
+
+        struct Slow { at: i32 }
+
+        impl Slow with Walk<i32> {
+            fun next(&mut self): Option<i32> {
+                None
+            }
+
+            fun label(self): str {
+                sleep(1);
+                "slow"
+            }
+        }
+
+        fun main() {
+            print(Slow { at = 0 }.describe());
+        }
+        "#,
+        "slow\n",
+    );
+}

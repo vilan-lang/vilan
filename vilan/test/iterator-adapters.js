@@ -396,8 +396,8 @@ function $aJ(self, key, value) {
 }
 function $aH(self) {
 	let result = $aI();
-	for (const entry of self) {
-		$aJ(result, entry[0], entry[1]);
+	for (const entry2 of self) {
+		$aJ(result, entry2[0], entry2[1]);
 	}
 	return result;
 }
@@ -405,8 +405,8 @@ function $aK(self, key) {
 	const $aL = __map_get(self[0], hash(key));
 	let $aM = null;
 	if ($aL[0] === 0) {
-		const entry = $aL[1];
-		$aM = [ 0, __clone(entry[1]) ];
+		const entry2 = $aL[1];
+		$aM = [ 0, __clone(entry2[1]) ];
 	} else {
 		$aM = [ 1 ];
 	}
@@ -436,59 +436,57 @@ function $aQ(self) {
 	}
 	return seen;
 }
-(async () => {
-	console.log($f($e($d($c($b($a([ 1, 2, 3, 4, 5, 6 ]), (n) => {
-		return n % 2 === 0;
-	}), (n) => {
-		return n * 10;
-	}), 1), 2)));
-	console.log($u($t($s([ 0 ], (n) => {
-		return n * n;
-	}), 4)));
-	console.log($A([ 0 ], (n) => {
-		return n === 3;
-	}));
-	let zipped = $E(new2(0, 9), $D([ "a", "b" ]));
-	const $M = zipped;
-	while (true) {
-		const $N = $F($M);
-		if ($N[0] !== 0) {
-			break;
-		}
-		const pair = $N[1];
-		console.log("" + pair[0] + pair[1]);
+console.log($f($e($d($c($b($a([ 1, 2, 3, 4, 5, 6 ]), (n) => {
+	return n % 2 === 0;
+}), (n) => {
+	return n * 10;
+}), 1), 2)));
+console.log($u($t($s([ 0 ], (n) => {
+	return n * n;
+}), 4)));
+console.log($A([ 0 ], (n) => {
+	return n === 3;
+}));
+let zipped = $E(new2(0, 9), $D([ "a", "b" ]));
+const $M = zipped;
+while (true) {
+	const $N = $F($M);
+	if ($N[0] !== 0) {
+		break;
 	}
-	console.log($P($O($a([ 1, 2 ]), $a([ 3 ]))));
-	let numbered = $U($D([ "x", "y" ]));
-	const $X = numbered;
-	while (true) {
-		const $Y = $V($X);
-		if ($Y[0] !== 0) {
-			break;
-		}
-		const entry = $Y[1];
-		console.log("" + entry[0] + "=" + entry[1]);
+	const pair = $N[1];
+	console.log("" + pair[0] + pair[1]);
+}
+console.log($P($O($a([ 1, 2 ]), $a([ 3 ]))));
+let numbered = $U($D([ "x", "y" ]));
+const $X = numbered;
+while (true) {
+	const $Y = $V($X);
+	if ($Y[0] !== 0) {
+		break;
 	}
-	console.log($Z($a([ 1, 2, 3 ]), 0, (total, n) => {
-		return total + n;
-	}));
-	console.log($ac($a([ 1, 2, 3 ]), (n) => {
-		return n > 0;
-	}));
-	console.log($ak($af($a([ 1, 2, 3 ]))));
-	$an($a([ 1, 2 ]), (n) => {
-		return console.log(n);
-	});
-	console.log($aA($ax($ar($aq($a([ 1, 2, 2, 3 ]), (n) => {
-		return n > 1;
-	})))));
-	const lengths = $aH($aC($aB($D([ "alpha", "hi" ]), (word) => {
-		return [ word, word.length ];
-	})));
-	console.log($aN($aK(lengths, "hi"), -(1)));
-	let live = [ 1, 2 ];
-	let cursor = $a(live);
-	live.push(3);
-	console.log($aQ(cursor));
-	console.log(live.length);
-})();
+	const entry = $Y[1];
+	console.log("" + entry[0] + "=" + entry[1]);
+}
+console.log($Z($a([ 1, 2, 3 ]), 0, (total, n) => {
+	return total + n;
+}));
+console.log($ac($a([ 1, 2, 3 ]), (n) => {
+	return n > 0;
+}));
+console.log($ak($af($a([ 1, 2, 3 ]))));
+$an($a([ 1, 2 ]), (n) => {
+	return console.log(n);
+});
+console.log($aA($ax($ar($aq($a([ 1, 2, 2, 3 ]), (n) => {
+	return n > 1;
+})))));
+const lengths = $aH($aC($aB($D([ "alpha", "hi" ]), (word) => {
+	return [ word, word.length ];
+})));
+console.log($aN($aK(lengths, "hi"), -(1)));
+let live = [ 1, 2 ];
+let cursor = $a(live);
+live.push(3);
+console.log($aQ(cursor));
+console.log(live.length);

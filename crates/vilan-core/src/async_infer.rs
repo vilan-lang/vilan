@@ -604,9 +604,39 @@ fn trait_method_candidates(program: &Program, trait_id: Id, member: &str) -> Vec
     candidates
 }
 
+/// Whether `member_id` is callable AS A METHOD — its first parameter is named
+/// `self`. `Analyzer::is_self_method`'s post-analysis twin, over a `Program`.
+///
+/// A dispatched `receiver.name()` can only ever select a member with a
+/// receiver, so a same-named STATIC is not a candidate for it however sound the
+/// rest of the over-approximation is. Leaving statics in is not merely
+/// imprecise, it is wrong in a way users feel: `std::promise::Promise::all` is
+/// an `async external` static, `promise` is a force-loaded core module, and so
+/// every `xs.iter().all(p)` — an `OnType` re-dispatch, which cannot pin its
+/// trait and falls back to this scan — used to color its whole caller async,
+/// down to an `async` `main`. Nothing there is reachable from the call.
+fn is_self_method(program: &Program, member_id: Id) -> bool {
+    let first_parameter_id = match program.entity_map.get(&member_id) {
+        Some(crate::analyzer::Expr::Function(function_id)) => program
+            .functions
+            .get(function_id)
+            .and_then(|function| function.parameters.first().copied()),
+        Some(crate::analyzer::Expr::ExternalFunction(external_function_id)) => program
+            .external_functions
+            .get(external_function_id)
+            .and_then(|external| external.parameters.first().copied()),
+        _ => None,
+    };
+    first_parameter_id
+        .and_then(|parameter_id| program.parameters.get(&parameter_id))
+        .map(|parameter| parameter.name == "self")
+        .unwrap_or(false)
+}
+
 /// Every impl member and trait default with the given name — the fallback when a
 /// dispatch's trait can't be pinned (a multi-bound parameter, or an `OnType`
-/// re-dispatch). Over-approximate but sound: it can only add async-ness.
+/// re-dispatch). Over-approximate but sound: it can only add async-ness. Members
+/// with no receiver are excluded — see [`is_self_method`].
 fn members_named(program: &Program, member: &str) -> Vec<Id> {
     let mut candidates = Vec::new();
     for implementation in &program.implementations {
@@ -619,6 +649,7 @@ fn members_named(program: &Program, member: &str) -> Vec<Id> {
             candidates.push(*member_id);
         }
     }
+    candidates.retain(|member_id| is_self_method(program, *member_id));
     candidates
 }
 

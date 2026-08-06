@@ -109,6 +109,19 @@ snapshot. So the eager four keep their bodies. Nothing is ambiguous as a result:
 `List` does not implement `Iterator`, so the lazy `map` is reached only through
 `.iter()` and the two are told apart by what they are called on.
 
+**A method call is no longer colored async by a same-named *static*.** When the
+compiler cannot pin which impl a dispatched `receiver.name()` will select, it
+considers every member called `name` and takes the caller as async if any of them
+is — sound, and deliberately over-approximate. Statics were in that set, and they
+cannot be: a method call never selects a member with no receiver. It surfaced the
+moment the standard library grew an `Iterator::all`, because `Promise::all` is an
+`async` static in an always-loaded module, so `xs.iter().all(p)` colored its whole
+caller async down to an `async` `main` — for a program with nothing async in it.
+Compile-time evaluation then refused such a program outright, since macro and
+`const` bodies are synchronous. The candidate scan now keeps only members that
+take a receiver. Nothing else in the corpus moved a byte, and a genuinely async
+dispatched member still colors its caller, which is pinned in both directions.
+
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
 
 **It also fixes something you could not fix from outside.** Two writes in flight over one signal corrupted it. An older write that fails *after* a newer one succeeded rolled the newer value away — probe it through the free function and the screen ends up showing the value the cell started at while the server holds one from two writes later. The cell discards a superseded outcome (the newest write owns the cell, and the outcome still returns to its own caller), and a rollback lands on the last value the **server** confirmed rather than on whatever the signal happened to hold when the write began. Those are two different questions, so confirmations carry their own counter and an out-of-order reply cannot walk the recorded truth backwards.
