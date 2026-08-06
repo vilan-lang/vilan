@@ -702,3 +702,149 @@ anything that already exists.
    language feature request bindgen's design surfaces but doesn't itself
    need — flagged for the project owner's call on whether it's worth
    opening as its own backlog item.
+
+---
+
+## 9. Implementation notes (2026-08-06, take-up)
+
+Everything below was found by **running** the compiler at take-up, not by
+re-reading the document. Where it contradicts §§1–8, the running compiler
+wins and the deviation is stated plainly. The STATUS block above is
+untouched.
+
+### 9.1 The parser: written here, not oxc (deviates from §2)
+
+§2 recommends `oxc_parser` and conditions it on a gate: *"whoever takes this
+item up should run `cargo about generate` against a real `Cargo.lock` with
+oxc added and read its own output before assuming the license surface is
+clean."* That was run. **It fails**, though not on the crate §2 predicted:
+
+```
+error: failed to satisfy license requirements
+   ┌─ …/dragonbox_ecma-0.1.12/Cargo.toml:40:12
+40 │ license = "Apache-2.0 WITH LLVM-exception OR BSL-1.0"
+```
+
+`dragonbox_ecma` is reached through `oxc_syntax`, which every oxc crate
+depends on unconditionally — no feature flag drops it. Neither licence branch
+is on `about.toml`'s **closed** `accepted` list, so adopting oxc means
+amending the project's licence policy, which is the owner's call and not a
+side effect of a tool.
+
+Two further costs, both measured rather than estimated:
+
+- **44 new crates**, not the "closer to a dozen" §2 predicted — 136 → 180
+  packages in `Cargo.lock`, a 32% growth for one non-build-time subcommand.
+- §1 puts the machinery in `vilan-core`, and **`vilan-wasm` depends on
+  `vilan-core` unconditionally**. The playground artifact is deliberately
+  size-tuned (`Cargo.toml`'s `wasm-release` profile exists for exactly that),
+  and would link a whole JavaScript parser it can never call.
+
+A third, smaller: oxc 0.143 requires rustc 1.95 and this toolchain is 1.90, so
+the lockfile would pin 0.110 — 33 releases behind.
+
+**Resolution: a purpose-built `.d.ts` parser** (`crates/vilan-core/src/
+bindgen/dts.rs`). A `.d.ts` is declaration-only — no expressions, no
+statements, no bodies, no JSX, no regex literals — so the grammar is small,
+and this repo already contains a hand-written lexer and parser for a much
+larger language. Cost: **zero** new dependencies, no licence-policy change,
+`THIRD-PARTY-NOTICES.txt` and `Cargo.lock` untouched (`cargo test -p vilan-cli
+--test third_party_notices` passes unchanged). It chewed 39,429 lines of
+`lib.dom.d.ts` in under 8 s. If the owner prefers oxc, the swap is one module
+behind an unchanged `bindgen::generate` seam plus two `about.toml` entries.
+
+### 9.2 What crosses a host boundary — four corrected rows
+
+OWNER NOTE 2 asked one row to be verified. Verifying it exposed a shared root
+cause under three more: **a vilan aggregate has a vilan-owned runtime
+representation, and a host does not speak it.** Only an `external struct` — an
+opaque handle reached through `[extern(get/set, …)]` — crosses intact.
+
+| § | Row as written | What running it does | Now |
+|---|---|---|---|
+| 3.9 | `{ [index: number]: T }` → `List<T>` | `List<T>` is a native JS **array**. An array-*like* (`{0:"a", length:1}`) has no `Symbol.iterator`, so `for`-in throws `TypeError: … is not iterable` — and `map`/`filter`/`fold`/`for_each`/`reverse` are all built on `for`-in. A real array with **holes** is worse than sparse-tolerant: each hole arrives as `undefined` in a `T`-typed slot and crashes on first use. | TODO, naming `Array.from` as the fix. `T[]`/`Array<T>` → `List<T>` **is** correct and kept. |
+| 3.9 | `{ [key: string]: T }` → `Map<str, T>` | `std::map::Map` is a **plain vilan struct** wrapping a `NativeMap` keyed by `key.hash()` (`std/src/map.vl:11-13`), not a host object. A host `{"a":1}` read through it dies on `.has`. | TODO, steering to per-key `[extern(get, …)]` accessors. |
+| 3.3 | discriminated union → `enum` + payload structs | A vilan `enum` lowers to `[tag, …payload]`; the TS union is a tagged **object**. `match` compiles to `value[0] === 0`, matches no arm, and crashes. Payload `struct`s could not receive the fields either. | TODO, steering to an opaque handle plus a hand-written tag accessor. |
+| 3.2 | every absence → `Option<T>` | `Option` is a tagged array (`Some(v)` = `[0, v]`, `None` = `[1]`). **Reading:** a host returning `"hello"` is tested as `value[0] === 0`, i.e. `"h" === 0`, so a *present* value arrives as `None`. **Writing:** `None` reaches the host as `[1]`, which for an optional `boolean` is **truthy** — `arc(…, counterclockwise?)` silently reverses. | Bare type + a `///` note. An optional **parameter** becomes one binding per call arity (§9.3). |
+
+The fact underneath all four: `struct Point { x: f64 }` lowers to `[x]` and
+`p.x` to `p[0]`, so a plain `struct` reads the wrong slots of a host object
+and yields `undefined` **silently**. This promotes §3.8's v1 recommendation
+("`external struct` always") from a judgment call to a requirement — the
+alternative it weighed is not merely less ergonomic, it is wrong.
+
+The one aggregate that *does* cross: a vilan **tuple** is a JS array, so TS
+`[A, B]` → `(A, B)` is exact.
+
+Both facts are pinned as tests that go red if the language changes
+(`crates/vilan-core/tests/bindgen.rs::a_vilan_struct_is_a_positional_array_at_runtime`,
+`::option_cannot_cross_a_host_boundary_in_either_direction`).
+
+### 9.3 Optional parameters: one binding per arity (replaces §3.2's row)
+
+Since `Option` cannot cross, and making an optional parameter *required*
+would force callers to invent a value the host is meant never to see, the
+exact mapping is the one TypeScript's own rule hands over: **optionals are
+trailing**, so `f(a, b?)` is exactly two call shapes. bindgen emits both, of
+the same host symbol, with the short one keeping the plain name:
+
+```
+[extern(method, "getContext")] external fun get_context(self, id: str): …;
+[extern(method, "getContext")] external fun get_context_with_options(self, id: str, options: …): …;
+```
+
+This is not a new idea — `std/src/browser/dom.vl:63-70` already binds one
+`appendChild` twice, as `append` and `append_text`. With two or more optionals
+the shortest and longest arities are bound and the intermediate ones are
+TODO'd rather than combinatorially expanded.
+
+### 9.4 OWNER NOTE 1 — backed enums do not exist; the question is the language's
+
+**Answer: no.** A vilan enum discriminant is `= (-)? integer` and nothing else
+(`crates/vilan-core/src/parsing.rs::parse_discriminant`); `enum Align { Start
+= "start" }` is a parse error (*"found '=' expected ',' or '}'"*). So bindgen
+ships §3.3's match-wrapper as drafted.
+
+**The language question, recorded here rather than decided inside bindgen:**
+should an enum carry a **string** backing value? The precedent is already
+built and is exactly the right shape — a C-like enum (`all_data_less &&
+any_explicit_discriminant`, `analyzer.rs:15367`) is `is_numeric` and lowers to
+its **bare discriminant**: `enum Ordering { Less = -1, … }` compiles
+`Ordering::Greater` to `1`, not to a tagged array. A string-backed enum
+lowering to its bare string would make bindgen's entire match-wrapper
+machinery unnecessary — the enum would *be* the host's string — and would give
+the same benefit to every hand-written binding in std (`fetch.vl`'s methods,
+`dom.vl`'s event names). It is worth its own backlog item; bindgen is
+evidence for it, not the place to settle it.
+`crates/vilan-core/tests/bindgen.rs::a_vilan_enum_cannot_carry_a_string_backing_value`
+goes red the day it lands, and points at the code to delete.
+
+### 9.5 Smaller deviations and additions
+
+- **§5, type aliases.** An alias whose right-hand side maps to no *declaration*
+  (`type GLenum = number`) is now **transparent**: substituted at every
+  reference rather than TODO'd. Without it `lib.dom.d.ts` alone reported ~1,500
+  references to types it plainly declares (`GLenum` 428, `GLint` 240, …).
+- **Attribute order is fixed**, and §4's examples do not say so: the parser's
+  chain is `extern`, `must_use`, `rpc`, `trait_only`, `doc(hidden)`,
+  `platform` (`parsing.rs:2903-2913`). `[platform(…)]` before `[extern(…)]` is
+  a parse error.
+- **Interfaces get an `Object()` constructor.** §3.2 cites `RequestInit` as
+  the precedent to follow; that precedent *includes* `[extern("Object")]
+  external fun new_request_init()` (`fetch.vl:109-110`), without which the
+  options-bag direction the section spends three paragraphs on cannot be
+  written at all.
+- **`extends` is flattened** (base members copied in, derived wins, generic
+  arguments substituted) — §3.7/§3.8 do not rule on it. Flattening is what a
+  human writing the binding does and the only mapping that leaves the derived
+  type usable. It does **not** recover assignability: `Element` is still not
+  accepted where `Node` is expected, which is §3.8's nominal limit.
+- **Name collisions get a deterministic `_2` suffix** (a property `align` and a
+  method `setAlign` both want `set_align`), assigned in source order so §6's
+  byte-stability gate holds.
+- **A string literal that is not an identifier** is prefixed: `"2d"` in
+  `type OffscreenRenderingContextId` becomes variant `_2d`. This was the single
+  construct that stopped 410k generated lines from parsing — found by the probe.
+- **`--stats`** reports coverage per construct, so §6's "fourth, softer check"
+  is a measurement rather than a claim.
+
