@@ -2848,26 +2848,40 @@ impl<'src> Analyzer<'src> {
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
+        //
+        // C1, the same discipline as the sort above: ONE constraint id can have
+        // SEVERAL registration entities, because `impl Subject<type T>`
+        // deliberately inherits the subject's id (`register_subject_binders`, the
+        // relation B77 found) — a user's `impl Set<type T>` is the same id as
+        // `set.vl`'s `struct Set<T: Hashable>`. A `.find()` over the entity map
+        // picked one at random, so WHICH FILE the note pointed at changed run to
+        // run. Take the LEAST entity id instead (B57's tie-break): ids are minted
+        // in walk order, so that is the earliest declaration — which is the one
+        // that actually WRITES the bound, the inheriting binders having only
+        // adopted it.
         let bound_declarations: Vec<(Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(span, msg, constraint_id)| {
-                let note = self
+                let declaration = self
                     .expr_id_to_expr_map
                     .iter()
-                    .find(|(_, expr)| {
+                    .filter(|(_, expr)| {
                         matches!(expr, Expr::Generic(declared) if *declared == constraint_id)
                     })
-                    .and_then(|(entity_id, _)| {
-                        let declaration_span = **self.span_map.get(entity_id)?;
-                        if declaration_span.into_range().is_empty() {
-                            return None;
-                        }
-                        Some(crate::error::Note {
-                            span: declaration_span,
-                            msg: "the bound is declared here".to_string(),
-                            source: self.source_of_id(*entity_id),
-                        })
-                    });
+                    .filter(|(entity_id, _)| {
+                        self.span_map
+                            .get(*entity_id)
+                            .is_some_and(|declaration_span| {
+                                !declaration_span.into_range().is_empty()
+                            })
+                    })
+                    .map(|(entity_id, _)| *entity_id)
+                    .min_by_key(|entity_id| entity_id.0);
+                let note = declaration.map(|entity_id| crate::error::Note {
+                    span: **self.span_map.get(&entity_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: "the bound is declared here".to_string(),
+                    source: self.source_of_id(entity_id),
+                });
                 (span, msg, note)
             })
             .collect();
