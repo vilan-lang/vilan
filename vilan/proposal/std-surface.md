@@ -849,3 +849,57 @@ gained `entries`/`contains_value` on the `Map` fragment and
 `union`/`intersection`/`difference` on the `Set` fragment, each with a new
 compiled example. `std_twin_parity` is unaffected — `map`/`set` are not
 twinned (`browser`/`process`) modules, so no allowlist entry was needed.
+
+### 7.7.1 The bug above, root-caused and closed (B85, 2026-08-06)
+
+§7.7's "a real bug found, not fixed here" is fixed. Its framing was too
+narrow in one direction and too wide in another, and both corrections are
+the finding:
+
+- **It was never about `self`, or about a generic `impl`.** The `Set`
+  lowering was selected by asking the ITERABLE EXPRESSION for its type at
+  emission time (`is_set_typed(iterable_id)` → `expr_type_id`), and that
+  question is silent for every expression that does not *produce* a type of
+  its own. A bare reference to a parameter is one — so `self`, `other`, and
+  a plain `fun count(s: Set<i32>)` in a non-generic free function were all
+  equally broken — and so are a call result (`for x in make_set()`) and a
+  `*view` deref. The forms that worked, a `let` binding and a field access,
+  are exactly the forms the analyzer records a type for. `self` was simply
+  the most common parameter, never a special one.
+- **The fix is the type question, at the source.** The analyzer already
+  infers the iterable's type in `build()` — it needs it to decide the loop's
+  element type and native-vs-protocol lowering — and then discarded it. It
+  now keeps it (`Program::for_each_iterable_types`, keyed by loop id, the
+  same shape as `for_each_next`), and emission reads that instead of
+  re-deriving. Total by construction: there is no expression form left for
+  which the answer can go missing.
+
+The payoff §7.7 anticipated holds: `for x in self` inside `Set`'s own impl
+is legal and correct now. std's existing methods keep `self.table.values()`
+— rewriting them would be churn with no behavioural difference — but the
+comment in `set.vl` that recorded the workaround has been rewritten to say
+that the direct form is fine and the idiom is now a style choice.
+
+**A neighbour found by the sweep, NOT fixed, filed for the backlog.** `for
+x in map` compiles at every call site and iterates once. `Map` has no loop
+lowering and no `next`, i.e. it is not iterable at all — but the analyzer's
+un-iterable refusal (B56) only covers a generic or a bare trait `Self`; a
+STRUCT with no protocol method falls through to a native `for...of`, which
+over `Map`'s flat field array yields its one backing `NativeMap`. This is
+not B85 (no lowering is being skipped — none exists) and it is not
+parameter-shaped (a concrete local `Map` does it too). The fix is B56's own
+rule extended from generics to structs, with the natively-iterable built-ins
+(`List`, `Set`, `str`, `[T; n]`) as the exception; giving `Map` a loop form
+instead would be new surface, and §7.7 already declined to settle what `Map`
+iteration yields. Pinned `#[ignore]`d as
+`a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field`.
+
+Coverage: eight new pins in `crates/vilan-core/tests/inference.rs`, one per
+iterable shape (own-impl `self`, `&mut self` receiver, a second `Set<T>`
+parameter, a concrete and a generic free-function parameter, a call result,
+a `*view`, a field, a `let`, a loop binding, a closure parameter) plus the
+sibling containers (`List`/`str` inside their own impls). Non-vacuity was
+proven by restoring the pre-fix lookup in the transformer: the seven `Set`
+pins went red together and the sibling pin stayed green, which is the right
+split. Corpus goldens byte-identical — no program in the tree writes the
+shape, which is why it survived this long.

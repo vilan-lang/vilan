@@ -45,12 +45,15 @@ impl Set<type T: Hashable> {
 	}
 
 	// `union`/`intersection`/`difference` walk `self.table.values()` rather than
-	// `for x in self` — matching `values()` above — because the native `for x in
-	// set` lowering only fires for a *concrete* `Set`-typed expression at a call
-	// site; `self` inside `Set`'s own generic impl does not resolve that way and
-	// would iterate the struct's backing array instead of its elements. Every
-	// existing method in this file already routes through `.table` for the same
-	// reason; this is not a new workaround.
+	// `for x in self` — matching `values()` above, and every other method in this
+	// file. That started as a workaround: the native `for x in set` lowering used
+	// to fire only for an iterable that carried a type on its own expression, so
+	// `self` (or any parameter, call result or `*view`) fell through to a loop
+	// over the struct's one-element backing array. B85 fixed that at the root —
+	// the loop's iterable type now comes from the analyzer — so `for x in self`
+	// is a correct way to write these today. The `.table.values()` form stays
+	// because it is equivalent and rewriting it would be churn, NOT because the
+	// direct form is unsafe.
 
 	/// A new set holding every element that is in `self`, `other`, or both.
 	fun union(self, other: Set<T>): Set<T> {

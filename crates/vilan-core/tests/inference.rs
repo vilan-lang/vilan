@@ -37990,6 +37990,356 @@ fn the_map_set_parity_batch_needs_only_its_own_type_import() {
     );
 }
 
+// --- B85: `for x in <set>` fires for every form of the iterable ---------------
+//
+// The `Set` loop lowering (`__set_iter`, walking the backing map's values) used
+// to be chosen from a type lookup on the ITERABLE EXPRESSION, and that lookup is
+// silent for every expression that stores no type on its own id — a parameter
+// (`self` above all), a call result, a `*view`. Those loops fell through to a
+// bare `for...of` over the struct's one-element field array, so a 3-element set
+// counted 1, silently. The type now comes from the analyzer's own per-loop
+// record (`for_each_iterable_types`), which is total by construction; these pins
+// cover one shape of iterable each, plus the sibling containers whose loops must
+// keep lowering exactly as before.
+
+#[test]
+fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
+    // The recorded repro (std-surface.md §7.7). `self` is the case std's own
+    // `Set` methods have been routing around via `self.table.values()` by
+    // convention since I4; the direct form is what a user writes first.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun probe(self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            print(s.probe());   // 3, not 1
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
+    // Counting alone would also pass a loop that walked the right NUMBER of
+    // wrong things, so this one sums the elements: the backing-array lowering
+    // yields the `NativeMap` itself, which does not add.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun total(self): i32 {
+                mut sum = 0;
+                for x in self {
+                    sum = sum + 1;
+                }
+                sum
+            }
+        }
+        impl Set<i32> {
+            fun sum(self): i32 {
+                mut sum = 0;
+                for x in self {
+                    sum = sum + x;
+                }
+                sum
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(10);
+            s.insert(20);
+            s.insert(30);
+            print(s.total());   // 3
+            print(s.sum());     // 60 -- real elements, in insertion order
+        }
+        "#,
+        "3\n60\n",
+    );
+}
+
+#[test]
+fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
+    // The payoff, and the shape that found the bug: a `union` written the direct
+    // way (`for value in self` / `for value in other`) rather than through
+    // `self.table.values()`. The first draft of std's `union` was exactly this
+    // and returned length 1 for a 4-element union. std's existing methods keep
+    // their `.table.values()` idiom (rewriting them would be churn) -- what this
+    // pins is that the convention is no longer load-bearing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun merged(self, other: Set<T>): Set<T> {
+                mut result: Set<T> = Set::new();
+                for value in self {
+                    result.insert(value);
+                }
+                for value in other {
+                    result.insert(value);
+                }
+                result
+            }
+        }
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(3);
+            b.insert(4);
+            print(a.merged(b).len());   // 4, not 1
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun probe(&mut self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            print(s.probe());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
+    // Not an `impl` at all, and not generic: `self` was only the most common
+    // parameter, never the special one. A concrete `Set<i32>` parameter and a
+    // generic `Set<T>` one were equally broken.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        fun count_concrete(s: Set<i32>): i32 {
+            mut n = 0;
+            for x in s {
+                n = n + 1;
+            }
+            n
+        }
+        fun count_generic<T: Hashable>(s: Set<T>): i32 {
+            mut n = 0;
+            for x in s {
+                n = n + 1;
+            }
+            n
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            print(count_concrete(s));
+            print(count_generic(s));
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
+    // The other two forms that store no type on their own expr id. A `let`
+    // binding and a field access always worked (both are recorded), and are
+    // here as the regression half of the same pin.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        struct Holder {
+            inner: Set<i32>,
+        }
+        fun make(): Set<i32> {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s
+        }
+        fun from_call(): i32 {
+            mut n = 0;
+            for x in make() {
+                n = n + 1;
+            }
+            n
+        }
+        fun from_view(s: &Set<i32>): i32 {
+            mut n = 0;
+            for x in *s {
+                n = n + 1;
+            }
+            n
+        }
+        fun from_field(holder: Holder): i32 {
+            mut n = 0;
+            for x in holder.inner {
+                n = n + 1;
+            }
+            n
+        }
+        fun main() {
+            let s = make();
+            print(from_call());                       // call result
+            print(from_view(&s));                     // *view
+            print(from_field(Holder { inner = s }));  // field access
+            mut n = 0;
+            for x in s {                              // plain `let` binding
+                n = n + 1;
+            }
+            print(n);
+        }
+        "#,
+        "3\n3\n3\n3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_survives_nesting_and_a_closure_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun make(): Set<i32> {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s
+        }
+        fun main() {
+            mut n = 0;
+            for s in [make(), make()] {
+                for x in s {
+                    n = n + 1;
+                }
+            }
+            print(n);   // 6 -- the loop binding is a `Set`, not an element
+            let count = |s: Set<i32>| {
+                mut c = 0;
+                for x in s {
+                    c = c + 1;
+                }
+                c
+            };
+            print(count(make()));
+        }
+        "#,
+        "6\n3\n",
+    );
+}
+
+#[test]
+fn the_sibling_containers_iterate_inside_their_own_impls_too() {
+    // The sweep's other half. `List` and `str` are JS-native iterables, so their
+    // loops never needed a type-driven lowering and were never broken -- pinned
+    // here so the B85 change is proven not to have moved them either.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        impl List<type T> {
+            fun count(self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        impl str {
+            fun letters(self): i32 {
+                mut n = 0;
+                for c in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            print([1, 2, 3].count());
+            print("abc".letters());
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+#[ignore] // KNOWN BUG, found by B85's sweep: `for x in map` is silently wrong.
+fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
+    // `Map` has NO native loop lowering and no `next` -- it is not iterable at
+    // all. But the analyzer only refuses an uniterable subject when it is a
+    // generic or a bare trait `Self` (B56); a STRUCT with no protocol method
+    // falls through to a native `for...of`, which over `Map`'s flat field array
+    // yields its one backing `NativeMap`. So `for entry in scores` compiles and
+    // "iterates" exactly once, whatever the map holds -- at every call site, not
+    // just inside `Map`'s own impl, so this is B85's neighbour and not B85.
+    //
+    // The fix is B56's own rule ("this is an error, not a silent lowering")
+    // extended from generics to structs, with the natively-iterable built-ins
+    // (`List`, `Set`, `str`, `[T; n]`) as the exception. Giving `Map` a loop
+    // lowering instead would be new surface: std-surface.md §7.7 declined to
+    // settle what `Map` iteration yields (keys? values? pairs?), and
+    // `map.entries()` already covers the need.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+            scores.insert("b", 2);
+            mut n = 0;
+            for entry in scores {
+                n = n + 1;
+            }
+            print(n);
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
 // --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
 //
 // `display.vl` sits outside the always-loaded core set and outside its

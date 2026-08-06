@@ -3836,7 +3836,15 @@ impl<'src> Transformer<'src> {
                     .unwrap_or(js::Node::Void);
                 // `Set` is a vilan struct over a `NativeMap`; iterate the backing
                 // map's stored originals (`set[0].values()`), in insertion order.
-                let t_iterable = if self.is_set_typed(*iterable_id) {
+                //
+                // The type comes from the analyzer's own record for this loop
+                // (`for_each_iterable_types`) rather than from a lookup on the
+                // iterable expression: only the analyzer knows it for the forms
+                // that store no type on their own id — a parameter, and `self`
+                // above all, but equally a call, an `if`, a block, an `await` or
+                // a `*view`. Asking the expression left all of those looking
+                // untyped, and the lowering below silently didn't fire (B85).
+                let t_iterable = if self.for_each_iterates_a_set(id) {
                     self.used_helpers.insert("__set_iter");
                     js::Node::Call(
                         Box::new(js::Node::Local("__set_iter".to_string())),
@@ -6196,12 +6204,21 @@ impl<'src> Transformer<'src> {
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
-    /// Whether an expression's (monomorphized) type is the built-in `Set` — a
-    /// vilan struct wrapping a `NativeMap` (I1). Its elements are the backing
-    /// map's stored originals, so `for x in set` iterates `set[0].values()`.
-    fn is_set_typed(&self, expr_id: Id) -> bool {
-        self.expr_type_id(expr_id)
-            .map(|type_id| self.resolve_type_id(type_id))
+    /// Whether a `for x in ...` loop's iterable is the built-in `Set` — a vilan
+    /// struct wrapping a `NativeMap` (I1). Its elements are the backing map's
+    /// stored originals, so such a loop iterates `set[0].values()`.
+    ///
+    /// Keyed by the LOOP, not by the iterable expression: the analyzer recorded
+    /// the type it inferred there (`for_each_iterable_types`), which is the only
+    /// total answer. Re-deriving it here from the iterable's own expr id was
+    /// what B85 was — silent for every form that stores no type of its own, so
+    /// `for x in self` inside `Set`'s own impl, `for x in make_set()` and `for
+    /// x in *view` all walked the struct's one-element field array instead.
+    fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
+        self.program
+            .for_each_iterable_types
+            .get(&for_each_id)
+            .map(|type_id| self.resolve_type_id(*type_id))
             .and_then(|type_id| self.program.type_id_to_type_map.get(&type_id))
             .is_some_and(|type_| match type_ {
                 Type::Struct(id, _) => self

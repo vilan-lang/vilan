@@ -1500,6 +1500,14 @@ pub struct Analyzer<'src> {
     // For-each loops whose iterable is a custom iterator: the resolved `next`
     // method id, so codegen emits a `next()`/`Some`-matching loop instead.
     for_each_next: HashMap<Id, Id>,
+    // For-each loops → the type the iterable INFERRED to, by loop id. The
+    // transformer's native lowerings are chosen by that type, and it cannot
+    // recover it on its own: an iterable written as a parameter (`self` above
+    // all), a call, an `if`, a block, an `await` or a `*view` stores no type on
+    // its own expr id, so the emission-side lookup came back silent and the
+    // loop fell through to a bare `for...of` (B85). This is the same type the
+    // element and protocol decisions just above are made from, kept.
+    for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` / `for e in &list` — the loop binding is a view of each
     // element rather than a copy. Maps the binding id to whether the view is
     // writable (`&mut`). Drives the indexed-loop lowering + view classification.
@@ -2108,6 +2116,7 @@ impl<'src> Analyzer<'src> {
             untyped_comprehension_binders: HashSet::new(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::new(),
+            for_each_iterable_types: HashMap::new(),
             for_each_views: HashMap::new(),
             wrapped_view_captures: HashMap::new(),
             prepped_binary_ops: Vec::new(),
@@ -24070,6 +24079,16 @@ impl<'src> Analyzer<'src> {
         // (e.g. a `List`) stays a native `for...of`.
         for (for_each_id, iterable_id) in std::mem::take(&mut self.prepped_for_each) {
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
+            // Keep it: emission picks its native lowering by this same type, and
+            // it is the only place the type is known. A `for x in <expr>` whose
+            // iterable stores no type on its own expr id — a parameter (`self`
+            // included), a call, an `if`, a block, an `await`, a `*view` — read
+            // back untyped on the emission side, and every type-driven lowering
+            // silently didn't fire (B85: `for x in set` walked the `Set` struct's
+            // one-element backing array instead of its elements).
+            let iterable_type_id = iterable_type.clone().get_type_id(self);
+            self.for_each_iterable_types
+                .insert(for_each_id, iterable_type_id);
             // `for e in &mut container` drives a `next_mut(&mut self): Option<&mut
             // T>` iterator (each binding a writable view); a plain `for x in
             // container` drives `next`. A built-in `List`/`Set` has neither and
@@ -25553,6 +25572,13 @@ pub struct Program<'src> {
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
     pub for_each_next: HashMap<Id, Id>,
+    /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
+    /// native lowerings are chosen by it (`Set` walks its backing map's values,
+    /// everything else is a plain `for...of`), and emission cannot recover it —
+    /// an iterable written as a parameter (`self`), a call, an `if`, a block, an
+    /// `await` or a `*view` stores no type on its own expr id, so the lookup
+    /// came back silent and the loop fell through to the bare form (B85).
+    pub for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
@@ -29781,6 +29807,7 @@ fn analyze_over_world<'src>(
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,
         for_each_next: analyzer.for_each_next,
+        for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,
