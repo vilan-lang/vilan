@@ -17,6 +17,7 @@ impl List<type T> {
 	fun remove(&mut self, index: i32): T          // panics out of bounds
 	fun len(self): i32
 	fun is_empty(self): bool
+	fun iter(self): ListIterator<T>              // the lazy cursor; see Iterator
 	fun get(self, index: i32): Option<T>
 	fun first(self): Option<T>
 	fun last(self): Option<T>
@@ -40,7 +41,26 @@ impl List<type T: Display> { fun join(self, separator: str): str }
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
 `for e in &mut list` (in-place views; see the
-[memory model](../tour/memory-model.md)).
+[memory model](../tour/memory-model.md)). `list.iter()` hands back a
+`ListIterator<T>` — a cursor over a **snapshot** of the list, and the entry to
+the [adapter chain](#iterator). The snapshot is rule 1 at work (the cursor
+stores the list in a slot that outlives the call, so it copies), which means a
+`push` after `iter()` is not walked, and that `iter()` itself costs a copy:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut live = [1, 2];
+	mut cursor = live.iter();
+	live.push(3);
+	mut total = 0;
+	for value in cursor {
+		total += value;   // 1 + 2 — the snapshot predates the push
+	}
+	print(total);
+}
+```
 
 The methods that take `self` by value are pure — they return a new list and
 leave the receiver alone. The mutating ones take `&mut self`: `push`, `pop`,

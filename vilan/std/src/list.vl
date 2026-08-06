@@ -3,6 +3,7 @@
 // `push` is the native `.push`. Iterating a `List` uses a native `for...of`.
 import pkg::default::Default;
 import pkg::io::panic;
+import pkg::iterator::ListIterator;
 import pkg::operators::{ Add, Mul };
 import pkg::option::Option;
 
@@ -24,6 +25,15 @@ impl List<type T> {
 
 	fun is_empty(self): bool {
 		self.len() == 0
+	}
+
+	/// A lazy cursor over the list, and the entry to the adapter chain:
+	/// `xs.iter().filter(f).take(3).to_list()`. The cursor holds a SNAPSHOT
+	/// (rule 1), so mutating `xs` afterwards cannot disturb a walk in flight —
+	/// and the copy is why the eager methods below do not route through it for
+	/// a single pass.
+	fun iter(self): ListIterator<T> {
+		ListIterator { items = self, index = 0 }
 	}
 
 	/// A new list with `fn` applied to every element.

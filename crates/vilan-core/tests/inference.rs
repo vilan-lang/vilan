@@ -39307,3 +39307,171 @@ fn i5_iterator_from_fn_follows_the_repaired_receiver() {
         "1\n2\n-1\n",
     );
 }
+
+// --- I3 S3: `ListIterator` + `List::iter` (proposal/iterator-adapters.md P0) --
+// `List` reached none of the protocol: it implemented neither trait and had no
+// cursor, so the headline chain was blocked before any adapter existed.
+// `List::iter()` returns a concrete `ListIterator<T>` — concrete because a bare
+// trait type is not a value (B4), so an adapter chain's type has to stay
+// concrete end to end.
+
+#[test]
+fn list_iter_walks_the_elements_in_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut cursor = [1, 2, 3].iter();
+            for value in cursor {
+                print(value);
+            }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn list_iter_over_an_empty_list_is_immediately_exhausted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self };
+
+        fun main() {
+            let empty: List<i32> = [];
+            mut cursor = empty.iter();
+            print(cursor.next().is_none());
+            mut count = 0;
+            for _value in cursor {
+                count = count + 1;
+            }
+            print(count);
+        }
+        "#,
+        "true\n0\n",
+    );
+}
+
+#[test]
+fn list_iter_stays_exhausted_past_the_last_element() {
+    // Cursor exhaustion: `next` past the end keeps answering `None` rather than
+    // running off the array (the index guard, not a panic from `[]`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self };
+
+        fun main() {
+            mut cursor = [7].iter();
+            print(cursor.next().unwrap_or(-1));
+            print(cursor.next().unwrap_or(-1));
+            print(cursor.next().unwrap_or(-1));
+        }
+        "#,
+        "7\n-1\n-1\n",
+    );
+}
+
+#[test]
+fn list_iter_holds_a_snapshot_so_a_later_push_is_not_walked() {
+    // The rule-1 interaction, and the reason `iter` costs a copy: the cursor
+    // stores the list in a slot that outlives the call, so it snapshots.
+    // Mutating the list mid-walk cannot lengthen the walk — which is also what
+    // keeps rule 4 out of it, since the cursor shares no storage with `live`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut live = [1, 2];
+            mut cursor = live.iter();
+            live.push(3);
+            mut total = 0;
+            for value in cursor {
+                total = total + value;
+            }
+            print(total);
+            print(live.len());
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+fn list_iter_satisfies_an_iterator_bound() {
+    // `ListIterator` declares the trait, so it is accepted where the protocol is
+    // asked for by BOUND rather than by method name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+
+        fun count_of<I: Iterator<i32>>(mut source: I): i32 {
+            mut seen = 0;
+            for _value in source {
+                seen = seen + 1;
+            }
+            seen
+        }
+
+        fun main() {
+            print(count_of([4, 5, 6].iter()));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// --- Found while building I3 S3: a user `impl List<type T>` makes std's own
+// --- `List` methods report, nondeterministically ------------------------------
+
+/// A user-declared `impl List<type T>` block makes the entry-scoped checks
+/// report against std's OWN `List::map` / `List::filter` bodies — "the type of
+/// 'result' is never fully determined" against `mut result = List::new()` in
+/// `list.vl` — on roughly half of otherwise identical compiles of the SAME
+/// source. Two things are wrong at once:
+///
+/// 1. the diagnostic is **spurious**: `result` is fixed by the `result.push(..)`
+///    below it and by the declared return type, which is why the other half of
+///    the runs are clean; and
+/// 2. it points into **std**, whose definition-site diagnostics are meant to be
+///    frozen (`analysis-reuse.md` §6) — so a user's impl block is un-freezing
+///    entities it does not own.
+///
+/// The order-dependence is what makes it worth its own pin: a single compile
+/// proves nothing. It is also **cold-path only** — the base cache
+/// (`analysis-reuse.md` §6.10) serves every compile after the first in a
+/// process, and a served world is always the clean one, which is why a naive
+/// loop passes 300/300 and proves nothing either. So each attempt clears the
+/// cache first. Measured that way it fails roughly half the time, here and on
+/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predates this arc;
+/// `#[ignore]`d until the cause is found.
+///
+/// `base_cache_clear` is process-global, which is a second reason this stays
+/// ignored rather than joining the suite.
+#[test]
+#[ignore]
+fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
+    let source = r#"
+        import std::print;
+
+        impl List<type T> {
+            fun second_len(self): i32 {
+                self.len()
+            }
+        }
+
+        fun main() {
+            print([1, 2, 3].second_len());
+        }
+        "#;
+    for attempt in 0..20 {
+        vilan_core::analyzer::base_cache_clear();
+        if let Err(errors) = compile(source) {
+            panic!("attempt {attempt} reported against std: {errors:#?}");
+        }
+    }
+}

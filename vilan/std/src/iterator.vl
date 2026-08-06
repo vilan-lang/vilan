@@ -1,4 +1,4 @@
-import pkg::option::Option::{ self };
+import pkg::option::Option::{ None, Some, self };
 
 /// The lazy-sequence protocol. `next` advances the iterator's own state, so it
 /// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter
@@ -21,6 +21,29 @@ impl IteratorFromFn<type T> with Iterator<T> {
 impl Iterator<type T> {
 	fun from_fn(fn: || Option<T>): IteratorFromFn<T> {
 		IteratorFromFn { fn }
+	}
+}
+
+/// The cursor `List::iter()` hands back: an index over a SNAPSHOT of the list.
+/// The snapshot is rule 1 — `iter` receives its list by value, and storing a
+/// value in a slot that outlives the call copies it — so pushing to the list
+/// afterwards cannot disturb a walk already in flight. It also means `iter()`
+/// costs a copy of the list; the eager `List` methods that only need one pass
+/// still take one.
+struct ListIterator<T> {
+	items: List<T>,
+	index: i32,
+}
+
+impl ListIterator<type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		if self.index < self.items.len() {
+			let value = self.items[self.index];
+			self.index = self.index + 1;
+			Some(value)
+		} else {
+			None
+		}
 	}
 }
 
