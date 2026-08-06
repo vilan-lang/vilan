@@ -236,3 +236,124 @@ copies everything" each turns the golden red.
   `a_guard_that_needs_a_temporary_emits_it`; the fix is to emit guarded legs as
   nested ifs, which is the same restructuring §2.1's ordering discussion runs
   into and deserves its own slice.
+
+## 6. B81 — the alias path also READS late, 2026-08-06
+
+> The fourth gap of §2's review, the "non-place seam" family, at the shape it
+> actually reaches: a subject that is a **view**. §2.1 taught the alias path to
+> COPY what it captures and stopped there; it left the same path READING late.
+> Two seams, both closed here. Naming update: `materialize_capture_clones` is
+> now `materialize_captures` (it materializes non-copies too), and §3's row for
+> it reads against that name.
+
+### 6.1 The unstated premise
+
+`compile_is_pattern` records each capture as an accessor into the subject temp
+(`const $a = <subject>`) and substitutes it at **every reference**, so the slot
+is re-read wherever the capture is used. That is faithful only under a premise
+nothing ever wrote down: **the subject temp is a stable snapshot of the
+subject's value for the leg's lifetime.**
+
+Against an owned place it holds, and for a reason specific to how places
+change — an assignment **rebinds**. `feed = Feed::Ready(..)` installs a *fresh*
+aggregate and leaves `$a` holding the old one, so a deferred read still sees
+the pre-assignment value. Through a view it does not hold at all: a write
+through a view is an **in-place mutation of the very object `$a` aliases**,
+because that is how the write reaches the caller (`Object.assign(self, ..)`).
+Every deferred read in the leg then returns post-write state:
+
+```vilan
+fun step(&mut self): Option<str> {
+    if self is Feed::Ready(let items, let at) {
+        self = Feed::Ready(items, at + 1);
+        Some(items[at])            // indexed with at + 1
+    } else { None }
+}
+```
+
+`items` was already correct — an aggregate, so §2.1's copy declared it eagerly.
+`at` is an `i32`: it owes no copy, so the type filter dropped it before any
+elision was consulted and it kept its accessor `$a[2]`. Two `step`s over
+`Ready(["a","b","c"], 0)` printed `b`, `c`.
+
+The diagnosis came from the path that was *right*: an UNGUARDED `match` leg
+prints `a`, `b` on the identical program, because `compile_pattern` declares
+every capture as a real `const` at leg entry. Same subject, same view, same
+write — different pattern-compilation path. So the defect was never the view;
+it was the alias path's timing, which the view merely makes reachable.
+
+### 6.2 The rule
+
+> A capture from a subject rooted in a **writable view** is **materialized** —
+> read once, into a real declaration, at the match — whatever its type.
+
+Two independent questions, and separating them is the whole of the fix:
+**whether a capture COPIES** is settled by the capture's own type (§2.2's
+filter, unchanged), **when it is READ** by the subject's. `Program::
+materialized_captures` answers the second; `capture_clone_sites` still answers
+the first, and one statement carries both — `__clone` appears only when the
+copy is owed.
+
+That separation is what keeps both elisions intact. A SHARE materializes
+*without* `__clone`, so the alias it exists to preserve is preserved — only the
+slot read is frozen — and read-only walkers stay linear. The predicate asks
+about **writability** for the same reason: nothing can be written through a `&`
+view, so its temp is a snapshot again and `&self` methods keep their accessors
+verbatim. Widening it to every view is a byte-visible regression, pinned as
+such (`capture-clones.vl::width`).
+
+### 6.3 The resource shape
+
+R1 forbids the copy and B65 forbids inventing one — "there is no user-facing
+copy spelling in vilan to name", and `x is Some(let r)` is *always* a loan
+whatever the subject's form (`affine-moves.md` §9.1). So a resource capture is
+materialized bare: `const c = $a[1]`, which fixes **which value is loaned**
+without minting a second owner. It is not an error, and the reason is the
+decision order — the PLACE-subject twin of the same program accepts it and
+reads the pre-assignment payload, so rejecting it through a view would make the
+two paths differ in the opposite direction. B62's leg teardown is unaffected:
+`capture_drop_nodes` reads the alias table after materialization, so it finds
+the declared name and destroys the same value it always did.
+
+### 6.4 The second seam: `*view` was not a place at all
+
+`is_place_expr` excludes `Expr::Dereference`, so a `*v` subject collected **no
+capture candidates** — §2's rule was missing wholesale for that spelling, and
+even the aggregate captures aliased outright (`__at($a[1], $a[2])`, no
+`__clone` anywhere). A dereference is a place by every test that matters here;
+`place_root` and `readonly_root` both walk through it. The capture pass now
+asks `is_capture_subject_place`, which is `is_place_expr` plus `Dereference`.
+`is_place_expr` itself is left alone: rule 2's binding pass reads it against
+rule 3 (`assignment_target_is_view` — a forwarded view stays the same view, on
+purpose), a different question from the one a pattern subject asks.
+
+### 6.5 Pins, goldens, and what is left open
+
+Twelve pins in `inference.rs`, covering the value / List / resource payloads,
+nested patterns, guarded legs, unguarded `match`, both write orders, `&mut
+self`, a `&mut` parameter, a `*view` local, the `mut`-parameter twin, the place
+twin, and the `&self` line. Non-vacuity by three plants: materialization out
+(8 red), the deref widening out (1 red), and the copy out (1 red, on the pin
+that carries both shapes). The four that stay green under every plant are
+exactly the four that pin UNCHANGED behavior — the `mut`-parameter twin, the
+unguarded leg, the place-subject resource, and `&self`. `capture-clones.vl` gains `step`, `width` and
+`viewed_guarded` — the byte pin for the materialized declarations, the
+accessors that must NOT appear under `&self`, and B59's placement under the
+new rule (a guard reading a materialized capture takes the prelude shape). The
+golden's pre-existing bytes are unchanged; the fix moved no corpus program,
+because none had the shape.
+
+**Left open — the place path has the same seam, one write-form over.** A
+component write to an owned place mutates in place too, so the alias path's
+deferred read is wrong there as well:
+
+```vilan
+mut t = (7, 3);
+if t is (let a, let b) { t.1 = 99; print(b) }   // 99, want 3
+```
+
+Not widened into this arc on purpose. The rule above is *total* for its class —
+a writable view has no shape where its temp is a snapshot — whereas the place
+case needs either an alias analysis or materializing every capture
+unconditionally, and the latter moves goldens across the corpus and turns B59's
+placement question on for every guarded leg. Filed rather than patched.
