@@ -6287,7 +6287,8 @@ impl<'src> Analyzer<'src> {
         // An overwrite (R2) drops the binding's OLD value in place — the same
         // binding type. Seed those too, in case the binding is overwritten but
         // later moved out (so it is not in `dropped_bindings`).
-        let overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        let mut overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        overwrites.sort_unstable_by_key(|assignment_id| assignment_id.0);
         for assignment_id in overwrites {
             if let Some(Expr::Assignment(target_id, _)) =
                 self.expr_id_to_expr_map.get(&assignment_id)
@@ -6354,6 +6355,15 @@ impl<'src> Analyzer<'src> {
                     worklist.extend(glue.members.member_type_ids());
                 }
             }
+            // The seed types and the glue's members are both HashSet-ordered,
+            // so this list arrived in hash order — and it is an EDGE LIST that
+            // `platform_color` walks in order under a `visited` once-guard,
+            // which quotes the TRAIL that reached a boundary. Two drop impls
+            // meeting below the same off-platform callee would therefore have
+            // named different chains in the same diagnostic. Order is carried
+            // by nothing here (every successor is walked), so canonical id
+            // order is free.
+            methods.sort_unstable_by_key(|method| method.0);
             if !methods.is_empty() {
                 edges.insert(root, methods);
             }
@@ -10210,7 +10220,7 @@ impl<'src> Analyzer<'src> {
     /// to codegen (so the migration off `*` is byte-identical). Runs after
     /// `infer_borrows`, so `borrows`-call targets are recognized.
     fn rewrite_view_assignment_targets(&mut self) {
-        let assignments: Vec<(Id, Id, Id)> = self
+        let mut assignments: Vec<(Id, Id, Id)> = self
             .expr_id_to_expr_map
             .iter()
             .filter_map(|(id, expr)| match expr {
@@ -10218,6 +10228,16 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             .collect();
+        // The loop MINTS entity ids (`wrap_in_deref`), so a hash-ordered walk
+        // does not merely visit the assignments in an arbitrary order — it
+        // hands each synthetic `Dereference` a different id every run. Nothing
+        // downstream reads those ids in a way that reaches an emitted byte or a
+        // diagnostic today (measured: 20 cold compiles permute all 26 ids and
+        // produce one emission and one diagnostic list), but several passes do
+        // order and tie-break on `Id.0`, so leaving the mint order to a hash
+        // seed is a trap set for whichever of them starts to. Assignment ids
+        // are themselves walk order, so this is source order.
+        assignments.sort_unstable_by_key(|(assignment_id, _, _)| assignment_id.0);
         for (assignment_id, target_id, value_id) in assignments {
             // The target: a bare view writes *through*, so deref it.
             if !matches!(
