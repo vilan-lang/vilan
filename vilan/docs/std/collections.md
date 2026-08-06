@@ -352,6 +352,39 @@ name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
 not it declares the trait. Declaring it is what buys the adapters below — and
 what lets a generic bound accept your type.
 
+The name is what resolves, but the **shape is still checked**: the method has to
+return an `Option`, because the loop stops at `None`. A `next` annotated with
+anything else is a compile error rather than a loop that quietly runs zero
+times.
+
+### What a `for` can iterate
+
+Exactly two things:
+
+- **A type with `next`** (or `next_mut`, for `for e in &mut it`) — the protocol
+  above.
+- **A natively iterable value**: `List<T>`, a fixed array `[T; n]`, a tuple, a
+  `str` (yielding its characters), `Set<T>` (insertion order), and any host type
+  an `external struct` names.
+
+Anything else is a compile error. A struct or enum of your own that provides no
+`next` is *not* iterable — it has no meaning to fall back on, since a struct is
+its fields and an enum is its variant tag at runtime:
+
+```vilan,fragment
+struct Cursor { items: List<i32>, index: i32 }
+
+fun main() {
+	mut walked = Cursor { items = [1, 2], index = 0 };
+	for item in walked {   // cannot iterate `Cursor`: it has no `next`
+		print(item);
+	}
+}
+```
+
+`Map` is in that group: walk it through `entries()`, `keys()` or `values()`, as
+the `Map` section above does.
+
 ### Adapters
 
 Every `Iterator` gets these, as trait defaults — implement `next` and you have

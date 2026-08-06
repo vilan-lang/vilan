@@ -42291,21 +42291,30 @@ fn a_structurally_named_tuple_element_still_projects() {
     );
 }
 
-/// Found while repairing B78's own pin, which named its protocol method `step`
-/// and therefore never reached the protocol at all. `for x in subject` over a
-/// CONCRETE struct that has no `next` is not diagnosed — it silently lowers to
-/// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
-/// array. The program below prints `[ 1, 2 ]` and `0` — the two fields of
-/// `Cursor` — and exits 0.
-///
-/// This is P3/B56's defect one type-shape over. B56 closed it for a GENERIC
-/// subject (`report_uniterable_for_each`: "cannot iterate `T`: no bound on it
-/// provides `next`"), and the same reasoning applies verbatim to a concrete
-/// struct — a struct is not natively iterable either, and the fallback is
-/// nonsense rather than a different meaning. `#[ignore]`d: it asserts the
-/// desired outcome (a diagnostic) and today the program compiles and runs.
+// --- B80: a concrete subject with no protocol member ------------------------
+// Found while repairing B78's own pin, which named its protocol method `step`
+// and therefore never reached the protocol at all. `for x in subject` over a
+// CONCRETE struct or enum that has no `next` was not diagnosed — it lowered to
+// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
+// array (a struct) or its `[tag, ..payload]` array (an enum), so the program
+// printed the representation and exited 0.
+//
+// This is P3/B56's defect one type-shape over: B56 closed it for a GENERIC
+// subject (`report_uniterable_for_each`), and the same reasoning applies
+// verbatim to a concrete one. The rule the fix states is name AND shape — the
+// protocol stays duck-typed on the METHOD NAME (`iterator-adapters.md` §1), but
+// the subject must actually carry that method, and a `next` annotated with
+// something other than `Option<T>` is rejected rather than driven.
+//
+// The deliberate native forms are exempt: an `external struct` (a host handle
+// whose runtime shape is JavaScript's — `List`, `str`, `Bytes`, `NativeMap`)
+// and `Set` (the one ordinary vilan struct with a lowering of its own,
+// `__set_iter`). `[T; n]` and tuples never reach the arm.
+
+/// B80's own repro, verbatim from the `#[ignore]`d pin B78's arc filed: before
+/// the fix this printed `[ 1, 2 ]` and `0` — the two fields of `Cursor` — and
+/// exited 0.
 #[test]
-#[ignore]
 fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
     assert_fails_with(
         r#"
@@ -42316,6 +42325,333 @@ fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
         fun main() {
             mut walked = Cursor { items = [1, 2], index = 0 };
             for item in walked {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The enum twin of the same hole, both shapes. A data-less `enum Color` lowers
+/// to `[0]` (the representation rule is a CONJUNCTION — all-data-less AND
+/// any-explicit-discriminant — so a bare data-less enum is still a tagged
+/// array), and printed `0`; a payload variant `Shape::Circle(3)` is `[0, 3]`
+/// and printed `0` then `3`.
+#[test]
+fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Color { Red, Green, Blue }
+
+        fun main() {
+            let shade = Color::Red;
+            for value in shade {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun main() {
+            let shape = Shape::Circle(3);
+            for value in shape {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The protocol resolves on a MEMBER, and a field is not a member: a struct
+/// with a field literally named `next` provides nothing to drive. Before the
+/// fix this printed `5` then `7` — the field array, `next` included.
+#[test]
+fn a_field_named_next_does_not_satisfy_the_for_protocol() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Link { next: i32, value: i32 }
+
+        fun main() {
+            mut link = Link { next = 5, value = 7 };
+            for item in link {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// A fieldless struct is `[]` at runtime, so the fallback loop ran zero times
+/// and exited 0 — silently doing nothing rather than silently doing the wrong
+/// thing. It is the same missing member and gets the same diagnostic. (This is
+/// also why the exemption reads the declared `external` modifier and not
+/// "has no fields": a bodyless `external struct` and `struct Marker {}` are
+/// indistinguishable by field count.)
+#[test]
+fn a_for_loop_over_a_field_less_struct_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Marker {}
+
+        fun main() {
+            mut marker = Marker {};
+            for item in marker {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The name alone used to resolve the protocol, so a `next` DECLARED to return
+/// anything else was driven anyway: the lowering reads the `Option` tag off the
+/// result, `(5)[0]` is `undefined`, `undefined !== 0` breaks, and the loop ran
+/// ZERO times and exited 0. The diagnostic names the return type it found.
+#[test]
+fn a_next_that_does_not_return_option_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self): i32 {
+                self.count += 1;
+                self.count
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
+                print(item);
+            }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+}
+
+/// The `&mut` form drives `next_mut`, so it is a separate member and a separate
+/// diagnostic — including for a subject that has `next` and only `next`, which
+/// is the sharper case: `for item in down` is legal and `for item in &mut down`
+/// is not, and the message must name `next_mut` rather than `next`.
+#[test]
+fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in &mut walked {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        struct Down { left: i32 }
+
+        impl Down {
+            fun next(&mut self): Option<i32> {
+                if self.left <= 0 { None } else { self.left = self.left - 1; Some(self.left) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { left = 2 };
+            for item in &mut down {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+}
+
+/// A `Map` is an ordinary vilan struct over a `NativeMap`, and it has no `next`
+/// — so the fallback walked its one field and printed the backing map itself
+/// (`Map(1) { 'a' => [ 'a', 1 ] }`), exit 0. It is now diagnosed, and the
+/// message names the three documented ways to walk one.
+#[test]
+fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::map::Map;
+
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("alice", 1);
+            for entry in scores {
+                print(entry);
+            }
+        }
+        "#,
+        "`entries()`, `keys()` or `values()`",
+    );
+}
+
+/// The exemption set, end to end and at runtime: an `external struct` whose
+/// runtime shape is the host's (`List` — a JS array; `str` — a JS string,
+/// yielding characters; `Bytes` — a `Uint8Array`), `Set` (the `__set_iter`
+/// lowering over the backing map's stored originals), and the two shapes that
+/// never reach the struct/enum arm at all (`[T; n]` and a tuple). None of these
+/// declares a `next`, and every one of them must keep iterating.
+#[test]
+fn the_deliberate_native_iteration_forms_still_iterate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::bytes::{ Bytes, encode_utf8 };
+
+        fun main() {
+            for item in [1, 2] { print(item); }
+            for character in "ab" { print(character); }
+            let fixed: [i32; 2] = [3, 4];
+            for item in fixed { print(item); }
+            let pair = (5, 6);
+            for item in pair { print(item); }
+            mut seen: Set<i32> = Set::new();
+            seen.insert(7);
+            for item in seen { print(item); }
+            for byte in encode_utf8("h") { print(byte); }
+        }
+        "#,
+        "1\n2\na\nb\n3\n4\n5\n6\n7\n104\n",
+    );
+}
+
+/// The positive control the whole check is measured against: a struct that DOES
+/// declare `next(&mut self): Option<T>` drives the loop exactly as before,
+/// whether the method is inherent or comes with an `Iterator` clause, and so
+/// does `Range` (std's own). An unannotated `next` is not judged on its return
+/// type — `IteratorFromFn::next` is written that way in std and infers its
+/// `Option<T>` from its body — so `Iterator::from_fn` must keep working too.
+#[test]
+fn a_subject_that_declares_next_still_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::range::Range;
+        import std::iterator::Iterator;
+        import std::option::{Option, Some, None};
+
+        struct Countdown { remaining: i32 }
+        impl Countdown with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.remaining <= 0 { None } else { self.remaining -= 1; Some(self.remaining) }
+            }
+        }
+
+        struct Inherent { at: i32 }
+        impl Inherent {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut countdown = Countdown { remaining = 2 };
+            for value in countdown { print(value); }
+            mut inherent = Inherent { at = 0 };
+            for value in inherent { print(value); }
+            for value in Range::new(0, 2) { print(value); }
+            mut counted = 0;
+            mut produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 2 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n0\n1\n2\n0\n1\n1\n2\n",
+    );
+}
+
+/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
+/// trait default is reachable as a call (`empty.next()` resolves and returns
+/// `None`) but does not drive a loop — `method_member_candidates` reads the
+/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
+/// nothing. Before the fix the loop fell through to the native `for...of` and
+/// printed the `unused` field; now it is a clean "cannot iterate", which is the
+/// right interim answer but not the right final one. `#[ignore]`d: it asserts
+/// the desired outcome (the default drives the loop, printing `99` only).
+#[test]
+#[ignore]
+fn a_next_inherited_from_a_trait_default_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Empty { unused: i32 }
+        impl Empty with Fixed<i32> {}
+
+        fun main() {
+            mut empty = Empty { unused = 0 };
+            for item in empty { print(item); }
+            print(99);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+/// The half of the wrong-signature family the fix deliberately does NOT judge:
+/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
+/// std is written that way and infers `Option<T>`. A body that yields nothing
+/// therefore still reaches the lowering, which reads `undefined[0]` and throws
+/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
+/// than silent, so not the same class as B80 — but it should be a compile
+/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
+/// compiles and the failure is the runtime's.
+#[test]
+#[ignore]
+fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self) {
+                self.count += 1;
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
                 print(item);
             }
         }
