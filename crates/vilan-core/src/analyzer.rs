@@ -25996,6 +25996,77 @@ impl<'src> Program<'src> {
         self.diagnostic_sources.push(source);
     }
 
+    /// Put the diagnostic and warning lists into their ONE canonical order
+    /// (diagnostics-standard.md C1). Called at the end of
+    /// [`crate::post_analysis_passes`] — the last point at which either list
+    /// grows — so every consumer inherits it: the CLI's terminal rendering, the
+    /// language server's publish, and the HMR overlay.
+    ///
+    /// Diagnostics are produced by dozens of checks and many of them walk a
+    /// `HashMap`, so PUSH order was a randomly-seeded artifact. Two things fall
+    /// out of that. The terminal listed the same program's errors in a different
+    /// order run to run — untidy but survivable. And `hmr::render_overlay`
+    /// TRUNCATES at a cap, so *which* errors reached the browser changed run to
+    /// run, which is not. One policy here beats a sort in every producer.
+    ///
+    /// The key is: the file, then the position in it, then what the diagnostic
+    /// renders as. The source must lead — a [`Span`] is a byte offset into its
+    /// own file and carries no file identity, so spans from two files are not
+    /// comparable. The content tail (message, then the note's location and text)
+    /// is what makes this a total order over what a reader actually SEES; the
+    /// note belongs in it because sites like `emit_generic_leak` and
+    /// `emit_r11_violations` deliberately emit several diagnostics that share a
+    /// span and a message and differ only there.
+    ///
+    /// The sort is STABLE, so a producer's own ordering still decides between
+    /// entries this key cannot separate — which is why the local sorts upstream
+    /// (the C1 comments in `check_generic_bound_satisfaction`, the resource
+    /// checks, `init_order`) stay: this normalizes, it does not excuse.
+    pub fn normalize_diagnostic_order(&mut self) {
+        fn key<'a>(
+            error: &'a Error,
+            source: SourceId,
+        ) -> (
+            u32,
+            usize,
+            usize,
+            &'a str,
+            Option<(u32, usize, usize, &'a str)>,
+        ) {
+            (
+                source.0,
+                error.span.start,
+                error.span.end,
+                error.msg.as_str(),
+                error.note.as_ref().map(|note| {
+                    (
+                        note.source.unwrap_or(source).0,
+                        note.span.start,
+                        note.span.end,
+                        note.msg.as_str(),
+                    )
+                }),
+            )
+        }
+        fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
+            // `push_diagnostic` pads lazily, so the attribution vector can be
+            // SHORTER than the list it describes. Materialize the implicit
+            // entry-file tail before permuting, or that tail loses its file.
+            sources.resize(entries.len(), SourceId(0));
+            let mut paired: Vec<(Error, SourceId)> =
+                entries.drain(..).zip(sources.drain(..)).collect();
+            paired.sort_by(|(left, left_source), (right, right_source)| {
+                key(left, *left_source).cmp(&key(right, *right_source))
+            });
+            for (entry, source) in paired {
+                entries.push(entry);
+                sources.push(source);
+            }
+        }
+        sort_in_step(&mut self.diagnostics, &mut self.diagnostic_sources);
+        sort_in_step(&mut self.warnings, &mut self.warning_sources);
+    }
+
     /// The program's call graph: ONE build per analysis, shared by everything
     /// that runs once the context rewrite has landed (E35, `const-eval.md`
     /// §8.4).

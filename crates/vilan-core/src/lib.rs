@@ -522,6 +522,12 @@ pub fn post_analysis_passes(
     // rather than a load-time `ReferenceError`. Runs last: the relation is
     // only meaningful for a program that analyzed cleanly.
     init_order::check_cycles(program);
+    // THE seam for diagnostic order (E38, diagnostics-standard.md C1). Nothing
+    // after this point adds to either list, and both pipelines run this
+    // function, so normalizing here is what every consumer reads — including
+    // the HMR overlay, which shows only the first `OVERLAY_DIAGNOSTIC_CAP` of
+    // them and so needs the order to be an answer, not an artifact.
+    program.normalize_diagnostic_order();
 }
 
 /// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value
