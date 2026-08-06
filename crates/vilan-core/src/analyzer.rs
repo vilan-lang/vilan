@@ -18428,7 +18428,14 @@ impl<'src> Analyzer<'src> {
                 }
                 (a.clone(), bindings)
             }
-            (Type::Tuple(l_items), Type::Tuple(r_items)) => {
+            // Two tuples unify only at the SAME arity — the arity is part of the
+            // type, exactly as an array's length is (the arm below) and a
+            // closure's parameter count is. A mismatch falls through to the
+            // no-reconcile path, so `(i32, str)` and `(i32, str, bool)` are
+            // distinct. It used to zip, which silently truncated to the shorter
+            // side and yielded a 2-tuple for that pair — an arity the write
+            // never named (B70 tail, variadic-generics.md §T.8).
+            (Type::Tuple(l_items), Type::Tuple(r_items)) if l_items.len() == r_items.len() => {
                 let mut result_items = Vec::with_capacity(l_items.len());
                 let mut all_bindings = Vec::new();
                 for (l_item_id, r_item_id) in l_items.iter().zip(r_items.iter()) {
@@ -18655,15 +18662,19 @@ impl<'src> Analyzer<'src> {
             (Type::Struct(..) | Type::Enum(..), Type::Trait(trait_id, _)) => {
                 self.type_implements_trait(a, *trait_id)
             }
+            // Arity first, like the closure arm below and like `reconcile_type`'s
+            // tuple arm: a bare `zip` compares the common prefix and calls
+            // `(i32, str)` compatible with `(i32, str, bool)`.
             (Type::Tuple(l_items), Type::Tuple(r_items)) => {
-                l_items
-                    .iter()
-                    .zip(r_items.iter())
-                    .all(|(l_item_id, r_item_id)| {
-                        let l = l_item_id.get_type(self);
-                        let r = r_item_id.get_type(self);
-                        self.compare_type_rigid(&l, &r, substitution_context, rigid)
-                    })
+                l_items.len() == r_items.len()
+                    && l_items
+                        .iter()
+                        .zip(r_items.iter())
+                        .all(|(l_item_id, r_item_id)| {
+                            let l = l_item_id.get_type(self);
+                            let r = r_item_id.get_type(self);
+                            self.compare_type_rigid(&l, &r, substitution_context, rigid)
+                        })
             }
             // Same nominal type: compatible when the arguments are (a side with
             // no arguments is an erased/abstract `List`/`Option`, compatible with

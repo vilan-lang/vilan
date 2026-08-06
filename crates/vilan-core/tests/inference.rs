@@ -25761,6 +25761,199 @@ fn a_generic_valued_tuple_element_stays_nested_so_its_offsets_hold() {
     );
 }
 
+// --- B70 tail (§T.8): a tuple's ARITY is part of its type. `reconcile_type`'s
+// --- tuple arm zipped without a length check — unlike the array arm beside it,
+// --- which unifies only at the same length, and the closure arm, which unifies
+// --- only at the same parameter count — so it compared the common prefix and
+// --- called `(i32, str)` a match for `(i32, str, bool)`, yielding a 2-tuple
+// --- nobody wrote. Every position that reaches the reconciler accepted one
+// --- silently. One pin per position.
+
+/// §T.8 tail — an annotated binding. The plainest form: the write says three
+/// slots and the value has two, and it compiled clean.
+#[test]
+fn an_annotated_binding_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let t: (i32, str, bool) = (1, "x");
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — an argument against a declared parameter type.
+#[test]
+fn an_argument_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun need(t: (i32, str, bool)) {
+            print(t.0);
+        }
+        fun main() {
+            need((1, "x"));
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — a body reconciled against its declared return type.
+#[test]
+fn a_return_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun make(): (i32, str, bool) {
+            (1, "x")
+        }
+        fun main() {
+            print(make().0);
+        }
+        "#,
+        "Expected (i32, str, bool), but got (i32, str) instead.",
+    );
+}
+
+/// §T.8 tail — an assignment to an already-typed binding.
+#[test]
+fn an_assignment_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (1, 2);
+            t = (1, 2, 3);
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, i32), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — two `match` legs reconciled against each other.
+#[test]
+fn match_legs_reject_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let k = 1;
+            let t = match k { 1 => (1, 2), _ => (1, 2, 3) };
+            print(t.0);
+        }
+        "#,
+        "match legs have mismatched types",
+    );
+}
+
+/// §T.8 tail — a list literal's elements, unified against the first one's type.
+#[test]
+fn a_list_literal_rejects_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun main() {
+            let xs = [(1, 2), (1, 2, 3)];
+            print(xs.len());
+        }
+        "#,
+        "Expected (i32, i32) (this literal's element type), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — one generic parameter bound from two arguments. The reconciler is
+/// what decides they are the same `T`, so a truncating zip made two different
+/// tuple types agree.
+#[test]
+fn one_generic_bound_from_two_arguments_rejects_tuples_of_different_arities() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun pick<T>(a: T, b: T): T {
+            a
+        }
+        fun main() {
+            let t = pick((1, 2), (1, 2, 3));
+            print(t.0);
+        }
+        "#,
+        "Expected (i32, i32), but got (i32, i32, i32) instead.",
+    );
+}
+
+/// §T.8 tail — trait conformance (B29) compares through `compare_type_rigid`,
+/// whose tuple arm zipped the same way. An impl returning a tuple of a different
+/// arity than the trait declares was accepted.
+#[test]
+fn a_conformance_return_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        trait Pairs {
+            fun make(self): (i32, i32);
+        }
+        struct S { n: i32 }
+        impl S with Pairs {
+            fun make(self): (i32, i32, i32) { (1, 2, 3) }
+        }
+        fun main() {
+            let s = S { n = 1 };
+            print(s.make().0);
+        }
+        "#,
+        "`S`'s `make` returns `(i32, i32, i32)`, but `Pairs` declares `(i32, i32)`",
+    );
+}
+
+/// §T.8 tail — the same through a conformance PARAMETER position, which is the
+/// other `compare_type_rigid` call site.
+#[test]
+fn a_conformance_parameter_rejects_a_tuple_of_the_wrong_arity() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        trait Takes {
+            fun take(self, p: (i32, i32)): i32;
+        }
+        struct S { n: i32 }
+        impl S with Takes {
+            fun take(self, p: (i32, i32, i32)): i32 { p.0 }
+        }
+        fun main() {
+            let s = S { n = 1 };
+            print(s.take((1, 2, 3)));
+        }
+        "#,
+        "parameter 1 of `S`'s `take` is `(i32, i32, i32)`, but `Takes` declares `(i32, i32)`",
+    );
+}
+
+/// §T.8 tail — the arity check must not cost the MATCHING case anything: same
+/// arity still unifies, still binds a generic element, and still runs.
+#[test]
+fn tuples_of_the_same_arity_still_reconcile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun pick<T>(a: T, b: T): T {
+            b
+        }
+        fun main() {
+            let t: (i32, str) = (1, "x");
+            print(t.0);
+            let picked = pick((1, 2), (3, 4));
+            print(picked.1);
+        }
+        "#,
+        "1\n4\n",
+    );
+}
+
 // --- J2 value-flow asyncness: the marker on fields and return types,
 // --- adoption for unannotated bindings, and the divergence refusals
 // --- (backlog J2 "REMAINING" channels — closing the static-type/runtime-

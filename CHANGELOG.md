@@ -16,6 +16,8 @@ An element whose type is still a generic parameter deliberately stays nested, an
 
 The spread form was never affected and still is not: `(..make(), 6)` has always been correct, because a `..` splices for having been *written* as one and asks no type question at all. Record: `proposal/variadic-generics.md` §T.8.
 
+**A tuple's arity is part of its type again.** `let t: (i32, str, bool) = (1, "x")` compiled clean, and so did passing a two-tuple where a three-tuple was declared, returning one, assigning one, putting both in a list literal, binding both to one generic, and writing an impl whose method returns a tuple of a different arity than the trait declares. The unifier compared tuples by walking the pair until the shorter one ran out — so it agreed on the common prefix and never noticed the rest — where the array unification beside it has always required the same length and the closure unification the same parameter count. It requires the same arity now, in both the unifier and the trait-conformance comparison that had the same hole. Nine pins, each planted red.
+
 ## v0.29.0 — 2026-08-04
 
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
