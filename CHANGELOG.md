@@ -94,6 +94,21 @@ makes with `Display`. That constraint is pinned as a compiler fact, so when
 per-member bounds arrive the move onto the trait is additive and the record says
 why it could not be there first.
 
+**`List`'s own `map`/`filter`/`fold`/`for_each` are unchanged**, and the reason
+is recorded rather than left implicit. The plan was to re-express them over the
+adapters — `self.iter().map(fn).to_list()` — so that each name has exactly one
+meaning. Built and measured, it turned out to remove something that works today:
+an **async closure cannot adapt through an adapter chain**, because an adapter
+stores the closure in a field and calls it from a trait-dispatched `next`, where
+there is no single concrete callee to instantiate. `xs.map(async work)` stops
+compiling, and the corpus program that exists to pin adaptation stops building.
+It also cost about **5.5x** on a 20 000-element `map`→`filter`→`fold` — not from
+the per-element calls, but from two O(n) deep copies the eager loop does not pay:
+`iter()` snapshots the list, and the terminal copies the chain holding that
+snapshot. So the eager four keep their bodies. Nothing is ambiguous as a result:
+`List` does not implement `Iterator`, so the lazy `map` is reached only through
+`.iter()` and the two are told apart by what they are called on.
+
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
 
 **It also fixes something you could not fix from outside.** Two writes in flight over one signal corrupted it. An older write that fails *after* a newer one succeeded rolled the newer value away — probe it through the free function and the screen ends up showing the value the cell started at while the server holds one from two writes later. The cell discards a superseded outcome (the newest write owns the cell, and the outcome still returns to its own caller), and a rollback lands on the last value the **server** confirmed rather than on whatever the signal happened to hold when the write began. Those are two different questions, so confirmations carry their own counter and an out-of-order reply cannot walk the recorded truth backwards.

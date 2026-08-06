@@ -40330,3 +40330,69 @@ fn a_custom_conformer_gets_every_termination_for_free() {
         "4\n10\n4\ntrue\n4\n1\n2\n",
     );
 }
+
+// --- I3 S7: why the eager `List` forms were NOT re-expressed over the
+// --- adapters (proposal/iterator-adapters.md §4 option ii, §8) ---------------
+
+/// §4 ratified re-expressing `List::map`/`filter`/`fold`/`for_each` as
+/// `self.iter().map(fn).to_list()`, and §8 asked for a measurement before that
+/// rewrite landed. The measurement found a blocker the paper did not
+/// anticipate, and it is not the performance one: **an async closure cannot
+/// adapt through an adapter chain.**
+///
+/// Async polymorphism (A.1) instantiates an ASYNC instance of the callee when
+/// the closure argument is async. An adapter STORES the closure in a struct
+/// field and calls it from a trait-dispatched `next`, where there is no single
+/// concrete callee to instantiate — so the pass refuses it:
+///
+/// ```text
+/// an async closure cannot adapt a trait/generic-dispatched call (the concrete
+/// callee varies per instantiation); bind the callee concretely, or declare the
+/// trait parameter `async || T`
+/// ```
+///
+/// The repro below touches no std: it is a user's own eager helper written over
+/// the adapters. With `List::map` re-expressed, the same error lands inside
+/// `list.vl` and `vilan/test/adapt.vl` — the corpus test that exists to pin
+/// adaptation — fails to BUILD. `map`, `filter` and `fold` all break this way;
+/// `for_each` survives, having nothing to return.
+///
+/// So the eager four keep their eager bodies. The collision §4 exists to remove
+/// does not arise in what shipped — `List` does not implement `Iterator`, so the
+/// lazy `map`/`filter` are reachable only through `.iter()`, which is §4's own
+/// "degrades gracefully" state — and `an_async_closure_adapts_map_and_runs_
+/// sequentially` above is the standing guard that the eager path still adapts.
+///
+/// `#[ignore]`d because it asserts the DESIRED outcome: when adaptation learns
+/// to follow a trait-dispatched callee, this goes green and option (ii) becomes
+/// available. The measured cost stands separately and is recorded in the
+/// proposal: the adapter path ran ~5.5x slower than the eager loop on a
+/// 20 000-element `map`→`filter`→`fold` (8-9 ms against 49-50 ms, best of
+/// seven), from two O(n) deep copies the eager form does not pay — `iter()`
+/// snapshots the list, and the terminal's `mut self` copies the chain that
+/// holds it.
+#[test]
+#[ignore]
+fn an_async_closure_adapts_through_an_adapter_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+
+        fun mapped<T, U>(source: List<T>, fn: |T| U): List<U> {
+            source.iter().map(fn).to_list()
+        }
+
+        fun main() {
+            let lengths = mapped(["ab", "cdef"], |url| {
+                let length = url.len();
+                sleep(1);
+                print(length);
+                length
+            });
+            print(lengths);
+        }
+        "#,
+        "2\n4\n[ 2, 4 ]\n",
+    );
+}

@@ -710,3 +710,138 @@ own B-section backlog items, fixed inside this arc as S2.* They are not
 iterator features and would be bugs with or without adapters; filing them
 separately keeps the record honest about what was broken versus what was
 added, and lets S2 be reviewed as a compiler fix on its own terms.
+
+## 11. Implementation notes (2026-08-06, the I3 + I5 build)
+
+Appended by the slice that built S1–S5. The paper above is unchanged; this
+section records where the built thing differs from it and why. Three of the
+four items are things the paper asserted without probing.
+
+### S1–S5 shipped as written
+
+`next(&mut self)` (P1), `Range with Iterator<i32>`, `ListIterator<T>` +
+`List::iter` (P0), the seven adapters as trait defaults —
+`map`/`filter`/`take`/`skip`/`enumerate`/`zip`/`chain` — and the terminals
+`to_list`/`fold`/`for_each`/`count`/`any`/`all`/`rev`, `rev` being §6's
+materializing fallback. §3's home call held: a terminal written in a
+trait-SUBJECT inherent impl (`impl Iterator<type T> { .. }`) is still the
+verbatim B4 error on `self.next()` after B55/B56/B58, so trait defaults are
+the only home, exactly as §3 argued.
+
+### Deviation 1 — `to_set`/`to_map` are `List` methods, not trait defaults
+
+§5 recommends them "as trait defaults" and says their bounds "already have a
+home". They do not. `Iterator<T>` does not bound `T`; a trait default may
+not require a bound its trait does not declare; and a member cannot carry a
+bound of its own that unifies with `T`. Written as a default, `to_set` is a
+compile error **at its own definition**, before any call:
+
+```
+generic parameter 'T' is missing the bound ': Hashable' required by this call
+  … the bound is declared here  →  impl Set<type T: Hashable>
+```
+
+Probed in all three shapes — the direct `Set::new()` construction, a forward
+to a bounded `List::to_set`, and a bounded trait-subject impl (which fails
+earlier, on B4). A member generic that carries the bound
+(`fun to_set<E: Hashable>(mut self): Set<E>`) type-checks in the body and
+then cannot be inferred at any call site, which is the `collect` ergonomics
+the owner rejected, arriving by a different road.
+
+Shipped instead, beside the bounds they need — the `join`-on-`Display`
+precedent:
+
+```vilan
+impl List<type T: Hashable>            { fun to_set(self): Set<T> }    // set.vl
+impl List<(type K: Hashable, type V)>  { fun to_map(self): Map<K, V> } // map.vl
+```
+
+`to_map`'s impl subject binds the element **structurally**, which is how both
+of a `Map`'s requirements get stated at once; that this parses and
+monomorphizes is itself a finding. The chain reads
+`xs.iter().filter(f).to_list().to_set()`. Moving them onto the trait is
+purely additive whenever per-member bounds exist, and the constraint is
+pinned as a compiler fact so the record says why they could not be there
+first.
+
+### Deviation 2 — §4 option (ii) did NOT land, and the reason is not performance
+
+§8 asked for a measurement before the eager forms were re-expressed. The
+rewrite was made, measured, and reverted; both results are recorded here.
+
+**The blocker: an async closure cannot adapt through an adapter chain.**
+Async polymorphism (A.1) instantiates an async instance of the *callee* when
+the closure argument is async. An adapter stores the closure in a struct
+field and calls it from a trait-dispatched `next`, where there is no single
+concrete callee to instantiate, so the pass refuses it:
+
+```
+an async closure cannot adapt a trait/generic-dispatched call (the concrete
+callee varies per instantiation); bind the callee concretely, or declare the
+trait parameter `async || T`
+```
+
+With `List::map` re-expressed, that error lands inside `list.vl` and
+`vilan/test/adapt.vl` — the corpus program that exists to pin adaptation —
+**fails to build**. `map`, `filter` and `fold` all break this way;
+`for_each` survives, having nothing to return. So option (ii) as written
+removes a shipped, corpus-pinned capability. Pinned `#[ignore]`d as
+`an_async_closure_adapts_through_an_adapter_chain`, with a repro that
+touches no std: the same failure comes from a user's own eager helper
+written over the adapters.
+
+**The measurement, separately.** `map`→`filter`→`fold` over 20 000 elements,
+50 rounds, best of seven, after warm-up: **8–9 ms eager against 49–50 ms
+through the adapters — about 5.5x.** §8 predicted a per-element call cost but
+not the real driver, which is two O(n) *deep copies* the eager form does not
+pay: `iter()` snapshots the list (rule 1 — storing a value in a slot that
+outlives the call copies it, emitted as `__clone(self)`), and the terminal's
+`mut self` copies the chain that holds that snapshot. The §8 claim that "the
+adapter chain in between allocates nothing that survives" is therefore wrong
+for a `List` source. Output was byte-identical either way, so observable
+behaviour was preserved; the cost is real.
+
+**What not landing costs.** Less than §4 assumed. The collision §4 exists to
+remove does not arise in what shipped: `List` does not implement `Iterator`
+(S6/`Iterable` was left for its own slice), so the lazy `map`/`filter` are
+reachable only through `.iter()` and the two are told apart by the receiver
+type at the call site. That is §4's own "degrades gracefully" state, and it
+already has one meaning per name. What remains unpaid is the duplicated
+body — four short eager methods — which is the smaller half of (ii)'s case.
+
+**For the owner.** (ii) needs adaptation to follow a trait-dispatched callee
+before it can land at all, and wants an answer on the 5.5x even then. Both
+are recorded rather than decided here.
+
+### Deviation 3 — S6 (`Iterable`) untouched
+
+Open question (b) recommends S6 as a follow-on and this slice took that.
+`Iterable<T>` is left exactly as it shipped — one parameter, returning a bare
+`Iterator<T>`, still unusable under B4 and still implemented by nothing but
+its own blanket impl. The collections page stops claiming it works. The
+two-parameter `Iterable<T, I: Iterator<T>>` that S6 wants is unaffected by
+anything here.
+
+### Two defects found on the way, both pre-existing, both pinned `#[ignore]`d
+
+1. **A user `impl List<type T>` block makes the checks report against std's
+   own `List::map`/`List::filter`** — "the type of 'result' is never fully
+   determined" — on roughly half of otherwise identical compiles. The
+   diagnostic is spurious *and* it points into frozen std territory
+   (`analysis-reuse.md` §6), so a user's impl is un-freezing entities it does
+   not own. Reproduced on 39c951c at 14/30 through the CLI, so it predates
+   this arc. It is cold-path only: the base cache serves every compile after
+   the first in a process and always serves the clean world, so a loop that
+   does not clear the cache is vacuous.
+
+2. **The protocol loop drops a tuple element's type when the iterator's
+   element IS its own generic parameter.** `for pair in [(1, "a")].iter()`
+   gives "cannot access field '0' on type T", while the same iterator pulled
+   by hand (`if cursor.next() is Some(let pair)`) is fine, and the native
+   `for pair in [(1, "a")]` over a plain `List` has always worked. The repro
+   defines its own trait and cursor, so this is neither std's nor the arc's;
+   `List::iter` is simply the first generically-elemented iterator in std, so
+   it is the first thing that could reach the shape. `enumerate` and `zip` are
+   unaffected — they name their tuple element structurally in the `with`
+   clause — which places the defect in the loop binding's substitution alone.
+   Documented on the collections page rather than left to be discovered.
