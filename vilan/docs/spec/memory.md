@@ -120,6 +120,40 @@ A consequence worth naming: the list a pure `List` method returns never shares
 element storage with its receiver. Writing through an element of `xs.map(f)`,
 `xs.filter(p)`, `xs.sort_by(c)`, or `xs.reverse()` cannot show up in `xs`.
 
+A **pattern capture** is a binding, so it copies too — and the copy is taken
+when the pattern *matches*. A capture therefore holds what its subject held at
+that moment, and no later write to the subject can reach back into it. This
+holds however the write is spelled, the two that differ underneath included:
+assigning the subject **rebinds** it, while assigning through a **view** of it
+mutates its storage in place. Neither is visible through a capture:
+
+```vilan
+import std::print;
+
+enum Feed { Ready(List<str>, i32), Done }
+
+impl Feed {
+	fun step(&mut self): str {
+		if self is Feed::Ready(let items, let at) {
+			self = Feed::Ready(items, at + 1);
+			ret items[at];   // the index the match found, not at + 1
+		}
+		"-"
+	}
+}
+
+fun main() {
+	mut feed = Feed::Ready(["a", "b", "c"], 0);
+	print(feed.step());   // a
+	print(feed.step());   // b
+}
+```
+
+A capture of a **resource** payload is the one case that takes no copy (R1, §6.8):
+it is a loan of the payload, so it names the value the match found rather than a
+second owner of it — the timing above is what makes "the value the match found"
+well defined.
+
 ## 6.2 Rule 2 — elision is an optimization, never observable
 
 An implementation may skip a copy (reuse the storage) when no conforming

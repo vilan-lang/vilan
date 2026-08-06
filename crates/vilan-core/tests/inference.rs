@@ -3113,6 +3113,435 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 }
 
 // ---------------------------------------------------------------------------
+// B81 (rule 1 through a VIEWED subject). B53 made the alias path COPY what it
+// captures; it left the alias path READING late. Each capture stays an
+// accessor into the subject temp, re-read at every reference, which is a
+// faithful snapshot only while the subject can change by REBINDING — through a
+// `&mut` view it changes IN PLACE (that is how the write reaches the caller),
+// so every deferred read in the leg saw post-write state. Captures of a
+// writable-view subject are now read once, at the match. See
+// proposal/capture-clones.md §6.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
+    // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
+    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to `Object.assign(self,
+    // ..)`, mutating the very array `$a` aliases, so `items[at]` indexed with
+    // the INCREMENTED `at`. Printed "b\nc" for two steps over ["a","b","c"].
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): Option<str> {
+                if self is Feed::Ready(let items, let at) {
+                    self = Feed::Ready(items, at + 1);
+                    Some(items[at])
+                } else {
+                    None
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step().unwrap());
+            print(feed.step().unwrap());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_mut_parameter_subject_is_unchanged() {
+    // The twin that was always right, pinned so the fix cannot move it: a
+    // by-value `mut` parameter IS the callee's own copy (H9), so the subject
+    // rebinds and each call re-reads the caller's untouched value. Not a view,
+    // so no capture materializes and the emitted shape is byte-for-byte what
+    // B53 shipped.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun step(mut feed: Feed): Option<str> {
+            if feed is Feed::Ready(let items, let at) {
+                feed = Feed::Ready(items, at + 1);
+                Some(items[at])
+            } else {
+                None
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(step(feed).unwrap());
+            print(step(feed).unwrap());
+        }
+        "#,
+        "a\na\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_mut_view_parameter_reads_the_prematch_value() {
+    // The same hole reached through an ordinary `&mut` parameter rather than
+    // `&mut self` — the predicate is the parameter's CONVENTION, not the
+    // receiver position. Printed "b\nc".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun step(feed: &mut Feed): str {
+            if feed is Feed::Ready(let items, let at) {
+                feed = Feed::Ready(items, at + 1);
+                items[at]
+            } else {
+                "-"
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(step(&mut feed));
+            print(step(&mut feed));
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
+    // The second seam, and the worse one: `is_place_expr` excludes
+    // `Expr::Dereference`, so a `*view` subject collected NO capture
+    // candidates at all — B53's copy rule was missing wholesale for that
+    // spelling, and even the AGGREGATE capture aliased (`__at($a[1], $a[2])`,
+    // no `__clone` anywhere). Both halves are pinned here: `items` must be a
+    // copy and `at` must be the pre-match index. Printed "a" only after both
+    // fixes; before, "b".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            let view = &mut feed;
+            if *view is Feed::Ready(let items, let at) {
+                view = Feed::Ready(items, at + 1);
+                print(items[at]);
+            }
+        }
+        "#,
+        "a\n",
+    );
+}
+
+#[test]
+fn a_destructure_of_a_dereferenced_view_copies_its_captures() {
+    // The deref seam is not confined to the alias path — the capture pass
+    // gates `Expr::Destructure` on the same predicate, so `let (xs, n) =
+    // *view` collected no candidates either and B53's copy never fired. This
+    // one has nothing to do with reading late: `xs` simply aliased the
+    // subject's element, and growing it through the view grew the capture.
+    // Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            let view = &mut pair;
+            let (xs, n) = *view;
+            view.0.push(9);
+            print(xs.len());
+            print(n);
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
+    // A guard puts the leg on the alias path too, so it carries the same hole
+    // — and it is the ordering-sensitive one: `materialize_captures` runs
+    // BEFORE the guard is walked and re-points the alias table, so a guard
+    // that reads a materialized capture forces B59's prelude shape or the
+    // emitted guard names a binding that has not been declared yet. Printed
+    // "b\nc".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): str {
+                match self {
+                    Feed::Ready(let items, let at) if at >= 0 => {
+                        self = Feed::Ready(items, at + 1);
+                        items[at]
+                    }
+                    _ => "-",
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step());
+            print(feed.step());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_leg_on_a_viewed_subject_was_already_right() {
+    // The negative half of the diagnosis, pinned: an UNGUARDED leg compiles
+    // through `compile_pattern`, which declares every capture as a real
+    // `const` at leg entry — it never reads late, so it never had the bug.
+    // That asymmetry is what identified the alias path as the seam rather
+    // than the view.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): str {
+                match self {
+                    Feed::Ready(let items, let at) => {
+                        self = Feed::Ready(items, at + 1);
+                        items[at]
+                    }
+                    Feed::Done => "-",
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step());
+            print(feed.step());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn both_capture_shapes_survive_an_in_place_write_through_the_view() {
+    // The two payload shapes in one leg, and the sharper form of the write:
+    // not a whole-subject reassignment but COMPONENT writes through the view
+    // (`pair.0.push`, `pair.1 = 9`), which mutate the subject's storage
+    // without going near the subject binding.
+    //
+    // `items` is B53's business — an aggregate capture COPIES, so growing the
+    // source to 4 leaves it at 3. `at` is B81's — a scalar owes no copy, so it
+    // kept an accessor and read the 9. One pin, red either way: 12 without the
+    // materialization, 4 without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun grow(pair: &mut (List<str>, i32)): i32 {
+            if pair is (let items, let at) {
+                pair.0.push("d");
+                pair.1 = 9;
+                items.len() + at
+            } else {
+                -1
+            }
+        }
+        fun main() {
+            mut pair = (["a", "b", "c"], 0);
+            print(grow(&mut pair));
+            print(pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_nested_capture_from_a_viewed_subject_reads_the_prematch_value() {
+    // Every capture in the tree, not just the top level: the inner tuple's
+    // `xs`/`k` and the outer `at` all read through the same subject temp.
+    // 2 + 3 + 4; post-write it was 4 + 7 + 5.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Pair {
+            Two((List<i32>, i32), i32),
+            Neither,
+        }
+        impl Pair {
+            fun step(&mut self): i32 {
+                if self is Pair::Two((let xs, let k), let at) {
+                    self = Pair::Two(([9, 9, 9, 9], 7), 5);
+                    xs.len() + k + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut pair = Pair::Two(([1, 2], 3), 4);
+            print(pair.step());
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn a_viewed_capture_read_before_and_after_the_write_agrees() {
+    // Both orders in one leg. A read BEFORE the write was always right (the
+    // accessor had nothing to observe yet); the bug was only visible AFTER,
+    // which is exactly what makes the two disagree. The binding is one value,
+    // so 3 + 3 — not 3 + 13.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): i32 {
+                if self is Feed::Ready(let items, let at) {
+                    let before = at;
+                    self = Feed::Ready(items, at + 10);
+                    before + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a"], 3);
+            print(feed.step());
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_viewed_subject_loans_the_prematch_payload() {
+    // R1/R11 and B65's doctrine, at the viewed subject. A resource payload has
+    // no copy to make — "there is no user-facing copy spelling in vilan to
+    // name" (affine-moves.md §9.1), and `x is Some(let r)` is always a LOAN
+    // whatever the subject's form — so the capture is materialized WITHOUT
+    // `__clone`: `const c = $a[1]`, which fixes WHICH value is loaned without
+    // minting a second owner. That is what the place-subject twin below
+    // already does, and matching it is the whole rule. 1 + 0, not 9 + 5.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Conn {
+            id: i32,
+        }
+        enum Slot {
+            Full(Conn, i32),
+            Empty,
+        }
+        impl Slot {
+            fun peek(&mut self): i32 {
+                if self is Slot::Full(let c, let at) {
+                    self = Slot::Full(Conn { id = 9 }, 5);
+                    c.id + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut slot = Slot::Full(Conn { id = 1 }, 0);
+            print(slot.peek());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_place_subject_loans_the_prematch_payload() {
+    // The place twin the rule above is calibrated against: the same program
+    // with an owned `mut` local reads the pre-assignment payload because the
+    // assignment REBINDS and the subject temp keeps the old aggregate. It was
+    // already right, and pinning it is what makes "indistinguishable from the
+    // place path" a checked claim rather than a stated one.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Conn {
+            id: i32,
+        }
+        enum Slot {
+            Full(Conn, i32),
+            Empty,
+        }
+        fun main() {
+            mut slot = Slot::Full(Conn { id = 1 }, 0);
+            if slot is Slot::Full(let c, let at) {
+                slot = Slot::Full(Conn { id = 9 }, 5);
+                print(c.id + at);
+            }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_readonly_view_subject_keeps_its_shared_accessors() {
+    // The scope line, and the reason the predicate asks about WRITABILITY
+    // rather than view-ness. Nothing can be written through a `&` view, so its
+    // subject temp is a snapshot again and its captures keep the accessor —
+    // and with it B53's SHARE elision, which exists to stop read-only walkers
+    // deep-copying at every level. Widening the rule to every view would have
+    // taken that back for `&self` methods.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun peek(&self): i32 {
+                if self is Feed::Ready(let items, let at) {
+                    items.len() + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            let feed = Feed::Ready(["a", "b"], 5);
+            print(feed.peek());
+        }
+        "#,
+        "7\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B54 / A20 (rule 1 at the STORE seams). A place read into a slot of an
 // aggregate that outlives the expression must copy: a construction literal's
 // element/field/payload (B54), and the argument of a container method that
