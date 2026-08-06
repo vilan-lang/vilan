@@ -1479,10 +1479,15 @@ fn a_duplicate_function_name_is_silently_shadowed_rather_than_rejected() {
         errors.is_empty(),
         "vilan now rejects a duplicate definition: {errors:?}"
     );
-    // Two blocks on one subject are accepted just the same, which is the shape
-    // a second `impl` for the constructor idiom would have produced.
+    // Across two blocks the duplicate IS rejected — B74 widened the
+    // duplicate-inherent error to statics in this same cycle, so the mixed
+    // static/method pair a second constructor-idiom `impl` would have
+    // produced is a hard error, not a silent loss. bindgen's single-`impl`
+    // emission therefore guards against the ONE case the language still
+    // accepts (the same-block overwrite above), and this assert keeps the
+    // cross-block direction honest.
     assert!(
-        compile(
+        !compile(
             "external struct Reply;\n\
              impl Reply {\n\
              \t[extern(method, \"json\")]\n\
