@@ -671,6 +671,24 @@ struct Adaptation {
 /// are async, sorted for a stable key.
 type InstanceKey = (Id, Vec<Id>);
 
+/// Record the call that instantiates an adapted instance, keeping the LEAST id.
+///
+/// The origin is the span every transitive violation found inside the instance
+/// anchors at (`origin.unwrap_or(call_id)` in `sync_violations_at` and its
+/// siblings), so it is an ANSWER, not bookkeeping. The worklist that discovers
+/// instances is seeded from `program.functions.keys()` — hash order — so
+/// "whichever call discovered it first" was a coin flip; ids are minted in walk
+/// order, so the least one is the earliest instantiating call in the program.
+fn record_origin(origins: &mut HashMap<InstanceKey, Id>, key: &InstanceKey, call_id: Id) {
+    match origins.get_mut(key) {
+        Some(existing) if existing.0 <= call_id.0 => {}
+        Some(existing) => *existing = call_id,
+        None => {
+            origins.insert(key.clone(), call_id);
+        }
+    }
+}
+
 fn compute_adaptation(
     program: &Program,
     graph: &CallGraph,
@@ -722,7 +740,7 @@ fn compute_adaptation(
                 if !bits.is_empty() {
                     let key = (callee, bits);
                     instance_async.entry(key.clone()).or_insert(false);
-                    origins.entry(key.clone()).or_insert(call.call_id);
+                    record_origin(&mut origins, &key, call.call_id);
                     if queued.insert(key.clone()) {
                         pending.push(key);
                     }
@@ -768,6 +786,12 @@ fn compute_adaptation(
                                     .entry(callee_key.clone())
                                     .or_default()
                                     .insert(key.clone());
+                                // Every encounter, not just the discovering one:
+                                // the worklist is seeded from a hash-ordered key
+                                // set, so "the call that discovered it first" is
+                                // not a stable answer, and this id becomes the
+                                // SPAN a transitive violation reports at.
+                                record_origin(&mut origins, &callee_key, call.call_id);
                                 match instance_async.get(&callee_key) {
                                     Some(flag) => *flag,
                                     None => {
@@ -775,7 +799,6 @@ fn compute_adaptation(
                                         // re-run this one when its flag
                                         // lands.
                                         instance_async.insert(callee_key.clone(), false);
-                                        origins.insert(callee_key.clone(), call.call_id);
                                         if queued.insert(callee_key.clone()) {
                                             pending.push(callee_key);
                                         }
@@ -848,7 +871,21 @@ fn compute_adaptation(
     let field_stores = plain_closure_field_stores(program);
     let return_sites = plain_closure_return_sites(program);
     let mut reported_escapes: HashSet<Id> = HashSet::new();
-    let keys: Vec<InstanceKey> = instance_async.keys().cloned().collect();
+    // C1: this pass is FIRST-WINS across instances — `reported` and
+    // `reported_escapes` let one instance claim a violation and silence the
+    // others — and each instance anchors its diagnostic at its OWN origin. So a
+    // hash-ordered walk chose WHICH call site a transitive `sync` / host /
+    // escape violation named, and whether a note attached at all. Walk the
+    // instances in origin order instead: the earliest-minted instantiating call
+    // wins, base instances (no origin, and no diagnostics of their own) first.
+    let mut keys: Vec<InstanceKey> = instance_async.keys().cloned().collect();
+    keys.sort_by_key(|key| {
+        (
+            origins.get(key).map(|origin| origin.0),
+            key.0.0,
+            key.1.iter().map(|bit| bit.0).collect::<Vec<u32>>(),
+        )
+    });
     for key in keys {
         let (root, ref bits) = key;
         let members = component(root);
