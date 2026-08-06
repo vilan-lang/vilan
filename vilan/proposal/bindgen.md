@@ -702,3 +702,325 @@ anything that already exists.
    language feature request bindgen's design surfaces but doesn't itself
    need — flagged for the project owner's call on whether it's worth
    opening as its own backlog item.
+
+---
+
+## 9. Implementation notes (2026-08-06, take-up)
+
+Everything below was found by **running** the compiler at take-up, not by
+re-reading the document. Where it contradicts §§1–8, the running compiler
+wins and the deviation is stated plainly. The STATUS block above is
+untouched.
+
+### 9.1 The parser: written here, not oxc (deviates from §2)
+
+§2 recommends `oxc_parser` and conditions it on a gate: *"whoever takes this
+item up should run `cargo about generate` against a real `Cargo.lock` with
+oxc added and read its own output before assuming the license surface is
+clean."* That was run. **It fails**, though not on the crate §2 predicted:
+
+```
+error: failed to satisfy license requirements
+   ┌─ …/dragonbox_ecma-0.1.12/Cargo.toml:40:12
+40 │ license = "Apache-2.0 WITH LLVM-exception OR BSL-1.0"
+```
+
+`dragonbox_ecma` is reached through `oxc_syntax`, which every oxc crate
+depends on unconditionally — no feature flag drops it. Neither licence branch
+is on `about.toml`'s **closed** `accepted` list, so adopting oxc means
+amending the project's licence policy, which is the owner's call and not a
+side effect of a tool.
+
+Two further costs, both measured rather than estimated:
+
+- **44 new crates**, not the "closer to a dozen" §2 predicted — 136 → 180
+  packages in `Cargo.lock`, a 32% growth for one non-build-time subcommand.
+- §1 puts the machinery in `vilan-core`, and **`vilan-wasm` depends on
+  `vilan-core` unconditionally**. The playground artifact is deliberately
+  size-tuned (`Cargo.toml`'s `wasm-release` profile exists for exactly that),
+  and would link a whole JavaScript parser it can never call.
+
+A third, smaller: oxc 0.143 requires rustc 1.95 and this toolchain is 1.90, so
+the lockfile would pin 0.110 — 33 releases behind.
+
+**Resolution: a purpose-built `.d.ts` parser** (`crates/vilan-core/src/
+bindgen/dts.rs`). A `.d.ts` is declaration-only — no expressions, no
+statements, no bodies, no JSX, no regex literals — so the grammar is small,
+and this repo already contains a hand-written lexer and parser for a much
+larger language. Cost: **zero** new dependencies, no licence-policy change,
+`THIRD-PARTY-NOTICES.txt` and `Cargo.lock` untouched (`cargo test -p vilan-cli
+--test third_party_notices` passes unchanged). It chewed 39,429 lines of
+`lib.dom.d.ts` in under 8 s. If the owner prefers oxc, the swap is one module
+behind an unchanged `bindgen::generate` seam plus two `about.toml` entries.
+
+### 9.2 What crosses a host boundary — four corrected rows
+
+OWNER NOTE 2 asked one row to be verified. Verifying it exposed a shared root
+cause under three more: **a vilan aggregate has a vilan-owned runtime
+representation, and a host does not speak it.** Only an `external struct` — an
+opaque handle reached through `[extern(get/set, …)]` — crosses intact.
+
+| § | Row as written | What running it does | Now |
+|---|---|---|---|
+| 3.9 | `{ [index: number]: T }` → `List<T>` | `List<T>` is a native JS **array**. An array-*like* (`{0:"a", length:1}`) has no `Symbol.iterator`, so `for`-in throws `TypeError: … is not iterable` — and `map`/`filter`/`fold`/`for_each`/`reverse` are all built on `for`-in. A real array with **holes** is worse than sparse-tolerant: each hole arrives as `undefined` in a `T`-typed slot and crashes on first use. | TODO, naming `Array.from` as the fix. `T[]`/`Array<T>` → `List<T>` **is** correct and kept. |
+| 3.9 | `{ [key: string]: T }` → `Map<str, T>` | `std::map::Map` is a **plain vilan struct** wrapping a `NativeMap` keyed by `key.hash()` (`std/src/map.vl:11-13`), not a host object. A host `{"a":1}` read through it dies on `.has`. | TODO, steering to per-key `[extern(get, …)]` accessors. |
+| 3.3 | discriminated union → `enum` + payload structs | A vilan `enum` lowers to `[tag, …payload]`; the TS union is a tagged **object**. `match` compiles to `value[0] === 0`, matches no arm, and crashes. Payload `struct`s could not receive the fields either. | TODO, steering to an opaque handle plus a hand-written tag accessor. |
+| 3.2 | every absence → `Option<T>` | `Option` is a tagged array (`Some(v)` = `[0, v]`, `None` = `[1]`). **Reading:** a host returning `"hello"` is tested as `value[0] === 0`, i.e. `"h" === 0`, so a *present* value arrives as `None`. **Writing:** `None` reaches the host as `[1]`, which for an optional `boolean` is **truthy** — `arc(…, counterclockwise?)` silently reverses. | Bare type + a `///` note. An optional **parameter** becomes one binding per call arity (§9.3). |
+
+The fact underneath all four: `struct Point { x: f64 }` lowers to `[x]` and
+`p.x` to `p[0]`, so a plain `struct` reads the wrong slots of a host object
+and yields `undefined` **silently**. This promotes §3.8's v1 recommendation
+("`external struct` always") from a judgment call to a requirement — the
+alternative it weighed is not merely less ergonomic, it is wrong.
+
+The one aggregate that *does* cross: a vilan **tuple** is a JS array, so TS
+`[A, B]` → `(A, B)` is exact.
+
+Both facts are pinned as tests that go red if the language changes
+(`crates/vilan-core/tests/bindgen.rs::a_vilan_struct_is_a_positional_array_at_runtime`,
+`::option_cannot_cross_a_host_boundary_in_either_direction`).
+
+### 9.3 Optional parameters: one binding per arity (replaces §3.2's row)
+
+Since `Option` cannot cross, and making an optional parameter *required*
+would force callers to invent a value the host is meant never to see, the
+exact mapping is the one TypeScript's own rule hands over: **optionals are
+trailing**, so `f(a, b?)` is exactly two call shapes. bindgen emits both, of
+the same host symbol, with the short one keeping the plain name:
+
+```
+[extern(method, "getContext")] external fun get_context(self, id: str): …;
+[extern(method, "getContext")] external fun get_context_with_options(self, id: str, options: …): …;
+```
+
+This is not a new idea — `std/src/browser/dom.vl:63-70` already binds one
+`appendChild` twice, as `append` and `append_text`. With two or more optionals
+the shortest and longest arities are bound and the intermediate ones are
+TODO'd rather than combinatorially expanded.
+
+### 9.4 OWNER NOTE 1 — backed enums do not exist; the question is the language's
+
+**Answer: no.** A vilan enum discriminant is `= (-)? integer` and nothing else
+(`crates/vilan-core/src/parsing.rs::parse_discriminant`); `enum Align { Start
+= "start" }` is a parse error (*"found '=' expected ',' or '}'"*). So bindgen
+ships §3.3's match-wrapper as drafted.
+
+**The language question, recorded here rather than decided inside bindgen:**
+should an enum carry a **string** backing value? The precedent is already
+built and is exactly the right shape — a C-like enum (`all_data_less &&
+any_explicit_discriminant`, `analyzer.rs:15367`) is `is_numeric` and lowers to
+its **bare discriminant**: `enum Ordering { Less = -1, … }` compiles
+`Ordering::Greater` to `1`, not to a tagged array. A string-backed enum
+lowering to its bare string would make bindgen's entire match-wrapper
+machinery unnecessary — the enum would *be* the host's string — and would give
+the same benefit to every hand-written binding in std (`fetch.vl`'s methods,
+`dom.vl`'s event names). It is worth its own backlog item; bindgen is
+evidence for it, not the place to settle it.
+`crates/vilan-core/tests/bindgen.rs::a_vilan_enum_cannot_carry_a_string_backing_value`
+goes red the day it lands, and points at the code to delete.
+
+### 9.5 Smaller deviations and additions
+
+- **§5, type aliases.** An alias whose right-hand side maps to no *declaration*
+  (`type GLenum = number`) is now **transparent**: substituted at every
+  reference rather than TODO'd. Without it `lib.dom.d.ts` alone reported ~1,500
+  references to types it plainly declares (`GLenum` 428, `GLint` 240, …).
+- **Attribute order is fixed**, and §4's examples do not say so: the parser's
+  chain is `extern`, `must_use`, `rpc`, `trait_only`, `doc(hidden)`,
+  `platform` (`parsing.rs:2903-2913`). `[platform(…)]` before `[extern(…)]` is
+  a parse error.
+- **Interfaces get an `Object()` constructor.** §3.2 cites `RequestInit` as
+  the precedent to follow; that precedent *includes* `[extern("Object")]
+  external fun new_request_init()` (`fetch.vl:109-110`), without which the
+  options-bag direction the section spends three paragraphs on cannot be
+  written at all.
+- **`extends` is flattened** (base members copied in, derived wins, generic
+  arguments substituted) — §3.7/§3.8 do not rule on it. Flattening is what a
+  human writing the binding does and the only mapping that leaves the derived
+  type usable. It does **not** recover assignability: `Element` is still not
+  accepted where `Node` is expected, which is §3.8's nominal limit.
+- **Name collisions get a deterministic `_2` suffix** (a property `align` and a
+  method `setAlign` both want `set_align`), assigned in source order so §6's
+  byte-stability gate holds.
+- **A string literal that is not an identifier** is prefixed: `"2d"` in
+  `type OffscreenRenderingContextId` becomes variant `_2d`. This was the single
+  construct that stopped 410k generated lines from parsing — found by the probe.
+- **`--stats`** reports coverage per construct, so §6's "fourth, softer check"
+  is a measurement rather than a claim.
+
+## 10. Probe results — `lib.dom.d.ts` (2026-08-06)
+
+The closing step of E31, and the evidence the deferred canvas item (A17) was
+waiting on: **can the global APIs be autogenerated?**
+
+**Input.** `typescript@5.9.3`'s `lib/lib.dom.d.ts` — 39,429 lines, 2,415
+top-level declarations (1,262 `interface`, 823 `declare var`, 279 `type`, 48
+`declare function`, 2 `declare namespace`). Obtained with `npm pack typescript@5`
+into a scratch directory; deliberately **not** vendored into the repo.
+
+```
+vilan bindgen lib.dom.d.ts --platform browser -o dom.vl --stats
+```
+
+### 10.1 Coverage
+
+| | | |
+|---|---|---|
+| declarations bound | **1,589 / 2,415** | **65.8%** |
+| members bound (after `extends` flattening) | **61,224 / 61,317** | **99.8%** |
+| output | **489,523 lines** of vilan | |
+| `vilan check dom.vl --platform browser` | **exit 0, no errors**, 11.2 s | |
+
+The generated file **compiles**. That is the headline: nothing in the mapping
+table produces a signature the analyzer rejects, at DOM scale.
+
+**Skipped declarations — one construct, not many:**
+
+| count | construct |
+|---|---|
+| **824** | `declare var` (a global VALUE) |
+| 2 | `declare namespace` |
+
+**TODOs — 6,753**, plus 33,126 `///` absence notes (counted separately
+because the type *is* bound; only the possible `null` is unsayable):
+
+| count | construct |
+|---|---|
+| 2,448 | open union (`Node \| string`) |
+| 1,062 | indexed access type (`HTMLElementTagNameMap[K]`) |
+| 1,026 | rest parameter |
+| 824 | global variable |
+| 538 | function overload |
+| 375 | string-literal union property |
+| 237 | intermediate optional arity |
+| 101 | unresolved type reference (all genuinely cross-file: `ArrayBuffer`, `Uint8Array`, `Float32Array` — `lib.es5.d.ts`) |
+| 45 | call signature |
+| 41 | numeric index signature |
+| 24 | `Promise`-typed property |
+| ≤ 8 each | string index signature, `Record`, intersection, unresolved base, namespace, construct signature, template literal |
+
+Two caveats on reading these. **Flattening amplifies:** `lib.dom.d.ts` has 45
+`...` rest parameters, but `GlobalEventHandlers` and friends are copied into
+hundreds of derived interfaces, so one base member becomes many. And 61,317
+members is likewise a post-flattening count. Amplification does not change the
+*shape* of the answer, but it does mean the per-construct counts measure
+generated surface, not source surface.
+
+### 10.2 What fails, by construct class
+
+- **Globals (the whole shortfall).** Every `[extern(…)]` form binds a *call*
+  or a receiver's property; none reads a bare global as a value. `declare var
+  document: Document` therefore has no binding. This is 100% of the missing
+  34.2%.
+- **Overloads** (538) degrade gracefully — first signature wins, the rest are
+  quoted. `getContext` happens to list `"2d"` first, so the useful one is what
+  binds.
+- **Open unions** (2,448) widen to `any`. Mostly `Node | string` convenience
+  parameters and `string | number`; the loss is real but local.
+- **Indexed access types** (1,062) are the `querySelector<K extends keyof
+  HTMLElementTagNameMap>(…): HTMLElementTagNameMap[K]` family — TypeScript's
+  tag-name magic, which has no vilan analogue and would need `keyof` support
+  bindgen explicitly does not attempt (§3.11).
+- **Inheritance chains work.** `HTMLCanvasElement` flattens through
+  `HTMLElement` → `Element` → `Node` → `EventTarget` plus the mixin interfaces
+  to 516 bound methods, with generic bases substituted correctly. It costs
+  size, not correctness — and the assignability limit (§3.8) remains: a
+  generated `Element` is still not accepted where `Node` is expected.
+- **Namespaces** are a non-issue here: `lib.dom.d.ts` has 2.
+
+### 10.3 The one shape that would close the gap
+
+824 skipped globals, but they are not 824 different problems. **641** are one
+idiom, repeated:
+
+```ts
+declare var HTMLCanvasElement: {
+    prototype: HTMLCanvasElement;
+    new(): HTMLCanvasElement;
+};
+```
+
+A global whose **name matches a declared interface** and whose type is an
+object carrying a construct signature. That is a syntactic match, not a
+heuristic, and it maps onto an extern form that already exists precisely for
+it — `[extern(new, "HTMLCanvasElement")]`. Recognizing it alone would take
+declaration coverage from **65.8% to ~92%**, and it is the difference between
+"you cannot construct anything" and "you can". It is **not** implemented here:
+§5 puts globals out of v1 scope, and widening that is the owner's call, not a
+take-up agent's. It is the single highest-value item for v2. The residual ~183
+are genuine value globals (`document`, `window`, `navigator`) that want a
+different mechanism — a form that reads a global, or a convention that binds
+`document.foo` as a dotted global the way `std/src/browser/dom.vl` already
+does by hand.
+
+### 10.4 Does a usable canvas surface fall out? **Yes.**
+
+`CanvasRenderingContext2D` binds **99 externs with 19 TODOs**;
+`HTMLCanvasElement` binds 516 (flattened); `getContext` binds to the 2D
+overload. Written against the generated bindings, with **one** hand-added line
+for the entry point:
+
+```vilan,fragment
+[extern("document.getElementById")]
+[platform("browser")]
+external fun canvas_by_id(id: str): HTMLCanvasElement;
+
+fun main() {
+    let canvas = canvas_by_id("board");
+    canvas.set_width(640.0);
+    let context = canvas.get_context("2d");
+    context.set_fill_style("rebeccapurple");
+    context.fill_rect(10.0, 10.0, 120.0, 80.0);
+    context.begin_path();
+    context.arc(200.0, 100.0, 40.0, 0.0, 6.28);
+    context.set_font("16px sans-serif");
+    context.fill_text("drawn through generated bindings", 20.0, 200.0);
+    canvas.add_event_listener("click", |event| {
+        context.clear_rect(0.0, 0.0, 640.0, 480.0);
+    });
+}
+```
+
+compiles (exit 0) to exactly the JavaScript a person would write:
+
+```js
+const canvas = document.getElementById("board");
+canvas.width = 640.0;
+const context = canvas.getContext("2d");
+context.fillStyle = "rebeccapurple";
+context.fillRect(10.0, 10.0, 120.0, 80.0);
+context.beginPath();
+context.arc(200.0, 100.0, 40.0, 0.0, 6.28);
+context.font = "16px sans-serif";
+context.fillText("drawn through generated bindings", 20.0, 200.0);
+canvas.addEventListener("click", (event) => { context.clearRect(0.0, 0.0, 640.0, 480.0); return; });
+```
+
+No `Option` noise, correct arities, correct property-vs-method lowering,
+correct event-handler closure.
+
+### 10.5 Verdict
+
+**The global APIs CAN be autogenerated — with three caveats, none fatal.**
+
+1. **Entry points are the missing piece, and it is one construct.** Methods
+   and properties bind at 99.8%. What does not bind is *reaching* an object in
+   the first place. Until globals are handled, every generated DOM module needs
+   a handful of hand-written entry bindings — which is a handful, not a
+   surface: the canvas demonstration needed exactly one.
+2. **Size is the real cost, not correctness.** 39k lines of TypeScript become
+   489k lines of vilan, mostly from `extends` flattening. That is fine for a
+   generated file nobody reads top-to-bottom, and unacceptable as something to
+   *check in* wholesale. A canvas-shaped consumer wants bindgen pointed at a
+   trimmed `.d.ts`, or a `--only <Type>` filter that emits a named type and its
+   transitive closure. Nothing in the design prevents that; it is not built.
+3. **§7's boundary still holds, and this probe reinforces it.** Autogenerating
+   `lib.dom.d.ts` over `std::browser::dom` would replace 144 curated lines with
+   489k — every method whether or not `std::ui` uses one, 6,753 TODOs, and
+   `Element` no longer assignable where `Node` is expected. bindgen is for the
+   library std does not wrap. For **a canvas API specifically**, the useful
+   read is the opposite direction: generation is a fine way to *draft*
+   `CanvasRenderingContext2D`'s 99 methods rather than type them, and a human
+   then curates, narrows the `f64`s that are really `i32`s, and names the
+   handful of entry points — which is what the DOM binding got and is why it
+   is good.

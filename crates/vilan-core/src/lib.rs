@@ -4,6 +4,7 @@
 
 pub mod analyzer;
 pub mod async_infer;
+pub mod bindgen;
 pub mod call_graph;
 pub mod chunks;
 pub mod const_eval;

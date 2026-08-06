@@ -8,6 +8,7 @@ use std::{
 
 use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
+mod bindgen;
 mod hmr;
 mod init;
 mod job;
@@ -139,6 +140,29 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Generate `external` bindings from a TypeScript declaration file. The
+    /// emitted `.vl` is ordinary source to review and commit — never a build
+    /// step, and nothing regenerates it behind your back.
+    Bindgen {
+        /// The `.d.ts` file to read.
+        file: PathBuf,
+        /// Where to write the bindings. Omitted: `<file-stem>.vl` beside the
+        /// input (`leaflet.d.ts` → `leaflet.vl`).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// The `[platform("…")]` fence stamped on every generated binding:
+        /// `node`, `deno`, `bun`, `browser`, or `@process`. Required — a wrong
+        /// guess baked into checked-in source is worse than choosing once.
+        #[arg(long)]
+        platform: String,
+        /// Print the bindings instead of writing a file.
+        #[arg(long)]
+        stdout: bool,
+        /// Also report coverage: how many declarations and members bound, and
+        /// which TypeScript constructs did not.
+        #[arg(long)]
+        stats: bool,
+    },
     /// Update this binary (and `vilan-lsp` beside it) to the newest release.
     /// This is the only command that touches the network.
     Upgrade {
@@ -220,6 +244,13 @@ fn run_cli() -> ExitCode {
         }
         Command::Fmt { paths, check } => fmt(&paths, check),
         Command::Init { name, template } => init::init(name, template),
+        Command::Bindgen {
+            file,
+            output,
+            platform,
+            stdout,
+            stats,
+        } => bindgen::bindgen(file, output, platform, stdout, stats),
         Command::Upgrade { check } => upgrade::upgrade(check),
     }
 }

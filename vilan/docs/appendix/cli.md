@@ -156,6 +156,198 @@ resolve exactly as they do for the rest of the package. Each test passes
 by exiting 0; a failed `assert` panics, which fails it. Tests run on
 Node whatever the package's `target` says. `--watch` re-runs on save.
 
+## `vilan bindgen <file.d.ts>`
+
+Generates `external` bindings from a TypeScript declaration file, so a
+third-party JavaScript library can be reached from Vilan without
+hand-writing an `external struct` and an `[extern(…)]` `external fun`
+per member.
+
+**It is not a build step.** You run it by hand, once, and the `.vl` it
+writes is yours: review it, edit it, commit it. Nothing in `build`,
+`check`, or `run` reaches it, no manifest key turns it on, and nothing
+regenerates it behind your back. Treat the output the way you treat
+`vilan init`'s scaffold — a starting point you own from the moment it
+lands, not a cache entry.
+
+- `--platform <p>`: **required.** `node`, `deno`, `bun`, `browser`, or
+  `@process`. Every generated binding is stamped `[platform("<p>")]`.
+  There is no default and no sniffing of the `.d.ts`: generated bindings
+  land in *your* code, which is unconstrained by platform unless it is
+  fenced, so an unfenced browser-only binding in a Node project would
+  compile clean and fail at runtime. A library genuinely used on both
+  gets two runs, into two files.
+- `-o, --output <path>`: where to write. Omitted: `<stem>.vl` beside the
+  input (`leaflet.d.ts` → `leaflet.vl`).
+- `--stdout`: print instead of writing.
+- `--stats`: also report coverage — how many declarations and members
+  bound, and which TypeScript constructs did not.
+
+### What you get
+
+```ts
+declare function greet(name: string, loudly?: boolean): string;
+
+interface Marker {
+    readonly id: string;
+    title: string;
+    move(dx: number, dy: number): void;
+    on(event: string, handler: (x: number) => void): void;
+}
+```
+
+`vilan bindgen marker.d.ts --platform node` writes bindings in exactly
+the dialect `std` is written in:
+
+```vilan,norun
+[extern("greet")]
+[platform("node")]
+external fun greet(name: str): str;
+
+[extern("greet")]
+[platform("node")]
+external fun greet_with_loudly(name: str, loudly: bool): str;
+
+external struct Marker;
+
+impl Marker {
+	[extern(get, "id")]
+	[platform("node")]
+	external fun id(self): str;
+
+	[extern(get, "title")]
+	[platform("node")]
+	external fun title(self): str;
+
+	[extern(set, "title")]
+	[platform("node")]
+	external fun set_title(self, value: str): void;
+
+	[extern(method, "move")]
+	[platform("node")]
+	external fun move_(self, dx: f64, dy: f64): void;
+
+	[extern(method, "on")]
+	[platform("node")]
+	external fun on(self, event: str, handler: |f64| void): void;
+}
+
+fun main() { }
+```
+
+Names become `snake_case` (the extern keeps the exact JS spelling), a
+`readonly` property gets only a getter, and every `number` becomes `f64`,
+because a `.d.ts` cannot say whether a number is meant as an integer.
+Narrowing to `i32` is a human edit.
+
+An **optional parameter becomes one binding per call arity**. TypeScript
+optionals are trailing, so `greet(name)` and `greet(name, loudly)` are two
+real host calls and become two real bindings of the same symbol — the
+short one keeps the plain name. (`std` does the same by hand: `append` and
+`append_text` both bind `appendChild`.)
+
+### Absence, and why there is no `Option`
+
+Nothing bindgen emits is an `Option<T>`, and that is deliberate. Vilan has
+no `null`, and `Option` is a **tagged array** at runtime — `Some(v)` is
+`[0, v]`, `None` is `[1]` — which a third-party host neither produces nor
+reads. Both directions break:
+
+- reading, a host returning `"hello"` is tested as `value[0] == 0`, which
+  is `"h" == 0`, so a *present* value arrives as `None`;
+- writing, `None` reaches the host as the array `[1]` — and for an
+  optional `boolean` argument, `[1]` is truthy.
+
+So a type admitting `null`/`undefined` binds as the **bare type**, and the
+binding carries a `///` note saying the value may be missing. Guarding is
+yours. (`std` does use `Option` across `external` boundaries, but only
+ones it owns — compiler intrinsics and its own runtime helpers, which know
+the representation.)
+
+### `// TODO(bindgen)`
+
+**Nothing is ever dropped silently.** Every construct the generator
+cannot express becomes a comment naming it and saying why, in place:
+
+```text
+// TODO(bindgen): numeric index signature `[index: number]: string` —
+// this is an array-LIKE shape, NOT a JS array …
+```
+
+A generated file with TODOs is reviewable; one with silent gaps is a
+landmine. The ones you will meet most:
+
+| TypeScript | Why it can't map |
+|---|---|
+| `declare const x: T` | Every `[extern(…)]` form binds a *call* or a receiver's property; none reads a bare global as a value. Bind its members as dotted globals: `[extern("x.member")]`. |
+| `{ [key: string]: T }`, `{ [index: number]: T }`, `Record<K, V>` | An open keyed or array-like host object has no Vilan type at a host boundary — see below. |
+| overloads | Vilan has one signature per name. The first wins; the rest are quoted so you can hand-split them into distinct names. |
+| `A \| B` (open unions), intersections | No union or structural types in Vilan; widened to `any`. |
+| `namespace`, `declare module`, `declare global`, conditional/mapped types, `keyof` | Out of v1 scope. |
+
+### Why every interface becomes an `external struct`
+
+A Vilan `struct` is a **positional array** at runtime: `struct Point { x:
+f64 }` is `[x]`, and `p.x` is `p[0]`. A host object `{x: 1}` read through
+one yields `undefined`, silently. Only an `external struct` — an opaque
+handle whose fields are reached through `[extern(get/set, …)]` — survives
+the crossing. The same fact rules out three tempting mappings:
+
+- a TS discriminated union is a tagged *object*, while a Vilan `enum` is
+  `[tag, …payload]`;
+- `Map<str, T>` is a Vilan struct over a hashed native map, not a plain
+  host object;
+- `List<T>` is a real JS array, and an array-*like* (`{[index: number]:
+  T}` — numeric keys and `length`, no `Symbol.iterator`) is not one:
+  iterating it throws. Convert at the boundary with `Array.from` and bind
+  the result as `List<T>`.
+
+A `T[]`/`Array<T>` in a `.d.ts` *is* a real array and does map to
+`List<T>`; a TS tuple `[A, B]` maps to `(A, B)`, since a Vilan tuple is a
+JS array too.
+
+### Closed string sets
+
+A named union of string literals gets a real enum plus a wrapper that
+speaks it, because the host boundary still wants the raw string:
+
+```vilan,norun
+enum Align {
+	Start,
+	End,
+}
+
+external struct Chart;
+
+impl Chart {
+	[extern(set, "align")]
+	[doc(hidden)]
+	[platform("node")]
+	external fun set_align_raw(self, value: str): void;
+
+	fun set_align(self, value: Align): void {
+		self.set_align_raw(match value {
+			Align::Start => "start",
+			Align::End => "end",
+		})
+	}
+}
+
+fun main() { }
+```
+
+An *inline* `"left" | "right"` is widened to `str` instead — safe and
+exact, since that is what the host takes; only a union the library
+author bothered to name earns a type.
+
+### Scope
+
+bindgen targets the **third-party library `std` doesn't wrap**. It is
+not for regenerating `std::browser::dom`, which is a deliberately
+curated subset reviewed line by line, and it does not resolve types
+across files: a name declared in another `.d.ts` widens to `any` with a
+TODO.
+
 ## `vilan upgrade`
 
 Replaces this binary (and `vilan-lsp` beside it) with the newest
