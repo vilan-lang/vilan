@@ -2842,7 +2842,18 @@ impl<'src> Analyzer<'src> {
         // The substitution maps iterate in hash order — sort for deterministic
         // diagnostics, and dedup: one call can bind the same constraint along
         // several recorded routes.
-        errors.sort_by_key(|(span, msg, _)| (span.start, span.end, msg.clone()));
+        //
+        // The constraint is in the KEY, not just carried: the dedup collapses on
+        // span and message alone, and two DIFFERENT constraints can share both
+        // — `fun pair<A: Greet, B: Greet>(..)` called as `pair(1, 2)` reports
+        // 'i32' does not implement 'Greet' twice at the one call span, word for
+        // word. The survivor decides which declaration the note below points
+        // at, so without the constraint in the key that was a hash-order pick
+        // between `A` and `B` (16/14 over 30 cold analyses). Least id wins,
+        // which is the first-declared parameter.
+        errors.sort_by_key(|(span, msg, constraint_id)| {
+            (span.start, span.end, msg.clone(), constraint_id.0)
+        });
         errors
             .dedup_by(|(a_span, a_msg, _), (b_span, b_msg, _)| a_span == b_span && a_msg == b_msg);
         // Note WHERE the failing bound is declared (`T: Feed` in the

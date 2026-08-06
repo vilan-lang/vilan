@@ -166,10 +166,16 @@ fn assert_cold_rendering_is_stable(source: &'static str, platform: Platform) -> 
 /// `method_call_substitution`, the warning out of `check_must_use`, and each
 /// list landed in the diagnostics vector wherever its producer happened to run.
 ///
-/// Planted red two ways: restore the `.find()` in
-/// `check_generic_bound_satisfaction` and the `Holder` note flips (13/30);
-/// remove the `normalize_diagnostic_order` call from `post_analysis_passes` and
-/// the order flips.
+/// `pair(1, 2)` is the second half of the note's problem: two DIFFERENT
+/// constraints report the same message at the same span, the dedup collapses
+/// them on span and message alone, and the survivor decides which parameter the
+/// note names.
+///
+/// Planted red three ways: restore the `.find()` in
+/// `check_generic_bound_satisfaction` and the `Holder` note flips (20/10); drop
+/// the constraint from that function's sort key and `pair`'s note flips between
+/// `A` and `B` (16/14); remove the `normalize_diagnostic_order` call from
+/// `post_analysis_passes` and the order flips.
 #[test]
 fn the_whole_diagnostic_rendering_is_identical_on_every_cold_analysis() {
     let rendering = assert_cold_rendering_is_stable(
@@ -190,6 +196,8 @@ fn the_whole_diagnostic_rendering_is_identical_on_every_cold_analysis() {
         [must_use]
         fun tally(n: i32): i32 { n + 1 }
 
+        fun pair<A: Greet, B: Greet>(a: A, b: B): str { a.greet() }
+
         fun escapes() {
             let first_value = 1;
             let second_value = 2;
@@ -207,6 +215,7 @@ fn the_whole_diagnostic_rendering_is_identical_on_every_cold_analysis() {
             let holder: Holder<i32> = Holder { item = 1 };
             print(holder.shout());
             print(min(Plain { value = 1 }, Plain { value = 2 }).value);
+            print(pair(1, 2));
             tally(1);
             escapes();
         }
