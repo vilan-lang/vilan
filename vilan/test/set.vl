@@ -39,4 +39,20 @@ fun main() {
 
 	mut empty: Set<i32> = Set::new();
 	print(empty.is_empty()); // true
+
+	// `union`/`intersection`/`difference` -- I4's open tail.
+	mut left: Set<i32> = Set::new();
+	left.insert(1);
+	left.insert(2);
+	left.insert(3);
+	mut right: Set<i32> = Set::new();
+	right.insert(2);
+	right.insert(3);
+	right.insert(4);
+	print(left.union(right).len());        // 4 -- {1,2,3,4}
+	print(left.intersection(right).len()); // 2 -- {2,3}
+	print(left.difference(right).len());   // 1 -- {1}
+	print(left.union(empty).len());        // 3 -- identity
+	print(left.intersection(empty).len()); // 0
+	print(left.difference(empty).len());   // 3 -- nothing removed
 }

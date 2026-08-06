@@ -43,6 +43,48 @@ impl Set<type T: Hashable> {
 	fun values(self): List<T> {
 		self.table.values()
 	}
+
+	// `union`/`intersection`/`difference` walk `self.table.values()` rather than
+	// `for x in self` — matching `values()` above — because the native `for x in
+	// set` lowering only fires for a *concrete* `Set`-typed expression at a call
+	// site; `self` inside `Set`'s own generic impl does not resolve that way and
+	// would iterate the struct's backing array instead of its elements. Every
+	// existing method in this file already routes through `.table` for the same
+	// reason; this is not a new workaround.
+
+	/// A new set holding every element that is in `self`, `other`, or both.
+	fun union(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			result.insert(value);
+		}
+		for value in other.table.values() {
+			result.insert(value);
+		}
+		result
+	}
+
+	/// A new set holding only the elements present in BOTH `self` and `other`.
+	fun intersection(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			if other.contains(value) {
+				result.insert(value);
+			}
+		}
+		result
+	}
+
+	/// A new set holding the elements of `self` that are NOT in `other`.
+	fun difference(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			if !other.contains(value) {
+				result.insert(value);
+			}
+		}
+		result
+	}
 }
 
 /// The set half of the explicit termination family, and the end of an iterator

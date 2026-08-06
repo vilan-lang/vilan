@@ -166,6 +166,10 @@ impl Map<type K: Hashable, type V> {
 	fun is_empty(self): bool
 	fun keys(self): List<K>
 	fun values(self): List<V>
+	fun entries(self): List<(K, V)>
+}
+impl Map<type K: Hashable, type V: PartialEq> {
+	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
@@ -199,6 +203,29 @@ fun main() {
 `keys()` returns the real `K`s (in insertion order), and the key is snapshot
 on insert, so mutating the original afterward can't desync the map.
 
+`entries()` pairs `keys()`/`values()` into one `List<(K, V)>` snapshot, so
+walking both together needs no hand-zipping; `contains_value` (needing
+`V: PartialEq`, unlike the rest of `Map`) is the value-side counterpart to
+`contains_key`:
+
+```vilan
+import std::print;
+import std::map::Map;
+
+fun main() {
+	mut scores: Map<str, i32> = Map::new();
+	scores.insert("alice", 1);
+	scores.insert("bob", 2);
+	mut total = 0;
+	for entry in scores.entries() {
+		total = total + entry.1;   // entry.0 is the key, entry.1 the value
+	}
+	print(total);                        // 3
+	print(scores.contains_value(2));     // true
+	print(scores.contains_value(9));     // false
+}
+```
+
 ## `Set<T>`
 
 ```vilan,fragment
@@ -210,12 +237,37 @@ impl Set<type T: Hashable> {
 	fun len(self): i32
 	fun is_empty(self): bool
 	fun values(self): List<T>
+	fun union(self, other: Set<T>): Set<T>
+	fun intersection(self, other: Set<T>): Set<T>
+	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
 iterates the elements in insertion order.
+
+`union`/`intersection`/`difference` are the standard set operations, each
+returning a new `Set` and leaving both receivers untouched:
+
+```vilan
+import std::print;
+import std::set::Set;
+
+fun main() {
+	mut a: Set<i32> = Set::new();
+	a.insert(1);
+	a.insert(2);
+	a.insert(3);
+	mut b: Set<i32> = Set::new();
+	b.insert(2);
+	b.insert(3);
+	b.insert(4);
+	print(a.union(b).len());          // 4 -- {1, 2, 3, 4}
+	print(a.intersection(b).len());   // 2 -- {2, 3}
+	print(a.difference(b).len());     // 1 -- {1}
+}
+```
 
 ## `Hashable`
 

@@ -782,3 +782,70 @@ goldens — `vilan/test/list-search.vl`, `list-sort.vl`, `list-splice.vl`,
 corpus fixtures also carry the intrinsic through the interpreter
 differential. Docs: `docs/std/collections.md` (four new compiled examples)
 and `docs/std/numbers.md` (one). Ledger: row 212.
+
+### 7.7 I4's open tail — the `Map`/`Set` parity row (implementation record, 2026-08-06)
+
+§3's table left one row unranked rather than undesigned: "`Map`/`Set` parity
+(`entries`, `map`/`filter`, `union`/`intersection`)", zero corpus demand,
+"revisit if a future sweep finds any." Shipped now, following §7.1's
+placement contract and §7.2's bound-splitting precedent:
+
+- **`Map<K, V>.entries(self): List<(K, V)>`** — `self.table.values()`
+  directly (the same snapshot `keys()`/`values()` already build, just
+  unsplit). No new bound; lives in the existing unbounded `impl Map<type K:
+  Hashable, type V>` block in `map.vl`.
+- **`Map<K, V: PartialEq>.contains_value(self, value: V): bool`** — linear
+  scan over `self.table.values()`, comparing by `.eq()`. Needs `V:
+  PartialEq`, a bound the rest of `Map` does not carry, so it is split into
+  its own `impl Map<type K: Hashable, type V: PartialEq>` block — the same
+  reason `compare.vl` splits `List`'s bounded methods out of `list.vl`
+  (§1.1). `map.vl` now imports `pkg::compare::PartialEq`; no caller-side
+  import beyond `Map` itself is needed (pinned:
+  `the_map_set_parity_batch_needs_only_its_own_type_import`), the same
+  placement-is-free result compare.vl's own methods get.
+- **`Set<T>.union`/`.intersection`/`.difference` (self, other: Set<T>):
+  Set<T>`** — the textbook set operations. No extra bound beyond `Set`'s own
+  `T: Hashable`; all three live in the existing `impl Set<type T: Hashable>`
+  block in `set.vl`.
+
+**Deliberately NOT shipped, and why:** `map`/`filter`/`for_each` on either
+type, named in the same unranked row, stay unshipped. Unlike every §3 row
+1–9 (each mirroring an existing, unambiguous `List` precedent), the audit
+never settled what these would return — `Map.map` transforming values only
+into a new `Map<K, U>`? Both key and value into a `List<X>`? — and inventing
+that shape now would be exactly the kind of undesigned surface the charter's
+scope excludes. It is also redundant on arrival: once `entries()` exists,
+`map.entries().iter().map(...)...` (or the equivalent `List` detour for
+`Set`) already reaches the same result through existing, already-ranked
+machinery, with nothing missing to justify picking one shape over another
+by fiat. `str` was checked against this row too and carries nothing to
+ship — §1.3 is explicit that it has no ranked *or* unranked gap, unlike
+`Map`/`Set`.
+
+**A real bug found, not fixed here.** `for value in self` inside one of
+`Set`'s own methods does not get the `is_set_typed` native-lowering that a
+*concrete* `Set` expression gets at an ordinary call site (transformer.rs,
+`is_set_typed`/`is_set_typed`'s call site ~L3839): it walks the struct's
+one-element backing array (`[table]`) instead of the map's values, so a
+first draft of `union` silently returned length 1 for what should have been
+a 4-element set. Every existing `Set` method already avoids this by routing
+through `self.table.values()` rather than `for x in self`/`for x in other`
+— `values()` was the only one that needed it before now, and the new
+methods follow the same idiom. The underlying gap (why `self`'s static type
+inside its own defining `impl` block does not resolve as `is_set_typed`
+expects) is unfixed and out of this slice's scope; a minimal repro is a
+one-line `impl Set<type T: Hashable> { fun probe(self): i32 { mut n = 0; for
+x in self { n += 1; } n } }` called on a 3-element set, which returns 1 not
+3.
+
+Coverage: nine new pins in `crates/vilan-core/tests/inference.rs` (all
+`assert_compiles_and_runs`, each proven non-vacuous by planting the
+corresponding bug in `map.vl`/`set.vl` and watching the targeted test go
+red before restoring). `vilan/test/map.vl` and `vilan/test/set.vl` — the
+existing base corpus fixtures for these types — gained sections exercising
+the new methods, with goldens regenerated and diffed by hand before
+committing (no other corpus golden moved). Docs: `docs/std/collections.md`
+gained `entries`/`contains_value` on the `Map` fragment and
+`union`/`intersection`/`difference` on the `Set` fragment, each with a new
+compiled example. `std_twin_parity` is unaffected — `map`/`set` are not
+twinned (`browser`/`process`) modules, so no allowlist entry was needed.
