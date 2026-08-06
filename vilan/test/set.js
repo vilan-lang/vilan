@@ -7,6 +7,9 @@ function __clone(value) {
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
 }
+function __map_values(map) {
+	return [ ...map.values() ].map(__clone);
+}
 function __set_iter(set) {
 	return [ ...set[0].values() ];
 }
@@ -48,6 +51,34 @@ function $i(self) {
 function $j(self, value2) {
 	return self[0].has(hash(value2));
 }
+function $k(self, other) {
+	let result = $a();
+	for (const value2 of __map_values(self[0])) {
+		$b(result, value2);
+	}
+	for (const value3 of __map_values(other[0])) {
+		$b(result, value3);
+	}
+	return result;
+}
+function $l(self, other) {
+	let result = $a();
+	for (const value2 of __map_values(self[0])) {
+		if ($d(other, value2)) {
+			$b(result, value2);
+		}
+	}
+	return result;
+}
+function $m(self, other) {
+	let result = $a();
+	for (const value2 of __map_values(self[0])) {
+		if (!($d(other, value2))) {
+			$b(result, value2);
+		}
+	}
+	return result;
+}
 let numbers = $a();
 $b(numbers, 1);
 $b(numbers, 2);
@@ -77,3 +108,17 @@ console.log($i(words));
 console.log($j(words, "hi"));
 let empty = $a();
 console.log($f(empty));
+let left = $a();
+$b(left, 1);
+$b(left, 2);
+$b(left, 3);
+let right = $a();
+$b(right, 2);
+$b(right, 3);
+$b(right, 4);
+console.log($c($k(left, right)));
+console.log($c($l(left, right)));
+console.log($c($m(left, right)));
+console.log($c($k(left, empty)));
+console.log($c($l(left, empty)));
+console.log($c($m(left, empty)));

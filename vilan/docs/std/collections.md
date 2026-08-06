@@ -237,12 +237,37 @@ impl Set<type T: Hashable> {
 	fun len(self): i32
 	fun is_empty(self): bool
 	fun values(self): List<T>
+	fun union(self, other: Set<T>): Set<T>
+	fun intersection(self, other: Set<T>): Set<T>
+	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
 iterates the elements in insertion order.
+
+`union`/`intersection`/`difference` are the standard set operations, each
+returning a new `Set` and leaving both receivers untouched:
+
+```vilan
+import std::print;
+import std::set::Set;
+
+fun main() {
+	mut a: Set<i32> = Set::new();
+	a.insert(1);
+	a.insert(2);
+	a.insert(3);
+	mut b: Set<i32> = Set::new();
+	b.insert(2);
+	b.insert(3);
+	b.insert(4);
+	print(a.union(b).len());          // 4 -- {1, 2, 3, 4}
+	print(a.intersection(b).len());   // 2 -- {2, 3}
+	print(a.difference(b).len());     // 1 -- {1}
+}
+```
 
 ## `Hashable`
 

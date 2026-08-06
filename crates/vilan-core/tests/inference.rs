@@ -37539,6 +37539,143 @@ fn map_contains_value_on_an_empty_map_is_false() {
     );
 }
 
+#[test]
+fn set_union_combines_and_dedupes_the_overlap() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            b.insert(4);
+            let combined = a.union(b);
+            print(combined.len());          // 4 -- {1,2,3,4}, 2 and 3 not doubled
+            print(combined.contains(1));    // true
+            print(combined.contains(4));    // true
+            print(a.len());                 // 3 -- the receiver is untouched
+        }
+        "#,
+        "4\ntrue\ntrue\n3\n",
+    );
+}
+
+#[test]
+fn set_union_with_an_empty_set_is_identity_either_direction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            mut empty: Set<i32> = Set::new();
+            print(a.union(empty).len());       // 2
+            print(empty.union(a).len());       // 2
+            print(empty.union(empty).len());   // 0 -- both sides empty
+        }
+        "#,
+        "2\n2\n0\n",
+    );
+}
+
+#[test]
+fn set_intersection_keeps_only_the_shared_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            b.insert(4);
+            let shared = a.intersection(b);
+            print(shared.len());            // 2
+            print(shared.contains(2));      // true
+            print(shared.contains(1));      // false
+
+            mut disjoint: Set<i32> = Set::new();
+            disjoint.insert(100);
+            print(a.intersection(disjoint).len());   // 0 -- no overlap
+        }
+        "#,
+        "2\ntrue\nfalse\n0\n",
+    );
+}
+
+#[test]
+fn set_difference_keeps_elements_absent_from_the_other_side() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            let remainder = a.difference(b);
+            print(remainder.len());          // 1
+            print(remainder.contains(1));    // true
+            print(remainder.contains(2));    // false
+
+            print(a.difference(a).len());    // 0 -- a set minus itself is empty
+            mut empty: Set<i32> = Set::new();
+            print(a.difference(empty).len()); // 3 -- nothing removed
+        }
+        "#,
+        "1\ntrue\nfalse\n0\n3\n",
+    );
+}
+
+#[test]
+fn the_map_set_parity_batch_needs_only_its_own_type_import() {
+    // Placement pin, mirroring `the_std_surface_batch_needs_no_import`: `map.vl`
+    // pulls `compare::PartialEq` in transitively, so `contains_value` needs no
+    // separate import beyond `Map` itself; `union`/`intersection`/`difference`
+    // carry no extra bound beyond `Set`'s own `T: Hashable`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::set::Set;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+            mut total = 0;
+            for entry in scores.entries() {
+                total = total + entry.1;
+            }
+            print(total);
+            print(scores.contains_value(1));
+
+            mut xs: Set<i32> = Set::new();
+            xs.insert(1);
+            mut ys: Set<i32> = Set::new();
+            ys.insert(2);
+            print(xs.union(ys).len());
+            print(xs.intersection(ys).len());
+            print(xs.difference(ys).len());
+        }
+        "#,
+        "1\ntrue\n2\n0\n1\n",
+    );
+}
+
 // --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
 //
 // `display.vl` sits outside the always-loaded core set and outside its
