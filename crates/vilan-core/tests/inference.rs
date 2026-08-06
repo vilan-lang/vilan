@@ -41060,13 +41060,14 @@ fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
     // guard removed, `vilan/std/src/time.vl`'s inherent `Duration::describe`
     // collides with the `Wire` trait's `describe` and the corpus goes red.
     //
-    // NOTE, deliberately not pinned here: `Bag::default()` on this program
-    // resolves to the TRAIT's static (7), not the inherent one — the static
-    // accessor path never got B57's tiering (method-resolution.md §S2's
-    // residue; it is still a `find_map` in impl-registration order). That is a
-    // resolution bug, separate from this duplicate check, so this pin asserts
-    // only what B74 claims: these two are not a duplicate.
-    assert_compiles(
+    // The note this pin carried — that `Bag::default()` here resolved to the
+    // TRAIT's static (7) rather than the inherent one, because the static
+    // accessor path never got B57's tiering — is now B83, fixed: it resolves
+    // to the inherent `1`, and the value is pinned so the two facts stay
+    // together. The trait's declaration is still not a DUPLICATE of the
+    // inherent one, which is what B74 claims; it is outranked by it, which is
+    // what B57 claims. Both at once, on one program.
+    assert_compiles_and_runs(
         r#"
         import std::print;
         import std::default::Default;
@@ -41085,6 +41086,7 @@ fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
             print(Bag::default().n);
         }
         "#,
+        "1\n",
     );
 }
 
@@ -43242,5 +43244,220 @@ fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
 
         fun main() { }
         "#,
+    );
+}
+
+// --- B83: `Type::static()` gets B57's tiering --------------------------------
+//
+// `prepped_static_accessors` was a flat `find_map` in impl-registration order,
+// so a trait-provided static BEAT an inherent one that happened to register
+// later — inherent-over-trait inverted on the one path B57 did not reach
+// (method-resolution.md §S2's residue). The candidate set is unchanged; only
+// the ranking is new.
+
+#[test]
+fn b83_an_inherent_static_outranks_a_trait_provided_one() {
+    // The registration order that used to decide it: the trait impl FIRST.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+        impl Bag { fun default(): Bag { Bag { n = 1 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b83_the_inherent_static_wins_from_either_declaration_order() {
+    // The other order, which happened to be right before — the pair is what
+    // makes the rule a rule rather than a coincidence.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag { fun default(): Bag { Bag { n = 1 } } }
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b83_two_traits_providing_one_static_are_ambiguous() {
+    // B57 §4's ambiguity, on the static path. The steer §4 gives a method —
+    // `Trait::member(receiver)` — does NOT exist here: the qualified form
+    // selects an impl THROUGH the receiver, and a static has no receiver. So
+    // the diagnostic names the fix that always works and says outright that
+    // the qualified path is not available, rather than steering at a spelling
+    // that does not resolve.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        trait Beta { fun spawn(): Bag; }
+
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+        impl Bag with Beta { fun spawn(): Bag { Bag { n = 2 } } }
+
+        fun main() { print(Bag::spawn().n); }
+        "#,
+        "'spawn' is ambiguous on 'Bag': both 'Alpha' and 'Beta' provide it as a static, and a \
+         static has no receiver for a `Trait::spawn` path to select through; declare 'Bag''s own \
+         'spawn', which outranks every trait-provided one",
+    );
+}
+
+#[test]
+fn b83_an_inherent_static_resolves_the_two_trait_ambiguity() {
+    // The fix the diagnostic names, proven to work rather than asserted. An
+    // impossible steer is worse than no steer (the B65 lesson).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        trait Beta { fun spawn(): Bag; }
+
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+        impl Bag with Beta { fun spawn(): Bag { Bag { n = 2 } } }
+        impl Bag { fun spawn(): Bag { Bag { n = 9 } } }
+
+        fun main() { print(Bag::spawn().n); }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn b83_a_lone_trait_provided_static_still_resolves() {
+    // The load-bearing negative. `Type::method` refuses when only a trait
+    // provides it (§3.1) because `Trait::method(receiver)` is the sanctioned
+    // spelling; for a STATIC there is no other spelling at all, so the trait
+    // tier must stay reachable. Tightening this to match the method path would
+    // make every trait-provided static uncallable.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b83_a_static_on_a_trait_subject_impl_still_resolves() {
+    // The other shape the static path carries: an impl whose SUBJECT is a
+    // trait (`impl Iterator<type T> { fun from_fn(..) }`), which is how
+    // `Iterator::from_fn` is reached. The tiering runs over the same candidate
+    // set, so a trait-subject impl must keep resolving.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut n = 0;
+            let it = Iterator::from_fn(|| { n = n + 1; if n <= 3 { Some(n) } else { None } });
+            print(it.count());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b83_two_impls_of_one_trait_do_not_make_a_static_ambiguous() {
+    // §9(6) on the static path: the trait tier dedups by TRAIT, so two impls
+    // of one trait leave the name one home. The subjects differ here, so both
+    // impls are live at once — which is the case a same-subject pair could
+    // never reach.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+        struct Box_ { n: i32 }
+
+        impl Bag with Default { fun default(): Bag { Bag { n = 1 } } }
+        impl Box_ with Default { fun default(): Box_ { Box_ { n = 2 } } }
+
+        fun main() {
+            print(Bag::default().n);
+            print(Box_::default().n);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
+    // PROBED, and recorded rather than built: `Trait::static()` does not
+    // resolve, with or without a default body on the trait's declaration. It
+    // cannot, on today's design — `Trait::method(receiver)` picks an impl
+    // through the receiver's type, and a static offers nothing to pick with.
+    // This is why B83's ambiguity diagnostic names an inherent declaration as
+    // the fix rather than a qualified path.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+
+        fun main() { print(Alpha::spawn().n); }
+        "#,
+        "cannot find 'spawn' in Alpha",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag { Bag { n = 3 } } }
+
+        fun main() { print(Alpha::spawn().n); }
+        "#,
+        "cannot find 'spawn' in Alpha",
+    );
+}
+
+#[test]
+fn b83_a_trait_provided_method_is_still_refused_on_the_type_path() {
+    // §3.1 is untouched: `Type::method` still refuses a trait-only method and
+    // steers to `Trait::method(..)`, which for a METHOD does exist. The static
+    // path's reachable trait tier must not leak into it.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        trait Alpha { fun show(self): str; }
+        impl Bag with Alpha { fun show(self): str { "a" } }
+
+        fun main() { let s = Bag::show(Bag { n = 1 }); }
+        "#,
+        "'show' is not an inherent member of 'Bag'",
     );
 }

@@ -9106,6 +9106,35 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
+        // A `[trait_only]` trait method never resolves on the concrete type's
+        // own surface — only through a trait bound (§3.2). An inherent impl has
+        // no trait ids, so a type's *own* method with the same name stays
+        // reachable (the collision-safety point).
+        self.impl_member_candidates(subject_type, member_name, true, false)
+    }
+
+    /// The candidates a `Type::member` path head reaches (B83). It is a
+    /// SUPERSET of the method candidates in two ways, both matching what the
+    /// static accessor has always scanned: a declaration with no `self`
+    /// receiver qualifies (that is the whole point — `Bag::new()`), and a
+    /// `[trait_only]` member is reachable when the path head IS the trait
+    /// (access on the trait itself stays allowed, §3.2).
+    fn static_path_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        subject_is_trait: bool,
+    ) -> Vec<ImplMemberCandidate> {
+        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+    }
+
+    fn impl_member_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        methods_only: bool,
+        allow_trait_only: bool,
+    ) -> Vec<ImplMemberCandidate> {
         let mut candidates: Vec<ImplMemberCandidate> = self
             .implementations
             .iter()
@@ -9117,18 +9146,14 @@ impl<'src> Analyzer<'src> {
                 )
             })
             .filter_map(|implementation| {
-                // A `[trait_only]` trait method never resolves on the concrete
-                // type's own surface — only through a trait bound (§3.2). An
-                // inherent impl has no trait ids, so a type's *own* method with
-                // the same name stays reachable (the collision-safety point).
-                if self.member_is_trait_only(implementation, member_name) {
+                if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
                     return None;
                 }
                 let member_id = implementation
                     .declarations
                     .get(member_name)
                     .copied()
-                    .filter(|member_id| self.is_self_method(*member_id))?;
+                    .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
                 Some(ImplMemberCandidate {
                     member_id,
                     impl_subject: implementation.subject,
@@ -9147,7 +9172,13 @@ impl<'src> Analyzer<'src> {
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
     fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    }
+
+    /// The tiering itself, over an already-collected candidate list — shared by
+    /// `receiver.member()` and `Type::member()` (B83), which ranked by
+    /// registration order alone until the static path got this.
+    fn rank_member_candidates(&self, candidates: Vec<ImplMemberCandidate>) -> ImplMemberResolution {
         // Tier 1: inherent. Two inherent declarations for one subject are a
         // definition-site error (`check_duplicate_inherent_members`); resolution
         // still takes the first in the deterministic order, so that one error
@@ -23828,35 +23859,32 @@ impl<'src> Analyzer<'src> {
                         .iter()
                         .find(|candidate| candidate.home_trait.is_none())
                         .map(|candidate| (candidate.member_id, Some(candidate.impl_subject)));
+                    // The static path's own resolution, TIERED (B83). It was a
+                    // flat `find_map` in impl-registration order until here, so
+                    // an inherent `fun default()` lost to a trait-provided one
+                    // that happened to register first — inherent-over-trait
+                    // inverted on the one path B57 did not reach. The candidate
+                    // set is unchanged; only the ranking is new.
+                    let static_resolution = match method_candidates.is_empty() {
+                        // Only a trait provides it as a METHOD: refuse, and say
+                        // which path does reach it (handled below).
+                        false => ImplMemberResolution::Missing,
+                        true => self.rank_member_candidates(self.static_path_candidates(
+                            &subject_type,
+                            member_name,
+                            subject_is_trait,
+                        )),
+                    };
+                    let static_member = match &static_resolution {
+                        ImplMemberResolution::Found(member_id, impl_subject) => {
+                            Some((*member_id, Some(*impl_subject)))
+                        }
+                        _ => None,
+                    };
                     let member_id = variant_id
                         .map(|variant| (variant, None))
                         .or(inherent_method)
-                        .or_else(|| {
-                            // Only a trait provides it: refuse, and say which
-                            // path does reach it (handled below).
-                            if !method_candidates.is_empty() {
-                                return None;
-                            }
-                            self.implementations
-                                .iter()
-                                .filter(|x| {
-                                    self.compare_type(
-                                        &subject_type,
-                                        &x.subject.get_type(self),
-                                        &HashMap::new(),
-                                    )
-                                })
-                                .find_map(|x| {
-                                    if !subject_is_trait
-                                        && self.member_is_trait_only(x, member_name)
-                                    {
-                                        return None;
-                                    }
-                                    x.declarations
-                                        .get(member_name)
-                                        .map(|declaration| (*declaration, Some(x.subject)))
-                                })
-                        })
+                        .or(static_member)
                         // `Trait::member(receiver, ..)` (B57 §3.1): the explicit
                         // disambiguator. The trait's attached-static namespace
                         // (`Iterator::from_fn`) was searched above and is
@@ -23901,6 +23929,46 @@ impl<'src> Analyzer<'src> {
                                     }
                                 }
                             }
+                        }
+                        // Two traits provide it as a STATIC, and nothing the
+                        // type owns outranks them (B83). This is B57's §4
+                        // ambiguity on the static path — but the steer §4 gives
+                        // a method, `Trait::member(receiver)`, does not exist
+                        // here: the qualified form selects an impl THROUGH the
+                        // receiver, and a static has no receiver. So the fix
+                        // that always works is the one named, and the missing
+                        // one is named as missing rather than left to be
+                        // hunted for.
+                        None if matches!(
+                            static_resolution,
+                            ImplMemberResolution::AmbiguousTraits(_)
+                        ) =>
+                        {
+                            let ImplMemberResolution::AmbiguousTraits(homes) = &static_resolution
+                            else {
+                                unreachable!("just matched AmbiguousTraits");
+                            };
+                            let subject_str =
+                                self.pretty_print_type(&subject_type, &HashMap::new());
+                            let providers: Vec<String> = homes
+                                .iter()
+                                .map(|trait_id| {
+                                    format!("'{}'", self.trait_label_for(&subject_type, *trait_id))
+                                })
+                                .collect();
+                            self.diagnostics.push(Error {
+                                note: None,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "'{member_name}' is ambiguous on '{subject_str}': {}{} \
+                                     provide it as a static, and a static has no receiver for a \
+                                     `Trait::{member_name}` path to select through; declare \
+                                     '{subject_str}''s own '{member_name}', which outranks every \
+                                     trait-provided one",
+                                    if providers.len() == 2 { "both " } else { "" },
+                                    join_with(&providers, "and"),
+                                ),
+                            });
                         }
                         // Every candidate belongs to a trait: `Type::member` no
                         // longer reaches them (§3.1), and the fix is to name the

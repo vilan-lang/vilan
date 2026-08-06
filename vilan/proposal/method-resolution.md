@@ -718,3 +718,64 @@ unchanged, and its pin
 `a_duplicate_function_name_is_silently_shadowed_rather_than_rejected` —
 written to go red the day this landed — now asserts the error under the
 name `a_duplicate_function_name_is_rejected`.
+
+## 12. B83: the static path gets the tiering
+
+§S2's residue, filed as B83 by B74's arc. `prepped_static_accessors`
+resolved `Type::member` with a flat `find_map` over `implementations` in
+registration order, so a trait-provided static BEAT an inherent one that
+happened to register later. §3's headline rule — inherent over trait,
+unconditionally — was inverted on the one path §3 never reached, and which
+answer you got depended on the order the impl blocks were written in.
+Verified both ways before the fix: with `impl Bag with Default` first,
+`Bag::default()` gave the trait's `7`; with the inherent block first, `1`.
+
+The fix is the ranking, not the candidate set. §3's tiering came out of
+`resolve_impl_member` into `rank_member_candidates`, and the static path
+now feeds it exactly the candidates it always scanned — a declaration with
+no `self` receiver qualifies, and a `[trait_only]` member is reachable
+when the path head IS the trait. So a trait-SUBJECT impl (`impl
+Iterator<type T> { fun from_fn(..) }`, which is how `Iterator::from_fn`
+resolves) keeps working unchanged, and the only behavior that moves is
+which of two competing candidates wins.
+
+**The trait tier stays reachable here, unlike §3.1.** For a method, §3.1
+tightened `Type::method(receiver, ..)` to the type's OWN member because
+`Trait::method(receiver)` is the sanctioned alternative spelling. A static
+has no alternative spelling, so refusing the trait tier would make every
+trait-provided static uncallable — `Bag::default()` against a lone
+`impl Bag with Default` must resolve, and is pinned to.
+
+**The ambiguity diagnostic cannot offer §4's steer, and says so.** Two
+traits providing one static with nothing inherent above them is the same
+ambiguity §4 describes, and it is now reported instead of silently
+resolved to whichever registered first. But §4's fix — "call
+`Trait::member(receiver)` to pick one" — does not exist on this path, and
+`Trait::static()` cannot be built on today's design: the qualified form
+selects an impl THROUGH the receiver's type, and a static offers nothing
+to select with. Probed and pinned in both forms, with and without a
+default body on the trait's declaration: `Alpha::spawn()` reports "cannot
+find 'spawn' in Alpha". Whether a static should be reachable through a
+trait at all — and what would name the impl if it were — is a design
+question this arc does not answer.
+
+So the diagnostic names the fix that always works, and names the missing
+one as missing rather than leaving it to be hunted for:
+
+    'spawn' is ambiguous on 'Bag': both 'Alpha' and 'Beta' provide it as a
+    static, and a static has no receiver for a `Trait::spawn` path to
+    select through; declare 'Bag''s own 'spawn', which outranks every
+    trait-provided one
+
+An impossible steer is worse than no steer (B65's lesson), so the named
+fix is itself pinned working rather than asserted.
+
+**Blast radius: none.** A sweep for a subject with the same static name
+declared by both an inherent block and a trait-providing one found zero
+sites across std, the corpus, the examples and every bindgen fixture; the
+corpus goldens are byte-identical and all ten examples build. The pin
+`b74_a_trait_provided_static_does_not_collide_with_an_inherent_one` — which
+recorded the inversion in a note, deliberately unpinned — now asserts the
+value: `1`, the inherent one. The two claims sit on one program, which is
+the honest place for them: the trait's declaration is not a DUPLICATE of
+the inherent one (B74), it is OUTRANKED by it (B57).
