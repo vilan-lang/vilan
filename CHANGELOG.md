@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.30.0 — 2026-08-06
 
 **Which method a `value.method()` call runs is now a rule, not an accident of where you typed the impl block.** Resolution scanned every impl of the receiver's type and took the first hit, in registration order — so an inherent method and a trait's could swap places by moving two blocks in one file, or by renaming a module so it sorted differently, with exit 0 both times and nothing said. The rule now: an **inherent** method — one declared by an impl of the type whose `with` clause does not declare that name — always beats a trait's, whatever the text order and whichever module loaded first. Otherwise the method a trait provides, whether the impl declares it or inherits the trait's default.
 
