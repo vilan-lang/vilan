@@ -1,6 +1,6 @@
 # The Vilan Organization's stance on AI
 
-_This document was written exclusively by [Reed Syllas](https://github.com/ReedSyllas) without assistance from AI tooling._
+_This document was written exclusively by Reed Syllas without assistance from AI tooling._
 
 In the modern age, AI-assisted programming has become quite common. With it, two opposing sides have formed: those who love it and those who hate it. I'm not going to engage with the topic as a whole, but I will set guidelines for the Vilan project.
 
@@ -15,6 +15,7 @@ Sadly, a test suite only goes so far. Thus, AI-isms like frequent em-dashes, wor
 AI contributions to this project are allowed, with caveats.
 
 1. Human oversight must be used to ensure code is of sufficient quality.
-2. The language's grammar, APIs, and visuals are designed by humans for humans and will continue to be.
+2. Use of AI tooling must not be hidden. A generic "AI-assisted" attribution is acceptable.
+3. The language's grammar, APIs, and visuals are designed by humans for humans and will always continue to be.
 
 These requirements may become more or less restrictive over time.
