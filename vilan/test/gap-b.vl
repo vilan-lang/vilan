@@ -5,8 +5,14 @@ import std::print;
 // pattern (here a tuple) binds them as the impl's generics and flows them into
 // the method body, so `Some((let x, let y))` on a `Option<(T, U)>` self
 // destructures into `x: T`, `y: U`.
+//
+// Named `unzip_pair`, not `unzip`: `std::option` declares its own inherent
+// `unzip` for this very subject, and two inherent declarations of one name are
+// a definition-site error (B57, `proposal/method-resolution.md` §3). Before
+// that rule this file's copy was silently dead — shadowed by std's, and
+// indistinguishable only because the two bodies compute the same thing.
 impl Option<(type T, type U)> {
-	fun unzip(self): (Option<T>, Option<U>) {
+	fun unzip_pair(self): (Option<T>, Option<U>) {
 		match self {
 			Some((let x, let y)) => (Some(x), Some(y)),
 			_ => (None, None),
@@ -16,8 +22,8 @@ impl Option<(type T, type U)> {
 
 fun main() {
 	let pair = Some((3, 7));
-	print(pair.unzip());
+	print(pair.unzip_pair());
 
 	let empty: Option<(i32, i32)> = None;
-	print(empty.unzip());
+	print(empty.unzip_pair());
 }
