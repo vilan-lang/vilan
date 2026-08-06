@@ -64,3 +64,23 @@ impl Map<type K: Hashable, type V> {
 		result
 	}
 }
+
+/// The map half of the explicit termination family: a list of `(key, value)`
+/// pairs becomes a `Map`, so an iterator chain ends
+/// `xs.iter().map(|w| (w, w.len())).to_list().to_map()`. A repeated key keeps
+/// the LAST pair, matching `insert`.
+///
+/// The impl subject binds the element structurally — `List<(K, V)>` — which is
+/// how the two bounds a `Map` needs (`K: Hashable`, and the element being a
+/// pair at all) are stated. It lives here rather than on `Iterator` for the
+/// same reason `to_set` lives on `List`: a trait default may not require a
+/// bound its trait does not declare.
+impl List<(type K: Hashable, type V)> {
+	fun to_map(self): Map<K, V> {
+		mut result: Map<K, V> = Map::new();
+		for entry in self {
+			result.insert(entry.0, entry.1);
+		}
+		result
+	}
+}

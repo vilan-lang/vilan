@@ -1,3 +1,4 @@
+import pkg::iterator::Iterator;
 import pkg::option::Option::{ None, Some, self };
 
 /// A half-open integer range `[start, end)`. Iterate it with
@@ -12,7 +13,9 @@ impl Range {
 	fun new(start: i32, end: i32): Range {
 		Range { current = start, end = end }
 	}
+}
 
+impl Range with Iterator<i32> {
 	fun next(&mut self): Option<i32> {
 		if self.current < self.end {
 			let value = self.current;

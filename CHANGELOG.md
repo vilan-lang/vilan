@@ -49,6 +49,123 @@ The parser is our own, and that is the one place this departs from the paper. `p
 **And the probe that was the point of doing this now.** Run against TypeScript's own `lib.dom.d.ts` — 39,429 lines, 2,415 declarations — bindgen emits **489,523 lines of vilan that type-check clean** through the real analyzer in eleven seconds. Members bind at **99.8%** (61,224 of 61,317, after `extends` flattening). Declarations bind at **65.8%**, and the entire shortfall is one construct: **824 `declare var` globals**, because every `[extern(…)]` form binds a *call* or a receiver's property and none reads a bare global as a value. 641 of those are the DOM's constructor idiom — `declare var HTMLCanvasElement: { new(): HTMLCanvasElement }` — so recognizing that one shape is the difference between an unusable and a usable binding. A working canvas program (fills, arcs, text, a click listener) compiles to exactly the JavaScript you would hand-write, on top of generated bindings plus **one** hand-written line for the entry point. The full findings are appended to `proposal/bindgen.md`; they are what the deferred canvas item (A17) was waiting on.
 
 Sixty pins, each planted red and restored, including two that fix *language* facts rather than bindgen's own behavior — that a struct is a positional array, and that `Option` cannot cross a host boundary — so the day either changes, the mapping rows built on them go red instead of quietly rotting.
+
+---
+
+**`Iterator` is a trait you can actually implement.** It declared
+`fun next(self): Option<T>` — by value — and a by-value receiver cannot advance
+anything, so every stateful iterator (a cursor, a counter, anything holding a
+position) hit the conformance error `match the receiver convention` and had to
+give up on the trait. `Range`, the one real lazy iterator in the standard
+library, was written that way: a bare inherent `next(&mut self)` and no `with
+Iterator<i32>` clause, because the clause was not available to it. `next` now
+takes `&mut self`, which is what advancing an iterator has always been, and
+`Range` carries the clause. The documentation's claim that "`Range` is one such
+type" is true for the first time.
+
+Nothing about `for … in` changed: the loop resolves the protocol on the *method
+name*, so a type with a `next(&mut self): Option<T>` has always driven a loop
+whether or not it declared the trait, and still does. What the repair buys is
+the trait as a **bound** — `fun total<I: Iterator<i32>>(mut source: I)` accepts a
+`Range` now — and it is the enabling change for everything else in this arc,
+since every adapter is stateful by construction. If you implemented `Iterator`
+by mutating something outside the iterator (a module-level counter — the only
+way that worked), the receiver is the one line to change.
+
+**`List` has a cursor, and every iterator has adapters.** `xs.iter()` returns a
+`ListIterator<T>`, and `map`, `filter`, `take`, `skip`, `enumerate`, `zip` and
+`chain` arrive as trait *defaults* on `Iterator` — so implementing `next` gets
+you all seven, on your own types as much as on std's. They are lazy: each one is
+a small struct holding its upstream, nothing runs until something pulls, and a
+chain makes **one** pass over the source with no intermediate lists.
+`[1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).map(|n| n * 10).take(2)` walks
+the six values once and touches four of them.
+
+Laziness is what makes `take` more than shorthand: it never pulls past its
+budget, so it bounds a source with no end. An iterator whose `next` always
+answers `Some` is now a normal thing to write, and `.take(3)` terminates it.
+`zip` stops with the shorter side; `enumerate` numbers what reaches *it*, so
+after a `filter` you get positions in the output rather than in the source.
+
+`xs.iter()` takes a **snapshot**. That is rule 1 rather than a policy — the
+cursor stores the list in a slot that outlives the call, so the storage copies —
+and it means a `push` after `iter()` is not walked, and that `iter()` itself
+costs a copy of the list. The eager `List` methods that only need one pass still
+take one.
+
+The adapter *types* are past participles — `Mapped`, `Taken`, `Filtered` — while
+the methods keep the plain names. `Map` is already a std type, and vilan's method
+resolution picks by registration order rather than reporting a collision, so the
+names are kept apart deliberately rather than arbitrated.
+
+One rough edge is documented rather than hidden: if an iterator's element type is
+its own generic parameter and you instantiate it at a *tuple*, the `for` binding
+loses the tuple — `for pair in [(1, "a")].iter() { pair.0 }` is rejected with
+"cannot access field '0' on type T". Pulling by hand works, iterating the `List`
+works, and `enumerate`/`zip` are unaffected because they name their tuple element
+structurally. It is a pre-existing defect in the loop's substitution that nothing
+in std could reach until `List::iter` existed; it is pinned.
+
+**A chain ends with a method that says what it builds.** `to_list`, `fold`,
+`for_each`, `count`, `any`, `all` and `rev` consume the iterator and hand back an
+ordinary value, and `to_list` is the primary one on purpose. A method that
+*names* what it builds needs no type annotation, reads at the call site, and
+works in the middle of an expression — `xs.iter().filter(f).to_list().len()` —
+which is exactly the shape a pipeline invites and exactly where an
+inference-driven `collect` gives up. **There is no `collect`, deliberately.** If
+one is ever added it will sit beside this family, never replace it.
+
+`any` and `all` short-circuit, so they answer over a source with no end;
+`count`, `fold`, `for_each` and `to_list` pull everything, so bound such a source
+with `take` first. `rev` is a **barrier** rather than a lazy adapter: it drains
+its upstream into a `List`, reverses that, and hands back a `ListIterator`, so
+the chain continues but the work has already happened. A lazy reverse wants a
+double-ended protocol — every adapter deciding whether it can walk backwards —
+which roughly doubles the surface of a layer that has not had its first user, and
+is purely additive whenever a consumer needs it: `rev`'s signature would not
+change, only its body.
+
+For a `Set` or a `Map`, terminate and convert: `List` gains
+`to_set(self): Set<T>` under `T: Hashable` and `to_map(self): Map<K, V>` over a
+list of pairs, so a chain reads
+`xs.iter().map(|w| (w, w.len())).to_list().to_map()`. Those two live on `List`
+rather than on `Iterator`, and the reason is a real limit worth knowing: a trait
+default may not require a bound its trait does not declare, and a method cannot
+carry one of its own that ties back to the trait's parameter — so a `to_set`
+written as a trait default is rejected at its own definition, before any call.
+Putting a bounded method beside the bound it needs is the choice `join` already
+makes with `Display`. That constraint is pinned as a compiler fact, so when
+per-member bounds arrive the move onto the trait is additive and the record says
+why it could not be there first.
+
+**`List`'s own `map`/`filter`/`fold`/`for_each` are unchanged**, and the reason
+is recorded rather than left implicit. The plan was to re-express them over the
+adapters — `self.iter().map(fn).to_list()` — so that each name has exactly one
+meaning. Built and measured, it turned out to remove something that works today:
+an **async closure cannot adapt through an adapter chain**, because an adapter
+stores the closure in a field and calls it from a trait-dispatched `next`, where
+there is no single concrete callee to instantiate. `xs.map(async work)` stops
+compiling, and the corpus program that exists to pin adaptation stops building.
+It also cost about **5.5x** on a 20 000-element `map`→`filter`→`fold` — not from
+the per-element calls, but from two O(n) deep copies the eager loop does not pay:
+`iter()` snapshots the list, and the terminal copies the chain holding that
+snapshot. So the eager four keep their bodies. Nothing is ambiguous as a result:
+`List` does not implement `Iterator`, so the lazy `map` is reached only through
+`.iter()` and the two are told apart by what they are called on.
+
+**A method call is no longer colored async by a same-named *static*.** When the
+compiler cannot pin which impl a dispatched `receiver.name()` will select, it
+considers every member called `name` and takes the caller as async if any of them
+is — sound, and deliberately over-approximate. Statics were in that set, and they
+cannot be: a method call never selects a member with no receiver. It surfaced the
+moment the standard library grew an `Iterator::all`, because `Promise::all` is an
+`async` static in an always-loaded module, so `xs.iter().all(p)` colored its whole
+caller async down to an `async` `main` — for a program with nothing async in it.
+Compile-time evaluation then refused such a program outright, since macro and
+`const` bodies are synchronous. The candidate scan now keeps only members that
+take a receiver. Nothing else in the corpus moved a byte, and a genuinely async
+dispatched member still colors its caller, which is pinned in both directions.
+
 ## v0.29.0 — 2026-08-04
 
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.

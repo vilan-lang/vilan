@@ -19253,7 +19253,7 @@ fn an_iterator_protocols_next_call_colors_the_loop() {
         struct Audited { limit: i32 }
 
         impl Audited with Iterator<i32> {
-            fun next(self): Option<i32> {
+            fun next(&mut self): Option<i32> {
                 write_file("audit.log", "tick");
                 produced = produced + 1;
                 if produced <= self.limit {
@@ -40208,5 +40208,1359 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
         "#,
         "Box { y = 2 }",
         "does not implement 'A'",
+    );
+}
+
+// --- I5: `Iterator::next` takes `&mut self` (proposal/iterator-adapters.md P1,
+// --- slice S1) --------------------------------------------------------------
+// The trait shipped declaring `fun next(self): Option<T>`, and B29's receiver-
+// convention conformance rightly rejected the `&mut self` every stateful
+// iterator needs — so the trait was unconformable as declared, and `Range`, the
+// one real lazy iterator in std, deliberately did not implement it. `next` is
+// now `&mut self`; these pin that the trait is implementable, that std's own
+// conformers work, and that the by-value declaration is gone for good.
+
+#[test]
+fn i5_a_stateful_iterator_conforms_to_the_repaired_trait() {
+    // The shape the by-value receiver made impossible: state on the ITERATOR,
+    // advanced by `next`. Pre-repair this was
+    // "`Counting`'s `next` receives `&mut self`, but `Iterator` declares `self`".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        struct Counting { at: i32, limit: i32 }
+
+        impl Counting with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit {
+                    self.at = self.at + 1;
+                    Some(self.at)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut counting = Counting { at = 0, limit = 3 };
+            for value in counting {
+                print(value);
+            }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn i5_a_by_value_next_no_longer_conforms() {
+    // The other direction, and the pin that keeps the repair honest: a conformer
+    // declaring the OLD by-value receiver is now the conformance error. Without
+    // it, re-widening `next` back to `self` would go unnoticed.
+    assert_fails_with(
+        r#"
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        struct Fixed { value: i32 }
+
+        impl Fixed with Iterator<i32> {
+            fun next(self): Option<i32> {
+                Some(self.value)
+            }
+        }
+
+        fun main() {}
+        "#,
+        "match the receiver convention",
+    );
+}
+
+#[test]
+fn i5_range_implements_the_iterator_trait() {
+    // `Range` gains the `with Iterator<i32>` clause it has always deserved, so
+    // the docs' "`Range` is one such type" is true for the first time. The
+    // `for` protocol is name-resolved and worked either way — what is new is
+    // that a bound `I: Iterator<i32>` accepts a `Range`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self };
+        import std::range::Range;
+
+        fun total<I: Iterator<i32>>(mut source: I): i32 {
+            mut sum = 0;
+            for value in source {
+                sum = sum + value;
+            }
+            sum
+        }
+
+        fun main() {
+            print(total(Range::new(1, 5)));
+            mut range = Range::new(0, 3);
+            print(range.next().unwrap_or(-1));
+            print(range.next().unwrap_or(-1));
+        }
+        "#,
+        "10\n0\n1\n",
+    );
+}
+
+#[test]
+fn i5_iterator_from_fn_follows_the_repaired_receiver() {
+    // std's other conformer. `from_fn`'s closure carries the state, so the
+    // receiver change is invisible at the call site EXCEPT that the binding must
+    // now be `mut` — which is the honest reading: pulling advances it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut produced = 0;
+            mut naturals = Iterator::from_fn(|| {
+                produced = produced + 1;
+                if produced <= 2 { Some(produced) } else { None }
+            });
+            print(naturals.next().unwrap_or(-1));
+            print(naturals.next().unwrap_or(-1));
+            print(naturals.next().unwrap_or(-1));
+        }
+        "#,
+        "1\n2\n-1\n",
+    );
+}
+
+// --- I3 S3: `ListIterator` + `List::iter` (proposal/iterator-adapters.md P0) --
+// `List` reached none of the protocol: it implemented neither trait and had no
+// cursor, so the headline chain was blocked before any adapter existed.
+// `List::iter()` returns a concrete `ListIterator<T>` — concrete because a bare
+// trait type is not a value (B4), so an adapter chain's type has to stay
+// concrete end to end.
+
+#[test]
+fn list_iter_walks_the_elements_in_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut cursor = [1, 2, 3].iter();
+            for value in cursor {
+                print(value);
+            }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn list_iter_over_an_empty_list_is_immediately_exhausted() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self };
+
+        fun main() {
+            let empty: List<i32> = [];
+            mut cursor = empty.iter();
+            print(cursor.next().is_none());
+            mut count = 0;
+            for _value in cursor {
+                count = count + 1;
+            }
+            print(count);
+        }
+        "#,
+        "true\n0\n",
+    );
+}
+
+#[test]
+fn list_iter_stays_exhausted_past_the_last_element() {
+    // Cursor exhaustion: `next` past the end keeps answering `None` rather than
+    // running off the array (the index guard, not a panic from `[]`).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self };
+
+        fun main() {
+            mut cursor = [7].iter();
+            print(cursor.next().unwrap_or(-1));
+            print(cursor.next().unwrap_or(-1));
+            print(cursor.next().unwrap_or(-1));
+        }
+        "#,
+        "7\n-1\n-1\n",
+    );
+}
+
+#[test]
+fn list_iter_holds_a_snapshot_so_a_later_push_is_not_walked() {
+    // The rule-1 interaction, and the reason `iter` costs a copy: the cursor
+    // stores the list in a slot that outlives the call, so it snapshots.
+    // Mutating the list mid-walk cannot lengthen the walk — which is also what
+    // keeps rule 4 out of it, since the cursor shares no storage with `live`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            mut live = [1, 2];
+            mut cursor = live.iter();
+            live.push(3);
+            mut total = 0;
+            for value in cursor {
+                total = total + value;
+            }
+            print(total);
+            print(live.len());
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+fn list_iter_satisfies_an_iterator_bound() {
+    // `ListIterator` declares the trait, so it is accepted where the protocol is
+    // asked for by BOUND rather than by method name.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+
+        fun count_of<I: Iterator<i32>>(mut source: I): i32 {
+            mut seen = 0;
+            for _value in source {
+                seen = seen + 1;
+            }
+            seen
+        }
+
+        fun main() {
+            print(count_of([4, 5, 6].iter()));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+// --- Found while building I3 S3: a user `impl List<type T>` makes std's own
+// --- `List` methods report, nondeterministically ------------------------------
+
+/// A user-declared `impl List<type T>` block makes the entry-scoped checks
+/// report against std's OWN `List::map` / `List::filter` bodies — "the type of
+/// 'result' is never fully determined" against `mut result = List::new()` in
+/// `list.vl` — on roughly half of otherwise identical compiles of the SAME
+/// source. Two things are wrong at once:
+///
+/// 1. the diagnostic is **spurious**: `result` is fixed by the `result.push(..)`
+///    below it and by the declared return type, which is why the other half of
+///    the runs are clean; and
+/// 2. it points into **std**, whose definition-site diagnostics are meant to be
+///    frozen (`analysis-reuse.md` §6) — so a user's impl block is un-freezing
+///    entities it does not own.
+///
+/// The order-dependence is what makes it worth its own pin: a single compile
+/// proves nothing. It is also **cold-path only** — the base cache
+/// (`analysis-reuse.md` §6.10) serves every compile after the first in a
+/// process, and a served world is always the clean one, which is why a naive
+/// loop passes 300/300 and proves nothing either. So each attempt clears the
+/// cache first. Measured that way it fails roughly half the time, here and on
+/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predates this arc;
+/// `#[ignore]`d until the cause is found.
+///
+/// `base_cache_clear` is process-global, which is a second reason this stays
+/// ignored rather than joining the suite.
+#[test]
+#[ignore]
+fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
+    let source = r#"
+        import std::print;
+
+        impl List<type T> {
+            fun second_len(self): i32 {
+                self.len()
+            }
+        }
+
+        fun main() {
+            print([1, 2, 3].second_len());
+        }
+        "#;
+    for attempt in 0..20 {
+        vilan_core::analyzer::base_cache_clear();
+        if let Err(errors) = compile(source) {
+            panic!("attempt {attempt} reported against std: {errors:#?}");
+        }
+    }
+}
+
+// --- I3 S4: the adapters (proposal/iterator-adapters.md §3) -------------------
+// Trait defaults on the repaired `Iterator<T>`, each returning a named concrete
+// struct that holds its upstream by value. Terminals arrive in S5, so these
+// drive the chains with a `for` loop — which also pins that the loop protocol
+// reaches an adapter, per instantiation.
+
+/// The source every adapter pin composes over: a stateful conformer that only
+/// works because `next` takes `&mut self`, and an UNBOUNDED one, so a pin that
+/// forgets to short-circuit hangs rather than passing.
+fn adapter_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{{ self, Some, None }};
+        import std::range::Range;
+
+        struct Naturals {{ at: i32 }}
+
+        impl Naturals with Iterator<i32> {{
+            fun next(&mut self): Option<i32> {{
+                self.at = self.at + 1;
+                Some(self.at)
+            }}
+        }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn map_applies_its_closure_to_every_value() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut doubled = [1, 2, 3].iter().map(|n| n * 2);
+                for value in doubled {
+                    print(value);
+                }
+                mut single = [7].iter().map(|n| n + 1);
+                for value in single {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "2\n4\n6\n8\n",
+    );
+}
+
+#[test]
+fn map_over_an_empty_source_yields_nothing() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let empty: List<i32> = [];
+                mut mapped = empty.iter().map(|n| n * 2);
+                mut seen = 0;
+                for _value in mapped {
+                    seen = seen + 1;
+                }
+                print(seen);
+            }
+            "#,
+        ),
+        "0\n",
+    );
+}
+
+#[test]
+fn map_changes_the_element_type() {
+    // `Mapped<Self, T, U>` carries both, so a chain may change type mid-way and
+    // stay concrete — the property B4 makes load-bearing.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut labelled = [1, 2].iter().map(|n| i"n={n}");
+                for label in labelled {
+                    print(label);
+                }
+            }
+            "#,
+        ),
+        "n=1\nn=2\n",
+    );
+}
+
+#[test]
+fn an_adapter_pulls_nothing_until_it_is_pulled() {
+    // Laziness, stated as an observation rather than a claim: constructing the
+    // chain runs no closure, and one `next` runs exactly one.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut pulled = 0;
+                mut mapped = [1, 2, 3].iter().map(|n| {
+                    pulled = pulled + 1;
+                    n * 2
+                });
+                print(pulled);
+                print(mapped.next().unwrap_or(-1));
+                print(pulled);
+            }
+            "#,
+        ),
+        "0\n2\n1\n",
+    );
+}
+
+#[test]
+fn filter_keeps_only_what_the_predicate_holds_for() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut evens = [1, 2, 3, 4, 5].iter().filter(|n| n % 2 == 0);
+                for value in evens {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "2\n4\n",
+    );
+}
+
+#[test]
+fn a_filter_that_rejects_everything_is_exhausted_not_stuck() {
+    // The loop inside `filter`'s `next` has to end on the upstream's `None`,
+    // not on a match — a predicate nothing satisfies is the case that proves it.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut none = [1, 2, 3].iter().filter(|n| n > 100);
+                mut seen = 0;
+                for _value in none {
+                    seen = seen + 1;
+                }
+                print(seen);
+                let empty: List<i32> = [];
+                print(empty.iter().filter(|n| n > 0).next().is_none());
+            }
+            "#,
+        ),
+        "0\ntrue\n",
+    );
+}
+
+#[test]
+fn take_stops_at_its_budget() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut first2 = [1, 2, 3, 4].iter().take(2);
+                for value in first2 {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut nothing = [1, 2, 3].iter().take(0);
+                print(nothing.next().is_none());
+                mut negative = [1, 2, 3].iter().take(-4);
+                print(negative.next().is_none());
+                mut over = [1, 2].iter().take(9);
+                mut seen = 0;
+                for _value in over {
+                    seen = seen + 1;
+                }
+                print(seen);
+            }
+            "#,
+        ),
+        "true\ntrue\n2\n",
+    );
+}
+
+#[test]
+fn take_short_circuits_an_unbounded_source() {
+    // The pin the whole laziness argument rests on: `Naturals` never answers
+    // `None`, so this terminates only because `take` stops pulling. A `take`
+    // that consumed its upstream eagerly would hang the test binary.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut first3 = Naturals { at = 0 }.take(3);
+                for value in first3 {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n",
+    );
+}
+
+#[test]
+fn skip_drops_the_first_values() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut rest = [1, 2, 3, 4].iter().skip(2);
+                for value in rest {
+                    print(value);
+                }
+                mut all = [1, 2].iter().skip(0);
+                for value in all {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "3\n4\n1\n2\n",
+    );
+}
+
+#[test]
+fn skipping_past_the_end_leaves_an_exhausted_iterator() {
+    // The upstream runs out DURING the skip, which is the case a naive `skip`
+    // gets wrong by then pulling once more and answering with a stale value.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut gone = [1, 2].iter().skip(5);
+                print(gone.next().is_none());
+                print(gone.next().is_none());
+                let empty: List<i32> = [];
+                print(empty.iter().skip(3).next().is_none());
+            }
+            "#,
+        ),
+        "true\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn skip_pays_its_cost_on_the_first_pull_not_at_construction() {
+    // An adapter that consumed its upstream when it was BUILT would not be
+    // lazy — and over `Naturals` it would not return at all.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut later = Naturals { at = 0 }.skip(2).take(2);
+                for value in later {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn enumerate_pairs_each_value_with_its_position() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut indexed = ["a", "b", "c"].iter().enumerate();
+                for pair in indexed {
+                    print(i"{pair.0}:{pair.1}");
+                }
+                let empty: List<str> = [];
+                print(empty.iter().enumerate().next().is_none());
+            }
+            "#,
+        ),
+        "0:a\n1:b\n2:c\ntrue\n",
+    );
+}
+
+#[test]
+fn enumerate_counts_its_own_output_not_the_upstreams() {
+    // Over a `filter`, the index must number what SURVIVES — the classic
+    // off-by-provenance bug, where the position comes from the source instead.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut indexed = [1, 2, 3, 4].iter().filter(|n| n % 2 == 0).enumerate();
+                for pair in indexed {
+                    print(i"{pair.0}:{pair.1}");
+                }
+            }
+            "#,
+        ),
+        "0:2\n1:4\n",
+    );
+}
+
+#[test]
+fn zip_stops_with_the_shorter_side() {
+    // Both directions, because they take different paths through `next`: a
+    // short LEFT never asks the right side, a short RIGHT drops a left value.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut short_right = [1, 2, 3].iter().zip(["x", "y"].iter());
+                for pair in short_right {
+                    print(i"{pair.0}{pair.1}");
+                }
+                mut short_left = [1].iter().zip(["x", "y", "z"].iter());
+                for pair in short_left {
+                    print(i"{pair.0}{pair.1}");
+                }
+                let empty: List<i32> = [];
+                print(empty.iter().zip([1, 2].iter()).next().is_none());
+                print([1, 2].iter().zip(empty.iter()).next().is_none());
+            }
+            "#,
+        ),
+        "1x\n2y\n1x\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn zip_bounds_an_unbounded_side() {
+    // `zip` over `Naturals` terminates because the finite side ends it —
+    // the same short-circuit property as `take`, reached differently.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut numbered = Naturals { at = 0 }.zip(["p", "q"].iter());
+                for pair in numbered {
+                    print(i"{pair.0}{pair.1}");
+                }
+            }
+            "#,
+        ),
+        "1p\n2q\n",
+    );
+}
+
+#[test]
+fn chain_yields_the_left_side_then_the_right() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut both = [1, 2].iter().chain([3, 4].iter());
+                for value in both {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n4\n",
+    );
+}
+
+#[test]
+fn chain_handles_an_empty_side_on_either_end() {
+    // And, once the left is exhausted, it is never asked again — the latch.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let empty: List<i32> = [];
+                mut right_only = empty.iter().chain([5, 6].iter());
+                for value in right_only {
+                    print(value);
+                }
+                mut left_only = [7].iter().chain(empty.iter());
+                for value in left_only {
+                    print(value);
+                }
+                print(empty.iter().chain(empty.iter()).next().is_none());
+            }
+            "#,
+        ),
+        "5\n6\n7\ntrue\n",
+    );
+}
+
+#[test]
+fn adapters_of_different_kinds_compose_into_one_chain() {
+    // Four stages over a `List`, each a different adapter, each holding the
+    // previous BY VALUE — the "adapter over adapter over adapter" case, where a
+    // dispatch that lost its instantiation used to emit an empty body (B55).
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut pipeline = [1, 2, 3, 4, 5, 6]
+                    .iter()
+                    .filter(|n| n % 2 == 0)
+                    .map(|n| n * 10)
+                    .skip(1)
+                    .take(2);
+                for value in pipeline {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "40\n60\n",
+    );
+}
+
+#[test]
+fn a_stateful_custom_conformer_drives_the_whole_adapter_set() {
+    // The arc's point, end to end: a user type whose `next` mutates its OWN
+    // state — impossible before I5 — reaching every adapter through the trait's
+    // defaults, with `Range` zipped in as a second std source.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut squares = Naturals { at = 0 }
+                    .map(|n| n * n)
+                    .filter(|n| n % 2 == 1)
+                    .zip(Range::new(10, 13))
+                    .take(2)
+                    .map(|pair| pair.0 + pair.1);
+                for value in squares {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "11\n20\n",
+    );
+}
+
+#[test]
+fn an_adapter_chain_leaves_its_source_list_alone() {
+    // The memory-model half: `iter()` snapshots (rule 1), and every adapter
+    // holds its upstream by value, so the whole pipeline is pure with respect
+    // to the list it started from — including under a `map` that would
+    // otherwise write through a shared element.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut source = [1, 2, 3];
+                mut doubled = source.iter().map(|n| n * 2);
+                mut total = 0;
+                for value in doubled {
+                    total = total + value;
+                }
+                print(total);
+                print(source.len());
+                print(source[0]);
+                source.push(4);
+                print(source.len());
+            }
+            "#,
+        ),
+        "12\n3\n1\n4\n",
+    );
+}
+
+// --- Found while building I3 S4: the protocol loop drops a TUPLE element's
+// --- type when the iterator's element is its own generic parameter -----------
+
+/// `for value in it` types `value` as the bare generic parameter (or as `any`)
+/// when `it`'s element type IS that parameter — so a tuple element cannot be
+/// projected: `pair.0` is "cannot access field '0' on type T". The same
+/// iterator pulled by hand is fine, which is what makes this the LOOP's bug
+/// rather than the iterator's:
+///
+/// ```text
+/// if cursor.step() is Some(let pair) { print(pair.0); }   // 1
+/// for pair in cursor { print(pair.0); }                   // cannot access field '0'
+/// ```
+///
+/// It is not std's and not this arc's — the repro below defines its own trait
+/// and its own cursor, and the native `for pair in [(1, "a")]` over a plain
+/// `List` (a different arm entirely) has always worked. What the arc DID is
+/// make the shape reachable: `List::iter()` is the first generically-elemented
+/// iterator in std, so `[(1, "a")].iter().filter(p)` now hits it. An adapter
+/// that names the tuple STRUCTURALLY in its `with` clause is unaffected —
+/// `enumerate` (`Iterator<(i32, T)>`) and `zip` (`Iterator<(T, U)>`) both
+/// project fine — so the defect is exactly the substitution of the loop
+/// binding, not tuples in the protocol.
+///
+/// `#[ignore]`d: it asserts the desired outcome and fails today.
+#[test]
+#[ignore]
+fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        trait Walk<T> {
+            fun step(&mut self): Option<T>;
+        }
+
+        struct Cursor<T> {
+            items: List<T>,
+            index: i32,
+        }
+
+        impl Cursor<type T> with Walk<T> {
+            fun step(&mut self): Option<T> {
+                if self.index < self.items.len() {
+                    let value = self.items[self.index];
+                    self.index = self.index + 1;
+                    Some(value)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut pulled = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
+            if pulled.step() is Some(let pair) {
+                print(pair.0);
+            }
+            mut looped = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
+            for pair in looped {
+                print(pair.1);
+            }
+        }
+        "#,
+        "1\na\nb\n",
+    );
+}
+
+// --- I3 S5: the terminations (proposal/iterator-adapters.md §5, §6) ----------
+// The EXPLICIT family is the primary termination API and there is no `collect`:
+// a method that names what it builds needs no annotation, reads at the call
+// site, and composes with a chain. `to_list`/`fold`/`for_each`/`count`/`any`/
+// `all`/`rev` are trait defaults; `to_set`/`to_map` are bounded `List` methods
+// (see `to_set_and_to_map_live_on_list_because_a_default_cannot_carry_a_bound`).
+
+#[test]
+fn to_list_pulls_a_chain_into_a_list() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let doubled = [1, 2, 3].iter().map(|n| n * 2).to_list();
+                print(doubled.len());
+                print(doubled[0]);
+                print(doubled[2]);
+                let empty: List<i32> = [];
+                print(empty.iter().to_list().len());
+                print([7].iter().to_list()[0]);
+            }
+            "#,
+        ),
+        "3\n2\n6\n0\n7\n",
+    );
+}
+
+#[test]
+fn to_list_composes_out_of_a_chain_where_an_inferred_collect_would_not() {
+    // §5's argument, made executable: the explicit terminal is usable in the
+    // middle of an expression, which is the shape a pipeline invites and the
+    // one `it.collect().len()` cannot resolve.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3, 4].iter().filter(|n| n % 2 == 0).to_list().len());
+            }
+            "#,
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn to_list_over_an_unbounded_source_is_bounded_by_take() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let first = Naturals { at = 0 }.take(4).to_list();
+                print(first.len());
+                print(first[3]);
+            }
+            "#,
+        ),
+        "4\n4\n",
+    );
+}
+
+#[test]
+fn fold_combines_left_to_right_from_its_seed() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().fold(0, |total, n| total + n));
+                print([1, 2, 3].iter().fold(100, |total, n| total - n));
+                let empty: List<i32> = [];
+                print(empty.iter().fold(42, |total, n| total + n));
+                print([1, 2, 3].iter().fold("", |text, n| text + i"{n}"));
+            }
+            "#,
+        ),
+        "6\n94\n42\n123\n",
+    );
+}
+
+#[test]
+fn for_each_runs_its_closure_once_per_value_in_order() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                [1, 2, 3].iter().filter(|n| n != 2).for_each(|n| print(n));
+                let empty: List<i32> = [];
+                empty.iter().for_each(|n| print(n));
+                print("done");
+            }
+            "#,
+        ),
+        "1\n3\ndone\n",
+    );
+}
+
+#[test]
+fn count_counts_what_reaches_it() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3, 4].iter().filter(|n| n > 2).count());
+                let empty: List<i32> = [];
+                print(empty.iter().count());
+                print([7].iter().count());
+                print(Naturals { at = 0 }.take(5).count());
+            }
+            "#,
+        ),
+        "2\n0\n1\n5\n",
+    );
+}
+
+#[test]
+fn any_short_circuits_on_the_first_hit() {
+    // The short-circuit is what lets `any` answer over an unbounded source —
+    // a version that drained first would not return at all.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().any(|n| n == 2));
+                print([1, 2, 3].iter().any(|n| n == 9));
+                let empty: List<i32> = [];
+                print(empty.iter().any(|n| n == 1));
+                print(Naturals { at = 0 }.any(|n| n == 4));
+            }
+            "#,
+        ),
+        "true\nfalse\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn all_short_circuits_on_the_first_miss_and_is_vacuously_true_when_empty() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().all(|n| n > 0));
+                print([1, 2, 3].iter().all(|n| n > 1));
+                let empty: List<i32> = [];
+                print(empty.iter().all(|n| n > 100));
+                print(Naturals { at = 0 }.all(|n| n < 3));
+            }
+            "#,
+        ),
+        "true\nfalse\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn rev_walks_the_values_backwards() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut backwards = [1, 2, 3].iter().rev();
+                for value in backwards {
+                    print(value);
+                }
+                let empty: List<i32> = [];
+                print(empty.iter().rev().count());
+                print([7].iter().rev().to_list()[0]);
+            }
+            "#,
+        ),
+        "3\n2\n1\n0\n7\n",
+    );
+}
+
+#[test]
+fn rev_is_a_barrier_that_still_composes_with_adapters_on_both_sides() {
+    // It hands back a `ListIterator`, so the chain continues — but it drained
+    // the upstream to do it, which is why the doc calls it a barrier and why
+    // the unbounded source has to be bounded BEFORE it.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let out = Naturals { at = 0 }.take(4).map(|n| n * 10).rev().take(2).to_list();
+                print(out[0]);
+                print(out[1]);
+            }
+            "#,
+        ),
+        "40\n30\n",
+    );
+}
+
+#[test]
+fn to_set_collapses_duplicates_at_the_end_of_a_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+
+        fun main() {
+            let unique = [1, 2, 2, 3, 3, 3].iter().filter(|n| n > 1).to_list().to_set();
+            print(unique.len());
+            print(unique.contains(2));
+            print(unique.contains(1));
+            let empty: List<str> = [];
+            print(empty.to_set().len());
+            print(["only"].to_set().len());
+        }
+        "#,
+        "2\ntrue\nfalse\n0\n1\n",
+    );
+}
+
+#[test]
+fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let lengths = ["aa", "b"].iter().map(|word| (word, word.len())).to_list().to_map();
+            print(lengths.len());
+            print(lengths.get("aa").unwrap_or(-1));
+            print(lengths.get("zz").unwrap_or(-1));
+            let repeated = [(1, "first"), (1, "second")].to_map();
+            print(repeated.get(1).unwrap_or("miss"));
+            let empty: List<(i32, str)> = [];
+            print(empty.to_map().len());
+        }
+        "#,
+        "2\n2\n-1\nsecond\n0\n",
+    );
+}
+
+#[test]
+fn to_set_and_to_map_live_on_list_because_a_default_cannot_carry_a_bound() {
+    // The deviation from §5 ("as trait defaults"), pinned as the compiler fact
+    // that forced it: `Iterator<T>` does not bound `T`, a default body may not
+    // require a bound its trait does not declare, and a member cannot carry its
+    // own that unifies with `T`. So a `to_set` written as a default is an error
+    // AT ITS OWN DEFINITION, before any call — which is what this asserts. When
+    // per-member bounds arrive, moving `to_set` onto the trait is additive and
+    // this pin is what says why it could not be there first.
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        import std::option::Option::{ self, Some, None };
+        import std::set::Set;
+
+        trait Walk<T> {
+            fun step(&mut self): Option<T>;
+
+            fun to_set(mut self): Set<T> {
+                mut result: Set<T> = Set::new();
+                for value in self {
+                    result.insert(value);
+                }
+                result
+            }
+        }
+
+        fun main() {}
+        "#,
+        "generic parameter 'T' is missing the bound ': Hashable'",
+    );
+}
+
+#[test]
+fn a_terminal_consumes_the_iterator_and_leaves_its_source_list_alone() {
+    // The affine half of the terminations: `mut self` consumes the chain, and
+    // because `iter()` snapshotted, the list it came from is untouched — its
+    // length, its elements, and its ability to be walked again.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut source = [1, 2, 3];
+                print(source.iter().map(|n| n * 2).to_list().len());
+                print(source.iter().count());
+                print(source.len());
+                print(source[0]);
+                source.push(4);
+                print(source.iter().count());
+            }
+            "#,
+        ),
+        "3\n3\n3\n1\n4\n",
+    );
+}
+
+#[test]
+fn a_custom_conformer_gets_every_termination_for_free() {
+    // The trait-default payoff, stated once over a user type: `next` is the
+    // only thing `Naturals` implements.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print(Naturals { at = 0 }.take(4).to_list().len());
+                print(Naturals { at = 0 }.take(4).fold(0, |total, n| total + n));
+                print(Naturals { at = 0 }.take(4).count());
+                print(Naturals { at = 0 }.take(4).all(|n| n < 5));
+                print(Naturals { at = 0 }.take(4).rev().to_list()[0]);
+                Naturals { at = 0 }.take(2).for_each(|n| print(n));
+            }
+            "#,
+        ),
+        "4\n10\n4\ntrue\n4\n1\n2\n",
+    );
+}
+
+// --- I3 S7: why the eager `List` forms were NOT re-expressed over the
+// --- adapters (proposal/iterator-adapters.md §4 option ii, §8) ---------------
+
+/// §4 ratified re-expressing `List::map`/`filter`/`fold`/`for_each` as
+/// `self.iter().map(fn).to_list()`, and §8 asked for a measurement before that
+/// rewrite landed. The measurement found a blocker the paper did not
+/// anticipate, and it is not the performance one: **an async closure cannot
+/// adapt through an adapter chain.**
+///
+/// Async polymorphism (A.1) instantiates an ASYNC instance of the callee when
+/// the closure argument is async. An adapter STORES the closure in a struct
+/// field and calls it from a trait-dispatched `next`, where there is no single
+/// concrete callee to instantiate — so the pass refuses it:
+///
+/// ```text
+/// an async closure cannot adapt a trait/generic-dispatched call (the concrete
+/// callee varies per instantiation); bind the callee concretely, or declare the
+/// trait parameter `async || T`
+/// ```
+///
+/// The repro below touches no std: it is a user's own eager helper written over
+/// the adapters. With `List::map` re-expressed, the same error lands inside
+/// `list.vl` and `vilan/test/adapt.vl` — the corpus test that exists to pin
+/// adaptation — fails to BUILD. `map`, `filter` and `fold` all break this way;
+/// `for_each` survives, having nothing to return.
+///
+/// So the eager four keep their eager bodies. The collision §4 exists to remove
+/// does not arise in what shipped — `List` does not implement `Iterator`, so the
+/// lazy `map`/`filter` are reachable only through `.iter()`, which is §4's own
+/// "degrades gracefully" state — and `an_async_closure_adapts_map_and_runs_
+/// sequentially` above is the standing guard that the eager path still adapts.
+///
+/// `#[ignore]`d because it asserts the DESIRED outcome: when adaptation learns
+/// to follow a trait-dispatched callee, this goes green and option (ii) becomes
+/// available. The measured cost stands separately and is recorded in the
+/// proposal: the adapter path ran ~5.5x slower than the eager loop on a
+/// 20 000-element `map`→`filter`→`fold` (8-9 ms against 49-50 ms, best of
+/// seven), from two O(n) deep copies the eager form does not pay — `iter()`
+/// snapshots the list, and the terminal's `mut self` copies the chain that
+/// holds it.
+#[test]
+#[ignore]
+fn an_async_closure_adapts_through_an_adapter_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+
+        fun mapped<T, U>(source: List<T>, fn: |T| U): List<U> {
+            source.iter().map(fn).to_list()
+        }
+
+        fun main() {
+            let lengths = mapped(["ab", "cdef"], |url| {
+                let length = url.len();
+                sleep(1);
+                print(length);
+                length
+            });
+            print(lengths);
+        }
+        "#,
+        "2\n4\n[ 2, 4 ]\n",
+    );
+}
+
+// --- Found while building I3 S5: a dispatched method call was colored by a
+// --- same-named STATIC (async_infer's candidate set) --------------------------
+// `dispatch_candidates` over-approximates on purpose — an `OnType` re-dispatch
+// does not carry its trait, so it falls back to every member with the call's
+// name. Statics were in that set, and they cannot be: `receiver.name()` never
+// selects a member with no receiver. Leaving them in was not merely imprecise.
+// `std::promise::Promise::all` is an `async external` STATIC and `promise` is a
+// force-loaded core module, so the moment std grew an `Iterator::all` trait
+// default, every `xs.iter().all(p)` colored its whole caller async — down to an
+// `async` `main`, which the const-eval interpreter then refuses outright
+// ("async (macro bodies are synchronous)"). The candidate scan now keeps only
+// members whose first parameter is `self`.
+
+/// Compile and assert the emitted JS contains no `async` — the shape a
+/// miscoloring produces, and one no assertion on stdout can see.
+#[track_caller]
+fn assert_compiles_without_async(source: &str) {
+    match compile(source) {
+        Ok(javascript) => assert!(
+            !javascript.contains("async"),
+            "the program was colored async:\n{javascript}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+#[test]
+fn a_dispatched_call_is_not_colored_by_a_same_named_async_static() {
+    // The user-level shape, with no std collision involved: an async STATIC and
+    // a sync trait DEFAULT sharing one name. The call is a method call, so the
+    // static is not reachable from it and must not color the caller.
+    assert_compiles_without_async(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Gate {}
+
+        impl Gate {
+            async fun scan(items: List<i32>): i32 {
+                items.len()
+            }
+        }
+
+        trait Walk<T> {
+            fun next(&mut self): Option<T>;
+
+            fun scan(mut self, predicate: |T| bool): bool {
+                for value in self {
+                    if predicate(value) {
+                        ret true;
+                    }
+                }
+                false
+            }
+        }
+
+        struct Counting { at: i32, limit: i32 }
+
+        impl Counting with Walk<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at < self.limit {
+                    self.at = self.at + 1;
+                    Some(self.at)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            print(Counting { at = 0, limit = 3 }.scan(|n| n == 2));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn iterator_all_does_not_color_its_caller_async_through_promise_all() {
+    // The std instance, and the one users actually meet: `Iterator::all` shares
+    // its name with `Promise::all`, an `async external` static in a force-loaded
+    // module. Before the narrowing this emitted `(async () => { … })()` for a
+    // program with nothing async in it.
+    assert_compiles_without_async(
+        r#"
+        import std::print;
+
+        fun main() {
+            print([1, 2, 3].iter().all(|n| n > 0));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
+    // The other direction, so the narrowing cannot go too far. `describe` is a
+    // trait default calling `self.label()` — an `OnType` re-dispatch, which is
+    // exactly the path that falls back to the same-named scan — and `label` is
+    // inferred async on the one impl. The caller must still be colored, and
+    // its output settled rather than a promise. Dropping every candidate takes
+    // this red, which is what makes the narrowing above a narrowing and not a
+    // deletion.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::sleep;
+        import std::option::Option::{ self, Some, None };
+
+        trait Walk<T> {
+            fun next(&mut self): Option<T>;
+            fun label(self): str;
+
+            fun describe(mut self): str {
+                self.label()
+            }
+        }
+
+        struct Slow { at: i32 }
+
+        impl Slow with Walk<i32> {
+            fun next(&mut self): Option<i32> {
+                None
+            }
+
+            fun label(self): str {
+                sleep(1);
+                "slow"
+            }
+        }
+
+        fun main() {
+            print(Slow { at = 0 }.describe());
+        }
+        "#,
+        "slow\n",
     );
 }

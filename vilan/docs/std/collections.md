@@ -17,6 +17,7 @@ impl List<type T> {
 	fun remove(&mut self, index: i32): T          // panics out of bounds
 	fun len(self): i32
 	fun is_empty(self): bool
+	fun iter(self): ListIterator<T>              // the lazy cursor; see Iterator
 	fun get(self, index: i32): Option<T>
 	fun first(self): Option<T>
 	fun last(self): Option<T>
@@ -40,7 +41,26 @@ impl List<type T: Display> { fun join(self, separator: str): str }
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
 `for e in &mut list` (in-place views; see the
-[memory model](../tour/memory-model.md)).
+[memory model](../tour/memory-model.md)). `list.iter()` hands back a
+`ListIterator<T>` — a cursor over a **snapshot** of the list, and the entry to
+the [adapter chain](#iterator). The snapshot is rule 1 at work (the cursor
+stores the list in a slot that outlives the call, so it copies), which means a
+`push` after `iter()` is not walked, and that `iter()` itself costs a copy:
+
+```vilan
+import std::print;
+
+fun main() {
+	mut live = [1, 2];
+	mut cursor = live.iter();
+	live.push(3);
+	mut total = 0;
+	for value in cursor {
+		total += value;   // 1 + 2 — the snapshot predates the push
+	}
+	print(total);
+}
+```
 
 The methods that take `self` by value are pure — they return a new list and
 leave the receiver alone. The mutating ones take `&mut self`: `push`, `pop`,
@@ -147,6 +167,7 @@ impl Map<type K: Hashable, type V> {
 	fun keys(self): List<K>
 	fun values(self): List<V>
 }
+impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
 
 Keys compare **by value**. Scalars work directly; a struct, enum, tuple, or
@@ -190,6 +211,7 @@ impl Set<type T: Hashable> {
 	fun is_empty(self): bool
 	fun values(self): List<T>
 }
+impl List<type T: Hashable> { fun to_set(self): Set<T> }
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
@@ -235,10 +257,201 @@ fun main() {
 The protocol `for` consumes, and the seam for custom sequences:
 
 ```vilan,fragment
-trait Iterator<T> { fun next(self): Option<T>; }
-trait Iterable<T> { fun iter(self): Iterator<T>; }
+trait Iterator<T> { fun next(&mut self): Option<T>; }
 Iterator::from_fn(fn: || Option<T>): IteratorFromFn<T>   // an iterator from a closure
 ```
 
-Anything implementing `Iterator`/`Iterable` works in a `for` loop.
-`Range` is one such type.
+`next` takes `&mut self` because advancing *is* a mutation of the iterator's own
+state — a cursor, a counter, a running total. Implement it on a struct of yours
+and the type works in a `for` loop, and satisfies an `I: Iterator<T>` bound:
+
+```vilan
+import std::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, Some, None };
+
+struct Countdown {
+	remaining: i32,
+}
+
+impl Countdown with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		if self.remaining <= 0 {
+			None
+		} else {
+			self.remaining -= 1;
+			Some(self.remaining)
+		}
+	}
+}
+
+fun main() {
+	mut countdown = Countdown { remaining = 3 };
+	for n in countdown {
+		print(n);   // 2, 1, 0
+	}
+}
+```
+
+`Range` implements `Iterator<i32>`, and so does every adapter below.
+
+One thing to know about the loop: `for` resolves the protocol on the *method
+name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
+not it declares the trait. Declaring it is what buys the adapters below — and
+what lets a generic bound accept your type.
+
+### Adapters
+
+Every `Iterator` gets these, as trait defaults — implement `next` and you have
+all of them:
+
+```vilan,fragment
+fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
+fun filter(self, predicate: |T| bool): Filtered<Self, T>
+fun take(self, count: i32): Taken<Self, T>
+fun skip(self, count: i32): Skipped<Self, T>
+fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
+fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
+fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
+```
+
+They are **lazy**: each returns a small struct holding its upstream, and nothing
+runs until something pulls. So a chain makes one pass over the source and builds
+no intermediate lists.
+
+```vilan
+import std::print;
+
+fun main() {
+	mut pipeline = [1, 2, 3, 4, 5, 6]
+		.iter()
+		.filter(|n| n % 2 == 0)
+		.map(|n| n * 10)
+		.take(2);
+	for value in pipeline {
+		print(value);   // 20, 40
+	}
+}
+```
+
+Laziness is what makes `take` more than a convenience: it never pulls past its
+budget, so it bounds a source that has no end.
+
+```vilan
+import std::print;
+import std::iterator::Iterator;
+import std::option::Option::{ self, Some, None };
+
+struct Naturals {
+	at: i32,
+}
+
+impl Naturals with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		self.at += 1;
+		Some(self.at)
+	}
+}
+
+fun main() {
+	mut squares = Naturals { at = 0 }.map(|n| n * n).take(3);
+	for value in squares {
+		print(value);   // 1, 4, 9
+	}
+}
+```
+
+`zip` stops with the **shorter** side, and `enumerate` numbers what reaches it —
+put it after a `filter` and you get the positions in the *output*, not in the
+source.
+
+The adapter types are named in the past participle — `Mapped`, `Taken`,
+`Filtered` — while the methods keep the plain names. That is deliberate: `Map`
+is already a std type, and vilan's method resolution picks by registration order
+rather than reporting a collision, so the type names stay out of each other's
+way.
+
+**One rough edge to know about.** If an iterator's element type is its own
+generic parameter and you instantiate it at a *tuple*, the `for` binding loses
+the tuple: `for pair in [(1, "a")].iter() { pair.0 }` is rejected with "cannot
+access field '0' on type T". Pull by hand instead —
+`if cursor.next() is Some(let pair) { pair.0 }` — or iterate the `List`
+directly, both of which work. `enumerate` and `zip` are not affected, because
+they name their tuple element structurally.
+
+### Terminations
+
+An adapter chain does nothing until it is *terminated*. These consume the
+iterator and hand back an ordinary value:
+
+```vilan,fragment
+fun to_list(mut self): List<T>
+fun fold<B>(mut self, init: B, fn: |B, T| B): B
+fun for_each(mut self, fn: |T| void)
+fun count(mut self): i32
+fun any(mut self, predicate: |T| bool): bool     // short-circuits on the first hit
+fun all(mut self, predicate: |T| bool): bool     // short-circuits on the first miss
+fun rev(mut self): ListIterator<T>               // a BARRIER — see below
+```
+
+`to_list` is the primary one, and it is deliberately explicit. A method that
+*names* what it builds needs no type annotation, reads at the call site, and
+works in the middle of an expression — `xs.iter().filter(f).to_list().len()` —
+which is exactly where an inference-driven `collect` gives up. There is no
+`collect` in vilan, by design; if one is ever added it will sit beside this
+family, never replace it.
+
+```vilan
+import std::print;
+
+fun main() {
+	let evens = [1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).to_list();
+	print(evens.len());                                     // 3
+	print([1, 2, 3].iter().fold(0, |total, n| total + n));   // 6
+	print([1, 2, 3, 4].iter().filter(|n| n > 2).count());    // 2
+	print([1, 2, 3].iter().any(|n| n == 2));                 // true
+	print([1, 2, 3].iter().all(|n| n > 0));                  // true
+}
+```
+
+`any` and `all` short-circuit, so they can answer over a source that has no end;
+`count`, `fold`, `for_each` and `to_list` pull everything, so bound such a source
+with `take` first.
+
+`rev` is a **barrier**, not a lazy adapter: it drains its upstream into a `List`,
+reverses that, and hands back a `ListIterator`. So the chain continues, but the
+work up to that point has already happened — and `rev` never returns over an
+unbounded source. (A lazy reverse needs a double-ended protocol, where every
+adapter decides whether it can walk backwards. That is purely additive later:
+`rev`'s signature would not change, only its body.)
+
+For a `Set` or a `Map`, terminate with `to_list()` and convert:
+
+```vilan,fragment
+impl List<type T: Hashable>            { fun to_set(self): Set<T> }
+impl List<(type K: Hashable, type V)>  { fun to_map(self): Map<K, V> }
+```
+
+```vilan
+import std::print;
+import std::map::Map;
+import std::set::Set;
+import std::option::Option::{ self, Some, None };
+
+fun main() {
+	let unique = [1, 2, 2, 3].iter().filter(|n| n > 1).to_list().to_set();
+	print(unique.len());   // 2
+
+	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
+	print(lengths.get("hi").unwrap_or(-1));   // 2
+}
+```
+
+These two live on `List` rather than on `Iterator`, and the reason is worth
+knowing because it shapes what you can write yourself: `to_set` needs
+`T: Hashable`, `Iterator<T>` does not bound `T`, and a trait default may not
+require a bound its trait does not declare — nor can a method carry one of its
+own. So a `to_set` written as a trait default is rejected at its own definition,
+before any call. Putting it beside the bound it needs is the same choice `join`
+makes with `Display`. A repeated key in `to_map` keeps the **last** pair, matching
+`insert`.

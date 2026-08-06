@@ -1,7 +1,127 @@
-import pkg::option::Option::{ self };
+import pkg::option::Option::{ None, Some, self };
 
+/// The lazy-sequence protocol. `next` advances the iterator's own state, so it
+/// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter
+/// holding an upstream — is exactly what this trait is for, and a by-value
+/// receiver made every one of them unconformable (I5).
 trait Iterator<T> {
-	fun next(self): Option<T>;
+	fun next(&mut self): Option<T>;
+
+	/// A new iterator yielding `fn(value)` for each of this one's values.
+	fun map<U>(self, fn: |T| U): Mapped<Self, T, U> {
+		Mapped { upstream = self, fn }
+	}
+
+	/// A new iterator yielding only the values `predicate` holds for.
+	fun filter(self, predicate: |T| bool): Filtered<Self, T> {
+		Filtered { upstream = self, predicate }
+	}
+
+	/// The first `count` values, then exhausted. `take` is what makes an
+	/// unbounded source usable: it never pulls past its budget, so
+	/// `source.take(3).to_list()` terminates over an infinite `from_fn`.
+	fun take(self, count: i32): Taken<Self, T> {
+		Taken { upstream = self, remaining = count }
+	}
+
+	/// Everything after the first `count` values. A source shorter than `count`
+	/// leaves an exhausted iterator, not an error.
+	fun skip(self, count: i32): Skipped<Self, T> {
+		Skipped { upstream = self, pending = count }
+	}
+
+	/// Pairs each value with its position: `(0, first), (1, second), ...`.
+	fun enumerate(self): Enumerated<Self, T> {
+		Enumerated { upstream = self, index = 0 }
+	}
+
+	/// Pairs this iterator's values with `other`'s, stopping when EITHER runs
+	/// out — so the result is as long as the shorter side.
+	fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U> {
+		Zipped { left = self, right = other }
+	}
+
+	/// This iterator's values, then `other`'s.
+	fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T> {
+		Chained { left = self, right = other, on_left = true }
+	}
+
+	// --- Terminations -------------------------------------------------------
+	//
+	// Each CONSUMES the iterator (`mut self`) and hands back an ordinary value.
+	// `to_list` is the primary one and it is deliberately explicit: a method
+	// that names what it builds needs no annotation, reads at the call site,
+	// and composes with a chain — where an inference-driven `collect` resolves
+	// only from an annotation and not at all from `it.collect().len()`. There
+	// is no `collect` here, by design; if one is ever added it is an addition
+	// beside this family, never a replacement for it.
+
+	/// Pull everything into a `List`, in order.
+	fun to_list(mut self): List<T> {
+		mut result: List<T> = [];
+		for value in self {
+			result.push(value);
+		}
+		result
+	}
+
+	/// Combine the values left-to-right, starting from `init`.
+	fun fold<B>(mut self, init: B, fn: |B, T| B): B {
+		mut accumulator = init;
+		for value in self {
+			accumulator = fn(accumulator, value);
+		}
+		accumulator
+	}
+
+	/// Run `fn` for each value, for its effect.
+	fun for_each(mut self, fn: |T| void): void {
+		for value in self {
+			fn(value);
+		}
+	}
+
+	/// How many values the iterator yields. Pulls all of them, so it does not
+	/// return over an unbounded source — bound it with `take` first.
+	fun count(mut self): i32 {
+		mut seen = 0;
+		for _value in self {
+			seen = seen + 1;
+		}
+		seen
+	}
+
+	/// Whether `predicate` holds for at least one value. Short-circuits on the
+	/// first hit, so it can answer over an unbounded source.
+	fun any(mut self, predicate: |T| bool): bool {
+		for value in self {
+			if predicate(value) {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// Whether `predicate` holds for every value — vacuously true when there
+	/// are none. Short-circuits on the first miss.
+	fun all(mut self, predicate: |T| bool): bool {
+		for value in self {
+			if !predicate(value) {
+				ret false;
+			}
+		}
+		true
+	}
+
+	/// The values in reverse order. A BARRIER, not a lazy adapter: it drains
+	/// the upstream into a `List` and reverses that, so it is O(n) in space and
+	/// never returns over an unbounded source. (A lazy reverse wants a
+	/// double-ended protocol — every adapter would have to decide whether it
+	/// can walk backwards — and that is additive later: `rev`'s signature does
+	/// not change, only its body.)
+	fun rev(mut self): ListIterator<T> {
+		ListIterator { items = self.to_list().reverse(), index = 0 }
+	}
 }
 
 struct IteratorFromFn<T> {
@@ -9,7 +129,7 @@ struct IteratorFromFn<T> {
 }
 
 impl IteratorFromFn<type T> with Iterator<T> {
-	fun next(self) {
+	fun next(&mut self) {
 		(self.fn)()
 	}
 }
@@ -17,6 +137,170 @@ impl IteratorFromFn<type T> with Iterator<T> {
 impl Iterator<type T> {
 	fun from_fn(fn: || Option<T>): IteratorFromFn<T> {
 		IteratorFromFn { fn }
+	}
+}
+
+/// The cursor `List::iter()` hands back: an index over a SNAPSHOT of the list.
+/// The snapshot is rule 1 — `iter` receives its list by value, and storing a
+/// value in a slot that outlives the call copies it — so pushing to the list
+/// afterwards cannot disturb a walk already in flight. It also means `iter()`
+/// costs a copy of the list; the eager `List` methods that only need one pass
+/// still take one.
+struct ListIterator<T> {
+	items: List<T>,
+	index: i32,
+}
+
+impl ListIterator<type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		if self.index < self.items.len() {
+			let value = self.items[self.index];
+			self.index = self.index + 1;
+			Some(value)
+		} else {
+			None
+		}
+	}
+}
+
+// --- The adapters -----------------------------------------------------------
+//
+// Each adapter is a struct holding its upstream BY VALUE plus whatever state it
+// needs, and each implements `Iterator` in terms of `self.upstream.next()`. The
+// names are past-participle (`Mapped`, not `Map`) because `Map` is a std type:
+// method resolution does not diagnose a collision, it picks by registration
+// order, so the type names are kept apart on purpose. The METHOD names stay
+// `map`/`filter`/`take`.
+//
+// A closure held in a FIELD is called parenthesized — `(self.fn)(value)` —
+// because method lookup does not fall back to fields.
+
+struct Mapped<I, T, U> {
+	upstream: I,
+	fn: |T| U,
+}
+
+impl Mapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
+	fun next(&mut self): Option<U> {
+		if self.upstream.next() is Some(let value) {
+			ret Some((self.fn)(value));
+		}
+		None
+	}
+}
+
+struct Filtered<I, T> {
+	upstream: I,
+	predicate: |T| bool,
+}
+
+impl Filtered<type I: Iterator<T>, type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		// Pull until the predicate holds or the upstream runs out. The loop is
+		// what makes `filter` lazy AND total: the rejected values are consumed
+		// here, not materialized.
+		mut found: Option<T> = None;
+		mut searching = true;
+		for searching {
+			if self.upstream.next() is Some(let value) {
+				if (self.predicate)(value) {
+					found = Some(value);
+					searching = false;
+				}
+			} else {
+				searching = false;
+			}
+		}
+		found
+	}
+}
+
+struct Taken<I, T> {
+	upstream: I,
+	remaining: i32,
+}
+
+impl Taken<type I: Iterator<T>, type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		if self.remaining <= 0 {
+			ret None;
+		}
+		self.remaining = self.remaining - 1;
+		self.upstream.next()
+	}
+}
+
+struct Skipped<I, T> {
+	upstream: I,
+	pending: i32,
+}
+
+impl Skipped<type I: Iterator<T>, type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		// The skip is paid on the FIRST pull, not at construction — an adapter
+		// that consumed its upstream when it was built would not be lazy.
+		for self.pending > 0 {
+			self.pending = self.pending - 1;
+			if self.upstream.next() is None {
+				self.pending = 0;
+				ret None;
+			}
+		}
+		self.upstream.next()
+	}
+}
+
+struct Enumerated<I, T> {
+	upstream: I,
+	index: i32,
+}
+
+impl Enumerated<type I: Iterator<T>, type T> with Iterator<(i32, T)> {
+	fun next(&mut self): Option<(i32, T)> {
+		if self.upstream.next() is Some(let value) {
+			let index = self.index;
+			self.index = index + 1;
+			ret Some((index, value));
+		}
+		None
+	}
+}
+
+struct Zipped<I, J, T, U> {
+	left: I,
+	right: J,
+}
+
+impl Zipped<type I: Iterator<T>, type J: Iterator<U>, type T, type U> with Iterator<(T, U)> {
+	fun next(&mut self): Option<(T, U)> {
+		// The left value is pulled first and DROPPED when the right side is
+		// already exhausted — a length mismatch costs the longer side one extra
+		// pull, which is the price of not buffering.
+		if self.left.next() is Some(let first) {
+			if self.right.next() is Some(let second) {
+				ret Some((first, second));
+			}
+		}
+		None
+	}
+}
+
+struct Chained<I, J, T> {
+	left: I,
+	right: J,
+	on_left: bool,
+}
+
+impl Chained<type I: Iterator<T>, type J: Iterator<T>, type T> with Iterator<T> {
+	fun next(&mut self): Option<T> {
+		if self.on_left {
+			if self.left.next() is Some(let value) {
+				ret Some(value);
+			}
+			// Latched, so an exhausted left side is asked once and never again.
+			self.on_left = false;
+		}
+		self.right.next()
 	}
 }
 

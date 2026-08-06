@@ -254,7 +254,7 @@ mut produced = 0;
 struct Naturals { limit: i32 }
 
 impl Naturals with Iterator<i32> {
-	fun next(self): Option<i32> {
+	fun next(&mut self): Option<i32> {
 		produced = produced + 1;
 		if produced <= self.limit {
 			Some(produced)

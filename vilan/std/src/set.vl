@@ -44,3 +44,23 @@ impl Set<type T: Hashable> {
 		self.table.values()
 	}
 }
+
+/// The set half of the explicit termination family, and the end of an iterator
+/// chain: `xs.iter().filter(f).to_list().to_set()`. Duplicates collapse and the
+/// first occurrence of each value decides its position.
+///
+/// It lives on `List` rather than on `Iterator` because the bound has nowhere
+/// else to go: `T: Hashable` is not a bound `Iterator<T>` declares, a trait
+/// default may not require one the trait does not, and a member cannot carry
+/// its own — so `to_set` on the trait would be a compile error at its own
+/// definition. This is the `join`-on-`Display` precedent: the method lives
+/// beside the bound it needs.
+impl List<type T: Hashable> {
+	fun to_set(self): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self {
+			result.insert(value);
+		}
+		result
+	}
+}
