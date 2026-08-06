@@ -1,6 +1,8 @@
 # Method resolution — a deliberate precedence rule (B57)
 
-> Status: DRAFT 2026-08-04 — awaiting review
+> Status: RATIFIED 2026-08-04 (owner review) — implement as recommended:
+> inherent-over-trait, duplicate-inherent as a hard error, trait-vs-trait
+> ambiguity error with `Trait::method(receiver)` disambiguation.
 
 ## 0. The problem and the thesis
 

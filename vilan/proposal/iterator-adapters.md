@@ -1,6 +1,12 @@
 # Iterator adapters and the pipeline ergonomics (I3)
 
-> Status: DRAFT 2026-08-03 — awaiting review
+> Status: RATIFIED 2026-08-04 (owner review) — all recommendations stand,
+> with one owner note on §collect: an explicit `to_list()`/`to_set()`
+> family is the PRIMARY termination API and must always exist — the
+> owner has been burned by Rust's collect-only ambiguities. `collect`
+> is acceptable as a future ADDITION, never as the only spelling.
+> Prerequisites all cleared: P2/P3/P4 fixed (B55/B56/B58), B57 ratified.
+> I5's protocol repair ships with this arc.
 >
 > Origin: the "whatever happened to iterators" audit (2026-08-03), filed as
 > backlog I3. Proposal-first per the house rules; nothing here is

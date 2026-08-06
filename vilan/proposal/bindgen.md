@@ -1,6 +1,15 @@
 # bindgen — generating `external` bindings from TypeScript headers (E31)
 
-> **Status: DRAFT 2026-08-03 — awaiting review**
+> **Status: RATIFIED 2026-08-04 (owner review)** — with three owner notes:
+> (1) string-literal unions: investigate whether a BACKED enum
+> (`enum Foo { a = "a", b = "b" }`) can replace the generated
+> match-wrapper — if vilan enums cannot carry backing values today,
+> record that as its own language question rather than deciding it
+> inside bindgen; (2) the `{ [index: number]: T }` → `List<T>` row is
+> CONDITIONAL — confirm whether List tolerates sparse keys before
+> shipping that mapping, and correct the row honestly if not;
+> (3) v2 direction per owner: an override table + automatic bindgen —
+> v1's explicit checked-in file stands, and is the core v2 needs anyway.
 >
 > Ground truth for every claim below was read from source, not assumed: std's
 > hand-written bindings (`fetch.vl`, `dom.vl`, `bytes.vl`, `time.vl`, `rpc.vl`,

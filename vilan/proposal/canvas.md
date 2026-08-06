@@ -1,6 +1,12 @@
 # Canvas — a typed 2D drawing surface over `std::canvas` (backlog A17)
 
-> Status: DRAFT 2026-08-03 — awaiting review
+> Status: DEFERRED 2026-08-04 (owner call) — pending the bindgen probe on
+> the global TypeScript declarations (lib.dom.d.ts). The owner's framing:
+> if bindgen can chew the globals, EVERY host API comes for free and
+> hand-maintaining canvas (and each next missing API) is the wrong path;
+> canvas was only ever the tester-demand instance of that general problem.
+> Revisit with the probe's result: autogen works → this proposal dissolves
+> into generated bindings; autogen fails → this design stands ready.
 
 Ground truth for this proposal was gathered from the shipped browser layer
 (`std/src/browser/dom.vl`, `ui.vl`, `router.vl`, `dev.vl`), the external-struct
