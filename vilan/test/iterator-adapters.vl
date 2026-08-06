@@ -1,0 +1,61 @@
+// I3/I5: the adapter chain end to end, through the emitter. `next` takes
+// `&mut self` (I5), so a stateful iterator conforms; the adapters are trait
+// defaults returning named concrete structs, and each stage monomorphizes to a
+// direct call — no dispatch table, no vtable. `Naturals` is unbounded, so the
+// short-circuiting stages are what make this program terminate at all.
+import std::iterator::Iterator;
+import std::map::Map;
+import std::option::Option::{ None, Some, self };
+import std::print;
+import std::range::Range;
+import std::set::Set;
+
+struct Naturals {
+	at: i32,
+}
+
+impl Naturals with Iterator<i32> {
+	fun next(&mut self): Option<i32> {
+		self.at = self.at + 1;
+		Some(self.at)
+	}
+}
+
+fun main() {
+	// A four-stage chain over a `List`, terminated explicitly.
+	print([1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).map(|n| n * 10).skip(1).take(2).to_list());
+
+	// The same adapters over a stateful custom conformer with no end.
+	print(Naturals { at = 0 }.map(|n| n * n).take(4).to_list());
+	print(Naturals { at = 0 }.any(|n| n == 3));
+
+	// Two-upstream adapters, and `Range` as a second std source.
+	mut zipped = Range::new(0, 9).zip(["a", "b"].iter());
+	for pair in zipped {
+		print(i"{pair.0}{pair.1}");
+	}
+	print([1, 2].iter().chain([3].iter()).count());
+	mut numbered = ["x", "y"].iter().enumerate();
+	for entry in numbered {
+		print(i"{entry.0}={entry.1}");
+	}
+
+	// The rest of the termination family, including `rev`'s barrier.
+	print([1, 2, 3].iter().fold(0, |total, n| total + n));
+	print([1, 2, 3].iter().all(|n| n > 0));
+	print([1, 2, 3].iter().rev().to_list());
+	[1, 2].iter().for_each(|n| print(n));
+
+	// `to_set` / `to_map`: bounded, so they live on `List`.
+	print([1, 2, 2, 3].iter().filter(|n| n > 1).to_list().to_set().len());
+	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
+	print(lengths.get("hi").unwrap_or(-1));
+
+	// `iter()` snapshots (rule 1): the push is not walked, and the list is
+	// untouched by the chain.
+	mut live = [1, 2];
+	mut cursor = live.iter();
+	live.push(3);
+	print(cursor.count());
+	print(live.len());
+}
