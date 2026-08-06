@@ -41071,50 +41071,67 @@ fn an_adapter_chain_leaves_its_source_list_alone() {
     );
 }
 
-// --- Found while building I3 S4: the protocol loop drops a TUPLE element's
-// --- type when the iterator's element is its own generic parameter -----------
+// --- B78: the protocol loop dropped the element's type when the iterator's
+// --- element IS its own generic parameter (FIXED) ----------------------------
+//
+// `iterable_element_type` reads the element off the DECLARED return type of the
+// subject's `next` — `impl ListIterator<type T> { fun next(..): Option<T> }` —
+// and took that payload verbatim. The payload is written in the SUBJECT's own
+// parameters, so it is abstract until instantiated against the receiver's
+// arguments, exactly like the `Trait` arm one match-arm below (which does
+// substitute, and is why a bounded-generic loop always worked). Untouched, the
+// binding got the bare parameter `T`, and a `T` admits nothing: field access,
+// method call and call-as-a-function all refused it.
+//
+// `enumerate` and `zip` hid the defect for the whole I3 arc because their
+// payloads are STRUCTURAL — `Option<(i32, T)>`, `Option<(T, U)>` — so the loop
+// saw a tuple whose PARTS were abstract, which projects fine, rather than a
+// whole that was. The subject arm now builds the same instantiation context the
+// trait arm does, from the struct's or enum's declared parameters.
 
-/// `for value in it` types `value` as the bare generic parameter (or as `any`)
-/// when `it`'s element type IS that parameter — so a tuple element cannot be
-/// projected: `pair.0` is "cannot access field '0' on type T". The same
-/// iterator pulled by hand is fine, which is what makes this the LOOP's bug
-/// rather than the iterator's:
-///
-/// ```text
-/// if cursor.step() is Some(let pair) { print(pair.0); }   // 1
-/// for pair in cursor { print(pair.0); }                   // cannot access field '0'
-/// ```
-///
-/// It is not std's and not this arc's — the repro below defines its own trait
-/// and its own cursor, and the native `for pair in [(1, "a")]` over a plain
-/// `List` (a different arm entirely) has always worked. What the arc DID is
-/// make the shape reachable: `List::iter()` is the first generically-elemented
-/// iterator in std, so `[(1, "a")].iter().filter(p)` now hits it. An adapter
-/// that names the tuple STRUCTURALLY in its `with` clause is unaffected —
-/// `enumerate` (`Iterator<(i32, T)>`) and `zip` (`Iterator<(T, U)>`) both
-/// project fine — so the defect is exactly the substitution of the loop
-/// binding, not tuples in the protocol.
-///
-/// `#[ignore]`d: it asserts the desired outcome and fails today.
+/// The filed shape: `List::iter()` is std's first generically-elemented
+/// iterator, so `for pair in [(1, "a")].iter()` was the first thing to reach it
+/// — "cannot access field '0' on type T". The same iterator pulled BY HAND was
+/// always fine, which is what places the defect in the loop's binding rather
+/// than in the iterator.
 #[test]
-#[ignore]
 fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::option::Option::{ self, Some, None };
 
-        trait Walk<T> {
-            fun step(&mut self): Option<T>;
+        fun main() {
+            mut pulled = [(1, "a"), (2, "b")].iter();
+            if pulled.next() is Some(let pair) {
+                print(pair.0);
+            }
+            for pair in [(1, "a"), (2, "b")].iter() {
+                print(pair.1);
+            }
         }
+        "#,
+        "1\na\nb\n",
+    );
+}
+
+/// The same defect with no std beyond the loop protocol itself: a user's own
+/// generically-elemented cursor. Neither std's nor the arc's — what the arc did
+/// was make the shape reachable.
+#[test]
+fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
 
         struct Cursor<T> {
             items: List<T>,
             index: i32,
         }
 
-        impl Cursor<type T> with Walk<T> {
-            fun step(&mut self): Option<T> {
+        impl Cursor<type T> {
+            fun next(&mut self): Option<T> {
                 if self.index < self.items.len() {
                     let value = self.items[self.index];
                     self.index = self.index + 1;
@@ -41127,7 +41144,7 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
 
         fun main() {
             mut pulled = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
-            if pulled.step() is Some(let pair) {
+            if pulled.next() is Some(let pair) {
                 print(pair.0);
             }
             mut looped = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
@@ -41137,6 +41154,220 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
         }
         "#,
         "1\na\nb\n",
+    );
+}
+
+/// Not a tuple defect — a BARE-PARAMETER defect. Every element form that a `T`
+/// refuses went red the same way, so each gets a leg: a struct (field access),
+/// a nested container (method call), an `Option` (method call on an enum), and
+/// a closure (call-as-a-function, "cannot call this as a function: it is T").
+#[test]
+fn a_protocol_loop_keeps_every_element_form_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            for point in [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }].iter() {
+                print(point.x);
+            }
+            for inner in [[1, 2, 3], [4]].iter() {
+                print(inner.len());
+            }
+            for maybe in [Some(5), None].iter() {
+                print(maybe.unwrap_or(-1));
+            }
+            for fn in [|n: i32| n + 1].iter() {
+                print(fn(41));
+            }
+        }
+        "#,
+        "1\n3\n3\n1\n5\n-1\n42\n",
+    );
+}
+
+/// A pattern match on the element never went red — an `is` against a bare `T`
+/// checked VACUOUSLY and still ran, which is why an enum element looked
+/// unaffected until a method was called on it. The pin is here so that
+/// leniency, whatever it is worth, stays a decision and not an accident: the
+/// element is a real `Shade` now and both arms still match.
+#[test]
+fn a_protocol_loop_element_matches_its_enum_variants() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Shade { Light, Dark(i32) }
+
+        fun main() {
+            for shade in [Shade::Dark(9), Shade::Light].iter() {
+                if shade is Shade::Dark(let depth) { print(depth); }
+                if shade is Shade::Light { print(0); }
+            }
+        }
+        "#,
+        "9\n0\n",
+    );
+}
+
+/// The subject arm covers ENUMS as well as structs, and an enum-shaped iterator
+/// reaches it by the same road (`Type::Enum(id, arguments)` -> the declared
+/// parameters of `enums[id]`). Same "cannot access field '1' on type T" before.
+#[test]
+fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Feed<T> { Ready(List<T>, i32), Done }
+
+        impl Feed<type T> {
+            fun next(&mut self): Option<T> {
+                if self is Feed::Ready(let items, let at) {
+                    let pulled = if at < items.len() { Some(items[at]) } else { None };
+                    let advanced = if at < items.len() {
+                        Feed::Ready(items, at + 1)
+                    } else {
+                        Feed::Done
+                    };
+                    self = advanced;
+                    pulled
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut feed = Feed::Ready([(1, "a"), (2, "b")], 0);
+            for pair in feed {
+                print(pair.0);
+                print(pair.1);
+            }
+        }
+        "#,
+        "1\na\n2\nb\n",
+    );
+}
+
+/// The `&mut` lending form drives `next_mut(&mut self): Option<&mut T>`
+/// (`iterator-adapters.md` §7) through the same arm, so a GENERIC container
+/// lent by view had the identical defect — the standing `next_mut` pins use a
+/// concrete `Bag` and could not see it.
+#[test]
+fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+
+        impl Bag<type T> {
+            fun next_mut(&mut self): Option<&mut T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor = self.cursor + 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in &mut bag {
+                print(pair.1);
+            }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The element survives an adapter chain, where the subject is a `Filtered<..>`
+/// whose own parameter is bound to the upstream's — one more instantiation hop
+/// than the bare `.iter()` legs above.
+#[test]
+fn a_protocol_loop_keeps_a_tuple_element_through_an_adapter_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in [(1, "a"), (2, "b"), (3, "c")].iter().filter(|p| p.0 > 1) {
+                print(pair.1);
+            }
+            for pair in [(1, "a"), (2, "b")].iter().take(1) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "b\nc\n1\n",
+    );
+}
+
+/// The regression guard on the forms that always worked, and the reason the
+/// defect survived the whole arc: a STRUCTURAL payload projects even without
+/// the instantiation, because only its parts are abstract.
+#[test]
+fn a_structurally_named_tuple_element_still_projects() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in ["a", "b"].iter().enumerate() {
+                print(pair.0);
+                print(pair.1);
+            }
+            for pair in [1, 2].iter().zip(["x", "y"].iter()) {
+                print(pair.1);
+            }
+            for pair in [(9, "z")] {
+                print(pair.0);
+            }
+        }
+        "#,
+        "0\na\n1\nb\nx\ny\n9\n",
+    );
+}
+
+/// Found while repairing B78's own pin, which named its protocol method `step`
+/// and therefore never reached the protocol at all. `for x in subject` over a
+/// CONCRETE struct that has no `next` is not diagnosed — it silently lowers to
+/// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
+/// array. The program below prints `[ 1, 2 ]` and `0` — the two fields of
+/// `Cursor` — and exits 0.
+///
+/// This is P3/B56's defect one type-shape over. B56 closed it for a GENERIC
+/// subject (`report_uniterable_for_each`: "cannot iterate `T`: no bound on it
+/// provides `next`"), and the same reasoning applies verbatim to a concrete
+/// struct — a struct is not natively iterable either, and the fallback is
+/// nonsense rather than a different meaning. `#[ignore]`d: it asserts the
+/// desired outcome (a diagnostic) and today the program compiles and runs.
+#[test]
+#[ignore]
+fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in walked {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
     );
 }
 
