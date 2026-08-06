@@ -40019,3 +40019,314 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
         "1\na\nb\n",
     );
 }
+
+// --- I3 S5: the terminations (proposal/iterator-adapters.md §5, §6) ----------
+// The EXPLICIT family is the primary termination API and there is no `collect`:
+// a method that names what it builds needs no annotation, reads at the call
+// site, and composes with a chain. `to_list`/`fold`/`for_each`/`count`/`any`/
+// `all`/`rev` are trait defaults; `to_set`/`to_map` are bounded `List` methods
+// (see `to_set_and_to_map_live_on_list_because_a_default_cannot_carry_a_bound`).
+
+#[test]
+fn to_list_pulls_a_chain_into_a_list() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let doubled = [1, 2, 3].iter().map(|n| n * 2).to_list();
+                print(doubled.len());
+                print(doubled[0]);
+                print(doubled[2]);
+                let empty: List<i32> = [];
+                print(empty.iter().to_list().len());
+                print([7].iter().to_list()[0]);
+            }
+            "#,
+        ),
+        "3\n2\n6\n0\n7\n",
+    );
+}
+
+#[test]
+fn to_list_composes_out_of_a_chain_where_an_inferred_collect_would_not() {
+    // §5's argument, made executable: the explicit terminal is usable in the
+    // middle of an expression, which is the shape a pipeline invites and the
+    // one `it.collect().len()` cannot resolve.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3, 4].iter().filter(|n| n % 2 == 0).to_list().len());
+            }
+            "#,
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn to_list_over_an_unbounded_source_is_bounded_by_take() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let first = Naturals { at = 0 }.take(4).to_list();
+                print(first.len());
+                print(first[3]);
+            }
+            "#,
+        ),
+        "4\n4\n",
+    );
+}
+
+#[test]
+fn fold_combines_left_to_right_from_its_seed() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().fold(0, |total, n| total + n));
+                print([1, 2, 3].iter().fold(100, |total, n| total - n));
+                let empty: List<i32> = [];
+                print(empty.iter().fold(42, |total, n| total + n));
+                print([1, 2, 3].iter().fold("", |text, n| text + i"{n}"));
+            }
+            "#,
+        ),
+        "6\n94\n42\n123\n",
+    );
+}
+
+#[test]
+fn for_each_runs_its_closure_once_per_value_in_order() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                [1, 2, 3].iter().filter(|n| n != 2).for_each(|n| print(n));
+                let empty: List<i32> = [];
+                empty.iter().for_each(|n| print(n));
+                print("done");
+            }
+            "#,
+        ),
+        "1\n3\ndone\n",
+    );
+}
+
+#[test]
+fn count_counts_what_reaches_it() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3, 4].iter().filter(|n| n > 2).count());
+                let empty: List<i32> = [];
+                print(empty.iter().count());
+                print([7].iter().count());
+                print(Naturals { at = 0 }.take(5).count());
+            }
+            "#,
+        ),
+        "2\n0\n1\n5\n",
+    );
+}
+
+#[test]
+fn any_short_circuits_on_the_first_hit() {
+    // The short-circuit is what lets `any` answer over an unbounded source —
+    // a version that drained first would not return at all.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().any(|n| n == 2));
+                print([1, 2, 3].iter().any(|n| n == 9));
+                let empty: List<i32> = [];
+                print(empty.iter().any(|n| n == 1));
+                print(Naturals { at = 0 }.any(|n| n == 4));
+            }
+            "#,
+        ),
+        "true\nfalse\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn all_short_circuits_on_the_first_miss_and_is_vacuously_true_when_empty() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print([1, 2, 3].iter().all(|n| n > 0));
+                print([1, 2, 3].iter().all(|n| n > 1));
+                let empty: List<i32> = [];
+                print(empty.iter().all(|n| n > 100));
+                print(Naturals { at = 0 }.all(|n| n < 3));
+            }
+            "#,
+        ),
+        "true\nfalse\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn rev_walks_the_values_backwards() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut backwards = [1, 2, 3].iter().rev();
+                for value in backwards {
+                    print(value);
+                }
+                let empty: List<i32> = [];
+                print(empty.iter().rev().count());
+                print([7].iter().rev().to_list()[0]);
+            }
+            "#,
+        ),
+        "3\n2\n1\n0\n7\n",
+    );
+}
+
+#[test]
+fn rev_is_a_barrier_that_still_composes_with_adapters_on_both_sides() {
+    // It hands back a `ListIterator`, so the chain continues — but it drained
+    // the upstream to do it, which is why the doc calls it a barrier and why
+    // the unbounded source has to be bounded BEFORE it.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let out = Naturals { at = 0 }.take(4).map(|n| n * 10).rev().take(2).to_list();
+                print(out[0]);
+                print(out[1]);
+            }
+            "#,
+        ),
+        "40\n30\n",
+    );
+}
+
+#[test]
+fn to_set_collapses_duplicates_at_the_end_of_a_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+
+        fun main() {
+            let unique = [1, 2, 2, 3, 3, 3].iter().filter(|n| n > 1).to_list().to_set();
+            print(unique.len());
+            print(unique.contains(2));
+            print(unique.contains(1));
+            let empty: List<str> = [];
+            print(empty.to_set().len());
+            print(["only"].to_set().len());
+        }
+        "#,
+        "2\ntrue\nfalse\n0\n1\n",
+    );
+}
+
+#[test]
+fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let lengths = ["aa", "b"].iter().map(|word| (word, word.len())).to_list().to_map();
+            print(lengths.len());
+            print(lengths.get("aa").unwrap_or(-1));
+            print(lengths.get("zz").unwrap_or(-1));
+            let repeated = [(1, "first"), (1, "second")].to_map();
+            print(repeated.get(1).unwrap_or("miss"));
+            let empty: List<(i32, str)> = [];
+            print(empty.to_map().len());
+        }
+        "#,
+        "2\n2\n-1\nsecond\n0\n",
+    );
+}
+
+#[test]
+fn to_set_and_to_map_live_on_list_because_a_default_cannot_carry_a_bound() {
+    // The deviation from §5 ("as trait defaults"), pinned as the compiler fact
+    // that forced it: `Iterator<T>` does not bound `T`, a default body may not
+    // require a bound its trait does not declare, and a member cannot carry its
+    // own that unifies with `T`. So a `to_set` written as a default is an error
+    // AT ITS OWN DEFINITION, before any call — which is what this asserts. When
+    // per-member bounds arrive, moving `to_set` onto the trait is additive and
+    // this pin is what says why it could not be there first.
+    assert_fails_with(
+        r#"
+        import std::hash::Hashable;
+        import std::option::Option::{ self, Some, None };
+        import std::set::Set;
+
+        trait Walk<T> {
+            fun step(&mut self): Option<T>;
+
+            fun to_set(mut self): Set<T> {
+                mut result: Set<T> = Set::new();
+                for value in self {
+                    result.insert(value);
+                }
+                result
+            }
+        }
+
+        fun main() {}
+        "#,
+        "generic parameter 'T' is missing the bound ': Hashable'",
+    );
+}
+
+#[test]
+fn a_terminal_consumes_the_iterator_and_leaves_its_source_list_alone() {
+    // The affine half of the terminations: `mut self` consumes the chain, and
+    // because `iter()` snapshotted, the list it came from is untouched — its
+    // length, its elements, and its ability to be walked again.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut source = [1, 2, 3];
+                print(source.iter().map(|n| n * 2).to_list().len());
+                print(source.iter().count());
+                print(source.len());
+                print(source[0]);
+                source.push(4);
+                print(source.iter().count());
+            }
+            "#,
+        ),
+        "3\n3\n3\n1\n4\n",
+    );
+}
+
+#[test]
+fn a_custom_conformer_gets_every_termination_for_free() {
+    // The trait-default payoff, stated once over a user type: `next` is the
+    // only thing `Naturals` implements.
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                print(Naturals { at = 0 }.take(4).to_list().len());
+                print(Naturals { at = 0 }.take(4).fold(0, |total, n| total + n));
+                print(Naturals { at = 0 }.take(4).count());
+                print(Naturals { at = 0 }.take(4).all(|n| n < 5));
+                print(Naturals { at = 0 }.take(4).rev().to_list()[0]);
+                Naturals { at = 0 }.take(2).for_each(|n| print(n));
+            }
+            "#,
+        ),
+        "4\n10\n4\ntrue\n4\n1\n2\n",
+    );
+}

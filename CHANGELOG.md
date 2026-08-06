@@ -62,6 +62,38 @@ works, and `enumerate`/`zip` are unaffected because they name their tuple elemen
 structurally. It is a pre-existing defect in the loop's substitution that nothing
 in std could reach until `List::iter` existed; it is pinned.
 
+**A chain ends with a method that says what it builds.** `to_list`, `fold`,
+`for_each`, `count`, `any`, `all` and `rev` consume the iterator and hand back an
+ordinary value, and `to_list` is the primary one on purpose. A method that
+*names* what it builds needs no type annotation, reads at the call site, and
+works in the middle of an expression — `xs.iter().filter(f).to_list().len()` —
+which is exactly the shape a pipeline invites and exactly where an
+inference-driven `collect` gives up. **There is no `collect`, deliberately.** If
+one is ever added it will sit beside this family, never replace it.
+
+`any` and `all` short-circuit, so they answer over a source with no end;
+`count`, `fold`, `for_each` and `to_list` pull everything, so bound such a source
+with `take` first. `rev` is a **barrier** rather than a lazy adapter: it drains
+its upstream into a `List`, reverses that, and hands back a `ListIterator`, so
+the chain continues but the work has already happened. A lazy reverse wants a
+double-ended protocol — every adapter deciding whether it can walk backwards —
+which roughly doubles the surface of a layer that has not had its first user, and
+is purely additive whenever a consumer needs it: `rev`'s signature would not
+change, only its body.
+
+For a `Set` or a `Map`, terminate and convert: `List` gains
+`to_set(self): Set<T>` under `T: Hashable` and `to_map(self): Map<K, V>` over a
+list of pairs, so a chain reads
+`xs.iter().map(|w| (w, w.len())).to_list().to_map()`. Those two live on `List`
+rather than on `Iterator`, and the reason is a real limit worth knowing: a trait
+default may not require a bound its trait does not declare, and a method cannot
+carry one of its own that ties back to the trait's parameter — so a `to_set`
+written as a trait default is rejected at its own definition, before any call.
+Putting a bounded method beside the bound it needs is the choice `join` already
+makes with `Display`. That constraint is pinned as a compiler fact, so when
+per-member bounds arrive the move onto the trait is additive and the record says
+why it could not be there first.
+
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.
 
 **It also fixes something you could not fix from outside.** Two writes in flight over one signal corrupted it. An older write that fails *after* a newer one succeeded rolled the newer value away — probe it through the free function and the screen ends up showing the value the cell started at while the server holds one from two writes later. The cell discards a superseded outcome (the newest write owns the cell, and the outcome still returns to its own caller), and a rollback lands on the last value the **server** confirmed rather than on whatever the signal happened to hold when the write began. Those are two different questions, so confirmations carry their own counter and an out-of-order reply cannot walk the recorded truth backwards.

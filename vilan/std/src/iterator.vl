@@ -45,6 +45,83 @@ trait Iterator<T> {
 	fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T> {
 		Chained { left = self, right = other, on_left = true }
 	}
+
+	// --- Terminations -------------------------------------------------------
+	//
+	// Each CONSUMES the iterator (`mut self`) and hands back an ordinary value.
+	// `to_list` is the primary one and it is deliberately explicit: a method
+	// that names what it builds needs no annotation, reads at the call site,
+	// and composes with a chain — where an inference-driven `collect` resolves
+	// only from an annotation and not at all from `it.collect().len()`. There
+	// is no `collect` here, by design; if one is ever added it is an addition
+	// beside this family, never a replacement for it.
+
+	/// Pull everything into a `List`, in order.
+	fun to_list(mut self): List<T> {
+		mut result: List<T> = [];
+		for value in self {
+			result.push(value);
+		}
+		result
+	}
+
+	/// Combine the values left-to-right, starting from `init`.
+	fun fold<B>(mut self, init: B, fn: |B, T| B): B {
+		mut accumulator = init;
+		for value in self {
+			accumulator = fn(accumulator, value);
+		}
+		accumulator
+	}
+
+	/// Run `fn` for each value, for its effect.
+	fun for_each(mut self, fn: |T| void): void {
+		for value in self {
+			fn(value);
+		}
+	}
+
+	/// How many values the iterator yields. Pulls all of them, so it does not
+	/// return over an unbounded source — bound it with `take` first.
+	fun count(mut self): i32 {
+		mut seen = 0;
+		for _value in self {
+			seen = seen + 1;
+		}
+		seen
+	}
+
+	/// Whether `predicate` holds for at least one value. Short-circuits on the
+	/// first hit, so it can answer over an unbounded source.
+	fun any(mut self, predicate: |T| bool): bool {
+		for value in self {
+			if predicate(value) {
+				ret true;
+			}
+		}
+		false
+	}
+
+	/// Whether `predicate` holds for every value — vacuously true when there
+	/// are none. Short-circuits on the first miss.
+	fun all(mut self, predicate: |T| bool): bool {
+		for value in self {
+			if !predicate(value) {
+				ret false;
+			}
+		}
+		true
+	}
+
+	/// The values in reverse order. A BARRIER, not a lazy adapter: it drains
+	/// the upstream into a `List` and reverses that, so it is O(n) in space and
+	/// never returns over an unbounded source. (A lazy reverse wants a
+	/// double-ended protocol — every adapter would have to decide whether it
+	/// can walk backwards — and that is additive later: `rev`'s signature does
+	/// not change, only its body.)
+	fun rev(mut self): ListIterator<T> {
+		ListIterator { items = self.to_list().reverse(), index = 0 }
+	}
 }
 
 struct IteratorFromFn<T> {

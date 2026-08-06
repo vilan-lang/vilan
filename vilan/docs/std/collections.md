@@ -167,6 +167,7 @@ impl Map<type K: Hashable, type V> {
 	fun keys(self): List<K>
 	fun values(self): List<V>
 }
+impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
 
 Keys compare **by value**. Scalars work directly; a struct, enum, tuple, or
@@ -210,6 +211,7 @@ impl Set<type T: Hashable> {
 	fun is_empty(self): bool
 	fun values(self): List<T>
 }
+impl List<type T: Hashable> { fun to_set(self): Set<T> }
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
@@ -376,3 +378,80 @@ access field '0' on type T". Pull by hand instead —
 `if cursor.next() is Some(let pair) { pair.0 }` — or iterate the `List`
 directly, both of which work. `enumerate` and `zip` are not affected, because
 they name their tuple element structurally.
+
+### Terminations
+
+An adapter chain does nothing until it is *terminated*. These consume the
+iterator and hand back an ordinary value:
+
+```vilan,fragment
+fun to_list(mut self): List<T>
+fun fold<B>(mut self, init: B, fn: |B, T| B): B
+fun for_each(mut self, fn: |T| void)
+fun count(mut self): i32
+fun any(mut self, predicate: |T| bool): bool     // short-circuits on the first hit
+fun all(mut self, predicate: |T| bool): bool     // short-circuits on the first miss
+fun rev(mut self): ListIterator<T>               // a BARRIER — see below
+```
+
+`to_list` is the primary one, and it is deliberately explicit. A method that
+*names* what it builds needs no type annotation, reads at the call site, and
+works in the middle of an expression — `xs.iter().filter(f).to_list().len()` —
+which is exactly where an inference-driven `collect` gives up. There is no
+`collect` in vilan, by design; if one is ever added it will sit beside this
+family, never replace it.
+
+```vilan
+import std::print;
+
+fun main() {
+	let evens = [1, 2, 3, 4, 5, 6].iter().filter(|n| n % 2 == 0).to_list();
+	print(evens.len());                                     // 3
+	print([1, 2, 3].iter().fold(0, |total, n| total + n));   // 6
+	print([1, 2, 3, 4].iter().filter(|n| n > 2).count());    // 2
+	print([1, 2, 3].iter().any(|n| n == 2));                 // true
+	print([1, 2, 3].iter().all(|n| n > 0));                  // true
+}
+```
+
+`any` and `all` short-circuit, so they can answer over a source that has no end;
+`count`, `fold`, `for_each` and `to_list` pull everything, so bound such a source
+with `take` first.
+
+`rev` is a **barrier**, not a lazy adapter: it drains its upstream into a `List`,
+reverses that, and hands back a `ListIterator`. So the chain continues, but the
+work up to that point has already happened — and `rev` never returns over an
+unbounded source. (A lazy reverse needs a double-ended protocol, where every
+adapter decides whether it can walk backwards. That is purely additive later:
+`rev`'s signature would not change, only its body.)
+
+For a `Set` or a `Map`, terminate with `to_list()` and convert:
+
+```vilan,fragment
+impl List<type T: Hashable>            { fun to_set(self): Set<T> }
+impl List<(type K: Hashable, type V)>  { fun to_map(self): Map<K, V> }
+```
+
+```vilan
+import std::print;
+import std::map::Map;
+import std::set::Set;
+import std::option::Option::{ self, Some, None };
+
+fun main() {
+	let unique = [1, 2, 2, 3].iter().filter(|n| n > 1).to_list().to_set();
+	print(unique.len());   // 2
+
+	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
+	print(lengths.get("hi").unwrap_or(-1));   // 2
+}
+```
+
+These two live on `List` rather than on `Iterator`, and the reason is worth
+knowing because it shapes what you can write yourself: `to_set` needs
+`T: Hashable`, `Iterator<T>` does not bound `T`, and a trait default may not
+require a bound its trait does not declare — nor can a method carry one of its
+own. So a `to_set` written as a trait default is rejected at its own definition,
+before any call. Putting it beside the bound it needs is the same choice `join`
+makes with `Display`. A repeated key in `to_map` keeps the **last** pair, matching
+`insert`.
