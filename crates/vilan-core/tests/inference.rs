@@ -19858,6 +19858,320 @@ fn an_imported_function_coerces_across_modules() {
     );
 }
 
+// --- B75: calling a fn-typed binding (fn-coercion.md §4) --------------------
+//
+// `let f = helper; f(1)` used to fail with "cannot call this as a function: it
+// is fn helper(i32): i32". `fn-coercion.md` §4 recorded the opposite ("calling
+// such a binding works as before"), so this was a hole, not a refusal: the call
+// resolver dispatched on the subject's ENTITY (a binding, not a declaration) and
+// never read its TYPE. It reads it now, through the same eligibility predicate
+// B20's coercion uses — one rule for what a `fun` value is, so the two can never
+// disagree. Emission needed nothing: a fn reference already emits as its own
+// (mangled) name, which is why the ANNOTATED form already worked.
+
+#[test]
+fn a_fn_typed_binding_calls() {
+    // The filed shape, end to end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            print(f(1));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_nested_fn_typed_binding_calls() {
+    // A `fun` declared inside another function (B71's neighbourhood, where this
+    // was found) is the same value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            fun helper(i: i32): i32 {
+                i * 3
+            }
+            let f = helper;
+            print(f(4));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_calls_at_every_arity() {
+    // Arity is the parameter list of the DECLARATION, so zero-, one- and
+    // multi-parameter forms all have to come through the one path — and a
+    // void-returning one has no declared return to read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun nothing(): i32 {
+            7
+        }
+
+        fun two(a: i32, b: i32): i32 {
+            a * b
+        }
+
+        fun shout(text: str) {
+            print(text);
+        }
+
+        fun main() {
+            let n = nothing;
+            let t = two;
+            let s = shout;
+            print(n());
+            print(t(3, 4));
+            s("hi");
+        }
+        main();
+        "#,
+        "7\n12\nhi\n",
+    );
+}
+
+#[test]
+fn a_rebound_fn_typed_binding_still_calls() {
+    // The type rides through a chain of bindings — each `let` copies
+    // `Type::Function(id)`, so the last one resolves the same declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 10
+        }
+
+        fun main() {
+            let f = helper;
+            let g = f;
+            let h = g;
+            print(h(5));
+        }
+        main();
+        "#,
+        "15\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_composes_with_the_b20_coercion() {
+    // The two directions must compose: bind a `fun` unannotated, CALL it, and
+    // also hand the same binding to a closure-typed parameter (where B20's
+    // coercion converts it). One value, both uses, in one program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            transform(value)
+        }
+
+        fun main() {
+            let f = double;
+            print(f(4));
+            print(apply(f, 5));
+        }
+        main();
+        "#,
+        "8\n10\n",
+    );
+}
+
+#[test]
+fn a_closure_typed_parameter_rebinds_and_calls() {
+    // The receiving end: a closure-typed parameter rebound to a plain `let` and
+    // called through the copy. This one always worked (the parameter's declared
+    // type is `Type::Closure`); it pins that widening the call operator did not
+    // disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            let inner = transform;
+            inner(value)
+        }
+
+        fun main() {
+            print(apply(double, 6));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arguments() {
+    // Resolving through the declaration is what buys the ordinary checks: a
+    // wrong argument TYPE through a binding reports like any other call.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f("text");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arity() {
+    // The arity check comes from the same path, so it reports the declaration's
+    // parameter count rather than silently accepting.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f(1, 2);
+        }
+        "#,
+        "Expected 1 argument, but got 2 instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_types_its_result() {
+    // The call's TYPE is the declaration's return type, not `Unknown`: a `str`
+    // result used as an `i32` has to fail.
+    assert_fails_with(
+        r#"
+        fun name(): str {
+            "x"
+        }
+
+        fun main() {
+            let f = name;
+            let n: i32 = f();
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+// The four functions with no value form (`fn-coercion.md` §1 rules 1-4,
+// `spec/types.md` §5.8). Each is DEFERRED there with its own reason, so a
+// binding cannot hold one to call either — pinned so that widening the call
+// operator can never quietly widen the value form with it. Each message names
+// the disqualifying property, which is what the tour promises ("the compiler
+// will tell you when you hit one").
+
+#[test]
+fn a_generic_fn_typed_binding_does_not_call() {
+    // Rule 2. Left open, this MISCOMPILED: the binding emits the declaration's
+    // name, monomorphization mints instance names from a disjoint pool, and the
+    // call reached a name specialization never produced (`$a is not defined`).
+    assert_fails_with(
+        r#"
+        fun identity<T>(x: T): T {
+            x
+        }
+
+        fun main() {
+            let f = identity;
+            let n = f(1);
+        }
+        "#,
+        "a generic function has no single value",
+    );
+}
+
+#[test]
+fn an_async_fn_typed_binding_does_not_call() {
+    // Rule 4. Left open, this compiled and printed `Promise { 2 }`: a call
+    // through a value is not awaited (the J2 gap), so the promise leaks.
+    assert_fails_with(
+        r#"
+        async fun fetchy(i: i32): i32 {
+            i + 1
+        }
+
+        async fun main() {
+            let f = fetchy;
+            let n = f(1);
+        }
+        "#,
+        "an `async` function has no value form",
+    );
+}
+
+#[test]
+fn a_method_fn_typed_binding_does_not_call() {
+    // Rule 3 — `x.method` as a value means receiver capture, deferred there.
+    // `Bag::bump` types as `fn bump(Bag): i32`, so without the gate it would
+    // have become callable as a side effect of this change.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+
+        impl Bag {
+            fun bump(self): i32 {
+                self.n + 1
+            }
+        }
+
+        fun main() {
+            let f = Bag::bump;
+            let b = Bag { n = 1 };
+            let n = f(b);
+        }
+        "#,
+        "a method has no value form",
+    );
+}
+
+#[test]
+fn an_external_fn_typed_binding_does_not_call() {
+    // Rule 1 — an extern's binding forms are call-shaped, so there is no sound
+    // value to hold.
+    assert_fails_with(
+        r#"
+        [extern("parseInt")]
+        external fun parse_int(text: str): i32;
+
+        fun main() {
+            let f = parse_int;
+            let n = f("12");
+        }
+        "#,
+        "an `external` function has no value form",
+    );
+}
+
 // --- K5: `std::time` + i53 on the wire (kolt-migration.md §2.5) --------------
 //
 // The runtime surface (arithmetic, describe, ISO, codec round-trips, sleep) is

@@ -167,6 +167,19 @@ Eligibility: a non-generic, non-method, non-`async`, non-`external`
 (generics, methods, async functions, externs) requires an explicit
 wrapping closure.
 
+The same eligibility decides what a **function-typed binding** can do. A
+binding that takes its type from the reference rather than an annotation
+keeps the function's own type, and calling it calls that function:
+
+```vilan,fragment
+let f = measure;                       // fun measure(text: str): i32
+let n = f("abc");                      // 3 — arity and argument types
+                                       // are the declaration's
+```
+
+An ineligible `fun` has no value form at all, so it can be neither
+stored nor called this way; the error names which rule it hit.
+
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
 

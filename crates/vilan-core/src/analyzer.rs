@@ -19735,6 +19735,79 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
+    /// The "not callable" message for a call subject that isn't one.
+    ///
+    /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
+    /// reads as a compiler mistake: the thing is spelled `fun` and the user just
+    /// called it. What is actually missing is a VALUE FORM — only the coercible
+    /// set (`fn-coercion.md` §1, `spec/types.md` §5.8) has one, and a binding can
+    /// hold and call exactly those. So name the disqualifying property and the
+    /// fix the docs already promise ("write the small wrapping closure. The
+    /// compiler will tell you when you hit one").
+    fn not_callable_message(&self, subject_type: &Type) -> String {
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let base = format!("cannot call this as a function: it is {rendered}");
+        let Type::Function(function_id) = subject_type else {
+            return base;
+        };
+        let Some(function) = self.functions.get(function_id) else {
+            // Not in `functions` at all: an `external fun`, whose binding forms
+            // are call-shaped (a dotted global loses its `this` when detached).
+            return match self.external_functions.get(function_id) {
+                Some(external) => format!(
+                    "{base}; an `external` function has no value form — call \
+                     '{}' directly, or wrap it in a closure",
+                    external.name
+                ),
+                None => base,
+            };
+        };
+        let reason = if !function.generic_parameter_constraint_ids.is_empty() {
+            "a generic function has no single value — which instantiation is meant \
+             would have to be chosen where the value is bound, not where it is called"
+        } else if function.is_async {
+            "an `async` function has no value form — a call through a value is not \
+             awaited, so the call would hand back an unawaited promise"
+        } else if function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))
+            .is_some_and(|parameter| parameter.name == "self")
+        {
+            "a method has no value form — one would have to capture a receiver"
+        } else {
+            return base;
+        };
+        format!(
+            "{base}; {reason}. Call '{}' directly, or wrap it in a closure",
+            function.name
+        )
+    }
+
+    /// A callable's parameters and own generics, by declaration id. One id
+    /// space serves plain and `external` functions, and a call resolves the
+    /// same way through either — whether it names the declaration
+    /// (`helper(1)`) or reaches it through a function-typed value
+    /// (`let f = helper; f(1)`).
+    fn callable_signature(&self, function_id: Id) -> Option<(Vec<Id>, Vec<TypeId>)> {
+        self.functions
+            .get(&function_id)
+            .map(|function| {
+                (
+                    function.parameters.clone(),
+                    function.generic_parameter_constraint_ids.clone(),
+                )
+            })
+            .or_else(|| {
+                self.external_functions.get(&function_id).map(|external| {
+                    (
+                        external.parameters.clone(),
+                        external.generic_parameter_constraint_ids.clone(),
+                    )
+                })
+            })
+    }
+
     fn wire_call(
         &mut self,
         call_id: Id,
@@ -20086,24 +20159,40 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Resolved;
                 }
                 let function_data = match &target {
-                    Expr::Function(function_id) => {
-                        self.functions.get(function_id).map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        })
+                    Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
+                        self.callable_signature(*function_id)
                     }
-                    Expr::ExternalFunction(external_function_id) => self
-                        .external_functions
-                        .get(external_function_id)
-                        .map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        }),
-                    _ => None,
+                    // A binding that HOLDS a function (`let f = helper; f(1)` —
+                    // B75). The target is the binding, not the declaration, so
+                    // the arm above finds nothing; the subject's TYPE names the
+                    // function it holds. `fn-coercion.md` §4 already promised
+                    // this ("calling such a binding works as before") — it never
+                    // did, because nothing taught the call operator to read the
+                    // type. Resolving through the declaration is what keeps it a
+                    // call rather than a second, weaker calling convention:
+                    // arity, spread collection and the argument check all come
+                    // from the one path below.
+                    //
+                    // Eligibility is B20's, deliberately: ONE predicate decides
+                    // whether a `fun` is a value at all (`fn-coercion.md` §1), so
+                    // the coercion and the call can never disagree about which
+                    // functions those are. Each exclusion is load-bearing here,
+                    // not inherited ceremony — a generic `fun` has no single
+                    // value to call (the binding, not the call, would have to
+                    // monomorphize, and the emitted reference names a function
+                    // that specialization never produced), and an `async` one
+                    // would hand back an unawaited promise, since a call through
+                    // a value is not awaited (§1 rule 4, the J2 gap). Both keep
+                    // today's error, as do `external` and `self` methods (§1
+                    // rules 1 and 3, both deferred there with their own reasons).
+                    _ => match &subject_type {
+                        Type::Function(function_id)
+                            if self.coercible_function_signature(*function_id).is_some() =>
+                        {
+                            self.callable_signature(*function_id)
+                        }
+                        _ => None,
+                    },
                 };
 
                 if let Some((parameters, generic_parameter_constraint_ids)) = function_data {
@@ -20259,8 +20348,7 @@ impl<'src> Analyzer<'src> {
                     let non_function_message = {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                        let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-                        format!("cannot call this as a function: it is {rendered}")
+                        self.not_callable_message(&subject_type)
                     };
                     self.diagnostics.push(Error { note: None,
                         // The SUBJECT is what isn't callable (A1).
@@ -20291,12 +20379,12 @@ impl<'src> Analyzer<'src> {
             }
             _ => {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+                let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot call this as a function: it is {rendered}"),
+                    msg,
                 });
                 Resolution::Failed
             }

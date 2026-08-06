@@ -173,9 +173,27 @@ fun main() {
 }
 ```
 
+You can also just name one and call it later. A binding holding a
+function is a function:
+
+```vilan
+import std::print;
+
+fun exclaim(text: str): str {
+	text + "!"
+}
+
+fun main() {
+	let shout = exclaim;
+	print(shout("hey"));
+}
+```
+
 This works for plain Vilan functions. It does not work for generic
-functions, methods, `async` functions, or externs. For those, write the
-small wrapping closure. The compiler will tell you when you hit one.
+functions, methods, `async` functions, or externs — those have no value
+form, so you can neither store one nor call it through a binding. For
+those, write the small wrapping closure. The compiler will tell you when
+you hit one, and which of the four you hit.
 
 ## Async closures
 
