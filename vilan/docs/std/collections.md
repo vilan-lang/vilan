@@ -166,6 +166,10 @@ impl Map<type K: Hashable, type V> {
 	fun is_empty(self): bool
 	fun keys(self): List<K>
 	fun values(self): List<V>
+	fun entries(self): List<(K, V)>
+}
+impl Map<type K: Hashable, type V: PartialEq> {
+	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
@@ -198,6 +202,29 @@ fun main() {
 
 `keys()` returns the real `K`s (in insertion order), and the key is snapshot
 on insert, so mutating the original afterward can't desync the map.
+
+`entries()` pairs `keys()`/`values()` into one `List<(K, V)>` snapshot, so
+walking both together needs no hand-zipping; `contains_value` (needing
+`V: PartialEq`, unlike the rest of `Map`) is the value-side counterpart to
+`contains_key`:
+
+```vilan
+import std::print;
+import std::map::Map;
+
+fun main() {
+	mut scores: Map<str, i32> = Map::new();
+	scores.insert("alice", 1);
+	scores.insert("bob", 2);
+	mut total = 0;
+	for entry in scores.entries() {
+		total = total + entry.1;   // entry.0 is the key, entry.1 the value
+	}
+	print(total);                        // 3
+	print(scores.contains_value(2));     // true
+	print(scores.contains_value(9));     // false
+}
+```
 
 ## `Set<T>`
 

@@ -55,6 +55,23 @@ fun main() {
 	print(sum); // 60
 	print(letters.keys().len()); // 3
 
+	// `entries()`: the paired key/value snapshot -- I4's open tail.
+	mut entry_order = "";
+	mut entry_total = 0;
+	for entry in letters.entries() {
+		entry_order = entry_order + entry.0;
+		entry_total = entry_total + entry.1;
+	}
+	print(entry_order); // abc -- insertion order
+	print(entry_total); // 60
+	print(letters.entries().len()); // 3
+
+	// `contains_value()`: value membership, not key membership.
+	print(letters.contains_value(20)); // true
+	print(letters.contains_value(99)); // false
+
 	mut empty: Map<str, i32> = Map::new();
 	print(empty.is_empty()); // true
+	print(empty.entries().len()); // 0
+	print(empty.contains_value(0)); // false
 }

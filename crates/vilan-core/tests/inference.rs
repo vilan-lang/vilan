@@ -37452,6 +37452,93 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
+// --- I4's open tail: Map/Set parity (proposal/std-surface.md §1.2/§3) --------
+//
+// The unranked "Map/Set parity" row v1 left unshipped: `entries`/
+// `contains_value` on `Map`, `union`/`intersection`/`difference` on `Set`.
+// `map`/`filter`/`for_each` on either are deliberately NOT here — the audit
+// never settled what they would return (a `Map`, a `List`, values only, pairs?)
+// and, once `entries()` exists, the composable route
+// (`map.entries().iter()...`) already covers the need with no ambiguity to
+// invent. `str` carries no ranked or unranked gap in the audit (§1.3) — nothing
+// to pin.
+
+#[test]
+fn map_entries_pairs_keys_and_values_in_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("alice", 1);
+            scores.insert("bob", 2);
+            scores.insert("alice", 99);   // overwrite -- position does not move
+            mut order = "";
+            mut total = 0;
+            for entry in scores.entries() {
+                order = order + entry.0;
+                total = total + entry.1;
+            }
+            print(order);                 // alicebob -- alice keeps its first slot
+            print(total);                 // 101 -- the overwritten value, not 1 + 2
+            print(scores.entries().len()); // 2 -- overwrite is not a new pair
+        }
+        "#,
+        "alicebob\n101\n2\n",
+    );
+}
+
+#[test]
+fn map_entries_on_an_empty_map_is_empty() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut empty: Map<str, i32> = Map::new();
+            print(empty.entries().len());   // 0
+            print(empty.entries().is_empty()); // true
+        }
+        "#,
+        "0\ntrue\n",
+    );
+}
+
+#[test]
+fn map_contains_value_compares_by_value_not_by_key() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("x", 5);
+            scores.insert("y", 5);   // a duplicate value under a different key
+            print(scores.contains_value(5));    // true
+            print(scores.contains_value(6));    // false -- absent
+            print(scores.contains_key("z"));    // false -- "z" was never a key
+        }
+        "#,
+        "true\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn map_contains_value_on_an_empty_map_is_false() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut empty: Map<str, i32> = Map::new();
+            print(empty.contains_value(0));
+        }
+        "#,
+        "false\n",
+    );
+}
+
 // --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
 //
 // `display.vl` sits outside the always-loaded core set and outside its
