@@ -2650,9 +2650,18 @@ impl<'src> Transformer<'src> {
             Expr::Generic(_) => {
                 return None;
             }
-            Expr::Function(id) => {
-                let function = self.program.functions.get(id).unwrap();
-                self.function(function)
+            // A `fun` DECLARATION, like the `struct`/`enum`/`trait`/`impl`
+            // declarations above it — including one nested in another function's
+            // body, which is the only way a `fun` reaches this walk. Emission is
+            // demand-driven from the roots: a call to it (or a reference to it
+            // as a value, through `Expr::Local` below) emits it once, at module
+            // level, keyed on its id. Emitting the body here too produced the
+            // same function TWICE (B71) — nested and hoisted, identical bodies,
+            // the inner shadowing the outer. A `fun` captures nothing, so where
+            // it is written is a scoping question the name generator already
+            // answers and not an emission one.
+            Expr::Function(_) => {
+                return None;
             }
             // An enum value is an array whose first element identifies the
             // variant; a bare (data-less) variant is just `[index]`. `bool` is
@@ -7498,19 +7507,20 @@ fn allocate_scope(
     let mut holder = holder.clone();
     for old in &scope.declarations {
         // One generated name is one binding, even where the emitter writes that
-        // binding out more than once — every instance of a monomorphized generic
-        // repeats its body's names, and a free `fun` nested in a member body is
-        // emitted both nested AND at module level. The rename map is keyed by
-        // NAME, so all of a binding's emission sites must land on one answer:
-        // take the allocation already made rather than minting a second,
-        // disagreeing one, which would rewrite the earlier site to a name chosen
-        // against a scope it is not in.
+        // binding out more than once: every instance of a monomorphized generic
+        // repeats its body's names. The rename map is keyed by NAME, so all of a
+        // binding's emission sites must land on one answer: take the allocation
+        // already made rather than minting a second, disagreeing one, which
+        // would rewrite the earlier site to a name chosen against a scope it is
+        // not in. (This branch also covered a nested free `fun`, which was
+        // emitted both nested and at module level until B71 stopped the item
+        // walk visiting it twice. The generic instances keep it live.)
         if let Some(allocated) = rename.get(old).cloned() {
-            // Meeting the name again is expected when the binding meets ITSELF:
-            // the nested copy of a hoisted `fun` shadows the module-level one,
-            // and the two are the same function. Two DIFFERENT bindings under
-            // one name is the collision this pass exists to prevent, and there
-            // is no name a name-keyed rename could give them both.
+            // Meeting the name again is expected when the binding meets ITSELF —
+            // two instances of one generic body are the same bindings written
+            // twice. Two DIFFERENT bindings under one name is the collision this
+            // pass exists to prevent, and there is no name a name-keyed rename
+            // could give them both.
             debug_assert!(
                 !used.contains(&allocated)
                     || holder.get(&allocated).map(String::as_str) == Some(old.as_str()),

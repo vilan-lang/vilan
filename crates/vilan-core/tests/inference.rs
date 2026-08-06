@@ -25954,6 +25954,140 @@ fn tuples_of_the_same_arity_still_reconcile() {
     );
 }
 
+// --- B71: a nested free `fun` is emitted ONCE. Emission is demand-driven from
+// --- the roots — a call emits the callee at module level, keyed on its id — but
+// --- the body walk ALSO emitted a `fun` declaration inline where it was
+// --- written, so a nested one came out twice with identical bodies, the inner
+// --- shadowing the outer. Harmless at runtime, which is why it went unseen; it
+// --- is dead output no reader of the JS can account for, and any change to
+// --- which copy a call resolves to would make it live. A count, not a run: the
+// --- duplicate is invisible to `assert_compiles_and_runs`.
+
+/// How many times `needle` appears in a clean compile's emitted JS.
+#[track_caller]
+fn emitted_occurrences(source: &str, needle: &str) -> usize {
+    match compile(source) {
+        Ok(js) => js.matches(needle).count(),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+/// B71 — the filed shape: a nested `fun` inside an IMPL METHOD's body.
+#[test]
+fn a_nested_fun_inside_an_impl_method_emits_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            struct S { n: i32 }
+            impl S {
+                fun run(self): i32 {
+                    fun helper(x: i32): i32 { x + 4242 }
+                    helper(self.n)
+                }
+            }
+            fun main() {
+                let s = S { n = 1 };
+                print(s.run());
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — the same in a plain function's body. The filed entry named the impl
+/// method; the double visit is the item walk's and has nothing to do with
+/// `impl`, so a free function's nested `fun` doubled identically.
+#[test]
+fn a_nested_fun_inside_a_free_function_emits_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun helper(x: i32): i32 { x + 4242 }
+                helper(n)
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — two nested `fun`s, one calling the other. Each emits once, and the
+/// inner call still resolves.
+#[test]
+fn two_nested_funs_each_emit_once() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun first(x: i32): i32 { x + 4242 }
+                fun second(x: i32): i32 { first(x) + 1 }
+                second(n)
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        1,
+    );
+}
+
+/// B71 — an uncalled nested `fun` emits NOTHING, which is what demand-driven
+/// emission means and what the inline copy was quietly overriding: it was
+/// emitted for having been written, not for being reached.
+#[test]
+fn an_uncalled_nested_fun_emits_nothing() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun run(n: i32): i32 {
+                fun helper(x: i32): i32 { x + 4242 }
+                n
+            }
+            fun main() {
+                print(run(1));
+            }
+            "#,
+            "return x + 4242;",
+        ),
+        0,
+    );
+}
+
+/// B71 — a nested `fun` that SHADOWS a module-level one of the same name. Both
+/// emit, once each, under distinct generated names, and each call reaches the
+/// one its scope names.
+#[test]
+fn a_nested_fun_shadowing_a_module_level_one_keeps_both_calls_right() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun helper(x: i32): i32 { x + 100 }
+        fun run(n: i32): i32 {
+            fun helper(x: i32): i32 { x + 1 }
+            helper(n)
+        }
+        fun main() {
+            print(run(1));
+            print(helper(1));
+        }
+        "#,
+        "2\n101\n",
+    );
+}
+
 // --- J2 value-flow asyncness: the marker on fields and return types,
 // --- adoption for unannotated bindings, and the divergence refusals
 // --- (backlog J2 "REMAINING" channels — closing the static-type/runtime-
