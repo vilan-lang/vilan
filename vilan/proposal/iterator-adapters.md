@@ -8,6 +8,13 @@
 > Prerequisites all cleared: P2/P3/P4 fixed (B55/B56/B58), B57 ratified.
 > I5's protocol repair ships with this arc.
 >
+> ARC SHIPPED 2026-08-06 (v0.30.0); implementation notes in §11.
+> Owner ruling 2026-08-06: §4 option (ii) is REFUSED — the async-closure
+> blocker and the measured ~5.5x on a List source (§11) are
+> disqualifying; the shipped state stands (one meaning per name, lazy
+> spellings via `.iter()` only). Remaining open here: S6/Iterable
+> under B4.
+>
 > Origin: the "whatever happened to iterators" audit (2026-08-03), filed as
 > backlog I3. Proposal-first per the house rules; nothing here is
 > implemented. Every claim below about what the compiler does today was

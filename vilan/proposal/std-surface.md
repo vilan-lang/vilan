@@ -437,6 +437,13 @@ like the eleven (now fourteen) that already exist.
 
 **Deferred, not decided — flagged for I3 to resolve:**
 
+> RESOLVED 2026-08-06 (owner ruling, post-I3): the eager question is
+> CLOSED AS DISSOLVED. `enumerate`/`zip`/`take`/`skip` all shipped
+> lazily on the adapter chain (v0.30.0, `.iter()`-reachable), `List`
+> gained `iter()`/`ListIterator` in the same arc, and eager duplicates
+> would violate the one-meaning-per-name policy B57 made enforceable.
+> The three bullets below stand as the record of why it waited.
+
 - **`enumerate`/`zip`** (§2.5) — real demand (`browser/ui.vl:298-317`),
   but these are named directly in I3's backlog entry as adapter
   candidates. Adding an eager `List.zip`/`List.enumerate` now would

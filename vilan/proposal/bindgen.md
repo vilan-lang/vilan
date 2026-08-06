@@ -11,6 +11,14 @@
 > (3) v2 direction per owner: an override table + automatic bindgen —
 > v1's explicit checked-in file stands, and is the core v2 needs anyway.
 >
+> v1 SHIPPED 2026-08-06 (v0.30.0) — implementation notes §9, the
+> lib.dom.d.ts probe §10 (notes (1) and (2) are answered there and in
+> §9.4: backed enums do not exist and are filed as their own language
+> question, B76; the array-like row and three siblings are corrected).
+> Owner ruling 2026-08-06: §5 WIDENS to the `declare var X: { new(): X }`
+> constructor idiom — E37(a) GRANTED; the v0.31.0 bindgen-v2 lane builds
+> it with the `--only <Type>` filter (E37(b)).
+>
 > Ground truth for every claim below was read from source, not assumed: std's
 > hand-written bindings (`fetch.vl`, `dom.vl`, `bytes.vl`, `time.vl`, `rpc.vl`,
 > `process/fs.vl`, `process/http.vl`), the parser/analyzer's actual accepted
