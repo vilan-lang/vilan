@@ -6,6 +6,16 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`(make(), 6).1` gives you the 6.** Building a tuple out of a value you did not first name lost that value's slots. `let pair = (4, 5); (pair, 6)` was fine; `(make(), 6)` — the same tuple, straight from the call — silently built the wrong thing, and every read past that element came back `undefined`. It compiled clean, it type-checked clean, and it has been wrong since tuples started storing flat: v0.28.0 and every release before it. No `..` was involved.
+
+Tuples store **flat**, so an element that is itself a tuple has to splice its slots into the one being built rather than nest inside it — that is what makes `.1` resolve to the slot the type says it does. The compiler decided whether to splice by looking up the element's type in the cache the type solver fills, and that cache only holds a type where one is *produced*: a binding, a literal, a field or index read, a `match`. Everything else is typed on demand and the answer thrown away. So a **call**, an `if`, an `else if` chain, a `{ block }`, a method call, an associated call, a call through a closure value, an `await`, a `*view` read, a `const` element — and, least expected of all, a plain **parameter** — all read as untyped, all nested, and all broke the layout. Now the tuple's own type rule keeps the type it computes for each element, so coverage follows from the rule rather than from which forms happened to leave a trace. Sixteen pins, one per form plus the mixed, nested and spread-alongside cases, each planted red and restored.
+
+An element whose type is still a generic parameter deliberately stays nested, and that is not a gap. A generic body is compiled once and emitted for every instantiation, and the flat offsets baked into that single pass count a generic element as one slot; splicing it at the instantiations that bind it to a tuple would move every offset past it. Pinned in both directions.
+
+The spread form was never affected and still is not: `(..make(), 6)` has always been correct, because a `..` splices for having been *written* as one and asks no type question at all. Record: `proposal/variadic-generics.md` §T.8.
+
 ## v0.29.0 — 2026-08-04
 
 **You can finally see an optimistic write happening.** `optimistic(signal, value, commit)` paints, awaits, and confirms or rolls back — and hands the outcome to whoever called it and to nobody else. So a button that should grey out while its write is in flight, or a banner that should say why one failed, needed a boolean you kept yourself, and a sweep of every app in the tree found not a single one. `Optimistic::over(signal)` wraps a signal you already have — no binding changes — and adds a `state` signal to bind: `Confirmed`, `Pending`, `Rejected(reason)`. `write` still returns the outcome; the state is an addition, not a replacement.

@@ -6146,13 +6146,37 @@ impl<'src> Transformer<'src> {
     /// flat array whose slots splice into a constructed tuple. A tuple literal is
     /// recognized structurally (its own id carries no stored type); anything else
     /// is decided by its resolved type.
+    ///
+    /// B70 (variadic-generics.md §T.8): the general cache answers only for the
+    /// forms that *store* a type. An element written as a call, an `if`, a
+    /// block, an `await`, a method call, a `*view` or a plain parameter is typed
+    /// on demand and stored nowhere, so this read came back silent and the
+    /// element nested instead of splicing — flat storage broken, every read past
+    /// it `undefined`. `tuple_element_types` is the type the tuple rule computed
+    /// for that very element and it covers every form; it is consulted second so
+    /// an expression that already answered keeps its answer byte for byte.
+    ///
+    /// The element entry is read UNRESOLVED, unlike the general one. The
+    /// analyzer bakes a `.n` read's flat offset into the AST from
+    /// `tuple_flat_width`, which counts a still-generic element as one slot
+    /// because a generic body is walked once for every instantiation — so
+    /// splicing one would move every offset past it. Reading the entry as
+    /// written keeps emission and those offsets on the same layout.
     fn is_tuple_typed(&self, expr_id: Id) -> bool {
         if matches!(self.program.entity_map.get(&expr_id), Some(Expr::Tuple(_))) {
             return true;
         }
-        self.expr_type_id(expr_id)
-            .map(|type_id| self.resolve_type_id(type_id))
-            .and_then(|type_id| self.program.type_id_to_type_map.get(&type_id))
+        if let Some(type_id) = self.expr_type_id(expr_id) {
+            return self
+                .program
+                .type_id_to_type_map
+                .get(&self.resolve_type_id(type_id))
+                .is_some_and(|type_| matches!(type_, Type::Tuple(_)));
+        }
+        self.program
+            .tuple_element_types
+            .get(&expr_id)
+            .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
