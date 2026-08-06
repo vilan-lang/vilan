@@ -24,6 +24,7 @@ pub fn bindgen(
     file: PathBuf,
     output: Option<PathBuf>,
     platform: String,
+    only: Vec<String>,
     stdout: bool,
     stats: bool,
 ) -> ExitCode {
@@ -39,12 +40,23 @@ pub fn bindgen(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| file.display().to_string()),
+        only,
     };
     if let Err(message) = options.validate() {
         return report_error(&message);
     }
 
     let generated = generate(&source, &options);
+
+    // A misspelled `--only` would otherwise write a file quietly missing the
+    // type the caller asked for, which is worse than writing nothing.
+    if !generated.unknown_only.is_empty() {
+        return report_error(&format!(
+            "{} declares none of: {}",
+            file.display(),
+            generated.unknown_only.join(", ")
+        ));
+    }
 
     if stats {
         eprint!("{}", generated.coverage.report());

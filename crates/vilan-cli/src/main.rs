@@ -155,6 +155,11 @@ enum Command {
         /// guess baked into checked-in source is worse than choosing once.
         #[arg(long)]
         platform: String,
+        /// Emit only this declaration and everything its signatures reach —
+        /// base types, member types, parameter and return types. Repeatable.
+        /// Omitted: the whole file.
+        #[arg(long)]
+        only: Vec<String>,
         /// Print the bindings instead of writing a file.
         #[arg(long)]
         stdout: bool,
@@ -248,9 +253,10 @@ fn run_cli() -> ExitCode {
             file,
             output,
             platform,
+            only,
             stdout,
             stats,
-        } => bindgen::bindgen(file, output, platform, stdout, stats),
+        } => bindgen::bindgen(file, output, platform, only, stdout, stats),
         Command::Upgrade { check } => upgrade::upgrade(check),
     }
 }

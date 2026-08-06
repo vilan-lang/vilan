@@ -1,0 +1,82 @@
+// board.vl — a canvas drawn entirely through GENERATED bindings.
+//
+// Every `canvas.*` and `context.*` call below resolves into `canvas.vl`, which
+// nobody typed: `vilan bindgen canvas.d.ts --platform browser --only
+// HTMLCanvasElement` wrote all 345 lines of it from the declaration file beside
+// it. This file adds exactly one binding by hand, and that one is the point of
+// the example as much as the drawing is — see `entry point`, below.
+
+import pkg::canvas::{ CanvasRenderingContext2D, HTMLCanvasElement };
+
+// THE ENTRY POINT — the one binding generation cannot supply.
+//
+// `lib.dom.d.ts` says `declare var document: Document`, and no `[extern(…)]`
+// form reads a bare global as a VALUE: they bind a call, or a property of a
+// receiver. So reaching the first object is still a hand-written line, and 183
+// of `lib.dom.d.ts`'s globals are in that position (`proposal/bindgen.md`
+// §10.2). It is a handful, not a surface — this program needs exactly one, and
+// once it holds a canvas every other call is generated.
+[extern("document.getElementById")]
+[platform("browser")]
+external fun canvas_by_id(id: str): HTMLCanvasElement;
+
+fun main() {
+	let canvas = canvas_by_id("board");
+	canvas.set_width(640.0);
+	canvas.set_height(360.0);
+
+	// `getContext` is a generated binding, and it returns a real
+	// `CanvasRenderingContext2D` rather than an opaque handle, because the
+	// declaration file said so and bindgen kept the type.
+	let context = canvas.get_context("2d");
+	draw(context);
+
+	// A click repaints. The listener parameter is a plain `|Event| void`: a
+	// void-returning closure slot accepts an async closure too, so the DOM's
+	// overwhelmingly common handler shape needs no asyncness annotation at all
+	// (`proposal/bindgen.md` §3.6).
+	canvas.add_event_listener("click", |event| {
+		context.clear_rect(0.0, 0.0, 640.0, 360.0);
+		draw(context);
+	});
+}
+
+/// Fills, an arc, and text — the shape §10.4's probe compiled, now against
+/// bindings that are checked in rather than pasted into a proposal.
+fun draw(context: CanvasRenderingContext2D) {
+	// A gradient wash. `fillStyle` is `string | CanvasGradient` in the
+	// declaration file, so bindgen widened it to `any` under a TODO — which is
+	// exactly why both a gradient and a colour string can be handed to it here.
+	let wash = context.create_linear_gradient(0.0, 0.0, 640.0, 0.0);
+	wash.add_color_stop(0.0, "#1b1035");
+	wash.add_color_stop(1.0, "#442266");
+	context.set_fill_style(wash);
+	context.fill_rect(0.0, 0.0, 640.0, 360.0);
+
+	// A filled rectangle.
+	context.set_fill_style("rebeccapurple");
+	context.fill_rect(40.0, 60.0, 160.0, 110.0);
+
+	// A stroked rectangle, to show the width property lowering to `lineWidth`.
+	context.set_stroke_style("#f5f0ff");
+	context.set_line_width(3.0);
+	context.stroke_rect(40.0, 60.0, 160.0, 110.0);
+
+	// An arc: a filled disc, then an outlined one beside it.
+	context.set_fill_style("#ffcc66");
+	context.begin_path();
+	context.arc(300.0, 115.0, 55.0, 0.0, 6.2831853);
+	context.fill();
+
+	context.begin_path();
+	context.arc(440.0, 115.0, 55.0, 0.0, 6.2831853);
+	context.close_path();
+	context.stroke();
+
+	// Text.
+	context.set_fill_style("#f5f0ff");
+	context.set_font("20px sans-serif");
+	context.fill_text("drawn through generated bindings", 40.0, 250.0);
+	context.set_font("14px sans-serif");
+	context.fill_text("click to repaint", 40.0, 280.0);
+}
