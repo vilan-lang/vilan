@@ -864,6 +864,19 @@ hiding a defect every future same-named pair would hit again.
    the first in a process and always serves the clean world, so a loop that
    does not clear the cache is vacuous.
 
+   **Fixed 2026-08-06 (B77).** The cause is not in the arc's territory at
+   all: a constraint id does not identify one declaring FILE. `impl
+   Subject<type T>` inherits the subject's constraint id on purpose
+   (`register_subject_binders`), so a user's `impl List<type T>` *is*
+   `list.vl`'s `T`. The residual-generic leak check collapsed that
+   many-to-one relation into a `HashMap<TypeId, SourceId>` with `.collect()`
+   — last write wins over a randomly-seeded hash iteration — so the recorded
+   declaring file flipped run to run, and half the time the entry won and
+   every `List<T>` inside `list.vl` read as foreign. The check now keeps the
+   SET of declaring files and asks whether the binding's own file is among
+   them. The arc's contribution was reachability: `impl List<type T>` is a
+   natural thing to write only once `List` has an iterator worth extending.
+
 2. **The protocol loop drops a tuple element's type when the iterator's
    element IS its own generic parameter.** `for pair in [(1, "a")].iter()`
    gives "cannot access field '0' on type T", while the same iterator pulled
@@ -875,3 +888,26 @@ hiding a defect every future same-named pair would hit again.
    unaffected — they name their tuple element structurally in the `with`
    clause — which places the defect in the loop binding's substitution alone.
    Documented on the collections page rather than left to be discovered.
+
+   **Fixed 2026-08-06 (B78).** The substitution was simply absent from one arm.
+   `iterable_element_type` reads the element off the DECLARED return type of the
+   subject's `next`, and that payload is written in the SUBJECT's own parameters
+   — abstract until instantiated against the receiver's arguments, exactly as
+   the `Trait` arm one match-arm below already did with the trait's (which is
+   why a bounded-generic loop, `for v in source` with `I: Iterator<T>`, always
+   worked). The struct/enum arm now builds the same instantiation context from
+   the subject's declared parameters. It was never about tuples: a bare `T`
+   admits nothing, so a struct element's field, a nested `List`'s `len()`, an
+   `Option`'s method and a closure element's CALL all refused identically, and
+   the `&mut` form (`next_mut`) and an enum-shaped subject were affected too —
+   eight pins, six of them red without the fix. §11's own claim that "the native
+   `for pair in [(1, "a")]` over a plain `List` has always worked" is right and
+   is now the regression guard beside `enumerate`/`zip`.
+
+   A separate defect fell out of repairing the pin, which named its protocol
+   method `step` and so never reached the protocol at all: `for x in subject`
+   over a CONCRETE struct with no `next` is not diagnosed. It lowers to a native
+   `for...of`, which walks the receiver's flat FIELD array — the program prints
+   the struct's fields and exits 0. That is P3/B56's defect one type-shape over
+   (B56 closed it for a generic subject), pinned `#[ignore]`d as
+   `a_for_loop_over_a_struct_without_next_is_diagnosed`.

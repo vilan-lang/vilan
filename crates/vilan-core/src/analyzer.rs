@@ -4234,6 +4234,21 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// The declared generic-parameter constraint ids of the struct or enum with
+    /// this id, in order — the left-hand side of an [`instantiation_context`]
+    /// built against a `Type::Struct(id, arguments)` / `Type::Enum(id,
+    /// arguments)`. Empty for an unparameterized or unknown subject, which makes
+    /// the substitution a no-op rather than a special case.
+    fn declared_parameter_constraint_ids(&self, subject_id: Id) -> Vec<TypeId> {
+        if let Some(struct_) = self.structs.get(&subject_id) {
+            return struct_.generic_parameter_constraint_ids.clone();
+        }
+        if let Some(enum_) = self.enums.get(&subject_id) {
+            return enum_.generic_parameter_constraint_ids.clone();
+        }
+        Vec::new()
+    }
+
     /// Whether any member (substituted through `context`) is a resource. Returns
     /// `(found, complete)`: finding a resource is definitive and complete; a
     /// negative result is complete only if every member's classification was.
@@ -16947,10 +16962,23 @@ impl<'src> Analyzer<'src> {
             }
             // `[T; n]` is a JS array too — iterate its element type `T`.
             Type::Array(element_id, _) => Some(element_id.get_type(self)),
-            // A custom iterator (e.g. `Range`): its element is the payload of
-            // `next(self): Option<T>` (or `next_mut(&mut self): Option<&mut T>` for
-            // a `&mut` view loop), so the binding gets type `T`.
-            Type::Struct(_, _) | Type::Enum(_, _) => {
+            // A custom iterator (e.g. `Range`, `ListIterator<T>`): its element is
+            // the payload of `next(self): Option<T>` (or `next_mut(&mut self):
+            // Option<&mut T>` for a `&mut` view loop), so the binding gets `T`.
+            //
+            // That payload is written in the SUBJECT's OWN parameters (`impl
+            // ListIterator<type T> { fun next(..): Option<T> }`), so it is
+            // abstract until instantiated against the receiver's arguments —
+            // the same step the `Trait` arm below takes with the trait's. Taking
+            // it verbatim typed the binding as the bare parameter `T` (B78), and
+            // a `T` admits nothing: `pair.0` on a `ListIterator<(i32, str)>`
+            // element was "cannot access field '0' on type T". `enumerate`/`zip`
+            // hid it — their payloads are STRUCTURAL (`Option<(i32, T)>`), so
+            // substituting the parts was enough even without substituting the
+            // whole.
+            Type::Struct(subject_id, subject_arguments)
+            | Type::Enum(subject_id, subject_arguments) => {
+                let (subject_id, subject_arguments) = (*subject_id, subject_arguments.clone());
                 let next_id = self.method_member_in_impls(iterable_type, next_method)?;
                 let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id)
                 else {
@@ -16961,15 +16989,16 @@ impl<'src> Analyzer<'src> {
                     .get(function_id)?
                     .return_type_id?
                     .get_type(self);
-                match return_type {
-                    Type::Enum(enum_id, arguments)
-                        if self.enums.get(&enum_id).map(|enumeration| enumeration.name)
-                            == Some("Option") =>
-                    {
-                        arguments.first().map(|element| element.get_type(self))
-                    }
-                    _ => None,
+                let Type::Enum(enum_id, arguments) = return_type else {
+                    return None;
+                };
+                if self.enums.get(&enum_id).map(|enumeration| enumeration.name) != Some("Option") {
+                    return None;
                 }
+                let element = arguments.first()?.get_type(self);
+                let parameter_ids = self.declared_parameter_constraint_ids(subject_id);
+                let substitution = Self::instantiation_context(&parameter_ids, &subject_arguments);
+                Some(self.substitute_type(&element, &substitution))
             }
             // `self` inside a trait default: its type is the declaring trait's
             // abstract `Self`. The element is the payload of the trait's own
@@ -24534,16 +24563,31 @@ impl<'src> Analyzer<'src> {
         // binders); one declared in ANOTHER file (`Map::new`'s `K` reaching a
         // user binding) can never ground there. A generic with no recorded
         // declaration stays lenient.
-        let generic_declaration_sources: HashMap<TypeId, SourceId> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter_map(|(entity_id, expr)| match expr {
-                Expr::Generic(constraint_id) => self
-                    .source_of_id(*entity_id)
-                    .map(|source| (*constraint_id, source)),
-                _ => None,
-            })
-            .collect();
+        //
+        // One constraint id can be declared in SEVERAL files, so this is a
+        // set per constraint and not a single source (B77). An impl binder
+        // written `impl Subject<type T>` deliberately *inherits* the
+        // subject's own constraint id (`register_subject_binders`) so that
+        // the binder is identical to having written the subject's bound out
+        // — which makes a user's `impl List<type T>` share the exact id of
+        // `list.vl`'s `struct List<T>`. Collapsing that many-to-one relation
+        // into one source is not merely lossy, it is *unstable*: the winner
+        // was whichever entity a randomly-seeded `HashMap` iteration reached
+        // last, so a user's impl block un-froze std's own `List::map` on
+        // roughly half of otherwise identical cold compiles.
+        let mut generic_declaration_sources: HashMap<TypeId, Vec<SourceId>> = HashMap::new();
+        for (entity_id, expr) in &self.expr_id_to_expr_map {
+            if let Expr::Generic(constraint_id) = expr
+                && let Some(source) = self.source_of_id(*entity_id)
+            {
+                let declared_in = generic_declaration_sources
+                    .entry(*constraint_id)
+                    .or_default();
+                if !declared_in.contains(&source) {
+                    declared_in.push(source);
+                }
+            }
+        }
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -24572,10 +24616,16 @@ impl<'src> Analyzer<'src> {
             let Some(source) = self.source_of_id(variable_id) else {
                 continue;
             };
+            // A residual leaks when the parameter is declared somewhere and
+            // NOWHERE is this binding's own file: `Map::new`'s `K` reaching
+            // user code. If any declaration of it is in this file, the
+            // binding sits inside a scope that can still bind it and the
+            // residual is legitimate — which is order-independent, unlike
+            // asking which single file declared it.
             let leaked = residuals.iter().any(|residual| {
                 generic_declaration_sources
                     .get(residual)
-                    .is_some_and(|declared_in| *declared_in != source)
+                    .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
                 let name = self

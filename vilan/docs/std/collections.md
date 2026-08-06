@@ -371,13 +371,26 @@ is already a std type, and vilan's method resolution picks by registration order
 rather than reporting a collision, so the type names stay out of each other's
 way.
 
-**One rough edge to know about.** If an iterator's element type is its own
-generic parameter and you instantiate it at a *tuple*, the `for` binding loses
-the tuple: `for pair in [(1, "a")].iter() { pair.0 }` is rejected with "cannot
-access field '0' on type T". Pull by hand instead —
-`if cursor.next() is Some(let pair) { pair.0 }` — or iterate the `List`
-directly, both of which work. `enumerate` and `zip` are not affected, because
-they name their tuple element structurally.
+A `for` binding gets the element type the iterator was instantiated at, whatever
+shape it is — a tuple, a struct, another container, a closure:
+
+```vilan
+import std::print;
+
+struct Point { x: i32, y: i32 }
+
+fun main() {
+	for pair in [(1, "a"), (2, "b")].iter() {
+		print(pair.0);                          // 1, then 2
+	}
+	for point in [Point { x = 1, y = 2 }].iter() {
+		print(point.x);                         // 1
+	}
+	for inner in [[1, 2, 3], [4]].iter() {
+		print(inner.len());                     // 3, then 1
+	}
+}
+```
 
 ### Terminations
 

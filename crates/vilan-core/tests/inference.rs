@@ -40454,35 +40454,49 @@ fn list_iter_satisfies_an_iterator_bound() {
     );
 }
 
-// --- Found while building I3 S3: a user `impl List<type T>` makes std's own
-// --- `List` methods report, nondeterministically ------------------------------
+// --- B77: a user `impl List<type T>` made std's own `List` methods report,
+// --- nondeterministically (FIXED) ---------------------------------------------
+//
+// A constraint id does NOT identify one declaring file. `impl Subject<type T>`
+// deliberately inherits the SUBJECT's constraint id (`register_subject_binders`),
+// so a user's `impl List<type T>` is the same id as `list.vl`'s `struct List<T>`
+// — by design, so the binder means exactly what writing the subject's bound out
+// would mean. The residual-generic leak check collapsed that many-to-one
+// relation into a `HashMap<TypeId, SourceId>` via `.collect()`, i.e. last write
+// wins over a randomly-seeded `HashMap` iteration. Whichever entity came last
+// became "the" declaring file, so on ~half of cold compiles the user's file won
+// and every `List<T>` residual inside `list.vl` read as declared elsewhere. The
+// check now keeps the SET of declaring files and asks whether the binding's own
+// file is among them, which is the question the rule always meant to ask and is
+// order-independent.
 
-/// A user-declared `impl List<type T>` block makes the entry-scoped checks
-/// report against std's OWN `List::map` / `List::filter` bodies — "the type of
-/// 'result' is never fully determined" against `mut result = List::new()` in
-/// `list.vl` — on roughly half of otherwise identical compiles of the SAME
-/// source. Two things are wrong at once:
+/// A user-declared `impl List<type T>` block must not make the entry-scoped
+/// checks report against std's OWN `List::map` / `List::filter` bodies — "the
+/// type of 'result' is never fully determined" against `mut result =
+/// List::new()` in `list.vl`. Two things were wrong at once:
 ///
-/// 1. the diagnostic is **spurious**: `result` is fixed by the `result.push(..)`
+/// 1. the diagnostic was **spurious**: `result` is fixed by the `result.push(..)`
 ///    below it and by the declared return type, which is why the other half of
-///    the runs are clean; and
-/// 2. it points into **std**, whose definition-site diagnostics are meant to be
-///    frozen (`analysis-reuse.md` §6) — so a user's impl block is un-freezing
+///    the runs were clean; and
+/// 2. it pointed into **std**, whose definition-site diagnostics are meant to be
+///    frozen (`analysis-reuse.md` §6) — so a user's impl block was un-freezing
 ///    entities it does not own.
 ///
 /// The order-dependence is what makes it worth its own pin: a single compile
-/// proves nothing. It is also **cold-path only** — the base cache
-/// (`analysis-reuse.md` §6.10) serves every compile after the first in a
+/// proves nothing, so this counts. It is also **cold-path only** — the base
+/// cache (`analysis-reuse.md` §6.10) serves every compile after the first in a
 /// process, and a served world is always the clean one, which is why a naive
-/// loop passes 300/300 and proves nothing either. So each attempt clears the
-/// cache first. Measured that way it fails roughly half the time, here and on
-/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predates this arc;
-/// `#[ignore]`d until the cause is found.
+/// loop passed 300/300 and proved nothing either. So each attempt clears the
+/// cache first. Measured that way it failed roughly half the time, here and on
+/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predated the I3 arc
+/// that found it. It is 30/30 clean now, and goes red at ~15/30 if the leak
+/// check is put back on a single declaring source.
 ///
-/// `base_cache_clear` is process-global, which is a second reason this stays
-/// ignored rather than joining the suite.
+/// `base_cache_clear` is process-global. Under nextest each test is its own
+/// process; under plain `cargo test` the worst it does to a concurrent test is
+/// cost it a cold analysis, since the base cache is a reuse cache and no answer
+/// may depend on a hit.
 #[test]
-#[ignore]
 fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
     let source = r#"
         import std::print;
@@ -40497,10 +40511,87 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
             print([1, 2, 3].second_len());
         }
         "#;
-    for attempt in 0..20 {
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
         vilan_core::analyzer::base_cache_clear();
         if let Err(errors) = compile(source) {
-            panic!("attempt {attempt} reported against std: {errors:#?}");
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles reported against std; the first said: {first_report:#?}"
+    );
+}
+
+/// The other half of B77's rule, and the guard that the fix is not a
+/// suppression: sharing a constraint id across files makes a residual legal in
+/// EVERY file that declares it, not in none of them. The user's own impl body
+/// binds `T`, so a `List<T>` binding inside it is as legitimate as the identical
+/// binding inside `list.vl` — and both must stay clean on the same cold compile.
+/// This went red on ~half of cold attempts before the fix, in the runs where
+/// `list.vl` rather than the entry won the collapse.
+#[test]
+fn a_generic_residual_is_legal_in_every_file_that_declares_its_parameter() {
+    let source = r#"
+        import std::print;
+
+        impl List<type T> {
+            fun doubled(self): List<T> {
+                mut copy = List::new();
+                for item in self {
+                    copy.push(item);
+                    copy.push(item);
+                }
+                copy
+            }
+        }
+
+        fun main() {
+            print([1, 2].doubled().len());
+        }
+        "#;
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
+        vilan_core::analyzer::base_cache_clear();
+        if let Err(errors) = compile(source) {
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles rejected a legitimate residual; \
+         the first said: {first_report:#?}"
+    );
+}
+
+/// B77's fix must not soften the B16 rule it lives inside: a parameter declared
+/// ONLY in another file still leaks. `Map::new`'s `K`/`V` are declared in
+/// `map.vl` and nowhere in the entry, so the set never contains the entry and
+/// the annotate steer still lands — on the cold path, where B77 lived.
+#[test]
+fn a_leaked_generic_still_reports_on_the_cold_path() {
+    let source = r#"
+        import std::map::Map;
+        fun main() {
+            mut table = Map::new();
+            table.insert("k", 1);
+        }
+        "#;
+    for attempt in 0..5 {
+        vilan_core::analyzer::base_cache_clear();
+        match compile(source) {
+            Ok(_) => panic!("attempt {attempt}: the leaked `Map::new` residual went unreported"),
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("never fully determined")),
+                "attempt {attempt}: wrong diagnostic: {errors:#?}"
+            ),
         }
     }
 }
@@ -40980,50 +41071,67 @@ fn an_adapter_chain_leaves_its_source_list_alone() {
     );
 }
 
-// --- Found while building I3 S4: the protocol loop drops a TUPLE element's
-// --- type when the iterator's element is its own generic parameter -----------
+// --- B78: the protocol loop dropped the element's type when the iterator's
+// --- element IS its own generic parameter (FIXED) ----------------------------
+//
+// `iterable_element_type` reads the element off the DECLARED return type of the
+// subject's `next` — `impl ListIterator<type T> { fun next(..): Option<T> }` —
+// and took that payload verbatim. The payload is written in the SUBJECT's own
+// parameters, so it is abstract until instantiated against the receiver's
+// arguments, exactly like the `Trait` arm one match-arm below (which does
+// substitute, and is why a bounded-generic loop always worked). Untouched, the
+// binding got the bare parameter `T`, and a `T` admits nothing: field access,
+// method call and call-as-a-function all refused it.
+//
+// `enumerate` and `zip` hid the defect for the whole I3 arc because their
+// payloads are STRUCTURAL — `Option<(i32, T)>`, `Option<(T, U)>` — so the loop
+// saw a tuple whose PARTS were abstract, which projects fine, rather than a
+// whole that was. The subject arm now builds the same instantiation context the
+// trait arm does, from the struct's or enum's declared parameters.
 
-/// `for value in it` types `value` as the bare generic parameter (or as `any`)
-/// when `it`'s element type IS that parameter — so a tuple element cannot be
-/// projected: `pair.0` is "cannot access field '0' on type T". The same
-/// iterator pulled by hand is fine, which is what makes this the LOOP's bug
-/// rather than the iterator's:
-///
-/// ```text
-/// if cursor.step() is Some(let pair) { print(pair.0); }   // 1
-/// for pair in cursor { print(pair.0); }                   // cannot access field '0'
-/// ```
-///
-/// It is not std's and not this arc's — the repro below defines its own trait
-/// and its own cursor, and the native `for pair in [(1, "a")]` over a plain
-/// `List` (a different arm entirely) has always worked. What the arc DID is
-/// make the shape reachable: `List::iter()` is the first generically-elemented
-/// iterator in std, so `[(1, "a")].iter().filter(p)` now hits it. An adapter
-/// that names the tuple STRUCTURALLY in its `with` clause is unaffected —
-/// `enumerate` (`Iterator<(i32, T)>`) and `zip` (`Iterator<(T, U)>`) both
-/// project fine — so the defect is exactly the substitution of the loop
-/// binding, not tuples in the protocol.
-///
-/// `#[ignore]`d: it asserts the desired outcome and fails today.
+/// The filed shape: `List::iter()` is std's first generically-elemented
+/// iterator, so `for pair in [(1, "a")].iter()` was the first thing to reach it
+/// — "cannot access field '0' on type T". The same iterator pulled BY HAND was
+/// always fine, which is what places the defect in the loop's binding rather
+/// than in the iterator.
 #[test]
-#[ignore]
 fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::option::Option::{ self, Some, None };
 
-        trait Walk<T> {
-            fun step(&mut self): Option<T>;
+        fun main() {
+            mut pulled = [(1, "a"), (2, "b")].iter();
+            if pulled.next() is Some(let pair) {
+                print(pair.0);
+            }
+            for pair in [(1, "a"), (2, "b")].iter() {
+                print(pair.1);
+            }
         }
+        "#,
+        "1\na\nb\n",
+    );
+}
+
+/// The same defect with no std beyond the loop protocol itself: a user's own
+/// generically-elemented cursor. Neither std's nor the arc's — what the arc did
+/// was make the shape reachable.
+#[test]
+fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
 
         struct Cursor<T> {
             items: List<T>,
             index: i32,
         }
 
-        impl Cursor<type T> with Walk<T> {
-            fun step(&mut self): Option<T> {
+        impl Cursor<type T> {
+            fun next(&mut self): Option<T> {
                 if self.index < self.items.len() {
                     let value = self.items[self.index];
                     self.index = self.index + 1;
@@ -41036,7 +41144,7 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
 
         fun main() {
             mut pulled = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
-            if pulled.step() is Some(let pair) {
+            if pulled.next() is Some(let pair) {
                 print(pair.0);
             }
             mut looped = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
@@ -41046,6 +41154,220 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
         }
         "#,
         "1\na\nb\n",
+    );
+}
+
+/// Not a tuple defect — a BARE-PARAMETER defect. Every element form that a `T`
+/// refuses went red the same way, so each gets a leg: a struct (field access),
+/// a nested container (method call), an `Option` (method call on an enum), and
+/// a closure (call-as-a-function, "cannot call this as a function: it is T").
+#[test]
+fn a_protocol_loop_keeps_every_element_form_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            for point in [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }].iter() {
+                print(point.x);
+            }
+            for inner in [[1, 2, 3], [4]].iter() {
+                print(inner.len());
+            }
+            for maybe in [Some(5), None].iter() {
+                print(maybe.unwrap_or(-1));
+            }
+            for fn in [|n: i32| n + 1].iter() {
+                print(fn(41));
+            }
+        }
+        "#,
+        "1\n3\n3\n1\n5\n-1\n42\n",
+    );
+}
+
+/// A pattern match on the element never went red — an `is` against a bare `T`
+/// checked VACUOUSLY and still ran, which is why an enum element looked
+/// unaffected until a method was called on it. The pin is here so that
+/// leniency, whatever it is worth, stays a decision and not an accident: the
+/// element is a real `Shade` now and both arms still match.
+#[test]
+fn a_protocol_loop_element_matches_its_enum_variants() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Shade { Light, Dark(i32) }
+
+        fun main() {
+            for shade in [Shade::Dark(9), Shade::Light].iter() {
+                if shade is Shade::Dark(let depth) { print(depth); }
+                if shade is Shade::Light { print(0); }
+            }
+        }
+        "#,
+        "9\n0\n",
+    );
+}
+
+/// The subject arm covers ENUMS as well as structs, and an enum-shaped iterator
+/// reaches it by the same road (`Type::Enum(id, arguments)` -> the declared
+/// parameters of `enums[id]`). Same "cannot access field '1' on type T" before.
+#[test]
+fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Feed<T> { Ready(List<T>, i32), Done }
+
+        impl Feed<type T> {
+            fun next(&mut self): Option<T> {
+                if self is Feed::Ready(let items, let at) {
+                    let pulled = if at < items.len() { Some(items[at]) } else { None };
+                    let advanced = if at < items.len() {
+                        Feed::Ready(items, at + 1)
+                    } else {
+                        Feed::Done
+                    };
+                    self = advanced;
+                    pulled
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut feed = Feed::Ready([(1, "a"), (2, "b")], 0);
+            for pair in feed {
+                print(pair.0);
+                print(pair.1);
+            }
+        }
+        "#,
+        "1\na\n2\nb\n",
+    );
+}
+
+/// The `&mut` lending form drives `next_mut(&mut self): Option<&mut T>`
+/// (`iterator-adapters.md` §7) through the same arm, so a GENERIC container
+/// lent by view had the identical defect — the standing `next_mut` pins use a
+/// concrete `Bag` and could not see it.
+#[test]
+fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+
+        impl Bag<type T> {
+            fun next_mut(&mut self): Option<&mut T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor = self.cursor + 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in &mut bag {
+                print(pair.1);
+            }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The element survives an adapter chain, where the subject is a `Filtered<..>`
+/// whose own parameter is bound to the upstream's — one more instantiation hop
+/// than the bare `.iter()` legs above.
+#[test]
+fn a_protocol_loop_keeps_a_tuple_element_through_an_adapter_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in [(1, "a"), (2, "b"), (3, "c")].iter().filter(|p| p.0 > 1) {
+                print(pair.1);
+            }
+            for pair in [(1, "a"), (2, "b")].iter().take(1) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "b\nc\n1\n",
+    );
+}
+
+/// The regression guard on the forms that always worked, and the reason the
+/// defect survived the whole arc: a STRUCTURAL payload projects even without
+/// the instantiation, because only its parts are abstract.
+#[test]
+fn a_structurally_named_tuple_element_still_projects() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in ["a", "b"].iter().enumerate() {
+                print(pair.0);
+                print(pair.1);
+            }
+            for pair in [1, 2].iter().zip(["x", "y"].iter()) {
+                print(pair.1);
+            }
+            for pair in [(9, "z")] {
+                print(pair.0);
+            }
+        }
+        "#,
+        "0\na\n1\nb\nx\ny\n9\n",
+    );
+}
+
+/// Found while repairing B78's own pin, which named its protocol method `step`
+/// and therefore never reached the protocol at all. `for x in subject` over a
+/// CONCRETE struct that has no `next` is not diagnosed — it silently lowers to
+/// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
+/// array. The program below prints `[ 1, 2 ]` and `0` — the two fields of
+/// `Cursor` — and exits 0.
+///
+/// This is P3/B56's defect one type-shape over. B56 closed it for a GENERIC
+/// subject (`report_uniterable_for_each`: "cannot iterate `T`: no bound on it
+/// provides `next`"), and the same reasoning applies verbatim to a concrete
+/// struct — a struct is not natively iterable either, and the fallback is
+/// nonsense rather than a different meaning. `#[ignore]`d: it asserts the
+/// desired outcome (a diagnostic) and today the program compiles and runs.
+#[test]
+#[ignore]
+fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in walked {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
     );
 }
 
@@ -41360,71 +41682,16 @@ fn a_custom_conformer_gets_every_termination_for_free() {
     );
 }
 
-// --- I3 S7: why the eager `List` forms were NOT re-expressed over the
-// --- adapters (proposal/iterator-adapters.md §4 option ii, §8) ---------------
-
-/// §4 ratified re-expressing `List::map`/`filter`/`fold`/`for_each` as
-/// `self.iter().map(fn).to_list()`, and §8 asked for a measurement before that
-/// rewrite landed. The measurement found a blocker the paper did not
-/// anticipate, and it is not the performance one: **an async closure cannot
-/// adapt through an adapter chain.**
-///
-/// Async polymorphism (A.1) instantiates an ASYNC instance of the callee when
-/// the closure argument is async. An adapter STORES the closure in a struct
-/// field and calls it from a trait-dispatched `next`, where there is no single
-/// concrete callee to instantiate — so the pass refuses it:
-///
-/// ```text
-/// an async closure cannot adapt a trait/generic-dispatched call (the concrete
-/// callee varies per instantiation); bind the callee concretely, or declare the
-/// trait parameter `async || T`
-/// ```
-///
-/// The repro below touches no std: it is a user's own eager helper written over
-/// the adapters. With `List::map` re-expressed, the same error lands inside
-/// `list.vl` and `vilan/test/adapt.vl` — the corpus test that exists to pin
-/// adaptation — fails to BUILD. `map`, `filter` and `fold` all break this way;
-/// `for_each` survives, having nothing to return.
-///
-/// So the eager four keep their eager bodies. The collision §4 exists to remove
-/// does not arise in what shipped — `List` does not implement `Iterator`, so the
-/// lazy `map`/`filter` are reachable only through `.iter()`, which is §4's own
-/// "degrades gracefully" state — and `an_async_closure_adapts_map_and_runs_
-/// sequentially` above is the standing guard that the eager path still adapts.
-///
-/// `#[ignore]`d because it asserts the DESIRED outcome: when adaptation learns
-/// to follow a trait-dispatched callee, this goes green and option (ii) becomes
-/// available. The measured cost stands separately and is recorded in the
-/// proposal: the adapter path ran ~5.5x slower than the eager loop on a
-/// 20 000-element `map`→`filter`→`fold` (8-9 ms against 49-50 ms, best of
-/// seven), from two O(n) deep copies the eager form does not pay — `iter()`
-/// snapshots the list, and the terminal's `mut self` copies the chain that
-/// holds it.
-#[test]
-#[ignore]
-fn an_async_closure_adapts_through_an_adapter_chain() {
-    assert_compiles_and_runs(
-        r#"
-        import std::print;
-        import std::time::sleep;
-
-        fun mapped<T, U>(source: List<T>, fn: |T| U): List<U> {
-            source.iter().map(fn).to_list()
-        }
-
-        fun main() {
-            let lengths = mapped(["ab", "cdef"], |url| {
-                let length = url.len();
-                sleep(1);
-                print(length);
-                length
-            });
-            print(lengths);
-        }
-        "#,
-        "2\n4\n[ 2, 4 ]\n",
-    );
-}
+// --- I3 S7: the eager `List` forms are NOT re-expressed over the adapters,
+// --- permanently (proposal/iterator-adapters.md §4 option ii, §8) ------------
+// The owner REFUSED option (ii) on 2026-08-06: an async closure cannot adapt
+// through an adapter chain (the adapter stores it in a struct field and calls
+// it from a trait-dispatched `next`, which adaptation cannot follow), and the
+// adapter path measured ~5.5x slower than the eager loop on a `List` source.
+// The `#[ignore]`d pin that waited on that ruling is retired — it asserted an
+// outcome the project has decided never to want. The eager four keep their
+// eager bodies; `an_async_closure_adapts_map_and_runs_sequentially` above is
+// the standing guard that the eager path still adapts.
 
 // --- Found while building I3 S5: a dispatched method call was colored by a
 // --- same-named STATIC (async_infer's candidate set) --------------------------
