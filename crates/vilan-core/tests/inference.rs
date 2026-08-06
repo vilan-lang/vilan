@@ -42784,3 +42784,249 @@ fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
         "slow\n",
     );
 }
+
+// --- B79: the enum discriminant family ---------------------------------------
+//
+// `proposal/backed-enums.md` §1.7 surveyed the existing integer discriminant
+// and found it validates nothing: a duplicate MISCOMPILES (two variants become
+// one runtime value and the second `match` arm is dead), a fraction truncates,
+// an overflowing magnitude became `0` — an ordinary discriminant a sibling may
+// hold, which routes an overflow straight into the duplicate hole — and a
+// discriminant that cannot reach the runtime at all is silently discarded.
+//
+// The messages state the rule AS IT STANDS. `backed-enums.md` is a live
+// proposal to widen the production to string backings, and §3.3/§3.7 design
+// exactly these rules for that world too, so none of them foreclose it.
+
+#[test]
+fn b79_two_variants_cannot_share_a_discriminant() {
+    // P5, the live miscompile: `Dup::B` matched `Dup::A`'s arm and the program
+    // printed "a" with exit 0.
+    assert_fails_noting(
+        r#"
+        enum Dup { A = 1, B = 1, C = 2 }
+        fun main() { }
+        "#,
+        "variant 'B' has discriminant 1, which 'A' already uses",
+        "A = 1",
+        "'A' has discriminant 1",
+    );
+}
+
+#[test]
+fn b79_an_implicit_discriminant_collides_just_as_loudly() {
+    // The C-style continuation is part of the value set, so a collision needs
+    // no second `=` to happen: `C` walks onto 1 behind `B = 0`.
+    assert_fails_with(
+        r#"
+        enum Walked { A = 1, B = 0, C }
+        fun main() { }
+        "#,
+        "variant 'C' has discriminant 1, which 'A' already uses",
+    );
+}
+
+#[test]
+fn b79_a_fractional_discriminant_is_rejected_rather_than_truncated() {
+    // P7's first half: `= 1.5` silently became `1`.
+    assert_fails_with(
+        r#"
+        enum Fraction { X = 1.5, Y = 7 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1.5` is not",
+    );
+}
+
+#[test]
+fn b79_a_suffixed_discriminant_is_rejected_rather_than_dropped() {
+    // The same hole one token over, and the reason `1_000` is in it: the
+    // number token's suffix is `_000`, and reducing the WHOLE part alone read
+    // the literal as `1`. `= 1u32` was `1` with the type annotation discarded.
+    assert_fails_with(
+        r#"
+        enum Grouped { A = 1_000, B = 1 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1_000` carries the trailer `_000`",
+    );
+    assert_fails_with(
+        r#"
+        enum Suffixed { A = 1u32, B = 2 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1u32` carries the trailer `u32`",
+    );
+}
+
+#[test]
+fn b79_an_overflowing_discriminant_is_rejected_rather_than_zeroed() {
+    // P7's second half, and the worse one: `unwrap_or(0)` (`parsing.rs:3315`,
+    // inherited from chumsky and never revisited) turned this into `0`.
+    assert_fails_with(
+        r#"
+        enum Overflow { X = 99999999999999999999, Y = 1 }
+        fun main() { }
+        "#,
+        "the enum discriminant `99999999999999999999` is out of range",
+    );
+    // Both directions of the bound, one past each end.
+    assert_fails_with(
+        r#"
+        enum Under { X = -9223372036854775809 }
+        fun main() { }
+        "#,
+        "the enum discriminant `-9223372036854775809` is out of range",
+    );
+}
+
+#[test]
+fn b79_the_i64_bounds_themselves_are_legal() {
+    // The negative bound is one PAST the positive one, because the minus
+    // applies to the magnitude rather than being parsed into it — the same
+    // rule `-128i8` follows. Off-by-one here would reject a legal program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }
+        fun main() {
+            print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
+        }
+        "#,
+        "min\n",
+    );
+}
+
+#[test]
+fn b79_a_discriminant_sequence_cannot_run_past_the_bound() {
+    // The continuation has nowhere to go. `discriminant + 1` panicked the
+    // debug compiler here and wrapped the release one.
+    assert_fails_with(
+        r#"
+        enum Edge { A = 9223372036854775807, B }
+        fun main() { }
+        "#,
+        "variant 'B' continues the discriminant sequence past 9223372036854775807",
+    );
+}
+
+#[test]
+fn b79_a_hex_discriminant_is_read_as_hex() {
+    // Not a new spelling — `0xFF` is one integer token everywhere else in the
+    // language, and the analyzer's own range check already reads it as radix
+    // 16. The discriminant path re-implemented literal reading with
+    // `parse::<i64>()`, which FAILS on `0xFF` and fell to `unwrap_or(0)`. The
+    // silent `0` is the bug; reading it is the fix, not a feature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Mask { Low = 0x0F, High = 0xF0 }
+        fun main() {
+            print(match Mask::High { Mask::Low => "low", Mask::High => "high" });
+        }
+        "#,
+        "high\n",
+    );
+}
+
+#[test]
+fn b79_a_payload_variant_cannot_carry_a_discriminant() {
+    // The direct half of §3.3's rule: a bare backing value has nowhere to put
+    // a payload.
+    assert_fails_with(
+        r#"
+        enum Pay { A(str) = 1, B }
+        fun main() { }
+        "#,
+        "variant 'A' carries a payload, so it cannot have an explicit discriminant",
+    );
+}
+
+#[test]
+fn b79_a_discriminant_beside_a_payload_variant_is_rejected() {
+    // P6, and the shape the rule is really about: `is_numeric` is a
+    // CONJUNCTION — all-data-less AND any-explicit-discriminant — so `B`'s
+    // payload flips the whole enum to the tagged form and `A = 1` is inert. It
+    // parsed, it was stored in `EnumVariantDeclaration::discriminant`, and
+    // nothing would ever read it.
+    assert_fails_noting(
+        r#"
+        enum Mixed { A = 1, B(str) }
+        fun main() { }
+        "#,
+        "an explicit discriminant is only meaningful when every variant is data-less, and 'B' \
+         carries a payload",
+        "B(str)",
+        "'B' carries a payload here",
+    );
+}
+
+#[test]
+fn b79_the_still_legal_discriminant_forms_all_compile() {
+    // The negative space, so the family cannot creep: negatives, gaps, a
+    // mixture of explicit and continued values, a payload enum with no
+    // discriminants at all, and a plain enum with none.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Signed { A = -3, B = -1, C = 5, D }
+        enum Gapped { X = 10, Y = 20, Z = 30 }
+        enum Plain { P, Q, R }
+        enum Carried { S(str), T(i32) }
+
+        fun main() {
+            print(match Signed::D { Signed::A => "a", Signed::B => "b", Signed::C => "c", Signed::D => "d" });
+            print(match Gapped::Y { Gapped::X => 1, Gapped::Y => 2, Gapped::Z => 3 });
+            print(match Plain::R { Plain::P => "p", Plain::Q => "q", Plain::R => "r" });
+            print(match Carried::T(7) { Carried::S(let s) => s, Carried::T(let n) => "t" });
+        }
+        "#,
+        "d\n2\nr\nt\n",
+    );
+}
+
+#[test]
+fn b79_a_rejected_discriminant_does_not_also_read_as_a_duplicate() {
+    // The cascade guard. An overflowing magnitude used to BECOME `0`, so the
+    // one mistake reported twice — once as itself and once as a collision with
+    // whatever legitimately holds `0`. A variant with no usable value takes no
+    // part in the uniqueness check.
+    let diagnostics = failure_diagnostics(
+        r#"
+        enum Both { A = 0, B = 99999999999999999999 }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly one diagnostic; got: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].0.contains("is out of range"),
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b79_std_ordering_still_lowers_to_its_bare_discriminant() {
+    // The load-bearing negative for the whole family: `std/src/compare.vl`'s
+    // `Ordering { Less = -1, Equal = 0, Greater = 1 }` is the one enum in the
+    // tree that uses the feature, and the representation rule says it lowers
+    // to the bare integer rather than the `[index]` array.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        fun main() {
+            print(Ordering::Greater);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("console.log(1)"),
+        "Ordering::Greater should lower to the bare `1`, got:\n{javascript}"
+    );
+}

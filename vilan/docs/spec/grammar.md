@@ -112,15 +112,36 @@ struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-param
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ "[" "expose" "]" ] IDENT [ ":" type ] ;
 
-enum    = [ "resource" ] "enum" IDENT [ generic-params ]
-          "{" [ variant { "," variant } [ "," ] ] "}" ;
-variant = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
-          [ "=" [ "-" ] NUMBER ] ;
+enum         = [ "resource" ] "enum" IDENT [ generic-params ]
+               "{" [ variant { "," variant } [ "," ] ] "}" ;
+variant      = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+               [ "=" discriminant ] ;
+discriminant = [ "-" ] INTEGER ;
+INTEGER      = NUMBER without a fractional part and without a SUFFIX ;
 ```
 
 A `;`-bodied struct is legal only for `external` structs (host types). An
 explicit variant discriminant (`= 0`, `= -1`) fixes the variant's integer
 tag.
+
+The discriminant is an **integer**, not a general `NUMBER`: a fractional
+part (`= 1.5`) and a type suffix (`= 1u32`, and `= 1_000`, which lexes as
+`1` with the trailer `_000`) are both errors rather than being silently
+discarded. Hex is read as hex (`= 0xFF` is 255). The value must fit a
+signed 64-bit integer, and so must the implicit continuation: a variant
+with no discriminant takes the previous variant's plus one, starting at
+0, and running past the bound is an error rather than a wrap.
+
+**Two variants may not share a discriminant**, whether written or
+continued — `enum Dup { A = 1, B = 1 }` and `enum Walked { A = 1, B = 0,
+C }` are both rejected. Sharing one would make two variants a single
+runtime value (see §5.3 of the types chapter), leaving the second
+`match` arm unreachable in an otherwise exhaustive match.
+
+**A discriminant is only legal when every variant is data-less.** A
+variant carrying a payload may not carry one, and neither may its
+data-less siblings: an enum with any payload variant uses the tagged
+representation, in which a discriminant has nowhere to go.
 
 The leading `resource` modifier marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in the resources

@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 use crate::error::{Error, Note};
 use crate::id::Id;
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern,
+    BinaryOp, Convention, Discriminant, ExternBinding, Func, GenericParameters, ImportBranch, Node,
+    NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -14413,6 +14413,112 @@ impl<'src> Analyzer<'src> {
         0
     }
 
+    /// The value of an explicit enum discriminant, or `None` with a diagnostic
+    /// when the literal is not the integer the grammar means (B79).
+    ///
+    /// The parser used to reduce this itself, with `.parse::<i64>()
+    /// .unwrap_or(0)` over the number token's WHOLE part alone — which quietly
+    /// accepted three spellings it does not mean: a fraction (`= 1.5` became
+    /// `1`), a type suffix (`= 1u32` became `1`, and `= 1_000` lexes as `1`
+    /// with the suffix `_000`), and a magnitude past `i64` (which became `0`,
+    /// a perfectly ordinary discriminant a sibling may legitimately hold —
+    /// routing an overflow straight into the duplicate hole). Hex is read the
+    /// way every other integer literal in the language is read
+    /// (`0x` + radix 16), not left to fail `parse` into `0`.
+    ///
+    /// The message deliberately states the rule as it stands rather than as a
+    /// permanent one: `proposal/backed-enums.md` is a live proposal to widen
+    /// the production to string backings, and this diagnostic must not
+    /// foreclose it.
+    fn discriminant_value(&mut self, written: &Discriminant<'src>) -> Option<i64> {
+        let mut reject = |msg: String| {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg,
+            });
+            None::<i64>
+        };
+        if written.fraction.is_some() {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` is not"
+            ));
+        }
+        if let Some(suffix) = written.suffix {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` carries the trailer \
+                 `{suffix}`; write the bare number"
+            ));
+        }
+        let magnitude = match written.whole.strip_prefix("0x") {
+            Some(hex) => u128::from_str_radix(hex, 16),
+            None => written.whole.parse::<u128>(),
+        };
+        // A negative discriminant reaches one past the positive bound, exactly
+        // as the literal `-9223372036854775808` does elsewhere: the minus is
+        // applied to the magnitude, not parsed into it.
+        let bound = if written.negative {
+            1u128 << 63
+        } else {
+            (1u128 << 63) - 1
+        };
+        match magnitude {
+            Ok(magnitude) if magnitude <= bound => Some(match written.negative {
+                true => (magnitude as i64).wrapping_neg(),
+                false => magnitude as i64,
+            }),
+            _ => reject(format!(
+                "the enum discriminant `{written}` is out of range \
+                 (-9223372036854775808 ..= 9223372036854775807)"
+            )),
+        }
+    }
+
+    /// B79's placement rule: an explicit discriminant only means anything when
+    /// EVERY variant is data-less. `is_numeric` is a conjunction — all-data-less
+    /// AND any-explicit-discriminant — so one payload variant flips the whole
+    /// enum to the tagged `[index, ..data]` form and every discriminant in it
+    /// becomes inert. It parsed, it was stored, and nothing will ever read it.
+    ///
+    /// Two shapes, two messages: the discriminant sits on the payload variant
+    /// itself, or on a data-less sibling of one. `proposal/backed-enums.md`
+    /// §3.3 designs the same rule for string backings, so closing it here is
+    /// the integer half of one rule rather than a rule of its own.
+    fn check_discriminant_placement(
+        &mut self,
+        variant_name: &'src str,
+        written: &Discriminant<'src>,
+        has_payload: bool,
+        first_payload_variant: Option<(&'src str, Span)>,
+    ) {
+        if has_payload {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg: format!(
+                    "variant '{variant_name}' carries a payload, so it cannot have an explicit \
+                     discriminant"
+                ),
+            });
+            return;
+        }
+        let Some((payload_variant, payload_span)) = first_payload_variant else {
+            return;
+        };
+        self.diagnostics.push(Error {
+            note: Some(crate::error::Note {
+                span: payload_span,
+                msg: format!("'{payload_variant}' carries a payload here"),
+                source: None,
+            }),
+            span: written.span,
+            msg: format!(
+                "an explicit discriminant is only meaningful when every variant is data-less, and \
+                 '{payload_variant}' carries a payload; remove the discriminant, or the payload"
+            ),
+        });
+    }
+
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
         list.iter()
             .map(|child| self.walk_expr_node(child, scope_id))
@@ -15707,9 +15813,24 @@ impl<'src> Analyzer<'src> {
                 // C-style discriminants: each unspecified variant continues from
                 // the previous value plus one, starting at 0. The enum is numeric
                 // only if every variant is data-less and one is explicit.
-                let mut next_discriminant: i64 = 0;
+                // `None` once the sequence has run past `i64::MAX` and there is
+                // no next value to hand out — a plain `+ 1` panicked the debug
+                // compiler there and wrapped the release one.
+                let mut next_discriminant: Option<i64> = Some(0);
                 let mut all_data_less = true;
                 let mut any_explicit_discriminant = false;
+                // B79's payload rule: a discriminant only reaches the runtime
+                // when EVERY variant is data-less, so the first payload variant
+                // is what a stray discriminant must be reported against.
+                let first_payload_variant = variants
+                    .0
+                    .iter()
+                    .find(|variant| !variant.0.1.is_empty())
+                    .map(|variant| (variant.0.0, variant.1));
+                // B79's uniqueness rule: value -> the variant that took it
+                // first. Implicit values count — `enum E { A = 1, B = 0, C }`
+                // walks C onto 1 and collides just as loudly.
+                let mut discriminant_owners: IndexMap<i64, (&'src str, Span)> = IndexMap::new();
                 for (variant_index, variant) in variants.0.iter().enumerate() {
                     let variant_name = variant.0.0;
                     let data_type_ids: Vec<TypeId> = variant
@@ -15719,10 +15840,63 @@ impl<'src> Analyzer<'src> {
                         .map(|data_type| self.walk_type_node(data_type, body_scope_id))
                         .collect();
                     all_data_less &= data_type_ids.is_empty();
-                    let explicit_discriminant = variant.0.2;
+                    let explicit_discriminant = variant.0.2.as_ref();
                     any_explicit_discriminant |= explicit_discriminant.is_some();
-                    let discriminant = explicit_discriminant.unwrap_or(next_discriminant);
-                    next_discriminant = discriminant + 1;
+                    if let Some(written) = explicit_discriminant {
+                        self.check_discriminant_placement(
+                            variant_name,
+                            written,
+                            !data_type_ids.is_empty(),
+                            first_payload_variant,
+                        );
+                    }
+                    // `None` when this variant has no usable value: either the
+                    // literal it wrote was rejected above, or the C-style
+                    // sequence it was continuing has no next value. Either way
+                    // it is already diagnosed, and it takes no part in the
+                    // uniqueness check — one bad literal must not also read as
+                    // a duplicate.
+                    let discriminant = match explicit_discriminant {
+                        Some(written) => self.discriminant_value(written),
+                        None => {
+                            if next_discriminant.is_none() {
+                                self.diagnostics.push(Error {
+                                    note: None,
+                                    span: variant.1,
+                                    msg: format!(
+                                        "variant '{variant_name}' continues the discriminant \
+                                         sequence past 9223372036854775807; give it an explicit \
+                                         discriminant"
+                                    ),
+                                });
+                            }
+                            next_discriminant
+                        }
+                    };
+                    if let Some(discriminant) = discriminant {
+                        next_discriminant = discriminant.checked_add(1);
+                        match discriminant_owners.get(&discriminant) {
+                            Some((owner, owner_span)) => self.diagnostics.push(Error {
+                                // Both variants are in the one declaration, so
+                                // the note needs no source of its own.
+                                note: Some(crate::error::Note {
+                                    span: *owner_span,
+                                    msg: format!("'{owner}' has discriminant {discriminant}"),
+                                    source: None,
+                                }),
+                                span: variant.1,
+                                msg: format!(
+                                    "variant '{variant_name}' has discriminant {discriminant}, \
+                                     which '{owner}' already uses; two variants of '{name}' \
+                                     cannot share one"
+                                ),
+                            }),
+                            None => {
+                                discriminant_owners.insert(discriminant, (variant_name, variant.1));
+                            }
+                        }
+                    }
+                    let discriminant = discriminant.unwrap_or(0);
                     let variant_id = self.new_entity_id();
                     self.expr_id_to_expr_map
                         .insert(variant_id, Expr::EnumVariant(id, variant_index));
