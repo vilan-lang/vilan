@@ -7,6 +7,16 @@
 > canvas was only ever the tester-demand instance of that general problem.
 > Revisit with the probe's result: autogen works → this proposal dissolves
 > into generated bindings; autogen fails → this design stands ready.
+>
+> PROBE ANSWERED 2026-08-06 (bindgen.md §10): the globals DO autogen.
+> 99.8% of lib.dom's members bind; `CanvasRenderingContext2D` comes out
+> at 99 externs / 19 TODOs; a real canvas program — fills, arcs, text, a
+> click listener — compiles to hand-written-identical JS on generated
+> bindings plus ONE hand-added entry-point line. Per the condition above,
+> this proposal DISSOLVES into bindgen v2 (backlog E37): the remaining
+> gate is the owner's ruling on the `declare var` constructor idiom,
+> which v1's ratified §5 deliberately excluded. The design below stands
+> ready only if that ruling refuses the widening.
 
 Ground truth for this proposal was gathered from the shipped browser layer
 (`std/src/browser/dom.vl`, `ui.vl`, `router.vl`, `dev.vl`), the external-struct

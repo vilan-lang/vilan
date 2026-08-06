@@ -3676,3 +3676,192 @@ byte-identical, 37 computed-identical; the conversion is safe incrementally
 in any order (checked at all 36 background sites). The per-row conversion
 table closes ui-styling.md §0bis.5; the website conversion rides the next
 cycle post-release.]
+
+### Moved at the v0.30.0 cut (2026-08-06)
+
+#### B57. method resolution is registration-order; no ambiguity diagnostic — SHIPPED 2026-08-06
+
+(M; same probes) — resolution is a flat `find_map` over
+impls in REGISTRATION ORDER (`analyzer.rs` ~7663-7692): swapping two
+impl blocks in one file flips which method wins, silently, with no
+diagnostic anywhere. "Inherent wins" is folklore, not implemented.
+Needs a deliberate precedence rule (inherent over trait? explicit
+disambiguation for ties?) plus an ambiguity diagnostic. Interacts
+with I3's name policy (eager `List.map` vs a lazy adapter `map`).
+Evidence in `iterator-adapters.md` §5.
+[Ship notes: the rule landed whole — inherent-over-trait, duplicate
+inherents a hard error with a cross-file note, trait-vs-trait ambiguity
+named with both fixes receiver-substituted, `Trait::method(receiver)`
+disambiguation with `Type::method` tightened to match. The one-time
+old-vs-new agreement check over the corpus, every example, and the docs
+fences found ZERO sites whose resolution changes — the entire blast
+radius was gap-b.vl's dead duplicate `unzip` (renamed, not deleted, so
+its pin survives), narrower than §2.1's survey predicted. Six recorded
+deviations (method-resolution.md §9), chiefly: "inherent" is a property
+of the MEMBER, not the impl block; the tie-break is entity-id order, not
+raw (source_id, span) — the entry file pins SourceId(0) and would have
+ranked user declarations above std's; and `Trait::member` against an
+inherited default had to re-wire through wire_method_call because
+`reconcile_type(Trait, Struct)` has no arm — filed as B72. Twenty pins,
+nine plants. Duplicate STATICS are out of scope and filed as B74.]
+
+#### B70. a tuple element that is a call or `if` loses its splice — SHIPPED 2026-08-06
+
+(M;
+found 2026-08-04 by the B3b arc, pre-existing on v0.28.0, SILENT
+MISCOMPILE, no spread involved) — `(make(), 6).1` compiles clean and
+evaluates to `undefined`: the construction silently nests because the
+splice test reads the type cache, which holds bindings and literals
+but not every expression form. Pinned `#[ignore]`d beside the
+identical spread program that passes (the spread's splice is
+mark-driven and immune). The proper fix is the cache's coverage —
+its own slice. Also recorded: `reconcile_type`'s tuple arm zips with
+no length check, unlike the Array arm beside it. Record:
+variadic-generics.md §T.
+[Ship notes: ELEVEN forms were broken, not two — free/method/associated/
+closure-value calls, `if`, `else if` chains, blocks, `await`, `*view`,
+`const` elements, and a bare parameter. The filed remedy ("the cache's
+coverage") was tried twice and is WRONG: types are deliberately not
+interned, so any re-derived type is identity-distinct and silently
+unhooks every TypeId-keyed consumer (drop glue, resource classification,
+const eval). The shipped fix: the tuple's own type rule keeps the type
+it already computed per element (tuple_element_types), consulted where
+the general cache is silent — general over forms, no re-inference, no
+minted ids. A boundary the record did not anticipate: a still-generic
+element must NOT splice even at a tuple-binding instantiation (flat
+offsets are baked once per generic body); pinned in both directions.
+The arity tail was SEVEN positions, not one — annotated binding,
+argument, return, assignment, match legs, list elements, generic
+binding — plus the identical hole in compare_type_rigid (trait
+conformance). 25 pins, the §T.8 ignore lifted. Zero goldens moved.]
+
+#### B71. a nested free `fun` is emitted twice — SHIPPED 2026-08-06
+
+(S; noted 2026-08-04
+by the B69 arc) — `fun helper` inside an impl method's body emits
+both nested and at module level: identical bodies, inner shadows
+outer, harmless today, and the renamer now handles the twin
+explicitly — but the duplicate is unexamined dead output that any
+future emission change could turn live. Root-cause where the item
+walk double-visits.
+[Ship notes: the filed premise was incomplete — it reproduces in a
+PLAIN function's body too; the double visit had nothing to do with
+`impl`. The body walk no longer emits a declaration for being written,
+so an uncalled nested `fun` now emits nothing, which is what
+demand-driven emission means everywhere else (pinned). The renamer's
+twin-handling was KEPT — probed rather than assumed: monomorphized
+generic instances hit the same branch 29 times across the corpus; only
+the dead reason was removed from its comments. Five pins. Bycatch
+filed as B75: calling a fn-typed binding is rejected outright.]
+
+#### E31. generate `external` bindings from TypeScript headers — v1 SHIPPED 2026-08-06
+
+(M–L;
+user request 2026-08-03) — std's host bindings are hand-written
+(`external fun status(self): i32` etc. in fetch/ws/dom), and any user
+reaching for a JS library writes the same by hand. The ask: a bindgen
+tool that parses TypeScript declaration files (`.d.ts`) and emits
+vilan `external` declarations — candidate parser is **oxc**
+(https://oxc.rs/ — Rust, fast, actively maintained, parses TS
+including `.d.ts`; alternatives: swc, or the TS compiler via a node
+subprocess, which trades a Rust dependency for a runtime one).
+Probably `vilan bindgen <file.d.ts>` emitting a `.vl` module to
+review and check in, NOT a build-time step — generated bindings
+should be visible, versioned source (matches the F5 project-model
+philosophy). Design questions at take-up: the TYPE MAPPING table
+(unions → enums or overloads? generics? `undefined`/optional →
+`Option`? callbacks → closure types with asyncness? overloads —
+vilan has none), what subset is v1 (start: interfaces, functions,
+classes with methods/properties, no conditional/mapped types —
+emit a TODO comment for the unmappable), and how `[platform(...)]`
+attribution is chosen. Adding oxc is a dependency bump → the
+third-party-notices gate (`cargo about generate`). Note the DOM
+itself is deliberately hand-curated (`std::browser::dom` wraps, not
+mirrors); bindgen targets THIRD-PARTY libraries, not a reason to
+regenerate std.
+[Ship notes: `vilan bindgen <file.d.ts> --platform <p>` shipped with
+ZERO new dependencies — oxc failed the notices gate this very entry
+demanded (dragonbox_ecma's license is on neither branch of about.toml's
+closed list, plus 44 crates against the ~12 predicted and a whole JS
+parser in the size-tuned wasm artifact); a 1454-line declaration-only
+parser was written instead behind a seam oxc can still swap into. FOUR
+ratified mapping rows were wrong for one root cause: a vilan aggregate
+has a vilan-owned runtime representation a host does not speak (struct =
+positional array, enum = [tag,…payload], Map = hashed native map, and
+List rejects array-likes and holes — the owner's flagged row confirmed).
+Option is the fourth and worst: a host string read through Option
+arrives as None ("h" === 0), so NOTHING bindgen emits is ever an Option
+— nullable binds bare with a note, optional params become one binding
+per call arity, std's own appendChild precedent. Nothing is dropped
+silently: every inexpressible construct becomes a TODO(bindgen) naming
+it. The lib.dom.d.ts probe (bindgen.md §10): 99.8% of members bind,
+65.8% of declarations, 489,523 lines of vilan type-check clean in
+11.2s; the entire declaration shortfall is 824 `declare var` globals,
+641 of them one constructor idiom — recognizing it takes coverage to
+~92% and is v2's highest-value item (E37). A real canvas program
+compiles to hand-written-identical JS on generated bindings plus one
+entry line — the verdict A17 was waiting on. Backed enums recorded as
+their own language question (B76). Sixty pins, six plants.]
+
+#### I3. iterator adapters + the pipeline ergonomics — ARC SHIPPED 2026-08-06
+
+(M;
+proposal-first; filed 2026-08-03 after a "whatever happened to
+iterators" audit) — the protocol shipped in the FIRST std commit and
+never grew a surface: `std::iterator` is 31 lines — `Iterator<T>` with
+the lone `next(self): Option<T>`, `IteratorFromFn`, `Iterable<T>`, a
+blanket Iterable-for-Iterator impl — and no `map`/`filter`/`take`/
+`zip`/`enumerate`/`rev`/`collect` exists on it anywhere. The language
+half is DONE and good: `for x in` drives the protocol loop for any
+type with `next` (`next_mut` for `for e in &mut c` — the lending form
+rule 4 already protects; memory-management-rev-1.md records that origin
+summaries dissolve the GAT problem), and `Range` iterates lazily. The
+missing piece is the adapter layer, plus the ergonomics decision the
+user raised: the raw chain is `list.iter().filter(f).map(g).collect()`
+and both end taxes are removable. Design directions for the proposal:
+define the adapters ON `Iterable` (blanket-reachable), so a `List`
+chains directly — `xs.filter(f).take(3).to_list()` — with an explicit
+name policy against `List`'s inherent EAGER `map`/`filter`/`fold`
+(inherent wins; adapters either share names lazily via `.iter()` only,
+or the eager forms are re-expressed over the adapters and fused);
+`collect` vs a plain `to_list()`/`to_set()` family (a FromIterator-like
+trait wants thought against B4 — adapter STRUCTS monomorphize fine,
+`IteratorFromFn` already stores a closure field, but "consume any
+Iterable" generically leans on bare-trait typing); `rev` needs a
+double-ended story or a List-materializing fallback, and belongs in the
+same paper. I4's basics (reverse/sort/join on List) should not wait for
+this proposal — eager forms first, lazy adapters subsume later.
+[Ship notes: the arc landed on the repaired trait — adapters
+map/filter/take/skip/enumerate/zip/chain as trait defaults, terminations
+to_list/fold/for_each/count/any/all/rev, NO collect per the owner's
+ruling that the explicit family is primary. to_set/to_map live as List
+methods beside their bounds, not trait defaults — §5's "the bounds
+already have a home" was wrong: a default cannot require a bound its
+trait doesn't declare, an error at its own definition (pinned as a
+compiler fact; iterator-adapters.md §11). §4 option (ii) — the eager
+forms re-expressed over the adapters — was BUILT, MEASURED, and
+REVERTED: an async closure cannot adapt through an adapter chain
+(adapt.vl fails to build re-expressed), and the lazy chain costs ~5.5x
+on a List source from two O(n) clones §8 said wouldn't exist; the
+`#[ignore]`d pin waits on the owner's ruling. The names stay one
+meaning each: List doesn't implement Iterator, lazy spellings are
+reachable only via .iter(). Bycatch fixed: async_infer's dispatch
+candidates included STATICS, so `xs.iter().all(p)` collided with
+Promise::all and colored main async (3 pins). Two pre-existing defects
+found and filed: B77 (spurious cold-compile diagnostics against std's
+List under a user impl List<type T>), B78 (the protocol loop drops a
+tuple element's type when the element is its own generic parameter).]
+
+#### I5. the iterator protocol is unconformable as declared — FIXED 2026-08-06
+
+(M; found
+2026-08-03 by I3's design probes) — `Iterator::next` is declared
+`self` BY VALUE, and B29 signature conformance now rightly rejects the
+`&mut self` a stateful iterator needs — so the trait cannot be
+usefully implemented: `Range` sidesteps it with a bare inherent impl
+and implements no trait, and zero `.iter()` calls exist in the entire
+tree. The protocol needs repair (likely `next(&mut self)` — decide in
+the I3 proposal round) before any adapter layer can exist. Evidence:
+`iterator-adapters.md` (P1).
+[Ship notes: `next` takes `&mut self`; every conformer migrated; Range
+now carries `with Iterator<i32>` — the clause it existed to sidestep.]
