@@ -1454,38 +1454,39 @@ fn a_vilan_enum_cannot_carry_a_string_backing_value() {
 }
 
 #[test]
-fn a_duplicate_function_name_is_silently_shadowed_rather_than_rejected() {
+fn a_duplicate_function_name_is_rejected() {
     // The LANGUAGE fact the collision renamer exists for, found while building
-    // E37(a) and pinned rather than left as folklore: two functions of one name
-    // in an `impl` are NOT a diagnostic. The analyzer accepts them, and the
-    // LAST definition wins — so a generated file that let a constructor
-    // object's static `json` collide with the instance `json` would compile
-    // clean while one of the two bindings simply did not exist. That is why
-    // bindgen emits both into one `impl` sharing one name table (`unique_name`)
-    // rather than into a second block of its own.
+    // E37(a) and pinned rather than left as folklore. It was pinned the other
+    // way round: two functions of one name in an `impl` were NOT a diagnostic
+    // — the analyzer accepted them and the LAST definition won, so a generated
+    // file that let a constructor object's static `json` collide with the
+    // instance `json` compiled clean while one of the two bindings simply did
+    // not exist. That is why bindgen emits both into one `impl` sharing one
+    // name table (`unique_name`) rather than into a second block of its own.
     //
-    // If vilan ever rejects a duplicate definition, this goes red — and the
-    // renamer becomes a guard against a compile error rather than against a
-    // silent loss, which is a strictly better world.
-    let errors = compile(
-        "struct Box_ { value: i32 }\n\
-         impl Box_ {\n\
-         \tfun which(self): str { \"first\" }\n\
-         \tfun which(self): str { \"second\" }\n\
-         }\n\
-         fun main() {}\n",
-    );
+    // B84 closed it, and this pin was WRITTEN to go red the day it did: the
+    // renamer is now a guard against a compile error rather than against a
+    // silent loss, which is the strictly better world the old comment
+    // predicted. bindgen's own emission is unchanged — `unique_name` already
+    // guaranteed it never produces a duplicate, which `every_golden_compiles`
+    // checks for every fixture.
     assert!(
-        errors.is_empty(),
-        "vilan now rejects a duplicate definition: {errors:?}"
+        !compile(
+            "struct Box_ { value: i32 }\n\
+             impl Box_ {\n\
+             \tfun which(self): str { \"first\" }\n\
+             \tfun which(self): str { \"second\" }\n\
+             }\n\
+             fun main() {}\n",
+        )
+        .is_empty(),
+        "vilan accepts a same-block duplicate definition again"
     );
-    // Across two blocks the duplicate IS rejected — B74 widened the
-    // duplicate-inherent error to statics in this same cycle, so the mixed
-    // static/method pair a second constructor-idiom `impl` would have
-    // produced is a hard error, not a silent loss. bindgen's single-`impl`
-    // emission therefore guards against the ONE case the language still
-    // accepts (the same-block overwrite above), and this assert keeps the
-    // cross-block direction honest.
+    // The cross-block direction, kept: B74 widened the duplicate-inherent
+    // error to statics, so the mixed static/method pair a second
+    // constructor-idiom `impl` would have produced is a hard error too. Both
+    // directions now agree, which is what makes the single-`impl` emission a
+    // hygiene choice rather than a workaround.
     assert!(
         !compile(
             "external struct Reply;\n\

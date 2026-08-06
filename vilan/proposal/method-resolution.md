@@ -670,3 +670,51 @@ Reaching a bounded generic with a bare-trait-typed value produces the
 program — reachable today through `let x: A = bag; use_it(x)` with no
 change from this arc. It is a wrong diagnostic (an internal-error shape
 for a user-level mistake), not a miscompile, and belongs with B4.
+
+## 11. B84: one block declaring one name twice
+
+The duplicate rule §3/§4 designs ranks TWO BLOCKS competing for one
+surface. A block competing with *itself* was never in scope, and it turned
+out never to have been reachable either: `Implementation::declarations`
+was collected by reading a scope's `name_to_id_map` back, and a map holds
+one entry per name. Two `fun which(self)` in one `impl` overwrote each
+other during the walk, so by the time `check_duplicate_inherent_members`
+ran there was one declaration, no pair, and no error — the program
+compiled to the second definition, silently. The identical two
+declarations one block apart were a hard error throughout. Nothing about
+the rule differed; only whether the second declaration had survived to be
+counted.
+
+The fix is in the record, not the check. A scope now keeps
+`declaration_order` — every item declaration, in walk order, repeats
+included — beside the `name_to_id_map` index, exactly as
+`local_value_declarations` keeps positional value bindings beside it for
+`local-shadowing.md` §2. `Implementation` and `Trait` each carry the
+resulting `declared_members`, and their one-entry-per-name `declarations`
+is that list collected into an `IndexMap`. So the surface is *derived*
+from the record instead of standing in for it.
+
+**Two rules, deliberately separate.** The inherent rule (§3) exempts a
+trait-provided name so that two impls of one trait stay legal — §9(6)'s
+platform twins, and the std `Into` blanket beside a user's own. Neither
+justification reaches inside a single block: there is no second impl to be
+a twin of, and a name a block writes twice is a mistake whatever trait
+homes it. So `check_duplicate_block_members` asks only "was this name
+written twice *here*", covering `trait` bodies for the same reason, and
+the inherent check skips a same-block pair so an inherent duplicate is
+reported once rather than by both. Both emit the same diagnostic through
+one shared reporter, so the two rules are indistinguishable to a reader
+of the error — which is the point: the block boundary was never something
+a user should have been able to feel.
+
+**Blast radius: none.** A sweep of every `.vl` file in the repo (225) and
+every fenced example in `docs/` and `proposal/` found zero same-block
+duplicates. std's one recorded candidate — `pop`, which `std-surface.md`
+§1.1 records as declared in both `list.vl` and `option.vl` — is stale:
+`option.vl` no longer redeclares it, and it was cross-file (so cross-block,
+and skipped as frozen) either way. bindgen self-manages one shared name
+table (`unique_name`) precisely because of this hole; its output is
+unchanged, and its pin
+`a_duplicate_function_name_is_silently_shadowed_rather_than_rejected` —
+written to go red the day this landed — now asserts the error under the
+name `a_duplicate_function_name_is_rejected`.

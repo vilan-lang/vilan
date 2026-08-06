@@ -43030,3 +43030,217 @@ fn b79_std_ordering_still_lowers_to_its_bare_discriminant() {
         "Ordering::Greater should lower to the bare `1`, got:\n{javascript}"
     );
 }
+
+// --- B84: two same-named members in ONE block --------------------------------
+//
+// `impl Bag { fun which(self) … "first"  fun which(self) … "second" }` compiled
+// clean and ran "second". The cross-block shape — the same two declarations in
+// two `impl` blocks — was already a hard error (B57, widened to statics by
+// B74); nothing about the RULE differed, only whether the second declaration
+// survived to be counted. A scope map holds one entry per name, so the second
+// declaration overwrote the first before `collect_declarations` read the map
+// back, and the check had no pair to compare.
+
+#[test]
+fn b84_two_methods_of_one_name_in_one_block_collide() {
+    assert_fails_noting(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "first" }
+            fun which(self): str { "second" }
+        }
+        fun main() { }
+        "#,
+        "'which' is already defined for 'Bag'; remove or rename this one",
+        "which",
+        "'which' is already defined here",
+    );
+}
+
+#[test]
+fn b84_two_statics_of_one_name_in_one_block_collide() {
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun make(): Bag { Bag { n = 1 } }
+            fun make(): Bag { Bag { n = 2 } }
+        }
+        fun main() { }
+        "#,
+        "'make' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_a_static_and_a_method_of_one_name_in_one_block_collide() {
+    // The mixed pair, which B74 established shares ONE namespace: receiver
+    // position is not part of a member's identity, so a `fun tag()` and a
+    // `fun tag(self)` cannot both be reached whether they sit in one block or
+    // two.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        impl Bag {
+            fun tag(): str { "static" }
+            fun tag(self): str { "method" }
+        }
+        fun main() { print(Bag::tag()); }
+        "#,
+        "'tag' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_two_externals_of_one_name_in_one_block_collide() {
+    // The shape bindgen's name table exists to prevent, written by hand: a
+    // constructor object's static binding beside the instance method of the
+    // same name.
+    assert_fails_with(
+        r#"
+        external struct Reply;
+        impl Reply {
+            [extern(method, "json")]
+            external fun json(self): str;
+            [extern("Reply.json")]
+            external fun json(data: str): Reply;
+        }
+        fun main() { }
+        "#,
+        "'json' is already defined for 'Reply'",
+    );
+}
+
+#[test]
+fn b84_a_trait_provided_name_declared_twice_in_one_block_collides() {
+    // The block rule is NOT the inherent rule with a wider input. The inherent
+    // rule exempts a trait-provided name so that two impls of one trait — the
+    // platform twins — stay legal (method-resolution.md §9(6)); inside ONE
+    // block there is no twin to protect, and a name written twice is a mistake
+    // whatever trait homes it.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        impl Bag with Marker {
+            fun mark(self): str { "a" }
+            fun mark(self): str { "b" }
+        }
+        fun main() { }
+        "#,
+        "'mark' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_a_trait_declaring_one_name_twice_collides() {
+    // A trait body is a block too, and its declarations went through the same
+    // scope map.
+    assert_fails_with(
+        r#"
+        trait Twice {
+            fun a(self): str;
+            fun a(self): str;
+        }
+        fun main() { }
+        "#,
+        "'a' is already defined for 'trait Twice'",
+    );
+}
+
+#[test]
+fn b84_three_copies_in_one_block_report_twice() {
+    // Each later declaration is reported against the FIRST, matching the
+    // cross-block rule's shape rather than chaining pairwise.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "1" }
+            fun which(self): str { "2" }
+            fun which(self): str { "3" }
+        }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(message, _)| message.contains("'which' is already defined for 'Bag'"))
+            .count(),
+        2,
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b84_a_same_block_duplicate_is_reported_once_not_twice() {
+    // The two rules overlap on an inherent same-block pair. The inherent check
+    // skips a pair from one block precisely so this stays a single report.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "first" }
+            fun which(self): str { "second" }
+        }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly one diagnostic; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b84_one_name_per_block_across_two_blocks_still_compiles() {
+    // The negative space: the block rule must not reach across blocks, or the
+    // platform twins and every ordinary two-impl type go red. `describe` is
+    // declared once per block, in three blocks, two of them trait impls.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        trait Label { fun label(self): str; }
+
+        impl Bag { fun describe(self): str { "bag" } }
+        impl Bag with Marker { fun mark(self): str { "m" } }
+        impl Bag with Label { fun label(self): str { "l" } }
+
+        fun main() {
+            let bag = Bag { n = 1 };
+            print(bag.describe());
+            print(bag.mark());
+            print(bag.label());
+        }
+        "#,
+        "bag\nm\nl\n",
+    );
+}
+
+#[test]
+fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
+    // §9(6), kept load-bearing: the trait tier dedups by trait, so the name
+    // still has one home. `Into`'s std blanket impl is the live instance, and
+    // a user's own `Into` impl beside it must stay legal.
+    assert_compiles(
+        r#"
+        import std::into::Into;
+
+        struct Celsius { degrees: i32 }
+        struct Fahrenheit { degrees: i32 }
+
+        impl Celsius with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+
+        fun main() { }
+        "#,
+    );
+}

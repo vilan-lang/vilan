@@ -728,6 +728,11 @@ struct PreppedIs<'src> {
 pub struct Implementation<'src> {
     pub subject: TypeId,
     pub declarations: IndexMap<&'src str, Id>,
+    /// Every member the block declared, in order, INCLUDING a name declared
+    /// twice (B84) — which `declarations`, being one entry per name, cannot
+    /// represent. The duplicate-inherent check reads this; everything that
+    /// asks "what does this type provide" reads `declarations`.
+    pub declared_members: Vec<(&'src str, Id)>,
     /// The traits this impl provides (`impl Point with Eq + Ord` -> [Eq, Ord]),
     /// resolved during the conformance check. Lets a method call on the subject
     /// fall back to a trait's inherited default methods.
@@ -786,6 +791,10 @@ pub struct Trait<'src> {
     /// The members the trait declares, keyed by name. For a required method
     /// without a default body these point at signature-only functions.
     pub declarations: IndexMap<&'src str, Id>,
+    /// The same members in declaration order, WITH repeats — the record a
+    /// same-block redeclaration survives on (B84). See
+    /// [`Implementation::declared_members`].
+    pub declared_members: Vec<(&'src str, Id)>,
     /// Supertraits (`trait Ord with Eq + PartialOrd`), as the type ids of the
     /// `with` clause. A type implementing this trait must also satisfy these,
     /// and their members are inherited for method resolution.
@@ -1192,6 +1201,16 @@ pub struct Scope<'src> {
     /// declaration, so map consumers (completions, emission order, the
     /// parent-scope memo) are untouched.
     pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
+    /// Item declarations in walk order, EVERY one of them — where
+    /// `name_to_id_map` keeps only the last of a repeated name (B84). The map
+    /// is a lookup index and cannot hold two entries for one name, so reading
+    /// the declarations back off it silently lost a redeclaration before any
+    /// check could see it: two `fun which()` in one `impl` block were one
+    /// declaration by the time `collect_declarations` ran, and the
+    /// duplicate-inherent check (B57/B74) never had a pair to compare. The
+    /// same shape one block over — two `impl` blocks — was always a hard
+    /// error, because there the two live in different scopes.
+    pub declaration_order: Vec<(&'src str, Id)>,
 }
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, plus each
@@ -3495,22 +3514,35 @@ impl<'src> Analyzer<'src> {
     /// `is_self_method` for B57's scope; that filter was doing double duty as
     /// "methods only" and "same namespace only", and only the first was meant.
     ///
+    /// **The block boundary is not part of the identity either (B84).** The
+    /// check reads each impl's `declared_members` — the ordered record of what
+    /// the block declared — rather than its `declarations` surface. Reading
+    /// the surface could never see a redeclaration, because a surface is one
+    /// entry per name: two `fun which()` in ONE block overwrote each other in
+    /// the scope map long before `collect_declarations` ran, so the pair the
+    /// check compares never existed and the program compiled to the second
+    /// definition in silence. The same two declarations one block apart were
+    /// always a hard error — nothing about the rule differed, only whether the
+    /// second declaration had survived to be counted.
+    ///
     /// A definition-site check, so it joins the family that skips frozen std
     /// entities (S1): a duplicate whose second declaration is std's own is
     /// pinned clean by the differential gate, which forces the full scan.
     fn check_duplicate_inherent_members(&mut self) {
         // Group by member name first — only same-named declarations can
         // collide, and the pairwise subject comparison is the expensive half.
-        let mut by_name: IndexMap<&'src str, Vec<usize>> = IndexMap::new();
+        // An impl contributes one entry per DECLARATION, so a block that
+        // declares a name twice appears twice.
+        let mut by_name: IndexMap<&'src str, Vec<(usize, Id)>> = IndexMap::new();
         for (index, implementation) in self.implementations.iter().enumerate() {
-            for name in implementation.declarations.keys() {
-                by_name.entry(name).or_default().push(index);
+            for (name, member_id) in &implementation.declared_members {
+                by_name.entry(name).or_default().push((index, *member_id));
             }
         }
         // (member name, first declaration, second declaration, subject).
         let mut duplicates: Vec<(&'src str, Id, Id, TypeId)> = Vec::new();
-        for (member_name, implementation_indices) in &by_name {
-            if implementation_indices.len() < 2 {
+        for (member_name, declarations) in &by_name {
+            if declarations.len() < 2 {
                 continue;
             }
             // Only inherent declarations compete. A trait's member is RANKED
@@ -3520,44 +3552,112 @@ impl<'src> Analyzer<'src> {
             // (`Default::default`, `Wire::rebuild`) exactly as they home a
             // method — which is what keeps two impls of one trait from
             // colliding here now that statics compete.
-            let mut inherent: Vec<(Id, TypeId)> = implementation_indices
+            let mut inherent: Vec<(usize, Id, TypeId)> = declarations
                 .iter()
-                .filter_map(|index| {
+                .filter_map(|(index, member_id)| {
                     let implementation = &self.implementations[*index];
-                    let member_id = *implementation.declarations.get(member_name)?;
                     (self
                         .member_home_trait(implementation, member_name)
                         .is_none()
                         && !self.member_is_trait_only(implementation, member_name))
-                    .then_some((member_id, implementation.subject))
+                    .then_some((*index, *member_id, implementation.subject))
                 })
                 .collect();
             if inherent.len() < 2 {
                 continue;
             }
-            inherent.sort_by_key(|(member_id, _)| self.declaration_order(*member_id));
+            inherent.sort_by_key(|(_, member_id, _)| self.declaration_order(*member_id));
             // Each later declaration is reported against the FIRST subject-
             // compatible one before it, so three copies produce two errors,
-            // each naming the original.
-            for (position, (member_id, subject)) in inherent.iter().enumerate() {
+            // each naming the original. A pair from the SAME block is the block
+            // rule's, already reported by `check_duplicate_block_members`.
+            for (position, (index, member_id, subject)) in inherent.iter().enumerate() {
                 let subject_type = subject.get_type(self);
-                let earlier = inherent[..position].iter().find(|(_, earlier_subject)| {
-                    self.compare_type(
-                        &subject_type,
-                        &earlier_subject.get_type(self),
-                        &HashMap::new(),
-                    )
-                });
-                if let Some((earlier_id, _)) = earlier {
+                let earlier = inherent[..position]
+                    .iter()
+                    .filter(|(earlier_index, _, _)| earlier_index != index)
+                    .find(|(_, _, earlier_subject)| {
+                        self.compare_type(
+                            &subject_type,
+                            &earlier_subject.get_type(self),
+                            &HashMap::new(),
+                        )
+                    });
+                if let Some((_, earlier_id, _)) = earlier {
                     duplicates.push((member_name, *earlier_id, *member_id, *subject));
                 }
             }
         }
-        for (member_name, first_id, second_id, subject) in duplicates {
+        let duplicates = duplicates
+            .into_iter()
+            .map(|(member_name, first_id, second_id, subject)| {
+                let subject_label =
+                    self.pretty_print_type(&subject.get_type(self), &HashMap::new());
+                (member_name, first_id, second_id, subject_label)
+            })
+            .collect();
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// **One block may declare a name once (B84).** Two `fun which()` in one
+    /// `impl` used to overwrite each other in the scope map, so the program
+    /// compiled to the second definition and the first simply did not exist —
+    /// the same two declarations one block apart having always been a hard
+    /// error.
+    ///
+    /// Separate from the inherent check above because it is a separate rule
+    /// with a separate scope, not a case of that one. The inherent rule ranks
+    /// TWO BLOCKS competing for one surface, and deliberately exempts a
+    /// trait-provided name (§3: ranked, not duplicated) so that two impls of
+    /// one trait — the platform twins, §9(6) — stay legal. Neither
+    /// justification reaches inside a single block: there is no second impl to
+    /// be a twin of, and a name the block declares twice is a mistake whatever
+    /// trait homes it. So this one asks only "was it written twice here", and
+    /// the inherent check skips a same-block pair rather than reporting it a
+    /// second time.
+    fn check_duplicate_block_members(&mut self) {
+        let mut duplicates: Vec<(&'src str, Id, Id, String)> = Vec::new();
+        let blocks = self
+            .implementations
+            .iter()
+            .map(|implementation| {
+                (
+                    implementation.declared_members.clone(),
+                    self.pretty_print_type(&implementation.subject.get_type(self), &HashMap::new()),
+                )
+            })
+            .chain(self.traits.values().map(|trait_| {
+                (
+                    trait_.declared_members.clone(),
+                    format!("trait {}", trait_.name),
+                )
+            }))
+            .collect::<Vec<_>>();
+        for (declared_members, subject_label) in blocks {
+            // First declaration per name; every later one is reported against
+            // it, so three copies produce two errors.
+            let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::new();
+            for (member_name, member_id) in declared_members {
+                match first_by_name.get(member_name) {
+                    Some(first_id) => {
+                        duplicates.push((member_name, *first_id, member_id, subject_label.clone()))
+                    }
+                    None => {
+                        first_by_name.insert(member_name, member_id);
+                    }
+                }
+            }
+        }
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// The shared reporting half of the two duplicate-declaration rules:
+    /// `(member name, first declaration, second declaration, subject label)`.
+    fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
+        for (member_name, first_id, second_id, subject_label) in duplicates {
             if self.frozen_entity(second_id) {
                 continue;
             }
-            let subject_label = self.pretty_print_type(&subject.get_type(self), &HashMap::new());
             // C3: the FIRST declaration is the whole point of the message —
             // "already defined" is unactionable without saying where. The note
             // carries its own source, so it renders even across files (the
@@ -9651,6 +9751,16 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Registers an ITEM declaration into a scope: the `name_to_id_map` entry
+    /// (the lookup index, last declaration wins) plus the ordered record of
+    /// every declaration, which is what a redeclaration needs to survive on
+    /// (B84). The value twin is [`Analyzer::declare_scope_value`].
+    fn declare_scope_item(&mut self, scope_id: Id, name: &'src str, id: Id) {
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.insert(name, id);
+        scope.declaration_order.push((name, id));
+    }
+
     fn get_scope_id_for_entity(&mut self, entity_id: Id) -> Id {
         self.expr_id_to_scope_id_map
             .get(&entity_id)
@@ -9666,6 +9776,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         }
     }
 
@@ -9749,8 +9860,7 @@ impl<'src> Analyzer<'src> {
             else {
                 return;
             };
-            let scope = analyzer.mut_scope_for_scope_id(module_scope_id);
-            scope.name_to_id_map.insert(name, id);
+            analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
             Node::Export(inner)
@@ -9794,6 +9904,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         };
         self.scopes.insert(id, scope);
         self.scopes.get_mut(&id).unwrap()
@@ -14363,22 +14474,27 @@ impl<'src> Analyzer<'src> {
         scope.name_to_id_map.insert(name, expr_id);
     }
 
-    /// Collects the named members declared in a trait/impl body scope,
-    /// excluding the implicit `Self` binding and generic parameters.
-    fn collect_declarations(&self, scope_id: Id) -> IndexMap<&'src str, Id> {
+    /// The members declared in a trait/impl body scope, in declaration order
+    /// and WITH repeats, excluding the implicit `Self` binding and generic
+    /// parameters. Collecting it into an `IndexMap` gives the SURFACE the type
+    /// presents — one entry per name, the last declaration winning — and the
+    /// difference between the two is exactly what the duplicate check needs
+    /// (B84): reading the surface back could never see a redeclaration,
+    /// because a redeclaration is precisely what a surface does not have.
+    fn collect_declared_members(&self, scope_id: Id) -> Vec<(&'src str, Id)> {
         self.scopes
             .get(&scope_id)
             .unwrap()
-            .name_to_id_map
+            .declaration_order
             .iter()
             .filter(|(name, expr_id)| {
-                **name != "Self"
+                *name != "Self"
                     && !matches!(
-                        self.expr_id_to_expr_map.get(*expr_id),
+                        self.expr_id_to_expr_map.get(expr_id),
                         Some(Expr::Generic(_))
                     )
             })
-            .map(|(name, expr_id)| (*name, *expr_id))
+            .copied()
             .collect()
     }
 
@@ -15143,8 +15259,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Func(function) => {
                 let name = function.name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15727,8 +15842,7 @@ impl<'src> Analyzer<'src> {
                 let name_span = name.1;
                 let name = name.0;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15798,8 +15912,7 @@ impl<'src> Analyzer<'src> {
                 let name_span = name.1;
                 let name = name.0;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -16048,7 +16161,9 @@ impl<'src> Analyzer<'src> {
                 }
                 let subject = subject_type_id;
                 self.walk_expr_nodes(&body.0, body_scope_id);
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 let implementation_index = self.implementations.len();
                 // `impl Subject with A + B` must satisfy each trait; record a
                 // conformance check per trait to run once declarations are known.
@@ -16084,6 +16199,7 @@ impl<'src> Analyzer<'src> {
                 self.implementations.push(Implementation {
                     subject,
                     declarations,
+                    declared_members,
                     trait_ids: Vec::new(),
                     trait_args: Vec::new(),
                 });
@@ -16093,8 +16209,7 @@ impl<'src> Analyzer<'src> {
             Node::Trait(name, generic_parameters, supertraits, body) => {
                 let name_span = name.1;
                 let name = name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -16127,7 +16242,9 @@ impl<'src> Analyzer<'src> {
                 self.walking_trait_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
                 self.walking_trait_body = was_walking_trait_body;
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 self.traits.insert(
                     id,
                     Trait {
@@ -16137,6 +16254,7 @@ impl<'src> Analyzer<'src> {
                         generic_parameter_constraint_ids,
                         generic_parameter_names,
                         declarations,
+                        declared_members,
                         supertraits,
                     },
                 );
@@ -16317,8 +16435,7 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Error)
             }
             Node::Module(name, body) => {
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 self.module_scope_ids.insert(body_scope_id);
@@ -29460,6 +29577,11 @@ fn analyze_over_world<'src>(
     // between them. After conformance, so an impl's `with`-clause traits are
     // resolved onto it and a trait's member is not mistaken for the type's own.
     analyzer.check_duplicate_inherent_members();
+    // One block declaring one name twice (B84) — a different rule with a
+    // different scope, so a trait-provided name collides here even though it
+    // is exempt above. Runs after the inherent check so a program with both
+    // reports them in that order.
+    analyzer.check_duplicate_block_members();
     // With `drop_methods` recorded, build the per-type destruction glue the
     // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
     analyzer.build_drop_glue();
