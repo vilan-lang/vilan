@@ -506,3 +506,86 @@ leaves an identically-shaped bug reachable through any bounded generic.
 *recommend settling this proposal first*, since I3 §10a already
 recommends re-expressing (option ii) *conditional on* the precedence
 question this proposal answers.
+
+## 9. Implementation notes (shipped, v0.30.0 cycle)
+
+Every slice S1–S5 landed as designed. Six places where the built thing
+differs from the paper, and why:
+
+**(1) The tie-break order inside a tier is the declaration's entity id,
+not `(source_id, span)` (§4).** Entity ids are minted in walk order:
+textual order within a file, the canonical module order across files
+(std first, the entry file last), which is exactly the deterministic,
+import-order-independent order §2 established. The literal `SourceId`
+cannot be used, and measuring it is what found this: the entry file is
+pinned to `SourceId(0)` so editor features resolve against the open
+document, so sorting by the raw id ranks the *user's* declarations before
+std's — and the first agreement sweep duly anchored `gap-b.vl`'s
+duplicate-`unzip` diagnostic inside `std/src/option.vl`, the one file the
+user cannot edit. Entity-id order realizes §4's intent ("the same program
+always anchors the same place"); the raw source id defeats it.
+
+**(2) "Inherent" is a property of the MEMBER, not of the impl block.** §3
+says "an inherent impl's declared member". The implementation asks
+instead whether any trait of the declaring impl (or a supertrait of one)
+declares that name: a method written inside a `with`-clause block that
+the trait does *not* declare is the type's own, and competes in the
+inherent tier. This matters for both halves of the rule — it keeps the
+duplicate check honest (an "extra" method in a trait-impl block does
+collide with an inherent one of the same name, and has a pin), and it
+keeps the ambiguity diagnostic truthful, since it names each candidate's
+home trait and such a member has none.
+
+**(3) `gap-b.vl` is renamed, not deleted (S1).** §2.1's fix was "delete
+the dead redeclaration". Deleting it would have left the file calling
+*std's* `unzip`, retiring the Gap B shape (an impl subject with `type`
+binders nested in a tuple) that the file exists to pin. `unzip_pair`
+keeps the pin and clears the collision; the diagnostic offers both fixes
+by design. The `.js` golden is byte-identical either way — the emitted
+function is name-mangled and the two bodies compile the same.
+
+**(4) The duplicate diagnostic's second location is a NOTE, not an inline
+path (§4).** The paper writes `'unzip' is already defined for
+'Option<(T, U)>' (…/option.vl:198)`. The renderer already carries a
+cross-file secondary note (the conformance-note shape: a span plus its own
+`SourceId`), which renders the other declaration with its real source
+excerpt instead of a hand-formatted path. The message keeps a
+`by module 'option'` clause so the one-line form still says where.
+
+**(5) `Trait::member(receiver, …)` against an INHERITED default is wired
+as the method call it is equivalent to.** §3.1 asked for "`generic_dispatch`
+insert + re-dispatch at codegen", which is what happens — but the call
+cannot also ride the ordinary call path, because the trait's declaration
+types its receiver as the trait itself and `reconcile_type(Trait, Struct)`
+has no arm (a pre-existing gap: `fun show(v: SomeTrait)` rejects a
+concrete implementing value today, on `next` as much as on this branch).
+So the analyzer re-wires the call through `wire_method_call`, exactly as
+`receiver.member()` is wired, and records the named trait in
+`bound_dispatch_traits` — without which two traits whose defaults share a
+name both resolved to whichever the transformer's by-name lookup reached
+first, which would have silently undone the disambiguation.
+
+**(6) Two impls of the SAME trait are deliberately not an ambiguity.**
+The trait tier dedups by trait, so the name still has one home. This is
+what keeps the platform twins (§2) safe against a future build that did
+load both, and it leaves the std blanket `impl type T with Into<T>`
+behaving exactly as it does today for a type that also writes its own
+`Into` impl — a specificity question, which §3(b) declines.
+
+### The agreement check (§6 / S4), as run
+
+The probe compared the tiered resolver against the old flat scan at every
+concrete-receiver resolution, behind `VILAN_RESOLVER_AGREEMENT`, and was
+removed before landing (S4: "run once… not kept as permanent machinery").
+
+- **`vilan/test` — 111 programs:** one flagged site, `unzip`, flagged as
+  `dup_inherent`, both resolvers picking the *same* member (std's). Zero
+  resolution changes. With `gap-b.vl` fixed: zero flags.
+- **`vilan/examples` — 9 packages:** zero.
+- **`vilan/docs` fences (the docs gate):** zero.
+- **`crates/vilan-core/tests/inference.rs` — 1588 tests:** zero.
+
+So the survey's headline holds under the compiler's own type-aware
+machinery, and is if anything narrower than §2.1 predicted: the one live
+site is not a *resolution* change at all — both rules pick std's `unzip` —
+it is a duplicate the old rule could not see.

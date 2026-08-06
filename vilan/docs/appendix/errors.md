@@ -77,6 +77,34 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
+**"'…' is already defined for '…'; remove or rename this one"**
+Two impls declare the same method name for the same type, and neither
+name belongs to a trait. Nothing ranks them, so one of the two would
+simply never run — the note points at the other declaration. Delete the
+copy you don't want, or rename it. It is reported where it is defined,
+not where it is called.
+→ [Names, modules, and packages](../spec/names.md)
+
+**"'…' is ambiguous on '…': both '…' and '…' provide it; call '…' to pick one"**
+Two traits supply the same method name for this receiver (or, for a
+generic receiver, two arms of its `T: A + B` bound), and the type has no
+inherent method of its own to outrank them. Say which one you mean with
+`Trait::method(receiver, …)` — the message spells both options out with
+your own receiver already substituted in.
+→ [Names, modules, and packages](../spec/names.md)
+
+**"'…' is not an inherent member of '…': '…' provides it; call '…' instead"**
+`Type::method(receiver)` means the type's *own* method. This one comes
+from a trait, so name the trait at the path head instead:
+`Trait::method(receiver)`.
+→ [Names, modules, and packages](../spec/names.md)
+
+**"'…' does not implement '…', so '…::…' cannot be called on it"**
+A `Trait::method(receiver)` call named a trait the receiver's type has no
+`impl … with` for. Implement the trait, or call the method the receiver
+does have.
+→ [Data and traits](../tour/data-and-traits.md)
+
 **"… match the receiver convention"** · **"… match the parameter convention"** · **"… match the declared type"** · **"… match the declared return type"** · **"… match the declared parameter list"** · **"… match the trait's type-parameter list"**
 A method an `impl … with Trait` provides must match the trait's
 declaration, not just its name: the receiver convention (`self` / `&self`

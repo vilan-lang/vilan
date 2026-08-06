@@ -2,6 +2,18 @@ pub fn plural(n: usize, singular: &str, plural: &str) -> String {
     if n == 1 { singular } else { plural }.to_string()
 }
 
+/// Joins items into an English phrase — `a`, `a and b`, `a, b and c` — with
+/// `conjunction` between the last two. For a diagnostic that has to name
+/// several candidates in prose rather than as a list.
+pub fn join_with(items: &[String], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, last] => format!("{first} {conjunction} {last}"),
+        [rest @ .., last] => format!("{} {conjunction} {last}", rest.join(", ")),
+    }
+}
+
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
@@ -368,10 +380,21 @@ pub fn trim_multiline_string(raw: &str) -> Result<String, (String, std::ops::Ran
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_path, normalize_components, normalize_newlines, strip_bom, strip_verbatim_prefix,
-        trim_multiline_string,
+        canonical_path, join_with, normalize_components, normalize_newlines, strip_bom,
+        strip_verbatim_prefix, trim_multiline_string,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_candidate_list_reads_as_english() {
+        let one = ["'A'".to_string()];
+        let two = ["'A'".to_string(), "'B'".to_string()];
+        let three = ["'A'".to_string(), "'B'".to_string(), "'C'".to_string()];
+        assert_eq!(join_with(&one, "and"), "'A'");
+        assert_eq!(join_with(&two, "and"), "'A' and 'B'");
+        assert_eq!(join_with(&three, "or"), "'A', 'B' or 'C'");
+        assert_eq!(join_with(&[], "and"), "");
+    }
 
     #[test]
     fn a_verbatim_drive_path_loses_its_prefix() {

@@ -112,11 +112,55 @@ style.
 ## 4.6 Statics and members
 
 `Type::member` (§3.6) resolves `member` in `Type`'s namespace: enum
-variants, and the static functions of the type's impls (those without
-`self`). `value.member` resolves against the value's type: fields first,
-then methods of inherent impls, then trait members visible via the type's
-impls (§5.7). Generic statics take their arguments at the path head:
-`List<str>::new()`.
+variants, the static functions of the type's impls (those without `self`),
+and the type's own `self`-methods. Generic statics take their arguments at
+the path head: `List<str>::new()`.
+
+`value.member` resolves against the value's type: fields first, then
+methods, by a **precedence rule** — not by the order the impl blocks
+happen to be written or the modules happen to load:
+
+1. An **inherent** method — one declared by an impl of the type whose
+   `with` clause does not declare that name — always wins, whatever the
+   text order.
+2. Otherwise, the method a **trait** provides, whether the impl declares
+   it or inherits the trait's default (§5.7).
+
+Two declarations at the same level are an error rather than a silent
+pick. Two *inherent* declarations of one name for one subject are rejected
+at the definition site, before any call resolves them. Two *traits*
+providing one name, with no inherent method above them, make each call an
+ambiguity error — as does a `T: A + B` bound whose two arms supply it.
+
+```vilan
+import std::print;
+
+struct Bag { x: i32 }
+trait Iter { fun pick(self): str; }
+
+impl Bag with Iter {
+    fun pick(self): str { "the trait's" }
+}
+
+impl Bag {
+    fun pick(self): str { "the type's own" }
+}
+
+fun main() {
+    let bag = Bag { x = 1 };
+    // The inherent method wins, though the trait impl is written first.
+    print(bag.pick());
+    // Naming the trait reaches its version; naming the type means the
+    // inherent one, and never falls through to a trait's.
+    print(Iter::pick(bag));
+    print(Bag::pick(bag));
+}
+```
+
+`Trait::member(receiver, args…)` is the disambiguator: it names which
+provider to use, and works on a concrete receiver or a trait-bounded
+generic one. `Type::member(receiver, args…)` means the type's own member
+or nothing.
 
 ## 4.7 The prelude
 

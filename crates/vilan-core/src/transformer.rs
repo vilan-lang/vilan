@@ -2824,7 +2824,14 @@ impl<'src> Transformer<'src> {
                     self.program.generic_dispatch.get(id).copied()
                 {
                     if let Some(type_id) = concrete_type.or(self.current_self_type) {
-                        if let Some(dispatch) = self.resolve_dispatch(type_id, member_name) {
+                        // A `Trait::member(receiver, ..)` call names the trait to
+                        // dispatch on (B57 §3.1) — without it, two traits whose
+                        // DEFAULTS share a name both resolve to whichever the
+                        // by-name lookup reaches first.
+                        let preferred = self.program.bound_dispatch_traits.get(id).copied();
+                        if let Some(dispatch) =
+                            self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+                        {
                             return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                         }
                     }

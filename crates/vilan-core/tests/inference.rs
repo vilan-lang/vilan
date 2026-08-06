@@ -39181,3 +39181,393 @@ fn b65_a_loaned_capture_consumed_inside_a_generic_reports_at_the_instantiation()
         "a capture of a loaned resource-typed subject is moved out",
     );
 }
+
+// --- B57: method-resolution precedence (proposal/method-resolution.md) -------
+
+/// The rule itself: an inherent member outranks a trait's, whatever order the
+/// impl blocks are written in. The TRAIT block comes first here, so the old
+/// first-registration-wins scan answered `TRAIT`.
+#[test]
+fn b57_an_inherent_method_outranks_a_trait_method() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait Iter<T> { fun pick(self): str; }
+        impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
+        impl Bag { fun pick(self): str { "INHERENT" } }
+        fun main() { print(Bag { x = 1 }.pick()); }
+        "#,
+        "INHERENT\n",
+    );
+}
+
+/// …and the same answer with the blocks swapped. Precedence is a property of
+/// the program, not of where its text happens to sit (§3(c)'s whole argument
+/// against blessing declaration order).
+#[test]
+fn b57_inherent_precedence_does_not_depend_on_impl_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait Iter<T> { fun pick(self): str; }
+        impl Bag { fun pick(self): str { "INHERENT" } }
+        impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
+        fun main() { print(Bag { x = 1 }.pick()); }
+        "#,
+        "INHERENT\n",
+    );
+}
+
+/// A trait member with no inherent competitor still resolves — the tiering
+/// ranks, it does not hide.
+#[test]
+fn b57_a_trait_method_still_resolves_without_an_inherent_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait Iter<T> { fun pick(self): str; }
+        impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
+        fun main() { print(Bag { x = 1 }.pick()); }
+        "#,
+        "TRAIT\n",
+    );
+}
+
+/// The precedence carries through a generic subject: `impl Bag<type T>`'s own
+/// method wins over the trait impl for the same subject, and the body still
+/// monomorphizes against the receiver.
+#[test]
+fn b57_inherent_precedence_holds_for_a_generic_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag<T> { x: T }
+        trait Iter<T> { fun pick(self): T; }
+        impl Bag<type T> with Iter<T> { fun pick(self): T { print("TRAIT"); self.x } }
+        impl Bag<type T> { fun pick(self): T { print("INHERENT"); self.x } }
+        fun main() { print(Bag { x = 7 }.pick()); }
+        "#,
+        "INHERENT\n7\n",
+    );
+}
+
+/// Two inherent declarations of one name for one subject: a definition-site
+/// error, anchored at the SECOND, with a note at the first (§4). This is the
+/// shape the survey found live in the corpus (`vilan/test/gap-b.vl`'s dead
+/// `unzip`, shadowed by std's).
+#[test]
+fn b57_two_inherent_declarations_of_one_name_are_an_error() {
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { x: i32 }
+        impl Bag { fun pick(self): str { "one" } }
+        impl Bag { fun pick(self): str { "two" } }
+        fun main() { let bag = Bag { x = 1 }; }
+        "#,
+        // The SECOND declaration's name is the anchor (A1/A3).
+        "pick",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+/// …and the note points at the first declaration, so "already defined" says
+/// where (C3).
+#[test]
+fn b57_the_duplicate_inherent_error_notes_the_first_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Bag { x: i32 }
+        impl Bag { fun first_here(self): str { "one" } }
+        impl Bag { fun first_here(self): str { "two" } }
+        fun main() { let bag = Bag { x = 1 }; }
+        "#,
+        "is already defined for 'Bag'",
+        "first_here",
+        "is already defined here",
+    );
+}
+
+/// The duplicate rule is about the type's OWN members, so a `with`-clause block
+/// declaring a name its traits do not declare is inherent too — and collides
+/// with a plain inherent block's same name.
+#[test]
+fn b57_an_extra_method_in_a_trait_impl_block_counts_as_inherent() {
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { x: i32 }
+        trait Iter<T> { fun step(self): str; }
+        impl Bag with Iter<i32> {
+            fun step(self): str { "step" }
+            fun extra(self): str { "in the with-block" }
+        }
+        impl Bag { fun extra(self): str { "inherent" } }
+        fun main() { let bag = Bag { x = 1 }; }
+        "#,
+        "extra",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+/// Two impls of DIFFERENT subjects sharing a method name are not duplicates —
+/// the rule is per subject, not per name.
+#[test]
+fn b57_the_same_method_name_on_two_types_is_not_a_duplicate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        struct Box { y: i32 }
+        impl Bag { fun pick(self): str { "bag" } }
+        impl Box { fun pick(self): str { "box" } }
+        fun main() { print(Bag { x = 1 }.pick()); print(Box { y = 2 }.pick()); }
+        "#,
+        "bag\nbox\n",
+    );
+}
+
+/// Two traits providing one name, with no inherent member above them: an
+/// ambiguity error that names both homes and both disambiguating spellings,
+/// built from the call's own receiver (§4).
+#[test]
+fn b57_two_traits_providing_one_name_are_ambiguous() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        trait B { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        impl Bag with B { fun pick(self): str { "B" } }
+        fun main() { let bag = Bag { x = 1 }; print(bag.pick()); }
+        "#,
+        "pick",
+        4,
+        "'pick' is ambiguous on 'Bag': both 'A' and 'B' provide it; \
+         call 'A::pick(bag)' or 'B::pick(bag)' to pick one",
+    );
+}
+
+/// The same rule one tier down: two traits whose DEFAULTS share a name are as
+/// ambiguous as two that declare it (§3, S2's third scan).
+#[test]
+fn b57_two_inherited_defaults_of_one_name_are_ambiguous() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
+        trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        impl Bag with B { fun mark(self): str { "m" } }
+        fun main() { let bag = Bag { x = 1 }; print(bag.pick()); }
+        "#,
+        "pick",
+        2,
+        "'pick' is ambiguous on 'Bag': both 'A' and 'B' provide it",
+    );
+}
+
+/// A supertrait offering a member through two routes is ONE candidate, not an
+/// ambiguity: `Ord with Eq` must not double-count `eq`.
+#[test]
+fn b57_a_supertrait_reached_twice_is_not_ambiguous() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait Base { fun tag(self): str { "base" } }
+        trait Left with Base { fun l(self): str; }
+        trait Right with Base { fun r(self): str; }
+        impl Bag with Left { fun l(self): str { "l" } }
+        impl Bag with Right { fun r(self): str { "r" } }
+        fun main() { print(Bag { x = 1 }.tag()); }
+        "#,
+        "base\n",
+    );
+}
+
+/// And the third scan: a `T: A + B` bound list whose two arms both supply the
+/// name — the same disease in a third location (§8(e)), now the same error.
+#[test]
+fn b57_a_bound_list_supplying_one_name_twice_is_ambiguous() {
+    assert_fails_spanning_nth(
+        r#"
+        import std::print;
+        trait A { fun pick(self): str; }
+        trait B { fun pick(self): str; }
+        fun through<T: A + B>(value: T): str { value.pick() }
+        struct Bag { x: i32 }
+        impl Bag with A { fun pick(self): str { "A" } }
+        impl Bag with B { fun pick(self): str { "B" } }
+        fun main() { print(through(Bag { x = 1 })); }
+        "#,
+        "pick",
+        2,
+        "'pick' is ambiguous on 'T': both 'A' and 'B' provide it; \
+         call 'A::pick(value)' or 'B::pick(value)' to pick one",
+    );
+}
+
+/// A bound list whose arms reach the SAME declaration (`T: Sub + Super`) is one
+/// candidate, not an ambiguity.
+#[test]
+fn b57_a_bound_list_reaching_one_declaration_twice_is_not_ambiguous() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Base { fun tag(self): str; }
+        trait Extra with Base { fun more(self): str; }
+        fun show<T: Base + Extra>(value: T): str { value.tag() }
+        struct Bag { x: i32 }
+        impl Bag with Extra { fun tag(self): str { "t" } fun more(self): str { "m" } }
+        fun main() { print(show(Bag { x = 1 })); }
+        "#,
+        "t\n",
+    );
+}
+
+/// The disambiguator, on an AMBIGUOUS receiver: naming the trait picks that
+/// trait's version, and the two spellings give different answers.
+#[test]
+fn b57_trait_qualified_calls_disambiguate_two_traits() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        trait B { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        impl Bag with B { fun pick(self): str { "B" } }
+        fun main() { let bag = Bag { x = 1 }; print(A::pick(bag)); print(B::pick(bag)); }
+        "#,
+        "A\nB\n",
+    );
+}
+
+/// The disambiguator, on an INHERENT-SHADOWED receiver: the trait's version is
+/// reachable even though the inherent one outranks it at `bag.pick()`. Without
+/// this the trait member would be unreachable, not merely outranked.
+#[test]
+fn b57_a_trait_qualified_call_reaches_past_an_inherent_method() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait Iter<T> { fun pick(self): str; }
+        impl Bag with Iter<i32> { fun pick(self): str { "TRAIT" } }
+        impl Bag { fun pick(self): str { "INHERENT" } }
+        fun main() {
+            let bag = Bag { x = 1 };
+            print(bag.pick());
+            print(Iter::pick(bag));
+            print(Bag::pick(bag));
+        }
+        "#,
+        "INHERENT\nTRAIT\nINHERENT\n",
+    );
+}
+
+/// `ConcreteType::member(receiver)` means the type's OWN member or nothing
+/// (§3.1(2)): it must not fall through to a trait's, which would leave a second
+/// unreformed door into the ambiguity the rule closes.
+#[test]
+fn b57_a_type_qualified_call_does_not_fall_through_to_a_trait() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        fun main() { print(Bag::pick(Bag { x = 1 })); }
+        "#,
+        "Bag::pick",
+        "'pick' is not an inherent member of 'Bag': 'A' provides it; \
+         call 'A::pick(..)' instead",
+    );
+}
+
+/// The disambiguator against an INHERITED DEFAULT: the impl declares nothing,
+/// so the call re-dispatches on the named trait's surface — which is what keeps
+/// two same-named defaults distinguishable.
+#[test]
+fn b57_a_trait_qualified_call_picks_between_inherited_defaults() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun tag(self): str; fun pick(self): str { "from-A" } }
+        trait B { fun mark(self): str; fun pick(self): str { "from-B" } }
+        impl Bag with A { fun tag(self): str { "t" } }
+        impl Bag with B { fun mark(self): str { "m" } }
+        fun main() { let bag = Bag { x = 1 }; print(A::pick(bag)); print(B::pick(bag)); }
+        "#,
+        "from-A\nfrom-B\n",
+    );
+}
+
+/// The disambiguator on a GENERIC receiver: inside `fun f<T: A>` there is no
+/// implementation to point at until the call monomorphizes, so it rides the
+/// bound-dispatch channel — and still reaches the named trait's version.
+#[test]
+fn b57_a_trait_qualified_call_works_on_a_generic_receiver() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun pick(self): str; }
+        trait B { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        impl Bag with B { fun pick(self): str { "B" } }
+        fun left<T: A>(value: T): str { A::pick(value) }
+        fun right<T: B>(value: T): str { B::pick(value) }
+        fun main() { print(left(Bag { x = 1 })); print(right(Bag { x = 1 })); }
+        "#,
+        "A\nB\n",
+    );
+}
+
+/// A trait-qualified call with arguments, nested inside another call and
+/// chained off the result — the multi-parameter / nested / chained edge forms.
+#[test]
+fn b57_a_trait_qualified_call_takes_arguments_and_chains() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        trait A { fun join(self, left: str, right: str): str; }
+        impl Bag with A { fun join(self, left: str, right: str): str { left + right } }
+        impl Bag { fun join(self, left: str, right: str): str { "inherent" } }
+        impl str { fun shout(self): str { self + "!" } }
+        fun main() {
+            let bag = Bag { x = 1 };
+            print(A::join(bag, "a", "b").shout());
+            print(A::join(bag, A::join(bag, "n", "e"), "sted"));
+        }
+        "#,
+        "ab!\nnested\n",
+    );
+}
+
+/// Naming a trait the receiver does not implement is an error that says so,
+/// rather than resolving to the trait's abstract declaration and emitting an
+/// empty function.
+#[test]
+fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+        struct Bag { x: i32 }
+        struct Box { y: i32 }
+        trait A { fun pick(self): str; }
+        impl Bag with A { fun pick(self): str { "A" } }
+        fun main() { print(A::pick(Box { y = 2 })); }
+        "#,
+        "Box { y = 2 }",
+        "does not implement 'A'",
+    );
+}
