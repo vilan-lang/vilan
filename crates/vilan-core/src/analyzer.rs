@@ -9958,6 +9958,27 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// Whether a pattern's subject names existing storage, so its captures bind
+    /// pieces of something with another owner — [`Self::is_place_expr`] plus
+    /// **`*view`**.
+    ///
+    /// B81: a dereference is a place by every test that matters here
+    /// ([`Self::place_root`] and [`Self::readonly_root`] both walk through it),
+    /// and `*v is Some(let x)` reads the borrowed storage exactly as `v.field`
+    /// does — but `is_place_expr` excludes it, so the whole capture pass
+    /// skipped that spelling and its captures aliased outright, the aggregate
+    /// ones included. `is_place_expr` itself stays as it is: rule 2's binding
+    /// pass reads it against rule 3 (`assignment_target_is_view` — a view
+    /// forwarded stays the same view, on purpose), which is a different
+    /// question from the one a pattern subject asks.
+    fn is_capture_subject_place(&self, expr_id: Id) -> bool {
+        self.is_place_expr(expr_id)
+            || matches!(
+                self.expr_id_to_expr_map.get(&expr_id),
+                Some(Expr::Dereference(_))
+            )
+    }
+
     /// The "declare it …" clause for an immutable-root diagnostic, from
     /// [`Self::readonly_root`]'s fix marker. A plain parameter offers BOTH
     /// spellings — `mut` (this function's copy) and `&mut` (the caller's
@@ -10095,6 +10116,35 @@ impl<'src> Analyzer<'src> {
             .get(&root)
             .is_some_and(|parameter| parameter.convention == Convention::Own)
             && !written_roots.contains(&root)
+    }
+
+    /// B81: whether a pattern's subject is rooted in a WRITABLE view — a `&mut`
+    /// parameter (`&mut self` included), or a local bound to a `&mut` view.
+    ///
+    /// This is the question the alias path's accessor substitution turns on.
+    /// That path records each capture as an accessor into the subject temp and
+    /// re-reads it at every reference, which is faithful only while the temp is
+    /// a stable snapshot of the subject's VALUE. Against an owned place it is:
+    /// a write to a place REBINDS it (`feed = Feed::Ready(..)` installs a fresh
+    /// aggregate and the temp keeps the old one). Through a view it is not — a
+    /// write through a view is an in-place mutation of the very object the temp
+    /// aliases, because that is how the write reaches the caller — so every
+    /// deferred read in the leg observes POST-write state. Captures of such a
+    /// subject must therefore be read once, at the match
+    /// ([`Program::materialized_captures`]).
+    ///
+    /// Writability is the whole of it: nothing can be written through a `&`
+    /// view, so its temp is a snapshot again and its captures keep the accessor
+    /// (and the SHARE elision that rides on it — the two sets are disjoint,
+    /// since `share_subject_is_stable` admits no writable-view root).
+    fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        let Some(root) = self.place_root(subject_id) else {
+            return false;
+        };
+        if let Some(parameter) = self.parameters.get(&root) {
+            return parameter.convention == Convention::RefMut;
+        }
+        self.view_binding_mutability(root) == Some(true)
     }
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
@@ -13491,12 +13541,11 @@ impl<'src> Analyzer<'src> {
     /// elements have no other owner. Fixed-array patterns keep their
     /// existing unconditional per-element clone.
     ///
-    /// Returns the copy sites (keyed by how the copy is decided — see
-    /// [`CopyDecision`]) and the SHARED captures, the ones the share elision
-    /// left aliasing their subject. The second set is not codegen's business:
-    /// it is what rule 2's move elision must refuse to move out of, so this
-    /// pass runs BEFORE `compute_clone_sites`.
-    fn compute_capture_clone_sites(&mut self) -> (HashMap<Id, CopyDecision>, HashSet<Id>) {
+    /// Returns a [`CapturePlan`]: the copy sites, the SHARED captures, and
+    /// B81's materialized ones. `shared` is not codegen's business — it is what
+    /// rule 2's move elision must refuse to move out of, so this pass runs
+    /// BEFORE `compute_clone_sites`.
+    fn compute_capture_clone_sites(&mut self) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -13508,7 +13557,7 @@ impl<'src> Analyzer<'src> {
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::Destructure(value_id, pattern) => {
-                    if self.is_place_expr(*value_id) {
+                    if self.is_capture_subject_place(*value_id) {
                         let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *value_id)));
@@ -13517,7 +13566,7 @@ impl<'src> Analyzer<'src> {
                 Expr::Match(subject_id, legs) => {
                     for leg in legs {
                         self.insert_seam_roots(leg.body, &mut seam_roots);
-                        if self.is_place_expr(*subject_id) {
+                        if self.is_capture_subject_place(*subject_id) {
                             let mut captures = Vec::new();
                             Self::collect_pattern_captures(&leg.pattern, &mut captures);
                             candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
@@ -13525,7 +13574,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 Expr::Is(subject_id, pattern) => {
-                    if self.is_place_expr(*subject_id) {
+                    if self.is_capture_subject_place(*subject_id) {
                         let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
@@ -13568,6 +13617,7 @@ impl<'src> Analyzer<'src> {
         let written_roots = self.collect_written_roots();
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::new();
+        let mut materialized: HashSet<Id> = HashSet::new();
         for (capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
                 .variables
@@ -13576,6 +13626,16 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
+            // B81, and asked FIRST because it is orthogonal to every filter
+            // below: whether a capture must be READ at the match is settled by
+            // the subject alone, where whether it must be COPIED is settled by
+            // its own type. A scalar owes no copy and a resource is forbidden
+            // one, yet both read the wrong slot when a write through the
+            // subject's view mutates it in place mid-leg
+            // ([`Self::subject_is_writable_view`]).
+            if self.subject_is_writable_view(subject_id) {
+                materialized.insert(capture_id);
+            }
             let capture_type = type_id.get_type(self);
             // A bare `T` is admitted without knowing whether it is an
             // aggregate — `__clone` is identity on scalars, so the
@@ -13620,7 +13680,11 @@ impl<'src> Analyzer<'src> {
                 sites.insert(capture_id, copy);
             }
         }
-        (sites, shared)
+        CapturePlan {
+            sites,
+            shared,
+            materialized,
+        }
     }
 
     /// The generic constraints whose binding to a resource type would make
@@ -25495,6 +25559,24 @@ pub enum CopyDecision {
     UnlessResource(Vec<TypeId>),
 }
 
+/// What `compute_capture_clone_sites` settles about a program's pattern
+/// captures. Three answers to two independent questions — **is this capture
+/// COPIED**, and **when is it READ** — which B53 and B81 answer separately:
+/// copying is decided by the capture's own type (an aggregate copies, a
+/// resource never does), reading by the subject's (an owned place freezes on
+/// rebinding, a `&mut` view does not freeze at all).
+pub struct CapturePlan {
+    /// The captures that copy, keyed by how the copy is decided.
+    pub sites: HashMap<Id, CopyDecision>,
+    /// The captures the SHARE elision left aliasing their subject. Consumed by
+    /// rule 2's move elision, which must refuse to move out of one, and by
+    /// nothing in codegen.
+    pub shared: HashSet<Id>,
+    /// The captures that must be read at the match rather than at each
+    /// reference (B81).
+    pub materialized: HashSet<Id>,
+}
+
 /// How a resource type's members are reached at runtime for destruction.
 #[derive(Debug, Clone)]
 pub enum DropMembers {
@@ -25778,6 +25860,19 @@ pub struct Program<'src> {
     /// value says whether the copy is unconditional or re-decided per
     /// monomorphization (see [`CopyDecision`]).
     pub capture_clone_sites: HashMap<Id, CopyDecision>,
+    /// B81: pattern captures the ALIAS path must turn into a real declaration
+    /// even when they owe no copy — the ones whose subject is rooted in a
+    /// writable view (`analyzer.rs::subject_is_writable_view`). That path
+    /// substitutes an accessor into the subject temp at every reference, and a
+    /// write through the view mutates the object that temp aliases IN PLACE, so
+    /// a deferred read returns post-write state: `if self is Feed::Ready(let
+    /// items, let at) { self = Feed::Ready(items, at + 1); items[at] }` read the
+    /// incremented `at`. Declaring the capture reads the slot once, at the
+    /// match, which is what the DECLARED path (`compile_pattern`) always did and
+    /// what makes the two paths agree. Orthogonal to `capture_clone_sites`:
+    /// this set says WHEN, that map says WHETHER TO COPY, and a resource
+    /// capture is in this set and never in that map (R1).
+    pub materialized_captures: HashSet<Id>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
     /// per monomorphization — a generic capture bound at `T` copies for a
@@ -29549,9 +29644,9 @@ fn analyze_over_world<'src>(
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let (capture_clone_sites, shared_captures) = analyzer.compute_capture_clone_sites();
+    let capture_plan = analyzer.compute_capture_clone_sites();
     let resource_types = analyzer.compute_resource_types();
-    let clone_sites = analyzer.compute_clone_sites(&shared_captures);
+    let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
     let return_clone_sites = analyzer.compute_return_clone_sites();
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
@@ -29853,7 +29948,8 @@ fn analyze_over_world<'src>(
         clone_sites,
         return_clone_sites,
         parameter_entry_clones,
-        capture_clone_sites,
+        capture_clone_sites: capture_plan.sites,
+        materialized_captures: capture_plan.materialized,
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),
