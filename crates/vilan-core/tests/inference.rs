@@ -42720,21 +42720,30 @@ fn a_structurally_named_tuple_element_still_projects() {
     );
 }
 
-/// Found while repairing B78's own pin, which named its protocol method `step`
-/// and therefore never reached the protocol at all. `for x in subject` over a
-/// CONCRETE struct that has no `next` is not diagnosed — it silently lowers to
-/// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
-/// array. The program below prints `[ 1, 2 ]` and `0` — the two fields of
-/// `Cursor` — and exits 0.
-///
-/// This is P3/B56's defect one type-shape over. B56 closed it for a GENERIC
-/// subject (`report_uniterable_for_each`: "cannot iterate `T`: no bound on it
-/// provides `next`"), and the same reasoning applies verbatim to a concrete
-/// struct — a struct is not natively iterable either, and the fallback is
-/// nonsense rather than a different meaning. `#[ignore]`d: it asserts the
-/// desired outcome (a diagnostic) and today the program compiles and runs.
+// --- B80: a concrete subject with no protocol member ------------------------
+// Found while repairing B78's own pin, which named its protocol method `step`
+// and therefore never reached the protocol at all. `for x in subject` over a
+// CONCRETE struct or enum that has no `next` was not diagnosed — it lowered to
+// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
+// array (a struct) or its `[tag, ..payload]` array (an enum), so the program
+// printed the representation and exited 0.
+//
+// This is P3/B56's defect one type-shape over: B56 closed it for a GENERIC
+// subject (`report_uniterable_for_each`), and the same reasoning applies
+// verbatim to a concrete one. The rule the fix states is name AND shape — the
+// protocol stays duck-typed on the METHOD NAME (`iterator-adapters.md` §1), but
+// the subject must actually carry that method, and a `next` annotated with
+// something other than `Option<T>` is rejected rather than driven.
+//
+// The deliberate native forms are exempt: an `external struct` (a host handle
+// whose runtime shape is JavaScript's — `List`, `str`, `Bytes`, `NativeMap`)
+// and `Set` (the one ordinary vilan struct with a lowering of its own,
+// `__set_iter`). `[T; n]` and tuples never reach the arm.
+
+/// B80's own repro, verbatim from the `#[ignore]`d pin B78's arc filed: before
+/// the fix this printed `[ 1, 2 ]` and `0` — the two fields of `Cursor` — and
+/// exited 0.
 #[test]
-#[ignore]
 fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
     assert_fails_with(
         r#"
@@ -42750,6 +42759,621 @@ fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
         }
         "#,
         "cannot iterate",
+    );
+}
+
+/// The enum twin of the same hole, both shapes. A data-less `enum Color` lowers
+/// to `[0]` (the representation rule is a CONJUNCTION — all-data-less AND
+/// any-explicit-discriminant — so a bare data-less enum is still a tagged
+/// array), and printed `0`; a payload variant `Shape::Circle(3)` is `[0, 3]`
+/// and printed `0` then `3`.
+#[test]
+fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Color { Red, Green, Blue }
+
+        fun main() {
+            let shade = Color::Red;
+            for value in shade {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun main() {
+            let shape = Shape::Circle(3);
+            for value in shape {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The protocol resolves on a MEMBER, and a field is not a member: a struct
+/// with a field literally named `next` provides nothing to drive. Before the
+/// fix this printed `5` then `7` — the field array, `next` included.
+#[test]
+fn a_field_named_next_does_not_satisfy_the_for_protocol() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Link { next: i32, value: i32 }
+
+        fun main() {
+            mut link = Link { next = 5, value = 7 };
+            for item in link {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// A fieldless struct is `[]` at runtime, so the fallback loop ran zero times
+/// and exited 0 — silently doing nothing rather than silently doing the wrong
+/// thing. It is the same missing member and gets the same diagnostic. (This is
+/// also why the exemption reads the declared `external` modifier and not
+/// "has no fields": a bodyless `external struct` and `struct Marker {}` are
+/// indistinguishable by field count.)
+#[test]
+fn a_for_loop_over_a_field_less_struct_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Marker {}
+
+        fun main() {
+            mut marker = Marker {};
+            for item in marker {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The name alone used to resolve the protocol, so a `next` DECLARED to return
+/// anything else was driven anyway: the lowering reads the `Option` tag off the
+/// result, `(5)[0]` is `undefined`, `undefined !== 0` breaks, and the loop ran
+/// ZERO times and exited 0. The diagnostic names the return type it found.
+#[test]
+fn a_next_that_does_not_return_option_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self): i32 {
+                self.count += 1;
+                self.count
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
+                print(item);
+            }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+}
+
+/// The `&mut` form drives `next_mut`, so it is a separate member and a separate
+/// diagnostic — including for a subject that has `next` and only `next`, which
+/// is the sharper case: `for item in down` is legal and `for item in &mut down`
+/// is not, and the message must name `next_mut` rather than `next`.
+#[test]
+fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in &mut walked {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        struct Down { left: i32 }
+
+        impl Down {
+            fun next(&mut self): Option<i32> {
+                if self.left <= 0 { None } else { self.left = self.left - 1; Some(self.left) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { left = 2 };
+            for item in &mut down {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+}
+
+/// A `Map` is an ordinary vilan struct over a `NativeMap`, and it has no `next`
+/// — so the fallback walked its one field and printed the backing map itself
+/// (`Map(1) { 'a' => [ 'a', 1 ] }`), exit 0. It is now diagnosed, and the
+/// message names the three documented ways to walk one.
+#[test]
+fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::map::Map;
+
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("alice", 1);
+            for entry in scores {
+                print(entry);
+            }
+        }
+        "#,
+        "`entries()`, `keys()` or `values()`",
+    );
+}
+
+/// The exemption set, end to end and at runtime: an `external struct` whose
+/// runtime shape is the host's (`List` — a JS array; `str` — a JS string,
+/// yielding characters; `Bytes` — a `Uint8Array`), `Set` (the `__set_iter`
+/// lowering over the backing map's stored originals), and the two shapes that
+/// never reach the struct/enum arm at all (`[T; n]` and a tuple). None of these
+/// declares a `next`, and every one of them must keep iterating.
+#[test]
+fn the_deliberate_native_iteration_forms_still_iterate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::bytes::{ Bytes, encode_utf8 };
+
+        fun main() {
+            for item in [1, 2] { print(item); }
+            for character in "ab" { print(character); }
+            let fixed: [i32; 2] = [3, 4];
+            for item in fixed { print(item); }
+            let pair = (5, 6);
+            for item in pair { print(item); }
+            mut seen: Set<i32> = Set::new();
+            seen.insert(7);
+            for item in seen { print(item); }
+            for byte in encode_utf8("h") { print(byte); }
+        }
+        "#,
+        "1\n2\na\nb\n3\n4\n5\n6\n7\n104\n",
+    );
+}
+
+/// The positive control the whole check is measured against: a struct that DOES
+/// declare `next(&mut self): Option<T>` drives the loop exactly as before,
+/// whether the method is inherent or comes with an `Iterator` clause, and so
+/// does `Range` (std's own). An unannotated `next` is not judged on its return
+/// type — `IteratorFromFn::next` is written that way in std and infers its
+/// `Option<T>` from its body — so `Iterator::from_fn` must keep working too.
+#[test]
+fn a_subject_that_declares_next_still_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::range::Range;
+        import std::iterator::Iterator;
+        import std::option::{Option, Some, None};
+
+        struct Countdown { remaining: i32 }
+        impl Countdown with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.remaining <= 0 { None } else { self.remaining -= 1; Some(self.remaining) }
+            }
+        }
+
+        struct Inherent { at: i32 }
+        impl Inherent {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut countdown = Countdown { remaining = 2 };
+            for value in countdown { print(value); }
+            mut inherent = Inherent { at = 0 };
+            for value in inherent { print(value); }
+            for value in Range::new(0, 2) { print(value); }
+            mut counted = 0;
+            mut produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 2 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n0\n1\n2\n0\n1\n1\n2\n",
+    );
+}
+
+/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
+/// trait default is reachable as a call (`empty.next()` resolves and returns
+/// `None`) but does not drive a loop — `method_member_candidates` reads the
+/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
+/// nothing. Before the fix the loop fell through to the native `for...of` and
+/// printed the `unused` field; now it is a clean "cannot iterate", which is the
+/// right interim answer but not the right final one. `#[ignore]`d: it asserts
+/// the desired outcome (the default drives the loop, printing `99` only).
+#[test]
+#[ignore]
+fn a_next_inherited_from_a_trait_default_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Empty { unused: i32 }
+        impl Empty with Fixed<i32> {}
+
+        fun main() {
+            mut empty = Empty { unused = 0 };
+            for item in empty { print(item); }
+            print(99);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+/// The half of the wrong-signature family the fix deliberately does NOT judge:
+/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
+/// std is written that way and infers `Option<T>`. A body that yields nothing
+/// therefore still reaches the lowering, which reads `undefined[0]` and throws
+/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
+/// than silent, so not the same class as B80 — but it should be a compile
+/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
+/// compiles and the failure is the runtime's.
+#[test]
+#[ignore]
+fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self) {
+                self.count += 1;
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+// --- B82: an enum-variant pattern against a bare generic parameter ----------
+// `resolve_pattern` waved a `Type::Generic` scrutinee through beside `Unknown`
+// and `Any`, so NOTHING was checked and the tag test was emitted anyway. The
+// pattern then matched by coincidence of representation, which is silent wrong
+// code, not a missing diagnostic: a `List<i32>` `[0, 7]` "matched"
+// `Shape::Circle(let radius)` and bound `radius = 7`, and a trait default
+// written over its own `T` matched `Colour::Red` against a `Fruit::Apple(9)`.
+//
+// Whether it is fixable AT the pattern turns on WHICH parameter it is, and the
+// evidence for the split is `std::ui::View::swap` — see the `#[ignore]`d pin at
+// the end of this block. A parameter declared by a scope ENCLOSING the pattern
+// is abstract by construction (the declaration is checked once for all of its
+// instantiations), so it is an error. One that arrived from elsewhere means
+// only "not substituted yet", and the free-function twin already substitutes.
+
+/// B82's core case: a generic function matching on its own `T`-typed parameter.
+/// Every arm of the family is silent wrong code at runtime, not merely
+/// unchecked — `probe([0, 7])` returned `7` and `probe(Fruit::Apple("x"))`
+/// returned the *string* `"x"` from a function declared `: i32`.
+#[test]
+fn an_enum_pattern_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun probe<T>(value: T): i32 {
+            if value is Shape::Circle(let radius) { radius } else { -1 }
+        }
+
+        fun main() { print(probe(Shape::Circle(5))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The `match` form of the same thing — the pattern resolver is shared, and the
+/// pin exists so a future change to one form cannot quietly leave the other.
+#[test]
+fn an_enum_match_arm_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun probe<T>(value: T): i32 {
+            match value {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A trait's own parameter inside a DEFAULT body, which is the sharpest proof
+/// that the abstract check can never be right: the body below is written once
+/// and instantiated at two different enums, so `value is Colour::Red` cannot
+/// have one answer. It had one anyway — `Fruit::Apple(9)` is `[0, 9]`, the tag
+/// test `[0] === 0` passed, and `Basket.describe()` returned 1 where every
+/// reading of the source says 0.
+#[test]
+fn an_enum_pattern_on_a_traits_own_parameter_in_a_default_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple(i32), Pear(i32) }
+
+        trait Tell<T> {
+            fun payload(self): T;
+            fun describe(self): i32 {
+                let value = self.payload();
+                if value is Colour::Red { 1 } else { 0 }
+            }
+        }
+
+        struct Holder { at: i32 }
+        impl Holder with Tell<Colour> { fun payload(self): Colour { Colour::Red } }
+
+        struct Basket { at: i32 }
+        impl Basket with Tell<Fruit> { fun payload(self): Fruit { Fruit::Apple(9) } }
+
+        fun main() {
+            print(Holder { at = 0 }.describe());
+            print(Basket { at = 0 }.describe());
+        }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A BOUND does not rescue it, which is why the message does not suggest adding
+/// one: a trait bound cannot make a parameter be one particular enum, and the
+/// bounded `T` below is exactly as instantiable at some other implementor.
+#[test]
+fn a_bound_does_not_make_a_type_parameter_matchable() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        trait Tag { fun tag(self): i32; }
+        impl Route with Tag { fun tag(self): i32 { 1 } }
+
+        fun probe<T: Tag>(value: T): i32 {
+            if value is Route::Away(let id) { id } else { 0 }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The two concrete diagnostics the generic one now sits beside, neither of
+/// which had a pin: a scrutinee that is a different enum, and one that is not
+/// an enum at all. They are the reason the generic case reads as a hole rather
+/// than a policy — the check exists, it just had nothing to run against.
+#[test]
+fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple, Pear }
+
+        fun main() {
+            let value = Fruit::Apple;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "variant 'Colour::Red' does not belong to the matched enum",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+
+        fun main() {
+            let value: i32 = 5;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "cannot match an enum variant against type i32",
+    );
+}
+
+/// What must keep working, and does: an enum PARAMETERIZED by a type parameter
+/// is a `Type::Enum`, not a `Type::Generic`, so `Some(let value)` on an
+/// `Option<T>` inside a generic function is untouched — std's own bodies are
+/// full of it (`Set::to_set`, `View::swap`'s `last_value.read()`). So is an
+/// enum matching its own variants inside its own `impl`, where `self` is the
+/// abstract enum rather than a parameter. And a LITERAL pattern against a `T`
+/// is a different arm entirely, checked by `compare_type` and sound at runtime
+/// (a JS `===` against a number cannot be fooled by a string).
+#[test]
+fn matching_through_a_type_parameter_still_works_where_it_is_sound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        enum Route { Home, Away(i32) }
+
+        impl Route {
+            fun code(self): i32 {
+                if self is Route::Away(let id) { id } else { 0 }
+            }
+        }
+
+        fun first_or<T>(values: List<T>, fallback: T): T {
+            match values.get(0) {
+                Some(let value) => value,
+                None => fallback,
+            }
+        }
+
+        fun literal<T>(value: T): i32 {
+            match value {
+                1 => 10,
+                _ => 30,
+            }
+        }
+
+        fun main() {
+            print(first_or([5, 6], 0));
+            print(first_or(["a"], "z"));
+            print(Route::Away(3).code());
+            print(Route::Home.code());
+            print(literal(1));
+            print(literal("x"));
+        }
+        "#,
+        "5\na\n3\n0\n10\n30\n",
+    );
+}
+
+/// The evidence that decided B82's shape. A closure argument to a FREE
+/// function's generic reaches its body with the parameter already substituted,
+/// so the match inside is checked for real — the wrong enum is rejected by the
+/// pre-existing concrete diagnostic, with no help from B82's arm.
+#[test]
+fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "variant 'Other::First' does not belong to the matched enum",
+    );
+}
+
+/// And the half that does NOT, which is why B82 ships as a split rather than a
+/// blanket error. A closure argument to a METHOD's own generic reaches its body
+/// with the parameter still abstract, so the match inside is checked against
+/// nothing — the program below binds `Other::Second`'s payload out of a
+/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
+/// shape, and the routing guide's `swap(route, |current| match current { .. })`
+/// is the documented, shipped use, so a blanket error on a `Type::Generic`
+/// scrutinee takes the guide with it (probed: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
+///
+/// The fix is not at the pattern — it is to instantiate the closure parameter
+/// the way the free-function twin above already does. `#[ignore]`d: it asserts
+/// the diagnostic, and today the program compiles and runs.
+#[test]
+#[ignore]
+fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "does not belong to the matched enum",
     );
 }
 

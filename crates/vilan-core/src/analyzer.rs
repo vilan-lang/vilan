@@ -598,6 +598,12 @@ pub struct Struct<'src> {
     pub name_span: Span,
     pub generic_parameter_constraint_ids: Vec<TypeId>,
     pub fields: Vec<Field<'src>>,
+    /// Declared `external` (`docs/spec/types.md:47`): a host type, opaque —
+    /// its runtime representation belongs to JavaScript, not to vilan, so it
+    /// declares no fields and nothing may be assumed about its shape. An
+    /// ordinary struct, by contrast, IS its flat field array at runtime, which
+    /// is what makes a native `for...of` over one meaningless (B80).
+    pub external: bool,
     /// Declared `resource` (destruction.md §3): an explicitly-rooted owned
     /// resource. Containment then infers the class transitively — see
     /// `type_is_resource`.
@@ -14191,6 +14197,37 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// Whether `constraint_id` names a generic parameter declared by a scope
+    /// ENCLOSING `scope_id` — a function's own `<T>`, an impl's binder, or a
+    /// trait's parameter seen from inside a default body. Such a parameter is
+    /// abstract at this site by construction: the declaration is checked once
+    /// for all of its instantiations, so nothing downstream can make it
+    /// concrete. A generic that is *not* enclosing arrived from somewhere else
+    /// and means only "not substituted yet" (B82).
+    ///
+    /// The lookup is by name through the scope chain and stops at the first
+    /// binding of that name, so a nearer parameter shadowing this one answers
+    /// `false` — the conservative direction.
+    fn generic_declared_by_enclosing_scope(&self, constraint_id: TypeId, scope_id: Id) -> bool {
+        let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
+            return false;
+        };
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let Some(scope) = self.scopes.get(&id) else {
+                return false;
+            };
+            if let Some(entity_id) = scope.name_to_id_map.get(name).copied() {
+                return matches!(
+                    self.expr_id_to_expr_map.get(&entity_id),
+                    Some(Expr::Generic(found)) if *found == constraint_id
+                );
+            }
+            current = scope.parent_id;
+        }
+        false
+    }
+
     /// Walks the optional generic parameters of a declaration into `scope_id`,
     /// registering each as a `Generic` type bound by its constraint, and
     /// returns the constraint type ids in declaration order.
@@ -15729,6 +15766,7 @@ impl<'src> Analyzer<'src> {
             Node::Struct(name, generic_parameters, external, resource, body) => {
                 let name_span = name.1;
                 let name = name.0;
+                let external = *external;
                 let resource = *resource;
                 let scope = self.mut_scope_for_scope_id(scope_id);
                 scope.name_to_id_map.insert(name, id);
@@ -15792,6 +15830,7 @@ impl<'src> Analyzer<'src> {
                         name_span,
                         generic_parameter_constraint_ids,
                         fields,
+                        external,
                         resource,
                     },
                 );
@@ -16701,7 +16740,57 @@ impl<'src> Analyzer<'src> {
                 }
                 match expected_type_id.get_type(self) {
                     Type::Enum(expected_enum_id, _) if expected_enum_id == enum_id => {}
-                    Type::Unknown | Type::Any | Type::Generic(_) => {}
+                    Type::Unknown | Type::Any => {}
+                    // A bare generic parameter used to be waved through with the
+                    // unresolved types above, and it half belongs there. Nothing
+                    // was checked and the tag test was emitted anyway, so the
+                    // pattern matched by coincidence of representation — a
+                    // `List<i32>` `[0, 7]` "matched" `Shape::Circle(let radius)`
+                    // and bound `radius = 7` (B82). But which parameter it is
+                    // decides whether that is fixable HERE:
+                    //
+                    // - One declared by a scope ENCLOSING this pattern — the
+                    //   function's own `<T>`, or a trait's parameter inside a
+                    //   default body — is abstract by construction. The body is
+                    //   checked once for every instantiation at once, so no later
+                    //   pass can make it concrete, and the same default matched
+                    //   `Colour::Red` against a `Fruit::Apple(9)` for a second
+                    //   impl. That is an error. A BOUND does not rescue it: a
+                    //   trait bound cannot make a parameter be one particular
+                    //   enum, so the message does not suggest one.
+                    //
+                    // - One that arrived from elsewhere means only "not
+                    //   substituted yet". A closure argument to a METHOD's own
+                    //   generic reaches its body with the parameter still
+                    //   abstract, which is `std::ui::View::swap`'s shape and
+                    //   the routing guide's `swap(route, |current| match current
+                    //   { .. })` — a match that IS concrete at the call. Left
+                    //   lenient here, and pinned `#[ignore]`d: the fix is to
+                    //   instantiate that parameter (the free-function twin
+                    //   already does, and it gets the real check today).
+                    Type::Generic(constraint_id)
+                        if self.generic_declared_by_enclosing_scope(
+                            constraint_id,
+                            lookup_scope_id,
+                        ) =>
+                    {
+                        let parameter = self
+                            .pretty_print_type(&expected_type_id.get_type(self), &HashMap::new());
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span,
+                            msg: format!(
+                                "cannot match an enum variant against the generic parameter \
+                                 `{parameter}`: `{parameter}` is whatever each instantiation \
+                                 binds it to, so there is nothing here to check the pattern \
+                                 against — the tag test runs anyway and matches any value that \
+                                 happens to share the tag. Match a value of the enum's own type, \
+                                 or move the match to where `{parameter}` is concrete"
+                            ),
+                        });
+                        return None;
+                    }
+                    Type::Generic(_) => {}
                     Type::Enum(_, _) => {
                         self.diagnostics.push(Error {
                             note: None,
@@ -17194,6 +17283,84 @@ impl<'src> Analyzer<'src> {
         next_method: &str,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: no bound on it provides \
+                 `{next_method}(&mut self): Option<T>`, and a generic is not \
+                 natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) \
+                 or iterate a concrete container"
+            ),
+        );
+    }
+
+    /// The concrete twin of `report_uniterable_for_each`: a `for` over a named
+    /// struct or enum that provides no `next` and is not one of the deliberate
+    /// native forms. B56 closed this for a GENERIC subject; the concrete path
+    /// never got the check and stayed SILENT (B80) — a vilan struct IS its flat
+    /// field array at runtime and a vilan enum is `[tag, ..payload]`, so
+    /// `for item in Cursor { items = [1, 2], index = 0 }` printed `[ 1, 2 ]`
+    /// then `0` and exited 0, walking the representation.
+    fn report_uniterable_concrete_for_each(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let kind = match iterable_type {
+            Type::Enum(_, _) => "an enum",
+            _ => "a struct",
+        };
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: it has no \
+                 `{next_method}(&mut self): Option<T>`, and {kind} is not \
+                 natively iterable — the loop would walk its representation. \
+                 Implement the iterator protocol on it, or iterate a `List` / \
+                 `Set` / `Range` (a `Map` iterates through `entries()`, \
+                 `keys()` or `values()`)"
+            ),
+        );
+    }
+
+    /// A `for` over a struct or enum whose `next` is DECLARED to return
+    /// something other than `Option<T>`. The name alone resolves the protocol
+    /// (`iterator-adapters.md` §1), and the lowering then reads the `Option`
+    /// tag off whatever came back: `fun next(&mut self): i32` yields a number,
+    /// `number[0]` is `undefined`, `undefined !== 0` breaks — so the loop runs
+    /// ZERO times and exits 0. An UNANNOTATED `next` is not judged here;
+    /// `IteratorFromFn::next` is written that way in std and infers its
+    /// `Option<T>` from its body.
+    fn report_for_each_next_not_option(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+        return_type: &Type,
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let returned = self.pretty_print_type(return_type, &HashMap::new());
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: its `{next_method}` returns \
+                 `{returned}`, but the `for` protocol drives \
+                 `{next_method}(&mut self): Option<T>` and stops at `None`. \
+                 Return an `Option`, or rename the method"
+            ),
+        );
+    }
+
+    /// The shared tail of the three `for`-subject diagnostics: anchor the error
+    /// on the iterable expression, falling back to the loop itself.
+    fn report_for_each_error(&mut self, for_each_id: Id, iterable_id: Id, msg: String) {
         let span = **self
             .span_map
             .get(&iterable_id)
@@ -17202,13 +17369,62 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             note: None,
             span,
-            msg: format!(
-                "cannot iterate `{rendered}`: no bound on it provides \
-                 `{next_method}(&mut self): Option<T>`, and a generic is not \
-                 natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) \
-                 or iterate a concrete container"
-            ),
+            msg,
         });
+    }
+
+    /// Whether a concrete `for` subject with no `next` of its own is one of the
+    /// forms the loop DELIBERATELY lowers to a native `for...of` (B80's
+    /// exemption set — everything outside it is a silent walk of the receiver's
+    /// representation):
+    ///
+    /// - an `external struct`: a host handle whose runtime shape belongs to
+    ///   JavaScript, so `for...of` over it IS the host's own iteration protocol
+    ///   — `List<T>` (a JS array), `str` (a JS string, yielding characters),
+    ///   `Bytes` (a `Uint8Array`), `NativeMap` (a JS `Map`). It declares no
+    ///   vilan fields, so there is no field array to walk by mistake, and a
+    ///   host value that is not iterable throws AT the loop — loud, not silent.
+    /// - `Set<T>`: the one ordinary vilan struct with a lowering of its own,
+    ///   `__set_iter` over the backing map's stored originals
+    ///   (`transformer.rs`'s `is_set_typed`).
+    ///
+    /// `[T; n]` and a tuple are natively iterable too, but they are `Type::Array`
+    /// / `Type::Tuple` and never reach this arm.
+    fn subject_is_natively_iterable(&self, iterable_type: &Type) -> bool {
+        let Type::Struct(id, _) = iterable_type else {
+            return false;
+        };
+        if Some(*id) == self.primitive_struct_ids.get("Set").copied() {
+            return true;
+        }
+        self.structs.get(id).is_some_and(|struct_| struct_.external)
+    }
+
+    /// The declared return type of a `for` subject's protocol member, when it
+    /// contradicts `Option<T>` — the payload of
+    /// `report_for_each_next_not_option`. `None` means "no quarrel": either the
+    /// member is unannotated (judged by its body elsewhere) or it already
+    /// returns an `Option`.
+    fn for_each_next_non_option_return(&mut self, next_id: Id) -> Option<Type> {
+        let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
+            return None;
+        };
+        let return_type = self
+            .functions
+            .get(function_id)?
+            .return_type_id?
+            .get_type(self);
+        match &return_type {
+            Type::Enum(enum_id, _)
+                if self.enums.get(enum_id).map(|enumeration| enumeration.name)
+                    == Some("Option") =>
+            {
+                None
+            }
+            // An unresolved annotation is not evidence of a contradiction.
+            Type::Unknown | Type::Unresolved | Type::Any => None,
+            _ => Some(return_type),
+        }
     }
 
     /// If `type_` is a `List` whose element is still an unresolved inference slot
@@ -24193,6 +24409,21 @@ impl<'src> Analyzer<'src> {
                     if let Some((next_id, impl_subject_id)) =
                         self.method_member_impl_subject(&iterable_type, next_method)
                     {
+                        // The protocol is duck-typed on the METHOD NAME
+                        // (`iterator-adapters.md` §1), but the lowering still
+                        // reads an `Option` tag off what `next` hands back, so a
+                        // `next` annotated with anything else drives a loop that
+                        // silently runs zero times. Name AND declared shape.
+                        if let Some(return_type) = self.for_each_next_non_option_return(next_id) {
+                            self.report_for_each_next_not_option(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                &return_type,
+                            );
+                            continue;
+                        }
                         self.for_each_next.insert(for_each_id, next_id);
                         // Bind the providing impl's generics from the receiver
                         // (`Passthrough<Counting, i32>` against the impl's
@@ -24209,6 +24440,16 @@ impl<'src> Analyzer<'src> {
                             self.method_call_substitution
                                 .insert(for_each_id, bindings.into_iter().collect());
                         }
+                    } else if !self.subject_is_natively_iterable(&iterable_type) {
+                        // No protocol member and no deliberate native lowering:
+                        // the fallback `for...of` would walk the receiver's own
+                        // representation. B80 — B56's check, one type-shape over.
+                        self.report_uniterable_concrete_for_each(
+                            for_each_id,
+                            iterable_id,
+                            &iterable_type,
+                            next_method,
+                        );
                     }
                 }
                 // `for v in self` inside a trait default: `self` is the trait's

@@ -150,6 +150,16 @@ arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 `bool`; bindings inside an `is` pattern are scoped to nothing (use
 `match` to bind).
 
+A pattern is checked against the type of the value it matches, so an
+enum-variant pattern requires that type to be that enum. A **generic
+parameter of an enclosing declaration** is not: `T` is whatever each
+instantiation binds it to, and the declaration is checked once for all
+of them, so `value is Colour::Red` on a `T`-typed value is a compile
+error — in a generic function's body, and in a trait default over the
+trait's own parameter. Match a value of the enum's own type, or move the
+match to where the parameter is concrete. A bound does not change this:
+a trait bound cannot make a parameter be one particular enum.
+
 ## 5.8 Conversions and coercions
 
 There are **no implicit conversions** between numeric types; use the
@@ -298,6 +308,8 @@ fun main() {
 Normative rejection cases (each is a compile error):
 
 - Using a trait as a type (`let x: Display = …`).
+- An enum-variant pattern matched against a generic parameter of an
+  enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
   bound …`).
 - A `match` whose VALUE legs' types don't unify. Diverging legs
@@ -308,5 +320,8 @@ Normative rejection cases (each is a compile error):
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call;
 `effect`'s unannotated closure parameter can type against the impl's
-abstract `T` (B23). Each has a pinned test; the workaround is an
+abstract `T` (B23); and a closure passed to a **method's** own generic
+parameter reaches its body with that parameter still abstract, so a
+pattern inside it is not checked at all — the free-function twin
+substitutes and is. Each has a pinned test; the workaround is an
 annotation or a binding.*
