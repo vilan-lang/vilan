@@ -395,3 +395,109 @@ fn emitted_js_is_independent_of_import_order() {
          longer emitted in initialization order (`const` order churns)"
     );
 }
+
+/// E44 — a corpus build is byte-deterministic under CONCURRENCY.
+///
+/// Two concurrent corpus runs sharing a box once emitted different JavaScript
+/// for `reactive`, `reactive-flatten` and `signal-update` (`$E` against `$G`,
+/// `new2` against `fresh_id`) while sequential runs stayed byte-stable, and the
+/// filed suspicion was that scheduling reached inference order and so the type
+/// ids that monomorphization keys on (B95).
+///
+/// It cannot. A `vilan build` is single-threaded — the CLI's only threads are
+/// the HMR server's, and the compile path reads a clock for timing reports and
+/// nothing else — so no ambient scheduling decision is an input to it. The
+/// compile is a pure function of (binary, source, `$VILAN_STD`, environment,
+/// working directory); its temp and cache paths are process-namespaced or
+/// written by atomic rename. What DOES differ per process is the `HashMap` seed,
+/// which E38 established does not reach the output, and this pin re-establishes
+/// it for free: every worker below is a separate process with its own seed.
+///
+/// Measured before this pin existed: 216 concurrent builds (6 processes x 12
+/// rounds x the 3 named programs) on a loaded box, byte-identical, both with the
+/// id-keyed instance identity and with B95's structural one. The observed
+/// difference was therefore an INPUT difference, and the only input that moves
+/// while a box is being worked on is the binary itself: the harness resolves
+/// `CARGO_BIN_EXE_vilan`, a fixed path, which any concurrent `cargo build` in
+/// the same lane rewrites underneath a run in progress. That is the trap
+/// `CLAUDE.md` already states — "a run started mid-editing tests a tree that no
+/// longer exists" — and the three programs are simply the corpus's most
+/// sensitive: a one-instance difference anywhere in `std::reactive` shifts every
+/// generated name after it, which is exactly the reported shape.
+///
+/// The pin holds the property rather than the diagnosis: whatever the mechanism,
+/// concurrent builds of one source must agree.
+#[test]
+fn concurrent_builds_of_one_program_agree_byte_for_byte() {
+    // The corpus's most name-sensitive programs — the three E44 named.
+    const PROGRAMS: [&str; 3] = ["reactive", "reactive-flatten", "signal-update"];
+    const WORKERS: usize = 4;
+
+    let corpus = corpus_dir();
+    let root =
+        std::env::temp_dir().join(format!("vilan_corpus_concurrency_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // A private copy per worker — corpus programs import sibling modules, and
+    // two workers writing one directory would race on the output, not on the
+    // compiler.
+    for worker in 0..WORKERS {
+        let directory = root.join(worker.to_string());
+        std::fs::create_dir_all(&directory).expect("create the worker directory");
+        for entry in std::fs::read_dir(&corpus).expect("corpus directory") {
+            let path = entry.expect("corpus entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("vl") {
+                let name = path.file_name().expect("a corpus file has a name");
+                std::fs::copy(&path, directory.join(name)).expect("copy corpus source");
+            }
+        }
+    }
+
+    let emissions: Vec<Vec<(String, String)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let root = &root;
+                scope.spawn(move || {
+                    let directory = root.join(worker.to_string());
+                    PROGRAMS
+                        .iter()
+                        .map(|name| {
+                            let source = directory.join(format!("{name}.vl"));
+                            let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+                                .arg("build")
+                                .arg(&source)
+                                .env("VILAN_STD", std_dir())
+                                .output()
+                                .expect("run vilan build");
+                            assert!(
+                                output.status.success(),
+                                "{name} failed to build in worker {worker}:\n{}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                            let emitted = source.with_extension(GOLDEN_EXTENSION);
+                            (
+                                (*name).to_string(),
+                                std::fs::read_to_string(&emitted).expect("read the emission"),
+                            )
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("concurrency worker"))
+            .collect()
+    });
+    let _ = std::fs::remove_dir_all(&root);
+
+    let reference = emissions.first().expect("at least one worker");
+    for (worker, emission) in emissions.iter().enumerate().skip(1) {
+        for ((name, mine), (_, theirs)) in emission.iter().zip(reference) {
+            assert!(
+                mine == theirs,
+                "worker {worker} emitted different bytes for {name} than worker 0: {}",
+                first_difference(theirs, mine)
+            );
+        }
+    }
+}
