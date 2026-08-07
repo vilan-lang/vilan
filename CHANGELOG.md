@@ -94,6 +94,13 @@ The ~100 corpus goldens moved from `.js` to `.mjs` — **their bytes are unchang
 
 Creating a closure or an `async { .. }` block in an initializer is still legal, and that boundary is deliberate and pinned in both directions: a closure's body is not the initializer, and nothing runs it at load. Eleven pins covering every row of the rule, planted red on two opposing axes (the call-shaped regression, and an over-widening that reaches into created closures). The sweep found no program in std, the corpus, the examples or the docs that the widened check flips — no corpus golden had ever contained the shape, so the byte-identical gate had never seen it. Record: `proposal/top-level-await.md`.
 
+---
+
+**A `for` over a type whose `next` two traits declare says so, instead of "it has no `next`".** A struct implementing two traits that each declare `fun next(&mut self): Option<T>` was refused with "cannot iterate `Twin`: it has no `next(&mut self): Option<T>`" — of a type that has two of them, sending the reader off to write a method that was already there twice.
+
+The loop asked for the winning member through a lookup that answers "no such member" and "two traits provide it, name one" with the same `None`, so the ambiguity came out the exit meant for absence. The tier *below* it — a `next` inherited from a trait default, new in this same release — already reported the ambiguity properly, which left one program saying two different things about one problem depending on whether the two providers were defaults or declarations. The loop now asks the resolution question in the form that keeps the two failures apart and reports at whichever tier the competition is in, with one message at both tiers differing only in how the providers give the member.
+
+The steer is the one that works for a loop: a call resolves this by naming a provider — `Trait::next(receiver)` — and a `for` has no such spelling, so the message says to declare `next` on the type itself, where an inherent member beats every trait-provided one. That is also the rule that keeps the report from firing when there already *is* an inherent one, and one trait providing the name beside another trait that does not is not a competition at all. `next_mut`, the `for x in &mut subject` form, is a separate member reached through the same tiering and gets the same report. Five pins, planted red on three axes; corpus goldens byte-identical, since every program this touches was a compile error before and still is.
 
 ## v0.32.0 — 2026-08-06
 
