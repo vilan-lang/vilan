@@ -47174,3 +47174,64 @@ fn b83_a_trait_provided_method_is_still_refused_on_the_type_path() {
         "'show' is not an inherent member of 'Bag'",
     );
 }
+
+/// The number of interned types left behind by analyzing `source` — a
+/// deterministic, load-independent measure of how much work the constraint
+/// fixpoint did. Every attempt mints fresh type ids unconditionally, so a
+/// fixpoint that keeps retrying a stuck constraint set grows this table in
+/// direct proportion to the passes it ran.
+fn interned_type_count(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let program = program.expect("the probe programs must analyze");
+            assert!(
+                errors.is_empty(),
+                "the probe programs must be clean: {errors:?}"
+            );
+            program.type_id_to_type_map.len()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the probe worker must not panic")
+}
+
+#[test]
+fn the_constraint_fixpoint_stops_when_it_settles() {
+    // E43 (`suite-speed.md` §8). `import std::set` leaves ten constraints
+    // permanently deferred — legitimately unresolvable, committed to defaults
+    // by `finalize_build`. The solving loop is supposed to notice it has
+    // settled and stop; instead it counted every attempt's unconditional
+    // type-id MINTING as progress, so its quiescence test could never pass and
+    // it ran to `max_iterations` — ~14 000 passes over those ten constraints,
+    // ~2.2 s of a ~2.4 s import, and the same bill again inside every macro
+    // world (`macro_std` re-exports `std::set`, so `[derive(Debug)]` paid it
+    // twice over).
+    //
+    // `std::map` is the control: the same 111 lines, the same shape, no stuck
+    // constraints — and it always converged. Pinning `set` AGAINST `map`
+    // states the property that actually matters ("set costs what map costs")
+    // and stays honest as std grows, where an absolute bound would rot.
+    let set = interned_type_count(
+        "import std::set::Set;\n\nfun main() {\n\tmut s: Set<i32> = Set::new();\n\ts.insert(1);\n}\n",
+    );
+    let map = interned_type_count(
+        "import std::map::Map;\n\nfun main() {\n\tmut m: Map<str, i32> = Map::new();\n\tm.insert(\"a\", 1);\n}\n",
+    );
+    assert!(
+        set < map * 2,
+        "a settled fixpoint must stop: `import std::set` interned {set} types \
+         against `import std::map`'s {map}. A ratio this large means the loop is \
+         spinning on permanently deferred constraints again (E43)."
+    );
+}

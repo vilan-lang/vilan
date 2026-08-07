@@ -1400,10 +1400,12 @@ pub struct Analyzer<'src> {
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
     std_sources: std::collections::HashSet<SourceId>,
-    // Counts every write into `type_id_to_type_map` — the constraint
-    // fixpoint's third progress signal (S3b): an attempt that writes types
-    // without resolving still moves the world, and the exit condition must
-    // see it.
+    // Counts every write into `type_id_to_type_map` that CHANGES what a slot
+    // held — the constraint fixpoint's third progress signal (S3b): an attempt
+    // that refines a type without resolving still moves the world, and the exit
+    // condition must see it. Maintained only through `write_type_slot`, which
+    // owns the definition of "moves the world"; see it for why a fresh mint and
+    // an idempotent rewrite are both excluded.
     type_map_writes: u64,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
@@ -10075,9 +10077,41 @@ impl<'src> Analyzer<'src> {
         // must stay unshared. A correct interner would have to exclude `Unknown` /
         // `Unresolved` (and anything else later mutated) and require `Type: Hash + Eq`.
         let type_id = self.new_type_id();
-        self.type_map_writes += 1;
         self.type_id_to_type_map.insert(type_id, type_);
         type_id
+    }
+
+    /// Write `type_` into the slot `type_id` names, maintaining
+    /// `type_map_writes` — the constraint fixpoint's third progress signal.
+    ///
+    /// The signal has to mean "this attempt moved the world": a deferred
+    /// constraint that refines somebody else's type without resolving its own
+    /// has made progress the resolution count and the wake scan both miss, and
+    /// the exit condition must see it (S3b). Only a write that CHANGES a slot
+    /// others can already observe does that, so two kinds of write are
+    /// excluded:
+    ///
+    /// - a FRESH mint (`type_id_for_type`) — no deferred constraint holds the
+    ///   id yet, so the value it starts life with informs nobody;
+    /// - an IDEMPOTENT rewrite — a slot re-stamped with the value it already
+    ///   held tells every reader exactly what it told them before.
+    ///
+    /// Counting either makes the signal fire on every attempt, and the
+    /// fixpoint's quiescence test then can never pass: any program left with a
+    /// permanently deferred constraint runs the loop to its `max_iterations`
+    /// cap instead of stopping when it settles. That is E43's `std::set` cliff
+    /// — 10 stuck constraints re-run over ~14 000 passes, ~2.2 s of a ~2.4 s
+    /// import — and it was the mint at `type_id_for_type` (which every attempt
+    /// performs, unconditionally) that kept it lit.
+    fn write_type_slot(&mut self, type_id: TypeId, type_: Type) {
+        let changes_the_world = self
+            .type_id_to_type_map
+            .get(&type_id)
+            .is_some_and(|existing| *existing != type_);
+        if changes_the_world {
+            self.type_map_writes += 1;
+        }
+        self.type_id_to_type_map.insert(type_id, type_);
     }
 
     fn get_type_by_type_id(&self, type_id: TypeId) -> Type {
@@ -15648,9 +15682,7 @@ impl<'src> Analyzer<'src> {
                         },
                     );
                     let function_type_id = self.new_type_id();
-                    self.type_map_writes += 1;
-                    self.type_id_to_type_map
-                        .insert(function_type_id, Type::Function(id));
+                    self.write_type_slot(function_type_id, Type::Function(id));
                     self.expr_id_to_type_id_map.insert(id, function_type_id);
                     Some(Expr::ExternalFunction(id))
                 } else {
@@ -17627,8 +17659,7 @@ impl<'src> Analyzer<'src> {
         };
 
         if let Some(type_) = type_ {
-            self.type_map_writes += 1;
-            self.type_id_to_type_map.insert(type_id, type_);
+            self.write_type_slot(type_id, type_);
         }
 
         type_id
@@ -18349,9 +18380,8 @@ impl<'src> Analyzer<'src> {
                     if let Some(parameter) = self.parameters.get(parameter_id)
                         && matches!(parameter.type_id.get_type(self), Type::Unknown)
                     {
-                        self.type_map_writes += 1;
-                        self.type_id_to_type_map
-                            .insert(parameter.type_id, filled.clone());
+                        let slot = parameter.type_id;
+                        self.write_type_slot(slot, filled.clone());
                     }
                     return;
                 }
@@ -21189,9 +21219,7 @@ impl<'src> Analyzer<'src> {
                 if matches!(parameter_type, Type::Unknown)
                     && !matches!(argument_type, Type::Unknown)
                 {
-                    self.type_map_writes += 1;
-                    self.type_id_to_type_map
-                        .insert(*parameter_type_id, argument_type.clone());
+                    self.write_type_slot(*parameter_type_id, argument_type.clone());
                     // Remember WHO filled the slot: a later conflicting call
                     // diagnoses against this one by name, not as a bare
                     // mismatch (B13's recorded residual).
@@ -22137,8 +22165,7 @@ impl<'src> Analyzer<'src> {
             return Resolution::Resolved;
         }
         if !matches!(argument_type, Type::Unknown) {
-            self.type_map_writes += 1;
-            self.type_id_to_type_map.insert(slot, argument_type);
+            self.write_type_slot(slot, argument_type);
         }
         Resolution::Resolved
     }
@@ -24501,11 +24528,12 @@ impl<'src> Analyzer<'src> {
                             msg: message,
                         });
                     }
-                    self.type_map_writes += 1;
                     // A refused annotation resolves to `Unknown`, so the one
                     // report at the annotation stands alone instead of cascading
-                    // a mismatch through every use of the thing it names.
-                    self.type_id_to_type_map.insert(
+                    // a mismatch through every use of the thing it names. The
+                    // write goes through `write_type_slot`, which owns the
+                    // solver's progress accounting (E43).
+                    self.write_type_slot(
                         type_id,
                         match bare_trait_id {
                             Some(_) => Type::Unknown,
@@ -24531,8 +24559,7 @@ impl<'src> Analyzer<'src> {
                         span,
                         msg: message,
                     });
-                    self.type_map_writes += 1;
-                    self.type_id_to_type_map.insert(type_id, Type::Unknown);
+                    self.write_type_slot(type_id, Type::Unknown);
                 }
             }
         }
@@ -24549,8 +24576,7 @@ impl<'src> Analyzer<'src> {
                         Some(member_id) => {
                             let member_type =
                                 self.infer_type(member_id, &Type::Unknown, &HashMap::new());
-                            self.type_map_writes += 1;
-                            self.type_id_to_type_map.insert(type_id, member_type);
+                            self.write_type_slot(type_id, member_type);
                         }
                         None => {
                             self.diagnostics.push(Error {
@@ -24561,8 +24587,7 @@ impl<'src> Analyzer<'src> {
                                     member_name, module_name
                                 ),
                             });
-                            self.type_map_writes += 1;
-                            self.type_id_to_type_map.insert(type_id, Type::Unknown);
+                            self.write_type_slot(type_id, Type::Unknown);
                         }
                     }
                 }
@@ -24583,8 +24608,7 @@ impl<'src> Analyzer<'src> {
                             ),
                         });
                     }
-                    self.type_map_writes += 1;
-                    self.type_id_to_type_map.insert(type_id, Type::Unknown);
+                    self.write_type_slot(type_id, Type::Unknown);
                 }
             }
         }
@@ -25140,6 +25164,11 @@ impl<'src> Analyzer<'src> {
         // distinct queued task, bounded by the entity count, so twice it is ample.
         let max_iterations = 2 * self.entity_id as usize + 16;
 
+        // Consecutive backstop passes that resolved nothing, woke nothing, and
+        // refined no type in place. See the quiescence test at the bottom of
+        // the loop for why the second one in a row ends the fixpoint.
+        let mut fruitless_backstops = 0u32;
+
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
             if self.wake_ready_constraints() {
@@ -25152,7 +25181,8 @@ impl<'src> Analyzer<'src> {
             // deferred constraint once as a backstop — this catches an input that
             // resolved without a type-map write (so `wake_ready` missed it) and
             // makes the exit condition identical to run-all's "a full pass resolves
-            // nothing". If the backstop also makes no progress, it is a fixpoint.
+            // nothing". Whether a fruitless backstop ENDS the fixpoint is the
+            // quiescence test at the bottom of the loop.
             if self.deferred.is_empty() {
                 break;
             }
@@ -25166,17 +25196,46 @@ impl<'src> Analyzer<'src> {
             // constraint would be left unrun in `self.constraints` (the cause of a
             // late `match`-capture / inferred-element field access failing).
             let woke = self.wake_ready_constraints();
-            // A deferred attempt can WRITE types without resolving — a method
-            // call that types its closure argument's parameters and then
-            // defers at the incomplete-bindings guard has made real progress
-            // the resolution count and the wake scan both miss. Breaking here
-            // would strand the next attempt that those writes just unblocked
-            // (the two-phase chained-`map` stall, S3b: std's unrelated
-            // constraint churn masked this monolithically by granting extra
-            // rounds). Quiescence requires a fruitless retry AND an untouched
-            // type map; the `max_iterations` bound above keeps a
-            // write-without-progress cycle finite.
-            if !backstop_progress && !woke && self.type_map_writes == writes_before_backstop {
+            // A deferred attempt can move the world without resolving, and the
+            // exit condition must see it, in the two shapes it takes (S3b):
+            //
+            // - it can REFINE a type in place — a method call that types its
+            //   closure argument's parameters and then defers at the
+            //   incomplete-bindings guard. Every holder of that slot sees the
+            //   new type, so this is progress on its face; `type_map_writes`
+            //   counts exactly these (`write_type_slot`). Refinement is
+            //   monotone and finite, so it can buy unlimited further passes.
+            //
+            // - it can MINT fresh slots that a LATER attempt consumes — the
+            //   two-phase chained-`map` stall, where the pass that instantiates
+            //   `map`'s signature resolves nothing itself and the pass after it
+            //   succeeds on what that minting left behind. Minting is NOT
+            //   progress on its face (a fresh id has no readers yet), and,
+            //   unlike refinement, every attempt performs it unconditionally —
+            //   so it can never be counted as progress directly without the
+            //   loop losing its ability to stop at all.
+            //
+            // Hence the asymmetry: a fruitless backstop buys exactly ONE more.
+            // If that second pass also resolves nothing, wakes nothing and
+            // refines nothing, then it consumed none of the first pass's mints,
+            // and it left behind a structurally identical batch of its own —
+            // the state is stationary, and every later pass would repeat it.
+            // That is the fixpoint, so stop.
+            //
+            // Counting mints as progress is what E43 measured: with the signal
+            // lit on every attempt the test could never pass, so any program
+            // still holding a permanently deferred constraint ran the loop to
+            // `max_iterations` — `import std::set` spun ~14 000 passes over 10
+            // stuck constraints for ~2.2 s of its ~2.4 s (`suite-speed.md` §8).
+            // `max_iterations` goes back to being only a safety net against a
+            // non-converging bug, which is all it was ever meant to be.
+            let refined = self.type_map_writes != writes_before_backstop;
+            if backstop_progress || woke || refined {
+                fruitless_backstops = 0;
+                continue;
+            }
+            fruitless_backstops += 1;
+            if fruitless_backstops >= 2 {
                 break;
             }
         }
@@ -31454,5 +31513,91 @@ mod path_tests {
             "and clearing through either spelling must clear the one entry"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod fixpoint_progress_tests {
+    //! The constraint fixpoint's third progress signal (S3b, E43).
+    //!
+    //! `type_map_writes` is what tells the solving loop that an attempt which
+    //! resolved nothing still *moved the world*, so the loop must not stop.
+    //! Its meaning is load-bearing in both directions: count too little and a
+    //! genuine in-place refinement is missed, stranding the constraint it just
+    //! unblocked; count too much and the quiescence test can never pass, so the
+    //! loop runs to its `max_iterations` cap on every program left holding a
+    //! permanently deferred constraint. The second failure is what made
+    //! `import std::set` spin ~14 000 passes for ~2.2 s (`suite-speed.md` §8).
+
+    use super::Analyzer;
+    use crate::type_::Type;
+
+    #[test]
+    fn minting_a_fresh_type_id_is_not_progress() {
+        // Nobody holds the id yet, so the value it starts life with cannot
+        // unblock a constraint that deferred before it existed. This is the
+        // write E43 was counting — and `type_id_for_type` performs it on every
+        // attempt, unconditionally, which is why the signal never went quiet.
+        let mut analyzer = Analyzer::new();
+        for _ in 0..5 {
+            analyzer.type_id_for_type(Type::Any);
+        }
+        assert_eq!(
+            analyzer.type_map_writes, 0,
+            "minting fresh type ids must not register as fixpoint progress"
+        );
+    }
+
+    #[test]
+    fn a_first_write_into_an_unmapped_slot_is_not_progress() {
+        // The same rule stated at the helper: an id with no mapping has no
+        // readers to inform.
+        let mut analyzer = Analyzer::new();
+        let type_id = analyzer.new_type_id();
+        analyzer.write_type_slot(type_id, Type::Any);
+        assert_eq!(analyzer.type_map_writes, 0);
+    }
+
+    #[test]
+    fn refining_a_slot_in_place_is_progress() {
+        // The case S3b exists for: an `Unknown` closure-parameter slot becoming
+        // concrete while the attempt that filled it goes on to defer. Missing
+        // this strands the next attempt those writes unblocked.
+        let mut analyzer = Analyzer::new();
+        let type_id = analyzer.type_id_for_type(Type::Unknown);
+        analyzer.write_type_slot(type_id, Type::Any);
+        assert_eq!(
+            analyzer.type_map_writes, 1,
+            "an Unknown slot becoming concrete must register as progress"
+        );
+    }
+
+    #[test]
+    fn re_stamping_a_slot_with_the_value_it_holds_is_not_progress() {
+        // An idempotent rewrite tells every reader exactly what it told them
+        // before. A retry that performs one has learned nothing, and counting
+        // it keeps the loop alive on a world that has stopped moving.
+        let mut analyzer = Analyzer::new();
+        let type_id = analyzer.type_id_for_type(Type::Unknown);
+        analyzer.write_type_slot(type_id, Type::Any);
+        for _ in 0..5 {
+            analyzer.write_type_slot(type_id, Type::Any);
+        }
+        assert_eq!(
+            analyzer.type_map_writes, 1,
+            "only the write that CHANGED the slot counts, however often it is repeated"
+        );
+    }
+
+    #[test]
+    fn each_distinct_refinement_of_one_slot_counts_once() {
+        // Monotone refinement through several shapes: every step moves the
+        // world, and the interleaved idempotent rewrites do not.
+        let mut analyzer = Analyzer::new();
+        let type_id = analyzer.type_id_for_type(Type::Unknown);
+        for type_ in [Type::Unresolved, Type::Unresolved, Type::Any, Type::Any] {
+            analyzer.write_type_slot(type_id, type_);
+        }
+        assert_eq!(analyzer.type_map_writes, 2);
     }
 }
