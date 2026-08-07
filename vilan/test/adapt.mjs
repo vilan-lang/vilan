@@ -71,4 +71,7 @@ async function $h(urls, f) {
 		await (sleep(1, [ 1 ]));
 		return url.length + 10;
 	})));
-})();
+})().catch(($i) => {
+	console.error(String($i));
+	process.exit(1);
+});

@@ -89,9 +89,13 @@ The manifest declares what a directory builds. Sections:
 
 ## 11.5 Build products
 
-Each entry emits `dist/<name>.js` for its platform (browser entries
+Each entry emits `dist/<name>.<ext>` for its platform (browser entries
 first, so a server that ships bundles finds them fresh), plus
 `dist/<name>.css` when const evaluation emitted style assets (§9.2).
+The extension states the module kind to the host: `.mjs` on the process
+platforms, whose runtimes classify a file as ESM or CommonJS before
+running it, and `.js` on the browser, where the loading
+`<script type="module">` tag classifies it instead.
 
 A `browser` entry declaring **`split = true`** emits **route chunks**
 instead of one file: `dist/<name>.js` carries every module-level binding

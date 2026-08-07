@@ -1,4 +1,4 @@
-//! The corpus byte gate (backlog E5): every `vilan/test/*.vl` with a `.js`
+//! The corpus byte gate (backlog E5): every `vilan/test/*.vl` with a `.mjs`
 //! golden compiles — via the CURRENT `vilan` binary, exactly the command that
 //! generated the goldens — to byte-identical output (`.css` assets included).
 //!
@@ -11,6 +11,12 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The extension a corpus golden carries. Corpus programs are bare files with
+/// no manifest, so `vilan build` compiles them for the default platform (Node)
+/// and writes `.mjs` — the process legs take the extension that declares ESM to
+/// the runtime rather than leaving it to be sniffed (`top-level-await.md` §8.1).
+const GOLDEN_EXTENSION: &str = "mjs";
 
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test")
@@ -182,7 +188,7 @@ fn every_corpus_golden_is_byte_identical() {
         };
         if extension == "vl" {
             std::fs::copy(&path, work.join(name)).expect("copy corpus source");
-            if path.with_extension("js").is_file() {
+            if path.with_extension(GOLDEN_EXTENSION).is_file() {
                 programs.push(name.to_string());
             }
         }
@@ -219,7 +225,7 @@ fn every_corpus_golden_is_byte_identical() {
                             ));
                             continue;
                         }
-                        for asset in ["js", "css"] {
+                        for asset in [GOLDEN_EXTENSION, "css"] {
                             let golden_path = corpus.join(name).with_extension(asset);
                             if !golden_path.is_file() {
                                 continue;
@@ -268,7 +274,7 @@ fn no_corpus_golden_carries_hmr_instrumentation() {
     let mut checked = 0usize;
     for entry in std::fs::read_dir(&corpus).expect("corpus directory") {
         let path = entry.expect("corpus entry").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("js") {
+        if path.extension().and_then(|extension| extension.to_str()) != Some(GOLDEN_EXTENSION) {
             continue;
         }
         let golden = std::fs::read_to_string(&path).expect("read golden");
@@ -377,7 +383,7 @@ fn emitted_js_is_independent_of_import_order() {
             "build failed for variant {variant}:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::fs::read_to_string(src.with_extension("js")).expect("read emitted js")
+        std::fs::read_to_string(src.with_extension(GOLDEN_EXTENSION)).expect("read emitted js")
     };
     let js_a = build("a", &order_a);
     let js_b = build("b", &order_b);

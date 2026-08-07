@@ -303,7 +303,7 @@ fn ssr_process_render_matches_browser_dom_tree() {
 
     // Process leg: `render(app())`.
     let server_run = Command::new("node")
-        .arg("server.js")
+        .arg("server.mjs")
         .current_dir(&server)
         .output()
         .expect("run node server");

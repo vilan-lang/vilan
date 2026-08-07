@@ -135,7 +135,7 @@ impl StreamingServer {
             String::from_utf8_lossy(&build.stderr)
         );
         let mut child = Command::new("node")
-            .arg(dir.join("src/main.js"))
+            .arg(dir.join("src/main.mjs"))
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()

@@ -35,8 +35,11 @@ scaffold that stops working fails Vilan's build before it reaches yours.
 
 Compiles to JavaScript. The path may be a `.vl` file, a project
 directory, or omitted; then the nearest `vilan.toml` decides what to
-build. A single-entry package writes `<file>.js` beside the entry; a
-multi-entry package writes `dist/<name>.js` per entry. Assets emitted at
+build. A single-entry package writes the bundle beside the entry; a
+multi-entry package writes one into `dist/` per entry. The extension is
+the target's: `.mjs` on a process runtime (Node/Deno/Bun), so the host
+classifies the emitted ESM without inspecting it, and `.js` on the
+browser, whose `<script type="module">` already declares it. Assets emitted at
 compile time (the styling system's CSS) land beside the output.
 `[build] run` hooks execute first; a failing hook fails the build.
 

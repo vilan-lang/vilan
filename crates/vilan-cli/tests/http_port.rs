@@ -132,7 +132,7 @@ fun main() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    let server = ServerChild::spawn(&dir.join("src/main.js"));
+    let server = ServerChild::spawn(&dir.join("src/main.mjs"));
     let announced = server.await_line("port=", Duration::from_secs(60));
     let port: u16 = announced
         .split_whitespace()

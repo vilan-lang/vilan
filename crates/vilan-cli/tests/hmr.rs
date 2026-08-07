@@ -435,6 +435,103 @@ fn the_dev_channel_drives_the_watch_round() {
     outcome.unwrap();
 }
 
+/// The client leg of the B87 repro: a module-level spawn plus a binding that
+/// AWAITS it. `pending` is a `Task` (not a transferable form, so it is
+/// excluded from adopt), but `value: i32` is `TransferForm::Value`, so it IS
+/// wrapped in the `__hmr_adopt` thunk — which is built `is_async: false`.
+fn awaiting_initializer_source() -> String {
+    "import std::print;\nimport std::task::Task;\nimport std::time::sleep;\n\n     fun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\n     let pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\n     fun main() {\n\tprint(value);\n}\n"
+        .to_string()
+}
+
+/// B87 — the adopt thunk cannot carry an `await`, and now it never has to.
+///
+/// Before B86a closed the await-shaped hole, a watch round over this program
+/// compiled CLEAN and emitted `return await (pending);` inside the
+/// `is_async: false` thunk: a dev bundle that did not parse at all
+/// (`node --check` → "SyntaxError: Unexpected reserved word"), so the whole
+/// dev loop was dead, not degraded (`top-level-await.md` §1.5).
+///
+/// The adopt contract is deliberately NOT redesigned — the paper records it as
+/// latent, load-bearing only if top-level await is ever allowed (§4.2). What
+/// is claimed instead is that the shape is UNREACHABLE from vilan source, and
+/// that is what this pins: the same watch round now fails at compile, and no
+/// bundle carrying the unparseable shape is ever written.
+#[test]
+fn an_awaiting_initializer_cannot_reach_the_hmr_adopt_thunk() {
+    let dir = temp_project("adopt_await");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &client_source("a", "x1"));
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), deadline),
+            "round 1 should have written dist/client.js"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let mut sse = SseClient::connect(port);
+
+        // The edit that used to produce the unparseable bundle.
+        write(&dir, "src/client.vl", &awaiting_initializer_source());
+
+        // It is refused at COMPILE, and the refusal is the module-init rule —
+        // not some incidental later failure.
+        let error_event = sse.expect_event("error", deadline);
+        assert!(
+            error_event.contains("cannot suspend"),
+            "the round should fail with the module-initializer refusal: {error_event}"
+        );
+
+        // And the bundle on disk is still round 1's — never one carrying the
+        // shape that does not parse. `return await (` is the emitter's
+        // spelling and appears nowhere in the hand-written shim, so it is a
+        // faithful witness for "an await was walked into the thunk".
+        let bundle = std::fs::read_to_string(dir.join("dist/client.js")).expect("read bundle");
+        assert!(
+            !bundle.contains("return await ("),
+            "a bundle carrying `return await (` reached dist/ — the adopt \
+             thunk is synchronous, so this does not parse:\n{bundle}"
+        );
+        assert!(
+            !bundle.contains("pkg::value"),
+            "the awaited binding must never be handed to the adopt thunk:\n{bundle}"
+        );
+        // The same, through the route the browser actually fetches.
+        let served = String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+        assert!(
+            !served.contains("return await (") && !served.contains("pkg::value"),
+            "the served bundle must not carry the awaited binding's thunk:\n{served}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.unwrap();
+}
+
 /// A `common` library both legs import (`pkg::common::banner`). Editing it
 /// changes both bundles — the shared-edit row of the §6 matrix.
 fn common_source(banner: &str) -> String {
@@ -601,7 +698,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             bundle_before.contains("clientmark_one"),
             "the round-1 client bundle carries the original marker"
         );
-        let server_before = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let server_before = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
 
         // A client-only edit: the client bundle changes, the server's sources do
         // not — so the round SKIPS the server (prints the skip line) and pushes a
@@ -632,7 +729,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
 
         // Reuse fidelity: the skipped server leg's dist bytes are the round-1
         // artifact, untouched by the skip round.
-        let server_after = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let server_after = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
         assert_eq!(
             server_after, server_before,
             "a skipped leg's dist bytes must be exactly the reused artifact"
@@ -656,7 +753,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             "the one-shot rebuild should succeed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let fresh = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let fresh = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
         assert_eq!(
             &fresh, reused,
             "a one-shot build must equal the reused (cache-hit round) artifact"
@@ -784,7 +881,7 @@ fn port_from_buffer(buffer: &Arc<Mutex<Vec<String>>>, deadline: Duration) -> Opt
 /// A15 (`--entry`): a workspace with TWO Node legs (the kolt shape — a `server`
 /// and a `probe`) plus a browser leg. `run --watch --entry server` runs the
 /// chosen `server` leg (its boot marker appears), while the non-selected `probe`
-/// leg still COMPILES into the workspace (`dist/probe.js` exists) but is never
+/// leg still COMPILES into the workspace (`dist/probe.mjs` exists) but is never
 /// launched (its marker never appears). HMR rounds then work under the selection:
 /// a client edit swaps, a server edit restarts the chosen leg — and the probe
 /// still never runs. Same single-watcher, quick-exit-legs process hygiene as the
@@ -835,7 +932,7 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
             "the `--entry server` leg should run"
         );
         assert!(
-            dir.join("dist/probe.js").exists(),
+            dir.join("dist/probe.mjs").exists(),
             "the non-selected probe leg still compiles into the workspace"
         );
 
@@ -912,7 +1009,7 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
         .expect("run vilan build");
     assert!(status.success(), "the one-shot build should succeed");
     let one_shot_server =
-        std::fs::read(dir.join("dist/server.js")).expect("build wrote dist/server.js");
+        std::fs::read(dir.join("dist/server.mjs")).expect("build wrote dist/server.mjs");
 
     // A watch round rewrites dist/ from the same sources; its (uninstrumented)
     // server bundle must match byte-for-byte.
@@ -932,8 +1029,8 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
             wait_for_line(&lines, "server-booted", deadline),
             "round 1 should compile and boot the server"
         );
-        let watched_server = std::fs::read(dir.join("dist/server.js"))
-            .expect("the watch round wrote dist/server.js");
+        let watched_server = std::fs::read(dir.join("dist/server.mjs"))
+            .expect("the watch round wrote dist/server.mjs");
         assert_eq!(
             one_shot_server, watched_server,
             "a watch round's server bundle must be byte-identical to a one-shot build's"

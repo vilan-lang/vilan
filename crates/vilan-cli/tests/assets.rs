@@ -74,7 +74,7 @@ main();
         String::from_utf8_lossy(&output.stderr)
     );
     // The JS runs (the consts folded; no runtime emit calls survive).
-    let js = std::fs::read_to_string(dir.join("app.js")).unwrap();
+    let js = std::fs::read_to_string(dir.join("app.mjs")).unwrap();
     assert!(!js.contains("__emit_asset"), "no runtime emit calls:\n{js}");
     // The stylesheet sits beside it: deduplicated, lexically ordered ('.'
     // before '@', so media blocks take the later cascade position).

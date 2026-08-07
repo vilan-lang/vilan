@@ -43,4 +43,7 @@ async function labelled(label) {
 		return "third";
 	}, "main");
 	console.log(await (block));
-})();
+})().catch(($a) => {
+	console.error(String($a));
+	process.exit(1);
+});

@@ -125,7 +125,7 @@ fn the_node_template_builds_runs_and_passes_its_own_test() {
     );
 
     assert_ok(&vilan(&project, &["build", "."]), "vilan build .");
-    assert!(project.join("main.js").is_file(), "missing main.js");
+    assert!(project.join("main.mjs").is_file(), "missing main.mjs");
 }
 
 #[test]
@@ -200,8 +200,8 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
             "missing dist/client.js"
         );
         assert!(
-            project.join("dist/server.js").is_file(),
-            "missing dist/server.js"
+            project.join("dist/server.mjs").is_file(),
+            "missing dist/server.mjs"
         );
         assert!(
             project.join("dist/client.css").is_file(),
@@ -212,7 +212,7 @@ fn the_fullstack_template_builds_both_entries_and_serves_them() {
         // `src/app.html` by relative path, exactly as `vilan run .` runs it.
         let log = project.join("server.log");
         let mut server = Command::new("node")
-            .arg("dist/server.js")
+            .arg("dist/server.mjs")
             .current_dir(&project)
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&log).expect("log file")))

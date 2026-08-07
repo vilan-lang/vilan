@@ -294,9 +294,44 @@ Details in the [time reference](../std/time.md).
 - **No views across a suspension.** A `&`/`&mut` view held across an
   await is rejected. Re-derive after; see
   [the memory model](memory-model.md).
+- **No top-level await.** Module initialization is synchronous, on
+  purpose: the order bindings initialize in is derived from what they
+  read, and a suspension there would stall bindings that never asked to
+  wait. An `await` in a module-level initializer is a compile error in
+  every spelling.
+
+  The idiom is to **spawn at load and await in `main`**, which starts
+  the work just as early and keeps independent work overlapping:
+
+  ```vilan,norun
+  import std::print;
+  import std::time::sleep;
+  import std::task::Task;
+
+  fun load(ms: i32): i32 {
+  	sleep(ms);
+  	7
+  }
+
+  let config: Task<i32> = async load(10);   // starts at load
+  let catalog: Task<i32> = async load(20);  // ... and so does this, concurrently
+
+  async fun main() {
+  	print(await config + await catalog);   // the wait is visible, and here
+  }
+  ```
+
+  Creating a closure or an `async { .. }` block in an initializer is
+  fine too — its body is not the initializer, and nothing runs it at
+  load.
 
 ## Traps
 
+- A failure that escapes `async fun main()` **reports the error and
+  exits non-zero**, the same as a panic out of a sync `main` — it is
+  not left to the host's unhandled-rejection policy. Attaching that
+  outcome costs nothing at runtime: a `main` that keeps running (a
+  server holding a listener) is not hurried along by it.
 - On Node, **the process exits when nothing is left to do**: once
   `main` finishes, only live host handles (a running timer, a socket, a
   listening server) keep it alive. A dropped task that is merely

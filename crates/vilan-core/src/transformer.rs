@@ -1765,16 +1765,75 @@ impl<'src> Transformer<'src> {
         self.restore_instance(saved_instance);
 
         // An async `main` (it awaits) runs inside an invoked async arrow, since
-        // top-level `await` isn't assumed: `(async () => { .. })()`.
+        // module initialization is synchronous and there is no top-level await
+        // to lift it into (`execution.md` §7.1): `(async () => { .. })()`.
+        //
+        // That promise used to be DISCARDED (J6). A rejection then reached the
+        // host only as an unhandled-rejection event, so what a failing `main`
+        // did was the host's default policy rather than vilan's: Node ≥15
+        // happens to rethrow and exit non-zero, but it buries the program's
+        // error under `UnhandledPromiseRejection` and an engine-internal
+        // stack, and a host configured otherwise (or an older Node) exits 0.
+        // A *sync* `main` that panics has always terminated with the message
+        // and a non-zero code, and async `main` is the substitute vilan steers
+        // people to instead of top-level await — so the two must agree.
+        //
+        // `.catch` and not `await`: attaching a handler does not delay
+        // anything, so a `main` that never settles (a listening server) is
+        // untouched — it keeps running, and the handler simply never fires.
+        // `process.exit` rather than `exitCode`, for the same reason in
+        // reverse: a rejection while some other handle is still live (that
+        // same listener) would otherwise set a code and then hang forever.
+        // The unwind through `main` has already run its `finally` blocks by
+        // the time the handler sees the error, so exiting here does not skip
+        // teardown the way §7.1's exit-code path would.
         if main_is_async {
-            t_main_fn_body = vec![js::Node::Call(
+            let invocation = js::Node::Call(
                 Box::new(js::Node::Closure(js::Closure {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
                 })),
                 Vec::new(),
-            )];
+            );
+            // The browser has no exit code; its unhandled-rejection path
+            // already reports to the console, so there is nothing to add.
+            t_main_fn_body = if self.program.platform.has_process_exit() {
+                let error_name = self.ng.next_name();
+                vec![js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(invocation),
+                        "catch".to_string(),
+                    )),
+                    vec![js::Node::Closure(js::Closure {
+                        parameters: vec![js::Parameter {
+                            name: error_name.clone(),
+                        }],
+                        body: vec![
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("console".to_string())),
+                                    "error".to_string(),
+                                )),
+                                vec![js::Node::Call(
+                                    Box::new(js::Node::Local("String".to_string())),
+                                    vec![js::Node::Local(error_name)],
+                                )],
+                            ),
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("process".to_string())),
+                                    "exit".to_string(),
+                                )),
+                                vec![js::Node::Number("1".to_string(), None)],
+                            ),
+                        ],
+                        is_async: false,
+                    })],
+                )]
+            } else {
+                vec![invocation]
+            };
         }
 
         // Assembly-time tree-shake: keep a binding's declaration only when
@@ -3637,6 +3696,26 @@ impl<'src> Transformer<'src> {
                         inner
                     };
                     thunk_block.push(js::Node::Return(Box::new(inner)));
+                    // SYNCHRONOUS, and it depends on an invariant held
+                    // elsewhere: a module-level initializer cannot suspend
+                    // (`execution.md` §7.1, enforced await-shaped in
+                    // `async_infer`), so nothing walked into `thunk_block`
+                    // above can be an `await`. When the check was merely
+                    // call-shaped this was reachable, and the result was
+                    // `return await (pending);` inside a non-async arrow — a
+                    // dev bundle that did not parse at all
+                    // (`top-level-await.md` §1.5).
+                    //
+                    // Do not "fix" that by flipping this to `is_async: true`.
+                    // The thunk's value is written into a `const` that every
+                    // later binding reads as a value, and
+                    // `__hmr_adopt_signal`/`__hmr_adopt_shared` do
+                    // `var cell = thunk(); cell[0].v = …` — a promise-shaped
+                    // thunk poisons all three, and the call sites would each
+                    // need an `await`, which is top-level await again on every
+                    // transferable binding in the bundle. If the await rule is
+                    // ever relaxed, this contract is a redesign, not a patch
+                    // (`top-level-await.md` §4.2).
                     let thunk = js::Node::Closure(js::Closure {
                         parameters: Vec::new(),
                         body: thunk_block,

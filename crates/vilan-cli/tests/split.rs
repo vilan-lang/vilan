@@ -899,7 +899,7 @@ fn a_split_builds_chunks_are_servable_through_the_manifest() {
 
     let dist = staged.join("dist");
     let mut server = Command::new("node")
-        .arg(Path::new("dist").join("server.js"))
+        .arg(Path::new("dist").join("server.mjs"))
         .current_dir(&staged)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

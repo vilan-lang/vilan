@@ -115,6 +115,12 @@ pub struct CallGraph {
     /// Their `closure_parent_of` stays empty (as it always has); the binding
     /// itself is their creator for coloring purposes.
     initializer_closures: HashMap<Id, Vec<Id>>,
+    /// The `await` expressions inside each module-level binding's initializer,
+    /// in source order — the initializer's OWN awaits, not those of a closure
+    /// it merely creates (the collector does not descend into a closure body,
+    /// which is what makes module-level spawn legal). Module initialization is
+    /// synchronous, so any entry here is a refusal; `async_infer` reports it.
+    initializer_awaits: HashMap<Id, Vec<Id>>,
 }
 
 thread_local! {
@@ -205,11 +211,14 @@ impl CallGraph {
                 nested_closures: Vec::new(),
                 global_references: Vec::new(),
                 function_references: Vec::new(),
-                has_await: false,
+                await_sites: Vec::new(),
                 visited: HashSet::new(),
             };
             collector.walk(initial);
             graph.initializer_calls.insert(binding, collector.calls);
+            graph
+                .initializer_awaits
+                .insert(binding, collector.await_sites);
             graph
                 .initializer_closures
                 .insert(binding, collector.nested_closures);
@@ -242,7 +251,7 @@ impl CallGraph {
             nested_closures: Vec::new(),
             global_references: Vec::new(),
             function_references: Vec::new(),
-            has_await: false,
+            await_sites: Vec::new(),
             visited: HashSet::new(),
         };
         walk(&mut collector);
@@ -253,7 +262,7 @@ impl CallGraph {
                 .or_default()
                 .push(closure_id);
         }
-        if collector.has_await {
+        if !collector.await_sites.is_empty() {
             self.awaits.insert(node.id());
         }
         self.calls.insert(node.id(), collector.calls);
@@ -328,6 +337,17 @@ impl CallGraph {
     /// initializer.
     pub fn initializer_closures_of(&self, id: Id) -> &[Id] {
         self.initializer_closures
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The `await` expressions inside a module-level binding's (non-`const`)
+    /// initializer, in source order. An `await` inside a closure the
+    /// initializer merely *creates* is not here: the closure is its own unit,
+    /// and creating it suspends nothing at load.
+    pub fn initializer_awaits_of(&self, id: Id) -> &[Id] {
+        self.initializer_awaits
             .get(&id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -495,7 +515,11 @@ struct Collector<'a, 'src> {
     nested_closures: Vec<Id>,
     global_references: Vec<(Id, Id)>,
     function_references: Vec<(Id, Id)>,
-    has_await: bool,
+    /// The `await` expressions walked in this unit's own body, in source
+    /// order. A node only needs to know *whether* it awaits; a module-level
+    /// initializer needs the sites themselves, to span its refusal at the
+    /// `await` the user wrote.
+    await_sites: Vec<Id>,
     visited: HashSet<Id>,
 }
 
@@ -555,7 +579,7 @@ impl<'a, 'src> Collector<'a, 'src> {
             }
             // An `await` makes this node async; its operand may hold more calls.
             Expr::Await(inner) => {
-                self.has_await = true;
+                self.await_sites.push(id);
                 self.walk(*inner);
             }
             // A local binding's calls live in its initializer. A MODULE-LEVEL

@@ -47,4 +47,7 @@ async function delayed(label, ms) {
 	for (const result of results) {
 		console.log(result);
 	}
-})();
+})().catch(($a) => {
+	console.error(String($a));
+	process.exit(1);
+});

@@ -78,7 +78,7 @@ fn run(javascript: &str, label: &str) -> (String, i32) {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "vilan_release_names_{}_{unique}_{label}.js",
+        "vilan_release_names_{}_{unique}_{label}.mjs",
         std::process::id()
     ));
     std::fs::write(&path, javascript).expect("write scratch program");

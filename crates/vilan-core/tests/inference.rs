@@ -885,7 +885,11 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.js", std::process::id()));
+    // `.mjs`, exactly as the CLI's `run`/`test`/watch scripts: a process
+    // runtime classifies before it parses, and a harness that ran its bundles
+    // as CommonJS could not see an ESM-only defect at all
+    // (`top-level-await.md` §8.1).
+    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -896,6 +900,29 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
         Ok(output) => Err(vec![String::from_utf8_lossy(&output.stderr).into_owned()]),
         Err(error) => Err(vec![format!("could not run node: {error}")]),
     }
+}
+
+/// Compile and run, returning `(stdout, stderr, exit code)` whatever the exit —
+/// for pinning the entry shim's failure contract (J6), where the exit CODE and
+/// what reached stderr are the claims, not the stdout.
+fn compile_and_run_status(source: &str) -> (String, String, i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let javascript = compile(source).expect("expected a clean compile");
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("vilan_exit_{}_{unique}.mjs", std::process::id()));
+    std::fs::write(&path, javascript).expect("write script");
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
 }
 
 /// Compile, then execute the emitted JS with `node`, returning its stdout. A
@@ -958,7 +985,7 @@ fn compile_and_run_capturing_stderr(source: &str) -> Result<(String, String), Ve
 
     let js = compile(source)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.js", std::process::id()));
+    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -23492,6 +23519,387 @@ fn creating_an_async_closure_in_an_initializer_stays_legal() {
             let _w = warm;
         }
         "#,
+    );
+}
+
+// --- B86: the rule is AWAIT-shaped, not call-shaped ---------------------------
+//
+// The shipped check walked `initializer_calls_of`, so it only ever saw an
+// async CALL. An `await` whose operand is not a call — a `Task`-valued
+// binding, a spawn, a `Task` returned by a plain sync function — slipped
+// through, compiled clean, and emitted a genuine top-level `await` into the
+// bundle (`top-level-await.md` §1.3), which then miscompiled on the Node leg
+// (§1.4) and failed to parse at all under HMR (§1.5). These pin every row of
+// §5.2's boundary table, per case.
+
+/// `ready` + a module-level spawn, the shared preamble for the rows below.
+const AWAIT_SHAPED_PREAMBLE: &str = r#"
+        import std::print;
+        import std::task::Task;
+        import std::time::{ sleep_for, Duration };
+
+        fun ready(): i32 {
+            sleep_for(Duration::millis(1));
+            7
+        }
+"#;
+
+#[test]
+fn awaiting_a_task_valued_module_binding_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_valued_module_binding_steers_to_main() {
+    // The second message form: the operand is right there and already
+    // spawned, so the steer is to move the `await`, not to restructure.
+    assert_fails_noting(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "a module-level binding cannot suspend",
+        "await pending",
+        "hold `pending` here and `await` it in `main`",
+    );
+}
+
+#[test]
+fn awaiting_a_spawn_in_an_initializer_is_rejected() {
+    // The sharpest hole: `async ready()` is a CREATION, so the call to
+    // `ready` lives inside the spawned closure and never entered the
+    // initializer's direct call set.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async ready();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async ready()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_an_async_block_in_an_initializer_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async {{ 7 }};
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async { 7 }",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_from_a_sync_function_is_rejected() {
+    // `spawn_it` is not async — it returns a `Task`. The call check sees a
+    // sync callee and passes; the await check is what refuses it.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        fun spawn_it(): Task<i32> {{
+            async ready()
+        }}
+
+        let value: i32 = await spawn_it();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await spawn_it()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_nested_in_an_initializer_expression_is_rejected() {
+    // Any `await` REACHABLE in the initializer's own expression tree — not
+    // just one at its root.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = (await pending) + 1;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_non_task_in_an_initializer_is_rejected() {
+    // `await` on a plain value is legal JS and legal vilan inside a function;
+    // at module level it is still a suspension point, so it is still refused
+    // — and the steer stays true (it never claims the operand is a spawn).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        let plain: i32 = 7;
+        let value: i32 = await plain;
+
+        fun main() {
+            print(value);
+        }
+        "#,
+        "await plain",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_inside_a_closure_created_by_an_initializer_stays_legal() {
+    // THE BOUNDARY, kept deliberately where the call-shaped check had it: a
+    // closure's body is not the initializer. Creating the closure suspends
+    // nothing at load, so the initializer does not await — only calling it
+    // does, and that happens wherever the caller is.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let later = || {{ await pending }};
+
+        async fun main() {{
+            print(await later());
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_await_inside_an_async_block_in_an_initializer_stays_legal() {
+    // Same boundary through the `async { .. }` spelling: the block lowers to
+    // a closure, which is its own unit.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let wrapped: Task<i32> = async {{ await pending }};
+
+        async fun main() {{
+            print(await wrapped);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn spawning_at_module_level_stays_legal() {
+    // The idiom the diagnostic steers to, and the reason the null
+    // recommendation holds: the work starts at load, only the observation
+    // moves into `main`.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+
+        async fun main() {{
+            print(await pending);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
+    // `await ready()` is BOTH an await and an async call. The call form names
+    // the callee, so it wins — and it must be the ONLY diagnostic, not a pair
+    // for one line.
+    // `warm` takes an argument so the call site's snippet (`warm(1)`) is
+    // distinct from its declaration — the span must land on the call.
+    let source = r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        fun warm(seed: i32): i32 {
+            sleep_for(Duration::millis(1));
+            seed
+        }
+
+        let value: i32 = await warm(1);
+
+        fun main() {
+            print(value);
+        }
+        "#;
+    assert_fails_spanning(source, "warm(1)", "calls `warm`, which is async");
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| {
+            message.contains("cannot await (module initialization is synchronous)")
+                || message.contains("cannot suspend")
+        })
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "one refusal per binding, not a pair for one line"
+    );
+}
+
+// --- J6: `main`'s promise gets a contract ------------------------------------
+//
+// An async `main` is emitted as a fire-and-forget IIFE, and its promise used to
+// be DISCARDED. What a failing `main` then did was the HOST's policy, not
+// vilan's: Node >= 15 rethrows an unhandled rejection and exits non-zero, but
+// it buries the program's error under `UnhandledPromiseRejection` and an
+// engine-internal stack, and a host configured otherwise exits 0. A sync `main`
+// that panics has always terminated with the message and a non-zero code, and
+// async `main` is what the language steers people to instead of top-level
+// await (`top-level-await.md` §4.4/§8.3) — so the two must agree.
+
+#[test]
+fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("before");
+            panic("boom");
+            print("after");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a rejecting `main` must exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("boom"),
+        "the program's own error must reach stderr: {stderr}"
+    );
+    // The point is not merely a non-zero code — Node already gave one. It is
+    // that the failure is OURS to report, so the host's unhandled-rejection
+    // wrapper is gone and what remains is the message.
+    assert!(
+        !stderr.contains("UnhandledPromiseRejection")
+            && !stderr.contains("ERR_UNHANDLED_REJECTION"),
+        "the error must be surfaced by the shim, not left to the host's \
+         unhandled-rejection path: {stderr}"
+    );
+    assert!(
+        stdout.contains("before") && !stdout.contains("after"),
+        "output before the failure must still flush, and nothing after it \
+         may run: {stdout:?}"
+    );
+}
+
+#[test]
+fn a_resolving_async_main_exits_zero() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ok");
+        }
+        "#,
+    );
+    assert_eq!(code, 0, "a resolving `main` must exit 0; stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn a_panicking_sync_main_is_unchanged() {
+    // The contract async `main` was brought level WITH; it must not move.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+
+        fun main() {
+            print("before");
+            panic("boom");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a panicking sync `main` still exits 1: {stderr}");
+    assert!(stderr.contains("boom"), "and still says why: {stderr}");
+    assert!(stdout.contains("before"));
+}
+
+#[test]
+fn an_async_main_that_keeps_working_is_not_cut_short() {
+    // THE SERVER-LEG CARVE, in the form a test can hold: the shim attaches a
+    // handler, it does not `await`. A `main` that suspends and resumes — the
+    // shape a listening server generalizes — runs to completion, and a `main`
+    // that never settles is likewise never hurried. Had the shim awaited the
+    // IIFE (or exited on settle), this would truncate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            print("start");
+            sleep_for(Duration::millis(30));
+            print("middle");
+            sleep_for(Duration::millis(30));
+            print("end");
+        }
+        "#,
+        "start\nmiddle\nend\n",
+    );
+}
+
+#[test]
+fn the_browser_leg_gets_no_exit_handler() {
+    // The browser has no exit code, and its own unhandled-rejection path
+    // already reports to the console — so there is nothing to attach, and
+    // `process` does not exist to reference.
+    let emitted = compile_browser(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ui");
+        }
+        "#,
+    )
+    .expect("expected a clean browser compile");
+    assert!(
+        !emitted.contains("process.exit"),
+        "the browser bundle must not reference `process`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("})();"),
+        "the browser entry stays the bare fire-and-forget IIFE:\n{emitted}"
     );
 }
 
