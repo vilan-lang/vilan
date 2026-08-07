@@ -24,6 +24,10 @@ Two corpus goldens moved, both by exactly the new write and the small helper beh
 
 ---
 
+**Internal:** the `const` pass's two report lists (calls that cross into compile-time-only territory, and compile-time-only values that escape as values) now sort on their whole entry rather than on the span's start alone, so the `dedup` beside them — which compares the whole entry — cannot be defeated by two distinct entries sharing a start. Latent: no diagnostic in the tree changed.
+
+---
+
 ## v0.32.0 — 2026-08-06
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.
