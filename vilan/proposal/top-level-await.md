@@ -1,6 +1,14 @@
 # Top-level await — the design half (J3)
 
-> Status: DRAFT (awaiting owner review) — filed from backlog J3; design before code per the entry.
+> Status: RATIFIED 2026-08-07 (owner review) — §8.2: the null
+> recommendation IS the owner's position ("Null is fine") — the hole
+> closes, TLA stays shut; no revisit trigger named, so the default
+> stands (revisit on real user demand). §8.1: the owner ruled **.mjs**
+> for Node-leg build artifacts — AGAINST this draft's marker
+> recommendation, which was held loosely; the implementation follows
+> the ruling. B86/J6 unblocked; B87 verified-unreachable rides B86.
+>
+> Prior status: DRAFT (awaiting owner review) — filed from backlog J3; design before code per the entry.
 >
 > Origin: backlog J3 (`backlog-2026-07-18.md:718-721`), the standing other
 > half of a 2026-07-14 fix. The diagnostic half shipped in the v0.4.0
