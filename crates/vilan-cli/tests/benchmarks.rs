@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod support;
+
 #[test]
 fn benchmarks_run_and_report_the_deterministic_counts() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/benchmarks");
@@ -17,14 +19,26 @@ fn benchmarks_run_and_report_the_deterministic_counts() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn vilan run");
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // A liveness bound, and nothing more: this file asserts counts, not speed
+    // ("Timings are machine-dependent and deliberately not asserted", above).
+    // The 90 s literal that stood here was the heaviest COMPILE budget in the
+    // suite wearing a benchmark's clothes — `vilan/benchmarks` is the biggest
+    // project any test builds (13.4 s on an idle 16-core box, 24.5 s at load
+    // average ~28) and the benchmark workload itself runs in ~0.2 s of that. It
+    // failed at exactly 90.0 s on both CI runners in v0.32.0. E40.
+    let liveness = support::run_liveness();
+    let deadline = Instant::now() + liveness;
     loop {
         match child.try_wait().expect("poll vilan run") {
             Some(_status) => break,
             None if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("benchmarks did not finish within 90s");
+                panic!(
+                    "the benchmarks build+run did not finish within {liveness:?} \
+                     (a liveness bound, {:?} per reference compile on this machine)",
+                    support::reference_compile()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }

@@ -362,3 +362,85 @@ more `split` legs and `nested_nurseries_join_inside_out` — and `hmr_swap`
 itself at the then-120 s bound, which is what raised it to 300 s. The
 pattern is a backlog item of its own: the E32 treatment is unfinished in
 roughly a dozen places, and it wants one pass, not per-test patches.
+
+## 7. The rest of the family's compile budgets (E40, 2026-08-07)
+
+§6's closing paragraph filed the pattern; this is the pass. The v0.32.0 CI
+run made it urgent rather than tidy: it failed on BOTH the ubuntu and the
+windows leg, with the same two tests, each at exactly its own ceiling —
+`cancellation`'s `cancel_aborts_an_in_flight_fetch` at 45 s and
+`benchmarks`'s `benchmarks_run_and_report_the_deterministic_counts` at 90 s
+— while 3044 of the other 3046 tests passed. Shared 4-core runners take
+~54 min for the suite a 16-core dev box runs in ~9; under that interleave a
+fixed wall clock wrapped around a `vilan run` is a bet on the runner.
+
+**The unit, and why a cheap one is honest.** E39 could budget in units of
+the round the test itself had just paid for. Nothing in this family has a
+round 1, so the unit is measured separately: `support::reference_compile()`
+is one `vilan build` of a `std::print`-only project, run once per test,
+lazily. That probe is cheap (~0.23 s) rather than representative, and the
+measurement that justifies it is the one worth keeping:
+
+| project                             | idle    | load average ~28 |
+|-------------------------------------|---------|------------------|
+| the reference (`std::print` only)   | 227 ms  | 490 ms           |
+| a node app importing `std::time`    | 6.07 s  | 11.4 s           |
+| `vilan/benchmarks` (the heaviest)   | 13.4 s  | 24.5 s           |
+
+Contention costs all three the same ~2×, across a 60× range of compile
+weight — so the cheap probe measures the *machine* just as well as an
+expensive one, and the suite does not pay a real compile per test to find
+out. (`std::time` is the whole reason the range is that wide: importing it
+alone costs 6 s where `std::http`, `std::fetch` and `std::task` each cost
+~0.25 s. That is E43's cliff showing up in a second module; not chased
+here.) In reference units the heaviest member of the family is 59× idle /
+51× loaded, so `run_liveness()` is 240 units — E39's 4× over it — clamped
+to [60 s, `WATCH_LIVENESS`]. A probe that fails or hangs yields the
+CEILING, never a small number: a broken measurement must not be able to
+manufacture a tight budget.
+
+**Eleven watchdogs, and one real assertion.** `benchmarks` (90 s),
+`rpc_http` (60 s × 7), `owned_nursery` (20 s × 2) and `streaming` (45 s)
+all take the liveness bound: none of them claims a speed, and each one's
+actual claim is pinned by output that stays true however long the box
+takes — `benchmarks` says so in its own header, and `owned_nursery`'s
+"a drop never cancelled" is caught by `task-finished` appearing, not by a
+clock. Three watch-round deadlines the filing had missed join
+`WATCH_LIVENESS` for the same reason E39 moved `hmr.rs`'s six: `split`'s
+120 s, `assets`'s 120 s (whose comment already recorded 20 s losing this
+race three times in two days) and `watch_lifecycle`'s 60 s — the comment
+E39 quoted for reaching the right conclusion first, still carrying the
+wrong number.
+
+`cancellation` is the one member with a genuine claim about time, and it
+had TWO clocks on the same window: the 45 s watchdog and a *tighter* 30 s
+`started.elapsed()` that also began at `vilan run`'s spawn — a compile
+budget spelled as a latency assertion, and therefore the first thing a
+loaded box breaks. E32 excised the compile with a function boundary;
+here there is a process boundary instead, so the program supplies a marker:
+`on_start` prints `server-up`, the harness timestamps stdout as it arrives,
+and the assertion runs from that marker to `aborted-fast`. The budget is
+20 s, taken from the program's own scale — the server answers at 60 s, the
+client cancels at 150 ms — and it was proven non-vacuous by planting a 25 s
+stall inside the program (the string assertions stay green, so only this pin
+can fire): red at 25.16 s of a 32.1 s run, which also measures the ~7 s of
+compile the window no longer contains.
+
+**Stress validation.** Two full `cargo nextest run --workspace` runs started
+concurrently on a 16-core box, the shape that produced E39's failure list:
+`3046 tests run: 3046 passed (21 slow), 6 skipped` in 1040.5 s and
+`3046 tests run: 3046 passed (23 slow), 6 skipped` in 1038.7 s, both exit 0.
+Every member of the family green in both, where E39's equivalent runs had
+neither finishing clean. The margins are the interesting part:
+`rpc_http`'s disconnect leg took 146.8 s and 139.1 s against the 60 s it
+used to be given, `split`'s watch round 80 s against 120 s, and
+`benchmarks` 67-70 s against the 90 s that CI had already exceeded.
+
+**Left standing, on purpose.** Fixed clocks that wrap only a *node boot* of
+an already-built bundle — `rpc_http`'s 60 s ready line, `split`'s 30 s port
+wait, and `http_port`, `init`, `ssr_fullstack` and `transport_robustness`
+outside the family — are not this bug: their compile is already outside the
+window (the `vilan build`-then-`node` shape), and every one of them survived
+both concurrent suites. They are worth converting if CI ever flags one, and
+worth nothing before that. E41's vacuously-green negative windows in
+`hmr.rs` are untouched.

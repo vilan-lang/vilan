@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod support;
+
 /// A single-package project whose program prints once and exits, so the round's
 /// `node` child is gone before the interrupt lands: what remains on disk is
 /// exactly the temp script, with no orphan to clean up after the assertion.
@@ -34,8 +36,13 @@ fn temp_package(tag: &str) -> PathBuf {
 
 /// Waits (bounded) for `condition`, polling — the watcher compiles before it
 /// writes anything, and how long that takes is not this test's business.
+///
+/// This file reached that conclusion before the rest of the family did, and E39
+/// cited its comment while setting `WATCH_LIVENESS`; E40 finishes the trade by
+/// giving it the shared bound, because 60 s is still a number about the machine
+/// sitting in a test that is about `Ctrl-C`.
 fn wait_for(label: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + support::WATCH_LIVENESS;
     while Instant::now() < deadline {
         if condition() {
             return;

@@ -15,6 +15,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+mod support;
+
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_rpc_http_{tag}_{}", std::process::id()));
@@ -29,23 +31,35 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Runs `vilan run <dir>` with a watchdog: a server that never exits is killed
-/// (and the test failed) instead of hanging the suite.
-fn vilan_run_with_timeout(dir: &Path, timeout: Duration) -> String {
+/// Runs `vilan run <dir>` under a liveness bound — a COMPILE plus the emitted
+/// app — and returns its stdout. A server that never exits is killed (and the
+/// test failed) instead of hanging the suite.
+///
+/// The bound is `support::run_liveness()`, not the 60 s literal that stood at
+/// every one of this file's seven call sites (E40). Every claim here is about
+/// what the round-trips PRINT — `verify = true`, `add -> 5`, `survivor sees 5` —
+/// so the number was never measuring anything the test asserts, and five of
+/// these legs died on it at exactly 60.1 s under two concurrent suites.
+fn vilan_run_with_liveness_bound(dir: &Path) -> String {
+    let liveness = support::run_liveness();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn vilan run");
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + liveness;
     loop {
         match child.try_wait().expect("poll vilan run") {
             Some(_status) => break,
             None if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("vilan run did not exit within {timeout:?} (server hung?)");
+                panic!(
+                    "the build+run did not exit within {liveness:?} (a liveness bound, {:?} \
+                     per reference compile on this machine — server hung?)",
+                    support::reference_compile()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }
@@ -228,7 +242,7 @@ fun run_client(url: str) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     assert!(
         stdout.contains("verify = true"),
         "contract verification failed over HTTP:\n{stdout}"
@@ -348,7 +362,7 @@ fun run_clients(base: str) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     for expected in [
         "alice sees 0",
         "bob sees 0",
@@ -521,7 +535,7 @@ fun main() {{
 
     // Session 0 subscribes, then its process exits — the socket close must
     // reach the app as a disconnect.
-    let doomed_out = vilan_run_with_timeout(&doomed_dir, Duration::from_secs(60));
+    let doomed_out = vilan_run_with_liveness_bound(&doomed_dir);
     assert!(
         doomed_out.contains("doomed sees 0"),
         "the doomed session never saw the initial value:\n{doomed_out}"
@@ -530,7 +544,7 @@ fun main() {{
 
     // A fresh session subscribes and mutates: the disposed session must not
     // have taken the signal's other observers with it.
-    let survivor_out = vilan_run_with_timeout(&survivor_dir, Duration::from_secs(60));
+    let survivor_out = vilan_run_with_liveness_bound(&survivor_dir);
     for expected in ["survivor sees 0", "add -> 5", "survivor sees 5"] {
         assert!(
             survivor_out.contains(expected),
@@ -657,7 +671,7 @@ fun run_clients(port: i32) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     for expected in [
         "accept ok = true",
         "alice sees 0",
@@ -790,7 +804,7 @@ fun run_clients(port: i32) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     for expected in [
         "alice sees 0",
         "bob sees 0",
@@ -928,7 +942,7 @@ fun run_clients(port: i32) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(60));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     for expected in [
         "alice sees 0",
         "bob sees 0",

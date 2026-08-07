@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod support;
+
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_owned_{tag}_{}", std::process::id()));
@@ -27,25 +29,36 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Runs `vilan run <dir>` with a watchdog and returns `(stdout, stderr)`. A hang
-/// (a drop that never cancels, so the 60s sleep runs the clock out) kills the
-/// child and fails the test. Unlike `cancellation.rs`, this keeps stderr — the
-/// detached failure report is written there.
-fn run_project(dir: &Path, timeout: Duration) -> (String, String) {
+/// Runs `vilan run <dir>` under a liveness bound and returns `(stdout, stderr)`.
+/// Unlike `cancellation.rs`, this keeps stderr — the detached failure report is
+/// written there.
+///
+/// The bound is `support::run_liveness()`, not a literal (E40). The 20 s that
+/// stood here wrapped a COMPILE plus the program, and both of this file's tests
+/// died on it repeatedly under two concurrent suites. Nothing here claims a
+/// speed: "a drop that never cancels" — the failure the old comment named — is
+/// caught by the OUTPUT (`task-finished` present, `cleanup-A` absent), which is
+/// still true if the 60 s sleep runs all the way out. So this number only has to
+/// be too large for a healthy run and finite for a hung one.
+fn run_project(dir: &Path, liveness: Duration) -> (String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn vilan run");
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + liveness;
     loop {
         match child.try_wait().expect("poll vilan run") {
             Some(_status) => break,
             None if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("vilan run did not exit within {timeout:?} (a drop never cancelled?)");
+                panic!(
+                    "the build+run did not exit within {liveness:?} (a liveness bound, {:?} \
+                     per reference compile on this machine)",
+                    support::reference_compile()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -120,7 +133,7 @@ fun main() {
 }
 "#,
     );
-    let (stdout, stderr) = run_project(&dir, Duration::from_secs(20));
+    let (stdout, stderr) = run_project(&dir, support::run_liveness());
     assert!(
         stdout.contains("task-started"),
         "the owned task never started:\n{stdout}"
@@ -187,7 +200,7 @@ fun main() {
 }
 "#,
     );
-    let (stdout, stderr) = run_project(&dir, Duration::from_secs(20));
+    let (stdout, stderr) = run_project(&dir, support::run_liveness());
     // (b) the real failure is reported to the console, with the spawn origin.
     assert!(
         stderr.contains("unhandled task error") && stderr.contains("spawned in"),
