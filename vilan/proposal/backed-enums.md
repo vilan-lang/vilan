@@ -1,6 +1,13 @@
 # Backed enums — a variant carries the value the host speaks (B76)
 
-> Status: DRAFT (awaiting owner review) — filed from backlog B76; the owner's own question from the E31 review.
+> Status: RATIFIED 2026-08-08 (owner review) — as drafted, every settled
+> recommendation standing, with §7.2 DEFERRED: an `external fun` may NOT
+> return a backed enum in v1 — host boundaries keep the generated-wrapper
+> / `parse()` path (where an out-of-set value honestly yields `None`)
+> until backed enums grow a trap-arm story for the bare-`else` hazard
+> §7.2 records. Implementation is the v0.35.0 backed-enums lane.
+>
+> Prior status: DRAFT (awaiting owner review)
 >
 > Origin: OWNER NOTE 1 on `bindgen.md` (§9.4), recorded 2026-08-06 during the
 > E31 review and deliberately *not* settled inside bindgen — "record that as

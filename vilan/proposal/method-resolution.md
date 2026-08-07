@@ -721,6 +721,12 @@ name `a_duplicate_function_name_is_rejected`.
 
 ## 12. B83: the static path gets the tiering
 
+> RULED 2026-08-08 (owner): CLOSED AS DESIGNED — no trait-qualified
+> static syntax; the inherent declaration IS the disambiguator (it
+> outranks both trait tiers, which the shipped diagnostic already
+> steers to). Revisit only if a real user collision demands the
+> qualified spelling. The sweep found zero in-tree collisions.
+
 §S2's residue, filed as B83 by B74's arc. `prepped_static_accessors`
 resolved `Type::member` with a flat `find_map` over `implementations` in
 registration order, so a trait-provided static BEAT an inherent one that
