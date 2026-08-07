@@ -14088,6 +14088,37 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// Whether `constraint_id` names a generic parameter declared by a scope
+    /// ENCLOSING `scope_id` — a function's own `<T>`, an impl's binder, or a
+    /// trait's parameter seen from inside a default body. Such a parameter is
+    /// abstract at this site by construction: the declaration is checked once
+    /// for all of its instantiations, so nothing downstream can make it
+    /// concrete. A generic that is *not* enclosing arrived from somewhere else
+    /// and means only "not substituted yet" (B82).
+    ///
+    /// The lookup is by name through the scope chain and stops at the first
+    /// binding of that name, so a nearer parameter shadowing this one answers
+    /// `false` — the conservative direction.
+    fn generic_declared_by_enclosing_scope(&self, constraint_id: TypeId, scope_id: Id) -> bool {
+        let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
+            return false;
+        };
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let Some(scope) = self.scopes.get(&id) else {
+                return false;
+            };
+            if let Some(entity_id) = scope.name_to_id_map.get(name).copied() {
+                return matches!(
+                    self.expr_id_to_expr_map.get(&entity_id),
+                    Some(Expr::Generic(found)) if *found == constraint_id
+                );
+            }
+            current = scope.parent_id;
+        }
+        false
+    }
+
     /// Walks the optional generic parameters of a declaration into `scope_id`,
     /// registering each as a `Generic` type bound by its constraint, and
     /// returns the constraint type ids in declaration order.
@@ -16600,7 +16631,57 @@ impl<'src> Analyzer<'src> {
                 }
                 match expected_type_id.get_type(self) {
                     Type::Enum(expected_enum_id, _) if expected_enum_id == enum_id => {}
-                    Type::Unknown | Type::Any | Type::Generic(_) => {}
+                    Type::Unknown | Type::Any => {}
+                    // A bare generic parameter used to be waved through with the
+                    // unresolved types above, and it half belongs there. Nothing
+                    // was checked and the tag test was emitted anyway, so the
+                    // pattern matched by coincidence of representation — a
+                    // `List<i32>` `[0, 7]` "matched" `Shape::Circle(let radius)`
+                    // and bound `radius = 7` (B82). But which parameter it is
+                    // decides whether that is fixable HERE:
+                    //
+                    // - One declared by a scope ENCLOSING this pattern — the
+                    //   function's own `<T>`, or a trait's parameter inside a
+                    //   default body — is abstract by construction. The body is
+                    //   checked once for every instantiation at once, so no later
+                    //   pass can make it concrete, and the same default matched
+                    //   `Colour::Red` against a `Fruit::Apple(9)` for a second
+                    //   impl. That is an error. A BOUND does not rescue it: a
+                    //   trait bound cannot make a parameter be one particular
+                    //   enum, so the message does not suggest one.
+                    //
+                    // - One that arrived from elsewhere means only "not
+                    //   substituted yet". A closure argument to a METHOD's own
+                    //   generic reaches its body with the parameter still
+                    //   abstract, which is `std::ui::View::swap`'s shape and
+                    //   the routing guide's `swap(route, |current| match current
+                    //   { .. })` — a match that IS concrete at the call. Left
+                    //   lenient here, and pinned `#[ignore]`d: the fix is to
+                    //   instantiate that parameter (the free-function twin
+                    //   already does, and it gets the real check today).
+                    Type::Generic(constraint_id)
+                        if self.generic_declared_by_enclosing_scope(
+                            constraint_id,
+                            lookup_scope_id,
+                        ) =>
+                    {
+                        let parameter = self
+                            .pretty_print_type(&expected_type_id.get_type(self), &HashMap::new());
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span,
+                            msg: format!(
+                                "cannot match an enum variant against the generic parameter \
+                                 `{parameter}`: `{parameter}` is whatever each instantiation \
+                                 binds it to, so there is nothing here to check the pattern \
+                                 against — the tag test runs anyway and matches any value that \
+                                 happens to share the tag. Match a value of the enum's own type, \
+                                 or move the match to where `{parameter}` is concrete"
+                            ),
+                        });
+                        return None;
+                    }
+                    Type::Generic(_) => {}
                     Type::Enum(_, _) => {
                         self.diagnostics.push(Error {
                             note: None,

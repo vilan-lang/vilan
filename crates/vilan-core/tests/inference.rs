@@ -42660,6 +42660,294 @@ fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
     );
 }
 
+// --- B82: an enum-variant pattern against a bare generic parameter ----------
+// `resolve_pattern` waved a `Type::Generic` scrutinee through beside `Unknown`
+// and `Any`, so NOTHING was checked and the tag test was emitted anyway. The
+// pattern then matched by coincidence of representation, which is silent wrong
+// code, not a missing diagnostic: a `List<i32>` `[0, 7]` "matched"
+// `Shape::Circle(let radius)` and bound `radius = 7`, and a trait default
+// written over its own `T` matched `Colour::Red` against a `Fruit::Apple(9)`.
+//
+// Whether it is fixable AT the pattern turns on WHICH parameter it is, and the
+// evidence for the split is `std::ui::View::swap` — see the `#[ignore]`d pin at
+// the end of this block. A parameter declared by a scope ENCLOSING the pattern
+// is abstract by construction (the declaration is checked once for all of its
+// instantiations), so it is an error. One that arrived from elsewhere means
+// only "not substituted yet", and the free-function twin already substitutes.
+
+/// B82's core case: a generic function matching on its own `T`-typed parameter.
+/// Every arm of the family is silent wrong code at runtime, not merely
+/// unchecked — `probe([0, 7])` returned `7` and `probe(Fruit::Apple("x"))`
+/// returned the *string* `"x"` from a function declared `: i32`.
+#[test]
+fn an_enum_pattern_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun probe<T>(value: T): i32 {
+            if value is Shape::Circle(let radius) { radius } else { -1 }
+        }
+
+        fun main() { print(probe(Shape::Circle(5))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The `match` form of the same thing — the pattern resolver is shared, and the
+/// pin exists so a future change to one form cannot quietly leave the other.
+#[test]
+fn an_enum_match_arm_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun probe<T>(value: T): i32 {
+            match value {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A trait's own parameter inside a DEFAULT body, which is the sharpest proof
+/// that the abstract check can never be right: the body below is written once
+/// and instantiated at two different enums, so `value is Colour::Red` cannot
+/// have one answer. It had one anyway — `Fruit::Apple(9)` is `[0, 9]`, the tag
+/// test `[0] === 0` passed, and `Basket.describe()` returned 1 where every
+/// reading of the source says 0.
+#[test]
+fn an_enum_pattern_on_a_traits_own_parameter_in_a_default_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple(i32), Pear(i32) }
+
+        trait Tell<T> {
+            fun payload(self): T;
+            fun describe(self): i32 {
+                let value = self.payload();
+                if value is Colour::Red { 1 } else { 0 }
+            }
+        }
+
+        struct Holder { at: i32 }
+        impl Holder with Tell<Colour> { fun payload(self): Colour { Colour::Red } }
+
+        struct Basket { at: i32 }
+        impl Basket with Tell<Fruit> { fun payload(self): Fruit { Fruit::Apple(9) } }
+
+        fun main() {
+            print(Holder { at = 0 }.describe());
+            print(Basket { at = 0 }.describe());
+        }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A BOUND does not rescue it, which is why the message does not suggest adding
+/// one: a trait bound cannot make a parameter be one particular enum, and the
+/// bounded `T` below is exactly as instantiable at some other implementor.
+#[test]
+fn a_bound_does_not_make_a_type_parameter_matchable() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        trait Tag { fun tag(self): i32; }
+        impl Route with Tag { fun tag(self): i32 { 1 } }
+
+        fun probe<T: Tag>(value: T): i32 {
+            if value is Route::Away(let id) { id } else { 0 }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The two concrete diagnostics the generic one now sits beside, neither of
+/// which had a pin: a scrutinee that is a different enum, and one that is not
+/// an enum at all. They are the reason the generic case reads as a hole rather
+/// than a policy — the check exists, it just had nothing to run against.
+#[test]
+fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple, Pear }
+
+        fun main() {
+            let value = Fruit::Apple;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "variant 'Colour::Red' does not belong to the matched enum",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+
+        fun main() {
+            let value: i32 = 5;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "cannot match an enum variant against type i32",
+    );
+}
+
+/// What must keep working, and does: an enum PARAMETERIZED by a type parameter
+/// is a `Type::Enum`, not a `Type::Generic`, so `Some(let value)` on an
+/// `Option<T>` inside a generic function is untouched — std's own bodies are
+/// full of it (`Set::to_set`, `View::swap`'s `last_value.read()`). So is an
+/// enum matching its own variants inside its own `impl`, where `self` is the
+/// abstract enum rather than a parameter. And a LITERAL pattern against a `T`
+/// is a different arm entirely, checked by `compare_type` and sound at runtime
+/// (a JS `===` against a number cannot be fooled by a string).
+#[test]
+fn matching_through_a_type_parameter_still_works_where_it_is_sound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        enum Route { Home, Away(i32) }
+
+        impl Route {
+            fun code(self): i32 {
+                if self is Route::Away(let id) { id } else { 0 }
+            }
+        }
+
+        fun first_or<T>(values: List<T>, fallback: T): T {
+            match values.get(0) {
+                Some(let value) => value,
+                None => fallback,
+            }
+        }
+
+        fun literal<T>(value: T): i32 {
+            match value {
+                1 => 10,
+                _ => 30,
+            }
+        }
+
+        fun main() {
+            print(first_or([5, 6], 0));
+            print(first_or(["a"], "z"));
+            print(Route::Away(3).code());
+            print(Route::Home.code());
+            print(literal(1));
+            print(literal("x"));
+        }
+        "#,
+        "5\na\n3\n0\n10\n30\n",
+    );
+}
+
+/// The evidence that decided B82's shape. A closure argument to a FREE
+/// function's generic reaches its body with the parameter already substituted,
+/// so the match inside is checked for real — the wrong enum is rejected by the
+/// pre-existing concrete diagnostic, with no help from B82's arm.
+#[test]
+fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "variant 'Other::First' does not belong to the matched enum",
+    );
+}
+
+/// And the half that does NOT, which is why B82 ships as a split rather than a
+/// blanket error. A closure argument to a METHOD's own generic reaches its body
+/// with the parameter still abstract, so the match inside is checked against
+/// nothing — the program below binds `Other::Second`'s payload out of a
+/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
+/// shape, and the routing guide's `swap(route, |current| match current { .. })`
+/// is the documented, shipped use, so a blanket error on a `Type::Generic`
+/// scrutinee takes the guide with it (probed: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
+///
+/// The fix is not at the pattern — it is to instantiate the closure parameter
+/// the way the free-function twin above already does. `#[ignore]`d: it asserts
+/// the diagnostic, and today the program compiles and runs.
+#[test]
+#[ignore]
+fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "does not belong to the matched enum",
+    );
+}
+
 // --- I3 S5: the terminations (proposal/iterator-adapters.md §5, §6) ----------
 // The EXPLICIT family is the primary termination API and there is no `collect`:
 // a method that names what it builds needs no annotation, reads at the call
