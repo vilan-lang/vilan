@@ -70,6 +70,7 @@ is the historical record everything shipped gets moved into.
 | `p6-followups.md` | shipped arc (complete 2026-07-03) | The post-P6 (transport/RPC) completion ladder. |
 | `platform-coloring.md` | draft / proposed | Function-granular platform checking, successor to `platform-model.md`'s module-granular check. |
 | `platform-model.md` | shipped arc (2026-06-23) | The build model: backends, platforms, and layers. |
+| `process.md` | draft — awaiting owner review | Release cadence (weekly train + urgent triggers), branch protection, merge strategy, contribution scaffolding, and the alpha→beta promise — filed from the owner's 2026-08-07 process ask. |
 | `reactive-batching.md` | shipped arc (2026-07-02) | Deferred notification and the `batch` turn. |
 | `reactive-turns.md` | shipped arc (2026-07-09) | Reactive turns — scoped flush, async turns, replacing global auto-flush (A6). |
 | `releases.md` | active | Installation, versioning, and the release pipeline — the process this project actually runs. |
