@@ -8,6 +8,14 @@ tracks the latest state.
 
 ## Unreleased
 
+**Generic code compiles smaller: a generic function specialized twice at the same type is now emitted once.** Writing `List<i32>` in two places used to be enough to get two copies of everything generic that touched it — byte-identical functions, under two different names, both shipped. Across the test corpus that was 19 duplicate functions and about 1.7% of all emitted JavaScript; one program shed 30% of its output, dropping from 46 emitted functions to 34.
+
+The compiler does not intern types — resolving a type mutates it in place, so each written type gets its own identity and one `i32` has many. The table that remembers "this generic has already been specialized for these arguments" was keyed on those identities one level down, so `List<i32>` and `List<i32>` looked like different keys whenever their two `i32`s were different objects, which is most of the time. It now keys on the *shape* of the type — what it is, recursively — so equal types share one specialization and unequal ones still get their own.
+
+Nothing about behaviour changes; every program in the corpus runs identically before and after. Five goldens moved, all of them shrinking, and each movement is a duplicate disappearing.
+
+---
+
 **Writing a whole value through a `&mut` view replaces it. It used to merge.** `fun replace(v: &mut List<i32>) { v = [9] }` called on `[1, 2, 3]` left the caller's list three elements long — `len()` still said `3`, and `2` and `3` were still in it, behind the `9`. Nothing in the program said "merge", and nothing reported anything.
 
 The write has to keep the pointee's identity — that is how it reaches the caller at all — so it copies the new value's slots into the existing storage rather than rebinding a local. The copying was `Object.assign`, which is a *merge*: it writes the slots the source has and leaves every slot past them exactly where it was. For any aggregate whose width is fixed on both sides — a struct, a tuple, a `Map` — merge and replace are the same operation, which is why this went unnoticed. For the two whose width can shrink they are not, and the tail survived.
