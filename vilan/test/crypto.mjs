@@ -495,4 +495,7 @@ const header_segment = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9";
 	const first = await (__pbkdf2_sha512(encode_utf8("hunter2"), salt, 1000, 512));
 	const again = await (__pbkdf2_sha512(encode_utf8("hunter2"), salt, 1000, 512));
 	console.log(equals_constant_time(first, again));
-})();
+})().catch(($ab) => {
+	console.error(String($ab));
+	process.exit(1);
+});

@@ -149,4 +149,7 @@ async function $g(body, $h) {
 		return 7;
 	}, [ 1 ]));
 	console.log(value);
-})();
+})().catch(($j) => {
+	console.error(String($j));
+	process.exit(1);
+});

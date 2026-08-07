@@ -327,6 +327,11 @@ Details in the [time reference](../std/time.md).
 
 ## Traps
 
+- A failure that escapes `async fun main()` **reports the error and
+  exits non-zero**, the same as a panic out of a sync `main` — it is
+  not left to the host's unhandled-rejection policy. Attaching that
+  outcome costs nothing at runtime: a `main` that keeps running (a
+  server holding a listener) is not hurried along by it.
 - On Node, **the process exits when nothing is left to do**: once
   `main` finishes, only live host handles (a running timer, a socket, a
   listening server) keep it alive. A dropped task that is merely

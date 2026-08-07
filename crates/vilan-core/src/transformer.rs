@@ -1752,16 +1752,75 @@ impl<'src> Transformer<'src> {
         self.restore_instance(saved_instance);
 
         // An async `main` (it awaits) runs inside an invoked async arrow, since
-        // top-level `await` isn't assumed: `(async () => { .. })()`.
+        // module initialization is synchronous and there is no top-level await
+        // to lift it into (`execution.md` §7.1): `(async () => { .. })()`.
+        //
+        // That promise used to be DISCARDED (J6). A rejection then reached the
+        // host only as an unhandled-rejection event, so what a failing `main`
+        // did was the host's default policy rather than vilan's: Node ≥15
+        // happens to rethrow and exit non-zero, but it buries the program's
+        // error under `UnhandledPromiseRejection` and an engine-internal
+        // stack, and a host configured otherwise (or an older Node) exits 0.
+        // A *sync* `main` that panics has always terminated with the message
+        // and a non-zero code, and async `main` is the substitute vilan steers
+        // people to instead of top-level await — so the two must agree.
+        //
+        // `.catch` and not `await`: attaching a handler does not delay
+        // anything, so a `main` that never settles (a listening server) is
+        // untouched — it keeps running, and the handler simply never fires.
+        // `process.exit` rather than `exitCode`, for the same reason in
+        // reverse: a rejection while some other handle is still live (that
+        // same listener) would otherwise set a code and then hang forever.
+        // The unwind through `main` has already run its `finally` blocks by
+        // the time the handler sees the error, so exiting here does not skip
+        // teardown the way §7.1's exit-code path would.
         if main_is_async {
-            t_main_fn_body = vec![js::Node::Call(
+            let invocation = js::Node::Call(
                 Box::new(js::Node::Closure(js::Closure {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
                 })),
                 Vec::new(),
-            )];
+            );
+            // The browser has no exit code; its unhandled-rejection path
+            // already reports to the console, so there is nothing to add.
+            t_main_fn_body = if self.program.platform.has_process_exit() {
+                let error_name = self.ng.next_name();
+                vec![js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(invocation),
+                        "catch".to_string(),
+                    )),
+                    vec![js::Node::Closure(js::Closure {
+                        parameters: vec![js::Parameter {
+                            name: error_name.clone(),
+                        }],
+                        body: vec![
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("console".to_string())),
+                                    "error".to_string(),
+                                )),
+                                vec![js::Node::Call(
+                                    Box::new(js::Node::Local("String".to_string())),
+                                    vec![js::Node::Local(error_name)],
+                                )],
+                            ),
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("process".to_string())),
+                                    "exit".to_string(),
+                                )),
+                                vec![js::Node::Number("1".to_string(), None)],
+                            ),
+                        ],
+                        is_async: false,
+                    })],
+                )]
+            } else {
+                vec![invocation]
+            };
         }
 
         // Assembly-time tree-shake: keep a binding's declaration only when

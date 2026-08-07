@@ -70,6 +70,16 @@ must await something that ends with the app). On the browser platform,
 `panic(message)` aborts execution with the message; it types as `any`
 (§5.1). Failed `assert`s panic.
 
+**A failing `main` terminates with a non-zero status**, whether `main`
+is sync or `async`. A panic that escapes a sync `main` aborts the
+process; an `async fun main()` whose work fails reports the error and
+exits non-zero on the process platforms, rather than leaving the
+outcome to the host's unhandled-rejection policy. Attaching that
+outcome does not make the entrypoint wait: a `main` that never settles
+— a server holding a listener — is unaffected and keeps running. The
+browser has no exit status, so a failure there surfaces through the
+host's own reporting.
+
 ## 7.2 Evaluation order
 
 Within an expression, evaluation is **left-to-right**: operands before

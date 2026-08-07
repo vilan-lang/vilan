@@ -885,7 +885,11 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.js", std::process::id()));
+    // `.mjs`, exactly as the CLI's `run`/`test`/watch scripts: a process
+    // runtime classifies before it parses, and a harness that ran its bundles
+    // as CommonJS could not see an ESM-only defect at all
+    // (`top-level-await.md` §8.1).
+    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -896,6 +900,29 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
         Ok(output) => Err(vec![String::from_utf8_lossy(&output.stderr).into_owned()]),
         Err(error) => Err(vec![format!("could not run node: {error}")]),
     }
+}
+
+/// Compile and run, returning `(stdout, stderr, exit code)` whatever the exit —
+/// for pinning the entry shim's failure contract (J6), where the exit CODE and
+/// what reached stderr are the claims, not the stdout.
+fn compile_and_run_status(source: &str) -> (String, String, i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let javascript = compile(source).expect("expected a clean compile");
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("vilan_exit_{}_{unique}.mjs", std::process::id()));
+    std::fs::write(&path, javascript).expect("write script");
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
 }
 
 /// Compile, then execute the emitted JS with `node`, returning its stdout. A
@@ -958,7 +985,7 @@ fn compile_and_run_capturing_stderr(source: &str) -> Result<(String, String), Ve
 
     let js = compile(source)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.js", std::process::id()));
+    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -23130,6 +23157,139 @@ fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
     assert_eq!(
         refusals, 1,
         "one refusal per binding, not a pair for one line"
+    );
+}
+
+// --- J6: `main`'s promise gets a contract ------------------------------------
+//
+// An async `main` is emitted as a fire-and-forget IIFE, and its promise used to
+// be DISCARDED. What a failing `main` then did was the HOST's policy, not
+// vilan's: Node >= 15 rethrows an unhandled rejection and exits non-zero, but
+// it buries the program's error under `UnhandledPromiseRejection` and an
+// engine-internal stack, and a host configured otherwise exits 0. A sync `main`
+// that panics has always terminated with the message and a non-zero code, and
+// async `main` is what the language steers people to instead of top-level
+// await (`top-level-await.md` §4.4/§8.3) — so the two must agree.
+
+#[test]
+fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("before");
+            panic("boom");
+            print("after");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a rejecting `main` must exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("boom"),
+        "the program's own error must reach stderr: {stderr}"
+    );
+    // The point is not merely a non-zero code — Node already gave one. It is
+    // that the failure is OURS to report, so the host's unhandled-rejection
+    // wrapper is gone and what remains is the message.
+    assert!(
+        !stderr.contains("UnhandledPromiseRejection")
+            && !stderr.contains("ERR_UNHANDLED_REJECTION"),
+        "the error must be surfaced by the shim, not left to the host's \
+         unhandled-rejection path: {stderr}"
+    );
+    assert!(
+        stdout.contains("before") && !stdout.contains("after"),
+        "output before the failure must still flush, and nothing after it \
+         may run: {stdout:?}"
+    );
+}
+
+#[test]
+fn a_resolving_async_main_exits_zero() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ok");
+        }
+        "#,
+    );
+    assert_eq!(code, 0, "a resolving `main` must exit 0; stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn a_panicking_sync_main_is_unchanged() {
+    // The contract async `main` was brought level WITH; it must not move.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+
+        fun main() {
+            print("before");
+            panic("boom");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a panicking sync `main` still exits 1: {stderr}");
+    assert!(stderr.contains("boom"), "and still says why: {stderr}");
+    assert!(stdout.contains("before"));
+}
+
+#[test]
+fn an_async_main_that_keeps_working_is_not_cut_short() {
+    // THE SERVER-LEG CARVE, in the form a test can hold: the shim attaches a
+    // handler, it does not `await`. A `main` that suspends and resumes — the
+    // shape a listening server generalizes — runs to completion, and a `main`
+    // that never settles is likewise never hurried. Had the shim awaited the
+    // IIFE (or exited on settle), this would truncate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            print("start");
+            sleep_for(Duration::millis(30));
+            print("middle");
+            sleep_for(Duration::millis(30));
+            print("end");
+        }
+        "#,
+        "start\nmiddle\nend\n",
+    );
+}
+
+#[test]
+fn the_browser_leg_gets_no_exit_handler() {
+    // The browser has no exit code, and its own unhandled-rejection path
+    // already reports to the console — so there is nothing to attach, and
+    // `process` does not exist to reference.
+    let emitted = compile_browser(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ui");
+        }
+        "#,
+    )
+    .expect("expected a clean browser compile");
+    assert!(
+        !emitted.contains("process.exit"),
+        "the browser bundle must not reference `process`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("})();"),
+        "the browser entry stays the bare fire-and-forget IIFE:\n{emitted}"
     );
 }
 

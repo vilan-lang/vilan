@@ -1160,4 +1160,7 @@ function $ap(codec, frame) {
 	$au;
 	await (sleep_for(millis(10), [ 1 ]));
 	console.log("slept");
-})();
+})().catch(($aC) => {
+	console.error(String($aC));
+	process.exit(1);
+});

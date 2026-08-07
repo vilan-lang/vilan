@@ -139,7 +139,7 @@ fn both_ways(
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
-                .join(format!("vilan_equiv_{}_{unique}.js", std::process::id()));
+                .join(format!("vilan_equiv_{}_{unique}.mjs", std::process::id()));
             std::fs::write(&path, text).map_err(|error| error.to_string())?;
             let run = run_node(&path, NODE_TIMEOUT);
             let _ = std::fs::remove_file(&path);
@@ -371,7 +371,7 @@ fn scratch_js(tag: &str, source: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "vilan_run_node_{tag}_{}_{unique}.js",
+        "vilan_run_node_{tag}_{}_{unique}.mjs",
         std::process::id()
     ));
     std::fs::write(&path, source).expect("write the scratch program");
