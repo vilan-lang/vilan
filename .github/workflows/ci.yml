@@ -4,10 +4,34 @@
 # **and** windows.
 name: ci
 
+# Root prose never turns the suite red, so it does not buy a windows leg.
+# vilan/docs/** and vilan/proposal/** are deliberately NOT ignored: docs
+# fences are compiled by the docs gate, and the hygiene tripwire reads the
+# proposals. If these checks ever become required on protected PRs, switch
+# from paths-ignore to an always-running filter job — a skipped required
+# check leaves a PR stuck at "Expected".
 on:
   pull_request:
+    paths-ignore:
+      - README.md
+      - AI_STANCE.md
+      - AGENTS.md
+      - CLAUDE.md
+      - CODE_OF_CONDUCT.md
+      - LICENSE-APACHE
+      - LICENSE-MIT
+      - .gitignore
   push:
     branches: [next, main]
+    paths-ignore:
+      - README.md
+      - AI_STANCE.md
+      - AGENTS.md
+      - CLAUDE.md
+      - CODE_OF_CONDUCT.md
+      - LICENSE-APACHE
+      - LICENSE-MIT
+      - .gitignore
 
 # A superseded run on the same ref is cancelled; the newest push is the one
 # whose result matters.
