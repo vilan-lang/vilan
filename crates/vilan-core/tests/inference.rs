@@ -38734,7 +38734,8 @@ fn the_sibling_containers_iterate_inside_their_own_impls_too() {
 }
 
 #[test]
-#[ignore] // KNOWN BUG, found by B85's sweep: `for x in map` is silently wrong.
+// Found by B85's sweep as a known bug; closed at the same cut by B80's
+// for-loop rule — the two lanes converged on it from opposite sides.
 fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
     // `Map` has NO native loop lowering and no `next` -- it is not iterable at
     // all. But the analyzer only refuses an uniterable subject when it is a
