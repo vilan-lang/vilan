@@ -111,6 +111,18 @@ requires `Y`. A trait's generic parameters may carry defaults
 **bounds**; a trait is not a type: `let x: Display` is a compile error
 (no trait objects).
 
+That rule is enforced **at the annotation**, in every value position — a
+binding, a parameter, a return type, a field, a generic argument
+(`List<Display>`) — and reported where the trait's name is written,
+whether or not the declaration is ever used. A trait's name stays legal
+in the positions that name a bound or a namespace rather than a value's
+type: a generic parameter's bound (`<T: Display>`), a supertrait, an
+`impl` subject (`impl Iterator<type T>`, which blankets over a bound),
+and the head of a qualified path (`Display::show(x)`). Inside a trait's
+own declaration, write `Self` for "the implementing type"; a generic
+parameter defaulted to it (`trait PartialEq<B = Self>`) is a parameter,
+not the trait, and is unaffected.
+
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
 default may call the bound trait's members on a value of that parameter's
@@ -336,7 +348,10 @@ fun main() {
 
 Normative rejection cases (each is a compile error):
 
-- Using a trait as a type (`let x: Display = …`).
+- Using a trait as a type, in any value position — a binding, a
+  parameter, a return type, a field, a generic argument (`let x: Display
+  = …`, `fun f(v: Display)`, `fun make(): Display`, `struct H { item:
+  Display }`, `List<Display>`). Reported at the annotation (§5.5).
 - An enum-variant pattern matched against a generic parameter of an
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the

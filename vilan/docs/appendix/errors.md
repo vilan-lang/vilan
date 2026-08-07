@@ -77,12 +77,24 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"parameter '…' has bare trait type '…': a trait is not a value type (vilan has no trait objects)"**
-A parameter was declared with a trait as its type, and called with a
-value that implements it. Traits are **bounds**, not types, so the
-parameter can never accept a concrete value — the impl is fine, the
-signature is not. Write the generic the message spells out:
-`fun show<T: A>(v: T)`. The note points at the declaration to change.
+**"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
+A trait's name was written where a type belongs — a binding's
+annotation, a parameter, a return type, a struct field, or a generic
+argument like `List<Display>`. Traits are **bounds**, not types, so no
+value can ever have that type: the impl is fine, the signature is not.
+Write the generic the message spells out — `fun show<T: A>(v: T)` — or,
+inside the trait's own declaration, write `Self`, which is what a trait
+naming itself in a return position always meant. The note points at the
+trait, which may live in another module. For "one of several things at
+runtime", use an enum.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"cannot call '…' on a value of bare trait type '…'"**
+The same rule reached from the other side: a receiver whose type is a
+bare trait has no concrete implementation to dispatch to. Reachable
+inside an `impl` whose subject is itself a trait, where `self` is
+abstract; elsewhere the annotation that produced the value is refused
+first.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is already defined for '…'; remove or rename this one"**

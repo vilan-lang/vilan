@@ -1756,6 +1756,14 @@ pub struct Analyzer<'src> {
     // bare-trait *value* receiver elsewhere, which has no concrete type and is
     // rejected.
     trait_body_scopes: HashSet<Id>,
+    // Type ids written where a TRAIT is the legitimate spelling — a generic
+    // parameter's bound, a tuple bound's element bound, a supertrait, and an
+    // `impl` subject (`impl Iterator<type T> with Iterable<T>` blankets over a
+    // bound). Every other type position is a VALUE position, where a trait is
+    // an error (`proposal/trait-objects.md` §12.2, `spec/types.md` §5.5/§5.11).
+    // Marked here rather than the reverse so the default is the safe one: a
+    // type position added later is checked until it says otherwise.
+    trait_position_type_ids: HashSet<TypeId>,
     // The `std` `panic` intrinsic, if loaded. A call to it never returns, so it
     // types as `any` (unifying with any expected type) and lowers to a `throw`.
     panic_fn_id: Option<Id>,
@@ -2195,6 +2203,7 @@ impl<'src> Analyzer<'src> {
             variables: IndexMap::new(),
             walking_trait_body: false,
             trait_body_scopes: HashSet::new(),
+            trait_position_type_ids: HashSet::new(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
             const_exprs: Vec::new(),
@@ -14507,7 +14516,7 @@ impl<'src> Analyzer<'src> {
                     let element_bound = tuple_bound
                         .element
                         .as_deref()
-                        .map(|element| self.walk_type_node(element, scope_id));
+                        .map(|element| self.walk_trait_position_type_node(element, scope_id));
                     self.tuple_bounds.insert(
                         constraint_type_id,
                         TupleBoundRequirement {
@@ -14536,7 +14545,7 @@ impl<'src> Analyzer<'src> {
     ) -> TypeId {
         let bound_type_ids: Vec<TypeId> = bounds
             .iter()
-            .map(|bound| self.walk_type_node(bound, scope_id))
+            .map(|bound| self.walk_trait_position_type_node(bound, scope_id))
             .collect();
         let constraint_type_id = bound_type_ids
             .first()
@@ -15147,7 +15156,12 @@ impl<'src> Analyzer<'src> {
                 None
             }
             Node::StaticAccessor(subject, member_name) => {
-                let subject_type_id = self.walk_type_node(subject, scope_id);
+                // A path HEAD selects a namespace; it is not a value position,
+                // and it may legitimately be a trait. `A::pick(bag)` is B57's
+                // trait-qualified call (`method-resolution.md` §3) and
+                // `Iterator::from_fn(..)` is B83's trait-provided static —
+                // std's own, off `impl Iterator<type T>` (`iterator.vl:137`).
+                let subject_type_id = self.walk_trait_position_type_node(subject, scope_id);
                 self.prepped_static_accessors
                     .push((id, subject_type_id, member_name));
                 None
@@ -16425,7 +16439,10 @@ impl<'src> Analyzer<'src> {
                 for trait_ in traits {
                     self.register_subject_binders(trait_, body_scope_id);
                 }
-                let subject_type_id = self.walk_type_node(subject, body_scope_id);
+                // The subject may legitimately BE a trait: `impl Iterator<type T>`
+                // and `impl Iterator<type T> with Iterable<T>` blanket over a
+                // bound, which is how std writes "every iterator also iterates".
+                let subject_type_id = self.walk_trait_position_type_node(subject, body_scope_id);
                 // Within an `impl`, `Self` refers to the subject type.
                 self.register_self_type(body_scope_id, subject_type_id);
                 // Record the subject's generic arguments (the `<...>` on the head)
@@ -16518,7 +16535,7 @@ impl<'src> Analyzer<'src> {
                 // arguments (`PartialEq<B>`) see the trait's parameters.
                 let supertraits = supertraits
                     .iter()
-                    .map(|supertrait| self.walk_type_node(supertrait, body_scope_id))
+                    .map(|supertrait| self.walk_trait_position_type_node(supertrait, body_scope_id))
                     .collect();
                 // Bodyless methods are legitimate requirements inside a trait.
                 let was_walking_trait_body = self.walking_trait_body;
@@ -17384,6 +17401,23 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// `walk_type_node` for a position where a TRAIT is the legitimate spelling
+    /// — a generic parameter's bound (`<T: Display>`), a tuple bound's element
+    /// bound, a supertrait (`trait Ord: PartialOrd`), and an `impl` subject
+    /// (`impl Iterator<type T> with Iterable<T>` blankets over a bound). The
+    /// mark is what the `prepped_type_locals` drain consults before refusing a
+    /// trait as a value type; everything else defaults to a value position, so
+    /// a type position added later is checked until it says otherwise.
+    fn walk_trait_position_type_node(
+        &mut self,
+        node: &Spanned<Node<'src>>,
+        scope_id: Id,
+    ) -> TypeId {
+        let type_id = self.walk_type_node(node, scope_id);
+        self.trait_position_type_ids.insert(type_id);
+        type_id
+    }
+
     fn walk_type_node(&mut self, node: &Spanned<Node<'src>>, scope_id: Id) -> TypeId {
         let type_id = self.new_type_id();
 
@@ -17460,7 +17494,11 @@ impl<'src> Analyzer<'src> {
                 None
             }
             Node::StaticAccessor(subject, member_name) => {
-                let subject_type_id = self.walk_type_node(subject, scope_id);
+                // As in expression position above: a path head selects a
+                // namespace to look `member_name` up in. What the whole path
+                // resolves to is checked on its own; the head is not a value
+                // type, so a trait there is not the §12.2 mistake.
+                let subject_type_id = self.walk_trait_position_type_node(subject, scope_id);
                 self.prepped_type_static_accessors.push((
                     type_id,
                     subject_type_id,
@@ -20754,6 +20792,60 @@ impl<'src> Analyzer<'src> {
             ),
             note,
         )
+    }
+
+    /// The refusal for a trait written in VALUE position — a binding's
+    /// annotation, a parameter, a return type, a field, a generic argument
+    /// (`proposal/trait-objects.md` §12.2; `spec/types.md` §5.5, §5.11).
+    ///
+    /// It inherits B72's register — name the rule, then the declaration that
+    /// works — but not B72's shape. B72 reported at the CALL and needed a note
+    /// to point at the parameter declaration that had to change; here the
+    /// declaration is what the caret is already under, so naming the position
+    /// back to the reader would be telling them what they can see. The note
+    /// points at the trait instead, which is the thing they may not be able to
+    /// see: it can live in another module, so it carries its own `SourceId`,
+    /// exactly as B72's does.
+    ///
+    /// The `Self` steer is offered only inside the named trait's OWN body,
+    /// where `Self` and the trait's name denote the same thing — which is the
+    /// mistake std itself made five times (§1.5): the author wanted to write
+    /// "this type" and reached for the trait's name. Inside an unrelated
+    /// `impl`, `Self` is that impl's subject and the steer would be wrong, so
+    /// only the generic form is offered there.
+    fn bare_trait_in_value_position(
+        &self,
+        trait_id: Id,
+        scope_id: Id,
+    ) -> (String, Option<crate::error::Note>) {
+        let trait_ = self.traits.get(&trait_id);
+        let trait_name = trait_.map(|trait_| trait_.name).unwrap_or("this trait");
+        let note = trait_.map(|trait_| crate::error::Note {
+            span: trait_.name_span,
+            msg: format!("'{trait_name}' is declared here, as a trait"),
+            source: self.source_of_id(trait_.id),
+        });
+        let mut message = format!(
+            "'{trait_name}' is a trait, not a type: a trait is not a value type (vilan has \
+             no trait objects), so no value can have this type. Declare a generic parameter \
+             bounded by the trait instead — `<T: {trait_name}>` — and write 'T' here."
+        );
+        // `Self` in scope, resolving to this very trait, means the annotation
+        // sits inside the trait's own declaration. The lookup is by the type
+        // map directly rather than `get_type`, which panics on an id that has
+        // not resolved yet — an `impl`'s `Self` is a walked subject and may
+        // well still be in flight while this drain runs.
+        let self_is_this_trait = self
+            .try_get_type_id_by_name("Self", scope_id)
+            .and_then(|entity_id| self.expr_id_to_type_id_map.get(&entity_id))
+            .and_then(|self_type_id| self.type_id_to_type_map.get(self_type_id))
+            .is_some_and(|self_type| matches!(self_type, Type::Trait(id, _) if *id == trait_id));
+        if self_is_this_trait {
+            message.push_str(&format!(
+                " If you meant \"the type implementing {trait_name}\", write `Self`."
+            ));
+        }
+        (message, note)
     }
 
     /// The "not callable" message for a call subject that isn't one.
@@ -24330,8 +24422,68 @@ impl<'src> Analyzer<'src> {
                     // hit a not-yet-resolved type id and panic.
                     self.type_references
                         .push((source_id, span, definition_id, type_id));
+                    // B4/§12.2 (`proposal/trait-objects.md`): a trait written in
+                    // VALUE position is an error at the annotation, which is what
+                    // `spec/types.md` §5.5 and §5.11 have specified since they
+                    // were written. `Type::Trait` carries two opposite meanings —
+                    // the abstract `Self` of a trait declaration, guaranteed to
+                    // become concrete before anything is emitted, and a value the
+                    // user annotated with a trait, guaranteed never to — and only
+                    // the first is legitimate. The WRITTEN SPELLING separates
+                    // them exactly: `Self` is the first; the trait's own name,
+                    // anywhere that is not a bound, a supertrait or an `impl`
+                    // subject, is the second.
+                    //
+                    // Refusing it here — at the declaration, where the fix goes —
+                    // closes four holes at one arm rather than four: B55's
+                    // internal error on all three of its routes (§2.1), the
+                    // destructor-suppressing cast (§2.2), the silently
+                    // heterogeneous `List<Trait>` (§2.3), and the bare-trait
+                    // binding of a bounded generic (§1.4).
+                    // What is refused is writing the TRAIT'S OWN NAME, so the
+                    // test is on the entity the name resolved to, not on the
+                    // type it produced. Two other names resolve to the very
+                    // same `Type::Trait` and are not this mistake: `Self`,
+                    // which has a type binding and no `Expr` at all
+                    // (`register_self_type`), and a generic parameter defaulted
+                    // to it (`trait Add<B = Self>` makes `B` an
+                    // `Expr::Generic` over the trait — `spec/types.md`'s
+                    // `= Self` shorthand, and the same conflation
+                    // `written_type_spellings` exists to unpick). Keying on
+                    // `Expr::Trait` separates all three without asking any of
+                    // them how they were spelled.
+                    let names_the_trait = matches!(
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        Some(Expr::Trait(_))
+                    );
+                    let bare_trait_id = match &subject_type {
+                        Type::Trait(trait_id, _)
+                            if names_the_trait
+                                && !self.trait_position_type_ids.contains(&type_id) =>
+                        {
+                            Some(*trait_id)
+                        }
+                        _ => None,
+                    };
+                    if let Some(trait_id) = bare_trait_id {
+                        let (message, note) = self.bare_trait_in_value_position(trait_id, scope_id);
+                        self.diagnostics.push(Error {
+                            note,
+                            span,
+                            msg: message,
+                        });
+                    }
                     self.type_map_writes += 1;
-                    self.type_id_to_type_map.insert(type_id, subject_type);
+                    // A refused annotation resolves to `Unknown`, so the one
+                    // report at the annotation stands alone instead of cascading
+                    // a mismatch through every use of the thing it names.
+                    self.type_id_to_type_map.insert(
+                        type_id,
+                        match bare_trait_id {
+                            Some(_) => Type::Unknown,
+                            None => subject_type,
+                        },
+                    );
                 }
                 None => {
                     // `std::math::min(1, 2)` inline: the namespace root is not
