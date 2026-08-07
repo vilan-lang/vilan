@@ -1,6 +1,18 @@
 # Process — releasing, protecting, and taking contributions
 
-> Status: DRAFT (awaiting owner review) — filed from the owner's 2026-08-07 process ask.
+> Status: RATIFIED 2026-08-07 (owner review) — as drafted, with two
+> deliberate DEFERRALS: §2's branch protection (the ruleset amendment
+> stays unapplied) and §4's scaffolding slice (CONTRIBUTING.md,
+> SECURITY.md, templates — deferred, not refused; revisit with D5).
+> Everything else stands: §1's cadence (Saturday train, U1–U3 urgent
+> triggers, lazy release/0.MINOR patch branches), §7.2's gate
+> unification (the highest-priority item), §3's merge policy, §5's
+> beta contract and the v0.40.0 jump, §6's sweep split (already in
+> practice since the v0.33.0 close). Sub-questions ride the
+> recommendations. The §8 amendments minus protection/scaffolding are
+> the v0.34.0 process-amendments lane.
+>
+> Prior status: DRAFT (awaiting owner review)
 
 ## 0. The ask, and what this paper settles
 

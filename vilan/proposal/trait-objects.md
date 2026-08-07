@@ -1,6 +1,13 @@
 # Trait objects — one representation, two meanings (B4)
 
-> Status: DRAFT (awaiting owner review) — filed from backlog B4; proposal-first per the house rules.
+> Status: RATIFIED 2026-08-07 (owner review) — Q1 answered: trait
+> objects are DECLINED per the recommendation; the enforce-the-
+> distinction arc (S1–S3: the leak pin, the real diagnostic replacing
+> the internal error, the five std Self rewrites) is the v0.34.0
+> trait-enforce lane. The design sections stay priced for §3.5's
+> revisit criteria.
+>
+> Prior status: DRAFT (awaiting owner review)
 >
 > Origin: backlog B4, open since the lettered-section scheme began, carrying
 > three cycles of accumulated pressure: B29's asyncness note (2026-07-20),
