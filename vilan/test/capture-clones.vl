@@ -34,6 +34,19 @@
 // rule stops at: nothing can be written through a `&` view, so its captures
 // keep their accessors and the share elision with them — an over-widening to
 // every view turns exactly this function's bytes red.
+//
+// B88 adds the OWNED place, where the same seam is reached by a COMPONENT
+// write rather than by a view. The three functions below are one contrast,
+// and reading them together is the whole rule. `place_component` writes
+// `cell.1`, which mutates the very array the subject temp aliases, so both
+// captures become real declarations — `weight` bare, since an `i32` owes no
+// copy but does owe a READ. `place_rebound` is the identical function with
+// `cell = (..)` instead: a whole-binding assignment REBINDS, leaving the temp
+// a faithful snapshot, so `weight` keeps its accessor and only `cells` (which
+// owes B53's copy) is declared. The one line of difference between the two is
+// the rule. `place_guarded` is the guarded twin, whose guard reads the
+// materialized `weight` and so takes B59's prelude shape on the place path
+// exactly as `viewed_guarded` does on the viewed one.
 import std::io::print;
 import std::option::Option::{ self, Some, None };
 
@@ -63,6 +76,35 @@ fun viewed_guarded(pair: &mut (List<i32>, i32)): i32 {
 	match pair {
 		(let cells, let weight) if weight > 0 => {
 			pair.1 = 9;
+			cells.len() + weight
+		}
+		_ => 0,
+	}
+}
+
+fun place_component(): i32 {
+	mut cell = ([1, 2], 3);
+	if cell is (let cells, let weight) {
+		cell.1 = 9;
+		ret cells.len() + weight;
+	}
+	0
+}
+
+fun place_rebound(): i32 {
+	mut cell = ([1, 2], 3);
+	if cell is (let cells, let weight) {
+		cell = ([4], 5);
+		ret cells.len() + weight;
+	}
+	0
+}
+
+fun place_guarded(): i32 {
+	mut cell = ([1, 2], 3);
+	match cell {
+		(let cells, let weight) if weight > 0 => {
+			cell.1 = 9;
 			cells.len() + weight
 		}
 		_ => 0,
@@ -159,4 +201,7 @@ fun main() {
 	mut viewed = ([1, 2], 3);
 	print(viewed_guarded(&mut viewed));
 	print(viewed.1);
+	print(place_component());
+	print(place_rebound());
+	print(place_guarded());
 }

@@ -374,8 +374,9 @@ placement question on for every guarded leg. Filed rather than patched.
 
 ### 7.1 The shapes, measured
 
-The filed repro is one of seven. Probed against the shipped v0.32.0, each an
-`is`/guarded leg over an owned `mut` place with a scalar capture:
+The filed repro is one of seven. Probed against the pre-fix tree (`next` @
+`d5de163`, B81 included), each an `is`/guarded leg over an owned place with a
+scalar capture, each wanting 3:
 
 | shape | write | before |
 |---|---|---|
@@ -387,10 +388,13 @@ The filed repro is one of seven. Probed against the shipped v0.32.0, each an
 | `&mut self` method | `counter.bump()` | 99 |
 | write through a `&mut` of the subject | `vv.1 = 99` | 99 |
 
-Six shapes were *already* right and stay pinned as such: a whole assignment
-(`t = (1, 2)`), a whole field assignment (`he = E::Pair(..)`), a write to a
-DISJOINT field of the same root, an unguarded `match` leg, a `let`
-destructure, and an aggregate capture (B53 copies it eagerly, so no seam).
+Seven neighbours were *already* right, and each is pinned so the fix cannot
+move it: reading the capture BEFORE the write (the accessor has nothing to
+observe yet, which is what makes the two reads of one binding disagree), a
+whole assignment (`t = (1, 2)`), a whole FIELD assignment (`he =
+E::Pair(..)`, which rebinds the property), a write to a DISJOINT field of the
+same root, an unguarded `match` leg, a `let` destructure, and an aggregate
+capture (B53 copies it eagerly, so there is no seam to reach).
 
 ### 7.2 The two candidates, measured before choosing
 
@@ -508,11 +512,23 @@ without the copy. The three pins green under every plant are exactly the three
 that pin UNCHANGED behavior: the unguarded leg, the `let` destructure, and the
 disjoint field write.
 
-**No corpus golden moved.** Not by luck: `capture-clones.vl`'s place-subject
-functions (`grow_first`, `sum_over`, `total_width`, `guarded_width`,
-`first_or`, `first_or_guarded`) all take readonly or never-written subjects, so
-none is in the in-place set, and §6's viewed trio (`step`, `width`,
-`viewed_guarded`) rides the untouched view arm.
+**No existing corpus golden moved.** Not by luck: `capture-clones.vl`'s
+place-subject functions (`grow_first`, `sum_over`, `total_width`,
+`guarded_width`, `first_or`, `first_or_guarded`) all take readonly or
+never-written subjects, so none is in the in-place set, and §6's viewed trio
+(`step`, `width`, `viewed_guarded`) rides the untouched view arm.
+
+`capture-clones.vl` itself gains three functions, the way it did in §2 and §6
+— the fixture is where the emitted SHAPES are pinned in bytes, and a runtime
+pin cannot see a materialization that lands in the wrong place and still
+prints the right number. `place_component` and `place_rebound` are the same
+function twice, differing only in the write, so the byte diff between them IS
+the rule: the component-write version declares `const weight = $s[1]`, the
+rebinding one inlines `$t[1]`. `place_guarded` pins B59's placement on the
+place path. The golden moved **additively** — every pre-existing byte
+unchanged, including the temp names — and planting the place arm back out
+turns exactly those two functions red (`place_rebound` stays green, as it
+must).
 
 ### 7.7 Bycatch — a `borrows` CALL subject is §6.4 all over again
 
