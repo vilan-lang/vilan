@@ -21280,12 +21280,24 @@ impl<'src> Analyzer<'src> {
                     // stands after the arguments that could bind, the loop's own
                     // order IS the two-phase order and there is nothing to hoist,
                     // so the call keeps the exact inference schedule it has
-                    // always had — which matters, because re-inferring an
-                    // argument earlier mints its type id earlier, and
-                    // monomorphization keys on type ids (probed: hoisting
-                    // unconditionally left three corpus goldens
-                    // behaviour-identical but re-keyed, one of them emitting a
-                    // duplicate `Signal::new` instance).
+                    // always had — which matters, because hoisting
+                    // unconditionally emits a duplicate `Signal::new` and moves
+                    // three corpus goldens (`reactive`, `reactive-flatten`,
+                    // `signal-update`, behaviour-identical, +1 instance each).
+                    //
+                    // B90 filed that as type-id-keyed instance identity, and B95
+                    // proved it is not: with the instance key made STRUCTURAL
+                    // (`transformer.rs`'s `type_key`), un-gating still emits the
+                    // duplicate, and the probe says why — the two instances of
+                    // `Signal::new` carry substitutions of different SHAPE, `{T:
+                    // i32}` gated against `{T: i32, U: i32}` hoisted. The
+                    // pre-binding pass writes a SUPERSET of the substitution the
+                    // positional loop produces, and every entry joins the
+                    // instance key, so a binding the body never mentions splits
+                    // the instance. Closing that wants either a hoist that binds
+                    // exactly what the loop would, or a key restricted to the
+                    // constraints the callee's signature actually names —
+                    // measured work of its own, so the gate stays.
                     if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_))
                         && self.a_closure_argument_precedes_a_value_argument(argument_ids)
                     {
