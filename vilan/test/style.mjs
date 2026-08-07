@@ -56,10 +56,10 @@ function without_covered(rules, media, condition, property) {
 		return __clone(rules);
 	}
 	let out = __clone(rules);
-	for (const key of $k(rules)) {
+	for (const key of $c(rules)) {
 		const parts = key.split(":");
 		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
-			$l(out, key);
+			$k(out, key);
 		}
 	}
 	return out;
@@ -87,7 +87,7 @@ function add(self, b) {
 			const entry = $g[1];
 			const parts = key.split(":");
 			rules = without_covered(rules, __at(parts, 0), __at(parts, 1), __at(parts, 2));
-			$m(rules, key, entry);
+			$l(rules, key, entry);
 			$h = undefined;
 		} else {
 			$h = undefined;
@@ -121,17 +121,10 @@ function $d(self, key) {
 	}
 	return $f;
 }
-function $k(self) {
-	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
-	}
-	return result;
-}
-function $l(self, key) {
+function $k(self, key) {
 	self[0].delete(hash(key));
 }
-function $m(self, key, value) {
+function $l(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
 const card = [ [ new Map([ [ "::display", [ "::display", [ "sbiovxm", "display:flex" ] ] ], [ "::padding", [ "::padding", [ "s1ufvr2", "padding:var(--space-4)" ] ] ], [ "::background-color", [ "::background-color", [ "siolu0w", "background-color:var(--gray-50)" ] ] ], [ ":hover:background-color", [ ":hover:background-color", [ "s1c7l5ao", "background-color:var(--gray-100)" ] ] ] ]) ] ];

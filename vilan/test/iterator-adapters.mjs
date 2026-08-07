@@ -288,8 +288,7 @@ function $aj(self) {
 function $af(self) {
 	return [ $aj($ag(self)), 0 ];
 }
-function $ak(self) {
-	let result = [  ];
+function $ak(self, fn) {
 	const $al = self;
 	while (true) {
 		const $am = $k($al);
@@ -297,141 +296,107 @@ function $ak(self) {
 			break;
 		}
 		const value = $am[1];
-		result.push(__clone(value));
+		fn(value);
 	}
-	return result;
 }
-function $an(self, fn) {
+function $an(self) {
+	let result = [  ];
 	const $ao = self;
 	while (true) {
-		const $ap = $k($ao);
+		const $ap = $j($ao);
 		if ($ap[0] !== 0) {
 			break;
 		}
 		const value = $ap[1];
-		fn(value);
-	}
-}
-function $aq(self, predicate) {
-	return [ self, predicate ];
-}
-function $as(self) {
-	let found = [ 1 ];
-	let searching = true;
-	while (searching) {
-		const $at = $k(self[0]);
-		let $au = null;
-		if ($at[0] === 0) {
-			if (self[1]($at[1])) {
-				found = [ 0, __clone($at[1]) ];
-				searching = false;
-			}
-			$au = undefined;
-		} else {
-			searching = false;
-		}
-		$au;
-	}
-	return found;
-}
-function $ar(self) {
-	let result = [  ];
-	const $av = self;
-	while (true) {
-		const $aw = $as($av);
-		if ($aw[0] !== 0) {
-			break;
-		}
-		const value = $aw[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $ay() {
+function $ar() {
 	const table = new Map();
 	return [ table ];
 }
-function $az(self, value) {
+function $as(self, value) {
 	self[0].set(hash2(value), value);
 }
-function $ax(self) {
-	let result = $ay();
+function $aq(self) {
+	let result = $ar();
 	for (const value of self) {
-		$az(result, value);
+		$as(result, value);
 	}
 	return result;
 }
-function $aA(self) {
+function $at(self) {
 	return self[0].size;
 }
-function $aB(self, fn) {
+function $au(self, fn) {
 	return [ self, fn ];
 }
-function $aD(self) {
-	const $aE = $I(self[0]);
-	if ($aE[0] === 0) {
-		return [ 0, self[1]($aE[1]) ];
+function $aw(self) {
+	const $ax = $I(self[0]);
+	if ($ax[0] === 0) {
+		return [ 0, self[1]($ax[1]) ];
 	}
 	return [ 1 ];
 }
-function $aC(self) {
+function $av(self) {
 	let result = [  ];
-	const $aF = self;
+	const $ay = self;
 	while (true) {
-		const $aG = $aD($aF);
-		if ($aG[0] !== 0) {
+		const $az = $aw($ay);
+		if ($az[0] !== 0) {
 			break;
 		}
-		const value = $aG[1];
+		const value = $az[1];
 		result.push(__clone(value));
 	}
 	return result;
 }
-function $aI() {
+function $aB() {
 	const table = new Map();
 	return [ table ];
 }
-function $aJ(self, key, value) {
+function $aC(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
-function $aH(self) {
-	let result = $aI();
+function $aA(self) {
+	let result = $aB();
 	for (const entry2 of self) {
-		$aJ(result, entry2[0], entry2[1]);
+		$aC(result, entry2[0], entry2[1]);
 	}
 	return result;
 }
-function $aK(self, key) {
-	const $aL = __map_get(self[0], hash(key));
-	let $aM = null;
-	if ($aL[0] === 0) {
-		const entry2 = $aL[1];
-		$aM = [ 0, __clone(entry2[1]) ];
+function $aD(self, key) {
+	const $aE = __map_get(self[0], hash(key));
+	let $aF = null;
+	if ($aE[0] === 0) {
+		const entry2 = $aE[1];
+		$aF = [ 0, __clone(entry2[1]) ];
 	} else {
-		$aM = [ 1 ];
+		$aF = [ 1 ];
 	}
-	return $aM;
+	return $aF;
 }
-function $aN(self, fallback) {
-	const $aO = self;
-	let $aP = null;
-	if ($aO[0] === 0) {
-		const x = __clone($aO[1]);
-		$aP = x;
+function $aG(self, fallback) {
+	const $aH = self;
+	let $aI = null;
+	if ($aH[0] === 0) {
+		const x = __clone($aH[1]);
+		$aI = x;
 	} else {
-		$aP = __clone(fallback);
+		$aI = __clone(fallback);
 	}
-	return $aP;
+	return $aI;
 }
-function $aQ(self) {
+function $aJ(self) {
 	let seen = 0;
-	const $aR = self;
+	const $aK = self;
 	while (true) {
-		const $aS = $k($aR);
-		if ($aS[0] !== 0) {
+		const $aL = $k($aK);
+		if ($aL[0] !== 0) {
 			break;
 		}
-		const _value = $aS[1];
+		const _value = $aL[1];
 		seen = seen + 1;
 	}
 	return seen;
@@ -474,19 +439,19 @@ console.log($Z($a([ 1, 2, 3 ]), 0, (total, n) => {
 console.log($ac($a([ 1, 2, 3 ]), (n) => {
 	return n > 0;
 }));
-console.log($ak($af($a([ 1, 2, 3 ]))));
-$an($a([ 1, 2 ]), (n) => {
+console.log($ag($af($a([ 1, 2, 3 ]))));
+$ak($a([ 1, 2 ]), (n) => {
 	return console.log(n);
 });
-console.log($aA($ax($ar($aq($a([ 1, 2, 2, 3 ]), (n) => {
+console.log($at($aq($an($b($a([ 1, 2, 2, 3 ]), (n) => {
 	return n > 1;
 })))));
-const lengths = $aH($aC($aB($D([ "alpha", "hi" ]), (word) => {
+const lengths = $aA($av($au($D([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
-console.log($aN($aK(lengths, "hi"), -(1)));
+console.log($aG($aD(lengths, "hi"), -(1)));
 let live = [ 1, 2 ];
 let cursor = $a(live);
 live.push(3);
-console.log($aQ(cursor));
+console.log($aJ(cursor));
 console.log(live.length);

@@ -323,21 +323,21 @@ function chunk_pending() {
 function chunk_failure() {
 	return chunk_error_signal;
 }
-function set_chunk_pending(busy, $bm) {
+function set_chunk_pending(busy, $bl) {
 	if ($aa(chunk_pending_signal) !== busy) {
-		$bn(chunk_pending_signal, busy, $bm);
+		$bm(chunk_pending_signal, busy, $bl);
 	}
 }
 function clear_chunk_error($bc) {
-	const $be = $bd(chunk_error_signal);
-	let $bf = null;
-	if ($be[0] === 0) {
-		const _reason = $be[1];
-		$bf = $bg(chunk_error_signal, [ 1 ], $bc);
+	const $bd = $ar(chunk_error_signal);
+	let $be = null;
+	if ($bd[0] === 0) {
+		const _reason = $bd[1];
+		$be = $bf(chunk_error_signal, [ 1 ], $bc);
 	} else {
-		$bf = undefined;
+		$be = undefined;
 	}
-	return $bf;
+	return $be;
 }
 function place(self, parent) {
 	parent[0].appendChild(self[0]);
@@ -351,11 +351,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $bH = $bG([ 1 ], ($bE) => {
-		return $bF(body);
+	const $bG = $bF([ 1 ], ($bD) => {
+		return $bE(body);
 	});
-	const built = $bH[0];
-	const root = $bH[1];
+	const built = $bG[0];
+	const root = $bG[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -703,101 +703,98 @@ function $aK(self, source, render, $aL, $aM) {
 	}, $aL, $aM);
 	return __clone(self);
 }
-function $bd(self) {
+function $bg(self, $i) {
+	const $bh = $i;
+	let $bi = null;
+	if ($bh[0] === 0) {
+		const turn = $bh[1];
+		$bi = enqueue(turn, self[1].v);
+	} else {
+		const $bj = $m(draining_turns.v);
+		let $bk = null;
+		if ($bj[0] === 0) {
+			const draining = $bj[1];
+			$bk = enqueue(draining, self[1].v);
+		} else {
+			for (const subscriber of self[1].v) {
+				subscriber[1]();
+			}
+			$bk = undefined;
+		}
+		$bi = $bk;
+	}
+	return $bi;
+}
+function $bf(self, value, $g) {
+	self[0].v = value;
+	$bg(self, $g);
+}
+function $bn(self, $i) {
+	const $bo = $i;
+	let $bp = null;
+	if ($bo[0] === 0) {
+		const turn = $bo[1];
+		$bp = enqueue(turn, self[1].v);
+	} else {
+		const $bq = $m(draining_turns.v);
+		let $br = null;
+		if ($bq[0] === 0) {
+			const draining = $bq[1];
+			$br = enqueue(draining, self[1].v);
+		} else {
+			for (const subscriber of self[1].v) {
+				subscriber[1]();
+			}
+			$br = undefined;
+		}
+		$bp = $br;
+	}
+	return $bp;
+}
+function $bm(self, value, $g) {
+	self[0].v = value;
+	$bn(self, $g);
+}
+function $bv(self, $i) {
+	const $bw = $i;
+	let $bx = null;
+	if ($bw[0] === 0) {
+		const turn = $bw[1];
+		$bx = enqueue(turn, self[1].v);
+	} else {
+		const $by = $m(draining_turns.v);
+		let $bz = null;
+		if ($by[0] === 0) {
+			const draining = $by[1];
+			$bz = enqueue(draining, self[1].v);
+		} else {
+			for (const subscriber of self[1].v) {
+				subscriber[1]();
+			}
+			$bz = undefined;
+		}
+		$bx = $bz;
+	}
+	return $bx;
+}
+function $bu(self, value, $g) {
+	self[0].v = value;
+	$bv(self, $g);
+}
+function $bC(self) {
 	return self[0].v;
 }
-function $bh(self, $i) {
-	const $bi = $i;
-	let $bj = null;
-	if ($bi[0] === 0) {
-		const turn = $bi[1];
-		$bj = enqueue(turn, self[1].v);
-	} else {
-		const $bk = $m(draining_turns.v);
-		let $bl = null;
-		if ($bk[0] === 0) {
-			const draining = $bk[1];
-			$bl = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$bl = undefined;
-		}
-		$bj = $bl;
-	}
-	return $bj;
-}
-function $bg(self, value, $g) {
-	self[0].v = value;
-	$bh(self, $g);
-}
-function $bo(self, $i) {
-	const $bp = $i;
-	let $bq = null;
-	if ($bp[0] === 0) {
-		const turn = $bp[1];
-		$bq = enqueue(turn, self[1].v);
-	} else {
-		const $br = $m(draining_turns.v);
-		let $bs = null;
-		if ($br[0] === 0) {
-			const draining = $br[1];
-			$bs = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$bs = undefined;
-		}
-		$bq = $bs;
-	}
-	return $bq;
-}
-function $bn(self, value, $g) {
-	self[0].v = value;
-	$bo(self, $g);
-}
-function $bw(self, $i) {
-	const $bx = $i;
-	let $by = null;
-	if ($bx[0] === 0) {
-		const turn = $bx[1];
-		$by = enqueue(turn, self[1].v);
-	} else {
-		const $bz = $m(draining_turns.v);
-		let $bA = null;
-		if ($bz[0] === 0) {
-			const draining = $bz[1];
-			$bA = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$bA = undefined;
-		}
-		$by = $bA;
-	}
-	return $by;
-}
-function $bv(self, value, $g) {
-	self[0].v = value;
-	$bw(self, $g);
-}
-function $bD(self) {
-	return self[0].v;
-}
-function $bC(self, observer) {
+function $bB(self, observer) {
 	const id = fresh_id();
 	self[1].v.push([ id, () => {
-		observer($bD(self));
+		observer($bC(self));
 		return;
 	} ]);
-	observer($bD(self));
+	observer($bC(self));
 	return [ self[1], id ];
 }
-function $bB(self, observer, $ae, $af) {
-	$ai(get_owner($af), $bC(self, observer), $ae);
+function $bA(self, observer, $ae, $af) {
+	$ai(get_owner($af), $bB(self, observer), $ae);
 }
 function $aH(self, source, render, $aI, $aJ) {
 	const gated = $x($aG(source));
@@ -811,7 +808,7 @@ function $aH(self, source, render, $aI, $aJ) {
 		}
 		return;
 	};
-	$bB(source, (value) => {
+	$bA(source, (value) => {
 		const mine = generation.v + 1;
 		generation.v = mine;
 		clear_chunk_error($aI);
@@ -822,18 +819,18 @@ function $aH(self, source, render, $aI, $aJ) {
 		} else {
 			set_chunk_pending(true, $aI);
 			__chunk_load(arm, () => {
-				return $q([ 1 ], ($bt) => {
+				return $q([ 1 ], ($bs) => {
 					if (generation.v === mine) {
-						set_chunk_pending(false, [ 0, $bt ]);
+						set_chunk_pending(false, [ 0, $bs ]);
 						advance(value);
 					}
 					return;
 				});
 			}, (reason) => {
-				return $q([ 1 ], ($bu) => {
+				return $q([ 1 ], ($bt) => {
 					if (generation.v === mine) {
-						set_chunk_pending(false, [ 0, $bu ]);
-						$bv(chunk_error_signal, [ 0, reason ], [ 0, $bu ]);
+						set_chunk_pending(false, [ 0, $bt ]);
+						$bu(chunk_error_signal, [ 0, reason ], [ 0, $bt ]);
 					}
 					return;
 				});
@@ -843,12 +840,12 @@ function $aH(self, source, render, $aI, $aJ) {
 	}, $aI, $aJ);
 	return __clone(self);
 }
-function $bF(body) {
+function $bE(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, __clone(scope) ];
 }
-function $bG(policy, body) {
+function $bF(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);

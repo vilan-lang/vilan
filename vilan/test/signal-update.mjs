@@ -69,7 +69,7 @@ function drain(turn) {
 		turn[1].v = false;
 	}
 }
-function dispose(self, $J) {
+function dispose(self, $H) {
 	let kept = [  ];
 	for (const subscriber of self[0].v) {
 		if (subscriber[0] !== self[1]) {
@@ -77,10 +77,10 @@ function dispose(self, $J) {
 		}
 	}
 	self[0].v = kept;
-	const $K = $J;
-	let $L = null;
-	if ($K[0] === 0) {
-		const turn = $K[1];
+	const $I = $H;
+	let $J = null;
+	if ($I[0] === 0) {
+		const turn = $I[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== self[1]) {
@@ -88,11 +88,11 @@ function dispose(self, $J) {
 			}
 		}
 		turn[0].v = kept_pending;
-		$L = undefined;
+		$J = undefined;
 	} else {
-		$L = undefined;
+		$J = undefined;
 	}
-	return $L;
+	return $J;
 }
 function new4() {
 	return [ __shared_new([  ]) ];
@@ -208,180 +208,43 @@ function $x(self, mutate, $c) {
 function $D(self) {
 	return self[0].v;
 }
-function $E(value) {
-	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers) ];
-}
-function $G(self) {
-	return self[0].v;
-}
-function $F(self, observer) {
+function $E(self, observer) {
 	const id = fresh_id();
 	self[1].v.push([ id, () => {
-		observer($G(self));
+		observer($l(self));
 		return;
 	} ]);
-	observer($G(self));
+	observer($l(self));
 	return [ self[1], id ];
 }
-function $H(self, item, $I) {
+function $F(self, item, $G) {
 	self[0].v.push(() => {
-		dispose(item, $I);
+		dispose(item, $G);
 		return;
 	});
 	return __clone(item);
 }
-function $N(self, $e) {
-	const $O = $e;
-	let $P = null;
-	if ($O[0] === 0) {
-		const turn = $O[1];
-		$P = enqueue(turn, self[1].v);
-	} else {
-		const $Q = $i(draining_turns.v);
-		let $R = null;
-		if ($Q[0] === 0) {
-			const draining = $Q[1];
-			$R = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$R = undefined;
-		}
-		$P = $R;
-	}
-	return $P;
-}
-function $M(self, mutate, $c) {
-	mutate(self[0].v);
-	$N(self, $c);
-}
-function $T(self, $e) {
-	const $U = $e;
-	let $V = null;
-	if ($U[0] === 0) {
-		const turn = $U[1];
-		$V = enqueue(turn, self[1].v);
-	} else {
-		const $W = $i(draining_turns.v);
-		let $X = null;
-		if ($W[0] === 0) {
-			const draining = $W[1];
-			$X = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$X = undefined;
-		}
-		$V = $X;
-	}
-	return $V;
-}
-function $S(self, mutate, $c) {
-	mutate(self[0].v);
-	$T(self, $c);
-}
-function $aa(self, $e) {
-	const $ab = $e;
-	let $ac = null;
-	if ($ab[0] === 0) {
-		const turn = $ab[1];
-		$ac = enqueue(turn, self[1].v);
-	} else {
-		const $ad = $i(draining_turns.v);
-		let $ae = null;
-		if ($ad[0] === 0) {
-			const draining = $ad[1];
-			$ae = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$ae = undefined;
-		}
-		$ac = $ae;
-	}
-	return $ac;
-}
-function $Z(self, mutate, $c) {
-	mutate(self[0].v);
-	$aa(self, $c);
-}
-function $ag(self, $e) {
-	const $ah = $e;
-	let $ai = null;
-	if ($ah[0] === 0) {
-		const turn = $ah[1];
-		$ai = enqueue(turn, self[1].v);
-	} else {
-		const $aj = $i(draining_turns.v);
-		let $ak = null;
-		if ($aj[0] === 0) {
-			const draining = $aj[1];
-			$ak = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$ak = undefined;
-		}
-		$ai = $ak;
-	}
-	return $ai;
-}
-function $af(self, mutate, $c) {
-	mutate(self[0].v);
-	$ag(self, $c);
-}
-function $al(body, $am) {
-	const $an = $am;
-	let $ao = null;
-	if ($an[0] === 0) {
-		const current = $an[1];
-		$ao = body(current);
+function $L(body, $M) {
+	const $N = $M;
+	let $O = null;
+	if ($N[0] === 0) {
+		const current = $N[1];
+		$O = body(current);
 	} else {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[2].v = true;
-		$ao = result;
+		$O = result;
 	}
-	return $ao;
+	return $O;
 }
-function $aq(self, $e) {
-	const $ar = $e;
-	let $as = null;
-	if ($ar[0] === 0) {
-		const turn = $ar[1];
-		$as = enqueue(turn, self[1].v);
-	} else {
-		const $at = $i(draining_turns.v);
-		let $au = null;
-		if ($at[0] === 0) {
-			const draining = $at[1];
-			$au = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$au = undefined;
-		}
-		$as = $au;
-	}
-	return $as;
-}
-function $ap(self, mutate, $c) {
-	mutate(self[0].v);
-	$aq(self, $c);
-}
-function $ax(self, value, $ay) {
+function $R(self, value, $S) {
 	self[0].v = value;
-	$y(self, $ay);
+	$y(self, $S);
 }
-function $av(self, transform, $aw) {
-	$ax(self, transform($D(self)), $aw);
+function $P(self, transform, $Q) {
+	$R(self, transform($D(self)), $Q);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -405,37 +268,37 @@ $x(count, (value) => {
 	return;
 }, [ 1 ]);
 console.log($D(count));
-const watched = $E([ 0 ]);
-$H(owner, $F(watched, (list) => {
+const watched = $a([ 0 ]);
+$F(owner, $E(watched, (list) => {
 	return console.log("len " + list.length);
 }), [ 1 ]);
-$M(watched, (list) => {
+$b(watched, (list) => {
 	list.push(1);
 	list.push(2);
 	return;
 }, [ 1 ]);
-$S(watched, (list) => {
+$b(watched, (list) => {
 	return;
 }, [ 1 ]);
 console.log("---");
-$al(($Y) => {
-	$Z(watched, (list) => {
+$L(($K) => {
+	$b(watched, (list) => {
 		list.push(3);
 		return;
-	}, [ 0, $Y ]);
-	$af(watched, (list) => {
+	}, [ 0, $K ]);
+	$b(watched, (list) => {
 		list.push(4);
 		return;
-	}, [ 0, $Y ]);
+	}, [ 0, $K ]);
 	console.log("inside");
 	return;
 }, [ 1 ]);
-$ap(todos, (list) => {
+$b(todos, (list) => {
 	list.push(6);
 	console.log("reentrant " + $l(todos).length);
 	return;
 }, [ 1 ]);
-$av(count, (n) => {
+$P(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($D(count));

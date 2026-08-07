@@ -136,16 +136,13 @@ function $v(self, observer) {
 	observer($f(self));
 	return [ self[1], id ];
 }
-function $x(self) {
-	return self[0].v;
-}
 function $w(self, observer) {
 	const id = fresh_id();
 	self[1].v.push([ id, () => {
-		observer($x(self));
+		observer($e(self));
 		return;
 	} ]);
-	observer($x(self));
+	observer($e(self));
 	return [ self[1], id ];
 }
 function $c(self, $d) {
@@ -168,36 +165,36 @@ function $c(self, $d) {
 	});
 	return derived;
 }
-function $z(self, $o) {
-	const $A = $o;
-	let $B = null;
-	if ($A[0] === 0) {
-		const turn = $A[1];
-		$B = enqueue(turn, self[1].v);
+function $y(self, $o) {
+	const $z = $o;
+	let $A = null;
+	if ($z[0] === 0) {
+		const turn = $z[1];
+		$A = enqueue(turn, self[1].v);
 	} else {
-		const $C = $s(draining_turns.v);
-		let $D = null;
-		if ($C[0] === 0) {
-			const draining = $C[1];
-			$D = enqueue(draining, self[1].v);
+		const $B = $s(draining_turns.v);
+		let $C = null;
+		if ($B[0] === 0) {
+			const draining = $B[1];
+			$C = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$D = undefined;
+			$C = undefined;
 		}
-		$B = $D;
+		$A = $C;
 	}
-	return $B;
+	return $A;
 }
-function $y(self, value, $m) {
+function $x(self, value, $m) {
 	self[0].v = value;
-	$z(self, $m);
+	$y(self, $m);
 }
-function $E(self, transform, $F) {
+function $D(self, transform, $E) {
 	const derived = $a(transform($f(self)));
 	self[1].v.push([ fresh_id(), () => {
-		$l(derived, transform($f(self)), $F);
+		$l(derived, transform($f(self)), $E);
 		return;
 	} ]);
 	return derived;
@@ -211,13 +208,13 @@ const joined = $c(outer, [ 1 ]);
 console.log($f(joined));
 $l(first, 2, [ 1 ]);
 console.log($f(joined));
-$y(outer, second, [ 1 ]);
+$x(outer, second, [ 1 ]);
 console.log($f(joined));
 $l(first, 99, [ 1 ]);
 console.log($f(joined));
 $l(second, 11, [ 1 ]);
 console.log($f(joined));
-const doubled = $E(joined, (value) => {
+const doubled = $D(joined, (value) => {
 	return value * 2;
 }, [ 1 ]);
 $l(second, 21, [ 1 ]);
