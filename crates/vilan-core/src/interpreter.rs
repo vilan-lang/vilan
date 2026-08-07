@@ -1084,6 +1084,34 @@ impl Interpreter {
                 }
                 Ok(Value::Map(Rc::new(RefCell::new(map))))
             }
+            // Writing a whole aggregate through a view (backlog B89): REPLACE the
+            // pointee's contents, keeping its identity. A merge would leave any
+            // trailing slot the value does not reach standing — the enum
+            // reassigned to a shorter variant, or the shortened `&mut List<T>`.
+            // Mirrors the emitted `__replace`, so node and the interpreter agree.
+            "__replace" => match (take(0), take(1)) {
+                (Value::Array(target), Value::Array(source)) => {
+                    let elements: Vec<Value> = source.borrow().clone();
+                    *target.borrow_mut() = elements;
+                    Ok(Value::Array(target))
+                }
+                (Value::Object(target), Value::Object(source)) => {
+                    let entries: Vec<_> = source
+                        .borrow()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    for (key, value) in entries {
+                        target.borrow_mut().insert(key, value);
+                    }
+                    Ok(Value::Object(target))
+                }
+                (target, source) => Err(Failure::internal(format!(
+                    "__replace of {} onto {}",
+                    type_name(&source),
+                    type_name(&target)
+                ))),
+            },
             "__clone" => Ok(deep_clone(&take(0))),
             // `[value; n]` — n independent slots. `deep_clone` per slot matches the
             // emitted helper (a primitive copies, an aggregate is cloned) for both

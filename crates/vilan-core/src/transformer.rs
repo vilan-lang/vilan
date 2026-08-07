@@ -1276,6 +1276,19 @@ fn helper_source(name: &str) -> &'static str {
         "__nursery_of" => {
             "function __nursery_of(option) {\n\treturn option[0] === 0 ? option[1] : undefined;\n}"
         }
+        // Writing a whole aggregate through a view: REPLACE the pointee's
+        // contents, keeping its identity so every alias sees the new value.
+        // `Object.assign` alone is a merge — it never removes a slot the source
+        // does not reach — so the length is set first (backlog B89). Both sides
+        // are arrays for every aggregate the view machinery reaches (structs,
+        // tuples, enums and `List` are arrays; a `Map` is a one-slot array); the
+        // guard keeps an object-backed pointee on the plain merge.
+        "__replace" => {
+            "function __replace(target, value) {\n\
+             \tif (Array.isArray(target) && Array.isArray(value)) target.length = value.length;\n\
+             \treturn Object.assign(target, value);\n\
+             }"
+        }
         "__clone" => {
             "function __clone(value) {\n\
              \tif (Array.isArray(value)) return value.map(__clone);\n\
@@ -2320,7 +2333,7 @@ impl<'src> Transformer<'src> {
     /// pointee is abstract there, so it cannot be added to `primitive_views`; the
     /// classification is re-made here against the concrete type, so a scalar
     /// pointee uses the `(base, key)` representation its (concrete) caller passed
-    /// rather than the aggregate `Object.assign` path.
+    /// rather than the aggregate `__replace` path.
     fn generic_ref_param_is_scalar(&self, binding: Id) -> bool {
         self.program
             .parameters
@@ -2533,7 +2546,7 @@ impl<'src> Transformer<'src> {
 
     /// Whether an expression is a `Shared::write()` call — a single-slot view of
     /// the cell's `v` slot. Writing through it rebinds the slot (`cell.v = x`),
-    /// distinct from both the `(base, key)` and aggregate-`Object.assign` views.
+    /// distinct from both the `(base, key)` and aggregate-`__replace` views.
     fn is_shared_write(&self, operand: Id) -> bool {
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&operand) else {
             return false;
@@ -3693,8 +3706,9 @@ impl<'src> Transformer<'src> {
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
-                // aggregate view copies the fields in place (`Object.assign`), so
-                // the target and its aliases update rather than rebinding a local.
+                // aggregate view REPLACES the pointee's contents in place
+                // (`__replace`), so the target and its aliases update rather than
+                // rebinding a local.
                 // A primitive view's `*c` is a `[0]` slot write — the normal path.
                 if let Some(Expr::Dereference(operand)) = self.program.entity_map.get(target_id) {
                     if self.is_shared_write(*operand) {
@@ -3710,9 +3724,20 @@ impl<'src> Transformer<'src> {
                         return Some(js::Node::Assignment(Box::new(slot), Box::new(value)));
                     }
                     if !self.derefs_scalar_view(*operand) {
+                        // `Object.assign` was the write for years and is a MERGE:
+                        // it copies the value's slots over the pointee's and
+                        // leaves any TRAILING slot the value does not reach
+                        // standing (backlog B89). Every aggregate whose width can
+                        // shrink is wrong under it — an enum reassigned to a
+                        // shorter variant keeps the old payload in the tail
+                        // (unreachable through the enum's API, but present), and a
+                        // `&mut List<T>` written with a shorter list keeps its old
+                        // elements outright (`len` still counts them). The write
+                        // means REPLACE, so it emits replace.
                         let base = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
+                        self.used_helpers.insert("__replace");
                         return Some(js::Node::Call(
-                            Box::new(js::Node::Local("Object.assign".to_string())),
+                            Box::new(js::Node::Local("__replace".to_string())),
                             vec![base, value],
                         ));
                     }

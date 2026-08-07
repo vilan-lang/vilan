@@ -8,12 +8,16 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __replace(target, value) {
+	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
+	return Object.assign(target, value);
+}
 function step(self) {
 	const $n = self;
 	const items = __clone($n[1]);
 	const at = $n[2];
 	if ($n[0] === 0) {
-		Object.assign(self, [ 0, __clone(items), at + 1 ]);
+		__replace(self, [ 0, __clone(items), at + 1 ]);
 		return __at(items, at);
 	}
 	return "-";

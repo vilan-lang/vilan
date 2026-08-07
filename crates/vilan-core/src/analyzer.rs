@@ -26037,7 +26037,7 @@ pub enum Intrinsic {
     SharedValue,
     // `Shared.write()` -> a mutable view of the cell's slot, `self.v`. Same JS as
     // `SharedValue`, but distinguished so a write *through* it rebinds the slot
-    // (`self.v = x`) rather than merging (`Object.assign`).
+    // (`self.v = x`) rather than replacing the pointee's slots (`__replace`).
     SharedWrite,
     // `Set::new(): Set<T>` -> `new Set()`.
     SetNew,

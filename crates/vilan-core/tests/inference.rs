@@ -3126,9 +3126,10 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 #[test]
 fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
     // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
-    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to `Object.assign(self,
-    // ..)`, mutating the very array `$a` aliases, so `items[at]` indexed with
-    // the INCREMENTED `at`. Printed "b\nc" for two steps over ["a","b","c"].
+    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to a write in place
+    // (`__replace(self, ..)`), mutating the very array `$a` aliases, so
+    // `items[at]` indexed with the INCREMENTED `at`. Printed "b\nc" for two
+    // steps over ["a","b","c"].
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -3538,6 +3539,195 @@ fn a_readonly_view_subject_keeps_its_shared_accessors() {
         }
         "#,
         "7\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B89 (the view write is a REPLACE, not a merge). Writing a whole aggregate
+// through a view has to keep the pointee's identity — that is how the write
+// reaches the caller — so it copies the value's slots into the pointee rather
+// than rebinding. `Object.assign` did the copying, and `Object.assign` is a
+// MERGE: a slot the value does not reach is left standing. Every aggregate
+// whose width can shrink was wrong under it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_shortening_write_through_a_list_view_truncates() {
+    // The directly observable half, and the reason this is not merely an enum
+    // bug: `Object.assign(v, [ 1 ])` over a three-element list overwrote slot 0
+    // and left slots 1 and 2 alone, so the caller's list still had `len() == 3`
+    // and still held `2` and `3`. Nothing in the source says "merge".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun replace(v: &mut List<i32>) {
+            v = [9];
+        }
+        fun main() {
+            mut xs = [1, 2, 3];
+            replace(&mut xs);
+            print(xs.len());
+            print(xs[0]);
+        }
+        "#,
+        "1\n9\n",
+    );
+}
+
+#[test]
+fn a_shortening_reassign_of_a_viewed_enum_leaves_no_stale_payload() {
+    // B89's filed repro. `self = Feed::Done` lowers to a write of `[ 1 ]` over
+    // `[ 0, [ "a" ], 1 ]`; under the merge the payload survived in the trailing
+    // slots — unreachable through the enum's own API (the tag gates every
+    // read), but present, and for a RESOURCE payload it is a live object no
+    // owner can reach. The emitted shape is the pin: the truncating write, and
+    // the helper that truncates.
+    let source = r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun finish(&mut self) {
+                self = Feed::Done;
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a"], 1);
+            feed.finish();
+            if feed is Feed::Done {
+                print("done");
+            }
+        }
+    "#;
+    assert_emits_containing(source, "__replace(self, [ 1 ]);");
+    assert_emits_containing(
+        source,
+        "if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;",
+    );
+    assert_compiles_and_runs(source, "done\n");
+}
+
+#[test]
+fn a_widening_reassign_of_a_viewed_enum_fills_every_slot() {
+    // The other direction, which the fix must not break: the pointee GROWS, so
+    // setting the length first opens holes that the copy then fills. A payload
+    // read back after the widening write proves no slot was left a hole.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun start(&mut self) {
+                self = Feed::Ready(["a", "b"], 7);
+            }
+        }
+        fun main() {
+            mut feed = Feed::Done;
+            feed.start();
+            if feed is Feed::Ready(let items, let at) {
+                print(items.len());
+                print(at);
+            }
+        }
+        "#,
+        "2\n7\n",
+    );
+}
+
+#[test]
+fn an_equal_width_write_through_a_struct_view_is_unchanged() {
+    // The width-fixed case, pinned so the general form stays a superset of the
+    // merge it replaced: a struct's slots are the same on both sides, so the
+    // merge happened to be right there and the replace must agree with it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point { x: i32, y: i32 }
+        fun move_to(p: &mut Point) {
+            p = Point { x = 7, y = 8 };
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            move_to(&mut point);
+            print(point.x);
+            print(point.y);
+        }
+        "#,
+        "7\n8\n",
+    );
+}
+
+#[test]
+fn a_shortening_write_through_a_view_truncates_under_const_eval() {
+    // The const-eval interpreter runs the SAME emitted nodes, so it needs the
+    // replace natively — a merge there would fold a stale slot into a literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun replace(v: &mut List<i32>): i32 {
+            v = [9];
+            v.len()
+        }
+        fun main() {
+            print(const {
+                mut xs = [1, 2, 3];
+                replace(&mut xs)
+            });
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+#[ignore = "B89 residue: a view write never fires R2's overwrite drop (see the comment)"]
+fn a_view_write_drops_the_overwritten_variants_resource() {
+    // The half the truncation does NOT fix, recorded as its own case. R2
+    // (destruction.md §5) says assigning onto a binding that still owns a
+    // resource drops the old value first, and the OWNED-place twin implements
+    // it: `holder = Holder::Empty` on a local emits the tag-dispatching drop
+    // glue before the write, and this program prints "dropped held" when the
+    // reassign is written that way. Through a `&mut` view it does not — the
+    // scan that plans overwrite drops tracks BINDINGS the scanned body owns,
+    // and a loan owns nothing, so no drop is planned and the scope-end glue
+    // then reads the NEW tag and finds nothing to drop. Today the guard is
+    // silently leaked (this program prints "before\nafter"). Whether a loan may
+    // destroy the pointee's resource at all is a memory-model question, not a
+    // codegen one: the alternatives are to drop at the view write or to reject
+    // the write when the pointee's type carries a resource. Flagged for the
+    // owner; the assertion below is the outcome R2 implies.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop {
+            fun drop(&mut self) {
+                print(i"dropped {self.label}");
+            }
+        }
+        enum Holder {
+            Full(Guard),
+            Empty,
+        }
+        impl Holder {
+            fun clear(&mut self) {
+                self = Holder::Empty;
+            }
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            print("before");
+            holder.clear();
+            print("after");
+        }
+        "#,
+        "before\ndropped held\nafter\n",
     );
 }
 

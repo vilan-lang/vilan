@@ -1,3 +1,7 @@
+function __replace(target, value) {
+	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
+	return Object.assign(target, value);
+}
 function bump(slot) {
 	slot[0][slot[1]] = slot[0][slot[1]] + 1;
 }
@@ -14,6 +18,6 @@ r[0][r[1]] = r[0][r[1]] * 3;
 console.log(p[0]);
 let q = [ 1, 2 ];
 const w = q;
-Object.assign(w, [ 7, 8 ]);
+__replace(w, [ 7, 8 ]);
 console.log(q[0]);
 console.log(q[1]);
