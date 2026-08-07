@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## v0.31.0 — 2026-08-06
+## Unreleased
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.
 
@@ -64,6 +64,8 @@ The loop's native lowering — a `Set` is a struct over a native map, so the loo
 The type is now taken from the analyzer, which computed it for this very loop when it decided the loop's element type and is the only place it is known in full. Every shape of iterable therefore gets the same answer — including `for x in self`, which std's own `Set` methods have been routing around via `self.table.values()` by convention since the type existed. That convention is now a style choice rather than a requirement; the existing methods keep it (rewriting them would be churn), and writing the direct form in your own `impl Set<type T: Hashable>` block is correct. Eight pins across the iterable shapes, the seven `Set` ones planted red and restored; `List` and `str` are natively iterable, were never affected, and are pinned as the unmoved half. No emitted byte moved anywhere in the corpus.
 
 The sweep behind that fix turned up a neighbouring hole two lanes converged on from opposite sides: `for x in map` compiled, at every call site, and iterated once — `Map` has no loop form at all. The for-loop rule shipped above closes it: the loop now refuses an un-iterable struct and names `map.entries()`, `map.keys()` and `map.values()`. The pin one lane left waiting for that refusal is un-ignored in the same release it was written.
+
+## v0.31.0 — 2026-08-06
 
 **Writing `impl List<type T>` in your own file no longer makes the compiler complain about std's `List`.** Roughly half the time — the same file, the same compiler, a different answer per run — a user impl block on a std container produced "the type of 'result' is never fully determined", pointing at a `mut result = List::new()` line inside `list.vl` that you did not write and cannot annotate. The other half of the runs were clean, which is the tell: the diagnostic was never about your program.
 
