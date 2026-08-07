@@ -764,7 +764,12 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
         .spawn()
         .expect("spawn run --watch");
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // A watch round is a full compile, so this is `support::WATCH_LIVENESS` and
+    // not a literal (E40, following E39's sweep of `hmr.rs`): the claim is that
+    // the round CLEARS the seed build's chunks, never that it clears them
+    // quickly, and the 120 s that stood here was consumed outright on a box
+    // running several overlapping suites.
+    let deadline = Instant::now() + support::WATCH_LIVENESS;
     let mut cleared = false;
     while Instant::now() < deadline {
         if chunk_artifacts(&dist).is_empty() && dist.join("client.js").is_file() {
