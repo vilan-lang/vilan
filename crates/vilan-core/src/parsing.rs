@@ -43,9 +43,10 @@
 
 use crate::lexing;
 use crate::node::{
-    BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
-    ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If, ImportBranch,
-    MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField, TupleBound,
+    BinaryOp, Closure, Convention, Discriminant, ElementBody, ElementChild, ElementHeadItem,
+    EnumVariant, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
+    ImportBranch, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField,
+    TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -3304,16 +3305,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `= (-)? integer` — an explicit enum discriminant, or `None` (backtracking)
-    /// when no `=` follows. The magnitude is parsed as `i64` (0 on overflow,
-    /// matching chumsky's `unwrap_or(0)`).
-    fn parse_discriminant(&mut self) -> Option<i64> {
+    /// `= (-)? NUMBER` — an explicit enum discriminant, or `None`
+    /// (backtracking) when no `=` follows. The number token is carried
+    /// UNREDUCED: the grammar's production is an integer, but the token also
+    /// admits a fraction and a suffix, and reducing here is what turned an
+    /// overflowing magnitude into `0` (B79). The analyzer reads the value and
+    /// rejects every spelling the production does not mean.
+    fn parse_discriminant(&mut self) -> Option<Discriminant<'src>> {
         self.attempt(|parser| {
             parser.expect_op("=")?;
+            let start = parser.position;
             let negative = parser.eat_op("-");
-            let whole = parser.eat_integer()?;
-            let magnitude = whole.parse::<i64>().unwrap_or(0);
-            Some(if negative { -magnitude } else { magnitude })
+            let (whole, fraction, suffix) = parser.eat_number()?;
+            Some(Discriminant {
+                negative,
+                whole,
+                fraction,
+                suffix,
+                span: parser.span_from(start),
+            })
         })
     }
 
@@ -3810,12 +3820,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     /// The whole part of a `Number` token, consumed — the chumsky `integer`
-    /// selector, used by tuple bounds, discriminants, and array lengths.
+    /// selector, used by tuple bounds and array lengths.
     fn eat_integer(&mut self) -> Option<&'src str> {
-        if let Some(Token::Number(whole, _, _)) = self.peek() {
-            let whole = *whole;
+        Some(self.eat_number()?.0)
+    }
+
+    /// A whole `Number` token, consumed: `(whole, fraction, suffix)`. The
+    /// discriminant production needs every part, because which parts are
+    /// PRESENT is what says whether the literal is the integer the grammar
+    /// means.
+    fn eat_number(&mut self) -> Option<(&'src str, Option<&'src str>, Option<&'src str>)> {
+        if let Some(Token::Number(whole, fraction, suffix)) = self.peek() {
+            let parts = (*whole, *fraction, *suffix);
             self.bump();
-            Some(whole)
+            Some(parts)
         } else {
             None
         }
@@ -4635,7 +4653,10 @@ mod tests {
                 assert!(!resource);
                 let (_, less_data, less_disc) = &variants.0[0].0;
                 assert!(less_data.is_empty());
-                assert_eq!(*less_disc, Some(-1));
+                let less_disc = less_disc.as_ref().expect("Less has a discriminant");
+                assert!(less_disc.negative);
+                assert_eq!(less_disc.whole, "1");
+                assert_eq!(less_disc.to_string(), "-1");
                 let (_, more_data, more_disc) = &variants.0[2].0;
                 assert_eq!(more_data.len(), 2, "More carries two payload types");
                 assert_eq!(*more_disc, None);

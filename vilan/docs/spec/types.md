@@ -47,6 +47,35 @@ variant is a constructor (with payload types) and a static member of the
 enum. An `external struct` declares a host type: no fields, its surface
 defined entirely by externs in impls.
 
+### Enum representation
+
+An enum has one of two runtime representations, and **which one is a
+property of the whole declaration, not of a variant**. An enum is
+*numeric* when both of these hold:
+
+1. every variant is data-less, **and**
+2. at least one variant has an explicit discriminant.
+
+A numeric enum lowers to the bare discriminant: `Ordering::Greater` is
+the value `1`, comparisons and equality are native number comparisons,
+and a `match` tests `subject === 1`. Every other enum lowers to the
+tagged form `[index, …payload]`, and a `match` tests the tag slot.
+
+The conjunction is the part worth stating outright, because both halves
+are easy to trip over:
+
+```vilan,fragment
+enum Level { Low, Mid, High }           // tagged: no explicit discriminant
+enum Level { Low = 0, Mid, High }       // numeric: ONE `= 0` converts all three
+enum Level { Low = 0, Mid(i32) }        // rejected: a payload and a discriminant
+```
+
+Adding `= 0` to a single variant changes the runtime shape of the entire
+enum — including how its values cross a host boundary, since a numeric
+enum reaches an `external fun` as a plain number. Discriminants must be
+unique across the enum, counting the values implicitly continued from
+the previous variant; see the grammar chapter for the full rule.
+
 ## 5.4 Impls
 
 `impl Subject { … }` adds **inherent** members to `Subject`;

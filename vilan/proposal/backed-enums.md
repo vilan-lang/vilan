@@ -312,6 +312,46 @@ near the shape is). **Recommendation: all three get closed, as their own
 slice, landing before the backed-enum work and independently valuable
 without it.** They reject only programs that are already miscompiling.
 
+#### SHIPPED as B79 (v0.32.0 cycle) — what the survey got right, and two more
+
+All three closed, as their own slice, ahead of this proposal and without
+prejudging it. The messages state the rule as it stands — "an enum
+discriminant must be an integer", never "always will be" — so §3.1's
+widening is not foreclosed.
+
+Two corrections to the record above, both found by reading the token
+rather than the value:
+
+- **(c) is wider than "a fraction".** `unwrap_or(0)` sat over the number
+  token's WHOLE part alone, so it also ate a type suffix and a hex
+  literal. `= 1u32` became `1`; `= 1_000` became `1`, because the lexer
+  reads `_000` as a suffix; and `= 0xFF` became **`0`**, since
+  `parse::<i64>()` fails outright on `0xFF` — a second, undocumented route
+  into hole (a). Hex is now read as hex (the analyzer's own range check
+  has always read `0x` as radix 16); a fraction and a suffix are errors.
+  A third route was a compiler PANIC rather than a wrong answer:
+  `enum E { A = 9223372036854775807, B }` overflowed the debug build's
+  `discriminant + 1` and wrapped the release build's.
+
+- **(b) is not "a discriminant on a payload variant".** §1.7's own P6 is
+  `enum Mixed { A = 1, B(str) }`, where the discriminant sits on the
+  DATA-LESS variant and `B`'s payload is what makes it inert — so the
+  narrow reading would have left the recorded hole open. The rule shipped
+  is §3.3's: a payload variant may not carry a discriminant, and neither
+  may its data-less siblings. Two messages, one for each shape.
+
+The sweep confirms §5's premise: `std/src/compare.vl`'s `Ordering` is the
+only enum in the tree using the feature (plus the corpus's own copy of
+it), both legal under every rule, and corpus goldens are byte-identical.
+So this really did reject only programs that were already miscompiling.
+
+Also closed in the same arc, per the entry's second half: `grammar.md`
+wrote the production as `NUMBER` where the parser means an integer, and
+`types.md` §5.3 now carries the representation rule — `is_numeric` is a
+CONJUNCTION, so one `= 0` changes the whole enum's runtime shape — which
+was documented nowhere. That rule is what §3.5's lowering builds on, so
+it is now a written premise rather than a read-the-compiler one.
+
 ## 2. The demand side
 
 ### 2.1 std — eleven of fifteen payload-free enums exist only to become a string

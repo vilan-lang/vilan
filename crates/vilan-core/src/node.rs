@@ -871,8 +871,52 @@ impl<'src> Node<'src> {
 }
 
 // One enum variant: name, the types of its optional data, and an optional
-// explicit integer discriminant (`Less = -1`).
-pub type EnumVariant<'src> = (&'src str, Vec<Spanned<Node<'src>>>, Option<i64>);
+// explicit discriminant (`Less = -1`).
+pub type EnumVariant<'src> = (
+    &'src str,
+    Vec<Spanned<Node<'src>>>,
+    Option<Discriminant<'src>>,
+);
+
+// An explicit enum discriminant, `= (-)? NUMBER`, carried in the PARTS THE
+// LEXER SAW rather than as a value (B79). The grammar's production is an
+// integer, but the number token also admits a fraction (`1.5`) and a type
+// suffix (`1u32`), and its whole part may not fit an `i64` — spellings the
+// parser used to reduce to a value with `unwrap_or(0)`, silently turning an
+// overflow into the perfectly ordinary discriminant `0`. Keeping the spelling
+// lets the analyzer reject each one and quote it back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Discriminant<'src> {
+    // A leading `-` on the magnitude.
+    pub negative: bool,
+    // The number token's whole part: decimal digits, or `0x` + hex digits.
+    pub whole: &'src str,
+    // The fractional part, when the literal was written `1.5`.
+    pub fraction: Option<&'src str>,
+    // A trailing type suffix (`1u32`) or unknown trailer (`1_000` lexes as
+    // `1` with the suffix `_000`).
+    pub suffix: Option<&'src str>,
+    // The whole `(-)? NUMBER` span — what a diagnostic points at.
+    pub span: Span,
+}
+
+impl std::fmt::Display for Discriminant<'_> {
+    // The literal exactly as written, so the formatter round-trips it and a
+    // diagnostic quotes what the author typed.
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negative {
+            out.write_str("-")?;
+        }
+        out.write_str(self.whole)?;
+        if let Some(fraction) = self.fraction {
+            write!(out, ".{fraction}")?;
+        }
+        if let Some(suffix) = self.suffix {
+            out.write_str(suffix)?;
+        }
+        Ok(())
+    }
+}
 
 // One struct field: its name (with the name's own span), optional type
 // annotation, and whether it is `[expose]`d — observable by a service's client

@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 use crate::error::{Error, Note};
 use crate::id::Id;
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern,
+    BinaryOp, Convention, Discriminant, ExternBinding, Func, GenericParameters, ImportBranch, Node,
+    NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -734,6 +734,11 @@ struct PreppedIs<'src> {
 pub struct Implementation<'src> {
     pub subject: TypeId,
     pub declarations: IndexMap<&'src str, Id>,
+    /// Every member the block declared, in order, INCLUDING a name declared
+    /// twice (B84) — which `declarations`, being one entry per name, cannot
+    /// represent. The duplicate-inherent check reads this; everything that
+    /// asks "what does this type provide" reads `declarations`.
+    pub declared_members: Vec<(&'src str, Id)>,
     /// The traits this impl provides (`impl Point with Eq + Ord` -> [Eq, Ord]),
     /// resolved during the conformance check. Lets a method call on the subject
     /// fall back to a trait's inherited default methods.
@@ -792,6 +797,10 @@ pub struct Trait<'src> {
     /// The members the trait declares, keyed by name. For a required method
     /// without a default body these point at signature-only functions.
     pub declarations: IndexMap<&'src str, Id>,
+    /// The same members in declaration order, WITH repeats — the record a
+    /// same-block redeclaration survives on (B84). See
+    /// [`Implementation::declared_members`].
+    pub declared_members: Vec<(&'src str, Id)>,
     /// Supertraits (`trait Ord with Eq + PartialOrd`), as the type ids of the
     /// `with` clause. A type implementing this trait must also satisfy these,
     /// and their members are inherited for method resolution.
@@ -1198,6 +1207,16 @@ pub struct Scope<'src> {
     /// declaration, so map consumers (completions, emission order, the
     /// parent-scope memo) are untouched.
     pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
+    /// Item declarations in walk order, EVERY one of them — where
+    /// `name_to_id_map` keeps only the last of a repeated name (B84). The map
+    /// is a lookup index and cannot hold two entries for one name, so reading
+    /// the declarations back off it silently lost a redeclaration before any
+    /// check could see it: two `fun which()` in one `impl` block were one
+    /// declaration by the time `collect_declarations` ran, and the
+    /// duplicate-inherent check (B57/B74) never had a pair to compare. The
+    /// same shape one block over — two `impl` blocks — was always a hard
+    /// error, because there the two live in different scopes.
+    pub declaration_order: Vec<(&'src str, Id)>,
 }
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, plus each
@@ -3526,22 +3545,35 @@ impl<'src> Analyzer<'src> {
     /// `is_self_method` for B57's scope; that filter was doing double duty as
     /// "methods only" and "same namespace only", and only the first was meant.
     ///
+    /// **The block boundary is not part of the identity either (B84).** The
+    /// check reads each impl's `declared_members` — the ordered record of what
+    /// the block declared — rather than its `declarations` surface. Reading
+    /// the surface could never see a redeclaration, because a surface is one
+    /// entry per name: two `fun which()` in ONE block overwrote each other in
+    /// the scope map long before `collect_declarations` ran, so the pair the
+    /// check compares never existed and the program compiled to the second
+    /// definition in silence. The same two declarations one block apart were
+    /// always a hard error — nothing about the rule differed, only whether the
+    /// second declaration had survived to be counted.
+    ///
     /// A definition-site check, so it joins the family that skips frozen std
     /// entities (S1): a duplicate whose second declaration is std's own is
     /// pinned clean by the differential gate, which forces the full scan.
     fn check_duplicate_inherent_members(&mut self) {
         // Group by member name first — only same-named declarations can
         // collide, and the pairwise subject comparison is the expensive half.
-        let mut by_name: IndexMap<&'src str, Vec<usize>> = IndexMap::new();
+        // An impl contributes one entry per DECLARATION, so a block that
+        // declares a name twice appears twice.
+        let mut by_name: IndexMap<&'src str, Vec<(usize, Id)>> = IndexMap::new();
         for (index, implementation) in self.implementations.iter().enumerate() {
-            for name in implementation.declarations.keys() {
-                by_name.entry(name).or_default().push(index);
+            for (name, member_id) in &implementation.declared_members {
+                by_name.entry(name).or_default().push((index, *member_id));
             }
         }
         // (member name, first declaration, second declaration, subject).
         let mut duplicates: Vec<(&'src str, Id, Id, TypeId)> = Vec::new();
-        for (member_name, implementation_indices) in &by_name {
-            if implementation_indices.len() < 2 {
+        for (member_name, declarations) in &by_name {
+            if declarations.len() < 2 {
                 continue;
             }
             // Only inherent declarations compete. A trait's member is RANKED
@@ -3551,44 +3583,112 @@ impl<'src> Analyzer<'src> {
             // (`Default::default`, `Wire::rebuild`) exactly as they home a
             // method — which is what keeps two impls of one trait from
             // colliding here now that statics compete.
-            let mut inherent: Vec<(Id, TypeId)> = implementation_indices
+            let mut inherent: Vec<(usize, Id, TypeId)> = declarations
                 .iter()
-                .filter_map(|index| {
+                .filter_map(|(index, member_id)| {
                     let implementation = &self.implementations[*index];
-                    let member_id = *implementation.declarations.get(member_name)?;
                     (self
                         .member_home_trait(implementation, member_name)
                         .is_none()
                         && !self.member_is_trait_only(implementation, member_name))
-                    .then_some((member_id, implementation.subject))
+                    .then_some((*index, *member_id, implementation.subject))
                 })
                 .collect();
             if inherent.len() < 2 {
                 continue;
             }
-            inherent.sort_by_key(|(member_id, _)| self.declaration_order(*member_id));
+            inherent.sort_by_key(|(_, member_id, _)| self.declaration_order(*member_id));
             // Each later declaration is reported against the FIRST subject-
             // compatible one before it, so three copies produce two errors,
-            // each naming the original.
-            for (position, (member_id, subject)) in inherent.iter().enumerate() {
+            // each naming the original. A pair from the SAME block is the block
+            // rule's, already reported by `check_duplicate_block_members`.
+            for (position, (index, member_id, subject)) in inherent.iter().enumerate() {
                 let subject_type = subject.get_type(self);
-                let earlier = inherent[..position].iter().find(|(_, earlier_subject)| {
-                    self.compare_type(
-                        &subject_type,
-                        &earlier_subject.get_type(self),
-                        &HashMap::new(),
-                    )
-                });
-                if let Some((earlier_id, _)) = earlier {
+                let earlier = inherent[..position]
+                    .iter()
+                    .filter(|(earlier_index, _, _)| earlier_index != index)
+                    .find(|(_, _, earlier_subject)| {
+                        self.compare_type(
+                            &subject_type,
+                            &earlier_subject.get_type(self),
+                            &HashMap::new(),
+                        )
+                    });
+                if let Some((_, earlier_id, _)) = earlier {
                     duplicates.push((member_name, *earlier_id, *member_id, *subject));
                 }
             }
         }
-        for (member_name, first_id, second_id, subject) in duplicates {
+        let duplicates = duplicates
+            .into_iter()
+            .map(|(member_name, first_id, second_id, subject)| {
+                let subject_label =
+                    self.pretty_print_type(&subject.get_type(self), &HashMap::new());
+                (member_name, first_id, second_id, subject_label)
+            })
+            .collect();
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// **One block may declare a name once (B84).** Two `fun which()` in one
+    /// `impl` used to overwrite each other in the scope map, so the program
+    /// compiled to the second definition and the first simply did not exist —
+    /// the same two declarations one block apart having always been a hard
+    /// error.
+    ///
+    /// Separate from the inherent check above because it is a separate rule
+    /// with a separate scope, not a case of that one. The inherent rule ranks
+    /// TWO BLOCKS competing for one surface, and deliberately exempts a
+    /// trait-provided name (§3: ranked, not duplicated) so that two impls of
+    /// one trait — the platform twins, §9(6) — stay legal. Neither
+    /// justification reaches inside a single block: there is no second impl to
+    /// be a twin of, and a name the block declares twice is a mistake whatever
+    /// trait homes it. So this one asks only "was it written twice here", and
+    /// the inherent check skips a same-block pair rather than reporting it a
+    /// second time.
+    fn check_duplicate_block_members(&mut self) {
+        let mut duplicates: Vec<(&'src str, Id, Id, String)> = Vec::new();
+        let blocks = self
+            .implementations
+            .iter()
+            .map(|implementation| {
+                (
+                    implementation.declared_members.clone(),
+                    self.pretty_print_type(&implementation.subject.get_type(self), &HashMap::new()),
+                )
+            })
+            .chain(self.traits.values().map(|trait_| {
+                (
+                    trait_.declared_members.clone(),
+                    format!("trait {}", trait_.name),
+                )
+            }))
+            .collect::<Vec<_>>();
+        for (declared_members, subject_label) in blocks {
+            // First declaration per name; every later one is reported against
+            // it, so three copies produce two errors.
+            let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::new();
+            for (member_name, member_id) in declared_members {
+                match first_by_name.get(member_name) {
+                    Some(first_id) => {
+                        duplicates.push((member_name, *first_id, member_id, subject_label.clone()))
+                    }
+                    None => {
+                        first_by_name.insert(member_name, member_id);
+                    }
+                }
+            }
+        }
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// The shared reporting half of the two duplicate-declaration rules:
+    /// `(member name, first declaration, second declaration, subject label)`.
+    fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
+        for (member_name, first_id, second_id, subject_label) in duplicates {
             if self.frozen_entity(second_id) {
                 continue;
             }
-            let subject_label = self.pretty_print_type(&subject.get_type(self), &HashMap::new());
             // C3: the FIRST declaration is the whole point of the message —
             // "already defined" is unactionable without saying where. The note
             // carries its own source, so it renders even across files (the
@@ -9047,6 +9147,35 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
+        // A `[trait_only]` trait method never resolves on the concrete type's
+        // own surface — only through a trait bound (§3.2). An inherent impl has
+        // no trait ids, so a type's *own* method with the same name stays
+        // reachable (the collision-safety point).
+        self.impl_member_candidates(subject_type, member_name, true, false)
+    }
+
+    /// The candidates a `Type::member` path head reaches (B83). It is a
+    /// SUPERSET of the method candidates in two ways, both matching what the
+    /// static accessor has always scanned: a declaration with no `self`
+    /// receiver qualifies (that is the whole point — `Bag::new()`), and a
+    /// `[trait_only]` member is reachable when the path head IS the trait
+    /// (access on the trait itself stays allowed, §3.2).
+    fn static_path_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        subject_is_trait: bool,
+    ) -> Vec<ImplMemberCandidate> {
+        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+    }
+
+    fn impl_member_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        methods_only: bool,
+        allow_trait_only: bool,
+    ) -> Vec<ImplMemberCandidate> {
         let mut candidates: Vec<ImplMemberCandidate> = self
             .implementations
             .iter()
@@ -9058,18 +9187,14 @@ impl<'src> Analyzer<'src> {
                 )
             })
             .filter_map(|implementation| {
-                // A `[trait_only]` trait method never resolves on the concrete
-                // type's own surface — only through a trait bound (§3.2). An
-                // inherent impl has no trait ids, so a type's *own* method with
-                // the same name stays reachable (the collision-safety point).
-                if self.member_is_trait_only(implementation, member_name) {
+                if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
                     return None;
                 }
                 let member_id = implementation
                     .declarations
                     .get(member_name)
                     .copied()
-                    .filter(|member_id| self.is_self_method(*member_id))?;
+                    .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
                 Some(ImplMemberCandidate {
                     member_id,
                     impl_subject: implementation.subject,
@@ -9088,7 +9213,13 @@ impl<'src> Analyzer<'src> {
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
     fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    }
+
+    /// The tiering itself, over an already-collected candidate list — shared by
+    /// `receiver.member()` and `Type::member()` (B83), which ranked by
+    /// registration order alone until the static path got this.
+    fn rank_member_candidates(&self, candidates: Vec<ImplMemberCandidate>) -> ImplMemberResolution {
         // Tier 1: inherent. Two inherent declarations for one subject are a
         // definition-site error (`check_duplicate_inherent_members`); resolution
         // still takes the first in the deterministic order, so that one error
@@ -9692,6 +9823,16 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Registers an ITEM declaration into a scope: the `name_to_id_map` entry
+    /// (the lookup index, last declaration wins) plus the ordered record of
+    /// every declaration, which is what a redeclaration needs to survive on
+    /// (B84). The value twin is [`Analyzer::declare_scope_value`].
+    fn declare_scope_item(&mut self, scope_id: Id, name: &'src str, id: Id) {
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.insert(name, id);
+        scope.declaration_order.push((name, id));
+    }
+
     fn get_scope_id_for_entity(&mut self, entity_id: Id) -> Id {
         self.expr_id_to_scope_id_map
             .get(&entity_id)
@@ -9707,6 +9848,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         }
     }
 
@@ -9790,8 +9932,7 @@ impl<'src> Analyzer<'src> {
             else {
                 return;
             };
-            let scope = analyzer.mut_scope_for_scope_id(module_scope_id);
-            scope.name_to_id_map.insert(name, id);
+            analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
             Node::Export(inner)
@@ -9835,6 +9976,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         };
         self.scopes.insert(id, scope);
         self.scopes.get_mut(&id).unwrap()
@@ -14509,22 +14651,27 @@ impl<'src> Analyzer<'src> {
         scope.name_to_id_map.insert(name, expr_id);
     }
 
-    /// Collects the named members declared in a trait/impl body scope,
-    /// excluding the implicit `Self` binding and generic parameters.
-    fn collect_declarations(&self, scope_id: Id) -> IndexMap<&'src str, Id> {
+    /// The members declared in a trait/impl body scope, in declaration order
+    /// and WITH repeats, excluding the implicit `Self` binding and generic
+    /// parameters. Collecting it into an `IndexMap` gives the SURFACE the type
+    /// presents — one entry per name, the last declaration winning — and the
+    /// difference between the two is exactly what the duplicate check needs
+    /// (B84): reading the surface back could never see a redeclaration,
+    /// because a redeclaration is precisely what a surface does not have.
+    fn collect_declared_members(&self, scope_id: Id) -> Vec<(&'src str, Id)> {
         self.scopes
             .get(&scope_id)
             .unwrap()
-            .name_to_id_map
+            .declaration_order
             .iter()
             .filter(|(name, expr_id)| {
-                **name != "Self"
+                *name != "Self"
                     && !matches!(
-                        self.expr_id_to_expr_map.get(*expr_id),
+                        self.expr_id_to_expr_map.get(expr_id),
                         Some(Expr::Generic(_))
                     )
             })
-            .map(|(name, expr_id)| (*name, *expr_id))
+            .copied()
             .collect()
     }
 
@@ -14557,6 +14704,112 @@ impl<'src> Analyzer<'src> {
                 .to_string(),
         });
         0
+    }
+
+    /// The value of an explicit enum discriminant, or `None` with a diagnostic
+    /// when the literal is not the integer the grammar means (B79).
+    ///
+    /// The parser used to reduce this itself, with `.parse::<i64>()
+    /// .unwrap_or(0)` over the number token's WHOLE part alone — which quietly
+    /// accepted three spellings it does not mean: a fraction (`= 1.5` became
+    /// `1`), a type suffix (`= 1u32` became `1`, and `= 1_000` lexes as `1`
+    /// with the suffix `_000`), and a magnitude past `i64` (which became `0`,
+    /// a perfectly ordinary discriminant a sibling may legitimately hold —
+    /// routing an overflow straight into the duplicate hole). Hex is read the
+    /// way every other integer literal in the language is read
+    /// (`0x` + radix 16), not left to fail `parse` into `0`.
+    ///
+    /// The message deliberately states the rule as it stands rather than as a
+    /// permanent one: `proposal/backed-enums.md` is a live proposal to widen
+    /// the production to string backings, and this diagnostic must not
+    /// foreclose it.
+    fn discriminant_value(&mut self, written: &Discriminant<'src>) -> Option<i64> {
+        let mut reject = |msg: String| {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg,
+            });
+            None::<i64>
+        };
+        if written.fraction.is_some() {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` is not"
+            ));
+        }
+        if let Some(suffix) = written.suffix {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` carries the trailer \
+                 `{suffix}`; write the bare number"
+            ));
+        }
+        let magnitude = match written.whole.strip_prefix("0x") {
+            Some(hex) => u128::from_str_radix(hex, 16),
+            None => written.whole.parse::<u128>(),
+        };
+        // A negative discriminant reaches one past the positive bound, exactly
+        // as the literal `-9223372036854775808` does elsewhere: the minus is
+        // applied to the magnitude, not parsed into it.
+        let bound = if written.negative {
+            1u128 << 63
+        } else {
+            (1u128 << 63) - 1
+        };
+        match magnitude {
+            Ok(magnitude) if magnitude <= bound => Some(match written.negative {
+                true => (magnitude as i64).wrapping_neg(),
+                false => magnitude as i64,
+            }),
+            _ => reject(format!(
+                "the enum discriminant `{written}` is out of range \
+                 (-9223372036854775808 ..= 9223372036854775807)"
+            )),
+        }
+    }
+
+    /// B79's placement rule: an explicit discriminant only means anything when
+    /// EVERY variant is data-less. `is_numeric` is a conjunction — all-data-less
+    /// AND any-explicit-discriminant — so one payload variant flips the whole
+    /// enum to the tagged `[index, ..data]` form and every discriminant in it
+    /// becomes inert. It parsed, it was stored, and nothing will ever read it.
+    ///
+    /// Two shapes, two messages: the discriminant sits on the payload variant
+    /// itself, or on a data-less sibling of one. `proposal/backed-enums.md`
+    /// §3.3 designs the same rule for string backings, so closing it here is
+    /// the integer half of one rule rather than a rule of its own.
+    fn check_discriminant_placement(
+        &mut self,
+        variant_name: &'src str,
+        written: &Discriminant<'src>,
+        has_payload: bool,
+        first_payload_variant: Option<(&'src str, Span)>,
+    ) {
+        if has_payload {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg: format!(
+                    "variant '{variant_name}' carries a payload, so it cannot have an explicit \
+                     discriminant"
+                ),
+            });
+            return;
+        }
+        let Some((payload_variant, payload_span)) = first_payload_variant else {
+            return;
+        };
+        self.diagnostics.push(Error {
+            note: Some(crate::error::Note {
+                span: payload_span,
+                msg: format!("'{payload_variant}' carries a payload here"),
+                source: None,
+            }),
+            span: written.span,
+            msg: format!(
+                "an explicit discriminant is only meaningful when every variant is data-less, and \
+                 '{payload_variant}' carries a payload; remove the discriminant, or the payload"
+            ),
+        });
     }
 
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
@@ -15183,8 +15436,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Func(function) => {
                 let name = function.name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15768,8 +16020,7 @@ impl<'src> Analyzer<'src> {
                 let name = name.0;
                 let external = *external;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15840,8 +16091,7 @@ impl<'src> Analyzer<'src> {
                 let name_span = name.1;
                 let name = name.0;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15855,9 +16105,24 @@ impl<'src> Analyzer<'src> {
                 // C-style discriminants: each unspecified variant continues from
                 // the previous value plus one, starting at 0. The enum is numeric
                 // only if every variant is data-less and one is explicit.
-                let mut next_discriminant: i64 = 0;
+                // `None` once the sequence has run past `i64::MAX` and there is
+                // no next value to hand out — a plain `+ 1` panicked the debug
+                // compiler there and wrapped the release one.
+                let mut next_discriminant: Option<i64> = Some(0);
                 let mut all_data_less = true;
                 let mut any_explicit_discriminant = false;
+                // B79's payload rule: a discriminant only reaches the runtime
+                // when EVERY variant is data-less, so the first payload variant
+                // is what a stray discriminant must be reported against.
+                let first_payload_variant = variants
+                    .0
+                    .iter()
+                    .find(|variant| !variant.0.1.is_empty())
+                    .map(|variant| (variant.0.0, variant.1));
+                // B79's uniqueness rule: value -> the variant that took it
+                // first. Implicit values count — `enum E { A = 1, B = 0, C }`
+                // walks C onto 1 and collides just as loudly.
+                let mut discriminant_owners: IndexMap<i64, (&'src str, Span)> = IndexMap::new();
                 for (variant_index, variant) in variants.0.iter().enumerate() {
                     let variant_name = variant.0.0;
                     let data_type_ids: Vec<TypeId> = variant
@@ -15867,10 +16132,63 @@ impl<'src> Analyzer<'src> {
                         .map(|data_type| self.walk_type_node(data_type, body_scope_id))
                         .collect();
                     all_data_less &= data_type_ids.is_empty();
-                    let explicit_discriminant = variant.0.2;
+                    let explicit_discriminant = variant.0.2.as_ref();
                     any_explicit_discriminant |= explicit_discriminant.is_some();
-                    let discriminant = explicit_discriminant.unwrap_or(next_discriminant);
-                    next_discriminant = discriminant + 1;
+                    if let Some(written) = explicit_discriminant {
+                        self.check_discriminant_placement(
+                            variant_name,
+                            written,
+                            !data_type_ids.is_empty(),
+                            first_payload_variant,
+                        );
+                    }
+                    // `None` when this variant has no usable value: either the
+                    // literal it wrote was rejected above, or the C-style
+                    // sequence it was continuing has no next value. Either way
+                    // it is already diagnosed, and it takes no part in the
+                    // uniqueness check — one bad literal must not also read as
+                    // a duplicate.
+                    let discriminant = match explicit_discriminant {
+                        Some(written) => self.discriminant_value(written),
+                        None => {
+                            if next_discriminant.is_none() {
+                                self.diagnostics.push(Error {
+                                    note: None,
+                                    span: variant.1,
+                                    msg: format!(
+                                        "variant '{variant_name}' continues the discriminant \
+                                         sequence past 9223372036854775807; give it an explicit \
+                                         discriminant"
+                                    ),
+                                });
+                            }
+                            next_discriminant
+                        }
+                    };
+                    if let Some(discriminant) = discriminant {
+                        next_discriminant = discriminant.checked_add(1);
+                        match discriminant_owners.get(&discriminant) {
+                            Some((owner, owner_span)) => self.diagnostics.push(Error {
+                                // Both variants are in the one declaration, so
+                                // the note needs no source of its own.
+                                note: Some(crate::error::Note {
+                                    span: *owner_span,
+                                    msg: format!("'{owner}' has discriminant {discriminant}"),
+                                    source: None,
+                                }),
+                                span: variant.1,
+                                msg: format!(
+                                    "variant '{variant_name}' has discriminant {discriminant}, \
+                                     which '{owner}' already uses; two variants of '{name}' \
+                                     cannot share one"
+                                ),
+                            }),
+                            None => {
+                                discriminant_owners.insert(discriminant, (variant_name, variant.1));
+                            }
+                        }
+                    }
+                    let discriminant = discriminant.unwrap_or(0);
                     let variant_id = self.new_entity_id();
                     self.expr_id_to_expr_map
                         .insert(variant_id, Expr::EnumVariant(id, variant_index));
@@ -16022,7 +16340,9 @@ impl<'src> Analyzer<'src> {
                 }
                 let subject = subject_type_id;
                 self.walk_expr_nodes(&body.0, body_scope_id);
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 let implementation_index = self.implementations.len();
                 // `impl Subject with A + B` must satisfy each trait; record a
                 // conformance check per trait to run once declarations are known.
@@ -16058,6 +16378,7 @@ impl<'src> Analyzer<'src> {
                 self.implementations.push(Implementation {
                     subject,
                     declarations,
+                    declared_members,
                     trait_ids: Vec::new(),
                     trait_args: Vec::new(),
                 });
@@ -16067,8 +16388,7 @@ impl<'src> Analyzer<'src> {
             Node::Trait(name, generic_parameters, supertraits, body) => {
                 let name_span = name.1;
                 let name = name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -16101,7 +16421,9 @@ impl<'src> Analyzer<'src> {
                 self.walking_trait_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
                 self.walking_trait_body = was_walking_trait_body;
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 self.traits.insert(
                     id,
                     Trait {
@@ -16111,6 +16433,7 @@ impl<'src> Analyzer<'src> {
                         generic_parameter_constraint_ids,
                         generic_parameter_names,
                         declarations,
+                        declared_members,
                         supertraits,
                     },
                 );
@@ -16291,8 +16614,7 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Error)
             }
             Node::Module(name, body) => {
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 self.module_scope_ids.insert(body_scope_id);
@@ -23862,35 +24184,32 @@ impl<'src> Analyzer<'src> {
                         .iter()
                         .find(|candidate| candidate.home_trait.is_none())
                         .map(|candidate| (candidate.member_id, Some(candidate.impl_subject)));
+                    // The static path's own resolution, TIERED (B83). It was a
+                    // flat `find_map` in impl-registration order until here, so
+                    // an inherent `fun default()` lost to a trait-provided one
+                    // that happened to register first — inherent-over-trait
+                    // inverted on the one path B57 did not reach. The candidate
+                    // set is unchanged; only the ranking is new.
+                    let static_resolution = match method_candidates.is_empty() {
+                        // Only a trait provides it as a METHOD: refuse, and say
+                        // which path does reach it (handled below).
+                        false => ImplMemberResolution::Missing,
+                        true => self.rank_member_candidates(self.static_path_candidates(
+                            &subject_type,
+                            member_name,
+                            subject_is_trait,
+                        )),
+                    };
+                    let static_member = match &static_resolution {
+                        ImplMemberResolution::Found(member_id, impl_subject) => {
+                            Some((*member_id, Some(*impl_subject)))
+                        }
+                        _ => None,
+                    };
                     let member_id = variant_id
                         .map(|variant| (variant, None))
                         .or(inherent_method)
-                        .or_else(|| {
-                            // Only a trait provides it: refuse, and say which
-                            // path does reach it (handled below).
-                            if !method_candidates.is_empty() {
-                                return None;
-                            }
-                            self.implementations
-                                .iter()
-                                .filter(|x| {
-                                    self.compare_type(
-                                        &subject_type,
-                                        &x.subject.get_type(self),
-                                        &HashMap::new(),
-                                    )
-                                })
-                                .find_map(|x| {
-                                    if !subject_is_trait
-                                        && self.member_is_trait_only(x, member_name)
-                                    {
-                                        return None;
-                                    }
-                                    x.declarations
-                                        .get(member_name)
-                                        .map(|declaration| (*declaration, Some(x.subject)))
-                                })
-                        })
+                        .or(static_member)
                         // `Trait::member(receiver, ..)` (B57 §3.1): the explicit
                         // disambiguator. The trait's attached-static namespace
                         // (`Iterator::from_fn`) was searched above and is
@@ -23935,6 +24254,46 @@ impl<'src> Analyzer<'src> {
                                     }
                                 }
                             }
+                        }
+                        // Two traits provide it as a STATIC, and nothing the
+                        // type owns outranks them (B83). This is B57's §4
+                        // ambiguity on the static path — but the steer §4 gives
+                        // a method, `Trait::member(receiver)`, does not exist
+                        // here: the qualified form selects an impl THROUGH the
+                        // receiver, and a static has no receiver. So the fix
+                        // that always works is the one named, and the missing
+                        // one is named as missing rather than left to be
+                        // hunted for.
+                        None if matches!(
+                            static_resolution,
+                            ImplMemberResolution::AmbiguousTraits(_)
+                        ) =>
+                        {
+                            let ImplMemberResolution::AmbiguousTraits(homes) = &static_resolution
+                            else {
+                                unreachable!("just matched AmbiguousTraits");
+                            };
+                            let subject_str =
+                                self.pretty_print_type(&subject_type, &HashMap::new());
+                            let providers: Vec<String> = homes
+                                .iter()
+                                .map(|trait_id| {
+                                    format!("'{}'", self.trait_label_for(&subject_type, *trait_id))
+                                })
+                                .collect();
+                            self.diagnostics.push(Error {
+                                note: None,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "'{member_name}' is ambiguous on '{subject_str}': {}{} \
+                                     provide it as a static, and a static has no receiver for a \
+                                     `Trait::{member_name}` path to select through; declare \
+                                     '{subject_str}''s own '{member_name}', which outranks every \
+                                     trait-provided one",
+                                    if providers.len() == 2 { "both " } else { "" },
+                                    join_with(&providers, "and"),
+                                ),
+                            });
                         }
                         // Every candidate belongs to a trait: `Type::member` no
                         // longer reaches them (§3.1), and the fix is to name the
@@ -29738,6 +30097,11 @@ fn analyze_over_world<'src>(
     // between them. After conformance, so an impl's `with`-clause traits are
     // resolved onto it and a trait's member is not mistaken for the type's own.
     analyzer.check_duplicate_inherent_members();
+    // One block declaring one name twice (B84) — a different rule with a
+    // different scope, so a trait-provided name collides here even though it
+    // is exempt above. Runs after the inherent check so a program with both
+    // reports them in that order.
+    analyzer.check_duplicate_block_members();
     // With `drop_methods` recorded, build the per-type destruction glue the
     // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
     analyzer.build_drop_glue();
