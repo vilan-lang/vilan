@@ -243,9 +243,19 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         };
     };
 
+    // `errors` is the ENTRY's own lex/parse errors followed by the program's
+    // (`analyze_source`), while `diagnostic_sources` is parallel to the
+    // program's half alone — so the flat index has to lose that prefix before
+    // it can index the attribution. Feeding it straight in shifted every
+    // attribution by N wherever N parse errors preceded, and a recovered parse
+    // is exactly when a playground program has both (backlog E42). The language
+    // server does the same subtraction in `document.rs`. An index inside the
+    // prefix is the entry's own, which is what `None` means to `convert`.
+    let prefix = errors.len().saturating_sub(program.diagnostics.len());
     for (index, error) in errors.iter().enumerate() {
-        let path = program
-            .source_path(program.diagnostic_source(index))
+        let path = index
+            .checked_sub(prefix)
+            .and_then(|offset| program.source_path(program.diagnostic_source(offset)))
             .map(Path::to_path_buf);
         convert(error, "error", path.as_deref());
     }

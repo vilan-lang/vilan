@@ -342,3 +342,78 @@ fn the_overlay_cap_selects_the_same_diagnostics_every_time() {
         "the capped slice should be the escape reports: {shown:#?}"
     );
 }
+
+/// The const-only reports come out ONE per site, in the same order every time
+/// (B93).
+///
+/// `const_eval`'s two report lists — the runtime calls that cross into
+/// `asset::emit` territory, and the compile-time-only values that escape as
+/// values — are each sorted and then `dedup()`ed. `dedup` compares the WHOLE
+/// tuple but the key was `span.start` alone, so two distinct tuples sharing a
+/// start could interleave with a repeat of the first and the repeat would
+/// survive as a duplicate diagnostic; and among entries sharing a start the
+/// surviving ORDER was whatever the collecting walk happened to push. Widening
+/// the key to the whole tuple closes both.
+///
+/// The interleaving itself was NOT constructible: a boundary tuple is keyed by
+/// a unique call id so it cannot repeat at all, and a sweep of the
+/// compiler-behaviour corpus (every program in `tests/inference.rs`) found no
+/// analysis where two of these tuples even shared a `span.start`. So this pins
+/// the PROPERTY the widened key guarantees rather than the flip — one
+/// diagnostic per site, in a stable order — which is what a future collector
+/// that does push a repeat would break.
+///
+/// The program covers both lists and both of the escape list's shapes: three
+/// boundary calls (two of them naming the SAME callee, which is the pair the
+/// dedup has to keep apart), a named R function, and an unapplied R closure.
+#[test]
+fn the_const_only_reports_are_one_per_site_on_every_cold_analysis() {
+    let rendering = assert_cold_rendering_is_stable(
+        r#"
+        import std::asset::emit;
+
+        fun rule_a(): i32 { emit("css", ".a{}"); 1 }
+        fun rule_b(): i32 { emit("css", ".b{}"); 2 }
+
+        fun main() {
+            let first = rule_a();
+            let second = rule_b();
+            let third = rule_a();
+            let named = rule_b;
+            let leaked = || rule_a();
+        }
+        main();
+        "#,
+        Platform::default(),
+    );
+    let boundary: Vec<&String> = rendering
+        .iter()
+        .filter(|line| line.contains("evaluate this call inside a `const` expression"))
+        .collect();
+    assert_eq!(
+        boundary.len(),
+        3,
+        "one boundary report per crossing call, no more: {rendering:#?}"
+    );
+    let escapes: Vec<&String> = rendering
+        .iter()
+        .filter(|line| line.contains("has no runtime value form"))
+        .collect();
+    assert_eq!(
+        escapes.len(),
+        2,
+        "one escape report per value site, no more: {rendering:#?}"
+    );
+    assert!(
+        escapes
+            .iter()
+            .any(|line| line.contains("`rule_b` (it reaches `asset::emit`)")),
+        "the named-function escape must be reported: {rendering:#?}"
+    );
+    assert!(
+        escapes
+            .iter()
+            .any(|line| line.contains("this closure (it reaches `asset::emit`)")),
+        "the closure escape must be reported: {rendering:#?}"
+    );
+}

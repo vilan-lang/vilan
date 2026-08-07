@@ -6,6 +6,28 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**Writing a whole value through a `&mut` view replaces it. It used to merge.** `fun replace(v: &mut List<i32>) { v = [9] }` called on `[1, 2, 3]` left the caller's list three elements long — `len()` still said `3`, and `2` and `3` were still in it, behind the `9`. Nothing in the program said "merge", and nothing reported anything.
+
+The write has to keep the pointee's identity — that is how it reaches the caller at all — so it copies the new value's slots into the existing storage rather than rebinding a local. The copying was `Object.assign`, which is a *merge*: it writes the slots the source has and leaves every slot past them exactly where it was. For any aggregate whose width is fixed on both sides — a struct, a tuple, a `Map` — merge and replace are the same operation, which is why this went unnoticed. For the two whose width can shrink they are not, and the tail survived.
+
+The other shrinking shape is an enum reassigned to a smaller variant. `self = Feed::Done` over a `Feed::Ready(List<str>, i32)` wrote the tag and left the list and the index sitting in the slots behind it: unreachable through the enum's own API, since every read goes through the tag, but present in the value — and where the payload is a **resource**, a live object with a destructor that nothing can reach any more. The write truncates now, so a shortened value is the value you wrote and nothing else.
+
+One thing this does *not* fix, and it is recorded rather than quietly left: overwriting a variant through a view does not run the old payload's destructor. Assigning onto an owned binding does — `holder = Holder::Empty` drops the guard it displaced, which is the language's overwrite rule — but through a `&mut` loan no drop is planned, because the rule is written about a binding that *owns* a resource and a loan owns nothing. Truncating the slot does not change that either way; it only means the leaked object is no longer also reachable from the enum. Whether a loan may destroy the value it borrows is a memory-model question rather than a codegen one, and it is filed as one, with the program that shows it pinned as a failing case.
+
+Two corpus goldens moved, both by exactly the new write and the small helper behind it; nothing else in the corpus changed.
+
+---
+
+**An error in the web playground names the file it is in, even when the program also has a syntax error.** The playground gets one flat list of errors — the entry file's own lex and parse failures first, then everything the analyzer found — but the file each error belongs to is recorded only for the analyzer's half. The playground indexed that record with the *flat* position, so every attribution after a recovered syntax error was off by the number of syntax errors ahead of it, and the visitor's own syntax error could come back labeled with a standard-library file. The language server has always subtracted the prefix; the playground does now too.
+
+---
+
+**Internal:** the `const` pass's two report lists (calls that cross into compile-time-only territory, and compile-time-only values that escape as values) now sort on their whole entry rather than on the span's start alone, so the `dedup` beside them — which compares the whole entry — cannot be defeated by two distinct entries sharing a start. Latent: no diagnostic in the tree changed.
+
+---
+
 ## v0.32.0 — 2026-08-06
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.
