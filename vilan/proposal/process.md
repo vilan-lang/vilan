@@ -940,3 +940,113 @@ will point newcomers at `releases.md`, and a reader who copies §5's URL as
 current instructions follows a redirect. A parenthetical — *(as published
 then; the project now lives at `vilan-lang/vilan`)* — costs one clause and
 keeps the allowlist entry honest.
+
+---
+
+## 9. Implementation note — 2026-08-07
+
+What §8 asked for, and what became of each item, on the day of
+ratification. The two deferrals in the status block are §2's branch
+protection and §4's scaffolding slice; everything they touch is listed
+below as deferred rather than done, so a later session does not have to
+re-derive the boundary.
+
+### 9.1 Landed
+
+- **8.1 — the release gate is the CI gate** (`036d524`). `release.yml`'s
+  `gate` job installs `cargo-nextest` and runs `cargo nextest run
+  --workspace` plus `cargo test --workspace --doc`: `ci.yml`'s two legs,
+  character for character, on the same ubuntu runner behind the same pinned
+  node. It ran plain `cargo test` before. The comment above the steps names
+  the v0.32.0 incident and instructs that the two files change together.
+  This was the paper's highest-priority item and it is closed.
+- **8.2 — `ci.yml`'s filter moved into the workflow** (`707dcb7`).
+  `paths-ignore` is off `on:` entirely. A `changes` job always runs and
+  emits one `code` output from a plain `git diff --name-only` against the
+  PR base (or the push's `before`), matched against the same eight root
+  prose files the ignore list held. `test` and `wasm` gained
+  `needs: changes` and `if: needs.changes.outputs.code == 'true'`; their
+  matrix and steps are otherwise untouched. A final **`check`** job with
+  `if: always()` and `needs: [changes, test, wasm]` passes when every needed
+  job is `success` or `skipped` and fails on `failure` or `cancelled`.
+
+  Two implementation notes worth carrying forward. **The job is called
+  `check`, not `ci`** as §2.5 proposed — the status context reads
+  `ci / check`, and that is the string a ruleset must name. And the filter
+  is deliberately **not** `dorny/paths-filter`: ten lines of shell in the
+  path of the required check beats a third-party action in it. Every
+  uncertain answer is `true` (unusable base sha, force-push, empty diff all
+  run the suite), because a filter that wrongly skips is a hole in the gate
+  while a filter that wrongly runs costs runner minutes.
+- **8.4 / 8.5 / 8.6 / 8.7 / 8.9 — `releases.md` rewritten** (`d131d15`).
+  §4's "bump minor liberally" became the train rule with U1–U3 spelled out
+  and the Saturday cadence named; §7 step 1 names the real gate instead of
+  "669 tests" and `cargo test`; a new §7.1 states the sweep split as
+  procedure — (b) and (c) per cycle, (a) per cut over the whole accumulated
+  section, per entry and not optional; a new §7.2 carries the full cut
+  sequence, including the six steps after `git push` that lived only in the
+  pages repo's `docs.yml` header comment (fold `main`, dispatch the book
+  first, deploy the site second, verify the live playground manifest,
+  refresh the local toolchain in **both** install locations); a new §7.3
+  gives `release/0.MINOR` its mechanics. §7.2 also records the consequence
+  §6 asked for: the public site's freshness is now the cut cadence. §5's
+  install one-liner got its parenthetical.
+- **8.8, merge-policy half — repository settings.** Three `PATCH
+  /repos/vilan-lang/vilan` calls, all `200`:
+  `allow_rebase_merge: false` (§3 — the button is not there to be pressed
+  during an incident), `delete_branch_on_merge: true` (§2.6 — it deletes
+  only a merged PR's head branch, and lane branches do not merge by PR, so
+  the lane workflow is untouched), and `allow_squash_merge: true` with
+  `squash_merge_commit_message: COMMIT_MESSAGES` so an external
+  contributor's `Co-Authored-By` survives the squash. The last was already
+  `COMMIT_MESSAGES`; it was set explicitly so it is a decision rather than
+  a default. `allow_merge_commit` stays `true` — internal lanes merge
+  `--no-ff`.
+
+### 9.2 Deferred, and exactly where each one stopped
+
+- **§2 in whole — branch protection.** Ruleset 18887216 (`Protect default`)
+  was **not** touched and still reads `enforcement: "disabled"` with
+  `bypass_actors: []` and `required_signatures`. No second ruleset was
+  created for `next`. **8.3 is therefore open**, and so is the second half
+  of **8.1**: the `check` job exists and always reports, but nothing
+  requires it yet. That ordering is the right way round — §2.5's whole
+  argument is that the workflow must be reworked *before* the check becomes
+  required, and it now has been.
+- **§2.6's three security settings.** `secret_scanning`,
+  `secret_scanning_push_protection` and `dependabot_security_updates` were
+  verified still `disabled` and left that way: push protection arrived in
+  the paper as item 3 of §4's slice 1, so it deferred with the scaffolding.
+  This is the **half of 8.8 that remains open**, and it is the one with a
+  real failure mode behind it (a credential committed to a public
+  repository), so it should not drift far.
+- **§4's scaffolding slice.** No `CONTRIBUTING.md`, no `SECURITY.md`, no
+  `CODEOWNERS`, no issue or PR templates, and private vulnerability
+  reporting not enabled. `.github/` still contains two workflow files and
+  nothing else. Revisit with D5, per the status block.
+- **§5's beta promises** are unimplemented by design: the deprecation
+  window, the mandatory `### Breaking` heading and the wire-change rule
+  belong in `CHANGELOG.md`'s header and `releases.md` §4 *when beta is
+  called*, not before. The four-condition trigger has not fired; §5.4(d)
+  cannot fire without D5.
+- **Signed commits** stay out, per open question 3.
+
+### 9.3 What to watch on the next real push
+
+The `ci.yml` restructure could not be exercised before landing — the
+behavior only exists on GitHub's runners, and this lane pushes nothing.
+Three things to read on the next push and the first PR after it:
+
+1. **A code push must still be red-or-green on the merits.** `changes`
+   green, `test` (both legs) and `wasm` running as before, `check` green.
+2. **A root-prose-only push must take the cheap path**: `changes` green,
+   `test` and `wasm` **skipped**, `check` **green** — where before the
+   change there would have been no run at all. This is the behavior the
+   required check depends on, and it is the one with no local proof. Note
+   that `vilan/docs/**` and `vilan/proposal/**` are deliberately *not*
+   prose here, exactly as under the old `paths-ignore`: a docs or proposal
+   change runs the full suite.
+3. **The first PR** is where `github.event.pull_request.base.sha` gets its
+   first real exercise; pushes only ever use `github.event.before`. If the
+   filter is going to be wrong, the safe direction is the one it is built
+   to fail in — running the suite when it did not need to.
