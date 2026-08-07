@@ -216,7 +216,7 @@ cost a Windows contributor hours; it is also just better on Linux.
   pseudo-path Win32 can't resolve. Under `cfg(windows)` the order flips
   (`USERPROFILE` first); the install tests' `HOME`-seeding stays correct on
   unix and gets a Windows-order twin.
-- **Watch temp script leak**: `vilan-watch-{pid}.js` in `temp_dir()` is
+- **Watch temp script leak**: `vilan-watch-{pid}.mjs` in `temp_dir()` is
   rewritten every round and never removed — a leak everywhere and an
   intermittent sharing violation on Windows (no unlink-while-open). Delete
   after the child is killed + waited; best-effort delete on exit.
@@ -232,7 +232,7 @@ cost a Windows contributor hours; it is also just better on Linux.
   crate (§10d).
   This slice also delivers the exit half of §5's watch temp-script cleanup,
   which S3 deferred here: a `Ctrl-C` hook removes the session's
-  `vilan-watch-<pid>.js` — `watch_loop` never returns from its loop, so the
+  `vilan-watch-<pid>.mjs` — `watch_loop` never returns from its loop, so the
   per-round delete alone leaked one file per watch session.
 - **Virtual terminal enablement**: `paint.rs`'s gate init additionally
   enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on Windows consoles (same
@@ -414,6 +414,6 @@ stay F7/F5 scope — nothing in this arc pre-empts their design.
   `[entry.<name>]` is never case-checked (§5 scoped the rule to module
   resolution) — `vilan build Main.vl` on NTFS builds and fails on Linux.
 - **Watch e2e teardown leaves temp scripts:** the hmr/assets e2e tests kill
-  the CLI with SIGKILL, which no handler can catch — ~4 `vilan-watch-*.js`
+  the CLI with SIGKILL, which no handler can catch — ~4 `vilan-watch-*.mjs`
   per full suite run in the temp dir. Test-harness-only; sessions ended by
   Ctrl-C clean up (S4).

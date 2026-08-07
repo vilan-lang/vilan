@@ -280,9 +280,9 @@ fn a_dropped_connection_reconnects_and_resyncs() {
     let wait = Duration::from_secs(20);
 
     // Phase 1: server up (status 1), client syncs.
-    let server = LineChild::spawn(&dir.join("dist/server.js"), Some("1"));
+    let server = LineChild::spawn(&dir.join("dist/server.mjs"), Some("1"));
     server.await_line("listening 1", wait);
-    let client = LineChild::spawn(&dir.join("dist/client.js"), None);
+    let client = LineChild::spawn(&dir.join("dist/client.mjs"), None);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:1", wait);
 
@@ -312,7 +312,7 @@ fn a_dropped_connection_reconnects_and_resyncs() {
 
     // Phase 3: restart with DIFFERENT state — the backoff loop reconnects,
     // the hook re-attaches, the mirror resyncs, calls work again.
-    let revived = LineChild::spawn(&dir.join("dist/server.js"), Some("2"));
+    let revived = LineChild::spawn(&dir.join("dist/server.mjs"), Some("2"));
     revived.await_line("listening 2", wait);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:2", wait);
@@ -444,9 +444,9 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     // The mirror's first value arrives over the wire, so it lands AFTER the
     // wiring finishes — `await_line` consumes what it skips, so the order
     // here mirrors the client's emission order.
-    let server = LineChild::spawn(&dir.join("dist/server.js"), Some("1"));
+    let server = LineChild::spawn(&dir.join("dist/server.mjs"), Some("1"));
     server.await_line("listening 1", wait);
-    let client = LineChild::spawn(&dir.join("dist/client.js"), None);
+    let client = LineChild::spawn(&dir.join("dist/client.mjs"), None);
     client.await_line("state:Connected", wait);
     client.await_line("ready", wait);
     client.await_line("mirror:1", wait);
@@ -466,7 +466,7 @@ fn a_dirty_draft_repushes_itself_on_reconnect() {
     // Phase 3: a DIFFERENT server comes up (status 2). The backoff reconnects,
     // the mirror resyncs to 2 — which must NOT take the dirty local — and the
     // app's reconnect hook re-pushes the stranded 7.
-    let revived = LineChild::spawn(&dir.join("dist/server.js"), Some("2"));
+    let revived = LineChild::spawn(&dir.join("dist/server.mjs"), Some("2"));
     revived.await_line("listening 2", wait);
     client.await_line("state:Connected", wait);
     client.await_line("mirror:2", wait);

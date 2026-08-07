@@ -34,7 +34,7 @@ packages = ["common", "client", "server"]
 vilan run .
 ```
 
-This builds `dist/client.js` (browser) and `dist/server.js` (Node), then
+This builds `dist/client.js` (browser) and `dist/server.mjs` (Node), then
 starts the workspace's single `node` member, the server. Open
 <http://localhost:3000>: the page loads the client bundle, which renders a
 heading using the same `common::greeting` the server logs at startup.
@@ -42,8 +42,8 @@ heading using the same `common::greeting` the server logs at startup.
 Or build the bundles without running:
 
 ```sh
-vilan build .          # writes dist/server.js + dist/client.js
-node dist/server.js    # then run the server yourself
+vilan build .          # writes dist/server.mjs + dist/client.js
+node dist/server.mjs   # then run the server yourself
 ```
 
 `dist/` is generated and not checked in.

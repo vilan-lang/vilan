@@ -45,7 +45,7 @@ Save that as `hello.vl` and run it:
 
 ```sh
 vilan run hello.vl      # build + run
-vilan build hello.vl    # just compile — writes hello.js
+vilan build hello.vl    # just compile — writes hello.mjs
 vilan check hello.vl    # just type-check — writes nothing
 ```
 
@@ -96,7 +96,7 @@ yours.
 | Command | What it does |
 |---|---|
 | `vilan init [name]` | scaffold a project; `--template` picks `node`, `browser`, or `fullstack` |
-| `vilan build [path]` | compile to `<file>.js` (no path: use the nearest `vilan.toml`) |
+| `vilan build [path]` | compile to `<file>.mjs` — `.js` for a browser entry (no path: use the nearest `vilan.toml`) |
 | `vilan check [path]` | type-check and report problems, write nothing |
 | `vilan run [path] [args…]` | build and run; extra args reach `process::args()` |
 | `vilan fmt [paths…]` | format source files in place (`--check` to verify only) |

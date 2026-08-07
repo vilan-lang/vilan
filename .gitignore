@@ -8,8 +8,9 @@
 # stylesheet) beside the source.
 vilan/examples/**/dist/
 vilan/examples/**/*.js
+vilan/examples/**/*.mjs
 vilan/examples/**/*.css
 
 # The benchmark bundle (`vilan run vilan/benchmarks` writes it beside the source).
-vilan/benchmarks/src/main.js
+vilan/benchmarks/src/main.mjs
 vilan/docs/book/

@@ -298,7 +298,8 @@ pub const TABLES: &[Table] = &[
     Table {
         path: "entry.*",
         documentation: "One build entry of a multi-entry package; the name labels its \
-                        `dist/<name>.js` output.",
+                        `dist/<name>` output (`.mjs` on a process target, `.js` on the \
+                        browser).",
         keys: &[
             Key {
                 name: "path",

@@ -413,7 +413,7 @@ const WATCH_INTERRUPT_EXIT_CODE: i32 = 130;
 /// Installs the `Ctrl-C` exit hook for a watch session.
 ///
 /// [`watch_loop`] never returns from its loop, so without a hook the session's
-/// temp script (`vilan-watch-<pid>.js`) outlives it — one leaked file per watch
+/// temp script (`vilan-watch-<pid>.mjs`) outlives it — one leaked file per watch
 /// session (`windows-support.md` §6; the per-round delete in [`run_watch`]
 /// covers only restarts). The hook is deliberately tiny: remove the script,
 /// exit. Removal is silent here, unlike the per-round one — the process is on
@@ -754,6 +754,7 @@ fn hmr_round(
         next.push(hmr::LegArtifact {
             name: unit.name.clone(),
             is_browser: matches!(platform, Platform::Browser),
+            script_extension: platform.script_extension(),
             bundle: javascript,
             css,
             sources: sources.into_iter().collect(),
@@ -794,7 +795,7 @@ fn hmr_round(
         return child;
     }
     for leg in &next {
-        let bundle_path = dist.join(format!("{}.js", leg.name));
+        let bundle_path = dist.join(format!("{}.{}", leg.name, leg.script_extension));
         let contents = if leg.is_browser {
             hmr::instrument(&leg.bundle, channel.port(), version, &leg.name)
         } else {
@@ -849,8 +850,9 @@ fn hmr_round(
         child = match &selection {
             Ok(Some(unit)) => {
                 // Run from the workspace root so the server reads sibling
-                // `dist/*.js`, exactly as `run_workspace` / `build_and_spawn_run`.
-                let script = Path::new("dist").join(format!("{}.js", unit.name));
+                // `dist/` bundles, exactly as `run_workspace` /
+                // `build_and_spawn_run`.
+                let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
                 match spawn_node(&script, args, Some(&root)) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
@@ -921,7 +923,7 @@ fn manifest_fingerprint(root: &Path) -> u64 {
 /// The temp script a single-package `run --watch` round executes. One per
 /// process (the pid keys it), rewritten each round.
 fn watch_script_path() -> PathBuf {
-    env::temp_dir().join(format!("vilan-watch-{}.js", std::process::id()))
+    env::temp_dir().join(format!("vilan-watch-{}.mjs", std::process::id()))
 }
 
 /// Removes the round's temp script, best effort. Called once the child that was
@@ -987,7 +989,10 @@ fn build_and_spawn_run(
             // round thus refreshes the on-disk sidecar for the dev loop (hmr.md §11
             // S0); the workspace arm below gets this for free via
             // `build_workspace_artifacts`.
-            write_assets(&unit.entry.with_extension("js"), &assets);
+            write_assets(
+                &unit.entry.with_extension(platform.script_extension()),
+                &assets,
+            );
             let script = watch_script_path();
             if let Err(error) = fs::write(&script, javascript) {
                 eprintln!(
@@ -1023,7 +1028,7 @@ fn build_and_spawn_run(
                 return None;
             }
             launch(
-                &Path::new("dist").join(format!("{}.js", server.name)),
+                &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
                 Some(&root),
             )
         }
@@ -1224,7 +1229,7 @@ fn collect_vl_files(path: &Path, out: &mut Vec<PathBuf>) {
 /// A buildable unit — a workspace member, a lone package, or a bare file: the
 /// entry to compile, its package source root, the directory whose `vilan.toml`
 /// declares its dependencies (for resolving the workspace), and its codegen
-/// options. `name` labels a workspace member's `dist/<name>.js` output.
+/// options. `name` labels a workspace member's `dist/<name>` output.
 struct Unit {
     name: String,
     /// The entry file, resolved against the package root.
@@ -1515,9 +1520,34 @@ fn package_units(
     units
 }
 
-/// Rejects two build units sharing a name — their `dist/<name>.js` outputs
-/// would silently overwrite each other. (`none` members emit nothing, so they
-/// can't collide.)
+/// The `dist/` bundle one build unit writes. The extension is the platform's
+/// (`Platform::script_extension`) — a process runtime is handed a `.mjs` so it
+/// classifies the ESM we emit without sniffing it; the browser keeps `.js`,
+/// since its `<script type="module">` tag already declares the module. One
+/// definition, used by the writers and by every path that later launches or
+/// reports the artifact, so a name can never be reconstructed two ways.
+fn artifact_path(dist: &Path, name: &str, platform: Platform) -> PathBuf {
+    dist.join(format!("{name}.{}", platform.script_extension()))
+}
+
+/// The platform of a leg selected to be *run* under `node`. `select_node_entry`
+/// filters to `Platform::Node`, so every launch path below is Node by
+/// construction; naming it keeps those paths reading through
+/// [`artifact_path`] rather than hardcoding an extension.
+const NODE_LEG: Platform = Platform::Node {
+    version: vilan_core::target::NODE_LTS,
+};
+
+/// Rejects two build units sharing a name — their `dist/` outputs would
+/// silently overwrite each other. (`none` members emit nothing, so they can't
+/// collide.)
+///
+/// The check keys on the NAME, not on the emitted bundle path, and that stays
+/// right now that the extension is the platform's: two same-named units on the
+/// same platform overwrite the bundle outright, and two on *different*
+/// platforms still overwrite everything keyed by the bare name beside it — the
+/// `<name>.css` sidecar and the `<name>.chunks.json` manifest. So the message
+/// names `dist/<name>.*` rather than one extension.
 fn reject_output_collisions(members: &[(Unit, Platform)]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for (unit, platform) in members {
@@ -1527,7 +1557,7 @@ fn reject_output_collisions(members: &[(Unit, Platform)]) -> Result<(), String> 
         if !seen.insert(unit.name.as_str()) {
             return Err(format!(
                 "two build units are both named `{}`, so their outputs would \
-                 collide at dist/{}.js; rename one (the package name or the \
+                 collide at dist/{}.*; rename one (the package name or the \
                  `[entry.<name>]`)",
                 unit.name, unit.name
             ));
@@ -1600,7 +1630,7 @@ fn project_from_manifest(directory: &Path) -> Result<Project, String> {
 
     // `[entry.<name>]` sections: the single-package full-stack form
     // (proposal/platform-coloring.md §4.2). Lowers onto the same workspace
-    // orchestration as a `[project]` — every entry builds to `dist/<name>.js`,
+    // orchestration as a `[project]` — every entry builds to `dist/<name>`,
     // `run` picks the one node entry, `check` checks them all.
     if !manifest.entries.is_empty() {
         let members = package_units(directory, package, &manifest, options);
@@ -1659,7 +1689,7 @@ fn compile_unit(
     overlay: Option<&mut String>,
     // The artifact stem this leg writes under, and where its route chunks land,
     // when it declared `split = true` (`bundle-splitting.md` S2). The stem comes
-    // from the caller because it is the OUTPUT's name (`dist/<leg>.js`, or the
+    // from the caller because it is the OUTPUT's name (`dist/<leg>`, or the
     // entry file's own stem for a lone package), not the unit's. A caller that
     // passes `None` — `check`, `run`'s temp build, every watch round — compiles
     // the leg as one file, which is what keeps splitting a `build` artifact
@@ -1691,10 +1721,11 @@ fn compile_unit(
     )
 }
 
-/// Builds a lone package / bare file, writing `<entry>.js` (or printing to stdout).
+/// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg
+/// and `<entry>.js` on the browser (or printing to stdout).
 fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> ExitCode {
     let mut chunks = Vec::new();
-    // A lone package writes `<entry>.js` beside its source, so the entry file's
+    // A lone package writes `<entry>.<ext>` beside its source, so the entry file's
     // own stem is what its chunks are named after.
     let leg = unit
         .entry
@@ -1718,7 +1749,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         print!("{javascript}");
         return ExitCode::SUCCESS;
     }
-    let output_path = unit.entry.with_extension("js");
+    let output_path = unit.entry.with_extension(platform.script_extension());
     write_assets(&output_path, &assets);
     if let Err(code) = write_chunks(&output_path, &chunks) {
         return code;
@@ -1761,8 +1792,9 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
 fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
+    let platform = Platform::default();
     let (javascript, assets, _sources) =
-        match compile_unit(unit, Platform::default(), false, false, None, None) {
+        match compile_unit(unit, platform, false, false, None, None) {
             Ok(compiled) => compiled,
             Err(code) => return code,
         };
@@ -1771,11 +1803,15 @@ fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     // them — not beside the temp script `run_node_script` hands Node, which the
     // program never reads. Same helper and placement as `build_single`, so `run`
     // keeps the on-disk sidecar fresh (const-eval.md §3; hmr.md §11 S0).
-    write_assets(&unit.entry.with_extension("js"), &assets);
+    write_assets(
+        &unit.entry.with_extension(platform.script_extension()),
+        &assets,
+    );
     run_node_script(&javascript, args)
 }
 
-/// Builds every host (non-`none`) member of a workspace into `<root>/dist/<name>.js`
+/// Builds every host (non-`none`) member of a workspace into
+/// `<root>/dist/<name>.<ext>` (`.mjs` on a process leg, `.js` on the browser)
 /// — a `none` member is a pure library, compiled only as a dependency of a host.
 /// Members build in declaration order (the client before the server, so the
 /// server's `dist/client.js` exists). `--platform`/`--stdout` don't apply.
@@ -1851,7 +1887,7 @@ fn build_workspace_artifacts(
         let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
         let (javascript, assets, _sources) =
             compile_unit(unit, *platform, debug, false, None, sink)?;
-        let output = dist.join(format!("{}.js", unit.name));
+        let output = artifact_path(&dist, &unit.name, *platform);
         write_assets(&output, &assets);
         // Unconditional: this is also where a previous build's chunks are swept
         // when this one wrote none.
@@ -1966,7 +2002,7 @@ fn candidate_tail(node_members: &[&Unit]) -> String {
 }
 
 /// Builds a workspace, then runs its selected Node member (A15) with `node` from
-/// the project root (so it can read sibling `dist/*.js`). `args` are forwarded.
+/// the project root (so it can read sibling `dist/` bundles). `args` are forwarded.
 fn run_workspace(
     root: &Path,
     members: &[(Unit, Platform)],
@@ -1991,10 +2027,10 @@ fn run_workspace(
     if let Err(code) = build_workspace_artifacts(root, members, false, Emission::WholeBundles) {
         return code;
     }
-    // Run from the project root so the server reads sibling `dist/*.js`; the script
+    // Run from the project root so the server reads sibling `dist/` bundles; the script
     // path is relative to that working directory.
     let status = spawn_node(
-        &Path::new("dist").join(format!("{}.js", server.name)),
+        &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
         args,
         Some(root),
     )
@@ -2140,7 +2176,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         None,
     )
     .map_err(|_| String::new())?;
-    let script = env::temp_dir().join(format!("vilan-test-{}.js", std::process::id()));
+    let script = env::temp_dir().join(format!("vilan-test-{}.mjs", std::process::id()));
     if let Err(error) = fs::write(&script, javascript) {
         return Err(format!("cannot write {}: {error}", script.display()));
     }
@@ -2252,7 +2288,7 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
 ///
 /// Chunk names are `<leg>.<arm>.js`, and a leg name is a manifest-checked
 /// identifier (no `.`), so a chunk can never collide with another leg's
-/// `dist/<leg>.js` — which is why `reject_output_collisions` needs no chunk
+/// `dist/<leg>` — which is why `reject_output_collisions` needs no chunk
 /// pass of its own. That same shape is what makes the sweep below safe: every
 /// `<leg>.<anything>.js` beside the bundle is this leg's chunk and nobody
 /// else's.
@@ -2746,7 +2782,7 @@ fn compile_to_js(
 /// rather than piping via stdin, so the program keeps its own stdin — a piped
 /// script would consume it, breaking `scan()`.)
 fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
-    let script = env::temp_dir().join(format!("vilan-run-{}.js", std::process::id()));
+    let script = env::temp_dir().join(format!("vilan-run-{}.mjs", std::process::id()));
     if let Err(error) = fs::write(&script, javascript) {
         eprintln!(
             "{} cannot write {}: {error}",

@@ -59,8 +59,8 @@ keystroke by keystroke.
 Or build without running:
 
 ```sh
-vilan build .           # writes dist/client.js, dist/client.css, dist/server.js
-node dist/server.js     # the server runs from the project root
+vilan build .           # writes dist/client.js, dist/client.css, dist/server.mjs
+node dist/server.mjs    # the server runs from the project root
 ```
 
 `dist/` is generated and not checked in; the SQLite file (`notes.db`) is created

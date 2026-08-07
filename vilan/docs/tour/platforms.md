@@ -60,9 +60,10 @@ app/
     todo.vl       shared types — anything both entries import
 ```
 
-`vilan build` compiles every entry for its own target into
-`dist/<name>.js` (browser entries first, so a server that ships bundles
-finds them fresh); `vilan run` builds everything and starts the one
+`vilan build` compiles every entry for its own target into `dist/` —
+`<name>.mjs` for a process entry, `<name>.js` for a browser one
+(browser entries first, so a server that ships bundles finds them
+fresh); `vilan run` builds everything and starts the one
 Node entry; `vilan check` checks all entries, always. Reachability does
 the sorting: the same `store.vl` may use `std::fs` freely, because only
 the server entry reaches into it. If client code ever calls that far,

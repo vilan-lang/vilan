@@ -5,10 +5,10 @@
 //! ordinary `let`, no `const` keyword anywhere — and `tests/infer_preset/golden`
 //! holds what it compiles to under each preset:
 //!
-//!   * `release.js` — the sweep ran: arithmetic, a chain through it, a call
+//!   * `release.mjs` — the sweep ran: arithmetic, a chain through it, a call
 //!     with const-known arguments, and a small list are all literals, and the
 //!     functions that produced them are tree-shaken away;
-//!   * `debug.js` — the sweep did not run, and every one of those bindings is
+//!   * `debug.mjs` — the sweep did not run, and every one of those bindings is
 //!     still the expression the author wrote.
 //!
 //! The corpus gate cannot reach this: it builds bare `.vl` files with no
@@ -80,7 +80,7 @@ fn build_under(preset: &str) -> String {
         "the {preset} build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let emitted = std::fs::read_to_string(work.join("src/main.js")).expect("read emitted JS");
+    let emitted = std::fs::read_to_string(work.join("src/main.mjs")).expect("read emitted JS");
     let _ = std::fs::remove_dir_all(&work);
     emitted
 }
@@ -88,7 +88,7 @@ fn build_under(preset: &str) -> String {
 /// The release build folds, byte-for-byte.
 #[test]
 fn the_release_golden_carries_the_folds() {
-    let golden = std::fs::read_to_string(golden_dir().join("release.js")).expect("read golden");
+    let golden = std::fs::read_to_string(golden_dir().join("release.mjs")).expect("read golden");
     let rebuilt = build_under("release");
     assert_eq!(
         golden, rebuilt,
@@ -114,7 +114,7 @@ fn the_release_golden_carries_the_folds() {
 /// signal, since `BuildOptions::default()` is this preset.
 #[test]
 fn the_debug_golden_carries_no_folds() {
-    let golden = std::fs::read_to_string(golden_dir().join("debug.js")).expect("read golden");
+    let golden = std::fs::read_to_string(golden_dir().join("debug.mjs")).expect("read golden");
     let rebuilt = build_under("debug");
     assert_eq!(
         golden, rebuilt,
@@ -171,7 +171,7 @@ fn both_presets_run_identically_under_node() {
 /// Runs emitted JavaScript under node, returning `(stdout, exit code)`.
 fn run_under_node(label: &str, javascript: &str) -> (String, i32) {
     let script = std::env::temp_dir().join(format!(
-        "vilan_infer_preset_run_{}_{label}.js",
+        "vilan_infer_preset_run_{}_{label}.mjs",
         std::process::id()
     ));
     std::fs::write(&script, javascript).expect("write script");

@@ -551,7 +551,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             bundle_before.contains("clientmark_one"),
             "the round-1 client bundle carries the original marker"
         );
-        let server_before = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let server_before = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
 
         // A client-only edit: the client bundle changes, the server's sources do
         // not — so the round SKIPS the server (prints the skip line) and pushes a
@@ -582,7 +582,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
 
         // Reuse fidelity: the skipped server leg's dist bytes are the round-1
         // artifact, untouched by the skip round.
-        let server_after = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let server_after = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
         assert_eq!(
             server_after, server_before,
             "a skipped leg's dist bytes must be exactly the reused artifact"
@@ -606,7 +606,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             "the one-shot rebuild should succeed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let fresh = std::fs::read(dir.join("dist/server.js")).expect("dist/server.js");
+        let fresh = std::fs::read(dir.join("dist/server.mjs")).expect("dist/server.mjs");
         assert_eq!(
             &fresh, reused,
             "a one-shot build must equal the reused (cache-hit round) artifact"
@@ -734,7 +734,7 @@ fn port_from_buffer(buffer: &Arc<Mutex<Vec<String>>>, deadline: Duration) -> Opt
 /// A15 (`--entry`): a workspace with TWO Node legs (the kolt shape — a `server`
 /// and a `probe`) plus a browser leg. `run --watch --entry server` runs the
 /// chosen `server` leg (its boot marker appears), while the non-selected `probe`
-/// leg still COMPILES into the workspace (`dist/probe.js` exists) but is never
+/// leg still COMPILES into the workspace (`dist/probe.mjs` exists) but is never
 /// launched (its marker never appears). HMR rounds then work under the selection:
 /// a client edit swaps, a server edit restarts the chosen leg — and the probe
 /// still never runs. Same single-watcher, quick-exit-legs process hygiene as the
@@ -785,7 +785,7 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
             "the `--entry server` leg should run"
         );
         assert!(
-            dir.join("dist/probe.js").exists(),
+            dir.join("dist/probe.mjs").exists(),
             "the non-selected probe leg still compiles into the workspace"
         );
         assert!(
@@ -848,7 +848,7 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
         .expect("run vilan build");
     assert!(status.success(), "the one-shot build should succeed");
     let one_shot_server =
-        std::fs::read(dir.join("dist/server.js")).expect("build wrote dist/server.js");
+        std::fs::read(dir.join("dist/server.mjs")).expect("build wrote dist/server.mjs");
 
     // A watch round rewrites dist/ from the same sources; its (uninstrumented)
     // server bundle must match byte-for-byte.
@@ -868,8 +868,8 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
             wait_for_line(&lines, "server-booted", deadline),
             "round 1 should compile and boot the server"
         );
-        let watched_server = std::fs::read(dir.join("dist/server.js"))
-            .expect("the watch round wrote dist/server.js");
+        let watched_server = std::fs::read(dir.join("dist/server.mjs"))
+            .expect("the watch round wrote dist/server.mjs");
         assert_eq!(
             one_shot_server, watched_server,
             "a watch round's server bundle must be byte-identical to a one-shot build's"
