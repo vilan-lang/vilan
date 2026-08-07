@@ -4358,8 +4358,9 @@ impl<'src> Transformer<'src> {
         self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
-    /// B81: whether this capture must become a real declaration on the alias
-    /// path even when it owes no copy — see [`Program::materialized_captures`].
+    /// B81/B88: whether this capture must become a real declaration on the
+    /// alias path even when it owes no copy — see
+    /// [`Program::materialized_captures`].
     fn capture_materializes(&self, capture_id: Id) -> bool {
         self.program.materialized_captures.contains(&capture_id)
     }
@@ -4467,14 +4468,16 @@ impl<'src> Transformer<'src> {
     ///   storage. Captures that share or move own nothing to copy and keep
     ///   their accessor, which is what keeps the elisions free — and a RESOURCE
     ///   capture never copies (R1).
-    /// - **B81 — it must be READ at the match.** A subject rooted in a writable
-    ///   view is mutated IN PLACE when the leg writes through it, so an
-    ///   accessor re-read later in the leg returns post-write state. The
-    ///   declaration freezes the read without touching the value: no `__clone`,
-    ///   so a SHARE stays a share and a resource stays the loan B62's leg
-    ///   teardown destroys through (`capture_drop_nodes` reads the alias table
-    ///   after this runs, so it finds the declared name and destroys the very
-    ///   value the leg captured).
+    /// - **B81/B88 — it must be READ at the match.** A subject whose storage a
+    ///   write can reach IN PLACE — through a writable view, or through a
+    ///   COMPONENT write / `&mut` / `&mut self` call on an owned place — is
+    ///   mutated under the temp, so an accessor re-read later in the leg
+    ///   returns post-write state. The declaration freezes the read without
+    ///   touching the value: no `__clone`, so a SHARE stays a share and a
+    ///   resource stays the loan B62's leg teardown destroys through
+    ///   (`capture_drop_nodes` reads the alias table after this runs, so it
+    ///   finds the declared name and destroys the very value the leg
+    ///   captured).
     ///
     /// WHERE `out` goes decides WHEN that happens, and the callers answer
     /// differently: an `is` test emits into the statements before it (reading an

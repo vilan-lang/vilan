@@ -10241,15 +10241,39 @@ impl<'src> Analyzer<'src> {
     /// for the same storage still lands here, because taking the `&mut` that
     /// makes the second name is itself one of the three forms.
     ///
+    /// Split by what the write DOES to the storage at the root — see
+    /// [`WrittenRoots`], whose two sets answer two different questions.
+    ///
     /// Whole-program, computed once: the pass that consumes it
     /// ([`Self::compute_capture_clone_sites`]) is whole-program too, and a
     /// per-body split would buy nothing — a binding is local to one body.
-    fn collect_written_roots(&self) -> HashSet<Id> {
+    fn collect_written_roots(&self) -> WrittenRoots {
         let mut written_places: Vec<Id> = Vec::new();
+        let mut in_place_writes: Vec<Id> = Vec::new();
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
-                Expr::Assignment(target_id, _) => written_places.push(*target_id),
-                Expr::Reference(operand_id, true) => written_places.push(*operand_id),
+                Expr::Assignment(target_id, _) => {
+                    written_places.push(*target_id);
+                    // B88: the one write form that leaves the storage alone.
+                    // Assigning a whole OWNED binding rebinds it — a fresh
+                    // value is installed and every alias of the old one keeps
+                    // the old one — so it cannot reach into a subject temp.
+                    // Any DEEPER target writes into the storage that temp
+                    // aliases, and through a VIEW root even the whole-binding
+                    // form is an in-place write, since that is how a write
+                    // through a view reaches the caller at all.
+                    let rebinds = matches!(
+                        self.expr_id_to_expr_map.get(target_id),
+                        Some(Expr::Local(_))
+                    ) && !self.subject_is_writable_view(*target_id);
+                    if !rebinds {
+                        in_place_writes.push(*target_id);
+                    }
+                }
+                Expr::Reference(operand_id, true) => {
+                    written_places.push(*operand_id);
+                    in_place_writes.push(*operand_id);
+                }
                 Expr::Call(call_id) => {
                     let Some(function_call) = self.function_calls.get(call_id) else {
                         continue;
@@ -10263,19 +10287,29 @@ impl<'src> Analyzer<'src> {
                             {
                                 if conventions.get(index).copied() == Some(Convention::RefMut) {
                                     written_places.push(*argument_id);
+                                    in_place_writes.push(*argument_id);
                                 }
                             }
                         }
-                        None => written_places.extend(&function_call.argument_ids),
+                        None => {
+                            written_places.extend(&function_call.argument_ids);
+                            in_place_writes.extend(&function_call.argument_ids);
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        written_places
-            .into_iter()
-            .filter_map(|place_id| self.place_root(place_id))
-            .collect()
+        let roots = |places: Vec<Id>| -> HashSet<Id> {
+            places
+                .into_iter()
+                .filter_map(|place_id| self.place_root(place_id))
+                .collect()
+        };
+        WrittenRoots {
+            any: roots(written_places),
+            in_place: roots(in_place_writes),
+        }
     }
 
     /// The SHARE elision's predicate: whether a capture may alias this subject
@@ -10297,7 +10331,7 @@ impl<'src> Analyzer<'src> {
     /// reasoning and is deliberately NOT admitted here: it elides copies no
     /// resource program pays for, and widening it moves goldens for a gain
     /// nothing has asked for.
-    fn share_subject_is_stable(&self, subject_id: Id, written_roots: &HashSet<Id>) -> bool {
+    fn share_subject_is_stable(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
         if self.readonly_root(subject_id).is_some() {
             return true;
         }
@@ -10307,7 +10341,7 @@ impl<'src> Analyzer<'src> {
         self.parameters
             .get(&root)
             .is_some_and(|parameter| parameter.convention == Convention::Own)
-            && !written_roots.contains(&root)
+            && !written_roots.any.contains(&root)
     }
 
     /// B81: whether a pattern's subject is rooted in a WRITABLE view — a `&mut`
@@ -10337,6 +10371,27 @@ impl<'src> Analyzer<'src> {
             return parameter.convention == Convention::RefMut;
         }
         self.view_binding_mutability(root) == Some(true)
+    }
+
+    /// B88: the OWNED half of the same question. A subject temp aliases the
+    /// object at the subject place, so the alias path's deferred read is
+    /// faithful exactly while that object cannot change — and against an owned
+    /// place one write form leaves it alone while the rest do not. Assigning
+    /// the binding REBINDS it, which is why `subject_is_writable_view` is not
+    /// the whole rule and why B81 could stop where it did; a COMPONENT write
+    /// (`t.1 = 9`, `h.pair.1 = 9`, `xs[0] = 9`, `*v = 9`), an explicit `&mut`,
+    /// or a `&mut`-bound argument all mutate the object the temp holds
+    /// (`capture-clones.md` §7).
+    ///
+    /// Asked at ROOT granularity, like every other write question here: a
+    /// write that reaches the subject's storage under a second name got that
+    /// name from a `&mut` of the root, which is itself one of the three forms
+    /// [`Self::collect_written_roots`] records. Narrowing it to the ARM would
+    /// not be sound without that root step — `let v = &mut t` outside the arm
+    /// and `v.1 = 9` inside it is a write whose own root is `v`.
+    fn subject_is_mutated_in_place(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
+        self.place_root(subject_id)
+            .is_some_and(|root| written_roots.in_place.contains(&root))
     }
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
@@ -13828,14 +13883,20 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
-            // B81, and asked FIRST because it is orthogonal to every filter
-            // below: whether a capture must be READ at the match is settled by
-            // the subject alone, where whether it must be COPIED is settled by
-            // its own type. A scalar owes no copy and a resource is forbidden
-            // one, yet both read the wrong slot when a write through the
-            // subject's view mutates it in place mid-leg
-            // ([`Self::subject_is_writable_view`]).
-            if self.subject_is_writable_view(subject_id) {
+            // B81/B88, and asked FIRST because it is orthogonal to every
+            // filter below: whether a capture must be READ at the match is
+            // settled by the subject alone, where whether it must be COPIED is
+            // settled by its own type. A scalar owes no copy and a resource is
+            // forbidden one, yet both read the wrong slot when a mid-leg write
+            // mutates the subject's storage in place. Two arms, one question —
+            // can the object the subject temp aliases change under it: through
+            // a writable VIEW every write is in place, by construction
+            // ([`Self::subject_is_writable_view`]); through an owned PLACE
+            // every write but a whole-binding rebind is
+            // ([`Self::subject_is_mutated_in_place`]).
+            if self.subject_is_writable_view(subject_id)
+                || self.subject_is_mutated_in_place(subject_id, &written_roots)
+            {
                 materialized.insert(capture_id);
             }
             let capture_type = type_id.get_type(self);
@@ -26223,12 +26284,32 @@ pub enum CopyDecision {
     UnlessResource(Vec<TypeId>),
 }
 
+/// The binding roots a program's writes can reach, split by what the write
+/// does to the storage AT the root ([`Analyzer::collect_written_roots`]).
+///
+/// The two sets answer two different questions and must not be conflated.
+/// **`any`** is rule 2's: may a capture alias this subject at all — anything
+/// that can write it, however the write is spelled, makes the alias
+/// observable. **`in_place`** is B88's: may the OBJECT a subject temp holds
+/// change under the temp — which a whole-binding assignment to an owned root
+/// cannot do, because it installs a fresh value and leaves the old one to
+/// every alias of it (`capture-clones.md` §6.1).
+struct WrittenRoots {
+    /// Every root some write reaches.
+    any: HashSet<Id>,
+    /// The roots whose storage a write can mutate in place: a component write,
+    /// an explicit `&mut`, a `&mut`-bound argument, and — through a view root,
+    /// where a write is an in-place `Object.assign` — a whole-binding
+    /// assignment too. A subset of `any`.
+    in_place: HashSet<Id>,
+}
+
 /// What `compute_capture_clone_sites` settles about a program's pattern
 /// captures. Three answers to two independent questions — **is this capture
-/// COPIED**, and **when is it READ** — which B53 and B81 answer separately:
-/// copying is decided by the capture's own type (an aggregate copies, a
-/// resource never does), reading by the subject's (an owned place freezes on
-/// rebinding, a `&mut` view does not freeze at all).
+/// COPIED**, and **when is it READ** — which B53 and B81/B88 answer
+/// separately: copying is decided by the capture's own type (an aggregate
+/// copies, a resource never does), reading by whether the subject's storage
+/// can be mutated in place under the temp that aliases it.
 pub struct CapturePlan {
     /// The captures that copy, keyed by how the copy is decided.
     pub sites: HashMap<Id, CopyDecision>,
@@ -26531,18 +26612,23 @@ pub struct Program<'src> {
     /// value says whether the copy is unconditional or re-decided per
     /// monomorphization (see [`CopyDecision`]).
     pub capture_clone_sites: HashMap<Id, CopyDecision>,
-    /// B81: pattern captures the ALIAS path must turn into a real declaration
-    /// even when they owe no copy — the ones whose subject is rooted in a
-    /// writable view (`analyzer.rs::subject_is_writable_view`). That path
-    /// substitutes an accessor into the subject temp at every reference, and a
-    /// write through the view mutates the object that temp aliases IN PLACE, so
-    /// a deferred read returns post-write state: `if self is Feed::Ready(let
-    /// items, let at) { self = Feed::Ready(items, at + 1); items[at] }` read the
-    /// incremented `at`. Declaring the capture reads the slot once, at the
-    /// match, which is what the DECLARED path (`compile_pattern`) always did and
-    /// what makes the two paths agree. Orthogonal to `capture_clone_sites`:
-    /// this set says WHEN, that map says WHETHER TO COPY, and a resource
-    /// capture is in this set and never in that map (R1).
+    /// B81/B88: pattern captures the ALIAS path must turn into a real
+    /// declaration even when they owe no copy — the ones whose subject names
+    /// storage some write can mutate IN PLACE. That path substitutes an
+    /// accessor into the subject temp at every reference, so a mid-leg write
+    /// to the object that temp aliases makes every deferred read return
+    /// post-write state: `if self is Feed::Ready(let items, let at) { self =
+    /// Feed::Ready(items, at + 1); items[at] }` read the incremented `at`, and
+    /// so did `if t is (let a, let b) { t.1 = 99; print(b) }`. Two arms answer
+    /// the one question — a writable-view root, where every write is in place
+    /// by construction (`analyzer.rs::subject_is_writable_view`), and an owned
+    /// root reached by any write but a whole-binding rebind
+    /// (`analyzer.rs::subject_is_mutated_in_place`). Declaring the capture
+    /// reads the slot once, at the match, which is what the DECLARED path
+    /// (`compile_pattern`) always did and what makes the two paths agree.
+    /// Orthogonal to `capture_clone_sites`: this set says WHEN, that map says
+    /// WHETHER TO COPY, and a resource capture is in this set and never in
+    /// that map (R1).
     pub materialized_captures: HashSet<Id>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
