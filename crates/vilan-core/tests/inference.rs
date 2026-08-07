@@ -43377,16 +43377,21 @@ fn a_subject_that_declares_next_still_drives_the_loop() {
     );
 }
 
-/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
-/// trait default is reachable as a call (`empty.next()` resolves and returns
-/// `None`) but does not drive a loop — `method_member_candidates` reads the
-/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
-/// nothing. Before the fix the loop fell through to the native `for...of` and
-/// printed the `unused` field; now it is a clean "cannot iterate", which is the
-/// right interim answer but not the right final one. `#[ignore]`d: it asserts
-/// the desired outcome (the default drives the loop, printing `99` only).
+// --- B91: an inherited trait default drives the loop (Gap E, at the `for`) ---
+// A gap B80's check exposed rather than caused. A `next` INHERITED from a trait
+// default is the receiver's `next` everywhere else — `empty.next()` resolves and
+// returns `None`, and Gap E's `method_member_in_inherited_defaults` is what makes
+// it resolve — but the loop asked `method_member_candidates`, which reads each
+// impl's own `declarations`, and `impl Empty with Fixed<i32> {}` declares
+// nothing. B80 turned the silent native `for...of` into a clean "cannot iterate",
+// which was the right interim answer and the wrong final one: a protocol
+// duck-typed on a method NAME cannot mean one thing at a call and another at a
+// loop. The loop now falls back to the same tier the call does, dispatched to the
+// concrete receiver at codegen through the same `GenericDispatch::OnType`.
+
+/// B91's headline case, `#[ignore]`d until the fix: an impl that declares nothing
+/// still iterates, through the default it inherited.
 #[test]
-#[ignore]
 fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
@@ -43405,6 +43410,248 @@ fn a_next_inherited_from_a_trait_default_drives_the_loop() {
         }
         "#,
         "99\n",
+    );
+}
+
+/// The default that actually YIELDS, which the empty one above cannot prove: the
+/// inherited body calls back into the impl's own required member, so the loop has
+/// to reach the default AND the default has to dispatch to this receiver. The
+/// element type has to be right too — it is written in the TRAIT's `T`, bound by
+/// the arguments the impl wrote in its `with` clause.
+#[test]
+fn an_inherited_default_that_yields_drives_the_loop_to_its_end() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Countdown<T> {
+            fun tick(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.tick() }
+        }
+
+        struct Down { at: i32 }
+        impl Down with Countdown<i32> {
+            fun tick(&mut self): Option<i32> {
+                if self.at <= 0 { None } else { self.at -= 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { at = 3 };
+            for item in down { print(item + 1); }
+            print(99);
+        }
+        "#,
+        "3\n2\n1\n99\n",
+    );
+}
+
+/// A GENERIC subject, where one substitution step is not enough: `impl Bag<type
+/// T> with Feed<T>` maps the trait's `T` onto the impl's BINDER, which is still
+/// abstract, so the element instantiates only after the receiver binds the binder.
+/// `pair.1` is the probe — with the trait's arguments alone it was "cannot access
+/// field '1' on type T", the B78 shape one tier over.
+#[test]
+fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Feed<T> {
+            fun take(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.take() }
+        }
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+        impl Bag<type T> with Feed<T> {
+            fun take(&mut self): Option<T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in bag { print(pair.1); }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The `next_mut` twin, lending each element by writable view — a separate member
+/// and a separate lookup, so it gets its own pin (the `a_mut_for_loop_over_a_
+/// subject_without_next_mut_is_diagnosed` precedent). The writes land in the
+/// receiver, which is what makes it the `next_mut` protocol rather than `next`.
+#[test]
+fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Walk<T> {
+            fun step(&mut self): Option<&mut T>;
+            fun next_mut(&mut self): Option<&mut T> { self.step() }
+        }
+
+        struct Bag2 { items: List<i32>, cursor: i32 }
+        impl Bag2 with Walk<i32> {
+            fun step(&mut self): Option<&mut i32> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag2 { items = [1, 2, 3], cursor = 0 };
+            for item in &mut bag { item = *item * 10; }
+            print(bag.items[0]);
+            print(bag.items[2]);
+        }
+        "#,
+        "10\n30\n",
+    );
+}
+
+/// B57's tiering, unchanged by the new tier: an inherent `next` beside an
+/// inherited default one is not ambiguous — inherent wins, unconditionally
+/// (`method-resolution.md` §3). The loop consults the inherited tier only when
+/// the declared search comes back empty, which is the same order the call path
+/// uses, so the two cannot disagree about which body runs.
+#[test]
+fn an_inherent_next_beats_an_inherited_default_at_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl Two with Fixed<i32> {}
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(99);
+        }
+        "#,
+        "1\n2\n99\n",
+    );
+}
+
+/// Two traits offering same-named DEFAULTS are as ambiguous as two declaring the
+/// name outright (§3, one tier down), and the loop must not silently pick one.
+/// The call form resolves this by naming a provider — `Trait::next(receiver)` —
+/// and a `for` has no such spelling, so the steer is the edit that works: declare
+/// it inherently, the tier that beats both (B65's lesson, as B83 applied it).
+#[test]
+fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T> { None } }
+        trait Late<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Both { at: i32 }
+        impl Both with Early<i32> {}
+        impl Both with Late<i32> {}
+
+        fun main() {
+            mut both = Both { at = 0 };
+            for item in both { print(item); }
+        }
+        "#,
+        "`next` is ambiguous on `Both`",
+    );
+}
+
+/// The tier's boundaries, both inherited from Gap E's own rules rather than
+/// re-decided here. B80's declared-shape check applies to an inherited default
+/// exactly as to a declared member — the lowering reads an `Option` tag off
+/// whatever comes back, whoever wrote it. And a `[trait_only]` default is not
+/// inherited onto the concrete surface at all (§3.2), so it does not make the
+/// receiver iterable.
+#[test]
+fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Bad { fun next(&mut self): i32 { 0 } }
+
+        struct Nope { at: i32 }
+        impl Nope with Bad {}
+
+        fun main() {
+            mut nope = Nope { at = 0 };
+            for item in nope { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Hidden<T> { [trait_only] fun next(&mut self): Option<T> { None } }
+
+        struct H { at: i32 }
+        impl H with Hidden<i32> {}
+
+        fun main() {
+            mut h = H { at = 0 };
+            for item in h { print(item); }
+        }
+        "#,
+        "it has no `next(&mut self): Option<T>`",
+    );
+}
+
+/// A default inherited through a SUPERTRAIT, which is the same tier reached one
+/// hop further out: `impl Q with Derived<i32>` never names `Base` at all, and
+/// `method_member_in_trait` walks the supertrait closure to find the body.
+#[test]
+fn a_supertraits_default_next_drives_the_loop_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Base<T> { fun next(&mut self): Option<T> { None } }
+        trait Derived<T> with Base<T> {}
+
+        struct Q { at: i32 }
+        impl Q with Derived<i32> {}
+
+        fun main() {
+            mut q = Q { at = 0 };
+            for item in q { print(item); }
+            print(9);
+        }
+        "#,
+        "9\n",
     );
 }
 

@@ -352,6 +352,41 @@ name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
 not it declares the trait. Declaring it is what buys the adapters below — and
 what lets a generic bound accept your type.
 
+That resolution is ordinary method resolution, which means an **inherited
+default counts**. If the trait supplies a `next` body and your impl block is
+empty, your type still iterates — the same `next` you would reach by writing
+`value.next()`:
+
+```vilan
+import std::print;
+import std::option::Option::{ self, Some, None };
+
+trait Countdown<T> {
+	fun tick(&mut self): Option<T>;
+	fun next(&mut self): Option<T> { self.tick() }   // inherited by every impl
+}
+
+struct Down { at: i32 }
+
+impl Down with Countdown<i32> {
+	fun tick(&mut self): Option<i32> {
+		if self.at <= 0 { None } else { self.at -= 1; Some(self.at) }
+	}
+}
+
+fun main() {
+	mut down = Down { at = 3 };
+	for n in down {
+		print(n);   // 2, 1, 0
+	}
+}
+```
+
+Precedence is the usual one: a `next` declared on the type itself beats an
+inherited one, and two *different* traits offering same-named defaults is an
+ambiguity the loop reports rather than resolving for you — a `for` has no way to
+name a provider, so declare `next` on the type to settle it.
+
 The name is what resolves, but the **shape is still checked**: the method has to
 return an `Option`, because the loop stops at `None`. A `next` annotated with
 anything else is a compile error rather than a loop that quietly runs zero
@@ -362,7 +397,7 @@ times.
 Exactly two things:
 
 - **A type with `next`** (or `next_mut`, for `for e in &mut it`) — the protocol
-  above.
+  above, declared on the type or inherited from a trait default.
 - **A natively iterable value**: `List<T>`, a fixed array `[T; n]`, a tuple, a
   `str` (yielding its characters), `Set<T>` (insertion order), and any host type
   an `external struct` names.

@@ -9711,6 +9711,40 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The substitution an INHERITED trait default runs under on a concrete
+    /// receiver: the providing impl's own generics bound from the receiver
+    /// (`impl Bag<type T>` against `Bag<i32>` binds `T = i32`), and then the
+    /// TRAIT's parameters bound through the arguments that impl wrote in its
+    /// `with` clause (`impl Empty with Fixed<i32>` binds `Fixed`'s `T = i32`).
+    /// Without the second half a default's own signature stays abstract — its
+    /// `Option<T>` return, its `observer: |T| void` parameter (B23).
+    ///
+    /// Shared by `receiver.member()` and by `for x in receiver`, which drive the
+    /// same defaults through the same `GenericDispatch::OnType` channel.
+    fn inherited_default_bindings(
+        &mut self,
+        subject_type: &Type,
+        impl_subject_id: TypeId,
+        trait_id: Id,
+        trait_arguments: &[TypeId],
+    ) -> SubstitutionContext {
+        let impl_subject = impl_subject_id.get_type(self);
+        let mut bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject, subject_type, &HashMap::new())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        let trait_parameter_ids = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(trait_arguments) {
+            let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
+            bindings.insert(*parameter_id, resolved.get_type_id(self));
+        }
+        bindings
+    }
+
     /// Every inherited default `member_name` reaches on `subject_type`, one per
     /// distinct member: `Ord` requiring `PartialEq` offers `eq` through both,
     /// but it is ONE declaration, so it is one candidate — while two unrelated
@@ -17521,7 +17555,27 @@ impl<'src> Analyzer<'src> {
             Type::Struct(subject_id, subject_arguments)
             | Type::Enum(subject_id, subject_arguments) => {
                 let (subject_id, subject_arguments) = (*subject_id, subject_arguments.clone());
-                let next_id = self.method_member_in_impls(iterable_type, next_method)?;
+                // An INHERITED default drives the loop too (B91), and its payload
+                // is written in the TRAIT's parameters rather than the subject's.
+                // It instantiates through the same two-step substitution the call
+                // path uses — the providing impl's generics from the receiver,
+                // then the trait's parameters from the impl's written arguments —
+                // because one step is not enough: `impl Bag<type T> with Feed<T>`
+                // maps the trait's `T` onto the impl's BINDER, which is abstract
+                // until the receiver grounds it. Without this the binding took the
+                // `Any` fallback and `pair.1` was "cannot access field '1' on T".
+                let Some(next_id) = self.method_member_in_impls(iterable_type, next_method) else {
+                    let (_, impl_subject_id, trait_id, trait_arguments) =
+                        self.method_member_in_inherited_defaults(iterable_type, next_method)?;
+                    let payload = self.trait_next_payload(trait_id, next_method)?;
+                    let bindings = self.inherited_default_bindings(
+                        iterable_type,
+                        impl_subject_id,
+                        trait_id,
+                        &trait_arguments,
+                    );
+                    return Some(self.substitute_type(&payload, &bindings));
+                };
                 let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id)
                 else {
                     return None;
@@ -17573,6 +17627,28 @@ impl<'src> Analyzer<'src> {
         trait_arguments: &[TypeId],
         next_method: &str,
     ) -> Option<Type> {
+        let element = self.trait_next_payload(trait_id, next_method)?;
+        let parameter_ids = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        let substitution: SubstitutionContext = parameter_ids
+            .into_iter()
+            .zip(trait_arguments.iter().copied())
+            .collect();
+        Some(self.substitute_type(&element, &substitution))
+    }
+
+    /// The payload a trait's protocol member declares, UNSUBSTITUTED: the `T` of
+    /// `next(&mut self): Option<T>` as the trait itself wrote it. `None` when the
+    /// trait has no such member, or declares one that does not return an
+    /// `Option` — which is what makes "this bound gives no iterator" detectable
+    /// rather than silently native. Callers supply the substitution, and which
+    /// one differs: a bare `Self` receiver has only the trait's own arguments,
+    /// an inherited default on a concrete receiver needs the providing impl's
+    /// bindings underneath them (B91).
+    fn trait_next_payload(&mut self, trait_id: Id, next_method: &str) -> Option<Type> {
         let next_id = self.method_member_in_trait(trait_id, next_method)?;
         let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
             return None;
@@ -17588,17 +17664,7 @@ impl<'src> Analyzer<'src> {
         if self.enums.get(&enum_id).map(|enumeration| enumeration.name) != Some("Option") {
             return None;
         }
-        let element = arguments.first()?.get_type(self);
-        let parameter_ids = self
-            .traits
-            .get(&trait_id)
-            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-            .unwrap_or_default();
-        let substitution: SubstitutionContext = parameter_ids
-            .into_iter()
-            .zip(trait_arguments.iter().copied())
-            .collect();
-        Some(self.substitute_type(&element, &substitution))
+        Some(arguments.first()?.get_type(self))
     }
 
     /// A `for` whose subject is a generic (or a bare trait `Self`) that no
@@ -17685,6 +17751,39 @@ impl<'src> Analyzer<'src> {
                  `{returned}`, but the `for` protocol drives \
                  `{next_method}(&mut self): Option<T>` and stops at `None`. \
                  Return an `Option`, or rename the method"
+            ),
+        );
+    }
+
+    /// A `for` whose subject reaches its protocol member through TWO inherited
+    /// trait defaults (B91's ambiguous tier, B57 §3's rule one tier down). The
+    /// CALL form resolves this by naming one — `Trait::next(receiver)` — but a
+    /// loop has no spelling that selects a provider, so the steer is the fix
+    /// that works: declare the member inherently, the tier that beats both
+    /// (the B65 lesson, as B83 applied it to statics).
+    fn report_ambiguous_for_each_next(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+        trait_ids: &[Id],
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let providers: Vec<String> = trait_ids
+            .iter()
+            .map(|trait_id| format!("'{}'", self.trait_label_for(iterable_type, *trait_id)))
+            .collect();
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "`{next_method}` is ambiguous on `{rendered}`: {}{} provide it as an \
+                 inherited default, and a `for` loop has no spelling that names one. \
+                 Declare `{next_method}` on `{rendered}` itself — an inherent member \
+                 beats every trait-provided one",
+                if providers.len() == 2 { "both " } else { "" },
+                join_with(&providers, "and"),
             ),
         );
     }
@@ -21431,29 +21530,12 @@ impl<'src> Analyzer<'src> {
                                     id,
                                     GenericDispatch::OnType(Some(receiver_type_id), member_name),
                                 );
-                                // Bind the providing impl's generics from the
-                                // receiver, then the TRAIT's parameters through
-                                // the impl's written trait arguments — so the
-                                // default's signature (`observer: |T| void`)
-                                // types concretely and a closure argument's
-                                // parameter grounds (B23).
-                                let impl_subject = impl_subject_id.get_type(self);
-                                let mut bindings: SubstitutionContext = self
-                                    .reconcile_type(&impl_subject, &subject_type, &HashMap::new())
-                                    .map(|(_, bindings)| bindings.into_iter().collect())
-                                    .unwrap_or_default();
-                                let trait_parameter_ids = self
-                                    .traits
-                                    .get(&trait_id)
-                                    .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                    .unwrap_or_default();
-                                for (parameter_id, argument_id) in
-                                    trait_parameter_ids.iter().zip(trait_arguments)
-                                {
-                                    let resolved = self
-                                        .substitute_type(&argument_id.get_type(self), &bindings);
-                                    bindings.insert(*parameter_id, resolved.get_type_id(self));
-                                }
+                                let bindings = self.inherited_default_bindings(
+                                    &subject_type,
+                                    impl_subject_id,
+                                    trait_id,
+                                    &trait_arguments,
+                                );
                                 if !bindings.is_empty() {
                                     self.method_call_substitution.insert(id, bindings);
                                 }
@@ -24924,7 +25006,68 @@ impl<'src> Analyzer<'src> {
                             self.method_call_substitution
                                 .insert(for_each_id, bindings.into_iter().collect());
                         }
+                    } else if let [(next_id, impl_subject_id, trait_id, trait_arguments)] = self
+                        .inherited_default_candidates(&iterable_type, next_method)
+                        .as_slice()
+                    {
+                        let (next_id, impl_subject_id, trait_id, trait_arguments) = (
+                            *next_id,
+                            *impl_subject_id,
+                            *trait_id,
+                            trait_arguments.clone(),
+                        );
+                        // Gap E, at the loop (B91). `impl Empty with Fixed<i32> {}`
+                        // declares nothing, so the impl-declared search above finds
+                        // nothing — but the trait's DEFAULT `next` is the type's
+                        // `next` for every other purpose, `empty.next()` included,
+                        // and a protocol duck-typed on the method name cannot mean
+                        // one thing at a call and another at a loop. Re-dispatched
+                        // to this concrete type at codegen, exactly as the call is.
+                        if let Some(return_type) = self.for_each_next_non_option_return(next_id) {
+                            self.report_for_each_next_not_option(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                &return_type,
+                            );
+                            continue;
+                        }
+                        self.for_each_next.insert(for_each_id, next_id);
+                        let receiver_type_id = iterable_type.clone().get_type_id(self);
+                        self.generic_dispatch.insert(
+                            for_each_id,
+                            GenericDispatch::OnType(Some(receiver_type_id), next_method),
+                        );
+                        let bindings = self.inherited_default_bindings(
+                            &iterable_type,
+                            impl_subject_id,
+                            trait_id,
+                            &trait_arguments,
+                        );
+                        if !bindings.is_empty() {
+                            self.method_call_substitution.insert(for_each_id, bindings);
+                        }
                     } else if !self.subject_is_natively_iterable(&iterable_type) {
+                        // Two traits offering same-named DEFAULTS are as ambiguous
+                        // as two declaring the name outright (§3, one tier down),
+                        // and saying "it has no `next`" of a type that has two
+                        // sends the reader looking for the wrong edit.
+                        let ambiguous: Vec<Id> = self
+                            .inherited_default_candidates(&iterable_type, next_method)
+                            .iter()
+                            .map(|(_, _, trait_id, _)| *trait_id)
+                            .collect();
+                        if ambiguous.len() > 1 {
+                            self.report_ambiguous_for_each_next(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                &ambiguous,
+                            );
+                            continue;
+                        }
                         // No protocol member and no deliberate native lowering:
                         // the fallback `for...of` would walk the receiver's own
                         // representation. B80 — B56's check, one type-shape over.
