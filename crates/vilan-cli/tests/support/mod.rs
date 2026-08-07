@@ -26,7 +26,15 @@ use std::time::Duration;
 /// machine compete with a budget that was never measuring it.
 /// `watch_lifecycle.rs` reached this conclusion first — "how long that takes is
 /// not this test's business" — at 60 s.
-pub const WATCH_LIVENESS: Duration = Duration::from_secs(120);
+///
+/// The number is set from a measurement, not a feeling: one ordinary
+/// `vilan build` of `hmr_swap`'s own two-leg project — the identical work round
+/// 1 does — costs ~34 s wall on a 16-core box carrying a load average of ~38.
+/// 120 s was tried first and is only ~3.5× that, thin enough that a box running
+/// five overlapping suites consumed it. 300 s keeps ~9× headroom at that load
+/// and is still finite, which is the whole job. A green run never pays any of
+/// it: every wait returns the moment its condition holds.
+pub const WATCH_LIVENESS: Duration = Duration::from_secs(300);
 
 /// A budget for a watch round, expressed in units of the round this machine
 /// just paid for. `first_round` is the measured cost of round 1 — a full

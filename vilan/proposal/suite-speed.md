@@ -296,10 +296,17 @@ program. Here the claim IS about the watcher compiling, so the compile
 stays inside. Two substitutions instead:
 
 - **A liveness bound where the compile is** (`support::WATCH_LIVENESS`,
-  120 s). Nothing in the family asserts how fast a round is, so the number
+  300 s). Nothing in the family asserts how fast a round is, so the number
   only has to be too large for a healthy round and finite for a hung one.
   `watch_lifecycle.rs` had already reached this conclusion in a comment —
-  "how long that takes is not this test's business" — at 60 s.
+  "how long that takes is not this test's business" — at 60 s. The value is
+  measured, not felt: one ordinary `vilan build` of this test's own two-leg
+  project — the identical work round 1 does — costs **9.3 s** wall on an idle
+  16-core box and **34 s** on the same box at load average ~38. The old 20 s
+  was barely twice the idle cost, which is why load alone could exhaust it.
+  120 s was tried next and is ~3.5× the loaded cost, which a box running five
+  overlapping suites consumed outright (see the stress note below); 300 s is
+  ~9× loaded, ~32× idle.
 - **A calibrated budget for everything after it** (`support::round_budget`).
   Round 1's cost is now MEASURED, and every later wait is `4 ×` it (floored
   at 20 s, capped at the liveness bound). Round 1 is this machine's own
@@ -332,10 +339,26 @@ this lane did not otherwise touch), and its NEGATIVE windows
 failure mode — under load they go vacuously green rather than red, which is
 a weakened assertion, not a flake, and wants its own item.
 
-**Stress validation.** Two full `cargo nextest run --workspace` runs started
-concurrently on a 16-core box (the shape that produced the original
-failures). Both finished clean, `hmr_swap` included. Before the fix the same
-test failed at round 1 under a load average of 27 with nothing else of its
-own running; after it, it passed at 43 s wall under load average 46, which
-is the calibration doing its job — the budget grew with the machine because
-it was measured on it.
+**Stress validation.** Before the fix, the test failed at round 1 under a
+load average of 27 with no second copy of itself in sight. After it, it
+passed at 43 s wall under load average 46 — the calibrated budget growing
+with the machine because it was measured on it — and then passed **in both**
+of two full `cargo nextest run --workspace` runs started concurrently on the
+same 16-core box (49.6 s and 51.2 s wall, load average ~32), which is the
+shape that produced the original failures. That is the E32 bar, met.
+
+**What the same runs also showed, and it is not a `hmr_swap` fact.** Neither
+concurrent run finished clean, and every failure in both was a *different*
+test dying on its own fixed clock, with a message that names the shape
+outright: `owned_nursery`'s two legs at exactly 20.0 s ("vilan run did not
+exit within 20s"), four `rpc_http` legs at exactly 60.1 s ("vilan run did
+not exit within 60s"), `cancellation`'s fetch leg, and one `split` leg. All
+21 of those tests pass in isolation on the same tree, and each budget wraps
+a `vilan run` — i.e. a COMPILE — which is E32's original diagnosis
+word-for-word, in files E32 did not touch. An earlier attempt at this
+validation on a box that had drifted to five or six overlapping suites (load
+~77, ~5× the cores) showed the same list plus `streaming`, `benchmarks`, two
+more `split` legs and `nested_nurseries_join_inside_out` — and `hmr_swap`
+itself at the then-120 s bound, which is what raised it to 300 s. The
+pattern is a backlog item of its own: the E32 treatment is unfinished in
+roughly a dozen places, and it wants one pass, not per-test patches.
