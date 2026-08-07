@@ -537,3 +537,150 @@ whenever it is taken up: the fixpoint runs twice over the same constraint set
 base cache by a blanket `workspace.packages.is_empty()` test that a
 macro-world workspace can never satisfy even though every macro world in a
 process shares the same `macro_std`.
+
+## 8.1 It was not the `Hashable` bound graph: the fixpoint could not stop (E43, 2026-08-07)
+
+§8 left the cause as "`std::set` costs ~2.2 s of constraint solving … in the
+solver's handling of its `Hashable` bound graph". That guess was wrong, and
+the profile says so plainly. Nothing about `set`'s constraints is expensive.
+The solving loop simply never stopped running them.
+
+**The instrument.** The box was at load 30–38 (another agent's suite), so
+wall and CPU are both unusable and every number here is a **callgrind
+instruction count** — deterministic, and identical under any load. Debug
+binary, one `vilan check` per program in a fresh process. Ir tracks wall
+faithfully on the quiet baseline: `set` measured 9.36x `map` in Ir against
+the 9.5x §8 measured in milliseconds.
+
+**Where the 2.2 s went.** `import std::set` costs 23.4e9 Ir against
+`import std::map`'s 2.49e9 at the same 111 lines. The differential, by
+inclusive cost, is not spread around — it is two constraint kinds:
+
+| inclusive Ir                | set    | map    | ratio  |
+|-----------------------------|--------|--------|--------|
+| `resolve_for_each_item`     | 8.11e9 | 2.4e6  | 3431x  |
+| `resolve_method_arg_check`  | 8.22e9 | 8.9e6  |  922x  |
+| `resolve_constraints`       | 16.6e9 | 67.7e6 |  245x  |
+| `infer_type_path`           | 10.3e9 | 108e6  |   95x  |
+
+Those two kinds are 70% of the whole analysis. But their *per-call* cost is
+ordinary — what differs is how often they run. `resolve_for_each_item` is
+called **115,433 times for `set` and 24 times for `map`**, over five `for…in`
+loops against `map`'s four. The solver was re-running a handful of
+constraints tens of thousands of times.
+
+**Why.** Instrumenting the fixpoint's own loop gave the mechanism directly:
+
+```
+set  base : iterations=14022  max=14022  backstops=14012  deferred_left=10
+set  build: iterations=14842  max=14842  backstops=14840  deferred_left=10
+map  base : iterations=17     max=14044  backstops=5      deferred_left=0
+```
+
+`std::set` leaves **ten constraints permanently deferred** — legitimately
+unresolvable, and `finalize_build` commits them to defaults. The loop is
+supposed to notice it has settled. Instead it ran to `max_iterations`
+(`2 * entity count + 16`), every pass re-running those ten through full
+recursive `infer_type`. That is the entire cliff. `map` leaves nothing
+deferred, so it never entered the spin — which is the whole of why the two
+files differed. `[derive(Debug)]` showed the same shape twice, once per
+macro world (16,286 and 17,730 passes).
+
+The quiescence test could never pass. Its third progress signal (S3b) counted
+every write into `type_id_to_type_map`, and `type_id_for_type` mints a fresh
+id — and writes it — on **every attempt, unconditionally**. The signal was
+therefore lit on every pass, forever.
+
+**The fix** splits the signal into the two shapes it was conflating.
+*Refining* a slot in place (an `Unknown` closure parameter becoming concrete
+while the attempt that filled it defers) is progress on its face — every
+holder of that slot sees the new type — and it is monotone and finite, so it
+buys unlimited further passes. `write_type_slot` now owns that definition and
+counts exactly these: not a fresh mint (a new id has no readers), not an
+idempotent rewrite (it tells readers what they already knew). *Minting* slots
+a later attempt consumes is also real — it is the two-phase chained-`map`
+stall, where the pass that instantiates `map`'s signature resolves nothing
+and the pass after it succeeds on what that left behind — but every attempt
+mints, so it can never be counted directly. Hence the asymmetry: a fruitless
+backstop buys exactly **one** more pass. If the second also resolves, wakes
+and refines nothing, it consumed none of the first's mints and left a
+structurally identical batch of its own; the state is stationary and every
+later pass would repeat it. `max_iterations` goes back to being only the
+safety net against a non-converging bug, which is all it was meant to be.
+
+Both sides of that one-pass grace are pinned, each planted red: restoring the
+mint turns `the_constraint_fixpoint_stops_when_it_settles` red (`set` interns
+122,561 types against `map`'s 7,270), and dropping the grace to zero turns
+`mapped_maps_thread_the_element_type` and
+`a_slot_grounded_list_maps_a_field_closure` red — the two chained-`map` cases
+S3b was written for. Five unit tests pin `write_type_slot`'s rule directly.
+
+**Before / after, in Ir:**
+
+| program                        | before   | after   | ratio |
+|--------------------------------|----------|---------|-------|
+| `import std::set`              | 23.40e9  | 2.50e9  | 9.4x  |
+| a `[derive(Debug)]` program    | 29.94e9  | 4.84e9  | 6.2x  |
+| `import std::map` (the control)| 2.49e9   | 2.49e9  | 1.00x |
+
+`set` now costs what `map` costs — 2.496e9 against 2.492e9, a 0.2% gap. The
+cliff is not reduced, it is gone: there is no longer anything anomalous about
+`std::set`. The `[derive(Debug)]` headline is the user-facing one, and it is
+the same fix seen through two macro worlds. The inference test binary itself
+runs 188 s → 110 s.
+
+**§8's table, re-measured.** In CPU ms, the two binaries INTERLEAVED rep by
+rep with the minimum of five taken — the box was at load 22–38 throughout, so
+the absolute figures sit well above §8's quiet-box wall times and only the
+ratios are meaningful. Every row §8 called a cliff collapses; every row it
+called ordinary is untouched, which is the shape the diagnosis predicts.
+
+| module        | before CPU ms | after CPU ms | ratio | macro worlds |
+|---------------|---------------|--------------|-------|--------------|
+| `ui` (node)   |       14742.1 |       1749.4 | 8.43x |            3 |
+| `rpc_server`  |       16994.5 |       2523.0 | 6.74x |            3 |
+| `rpc`         |       15461.5 |       2229.5 | 6.94x |            3 |
+| `reactive`    |       15312.1 |       1904.3 | 8.04x |            3 |
+| `time`        |       10283.3 |       1412.4 | 7.28x |            2 |
+| `arena`       |        5439.3 |        915.3 | 5.94x |            1 |
+| `set`         |        4009.8 |        415.0 | 9.66x |            0 |
+| `crypto`      |         397.7 |        402.9 | 0.99x |            0 |
+| `db`          |         441.8 |        440.3 | 1.00x |            0 |
+| `map`         |         430.9 |        422.2 | 1.02x |            0 |
+| `io`          |         387.1 |        392.1 | 0.99x |            0 |
+
+The macro-world column no longer predicts anything: a world now costs what
+any other analysis costs. The four modules with no worlds and no `std::set`
+move by less than 2%, which is this instrument's noise floor — the fix is
+free where there was no spin to remove.
+
+No behavior change: the same ten constraints stay deferred and reach the same
+defaults; inference (1866), corpus, docs and diagnostic_determinism are green
+and byte-identical.
+
+### The fixpoint-twice question: measured, and there is nothing to ship
+
+§8 filed "the fixpoint runs twice over the same constraint set
+(`resolve_world()` then `build()`)" as a structural fact to take up. It was
+an artifact of the spin. The two runs' costs, in Ir:
+
+| leg                                   | before   | after   |
+|---------------------------------------|----------|---------|
+| `analyze_over_world` (the base leg)   | 12.11e9  | 612e6   |
+| `build`                               | 10.00e9  | 69.6e6  |
+| — of which `finalize_build`           | 64.1e6   | 64.1e6  |
+| — leaving `build`'s own fixpoint      | ~9.94e9  | **5.5e6** |
+
+Before, the two legs cost the same because *both* ran to `max_iterations`.
+After, the second fixpoint costs **5.5 million Ir against the first's 612
+million** — 0.9% of the first leg and 0.2% of the analysis. The two runs'
+inputs genuinely do differ (the second sees the entry's constraints, which is
+the point of the S3 split), and resolution is monotone, so the second run
+finds the work already done and settles in ~5 passes. Sharing them would save
+0.2%, at the cost of the split that S3 exists for. **Verdict: nothing to
+ship, and nothing left open.** The remaining §8 residue — macro worlds
+excluded from the base cache by `workspace.packages.is_empty()` — is
+untouched and still stands on its own.
+
+The `macro_std` re-export of `std::set` stays, per the owner's ruling. It no
+longer costs anything worth naming.
