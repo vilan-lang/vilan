@@ -444,3 +444,96 @@ window (the `vilan build`-then-`node` shape), and every one of them survived
 both concurrent suites. They are worth converting if CI ever flags one, and
 worth nothing before that. E41's vacuously-green negative windows in
 `hmr.rs` are untouched.
+
+## 8. The import-cost cliff is one mechanism: `std::set`, reached through every macro world (E43, 2026-08-07)
+
+E43 filed two data points — `std::set` and `std::time` each ~6 s to import
+where `std::print`/`std::http`/`std::fetch`/`std::task` cost ~0.25 s — and
+guessed they were one mechanism. They are. This is the measurement-first
+pass that found it, and the fix it points at is not contained, so the
+diagnosis is recorded here rather than attempted.
+
+**The instrument.** One `vilan check` per std module on a three-line program
+importing exactly that module, each in a FRESH PROCESS — the base cache
+(S3c) is process-global, so a new process is a cold cache, the out-of-process
+equivalent of the `base_cache_clear()` the B77 pins use. `VILAN_PHASE_TIMING=1`
+splits each analysis into `load+walk` / `base` (the pre-entry
+`resolve_world()`) / `build` / `checks`. Best of two reps, debug binary,
+quiet box. The instrument was re-verified working (E35 had fixed it
+panicking warm analyses): every run produced a program and `no errors`.
+
+One further column is doing the real work: **macro worlds**. A macro world is
+a nested `analyze_source`, and its phase line is suppressed — but its
+`post-passes` line is not, so counting those lines counts the nested
+analyses. The CLI calls `analyze` directly, so on this path every
+`post-passes` line is one macro world.
+
+| module (44 measured)  | cold ms | load+walk | base   | build  | checks | macro worlds |
+|-----------------------|---------|-----------|--------|--------|--------|--------------|
+| `ui` (node layer)     |    9830 |    9421.9 |  169.4 |   10.2 |  151.0 |            3 |
+| `rpc_server`          |    9795 |    9249.0 |  240.6 |    9.4 |  155.5 |            3 |
+| `rpc`                 |    9707 |    9224.3 |  200.3 |    7.9 |  169.5 |            3 |
+| `router` (browser)    |    9699 |    9287.9 |  180.3 |    9.0 |  138.3 |            3 |
+| `reactive`            |    9471 |    9193.2 |  113.4 |    5.4 |   98.9 |            3 |
+| `ui` (browser layer)  |    9406 |    9021.8 |  164.9 |    8.8 |  131.6 |            3 |
+| `time`                |    6467 |    6231.4 |   95.9 |    4.6 |   84.8 |            2 |
+| `arena`               |    3473 |    3303.3 |   83.5 |    4.1 |   52.3 |            1 |
+| `set`                 |    2494 |      92.5 | 1095.8 | 1063.3 |  212.8 |            0 |
+| `crypto`              |     522 |     171.6 |  201.3 |    7.1 |   92.6 |            0 |
+| `dev` (browser)       |     424 |     119.0 |  144.2 |   10.8 |   99.7 |            0 |
+| `db`                  |     391 |     103.8 |  121.2 |    6.7 |  120.9 |            0 |
+| the other 32 modules  | 233–326 |      ~90  |   ~85  |    ~4  |   ~55  |            0 |
+
+The macro-world column predicts the cliff exactly: ~3.1 s each, and nothing
+else in the table moves. `time` is not a heavy module — it reaches two
+macro-defining files. Worlds are cached per macro-DEFINING FILE, which is
+why the count is not the number of `[derive(..)]`/`[extern(..)]` sites
+(`rpc` has 18 sites and 3 worlds).
+
+**Two shapes, one hot ingredient.** Un-suppressing the nested phase line
+shows a macro world spends its time where `std::set` does — not in loading
+or walking, but in constraint solving, and it pays the fixpoint twice, once
+in `resolve_world()` and again in the post-entry `build()`:
+
+| analysis                       | load+walk | base   | build  | checks |
+|--------------------------------|-----------|--------|--------|--------|
+| the macro world of `[derive(Debug)]` |    64.4 | 3193.5 | 2922.0 |  503.7 |
+| `reactive`'s three worlds      | 25–51     | 1269–2086 | 1383–1497 | 235–263 |
+| `import std::set` (no macros)  |      92.5 | 1095.8 | 1063.3 |  212.8 |
+
+The reason both shapes are the same shape: **`macro_std/src/lib.vl` does
+`export import std::set;`**. Every macro world's workspace is `[macro_std]`,
+so every macro world analyzes `std::set` — and macro worlds can never reuse
+the base cache, because `base_cacheable` requires `workspace.packages`
+to be empty. Each one pays `std::set` from scratch.
+
+**Proven by ablation**, on CPU seconds rather than wall (the box was loaded;
+CPU time is the load-robust metric — three reps, tight):
+
+| macro_std variant, compiling one `[derive(Debug)]` | CPU s        |
+|----------------------------------------------------|--------------|
+| stock                                               | 5.18 / 5.26 / 5.19 |
+| without `export import std::set`                    | 0.93 / 0.93 / 0.78 |
+| without `std::set` AND `std::map`                   | 0.85 / 0.78 / 0.80 |
+
+`std::set` alone is the whole cliff; `std::map` is innocent (it imports for
+262 ms on its own, against `set`'s 2494 ms, at the same 111 lines).
+
+**This is not only a suite cost.** The same measurement says a plain user
+program whose only unusual feature is `[derive(Debug)]` pays ~3.4 s wall /
+5.2 s CPU to compile, and a second derive resolving to a second defining
+file pays ~6.3 s. That is a compiler-UX defect, not a test-harness one.
+
+**Why nothing is fixed here.** The contained-looking fix — dropping
+`std::set` from `macro_std`'s re-exports — treats a consumer, not the cause,
+and changes a published surface macro authors may bind. The cause is that
+`std::set` costs ~2.2 s of constraint solving where every other std module
+costs ~0.09 s, and that lives in the solver's handling of its `Hashable`
+bound graph, not in any one line of `set.vl`. It was NOT the `impl List<type
+T: Hashable>` tail (removing it changes nothing measurable), so localizing it
+wants a profiler run on a quiet box. Two structural facts belong with it
+whenever it is taken up: the fixpoint runs twice over the same constraint set
+(`resolve_world()` then `build()`), and macro worlds are excluded from the
+base cache by a blanket `workspace.packages.is_empty()` test that a
+macro-world workspace can never satisfy even though every macro world in a
+process shares the same `macro_std`.

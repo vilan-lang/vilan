@@ -24,8 +24,19 @@
 //! a contended box, and that is what failed `hmr_swap` under a loaded suite
 //! (E39). Nothing in this file asserts how fast a round is, so the bound only
 //! has to be finite. The per-test margins (`sleep(500/800 ms)`) and the
-//! negative windows (`assert_no`, `!buffer_has`) are a separate shape, recorded
-//! rather than changed here: see `proposal/suite-speed.md` §6.
+//! negative windows were the separate shape §6 recorded and left standing;
+//! E41 is that pass. Every negative assertion here is now anchored BETWEEN two
+//! positive events — `assert_none_before` closes a quiet SSE window on an event
+//! the next round is guaranteed to push, and the `PROBE_RAN` checks are instant
+//! scans placed after a strictly later round's evidence. A fixed window has the
+//! wrong sense for a negative: it passes as soon as it stops reading, so a slow
+//! box makes it prove *less*, and the quiet windows went vacuously green exactly
+//! under the contention that made a spurious push likeliest. Event-anchored, a
+//! slow box only lengthens the window, which can add evidence but never remove
+//! it. The `sleep(500/800 ms)` margins are gone for the same reason E39 removed
+//! its own: they paid for the baseline-snapshot race E20 fixed at its root
+//! (the watcher snapshots BEFORE the first action, so an edit landing during
+//! the initial build triggers a round rather than being swallowed).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -154,23 +165,56 @@ impl SseClient {
         panic!("did not observe a `{expected}` event within the deadline");
     }
 
-    /// Asserts that none of the `forbidden` event kinds arrive within `window`.
-    /// Other kinds (the connect-time `connected`) are ignored — this is the
-    /// server-only round's "the browser is told nothing" assertion. The push (if
-    /// any) is issued in the same watch round that restarts the Node child, so a
-    /// short window after the restart evidence is enough: a spurious event would
-    /// already be buffered on the socket.
-    fn assert_no(&mut self, forbidden: &[&str], window: Duration) {
+    /// Asserts that none of the `forbidden` kinds arrive before `closing` — an
+    /// event the NEXT round is guaranteed to push. Other kinds (the connect-time
+    /// `connected`) are ignored; this is the server-only round's "the browser is
+    /// told nothing" assertion.
+    ///
+    /// The window is anchored at BOTH ends by events: it opens at whatever
+    /// positive event the caller just observed (the restarted child's boot
+    /// marker) and closes at `closing`. SSE is an ordered stream, so anything
+    /// the quiet round pushed must arrive *before* `closing` — a slow box only
+    /// lengthens the window, which can add evidence but never remove it.
+    ///
+    /// That is the E41 fix. The fixed-duration `assert_no(2000ms)` this replaces
+    /// had the opposite sense: it passed as soon as a read timed out, so the
+    /// slower the box, the less of the stream it actually read, and the window
+    /// went *vacuously* green exactly when contention made it most likely to
+    /// matter. `closing` never arriving is now a failure, not a pass.
+    fn assert_none_before(&mut self, forbidden: &[&str], closing: &str, deadline: Duration) {
         let start = Instant::now();
-        while start.elapsed() < window {
-            match self.next_kind(window - start.elapsed()) {
+        while start.elapsed() < deadline {
+            match self.next_kind(deadline - start.elapsed()) {
+                Some(kind) if kind == closing => return,
                 Some(kind) => assert!(
                     !forbidden.contains(&kind.as_str()),
-                    "a `{kind}` event was pushed during the quiet window \
-                     (a server-only round must be silent)"
+                    "a `{kind}` event was pushed before the closing `{closing}` \
+                     (the preceding round must be silent)"
                 ),
                 None => break,
             }
+        }
+        panic!(
+            "the closing `{closing}` event never arrived — the quiet window never \
+             closed, so nothing was proven about it"
+        );
+    }
+
+    /// Asserts nothing more is waiting on the stream.
+    ///
+    /// Call this only AFTER a positive event has proven the latest round's push
+    /// was issued and flushed (its restarted child printed, or its bundle is
+    /// being served — both strictly follow the push). At that point a pending
+    /// event is a SECOND push, which is the one case
+    /// [`SseClient::assert_none_before`] cannot see on its own: when the quiet
+    /// round and the closing round would push the same `kind`, the closing read
+    /// consumes the spurious one and the real one is left here.
+    fn assert_nothing_pending(&mut self, forbidden: &[&str]) {
+        while let Some(kind) = self.next_kind(Duration::from_millis(250)) {
+            assert!(
+                !forbidden.contains(&kind.as_str()),
+                "a second `{kind}` event was pushed — the quiet round was not silent"
+            );
         }
     }
 }
@@ -312,14 +356,13 @@ fn the_dev_channel_drives_the_watch_round() {
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
-        // Round 1 has run once `dist/client.css` lands; a margin ensures the
-        // watcher's baseline snapshot is taken before the first edit (so the
-        // edit is seen as a change).
+        // Round 1 has run once `dist/client.css` lands. The margin that used to
+        // follow paid for the baseline-snapshot race E20 fixed at its root (the
+        // watcher snapshots before the first action), so it is gone.
         assert!(
             wait_for_file(&dir.join("dist/client.css"), deadline),
             "round 1 should have written dist/client.css"
         );
-        std::thread::sleep(Duration::from_millis(500));
 
         let mut sse = SseClient::connect(port);
 
@@ -450,8 +493,9 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
         // Round 1 is done once dist lands and the server has printed its boot
-        // marker; a margin then ensures the watcher's baseline snapshot is taken
-        // before the first edit (so the edit registers as a change).
+        // marker. No margin follows: the watcher snapshots its baseline BEFORE
+        // the first action (E20), so an edit landing at any point simply
+        // triggers a round — the sleep here was a vestige of that race.
         assert!(
             wait_for_file(&dir.join("dist/client.js"), deadline),
             "round 1 should have written dist/client.js"
@@ -460,7 +504,6 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
             wait_for_line(&lines, "SRVMARK_ONE", deadline),
             "the server leg should have booted in round 1"
         );
-        std::thread::sleep(Duration::from_millis(800));
 
         let mut sse = SseClient::connect(port);
 
@@ -475,17 +518,24 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
             wait_for_line(&lines, "SRVMARK_TWO", deadline),
             "a server-only edit should restart the Node child"
         );
-        sse.assert_no(&["swap", "css"], Duration::from_millis(2000));
 
         // Row 2 — shared edit: a change to `common.vl`, which both legs embed.
         // The server restarts (the banner it prints changes) AND a `swap` reaches
         // the browser (its bundle changed too, so the byte-diff classifies both).
+        // Its `swap` doubles as the closing anchor for row 1's quiet window: the
+        // marker above opened the window, this event closes it, and SSE ordering
+        // puts any push from the server-only round strictly between them.
         write(&dir, "src/common.vl", &common_source("BANNER_TWO"));
-        sse.expect_kind("swap", deadline);
+        sse.assert_none_before(&["swap", "css"], "swap", deadline);
         assert!(
             wait_for_line(&lines, "banner=BANNER_TWO", deadline),
             "a shared edit should restart the Node child with the new shared code"
         );
+        // The shared round's child has booted, so that round's push was issued
+        // and flushed well before: anything still pending is a SECOND push —
+        // the only way the server-only round could have spoken without being
+        // caught above, since both rounds push the same `swap` kind.
+        sse.assert_nothing_pending(&["swap", "css"]);
     }));
 
     support::kill_watcher(&mut watcher);
@@ -532,8 +582,9 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
-        // Round 1 compiles both legs and boots the server; a margin then ensures
-        // the watcher's baseline snapshot precedes the edit.
+        // Round 1 compiles both legs and boots the server. No margin follows:
+        // the watcher's baseline snapshot precedes its first action (E20), so
+        // an edit can no longer be swallowed by the initial build.
         assert!(
             wait_for_file(&dir.join("dist/client.js"), deadline),
             "round 1 should have written dist/client.js"
@@ -542,7 +593,6 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
             wait_for_line(&lines, "server-booted", deadline),
             "the server leg should have booted in round 1"
         );
-        std::thread::sleep(Duration::from_millis(800));
 
         let mut sse = SseClient::connect(port);
         let bundle_before =
@@ -788,17 +838,21 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
             dir.join("dist/probe.js").exists(),
             "the non-selected probe leg still compiles into the workspace"
         );
-        assert!(
-            !buffer_has(&buffer, "PROBE_RAN", Duration::from_millis(700)),
-            "the non-selected probe leg must not be launched"
-        );
-        std::thread::sleep(Duration::from_millis(800));
 
         let mut sse = SseClient::connect(port);
 
         // A client edit → the browser swaps under the selected-entry watcher.
         write(&dir, "src/client.vl", &client_source("c2", "x1"));
         sse.expect_kind("swap", deadline);
+        // Round 2's swap is the anchor for round 1's negative: a probe launched
+        // in round 1 would have printed a whole compile ago. So this is an
+        // INSTANT scan of everything captured so far, and a slow box only gives
+        // a wrongly-launched probe more time to show up — where the fixed
+        // 700 ms window it replaces proved less the slower the box got (E41).
+        assert!(
+            !buffer_has(&buffer, "PROBE_RAN", Duration::ZERO),
+            "the non-selected probe leg must not be launched"
+        );
 
         // A server edit → the chosen Node child restarts (its new marker prints);
         // nothing is pushed to the browser and the probe still never runs.
@@ -807,9 +861,19 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
             buffer_has(&buffer, "SERVER_UP two", deadline),
             "a server edit should restart the `--entry` leg"
         );
-        sse.assert_no(&["swap", "css"], Duration::from_millis(1500));
+
+        // Nothing follows the server round in this test, so a deliberately
+        // broken client supplies the closing anchor its quiet window needs.
+        // `error` is the right sentinel precisely because it is NEITHER
+        // forbidden kind: the round is guaranteed to push it, and SSE ordering
+        // then puts any `swap`/`css` from the server-only round strictly before
+        // it — with no ambiguity between the two rounds, which is what a `swap`
+        // closing anchor would have had here (the matrix test can afford one
+        // because a following stdout marker lets it check for a second push).
+        write(&dir, "src/client.vl", "fun main( {\n");
+        sse.assert_none_before(&["swap", "css"], "error", deadline);
         assert!(
-            !buffer_has(&buffer, "PROBE_RAN", Duration::from_millis(200)),
+            !buffer_has(&buffer, "PROBE_RAN", Duration::ZERO),
             "the probe leg still never runs"
         );
     }));
@@ -917,10 +981,10 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
             wait_for_file(&dir.join("dist/client.js"), deadline),
             "round 1 should have written dist/client.js"
         );
-        std::thread::sleep(Duration::from_millis(500));
 
         let mut sse = SseClient::connect(port);
         // Break the MODULE, on its own second line, leaving the entry intact.
+        // (The margin that stood here paid for E20's baseline-snapshot race.)
         write(
             &dir,
             "src/common.vl",
