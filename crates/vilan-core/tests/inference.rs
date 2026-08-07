@@ -2413,10 +2413,6 @@ fn a_closure_mut_parameter_works_unannotated() {
 }
 
 #[test]
-#[ignore = "pre-existing closure-deferral gap: a binding initialized from a \
-closure parameter typed via a plain function's declared closure type stays \
-unknown — the hand-written `mut x = v;` form fails identically (H9's desugar \
-reproduces it faithfully); un-ignore when the deferral wakes such bindings"]
 fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
     assert_compiles_and_runs(
         r#"
@@ -32981,7 +32977,6 @@ fn r11_indirect_generic_chain_is_rejected() {
 // internal moves escape. Un-ignore when the scan recurses through closure
 // nesting.
 #[test]
-#[ignore]
 fn r11_nested_closure_internal_double_move_is_rejected() {
     assert_fails_with(
         r#"
