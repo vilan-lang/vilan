@@ -158,10 +158,42 @@ fun main() {
 }
 ```
 
-A capture of a **resource** payload is the one case that takes no copy (R1, §6.8):
-it is a loan of the payload, so it names the value the match found rather than a
-second owner of it — the timing above is what makes "the value the match found"
-well defined.
+The rule is about the **storage the subject names**, not about how the subject
+is spelled, so it holds for all three spellings that name storage someone else
+owns: a place (`h.pair`), a dereference (`*view`), and a **`borrows` call**
+(`h.slot()`, which projects the receiver's storage rather than producing any of
+its own). The last one asks its questions of the arguments the call projects —
+the receiver is right there at the call site — so a write reaching the receiver
+reaches the capture's subject by the same reasoning:
+
+```vilan
+import std::print;
+
+struct Holder { cells: (List<i32>, i32) }
+
+impl Holder {
+	fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+}
+
+fun main() {
+	mut h = Holder { cells = ([1, 2], 3) };
+	if h.slot() is (let xs, let n) {
+		h.cells.0.push(9);
+		print(xs.len());   // 2 — the capture copied what the match found
+	}
+}
+```
+
+A call returning an **owned** value is not in this family: its result is
+storage of its own, with no second owner, so its captures bind without copying.
+
+Two payload shapes are the exceptions to "a capture copies". A capture of a
+**resource** payload takes no copy (R1, §6.8): it is a loan of the payload, so
+it names the value the match found rather than a second owner of it — the
+timing above is what makes "the value the match found" well defined. A capture
+that is itself a **view** (`Some(let v)` over an `Option<&mut T>`) takes none
+either, for the reason a view exists: it aliases on purpose, and copying it
+would mean writes through it stopped reaching the value it borrows.
 
 ## 6.2 Rule 2 — elision is an optimization, never observable
 

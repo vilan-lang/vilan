@@ -8,6 +8,16 @@ tracks the latest state.
 
 ## Unreleased
 
+**A pattern over a `borrows` call copies and reads like every other pattern.** `if h.slot() is (let xs, let n)` — where `slot` hands back `&mut self.cells` — bound `xs` to the receiver's own list rather than a copy of it, and re-read `n` out of the receiver's storage at every mention. Pushing to `h.cells.0` inside the leg grew `xs`; writing `h.cells.1` changed `n` under it. Neither of the two rules that govern a pattern capture fired, because the subject collected no candidates at all: the pass admitted a place and a `*view` and nothing else, and this subject is a *call*.
+
+It is the same hole one spelling over. A call that returns a view produces no storage of its own — it names the receiver's, exactly as `h.cells` does — so its captures bind pieces of something with another owner, which is the whole of the question. The pass asks that question of the arguments the call projects now, which is where the receiver is visible; a call returning an *owned* value stays outside the rule, because its result has no second owner and its captures were always right to bind it directly.
+
+The measurement is what fixed the shape of the rule. Admitting `borrows` calls newly reaches `Option<&mut T>` returns, whose `Some(let v)` capture *is* a view — and because references are transparent in the type system, `&mut Inner` looks like an ordinary aggregate to every test in the pass, so the copy rule fired on it and `v.n = 77` started writing a copy. A view aliases on purpose; it never copies. With that clause the corpus does not move at all, and without it two goldens do, one of them wrongly.
+
+The rule reaches the `&` direction too, which is why it is not simply "does this call return `&mut`". A readonly projection cannot be written *through*, but the receiver it projects can be written under its own name while the leg is live, and the capture aliases the receiver's storage either way. Chained projections work for the mirror reason — `o.inner_mut().peek()` is readonly, but what it was projected from is not, so the storage it names is writable after all.
+
+---
+
 **Writing a resource through a `&mut` view destroys what it replaces.** `fun clear(&mut self) { self = Holder::Empty }` on a `Holder::Full(Guard)` used to destroy nothing at all. The guard was still there, in a slot nothing could reach any more, and its destructor never ran — no diagnostic, no output, a silent leak.
 
 Assigning onto an owned binding has always done the right thing: `holder = Holder::Empty` drops the guard it displaces, which is the language's overwrite rule. The rule was written about a binding that *owns* a resource, and the machinery implemented it literally — it tracks the bindings a body owns, a loan owns nothing, so a write through `&mut self` matched nothing and planned nothing. The scope-end teardown then read the *new* tag and correctly found nothing to destroy.

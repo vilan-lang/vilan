@@ -4539,17 +4539,23 @@ fn a_whole_assignment_to_the_subject_still_leaves_its_captures_aliasing() {
     assert_compiles_and_runs(source, "3\n");
 }
 
+// ---------------------------------------------------------------------------
+// B97 (the THIRD subject spelling: a `borrows` CALL). A method returning a
+// `&mut` projection hands the pattern a subject that aliases the receiver's
+// storage, but the expression is a CALL — and `is_capture_subject_place`
+// admitted places and `*view` only, so the subject collected no candidates at
+// all and BOTH rules were missing at once: B53's copy and B81/B88's
+// materialization. Measured before shipping (proposal/capture-clones.md §9),
+// and the doctrine per payload shape is twinned below onto this path.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "B88 bycatch: a `borrows` call subject collects no capture candidates at all"]
 fn a_borrows_call_subject_reads_the_prematch_value() {
-    // Found while scoping B88, verified, filed rather than fixed. A method
-    // returning a `&mut` projection hands the pattern a subject that aliases
-    // the receiver's storage — but the expression is a CALL, and
-    // `is_capture_subject_place` admits places and `*view` only, so this
-    // subject collects no candidates and neither B53's copy nor B81/B88's
-    // materialization ever fires. `const $a = slot(h); … $a[1]` — the same
-    // shape §6.4 found for `*view`, one spelling over. Prints 99.
-    // See proposal/capture-clones.md §7.7.
+    // The VALUE half of the doctrine (§7.5): a scalar owes no copy, so the
+    // declaration alone fixes the timing. Before B97 this subject collected no
+    // candidates whatever — `const $a = slot(h); … $a[1]` — so the capture
+    // re-read the mutated slot and printed 99, the same shape §6.4 found for
+    // `*view`, one spelling over.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -4570,12 +4576,11 @@ fn a_borrows_call_subject_reads_the_prematch_value() {
 }
 
 #[test]
-#[ignore = "B88 bycatch: a `borrows` call subject collects no capture candidates at all"]
 fn a_borrows_call_subject_copies_its_captures() {
-    // The worse half of the same hole, and the one that is B53's ORIGINAL bug
-    // rather than a timing one: the aggregate capture aliases the receiver's
-    // element outright (no `__clone` anywhere in the output), so growing the
-    // source through the receiver grows the capture. Prints 3.
+    // The AGGREGATE half (§7.5), and the worse of the two because it is B53's
+    // ORIGINAL bug rather than a timing one: the capture aliased the
+    // receiver's element outright (no `__clone` anywhere in the output), so
+    // growing the source through the receiver grew the capture. Printed 3.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -4592,6 +4597,346 @@ fn a_borrows_call_subject_copies_its_captures() {
         }
         "#,
         "2\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload() {
+    // The RESOURCE half of the doctrine (§7.5), twinned onto the third path.
+    // R1 forbids the copy and B65 forbids inventing one ("there is no
+    // user-facing copy spelling in vilan to name", affine-moves.md §9.1), so
+    // the capture is materialized BARE — `const c = $a[0]`, no `__clone` — which
+    // fixes WHICH value is loaned without minting a second owner to destroy
+    // twice. Both halves asserted: the value (1, not 6) and the absent copy.
+    let source = r#"
+        import std::print;
+        resource struct Conn { id: i32 }
+        struct Holder { slot: (Conn, i32) }
+        impl Holder {
+            fun view(&mut self): &mut (Conn, i32) borrows self { &mut self.slot }
+        }
+        fun main() {
+            mut holder = Holder { slot = (Conn { id = 1 }, 0) };
+            if holder.view() is (let c, let at) {
+                holder.slot.1 = 5;
+                print(c.id + at);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the resource capture was materialized WITH a copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n");
+}
+
+#[test]
+fn both_capture_shapes_survive_a_write_through_a_borrows_call_subject() {
+    // The two-shape twin of `both_capture_shapes_survive_a_component_write_to_
+    // the_place` and its viewed sibling — what makes "the three paths are
+    // indistinguishable per shape" a checked claim rather than a story. Same
+    // two payload shapes, same two writes, a `borrows`-call subject instead of
+    // a place or a `&mut` parameter, same answers. Red on either axis: 12
+    // without the materialization, 4 without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (List<str>, i32) }
+        impl Holder {
+            fun view(&mut self): &mut (List<str>, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut holder = Holder { pair = (["a", "b", "c"], 0) };
+            if holder.view() is (let items, let at) {
+                holder.pair.0.push("d");
+                holder.pair.1 = 9;
+                print(items.len() + at);
+            }
+            print(holder.pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_readonly_borrows_call_subject_materializes_when_a_write_reaches_the_receiver() {
+    // Why the rule is not simply `returns_mut_view`, measured (§9): a `&`
+    // projection cannot be written THROUGH, but the receiver it projects can
+    // still be written under its own name while the leg is live, and the temp
+    // aliases the receiver's storage either way. B81's writable-view arm does
+    // not cover this, so the second arm asks B88's root question — of the
+    // arguments the callee projects, which is where the receiver is visible.
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if h.peek() is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_free_function_borrows_call_subject_reads_the_prematch_value() {
+    // The receiver is not special — `borrows` names a parameter POSITION, and
+    // the projection is read at the call site from whatever argument sits
+    // there. A rule keyed on "the subject is a method call on a place" would
+    // miss this. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun slot(h: &mut Holder): &mut (i32, i32) borrows h { &mut h.pair }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if slot(&mut h) is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_over_a_borrows_call_subject_reads_the_prematch_value() {
+    // B59's placement question on the third path: a guard that reads a
+    // materialized capture takes the prelude shape, and the leg still sees the
+    // pre-write value. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            print(match h.slot() {
+                (let a, let b) if b > 0 => {
+                    h.pair.1 = 99;
+                    b
+                }
+                _ => 0,
+            });
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_over_a_borrows_call_subject_copies_its_aggregate_capture() {
+    // The unguarded leg never had the TIMING bug — `compile_pattern` declares
+    // every capture as a real `const` at leg entry — but it had the COPY one,
+    // because the copy question is settled by the candidate set both paths
+    // share. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            match g.slot() {
+                (let xs, let n) => {
+                    g.cells.0.push(9);
+                    print(xs.len());
+                }
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_let_destructure_of_a_borrows_call_copies_its_aggregate_capture() {
+    // §6.4's other half at this spelling: the capture pass gates
+    // `Expr::Destructure` on the same predicate, so `let (xs, n) = h.slot()`
+    // never copied either and growing the element through the receiver grew
+    // the capture. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            let (xs, n) = g.slot();
+            g.cells.0.push(9);
+            print(xs.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_chained_borrows_projection_subject_reads_the_prematch_value() {
+    // Why the writable-view arm is kept alongside the root question, measured
+    // rather than argued (§9). A CHAINED projection's receiver is another
+    // call, and a call has no place root — so the root arm finds nothing to
+    // ask about and the subject would keep its accessor. B81's arm needs no
+    // write to be found: a `&mut` projection is a writable view by
+    // construction, whatever it was projected from. Printed 99 without it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Outer { inner: Inner }
+        impl Outer {
+            fun inner_mut(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Inner {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut o = Outer { inner = Inner { pair = (7, 3) } };
+            if o.inner_mut().slot() is (let a, let b) {
+                o.inner.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_readonly_projection_of_a_writable_one_reads_the_prematch_value() {
+    // The same arm read ONE LEVEL UP, and the shape that shows the two halves
+    // are not the same question. `peek()` returns `&`, so the outer call is
+    // not itself a writable view; its receiver is `inner_mut()`, which is —
+    // and the storage the temp aliases is therefore writable after all. The
+    // root arm cannot reach it (the receiver is a call, so it has no root),
+    // and the outer call's own convention says the wrong thing. Printed 99
+    // without the recursion into the projected receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Outer { inner: Inner }
+        impl Outer {
+            fun inner_mut(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Inner {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut o = Outer { inner = Inner { pair = (7, 3) } };
+            if o.inner_mut().peek() is (let a, let b) {
+                o.inner.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_wrapped_view_capture_over_a_borrows_call_is_not_copied() {
+    // The line the widening had to stop at, and the one the measurement found
+    // (§9): admitting `borrows` calls newly reaches `Option<&mut T>` returns,
+    // whose `Some(let v)` capture IS a view. References are transparent, so
+    // `&mut List<i32>` is an aggregate by every type test in the pass and the
+    // first candidate copied it — which deep-copies the borrowed storage, so
+    // `v[0] = 77` landed on the copy and the caller's list never changed
+    // (`option-view.vl`, 77 -> 1, a semantic break rather than a cost).
+    // A view aliases on purpose: it never copies.
+    let source = r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun inner_mut(&mut self): Option<&mut Inner> { Some(&mut self.inner) }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 1 } };
+            match h.inner_mut() {
+                Some(let v) => { v.n = 77; }
+                None => {}
+            }
+            print(h.inner.n);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a view capture was copied, which breaks the alias:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "77\n");
+}
+
+#[test]
+fn an_owned_call_subject_still_binds_without_copying() {
+    // The elision the widening must not take back, in bytes: a call returning
+    // an OWNED value produces storage of its own, so its elements have no
+    // second owner and B53 §2's "destructuring a FRESH value binds without
+    // copying" stands. `call_returns_view` is what separates the two, not
+    // "the subject is a call".
+    let source = r#"
+        import std::print;
+        fun make(): (List<i32>, i32) { ([1, 2], 3) }
+        fun main() {
+            if make() is (let xs, let n) {
+                print(xs.len() + n);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an owned call result's capture was copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "5\n");
+}
+
+#[test]
+fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
+    // The neighbour that was already right and must stay right: nothing writes
+    // the receiver while the leg is live, so the aggregate capture's copy is
+    // the only thing owed and the answer never depended on the timing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            if g.slot() is (let xs, let n) {
+                print(xs.len() + n);
+            }
+        }
+        "#,
+        "5\n",
     );
 }
 

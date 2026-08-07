@@ -310,6 +310,11 @@ pub struct ExternalFunction<'src> {
     // position (e.g. `Shared::write(self): &mut T borrows self` → `{0}`). A call
     // to it is a view when this is non-empty.
     pub borrows: BTreeSet<u32>,
+    /// Whether the (view) return type is `&mut` rather than `&` — `Function`'s
+    /// field of the same name, which B97 needs of an extern too: the capture
+    /// pass asks a `borrows`-call subject whether its view is writable, and the
+    /// callee may be either kind.
+    pub returns_mut_view: bool,
     /// The `&mut`-convention parameter positions the extern **bumps** (geometry may
     /// advance) — the `bumps` effect (`rule4-completion.md` §1). An extern has no
     /// body to infer from: a curated native-container mutator (`List::push`,
@@ -10306,12 +10311,96 @@ impl<'src> Analyzer<'src> {
     /// pass reads it against rule 3 (`assignment_target_is_view` — a view
     /// forwarded stays the same view, on purpose), which is a different
     /// question from the one a pattern subject asks.
+    ///
+    /// B97: a **`borrows` CALL** is admitted for the same reason `*view` was.
+    /// `h.slot()` returning `&mut self.pair` produces no storage of its own — it
+    /// names the receiver's, exactly as `h.pair` does — so its captures bind
+    /// pieces of something with another owner and both rules apply. An OWNED
+    /// call result needs no rule: its elements have no other owner, which is
+    /// what B53 §2's "destructuring a FRESH value binds without copying" says.
     fn is_capture_subject_place(&self, expr_id: Id) -> bool {
-        self.is_place_expr(expr_id)
-            || matches!(
-                self.expr_id_to_expr_map.get(&expr_id),
-                Some(Expr::Dereference(_))
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Dereference(_)) => true,
+            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+            _ => self.is_place_expr(expr_id),
+        }
+    }
+
+    /// The places a pattern subject's storage comes from — what the two write
+    /// questions below are actually about.
+    ///
+    /// For a place or a `*view` that is the subject itself. For a **`borrows`
+    /// call** (B97) it is the arguments the callee projects: the returned view
+    /// aliases their storage, and *which* arguments is `Function::borrows`, read
+    /// at the call site by [`Self::projected_argument_ids`]. That is why the
+    /// question is answerable at all — `capture-clones.md` §7.4's reason that a
+    /// ROOT walk needs no alias analysis holds here because the receiver is
+    /// right there in the call.
+    fn capture_subject_places(&self, subject_id: Id) -> Vec<Id> {
+        let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return vec![subject_id];
+        };
+        self.projected_argument_ids(*call_id)
+    }
+
+    /// The argument PLACES a view-returning call projects — the callee's
+    /// `borrows` positions read at the call site (receiver = position 0), with
+    /// an explicit `&mut h` unwrapped to the `h` it names. Empty for a call that
+    /// returns no view.
+    ///
+    /// [`Self::call_view_roots`] is this list taken all the way to binding
+    /// roots, for rule 4's anchor sets; B97 needs the places themselves, because
+    /// the questions it asks of them (writable-view, in-place-written) are the
+    /// same ones it asks of any other subject.
+    fn projected_argument_ids(&self, call_id: Id) -> Vec<Id> {
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return Vec::new();
+        };
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let positions: Vec<u32> = if let Some(function) = self.functions.get(callee_id) {
+            if !function.borrows.is_empty() {
+                function.borrows.iter().copied().collect()
+            } else if !function.has_body && function.returns_mut_view {
+                // A bodiless view-returning callee (a trait signature) declares
+                // no clause and cannot be read: project every argument.
+                (0..function_call.argument_ids.len() as u32).collect()
+            } else {
+                return Vec::new();
+            }
+        } else if let Some(external) = self.external_functions.get(callee_id) {
+            external.borrows.iter().copied().collect()
+        } else {
+            return Vec::new();
+        };
+        positions
+            .into_iter()
+            .filter_map(|position| function_call.argument_ids.get(position as usize).copied())
+            .map(
+                |argument_id| match self.expr_id_to_expr_map.get(&argument_id) {
+                    Some(Expr::Reference(operand, _)) => *operand,
+                    _ => argument_id,
+                },
             )
+            .collect()
+    }
+
+    /// Whether a call returns a view, and if so whether it is writable — the
+    /// `borrows`-call half of [`Self::view_binding_mutability`], factored out
+    /// because B97 asks it of a call that is never bound to anything.
+    fn call_view_mutability(&self, call_id: Id) -> Option<bool> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Expr::Local(callee_id) = self.expr_id_to_expr_map.get(&function_call.subject_id)?
+        else {
+            return None;
+        };
+        if let Some(function) = self.functions.get(callee_id) {
+            return (!function.borrows.is_empty()).then_some(function.returns_mut_view);
+        }
+        let external = self.external_functions.get(callee_id)?;
+        (!external.borrows.is_empty()).then_some(external.returns_mut_view)
     }
 
     /// The "declare it …" clause for an immutable-root diagnostic, from
@@ -10507,6 +10596,20 @@ impl<'src> Analyzer<'src> {
     /// (and the SHARE elision that rides on it — the two sets are disjoint,
     /// since `share_subject_is_stable` admits no writable-view root).
     fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        // B97: a `borrows` CALL is a writable view when the projection it
+        // returns is `&mut` — the arm is total for the same construction
+        // reason, since that is the only way the write reaches the receiver.
+        // It is one ALSO when the receiver it projects is itself reached
+        // through a writable view, which is the arm read one level up.
+        if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) {
+            if self.call_view_mutability(*call_id) == Some(true) {
+                return true;
+            }
+            return self
+                .projected_argument_ids(*call_id)
+                .into_iter()
+                .any(|place_id| self.subject_is_writable_view(place_id));
+        }
         let Some(root) = self.place_root(subject_id) else {
             return false;
         };
@@ -10533,8 +10636,10 @@ impl<'src> Analyzer<'src> {
     /// not be sound without that root step — `let v = &mut t` outside the arm
     /// and `v.1 = 9` inside it is a write whose own root is `v`.
     fn subject_is_mutated_in_place(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
-        self.place_root(subject_id)
-            .is_some_and(|root| written_roots.in_place.contains(&root))
+        self.capture_subject_places(subject_id)
+            .into_iter()
+            .filter_map(|place_id| self.place_root(place_id))
+            .any(|root| written_roots.in_place.contains(&root))
     }
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
@@ -11750,49 +11855,17 @@ impl<'src> Analyzer<'src> {
     /// but a view-typed return is unknowable — conservatively project every
     /// referenced argument (the dispatched default, mirroring `bumps`).
     fn call_view_roots(&self, call_id: Id, origins: &HashMap<Id, Vec<Id>>) -> Vec<Id> {
-        let Some(function_call) = self.function_calls.get(&call_id) else {
-            return Vec::new();
-        };
-        let argument_ids = &function_call.argument_ids;
-        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
-        else {
-            return Vec::new();
-        };
-        let positions: Vec<u32> = if let Some(function) = self.functions.get(callee_id) {
-            if !function.borrows.is_empty() {
-                function.borrows.iter().copied().collect()
-            } else if !function.has_body && function.returns_mut_view {
-                // Dispatched view-return with no clause: every argument position.
-                (0..argument_ids.len() as u32).collect()
-            } else {
-                return Vec::new();
-            }
-        } else if let Some(external) = self.external_functions.get(callee_id) {
-            external.borrows.iter().copied().collect()
-        } else {
-            return Vec::new();
-        };
         let mut roots = Vec::new();
-        for position in positions {
-            let Some(argument_id) = argument_ids.get(position as usize) else {
-                continue;
-            };
-            let argument_roots = match self.expr_id_to_expr_map.get(argument_id) {
-                Some(Expr::Reference(operand, _)) => self
-                    .place_root(*operand)
-                    .map(|root| vec![root])
-                    .unwrap_or_default(),
-                Some(Expr::Local(binding)) => origins
-                    .get(binding)
-                    .cloned()
-                    .or_else(|| self.place_root(*argument_id).map(|root| vec![root]))
-                    .unwrap_or_default(),
-                _ => self
-                    .place_root(*argument_id)
-                    .map(|root| vec![root])
-                    .unwrap_or_default(),
-            };
-            for root in argument_roots {
+        for place_id in self.projected_argument_ids(call_id) {
+            // A view BINDING in the projected position forwards its own origins
+            // (`let v = &x; f(v)` anchors on `x`); anything else roots directly.
+            let place_roots = match self.expr_id_to_expr_map.get(&place_id) {
+                Some(Expr::Local(binding)) => origins.get(binding).cloned(),
+                _ => None,
+            }
+            .or_else(|| self.place_root(place_id).map(|root| vec![root]))
+            .unwrap_or_default();
+            for root in place_roots {
                 if !roots.contains(&root) {
                     roots.push(root);
                 }
@@ -14058,6 +14131,21 @@ impl<'src> Analyzer<'src> {
             if self.type_is_resource(type_id) {
                 continue;
             }
+            // A capture that IS a view never copies either, for the reason a
+            // view exists: it aliases on purpose. B97 is what made this
+            // reachable — a `Some(let v)` capture over an `Option<&mut T>`
+            // call had no rule before, because its subject is a CALL and the
+            // capture pass could not see one. References are transparent, so
+            // `&mut List<i32>` is an aggregate by every type test here, and
+            // copying it deep-copies the borrowed storage: `v[0] = 77` then
+            // lands on the copy and the caller's value never changes
+            // (`option-view.vl`, measured). Materialization above is still
+            // right and still applies — freezing WHICH view is read changes no
+            // aliasing, exactly as the SHARE elision's materialization does
+            // not (`capture-clones.md` §6.2).
+            if self.binding_or_param_is_view(capture_id) {
+                continue;
+            }
             let copy = match self.resource_triggering_constraints(type_id, &capture_type) {
                 triggers if triggers.is_empty() => CopyDecision::Always,
                 triggers => CopyDecision::UnlessResource(triggers),
@@ -15709,6 +15797,10 @@ impl<'src> Analyzer<'src> {
                             return_type_id,
                             extern_binding: function.extern_binding.clone(),
                             borrows,
+                            returns_mut_view: matches!(
+                                return_type_node.map(|spanned| &spanned.0),
+                                Some(Node::Reference(true, _))
+                            ),
                             // Seeded after `build()`: the native-container table, or
                             // the all-`&mut` default (`infer_bumps`). Empty until then.
                             bumps: BTreeSet::new(),
