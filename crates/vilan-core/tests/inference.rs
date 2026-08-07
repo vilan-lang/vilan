@@ -22885,6 +22885,254 @@ fn creating_an_async_closure_in_an_initializer_stays_legal() {
     );
 }
 
+// --- B86: the rule is AWAIT-shaped, not call-shaped ---------------------------
+//
+// The shipped check walked `initializer_calls_of`, so it only ever saw an
+// async CALL. An `await` whose operand is not a call — a `Task`-valued
+// binding, a spawn, a `Task` returned by a plain sync function — slipped
+// through, compiled clean, and emitted a genuine top-level `await` into the
+// bundle (`top-level-await.md` §1.3), which then miscompiled on the Node leg
+// (§1.4) and failed to parse at all under HMR (§1.5). These pin every row of
+// §5.2's boundary table, per case.
+
+/// `ready` + a module-level spawn, the shared preamble for the rows below.
+const AWAIT_SHAPED_PREAMBLE: &str = r#"
+        import std::print;
+        import std::task::Task;
+        import std::time::{ sleep_for, Duration };
+
+        fun ready(): i32 {
+            sleep_for(Duration::millis(1));
+            7
+        }
+"#;
+
+#[test]
+fn awaiting_a_task_valued_module_binding_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_valued_module_binding_steers_to_main() {
+    // The second message form: the operand is right there and already
+    // spawned, so the steer is to move the `await`, not to restructure.
+    assert_fails_noting(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "a module-level binding cannot suspend",
+        "await pending",
+        "hold `pending` here and `await` it in `main`",
+    );
+}
+
+#[test]
+fn awaiting_a_spawn_in_an_initializer_is_rejected() {
+    // The sharpest hole: `async ready()` is a CREATION, so the call to
+    // `ready` lives inside the spawned closure and never entered the
+    // initializer's direct call set.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async ready();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async ready()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_an_async_block_in_an_initializer_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async {{ 7 }};
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async { 7 }",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_from_a_sync_function_is_rejected() {
+    // `spawn_it` is not async — it returns a `Task`. The call check sees a
+    // sync callee and passes; the await check is what refuses it.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        fun spawn_it(): Task<i32> {{
+            async ready()
+        }}
+
+        let value: i32 = await spawn_it();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await spawn_it()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_nested_in_an_initializer_expression_is_rejected() {
+    // Any `await` REACHABLE in the initializer's own expression tree — not
+    // just one at its root.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = (await pending) + 1;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_non_task_in_an_initializer_is_rejected() {
+    // `await` on a plain value is legal JS and legal vilan inside a function;
+    // at module level it is still a suspension point, so it is still refused
+    // — and the steer stays true (it never claims the operand is a spawn).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        let plain: i32 = 7;
+        let value: i32 = await plain;
+
+        fun main() {
+            print(value);
+        }
+        "#,
+        "await plain",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_inside_a_closure_created_by_an_initializer_stays_legal() {
+    // THE BOUNDARY, kept deliberately where the call-shaped check had it: a
+    // closure's body is not the initializer. Creating the closure suspends
+    // nothing at load, so the initializer does not await — only calling it
+    // does, and that happens wherever the caller is.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let later = || {{ await pending }};
+
+        async fun main() {{
+            print(await later());
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_await_inside_an_async_block_in_an_initializer_stays_legal() {
+    // Same boundary through the `async { .. }` spelling: the block lowers to
+    // a closure, which is its own unit.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let wrapped: Task<i32> = async {{ await pending }};
+
+        async fun main() {{
+            print(await wrapped);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn spawning_at_module_level_stays_legal() {
+    // The idiom the diagnostic steers to, and the reason the null
+    // recommendation holds: the work starts at load, only the observation
+    // moves into `main`.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+
+        async fun main() {{
+            print(await pending);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
+    // `await ready()` is BOTH an await and an async call. The call form names
+    // the callee, so it wins — and it must be the ONLY diagnostic, not a pair
+    // for one line.
+    // `warm` takes an argument so the call site's snippet (`warm(1)`) is
+    // distinct from its declaration — the span must land on the call.
+    let source = r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        fun warm(seed: i32): i32 {
+            sleep_for(Duration::millis(1));
+            seed
+        }
+
+        let value: i32 = await warm(1);
+
+        fun main() {
+            print(value);
+        }
+        "#;
+    assert_fails_spanning(source, "warm(1)", "calls `warm`, which is async");
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| {
+            message.contains("cannot await (module initialization is synchronous)")
+                || message.contains("cannot suspend")
+        })
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "one refusal per binding, not a pair for one line"
+    );
+}
+
 // --- The i53/u53 rename (numeric-types.md §8) --------------------------------
 //
 // The f64-backed wide integers are named for the precision they deliver

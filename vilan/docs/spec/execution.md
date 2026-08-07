@@ -34,6 +34,24 @@ bindings initialize in declaration order. Nothing here depends on how a
 file spells its imports, so reordering import statements, or the names
 inside a `{ .. }` list, cannot change what a program does.
 
+**Module initialization is synchronous.** An initializer may not
+suspend: an `await` reachable in a module-level binding's own
+initializer is a compile error, in every spelling — the implicit await
+of a call to an async function, and the explicit `await` whatever its
+operand (a `Task`-valued binding, a spawn, a `Task` returned by a plain
+function). This is a design position, not a limit of the emission
+model. The order above is *derived* from the dependency relation, and
+suspending a derived sequence makes one binding's completion wait on an
+ordering the program never wrote and cannot see.
+
+*Spawning* at module level stays legal, and is the idiom the rule
+steers to: `let pending: Task<T> = async work();` starts the work at
+load without suspending, and `main` — which may be `async` — awaits it
+where the wait is visible. Independent spawns overlap, where a sequence
+of awaited initializers would serialize. Creating an async closure or
+an `async { .. }` block is legal for the same reason: the body is not
+the initializer, and nothing runs it at load.
+
 Only a binding something reachable from `main` references initializes at
 all (§11.2's reachability rule): an unreferenced binding's initializer
 never runs, so load-time side effects are not a promise.
@@ -194,7 +212,8 @@ into `map` adapts both), and never crosses these boundaries:
 - a trait/generic-dispatched call: there is no statically-known callee
   to instantiate (bind the receiver concretely, or declare the trait
   parameter `async`);
-- a module-level initializer: it cannot await (§7.6's J.3 rule).
+- a module-level initializer: it cannot suspend, in any spelling
+  (§7.1) — spawn at load and await in `main` instead.
 
 **The divergence rule** (the remaining stores). An async closure flowing
 where a plain closure type is declared on a struct **field** or a

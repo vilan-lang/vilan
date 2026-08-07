@@ -412,6 +412,18 @@ thing has no name: an adopted async closure applied directly, a
 until called.)
 → [Async](../tour/async.md)
 
+**"the initializer of `…` awaits: a module-level binding cannot suspend"**
+The same rule, reported at an explicit `await` whose operand is not an
+async call — a `Task`-valued binding, a spawn (`await async f()`), or a
+`Task` returned by a plain function. Module initialization is
+synchronous by design, so every one of these is refused wherever the
+`await` sits in the initializer's expression. The note names the fix:
+*spawn* at module level (`let pending: Task<T> = async work();`), which
+starts the work at load without suspending, and `await` the `Task` in
+`main`. An `await` inside a closure the initializer merely *creates* is
+not the initializer's own and stays legal.
+→ [Async](../tour/async.md)
+
 **"`…` form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order"**
 Module-level bindings initialize in dependency order (spec §7.1): each
 one runs after everything its initializer evaluates at load: the
