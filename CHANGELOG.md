@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.31.0 — 2026-08-06
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.
 
