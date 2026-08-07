@@ -27,7 +27,7 @@ Rust workspace, four crates, plus the language's own tree:
 - `crates/vilan-embedded-std` — embeds the std source into the binary.
 - `vilan/std/src/*.vl` — the standard library, written in vilan. std loads as its own
   package with root-scoped module resolution.
-- `vilan/test/` — the corpus: `.vl` programs with **byte-identical** `.js` goldens.
+- `vilan/test/` — the corpus: `.vl` programs with **byte-identical** `.mjs` goldens.
 - `vilan/docs/` — the user-facing book + spec; every fenced example compiles.
 - `vilan/proposal/` — design documents. Semantics are settled here **before** code;
   the proposal named in your work order is the spec for your change.
