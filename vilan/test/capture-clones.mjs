@@ -155,6 +155,44 @@ function grow_first(pair2) {
 	}
 	return 0;
 }
+function slot(self) {
+	return self[0];
+}
+function peek(self) {
+	return self[0];
+}
+function called_component() {
+	let cell = [ [ [ 1, 2 ], 3 ] ];
+	const $x = slot(cell);
+	const cells = __clone($x[0]);
+	const weight = $x[1];
+	if (true) {
+		cell[0][1] = 9;
+		return cells.length + weight;
+	}
+	return 0;
+}
+function called_readonly() {
+	let cell = [ [ [ 1, 2 ], 3 ] ];
+	const $y = peek(cell);
+	const cells = __clone($y[0]);
+	const weight = $y[1];
+	if (true) {
+		cell[0][1] = 9;
+		return cells.length + weight;
+	}
+	return 0;
+}
+function fresh_pair() {
+	return [ [ 1, 2 ], 3 ];
+}
+function owned_call() {
+	const $z = fresh_pair();
+	if (true) {
+		return $z[0].length + $z[1];
+	}
+	return 0;
+}
 let entries = [  ];
 entries.push([ 1, 2 ]);
 entries.push([ 10, 20 ]);
@@ -193,3 +231,6 @@ console.log(viewed[1]);
 console.log(place_component());
 console.log(place_rebound());
 console.log(place_guarded());
+console.log(called_component());
+console.log(called_readonly());
+console.log(owned_call());

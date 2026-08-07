@@ -47,6 +47,19 @@
 // the rule. `place_guarded` is the guarded twin, whose guard reads the
 // materialized `weight` and so takes B59's prelude shape on the place path
 // exactly as `viewed_guarded` does on the viewed one.
+//
+// B97 adds the third subject spelling, a `borrows` CALL, which collected no
+// candidates at all before — so BOTH rules were missing and the bytes said so
+// (`const $x = slot(h); … $x[0]`, no `__clone` anywhere). `called_component`
+// is the twin of `place_component` with `h.slot()` in place of `cell`: same
+// two payload shapes, same component write, so the same two declarations —
+// `cells` with `__clone`, `weight` bare. `called_readonly` is why the rule is
+// not `returns_mut_view`: a `&` projection cannot be written THROUGH, but its
+// receiver can be written under its own name, and the temp aliases the
+// receiver's storage either way. `owned_call` is the line the widening stops
+// at — a call returning an OWNED value produces storage of its own, so its
+// captures bind with no copy and no declaration, and admitting it would take
+// back B53 §2's elision.
 import std::io::print;
 import std::option::Option::{ self, Some, None };
 
@@ -170,6 +183,42 @@ fun grow_first(pair: (List<i32>, i32)): i32 {
 	0
 }
 
+struct Cell { pair: (List<i32>, i32) }
+
+impl Cell {
+	fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.pair }
+	fun peek(&self): &(List<i32>, i32) borrows self { &self.pair }
+}
+
+fun called_component(): i32 {
+	mut cell = Cell { pair = ([1, 2], 3) };
+	if cell.slot() is (let cells, let weight) {
+		cell.pair.1 = 9;
+		ret cells.len() + weight;
+	}
+	0
+}
+
+fun called_readonly(): i32 {
+	mut cell = Cell { pair = ([1, 2], 3) };
+	if cell.peek() is (let cells, let weight) {
+		cell.pair.1 = 9;
+		ret cells.len() + weight;
+	}
+	0
+}
+
+fun fresh_pair(): (List<i32>, i32) {
+	([1, 2], 3)
+}
+
+fun owned_call(): i32 {
+	if fresh_pair() is (let cells, let weight) {
+		ret cells.len() + weight;
+	}
+	0
+}
+
 fun main() {
 	mut entries = List::new();
 	entries.push((1, 2));
@@ -204,4 +253,7 @@ fun main() {
 	print(place_component());
 	print(place_rebound());
 	print(place_guarded());
+	print(called_component());
+	print(called_readonly());
+	print(owned_call());
 }

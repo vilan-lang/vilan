@@ -565,3 +565,198 @@ different predicate (which calls return views — `Function::borrows` /
 `returns_mut_view` already answer it) reaching a different set of programs, and
 it deserves its own measurement rather than a rider on this one. An owned
 call result needs no rule: nothing else names it.
+
+## 8. B94 — the doctrine leaves the capture pass, 2026-08-07
+
+> Not a capture finding, recorded here because it is the same doctrine and the
+> §7.7 arc's sibling. B81/B88 said a capture must not be able to tell whether
+> its subject is reached through a view or through the place the view names.
+> B94 is that sentence one layer down, about the WRITE rather than the read: a
+> write through a view must not be able to tell either. Ruled 2026-08-07,
+> shipped in the same lane as §9. The rule and its reasoning live in
+> `destruction.md` §4 R2; this note records only what the two arcs share.
+
+The shape is §6.1's, inverted. §6.1's premise was that a subject temp is a
+stable snapshot, which holds through a rebind and fails through a view because
+**a write through a view is an in-place mutation of the pointee**. R2's
+implementation rested on the mirror premise — that the body doing the write
+owns what it overwrites — which holds for a place and fails through a view for
+the *same* reason: the value being clobbered belongs to a binding in another
+frame entirely. Both premises were unstated, both were true of exactly one
+spelling, and both were found by asking the owned twin what it answers.
+
+The B88 measurement discipline did not apply and was not paid. §7.2 measured
+two candidate predicates because both were correct and the choice was about
+cost; here the ruling fixed the predicate (the loan drops what it overwrites)
+and the only open question was its reach, which is a shape enumeration rather
+than a corpus tradeoff. Eleven runtime pins, one byte pin for the drop/write
+order, four plants; `resource.vl` gains `view_overwrite`, `refill`,
+`view_writes` and `loaned`, the last being the byte proof of the OTHER half —
+a `&` local of a resource takes no teardown of its own.
+
+The two halves are worth naming together, because one filter serves both.
+References are transparent, so `&mut Holder` *is* `Holder`, and a resource
+binding is a resource binding whether it owns or borrows. The planner read that
+set as "owners" and got both answers wrong in opposite directions: a loan was
+excused from destroying what it overwrote, and charged for destroying what it
+merely borrowed. `ResourceOwnership::owned_bindings` is the set minus the
+loans, and the two bugs close on the one line.
+
+**Left open**, on §6.5's standing reason: a COMPONENT write over a resource
+(`slot.held = Holder::Empty`) destroys nothing, on an owned place and through a
+view alike. R2 is written about a binding and R5 about reading and moving a
+field; writing over one falls between them. A different predicate over a
+different set of programs — filed, pinned `#[ignore]`d, not ridden in.
+
+## 9. B97 — the third subject spelling, 2026-08-07
+
+> §7.7's bycatch, closed. A `borrows` CALL hands the pattern a subject that
+> names the receiver's storage, and `is_capture_subject_place` admitted
+> `Local`/`Field`/`TupleIndex`/`Index`/`Deref` and nothing else — so the
+> subject collected **no capture candidates at all** and both rules were
+> missing at once, exactly as §6.4 found for `*view`. §7.7 declined to widen
+> §7's arc into it and asked for its own measurement; this is that measurement.
+
+### 9.1 The shapes, measured
+
+Fourteen probes against the pre-fix tree (`next` @ `bb54150`, B94 included).
+Each is a pattern over a `borrows`-returning call with a write in the leg;
+the two filed repros are the first two rows.
+
+| shape | subject | before | want |
+|---|---|---|---|
+| scalar capture, `&mut` projection | `h.slot()` | 99 | 3 |
+| aggregate capture, `&mut` projection | `g.slot()` | 3 | 2 |
+| scalar capture, **`&` projection** | `h.peek()` | 99 | 3 |
+| free function, `borrows h` | `slot(&mut h)` | 99 | 3 |
+| guarded `match` leg | `h.slot()` | 99 | 3 |
+| unguarded `match` leg, aggregate | `g.slot()` | 3 | 2 |
+| `let` destructure, aggregate | `g.slot()` | 3 | 2 |
+| **chained** `&mut` of `&mut` | `o.inner_mut().slot()` | 99 | 3 |
+| **chained** `&` of `&mut` | `o.inner_mut().peek()` | 99 | 3 |
+| resource payload | `holder.view()` | 1 (correct) | 1 |
+
+Four neighbours were already right, and each is pinned so the fix cannot move
+them: an unguarded leg's *timing* (`compile_pattern` declares at leg entry —
+only the COPY was owed), a `let` destructure's timing (same reason), a leg with
+no write at all, and an OWNED call result (`fresh_pair()`), whose elements have
+no second owner.
+
+One shape is **not** B97's and is filed separately: `fun make(&self): (i32, i32)
+{ self.pair }` returns the field's storage uncopied, so `let p = h.make();
+h.pair.1 = 99` shows through `p`. That is rule 1 at the RETURN seam, not the
+capture pass; §7.7's "an owned call result needs no rule: nothing else names
+it" is true of the capture pass and false of that function's own body.
+
+### 9.2 The candidates, measured before choosing
+
+Each was implemented far enough to rebuild the whole corpus and run the
+analyzer gate. "Shapes" counts the eleven pinned answers above.
+
+| | goldens moved | analyzer gate | shapes correct |
+|---|---|---|---|
+| **(a)** admit every view-returning call; both write arms | **2 — one a SEMANTIC BREAK** | — | 11 / 11 |
+| **(b)** (a), plus: a capture that IS a view never copies | **0** | 1879 pass | 11 / 11 |
+| **(c)** admit only `&mut`-returning calls | 0 | — | 10 / 11 |
+| **(d)** (b) without the write-set root arm | 0 | — | 10 / 11 |
+
+**(a) is wrong, and the corpus is what said so** — this is the measurement
+earning its keep rather than confirming a guess. Admitting `borrows` calls
+newly reaches `Option<&mut T>` returns, whose `Some(let v)` capture *is a
+view*. References are transparent, so `&mut Inner` is a cloneable aggregate by
+every type test in the pass, and B53's copy fired on it: `option-view.mjs`'s
+`const v3 = __clone($e[1]); v3[0] = 77` writes the copy, and the fixture's own
+output changed from `77` to `1`. `arena.mjs` moved too — a read-only recursive
+walker that began deep-copying its node at every level, the exact regression
+§6.2's writability predicate exists to prevent, in a new place.
+
+So the rule gains one clause, and it is not a special case: **a view never
+copies**, for the reason a view exists. Materialization still applies to it —
+freezing WHICH view is read changes no aliasing, the same argument §6.2 makes
+for the SHARE elision.
+
+**(c) and (d) are cheap and incomplete**, each in one direction. (c) keys
+candidacy on `returns_mut_view`, which is one of the two things §7.7 named, and
+leaves a `&` projection's late read broken — the receiver can still be written
+under its own name while the leg is live, and the temp aliases the receiver's
+storage whether or not the *view* is writable. (d) keeps candidacy and drops
+the root arm, which is the same loss by a different route. Neither costs a
+golden, and neither is the rule.
+
+**(b) ships.**
+
+### 9.3 The rule
+
+> A pattern subject that is a **view-returning call** collects capture
+> candidates: it names the storage of the arguments the callee projects, not
+> storage of its own. Both write questions are then asked of **those
+> arguments** rather than of the subject expression.
+
+`capture_subject_places` is the one line: for a place or a `*view`, the subject
+itself; for a `borrows` call, its projected argument places, read at the call
+site from `Function::borrows`. §7.4's reason that a ROOT walk needs no alias
+analysis holds here unchanged, and the task's own hint is why — **the receiver
+is right there in the call**. Nothing has to be tracked to connect the subject
+to the storage a write can reach.
+
+Materialization then has the two arms it has everywhere else, and both are
+pinned:
+
+- **Writable-view arm** (B81): a `&mut` projection is a writable view by
+  construction, so the arm needs no write to be found. It is not subsumed by
+  the root arm, and the shape that proves it is the CHAIN: `o.inner_mut()
+  .slot()` has a call for a receiver, and a call has no place root, so the root
+  arm has nothing to ask about. Read one level up as well — `o.inner_mut()
+  .peek()` returns `&`, yet the storage it names is writable because what it
+  was projected from is.
+- **Root arm** (B88): otherwise, whether a recorded in-place write reaches a
+  projected argument's root. `h.peek()` with `h.pair.1 = 9` in the leg is the
+  case, and it is what (c) and (d) both get wrong.
+
+The SHARE elision is deliberately NOT extended: `share_subject_is_stable` asks
+`place_root`, which is `None` for a call, so an immutable aggregate capture
+from a `borrows` call copies rather than sharing. That is the conservative
+direction, it moved no golden, and widening it is an optimization with its own
+seam question (§2's `unwrap` leak) rather than part of this fix.
+
+### 9.4 Doctrine per payload shape
+
+Unchanged from §6.2/§6.3/§7.5 — which is the point, and the twins are what
+check it. Each is the third member of a trio that now spans place, view, and
+call:
+
+- **Values** materialize (`a_borrows_call_subject_reads_the_prematch_value`).
+- **Aggregates** copy (`a_borrows_call_subject_copies_its_captures`), and both
+  shapes together in `both_capture_shapes_survive_a_write_through_a_borrows_
+  call_subject` — the third member of the pair §7.5 names.
+- **Resources** materialize **BARE**, no `__clone`
+  (`a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload`
+  asserts both halves: the value, and the absent copy).
+- **Views** — new here, because this is the path that reaches them — neither
+  copy nor lose their alias.
+
+### 9.5 Pins and non-vacuity
+
+Twenty-two pins in `inference.rs`, five plants:
+
+| plant | red |
+|---|---|
+| the call arm removed from `is_capture_subject_place` | 11 |
+| the view-capture filter removed | 1 (`a_wrapped_view_capture_over_a_borrows_call_is_not_copied`) |
+| the writable-view arm removed for calls | 2 (both chains) |
+| the projected-receiver recursion removed | 1 (`a_readonly_projection_of_a_writable_one_reads_the_prematch_value`) |
+| the root arm narrowed back to the subject place | 1 (`a_readonly_borrows_call_subject_materializes_when_a_write_reaches_the_receiver`) |
+
+The pins green under every plant are exactly the ones that pin UNCHANGED
+behavior: the owned call result, and the leg with no write in it.
+
+`capture-clones.vl` gains `called_component`, `called_readonly` and
+`owned_call`, the way it did in §2, §6 and §7 — the fixture is where the
+emitted SHAPES are pinned in bytes, and a runtime pin cannot see a
+materialization that lands in the wrong place and still prints the right
+number. `called_component` is `place_component` with `cell.slot()` for `cell`,
+so the byte diff between them IS the claim that the paths are
+indistinguishable: `const cells = __clone($x[0]); const weight = $x[1];`, both
+declared, one copied. `owned_call` keeps its accessors. The golden moved
+**additively** — every pre-existing byte unchanged. **No other corpus golden
+moved.**

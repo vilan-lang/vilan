@@ -310,6 +310,11 @@ pub struct ExternalFunction<'src> {
     // position (e.g. `Shared::write(self): &mut T borrows self` → `{0}`). A call
     // to it is a view when this is non-empty.
     pub borrows: BTreeSet<u32>,
+    /// Whether the (view) return type is `&mut` rather than `&` — `Function`'s
+    /// field of the same name, which B97 needs of an extern too: the capture
+    /// pass asks a `borrows`-call subject whether its view is writable, and the
+    /// callee may be either kind.
+    pub returns_mut_view: bool,
     /// The `&mut`-convention parameter positions the extern **bumps** (geometry may
     /// advance) — the `bumps` effect (`rule4-completion.md` §1). An extern has no
     /// body to infer from: a curated native-container mutator (`List::push`,
@@ -1314,10 +1319,12 @@ pub struct Analyzer<'src> {
     /// unconditional per-scope `try`/`finally` teardown, no runtime drop flags.
     /// Empty on resource-free programs, so their output stays byte-identical.
     dropped_bindings: HashSet<Id>,
-    /// Assignment expression ids that overwrite a still-owned resource binding —
-    /// the old value drops first, then the new one moves in (R2). Filled by
-    /// `plan_resource_drops`; read by the transformer.
-    overwrite_drops: HashSet<Id>,
+    /// Assignment expression ids that overwrite a live resource — the old value
+    /// drops first, then the new one moves in (R2) — mapped to the type of the
+    /// value being overwritten. Two shapes share the map: a still-owned resource
+    /// binding, and (B94) a write through a `&mut` view, whose pointee some other
+    /// body owns. Filled by `plan_resource_drops`; read by the transformer.
+    overwrite_drops: HashMap<Id, TypeId>,
     /// `impl Subject with Drop` sites (destruction.md §5), recorded during the
     /// conformance check (where the std `Drop` trait id resolves) and validated
     /// post-build, once resource classification is complete: `(subject TypeId,
@@ -2119,7 +2126,7 @@ impl<'src> Analyzer<'src> {
             generic_type_applications: Vec::new(),
             resource_value_places: HashSet::new(),
             dropped_bindings: HashSet::new(),
-            overwrite_drops: HashSet::new(),
+            overwrite_drops: HashMap::new(),
             drop_methods: HashMap::new(),
             drop_glue: HashMap::new(),
             drop_owned_types_by_root: HashMap::new(),
@@ -5623,8 +5630,9 @@ impl<'src> Analyzer<'src> {
     /// Drop planning (destruction.md §5, §7). Computes, for the whole program:
     /// `dropped_bindings` — the resource locals still owned at their declaring
     /// scope's fall-through end (dropped there, reverse declaration order) — and
-    /// `overwrite_drops` — the assignments that overwrite a still-owned resource
-    /// (R2: the old value drops first). A forward per-path walk over each function
+    /// `overwrite_drops` — the assignments that overwrite a live resource (R2:
+    /// the old value drops first), whether the value is owned by a binding this
+    /// walk tracks or reached through a `&mut` loan (B94). A forward per-path walk over each function
     /// and closure body mirrors the affine move scan's control flow, tracking the
     /// set of currently-owned resource bindings; because R7 forbids conditional
     /// moves, ownership at any program point is single-valued, so both outputs are
@@ -5632,18 +5640,35 @@ impl<'src> Analyzer<'src> {
     /// and the overwrite drops. A resource-free program plans nothing, keeping its
     /// output byte-identical.
     fn plan_resource_drops(&mut self) {
-        let resources = self.collect_resource_bindings();
+        let bindings = self.collect_resource_bindings();
+        // A loan owns nothing (B94). References are transparent, so `let v = &mut
+        // holder` and a `&mut Holder` parameter both mint resource-TYPED bindings
+        // whose value belongs to someone else — enrolling them made a view local's
+        // scope end destroy the borrowed value a second time.
+        let owned_bindings: HashSet<Id> = bindings
+            .iter()
+            .copied()
+            .filter(|binding| !self.binding_or_param_is_view(*binding))
+            .collect();
+        let loan_overwrites = self.collect_loan_overwrites(&bindings);
+        let resources = ResourceOwnership {
+            owned_bindings,
+            loan_overwrites,
+        };
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
         // reachability (it lowers transformer-side to the `__drop` helper), so its
         // owning function/closure needs a synthetic edge to that destructor. Same
         // source of truth as the scope-end drops (`owned_by_root`).
         let drop_sink_by_root = self.drop_sink_types_by_root();
-        if resources.is_empty() && drop_sink_by_root.is_empty() {
+        if resources.owned_bindings.is_empty()
+            && resources.loan_overwrites.is_empty()
+            && drop_sink_by_root.is_empty()
+        {
             return;
         }
         let mut dropped: HashSet<Id> = HashSet::new();
-        let mut overwrites: HashSet<Id> = HashSet::new();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
         let mut owned_by_root: HashMap<Id, HashSet<TypeId>> = HashMap::new();
         // Function bodies: the tail is the return value, so it is consuming — a
@@ -5666,7 +5691,7 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .copied()
                     .filter(|parameter| {
-                        resources.contains(parameter)
+                        resources.owned_bindings.contains(parameter)
                             && self.parameters.get(parameter).map(|p| p.convention)
                                 == Some(Convention::Own)
                     })
@@ -5682,7 +5707,7 @@ impl<'src> Analyzer<'src> {
         for (root, statements, tail, own_params) in &bodies {
             let mut owned: HashSet<Id> = own_params.iter().copied().collect();
             let mut root_dropped: HashSet<Id> = HashSet::new();
-            let mut root_overwrites: HashSet<Id> = HashSet::new();
+            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::new();
             self.plan_scope(
                 &[],
                 statements,
@@ -5715,7 +5740,7 @@ impl<'src> Analyzer<'src> {
         for (root, return_id) in closures {
             let mut owned: HashSet<Id> = HashSet::new();
             let mut root_dropped: HashSet<Id> = HashSet::new();
-            let mut root_overwrites: HashSet<Id> = HashSet::new();
+            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::new();
             self.plan_expr(
                 return_id,
                 true,
@@ -5739,6 +5764,73 @@ impl<'src> Analyzer<'src> {
         self.drop_owned_types_by_root = owned_by_root;
     }
 
+    /// B94 — R2's loan half. A write through a writable view is an **in-place
+    /// mutation of the pointee** (that is how it reaches the caller at all), so
+    /// it overwrites a live resource exactly as `holder = Holder::Empty` does
+    /// on the owned twin; the only difference is that the owner is another
+    /// body's binding, which the scan cannot see. Returns each such assignment
+    /// with the POINTEE type whose outgoing value drops.
+    ///
+    /// **No liveness question is asked, and none is needed.** The scan's
+    /// `owned` set exists because a body can move its own binding out and must
+    /// not then drop it twice; through a loan that is unreachable. This body
+    /// cannot move the pointee out — matching a loan inspects without consuming
+    /// (R6) and a field/element consume is a rejected partial move (R5) — and
+    /// the *owner* cannot either, because a binding moved out is dead: handing
+    /// a `&mut` of it to this call is a use-after-move the checker already
+    /// rejects (pinned: `a_view_write_after_the_owner_moved_out_is_rejected`).
+    /// A repeated write through the same view is safe for a third reason — the
+    /// drop glue reads the pointee's CURRENT contents, which the previous write
+    /// already replaced.
+    ///
+    /// The target is a view-typed l-value — `self` inside `&mut self`, a `&mut`
+    /// parameter, or a local bound to a `&mut` — which is one shape by
+    /// [`Self::assignment_target_is_view`], the same predicate that later wraps
+    /// it in the synthetic `Dereference` codegen writes through
+    /// ([`Self::rewrite_view_assignment_targets`], which runs well after this
+    /// pass; the assignment's own id is what both agree on). It must also be a
+    /// PLACE, because the transformer walks it twice — once for the drop, once
+    /// as the write's base — which is free for a name and would duplicate a
+    /// `borrows`-call target.
+    ///
+    /// A field or element THROUGH a view (`v.slot = ..`) is deliberately not
+    /// here: `assignment_target_is_view` excludes projections because they are
+    /// ordinary places reached by auto-deref, and overwriting a resource-holding
+    /// COMPONENT is R5's question rather than R2's — a separate hole, filed
+    /// rather than ridden in on this one.
+    fn collect_loan_overwrites(&mut self, bindings: &HashSet<Id>) -> HashMap<Id, TypeId> {
+        let targets: Vec<(Id, Id)> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter_map(|(id, expr)| match expr {
+                Expr::Assignment(target_id, _) => Some((*id, *target_id)),
+                _ => None,
+            })
+            .filter(|(_, target_id)| {
+                self.is_place_expr(*target_id)
+                    && self.assignment_target_is_view(*target_id)
+                    && self.subject_is_writable_view(*target_id)
+            })
+            .collect();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
+        for (assignment_id, target_id) in targets {
+            // References are transparent, so the view's own type IS the
+            // pointee's, and a resource-typed binding root answers the
+            // classification question without re-deriving it.
+            let Some(type_id) = self.place_value_type_id(target_id) else {
+                continue;
+            };
+            let is_resource = match self.expr_id_to_expr_map.get(&target_id) {
+                Some(Expr::Local(binding)) => bindings.contains(binding),
+                _ => self.type_is_resource(type_id),
+            };
+            if is_resource {
+                overwrites.insert(assignment_id, type_id);
+            }
+        }
+        overwrites
+    }
+
     /// Record the resource TYPES a scan root drops — a dropped local's type and an
     /// overwrite target's type — for the §8 drop reachability edges. Skips a root
     /// that drops nothing.
@@ -5746,7 +5838,7 @@ impl<'src> Analyzer<'src> {
         &self,
         root: Id,
         dropped: &HashSet<Id>,
-        overwrites: &HashSet<Id>,
+        overwrites: &HashMap<Id, TypeId>,
         out: &mut HashMap<Id, HashSet<TypeId>>,
     ) {
         let mut types: HashSet<TypeId> = HashSet::new();
@@ -5755,14 +5847,7 @@ impl<'src> Analyzer<'src> {
                 types.insert(type_id);
             }
         }
-        for assignment in overwrites {
-            if let Some(Expr::Assignment(target_id, _)) = self.expr_id_to_expr_map.get(assignment)
-                && let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id)
-                && let Some(variable) = self.variables.get(binding)
-            {
-                types.insert(variable.type_id);
-            }
-        }
+        types.extend(overwrites.values().copied());
         if !types.is_empty() {
             out.entry(root).or_default().extend(types);
         }
@@ -5783,21 +5868,23 @@ impl<'src> Analyzer<'src> {
         statements: &[Id],
         tail: Id,
         consuming: bool,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         let mut declared_here: Vec<Id> = Vec::new();
         for capture in captures {
-            if resources.contains(capture) {
+            if resources.owned_bindings.contains(capture) {
                 owned.insert(*capture);
                 declared_here.push(*capture);
             }
         }
         for statement in statements {
             match self.expr_id_to_expr_map.get(statement) {
-                Some(Expr::Variable(variable_id)) if resources.contains(variable_id) => {
+                Some(Expr::Variable(variable_id))
+                    if resources.owned_bindings.contains(variable_id) =>
+                {
                     declared_here.push(*variable_id);
                 }
                 // `let (a, b) = value` declares its captures here too: a consumed
@@ -5812,7 +5899,7 @@ impl<'src> Analyzer<'src> {
                     declared_here.extend(
                         bound
                             .into_iter()
-                            .filter(|capture| resources.contains(capture)),
+                            .filter(|capture| resources.owned_bindings.contains(capture)),
                     );
                 }
                 _ => {}
@@ -5838,10 +5925,10 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         consuming: bool,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         let Some(expr) = self.expr_id_to_expr_map.get(&expr_id).cloned() else {
             return;
@@ -5849,7 +5936,7 @@ impl<'src> Analyzer<'src> {
         match expr {
             // A resource binding moved (consuming use) stops being owned here.
             Expr::Local(binding) => {
-                if consuming && resources.contains(&binding) {
+                if consuming && resources.owned_bindings.contains(&binding) {
                     owned.remove(&binding);
                 }
             }
@@ -5871,7 +5958,7 @@ impl<'src> Analyzer<'src> {
                 if let Some(initial) = self.variables.get(&variable_id).and_then(|v| v.initial) {
                     self.plan_expr(initial, true, resources, owned, dropped, overwrites);
                 }
-                if resources.contains(&variable_id) {
+                if resources.owned_bindings.contains(&variable_id) {
                     owned.insert(variable_id);
                 }
             }
@@ -5886,24 +5973,36 @@ impl<'src> Analyzer<'src> {
                     let mut captures = Vec::new();
                     Self::collect_pattern_captures(&pattern, &mut captures);
                     for capture in captures {
-                        if resources.contains(&capture) {
+                        if resources.owned_bindings.contains(&capture) {
                             owned.insert(capture);
                         }
                     }
                 }
             }
-            // R2: assigning onto a binding that still owns a resource drops the
-            // old value first (recorded here), then the new value moves in.
+            // R2: assigning onto a place that still holds a resource drops the
+            // old value first (recorded here), then the new value moves in. Two
+            // arms, one rule — the owner of the outgoing value is either a
+            // binding this scan tracks, or (B94) another body's, reached through
+            // a loan.
             Expr::Assignment(target_id, value_id) => {
                 self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
                 match self.expr_id_to_expr_map.get(&target_id) {
-                    Some(Expr::Local(binding)) if resources.contains(binding) => {
-                        if owned.contains(binding) {
-                            overwrites.insert(expr_id);
+                    // The OWNED half: liveness is this scan's own answer, since
+                    // this body is the one that could have moved the value out.
+                    Some(Expr::Local(binding)) if resources.owned_bindings.contains(binding) => {
+                        if owned.contains(binding)
+                            && let Some(type_id) = self.dropped_binding_type_id(*binding)
+                        {
+                            overwrites.insert(expr_id, type_id);
                         }
                         owned.insert(*binding);
                     }
+                    // The LOAN half (B94): the pointee is always live, so the
+                    // set was settled statically before the scan began.
                     _ => {
+                        if let Some(&type_id) = resources.loan_overwrites.get(&expr_id) {
+                            overwrites.insert(expr_id, type_id);
+                        }
                         self.plan_expr(target_id, false, resources, owned, dropped, overwrites);
                     }
                 }
@@ -6073,10 +6172,10 @@ impl<'src> Analyzer<'src> {
         &self,
         branch: &ExprIfBranch,
         consuming: bool,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         let mut conditions: Vec<Id> = Vec::new();
         let mut arms: Vec<PlanArm> = Vec::new();
@@ -6136,10 +6235,10 @@ impl<'src> Analyzer<'src> {
         subject_id: Id,
         legs: &[ExprMatchLeg],
         consuming: bool,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         let subject_is_loan = self.pattern_subject_is_loan(subject_id);
         self.plan_expr(
@@ -6190,10 +6289,10 @@ impl<'src> Analyzer<'src> {
         arms: &[PlanArm],
         _has_implicit_else: bool,
         consuming: bool,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         let entry = owned.clone();
         let mut live_arms: Vec<HashSet<Id>> = Vec::new();
@@ -6235,10 +6334,10 @@ impl<'src> Analyzer<'src> {
         condition: Option<Id>,
         statements: &[Id],
         tail: Id,
-        resources: &HashSet<Id>,
+        resources: &ResourceOwnership,
         owned: &mut HashSet<Id>,
         dropped: &mut HashSet<Id>,
-        overwrites: &mut HashSet<Id>,
+        overwrites: &mut HashMap<Id, TypeId>,
     ) {
         if let Some(condition) = condition {
             self.plan_expr(condition, false, resources, owned, dropped, overwrites);
@@ -6447,19 +6546,19 @@ impl<'src> Analyzer<'src> {
                 worklist.push(type_id);
             }
         }
-        // An overwrite (R2) drops the binding's OLD value in place — the same
-        // binding type. Seed those too, in case the binding is overwritten but
-        // later moved out (so it is not in `dropped_bindings`).
-        let mut overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
-        overwrites.sort_unstable_by_key(|assignment_id| assignment_id.0);
-        for assignment_id in overwrites {
-            if let Some(Expr::Assignment(target_id, _)) =
-                self.expr_id_to_expr_map.get(&assignment_id)
-                && let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id)
-                && let Some(variable) = self.variables.get(binding)
-            {
-                worklist.push(variable.type_id);
-            }
+        // An overwrite (R2) drops the OLD value in place — the overwritten
+        // place's type, which the planner already resolved. Seed those too, in
+        // case the binding is overwritten but later moved out (so it is not in
+        // `dropped_bindings`), and because a B94 loan overwrite has no binding
+        // in this body to be seeded from at all.
+        let mut overwrites: Vec<(Id, TypeId)> = self
+            .overwrite_drops
+            .iter()
+            .map(|(assignment_id, type_id)| (*assignment_id, *type_id))
+            .collect();
+        overwrites.sort_unstable_by_key(|(assignment_id, _)| assignment_id.0);
+        for (_, type_id) in overwrites {
+            worklist.push(type_id);
         }
         // Early teardown (destruction.md §6): `drop(x)` moves `x` into the std
         // `drop` sink, which the transformer rewrites to `x`'s destructor at the
@@ -8253,13 +8352,28 @@ impl<'src> Analyzer<'src> {
         }
         let mut owned: HashSet<Id> = own_params.iter().copied().collect();
         let mut dropped: HashSet<Id> = HashSet::new();
-        let mut overwrites: HashSet<Id> = HashSet::new();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
+        // A loan owns nothing (B94), here as much as in the whole-program plan:
+        // a `&mut T` binding in the body is not a value this instantiation would
+        // have to destroy. `loan_overwrites` is deliberately empty — a generic
+        // body that WRITES through a `&mut T` would owe R2's drop of the pointee
+        // and cannot emit it, which is a leak this check should report; the set
+        // is per-instantiation type information this pass does not compute, so
+        // it is left to R11's own arc rather than half-answered here.
+        let resources = ResourceOwnership {
+            owned_bindings: resource_bindings
+                .iter()
+                .copied()
+                .filter(|binding| !self.binding_or_param_is_view(*binding))
+                .collect(),
+            loan_overwrites: HashMap::new(),
+        };
         self.plan_scope(
             &[],
             &statements,
             tail,
             true,
-            resource_bindings,
+            &resources,
             &mut owned,
             &mut dropped,
             &mut overwrites,
@@ -8285,7 +8399,7 @@ impl<'src> Analyzer<'src> {
         let mut leaked: Vec<(Id, Id, GenericLeak)> = dropped
             .into_iter()
             .map(|binding| (binding, binding, GenericLeak::ScopeEndDrop))
-            .chain(overwrites.into_iter().filter_map(|assignment| {
+            .chain(overwrites.into_keys().filter_map(|assignment| {
                 let Some(Expr::Assignment(target_id, _)) =
                     self.expr_id_to_expr_map.get(&assignment)
                 else {
@@ -10266,12 +10380,96 @@ impl<'src> Analyzer<'src> {
     /// pass reads it against rule 3 (`assignment_target_is_view` — a view
     /// forwarded stays the same view, on purpose), which is a different
     /// question from the one a pattern subject asks.
+    ///
+    /// B97: a **`borrows` CALL** is admitted for the same reason `*view` was.
+    /// `h.slot()` returning `&mut self.pair` produces no storage of its own — it
+    /// names the receiver's, exactly as `h.pair` does — so its captures bind
+    /// pieces of something with another owner and both rules apply. An OWNED
+    /// call result needs no rule: its elements have no other owner, which is
+    /// what B53 §2's "destructuring a FRESH value binds without copying" says.
     fn is_capture_subject_place(&self, expr_id: Id) -> bool {
-        self.is_place_expr(expr_id)
-            || matches!(
-                self.expr_id_to_expr_map.get(&expr_id),
-                Some(Expr::Dereference(_))
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Dereference(_)) => true,
+            Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+            _ => self.is_place_expr(expr_id),
+        }
+    }
+
+    /// The places a pattern subject's storage comes from — what the two write
+    /// questions below are actually about.
+    ///
+    /// For a place or a `*view` that is the subject itself. For a **`borrows`
+    /// call** (B97) it is the arguments the callee projects: the returned view
+    /// aliases their storage, and *which* arguments is `Function::borrows`, read
+    /// at the call site by [`Self::projected_argument_ids`]. That is why the
+    /// question is answerable at all — `capture-clones.md` §7.4's reason that a
+    /// ROOT walk needs no alias analysis holds here because the receiver is
+    /// right there in the call.
+    fn capture_subject_places(&self, subject_id: Id) -> Vec<Id> {
+        let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+            return vec![subject_id];
+        };
+        self.projected_argument_ids(*call_id)
+    }
+
+    /// The argument PLACES a view-returning call projects — the callee's
+    /// `borrows` positions read at the call site (receiver = position 0), with
+    /// an explicit `&mut h` unwrapped to the `h` it names. Empty for a call that
+    /// returns no view.
+    ///
+    /// [`Self::call_view_roots`] is this list taken all the way to binding
+    /// roots, for rule 4's anchor sets; B97 needs the places themselves, because
+    /// the questions it asks of them (writable-view, in-place-written) are the
+    /// same ones it asks of any other subject.
+    fn projected_argument_ids(&self, call_id: Id) -> Vec<Id> {
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return Vec::new();
+        };
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let positions: Vec<u32> = if let Some(function) = self.functions.get(callee_id) {
+            if !function.borrows.is_empty() {
+                function.borrows.iter().copied().collect()
+            } else if !function.has_body && function.returns_mut_view {
+                // A bodiless view-returning callee (a trait signature) declares
+                // no clause and cannot be read: project every argument.
+                (0..function_call.argument_ids.len() as u32).collect()
+            } else {
+                return Vec::new();
+            }
+        } else if let Some(external) = self.external_functions.get(callee_id) {
+            external.borrows.iter().copied().collect()
+        } else {
+            return Vec::new();
+        };
+        positions
+            .into_iter()
+            .filter_map(|position| function_call.argument_ids.get(position as usize).copied())
+            .map(
+                |argument_id| match self.expr_id_to_expr_map.get(&argument_id) {
+                    Some(Expr::Reference(operand, _)) => *operand,
+                    _ => argument_id,
+                },
             )
+            .collect()
+    }
+
+    /// Whether a call returns a view, and if so whether it is writable — the
+    /// `borrows`-call half of [`Self::view_binding_mutability`], factored out
+    /// because B97 asks it of a call that is never bound to anything.
+    fn call_view_mutability(&self, call_id: Id) -> Option<bool> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Expr::Local(callee_id) = self.expr_id_to_expr_map.get(&function_call.subject_id)?
+        else {
+            return None;
+        };
+        if let Some(function) = self.functions.get(callee_id) {
+            return (!function.borrows.is_empty()).then_some(function.returns_mut_view);
+        }
+        let external = self.external_functions.get(callee_id)?;
+        (!external.borrows.is_empty()).then_some(external.returns_mut_view)
     }
 
     /// The "declare it …" clause for an immutable-root diagnostic, from
@@ -10467,6 +10665,20 @@ impl<'src> Analyzer<'src> {
     /// (and the SHARE elision that rides on it — the two sets are disjoint,
     /// since `share_subject_is_stable` admits no writable-view root).
     fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        // B97: a `borrows` CALL is a writable view when the projection it
+        // returns is `&mut` — the arm is total for the same construction
+        // reason, since that is the only way the write reaches the receiver.
+        // It is one ALSO when the receiver it projects is itself reached
+        // through a writable view, which is the arm read one level up.
+        if let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) {
+            if self.call_view_mutability(*call_id) == Some(true) {
+                return true;
+            }
+            return self
+                .projected_argument_ids(*call_id)
+                .into_iter()
+                .any(|place_id| self.subject_is_writable_view(place_id));
+        }
         let Some(root) = self.place_root(subject_id) else {
             return false;
         };
@@ -10493,8 +10705,10 @@ impl<'src> Analyzer<'src> {
     /// not be sound without that root step — `let v = &mut t` outside the arm
     /// and `v.1 = 9` inside it is a write whose own root is `v`.
     fn subject_is_mutated_in_place(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
-        self.place_root(subject_id)
-            .is_some_and(|root| written_roots.in_place.contains(&root))
+        self.capture_subject_places(subject_id)
+            .into_iter()
+            .filter_map(|place_id| self.place_root(place_id))
+            .any(|root| written_roots.in_place.contains(&root))
     }
 
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
@@ -11710,49 +11924,17 @@ impl<'src> Analyzer<'src> {
     /// but a view-typed return is unknowable — conservatively project every
     /// referenced argument (the dispatched default, mirroring `bumps`).
     fn call_view_roots(&self, call_id: Id, origins: &HashMap<Id, Vec<Id>>) -> Vec<Id> {
-        let Some(function_call) = self.function_calls.get(&call_id) else {
-            return Vec::new();
-        };
-        let argument_ids = &function_call.argument_ids;
-        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
-        else {
-            return Vec::new();
-        };
-        let positions: Vec<u32> = if let Some(function) = self.functions.get(callee_id) {
-            if !function.borrows.is_empty() {
-                function.borrows.iter().copied().collect()
-            } else if !function.has_body && function.returns_mut_view {
-                // Dispatched view-return with no clause: every argument position.
-                (0..argument_ids.len() as u32).collect()
-            } else {
-                return Vec::new();
-            }
-        } else if let Some(external) = self.external_functions.get(callee_id) {
-            external.borrows.iter().copied().collect()
-        } else {
-            return Vec::new();
-        };
         let mut roots = Vec::new();
-        for position in positions {
-            let Some(argument_id) = argument_ids.get(position as usize) else {
-                continue;
-            };
-            let argument_roots = match self.expr_id_to_expr_map.get(argument_id) {
-                Some(Expr::Reference(operand, _)) => self
-                    .place_root(*operand)
-                    .map(|root| vec![root])
-                    .unwrap_or_default(),
-                Some(Expr::Local(binding)) => origins
-                    .get(binding)
-                    .cloned()
-                    .or_else(|| self.place_root(*argument_id).map(|root| vec![root]))
-                    .unwrap_or_default(),
-                _ => self
-                    .place_root(*argument_id)
-                    .map(|root| vec![root])
-                    .unwrap_or_default(),
-            };
-            for root in argument_roots {
+        for place_id in self.projected_argument_ids(call_id) {
+            // A view BINDING in the projected position forwards its own origins
+            // (`let v = &x; f(v)` anchors on `x`); anything else roots directly.
+            let place_roots = match self.expr_id_to_expr_map.get(&place_id) {
+                Some(Expr::Local(binding)) => origins.get(binding).cloned(),
+                _ => None,
+            }
+            .or_else(|| self.place_root(place_id).map(|root| vec![root]))
+            .unwrap_or_default();
+            for root in place_roots {
                 if !roots.contains(&root) {
                     roots.push(root);
                 }
@@ -14018,6 +14200,21 @@ impl<'src> Analyzer<'src> {
             if self.type_is_resource(type_id) {
                 continue;
             }
+            // A capture that IS a view never copies either, for the reason a
+            // view exists: it aliases on purpose. B97 is what made this
+            // reachable — a `Some(let v)` capture over an `Option<&mut T>`
+            // call had no rule before, because its subject is a CALL and the
+            // capture pass could not see one. References are transparent, so
+            // `&mut List<i32>` is an aggregate by every type test here, and
+            // copying it deep-copies the borrowed storage: `v[0] = 77` then
+            // lands on the copy and the caller's value never changes
+            // (`option-view.vl`, measured). Materialization above is still
+            // right and still applies — freezing WHICH view is read changes no
+            // aliasing, exactly as the SHARE elision's materialization does
+            // not (`capture-clones.md` §6.2).
+            if self.binding_or_param_is_view(capture_id) {
+                continue;
+            }
             let copy = match self.resource_triggering_constraints(type_id, &capture_type) {
                 triggers if triggers.is_empty() => CopyDecision::Always,
                 triggers => CopyDecision::UnlessResource(triggers),
@@ -15674,6 +15871,10 @@ impl<'src> Analyzer<'src> {
                             return_type_id,
                             extern_binding: function.extern_binding.clone(),
                             borrows,
+                            returns_mut_view: matches!(
+                                return_type_node.map(|spanned| &spanned.0),
+                                Some(Node::Reference(true, _))
+                            ),
                             // Seeded after `build()`: the native-container table, or
                             // the all-`&mut` default (`infer_bumps`). Empty until then.
                             bumps: BTreeSet::new(),
@@ -26859,6 +27060,30 @@ struct WrittenRoots {
     in_place: HashSet<Id>,
 }
 
+/// The static inputs of the drop scan ([`Analyzer::plan_resource_drops`]) —
+/// two answers to the one question R2 asks of an assignment, *who owns the
+/// value being overwritten*.
+///
+/// A binding in `owned_bindings` owns its value, so the scanned body's own
+/// flow settles whether it is still live at a write (and whether its scope end
+/// drops it). A loan owns nothing, and B94 is the consequence: a write through
+/// a `&mut` overwrites a value whose owner is another body's binding entirely,
+/// invisible to this scan — so those assignments are recorded up front, by the
+/// static shape of the target rather than by the scan's flow.
+struct ResourceOwnership {
+    /// Resource-typed bindings that OWN their value: every resource binding
+    /// MINUS the loans. References are transparent (`&mut Holder` has type
+    /// `Holder`), so `let v = &mut holder` mints a resource-typed binding that
+    /// owns nothing — enrolling it made its scope end destroy the borrowed
+    /// value a second time.
+    owned_bindings: HashSet<Id>,
+    /// B94: the assignments that write a resource pointee through a writable
+    /// view, mapped to the pointee type whose outgoing value drops. Static —
+    /// see [`Analyzer::collect_loan_overwrites`] for why no liveness question
+    /// is asked.
+    loan_overwrites: HashMap<Id, TypeId>,
+}
+
 /// What `compute_capture_clone_sites` settles about a program's pattern
 /// captures. Three answers to two independent questions — **is this capture
 /// COPIED**, and **when is it READ** — which B53 and B81/B88 answer
@@ -27196,9 +27421,12 @@ pub struct Program<'src> {
     /// scope in `try`/`finally`, dropping them in reverse declaration order.
     /// Filled by `plan_resource_drops`; empty on resource-free programs.
     pub dropped_bindings: HashSet<Id>,
-    /// Destruction (R2): assignment expression ids that overwrite a still-owned
-    /// resource binding — the old value drops before the new one moves in.
-    pub overwrite_drops: HashSet<Id>,
+    /// Destruction (R2): assignment expression ids that overwrite a live
+    /// resource — the old value drops before the new one moves in — mapped to
+    /// the type of the value being overwritten. Covers both the owned binding
+    /// (`holder = Holder::Empty`) and B94's loan (`self = Holder::Empty` inside
+    /// `&mut self`), which write the same value through different names.
+    pub overwrite_drops: HashMap<Id, TypeId>,
     /// Destruction glue per resource type id (destruction.md §5/§7): the impl's
     /// `drop` method (if any) and the resource members to destroy. The transformer
     /// emits one `__drop_<type>` helper per entry.

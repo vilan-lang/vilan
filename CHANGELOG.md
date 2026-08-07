@@ -30,6 +30,30 @@ The compiler does not intern types — resolving a type mutates it in place, so 
 
 Nothing about behaviour changes; every program in the corpus runs identically before and after. Five goldens moved, all of them shrinking, and each movement is a duplicate disappearing.
 
+---
+
+**A pattern over a `borrows` call copies and reads like every other pattern.** `if h.slot() is (let xs, let n)` — where `slot` hands back `&mut self.cells` — bound `xs` to the receiver's own list rather than a copy of it, and re-read `n` out of the receiver's storage at every mention. Pushing to `h.cells.0` inside the leg grew `xs`; writing `h.cells.1` changed `n` under it. Neither of the two rules that govern a pattern capture fired, because the subject collected no candidates at all: the pass admitted a place and a `*view` and nothing else, and this subject is a *call*.
+
+It is the same hole one spelling over. A call that returns a view produces no storage of its own — it names the receiver's, exactly as `h.cells` does — so its captures bind pieces of something with another owner, which is the whole of the question. The pass asks that question of the arguments the call projects now, which is where the receiver is visible; a call returning an *owned* value stays outside the rule, because its result has no second owner and its captures were always right to bind it directly.
+
+The measurement is what fixed the shape of the rule. Admitting `borrows` calls newly reaches `Option<&mut T>` returns, whose `Some(let v)` capture *is* a view — and because references are transparent in the type system, `&mut Inner` looks like an ordinary aggregate to every test in the pass, so the copy rule fired on it and `v.n = 77` started writing a copy. A view aliases on purpose; it never copies. With that clause the corpus does not move at all, and without it two goldens do, one of them wrongly.
+
+The rule reaches the `&` direction too, which is why it is not simply "does this call return `&mut`". A readonly projection cannot be written *through*, but the receiver it projects can be written under its own name while the leg is live, and the capture aliases the receiver's storage either way. Chained projections work for the mirror reason — `o.inner_mut().peek()` is readonly, but what it was projected from is not, so the storage it names is writable after all.
+
+---
+
+**Writing a resource through a `&mut` view destroys what it replaces.** `fun clear(&mut self) { self = Holder::Empty }` on a `Holder::Full(Guard)` used to destroy nothing at all. The guard was still there, in a slot nothing could reach any more, and its destructor never ran — no diagnostic, no output, a silent leak.
+
+Assigning onto an owned binding has always done the right thing: `holder = Holder::Empty` drops the guard it displaces, which is the language's overwrite rule. The rule was written about a binding that *owns* a resource, and the machinery implemented it literally — it tracks the bindings a body owns, a loan owns nothing, so a write through `&mut self` matched nothing and planned nothing. The scope-end teardown then read the *new* tag and correctly found nothing to destroy.
+
+The two spellings write the same storage under different names, so they now do the same thing. The width of the variant was never the mechanism: a same-width `Full(g1)` → `Full(g2)` leaked exactly as hard as a shrinking one, and so did a `&mut` parameter, a `&mut` local, a struct pointee with no enum tag anywhere, and a re-borrow two calls deep. All of them destroy their outgoing value now, running the same per-type destructor in the same order the owned spelling runs it — and the drop is emitted *before* the write truncates the payload out from under it.
+
+The loan asks no "is it still alive" question, and does not need one. It cannot move the pointee out — matching a loan inspects without consuming, and a field is not movable out of a live aggregate — and a binding its owner already moved out of is dead, so lending it is use-after-move, which was already an error. The owned spelling keeps its own liveness check for the case only it can reach.
+
+The same sentence fixed a second leak in the other direction. Because `&mut Holder` *is* `Holder` to the type system, `let v = &mut holder` minted a resource-typed local, and the teardown planner enrolled it as an owner — so the borrowed value was destroyed twice, once at the view's scope end and once at the owner's. A loan owns nothing: it neither escapes destroying what it overwrites nor destroys what it merely borrows.
+
+Found while proving it and filed rather than ridden in on: overwriting a resource-holding *component* — `slot.held = Holder::Empty` — still destroys nothing. That is a different rule (the one about fields, not the one about bindings) over a different set of programs, and it gets its own pass.
+
 
 ---
 
@@ -39,7 +63,7 @@ The write has to keep the pointee's identity — that is how it reaches the call
 
 The other shrinking shape is an enum reassigned to a smaller variant. `self = Feed::Done` over a `Feed::Ready(List<str>, i32)` wrote the tag and left the list and the index sitting in the slots behind it: unreachable through the enum's own API, since every read goes through the tag, but present in the value — and where the payload is a **resource**, a live object with a destructor that nothing can reach any more. The write truncates now, so a shortened value is the value you wrote and nothing else.
 
-One thing this does *not* fix, and it is recorded rather than quietly left: overwriting a variant through a view does not run the old payload's destructor. Assigning onto an owned binding does — `holder = Holder::Empty` drops the guard it displaced, which is the language's overwrite rule — but through a `&mut` loan no drop is planned, because the rule is written about a binding that *owns* a resource and a loan owns nothing. Truncating the slot does not change that either way; it only means the leaked object is no longer also reachable from the enum. Whether a loan may destroy the value it borrows is a memory-model question rather than a codegen one, and it is filed as one, with the program that shows it pinned as a failing case.
+One thing this did *not* fix was recorded rather than quietly left: overwriting a variant through a view did not run the old payload's destructor, because the overwrite rule is written about a binding that *owns* a resource and a loan owns nothing. Truncating the slot did not change that either way; it only meant the leaked object was no longer also reachable from the enum. That was a memory-model question rather than a codegen one, and it is answered above, in this same release.
 
 Two corpus goldens moved, both by exactly the new write and the small helper behind it; nothing else in the corpus changed.
 
