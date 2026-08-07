@@ -1,37 +1,26 @@
-# PR CI (proposal/windows-support.md §8, slice S0). Until now the suite ran
-# exactly once per release — at tag push, on ubuntu only (release.yml's `gate`
-# job). This runs it on every PR and every push to `next`/`main`, on ubuntu
-# **and** windows.
+# PR CI (proposal/windows-support.md §8, slice S0). Before this file existed
+# the suite ran exactly once per release — at tag push, on ubuntu only
+# (release.yml's `gate` job). This runs it on every PR and every push to
+# `next`/`main`, on ubuntu **and** windows.
 name: ci
 
-# Root prose never turns the suite red, so it does not buy a windows leg.
-# vilan/docs/** and vilan/proposal/** are deliberately NOT ignored: docs
-# fences are compiled by the docs gate, and the hygiene tripwire reads the
-# proposals. If these checks ever become required on protected PRs, switch
-# from paths-ignore to an always-running filter job — a skipped required
-# check leaves a PR stuck at "Expected".
+# NOTE the shape here, and do not put `paths-ignore` back (process.md §2.5,
+# §8.2). This workflow used to carry `paths-ignore` on both triggers, listing
+# the root prose files. A PR touching only those produced **no workflow run at
+# all** — not a skipped job, no run — and a required check that never reports
+# strands the PR at "Expected — waiting for status to be reported", forever.
+# That file list is close to a description of a first-time contributor's first
+# PR, so the first external README typo fix would have been unmergeable.
+#
+# Moving the filter to the job level does not fix it either while the filter
+# sits on `on:`: no trigger means no jobs, so an aggregator inside the workflow
+# would not run either. The filter has to move *into* the workflow, which is
+# what `changes` below is. The workflow now always triggers; the expensive legs
+# decide for themselves whether to run; `check` always reports.
 on:
   pull_request:
-    paths-ignore:
-      - README.md
-      - AI_STANCE.md
-      - AGENTS.md
-      - CLAUDE.md
-      - CODE_OF_CONDUCT.md
-      - LICENSE-APACHE
-      - LICENSE-MIT
-      - .gitignore
   push:
     branches: [next, main]
-    paths-ignore:
-      - README.md
-      - AI_STANCE.md
-      - AGENTS.md
-      - CLAUDE.md
-      - CODE_OF_CONDUCT.md
-      - LICENSE-APACHE
-      - LICENSE-MIT
-      - .gitignore
 
 # A superseded run on the same ref is cancelled; the newest push is the one
 # whose result matters.
@@ -40,7 +29,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Seconds of ubuntu, and it always runs. Deliberately a plain `git diff`
+  # rather than a filter action: this repository takes no dependency it can
+  # write itself in ten lines, and a third-party action in the path of the
+  # required check is a supply-chain surface for no gain.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The filter diffs against the base commit, so one commit is not
+          # enough. Full history is the only depth that is *always* enough (a
+          # long-lived branch or a force-push can put the base arbitrarily far
+          # back) and it costs seconds on a repository this size.
+          fetch-depth: 0
+      - id: filter
+        env:
+          # `pull_request` gives the PR's base; the checked-out ref is the merge
+          # commit, so base..HEAD is exactly the PR's net effect. `push` gives
+          # the commit the branch pointed at before this push. Read through env
+          # rather than interpolated into the script body — these are shas, but
+          # the habit is what keeps a workflow un-injectable.
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        # Every uncertain answer is `true`. A filter that wrongly skips the
+        # suite is a hole in the gate; a filter that wrongly runs it costs
+        # runner minutes. Those are not the same kind of mistake.
+        run: |
+          set -eu
+
+          if [ -z "${BASE_SHA:-}" ] \
+              || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+              echo "::notice::no usable base commit ('${BASE_SHA:-}') — running the suite"
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" HEAD)
+          echo "changed since $BASE_SHA:"
+          echo "$CHANGED"
+
+          # Root prose never turns the suite red, so it does not buy a windows
+          # leg. vilan/docs/** and vilan/proposal/** are deliberately NOT in
+          # this set: docs fences are compiled by the docs gate, and the hygiene
+          # tripwire reads the proposals. Anything not listed here is code.
+          PROSE='^(README\.md|AI_STANCE\.md|AGENTS\.md|CLAUDE\.md|CODE_OF_CONDUCT\.md|LICENSE-APACHE|LICENSE-MIT|\.gitignore)$'
+
+          if [ -z "$CHANGED" ] || printf '%s\n' "$CHANGED" | grep -qvE "$PROSE"; then
+              echo "::notice::a non-prose path changed — the suite runs"
+              echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+              echo "::notice::root prose only — the suite is skipped, and \`check\` still reports"
+              echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       # Both legs always run: the windows result is the deliverable here, so a
       # red ubuntu leg must not cancel it.
@@ -70,6 +117,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # THE gate command. release.yml's `gate` job runs these same two legs,
+      # character for character, and they change together — see releases.md §7
+      # step 1 for what happened the one time they disagreed.
       - name: The suite is green
         run: cargo nextest run --workspace
       # nextest does not run doc-tests. Every doc-test set is empty today;
@@ -85,6 +135,8 @@ jobs:
   # dependency that quietly stops compiling for the target would otherwise
   # surface at release time, or on the site.
   wasm:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,3 +163,36 @@ jobs:
           wasm-bindgen --target web --out-dir pkg \
             target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
           ls -l pkg/vilan_wasm_bg.wasm
+
+  # **This is the job to make a required status check** (process.md §2.5, where
+  # it is called `ci`; the context reads `ci / check`). Everything above it can
+  # legitimately not run; this cannot, which is the entire point — a required
+  # check that can be skipped is a PR stuck at "Expected" forever.
+  #
+  # `if: always()` runs it whatever the needed jobs did. The semantics are:
+  #
+  #   success  -> pass    the leg ran and was green
+  #   skipped  -> pass    the leg legitimately did not run (prose-only change,
+  #                       or `changes` short-circuited it)
+  #   failure  -> FAIL    a real leg went red
+  #   cancelled-> FAIL    the result is unknown, and unknown is not green
+  #
+  # So a docs-only or root-prose-only push takes the cheap path — `changes`
+  # runs, `test` and `wasm` skip, `check` is green — and any red leg turns
+  # `check` red. `changes` is in `needs` on purpose: if the filter itself
+  # fails, the two legs skip, and without this the aggregate would call that
+  # a pass.
+  check:
+    needs: [changes, test, wasm]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: What each needed job did
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS"
+      - name: A needed job failed or was cancelled
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::a needed job did not pass — see the results above"
+          exit 1
