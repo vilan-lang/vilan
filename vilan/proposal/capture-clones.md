@@ -363,3 +363,189 @@ a writable view has no shape where its temp is a snapshot — whereas the place
 case needs either an alias analysis or materializing every capture
 unconditionally, and the latter moves goldens across the corpus and turns B59's
 placement question on for every guarded leg. Filed rather than patched.
+
+## 7. B88 — the place path's own write form, 2026-08-07
+
+> §6.5's open item, closed. Same seam, same path, one write-form over. The
+> §6.1 diagnosis holds up exactly: an owned place's *whole-binding* assignment
+> rebinds and leaves the temp a snapshot, so B81 could stop there — but that
+> is one write form out of several, and the rest of them do to an owned place
+> precisely what a view's assignment does.
+
+### 7.1 The shapes, measured
+
+The filed repro is one of seven. Probed against the shipped v0.32.0, each an
+`is`/guarded leg over an owned `mut` place with a scalar capture:
+
+| shape | write | before |
+|---|---|---|
+| tuple component | `t.1 = 99` | 99 |
+| subject under a field | `h.pair.1 = 99` | 99 |
+| fixed-array element | `marr[1] = 99` | 99 |
+| indexed subject | `rows[0].1 = 99` | 99 |
+| nested component | `n.0.1 = 99` | 99 |
+| `&mut self` method | `counter.bump()` | 99 |
+| write through a `&mut` of the subject | `vv.1 = 99` | 99 |
+
+Six shapes were *already* right and stay pinned as such: a whole assignment
+(`t = (1, 2)`), a whole field assignment (`he = E::Pair(..)`), a write to a
+DISJOINT field of the same root, an unguarded `match` leg, a `let`
+destructure, and an aggregate capture (B53 copies it eagerly, so no seam).
+
+### 7.2 The two candidates, measured before choosing
+
+§6.5 named both. Each was implemented far enough to rebuild the whole corpus
+and run the analyzer gate.
+
+| | goldens moved | analyzer gate | probe shapes correct |
+|---|---|---|---|
+| **(a)** materialize every place-subject capture | **6** | 1810 pass | 13 / 13 |
+| **(b)** materialize on an in-place write set | **0** | 1810 pass | 13 / 13 |
+
+Both are *correct*. What separates them is what (a) costs, and the diffs say it
+plainly — the six are not six added copies:
+
+- `capture-clones.js` — **`width` regresses**, which is the case §6.2 widened
+  the predicate to WRITABILITY to protect and pinned in bytes for exactly this
+  reason. Under (a) a `&self` walker's captures stop sharing and start
+  declaring. `guarded_width` and `grow_first` move too.
+- `match-patterns.js`, `resource_take.js`, `capture-clones.js::guarded_width`
+  — three programs leave the else-if chain for B59's flat `matched`-flag
+  sequence, because a guard that reads a capture now reads a *declaration*.
+  That is §6.5's "turns B59's placement question on for every guarded leg",
+  observed rather than predicted, and it duplicates the capture's declaration
+  into every leg that binds one (`const x = $e; … const x2 = $e;`).
+- `equality.js`, `generic-equality.js`, `json-roundtrip.js` — plain additions,
+  all on `&self`/immutable subjects that owe nothing.
+
+So (a) buys totality by taking back a shipped elision and restructuring
+unrelated matches. **(b) ships.**
+
+### 7.3 The rule
+
+> A capture is materialized — read once, at the match — when the storage its
+> subject names can be mutated **in place** while the leg is live.
+
+One question, two arms, and the asymmetry is §6.1's own finding rather than a
+special case:
+
+- Through a **writable view** root, every write is in place by construction —
+  that is how a write through a view reaches the caller at all. The arm needs
+  no write to be found, and stays exactly as §6.2 shipped it.
+- Through an **owned place** root, a whole-binding assignment rebinds and every
+  other form does not. So the arm asks whether the program contains an in-place
+  write rooted there: a **component** assignment (`Field` / `TupleIndex` /
+  `Index` / `Deref` target), an explicit **`&mut`**, or a **`&mut`-bound
+  argument** — the receiver included, and every place argument of an
+  unresolvable callee.
+
+Those are the three forms `collect_written_roots` already records for rule 2's
+SHARE elision; the pass now returns them split (`WrittenRoots { any, in_place
+}`) rather than collecting them twice. `any` keeps answering the SHARE
+question — *may a capture alias this subject at all* — unchanged, and
+`in_place` answers this one.
+
+### 7.4 Why the question is asked at the ROOT
+
+An arm-scoped write-set walk — "can the body of this arm write a component of
+this subject" — is **not soundly implementable** on its own, and the
+counterexample is two lines:
+
+```vilan
+mut vt = (7, 3);
+let vv = &mut vt;
+if vt is (let a, let b) { vv.1 = 99; print(b) }
+```
+
+The write inside the arm has place root `vv`. Nothing in the arm mentions `vt`.
+To connect them an arm walk would need view-alias tracking, which is the
+whole-program assumption §6.5 was worried about. The root question does not
+need it: minting the second name is `&mut vt`, itself one of the three recorded
+forms, so the root is where the connection is already visible. Calls are sound
+for the same pre-existing reason — a `&mut`-bound argument is recorded, and an
+unresolvable callee (dispatched, generic) conservatively counts every place
+argument.
+
+The cost is coarseness in the other direction: a write to a *disjoint* field of
+the same root (`h.tag = 1` under a subject of `h.pair`) materializes a capture
+that never needed it. That changes no answer, and it is the same granularity
+rule 2's SHARE elision has always used. Pinned as
+`a_disjoint_field_write_leaves_a_sibling_subject_correct`.
+
+### 7.5 Doctrine per payload shape
+
+Unchanged from §6.2/§6.3 — that is the point, and the twins are what check it:
+
+- **Values** materialize. A scalar read IS the copy, so the declaration alone
+  fixes the timing (`an_is_capture_from_a_component_written_place_reads_the_
+  prematch_value`).
+- **Aggregates** copy, per B53 §2.2, and were already eager because of it.
+  `both_capture_shapes_survive_a_component_write_to_the_place` is the place
+  twin of §6's `both_capture_shapes_survive_an_in_place_write_through_the_view`
+  — same two shapes, same two component writes, same answers.
+- **Resources** materialize **BARE**: `const c = $a[0]`, no `__clone`. R1
+  forbids the copy and B65 forbids inventing one (`affine-moves.md` §9.1), so
+  the declaration fixes *which value is loaned* without minting a second owner.
+  `a_resource_capture_from_a_component_written_place_loans_the_prematch_payload`
+  asserts both halves — the value (1, not 6) and the absent `__clone`. B62's
+  leg teardown is unaffected for §6.3's reason: `capture_drop_nodes` reads the
+  alias table after materialization.
+
+### 7.6 Pins and non-vacuity
+
+Fifteen pins in `inference.rs`, four plants:
+
+| plant | red |
+|---|---|
+| the place arm removed (back to §6.2's condition) | 11 |
+| a whole-binding rebind counted as an in-place write | 1 (`a_whole_assignment_to_the_subject_still_leaves_its_captures_aliasing`) |
+| the explicit `&mut` dropped from the in-place set | 1 (`a_write_through_a_mut_view_of_the_subject_does_not_reach_its_captures`) |
+| the `&mut`-bound argument dropped from the in-place set | 1 (`a_mut_self_method_call_does_not_reach_a_capture_of_its_receiver`) |
+
+A fifth plant (B53's capture copy removed) takes the two-shape pin to `4\n4\n`,
+which is what makes it red on both axes — 12 without the materialization, 4
+without the copy. The three pins green under every plant are exactly the three
+that pin UNCHANGED behavior: the unguarded leg, the `let` destructure, and the
+disjoint field write.
+
+**No corpus golden moved.** Not by luck: `capture-clones.vl`'s place-subject
+functions (`grow_first`, `sum_over`, `total_width`, `guarded_width`,
+`first_or`, `first_or_guarded`) all take readonly or never-written subjects, so
+none is in the in-place set, and §6's viewed trio (`step`, `width`,
+`viewed_guarded`) rides the untouched view arm.
+
+### 7.7 Bycatch — a `borrows` CALL subject is §6.4 all over again
+
+Found while scoping this arc, verified, **not fixed here**. A method that
+returns a `&mut` projection (`borrows self`) hands the pattern a subject that
+aliases the receiver's storage — but the expression is a **call**, and
+`is_capture_subject_place` admits `Local`/`Field`/`TupleIndex`/`Index`/`Deref`
+and nothing else. So that subject collects **no capture candidates at all**,
+exactly as `*view` did before §6.4, and both rules are missing at once:
+
+```vilan
+struct Holder { pair: (i32, i32) }
+impl Holder {
+    fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+}
+
+mut h = Holder { pair = (7, 3) };
+if h.slot() is (let a, let b) { h.pair.1 = 99; print(b) }   // 99, want 3
+```
+
+```vilan
+mut g = Holder2 { cells = ([1, 2], 3) };
+if g.slot() is (let xs, let n) { g.cells.0.push(9); print(xs.len()) }  // 3, want 2
+```
+
+The emitted bytes name the defect outright: `const $c = slot2(g); … $c[0]` —
+no `__clone` anywhere, so the aggregate capture aliases the receiver's element
+(B53 §1's original bug), and the scalar re-reads the mutated slot (§6.1's).
+Pinned `#[ignore]`d as `a_borrows_call_subject_copies_its_captures` and
+`a_borrows_call_subject_reads_the_prematch_value`.
+
+Not widened into this arc for the reason §6.5 gave for this one: the fix is a
+different predicate (which calls return views — `Function::borrows` /
+`returns_mut_view` already answer it) reaching a different set of programs, and
+it deserves its own measurement rather than a rider on this one. An owned
+call result needs no rule: nothing else names it.
