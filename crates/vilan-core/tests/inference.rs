@@ -42756,6 +42756,170 @@ fn b72_a_bare_trait_return_is_still_accepted() {
     );
 }
 
+// --- B4 §2.2: a bare trait annotation must not launder a resource -----------
+//
+// `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis
+// classifies `Type::Trait` as "never a resource by containment", and marks that
+// verdict COMPLETE — correct for the `Self` meaning of `Type::Trait`, a lie for
+// the "a user annotated a value with a trait" meaning. So annotating a
+// resource-carrying value with a bare trait type silently deletes its
+// destructor call and silently licenses a second owner: containment inference
+// (`spec/memory.md` §341-346) cannot see through the trait type, so R1, R2 and
+// R10 never fire and scope-end destruction never happens. This is `spec/
+// memory.md` R12's laundering hazard through a sink R12 does not name, and
+// unlike `any` it does not even produce a diagnostic. Live data loss, in
+// shipped code, with no trait objects anywhere.
+//
+// Each leak case is paired with its CONCRETE control, which passes today and
+// must keep passing: the controls are what make the pins non-vacuous — they
+// prove the destructor machinery is live and that only the trait annotation
+// suppresses it.
+//
+// The ratified fix is the §12.2 tightening (a trait in value position is an
+// error at the annotation), so the closed shape of each leak is a REFUSAL, not
+// a destructor that runs. Un-ignore when that ships.
+
+#[test]
+fn a_resource_binding_runs_its_destructor() {
+    // P8's control arm, concrete annotation: `drop` runs at scope end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Handle = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+#[ignore = "B4 §2.2: a bare trait annotation suppresses the destructor; closed by the §12.2 tightening"]
+fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
+    // P8 row 2. Today this compiles, runs, prints `ok` and NEVER prints
+    // `closing` — one changed word in the annotation deleted the destructor.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Named = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_runs_its_destructor() {
+    // P8's control arm, by containment: an aggregate holding a resource behind
+    // a CONCRETE field is a resource, and its scope end destroys it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+#[ignore = "B4 §2.2: a bare trait FIELD hides the resource from containment; closed by the §12.2 tightening"]
+fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
+    // P8 row 4 — the field route, which is the dangerous one: the resource is
+    // reachable, owned, and invisible to containment inference.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_keeps_its_single_owner() {
+    // P9's control arm: through a concrete field, the affine checker sees the
+    // resource and refuses the second owner.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
+        "#,
+        "use of `holder` after it was moved",
+    );
+}
+
+#[test]
+#[ignore = "B4 §2.2/P9: a bare trait field launders the single-owner rule; closed by the §12.2 tightening"]
+fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
+    // P9. Today this compiles, runs, prints `ok`, and emits
+    // `const holder = [ [ 1 ] ];` — one resource, two live owners, no drop.
+    assert_fails(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
+        "#,
+    );
+}
+
 // --- B74: the duplicate check reaches statics (method-resolution.md §9) -----
 //
 // B57's duplicate-inherent check filtered `is_self_method`, per its own scope,
