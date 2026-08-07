@@ -3760,24 +3760,30 @@ impl<'src> Transformer<'src> {
                 }
             }
             Expr::Assignment(target_id, value_id) => {
-                // R2 (destruction.md §5): assigning onto a binding that still owns
+                // R2 (destruction.md §5): assigning onto a place that still holds
                 // a resource drops the OLD value first, then moves the new one in.
-                // The analyzer flagged the assignment; the target is a resource
-                // `Local` (only those are recorded).
-                if self.program.overwrite_drops.contains(&id) {
-                    let overwrite = match self.program.entity_map.get(target_id) {
-                        Some(Expr::Local(binding)) => self
-                            .program
-                            .variables
-                            .get(binding)
-                            .map(|variable| (*binding, variable.type_id)),
+                // The analyzer flagged the assignment and resolved the overwritten
+                // value's type; two target shapes reach here and both name the same
+                // storage the write is about to clobber — a resource `Local`, and
+                // (B94) the synthetic `Dereference` of a writable view, whose
+                // pointee is the caller's value. The drop is pushed BEFORE the new
+                // value is walked, so it runs before `__replace` truncates the
+                // payload out from under it (B89).
+                if let Some(&type_id) = self.program.overwrite_drops.get(&id) {
+                    let overwritten = match self.program.entity_map.get(target_id) {
+                        Some(Expr::Local(binding)) => {
+                            Some(js::Node::Local(self.ng.name_for(*binding)))
+                        }
+                        Some(Expr::Dereference(operand)) => {
+                            let operand = *operand;
+                            self.walk_entity(operand, block)
+                        }
                         _ => None,
                     };
-                    if let Some((binding, type_id)) = overwrite {
-                        let target = js::Node::Local(self.ng.name_for(binding));
-                        if let Some(drop) = self.resource_drop_of(type_id, target) {
-                            block.push(drop);
-                        }
+                    if let Some(overwritten) = overwritten
+                        && let Some(drop) = self.resource_drop_of(type_id, overwritten)
+                    {
+                        block.push(drop);
                     }
                 }
                 let value = self.walk_entity(*value_id, block).unwrap_or(js::Node::Void);

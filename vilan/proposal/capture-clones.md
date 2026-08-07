@@ -565,3 +565,45 @@ different predicate (which calls return views — `Function::borrows` /
 `returns_mut_view` already answer it) reaching a different set of programs, and
 it deserves its own measurement rather than a rider on this one. An owned
 call result needs no rule: nothing else names it.
+
+## 8. B94 — the doctrine leaves the capture pass, 2026-08-07
+
+> Not a capture finding, recorded here because it is the same doctrine and the
+> §7.7 arc's sibling. B81/B88 said a capture must not be able to tell whether
+> its subject is reached through a view or through the place the view names.
+> B94 is that sentence one layer down, about the WRITE rather than the read: a
+> write through a view must not be able to tell either. Ruled 2026-08-07,
+> shipped in the same lane as §9. The rule and its reasoning live in
+> `destruction.md` §4 R2; this note records only what the two arcs share.
+
+The shape is §6.1's, inverted. §6.1's premise was that a subject temp is a
+stable snapshot, which holds through a rebind and fails through a view because
+**a write through a view is an in-place mutation of the pointee**. R2's
+implementation rested on the mirror premise — that the body doing the write
+owns what it overwrites — which holds for a place and fails through a view for
+the *same* reason: the value being clobbered belongs to a binding in another
+frame entirely. Both premises were unstated, both were true of exactly one
+spelling, and both were found by asking the owned twin what it answers.
+
+The B88 measurement discipline did not apply and was not paid. §7.2 measured
+two candidate predicates because both were correct and the choice was about
+cost; here the ruling fixed the predicate (the loan drops what it overwrites)
+and the only open question was its reach, which is a shape enumeration rather
+than a corpus tradeoff. Eleven runtime pins, one byte pin for the drop/write
+order, four plants; `resource.vl` gains `view_overwrite`, `refill`,
+`view_writes` and `loaned`, the last being the byte proof of the OTHER half —
+a `&` local of a resource takes no teardown of its own.
+
+The two halves are worth naming together, because one filter serves both.
+References are transparent, so `&mut Holder` *is* `Holder`, and a resource
+binding is a resource binding whether it owns or borrows. The planner read that
+set as "owners" and got both answers wrong in opposite directions: a loan was
+excused from destroying what it overwrote, and charged for destroying what it
+merely borrowed. `ResourceOwnership::owned_bindings` is the set minus the
+loans, and the two bugs close on the one line.
+
+**Left open**, on §6.5's standing reason: a COMPONENT write over a resource
+(`slot.held = Holder::Empty`) destroys nothing, on an owned place and through a
+view alike. R2 is written about a binding and R5 about reading and moving a
+field; writing over one falls between them. A different predicate over a
+different set of programs — filed, pinned `#[ignore]`d, not ridden in.

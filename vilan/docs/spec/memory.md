@@ -370,8 +370,41 @@ changes no ownership and is policed by rule 4.
 - **R1: binding moves.** `let b = a;` transfers ownership; any later use of
   `a` is a compile error naming the move site. No copies ever fire for a
   resource.
-- **R2: overwrite drops.** Assigning onto a binding that still owns a
-  resource drops the old value first, then moves the new one in.
+- **R2: overwrite drops.** Assigning onto a place that still holds a
+  resource drops the old value first, then moves the new one in. A write
+  **through a `&mut` view** is such an assignment: it mutates the pointee in
+  place — that is how the write reaches the caller at all — so it destroys
+  what it replaces even though the loan owns nothing. The two spellings are
+  indistinguishable by design, because they write the same storage under
+  different names:
+
+  ```vilan
+  import std::print;
+  import std::drop::Drop;
+
+  resource struct Guard { label: str }
+  impl Guard with Drop {
+      fun drop(&mut self) { print(self.label); }
+  }
+
+  enum Holder { Full(Guard), Empty }
+  impl Holder {
+      fun clear(&mut self) { self = Holder::Empty; }   // drops the Guard
+  }
+
+  fun main() {
+      mut viewed = Holder::Full(Guard { label = "viewed" });
+      viewed.clear();                                  // prints "viewed"
+
+      mut owned = Holder::Full(Guard { label = "owned" });
+      owned = Holder::Empty;                           // and so does this
+  }
+  ```
+
+  The loan asks no liveness question and needs none: it cannot move the
+  pointee out (R5, R6), and a binding its owner already moved out of is dead,
+  so lending it is use-after-move (R1). The drop runs the same per-type glue
+  in the same order the owned spelling does.
 - **R3: parameters.** `self` / bare `x` / `&x` / `&mut x` are loans,
   unchanged (§6.3's table is the by-convention index of this line); `own
   x` is a move, and for a resource *only* a move: an `own` argument that is
@@ -504,6 +537,12 @@ R11) — and the same split holds for pattern captures: a concrete one drops
 at its arm's end, while inside a generic body no `T`-typed capture may be
 left owning at all.
 
+- **A loan takes no teardown.** Only an owner destroys. A view *binding* of a
+  resource (`let v = &mut holder`) names storage another binding still owns,
+  so its scope end drops nothing — its referent is destroyed once, where the
+  owner's scope ends. This is the same sentence R2's view-write half reads in
+  the other direction: a loan owns nothing, so it neither destroys at its own
+  scope end nor is excused from destroying what it overwrites.
 - **Module-level resources never drop.** A top-level `let` resource has
   process lifetime (the serve-forever server's `Database`). It is
   consequently **loan-only**: moving it into a local, an `own` argument, or

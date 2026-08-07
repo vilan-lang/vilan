@@ -61,6 +61,37 @@ fun containment() {
 	print("containment-body");
 }
 
+// B94: R2 through a LOAN. A write through a `&mut` view overwrites a value
+// another body owns, so it drops what it replaces exactly as `overwrite` above
+// does — and the drop is emitted BEFORE the `__replace` that truncates the
+// payload out from under it.
+resource struct Slot { held: Res }
+
+impl Slot {
+	// The `&mut self` spelling.
+	fun refill(&mut self) { self = Slot { held = Res { tag = "refilled" } }; }
+}
+
+// The `&mut x` parameter spelling of the same write.
+fun view_overwrite(slot: &mut Slot) {
+	slot = Slot { held = Res { tag = "replaced" } };
+}
+
+fun view_writes() {
+	mut slot = Slot { held = Res { tag = "original" } };
+	view_overwrite(&mut slot);
+	slot.refill();
+	print("view-writes-body");
+}
+
+// A loan owns nothing, so a view LOCAL of a resource takes no teardown of its
+// own: only `s` is wrapped, and "loaned" prints once.
+fun loaned() {
+	let s = Slot { held = Res { tag = "loaned" } };
+	let v = &s;
+	print("loaned-body");
+}
+
 fun main() {
 	locals();
 	print("--");
@@ -73,4 +104,8 @@ fun main() {
 	nested();
 	print("--");
 	containment();
+	print("--");
+	view_writes();
+	print("--");
+	loaned();
 }

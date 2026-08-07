@@ -1,3 +1,7 @@
+function __replace(target, value) {
+	if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;
+	return Object.assign(target, value);
+}
 function drop(self) {
 	console.log(self[0]);
 }
@@ -55,6 +59,32 @@ function containment() {
 		$e(bag);
 	}
 }
+function refill(self) {
+	$g(self);
+	__replace(self, [ [ "refilled" ] ]);
+}
+function view_overwrite(slot) {
+	$g(slot);
+	__replace(slot, [ [ "replaced" ] ]);
+}
+function view_writes() {
+	let slot = [ [ "original" ] ];
+	try {
+		view_overwrite(slot);
+		refill(slot);
+		console.log("view-writes-body");
+	} finally {
+		$g(slot);
+	}
+}
+function loaned() {
+	const s = [ [ "loaned" ] ];
+	try {
+		console.log("loaned-body");
+	} finally {
+		$g(s);
+	}
+}
 function $a($b) {
 	drop($b);
 }
@@ -65,6 +95,9 @@ function $c($d) {
 }
 function $e($f) {
 	$a($f[0]);
+}
+function $g($h) {
+	$a($h[0]);
 }
 locals();
 console.log("--");
@@ -77,3 +110,7 @@ console.log("--");
 nested();
 console.log("--");
 containment();
+console.log("--");
+view_writes();
+console.log("--");
+loaned();

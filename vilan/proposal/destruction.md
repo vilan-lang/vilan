@@ -100,6 +100,44 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   resources.
 - **R2 — overwrite drops.** Assigning onto a binding that still owns a resource drops the
   old value first, then moves the new one in (deterministic; Rust's rule).
+  *(Amended 2026-08-07 — B94, ruled and shipped in the v0.34.0 resources-drop lane.)*
+  Read the rule over the **place**, not the binding: a write **through a
+  writable view** drops the pointee's outgoing value too. A write through a
+  view is an in-place mutation of the pointee — that is how it reaches the
+  caller at all — so it destroys what it replaces exactly as the owned twin
+  does, and the two spellings are indistinguishable by design (the same
+  doctrine `capture-clones.md` §6.2/§7.3 applied to captures). The
+  implementation had taken the rule literally: `plan_resource_drops` tracks
+  bindings the scanned body OWNS, a loan owns nothing, so `self =
+  Holder::Empty` inside `&mut self` planned no drop and the scope-end glue then
+  read the NEW tag and found nothing — a silent leak, unrelated to width (a
+  same-width `Full(g1)` → `Full(g2)` leaked identically).
+  - **No liveness question, and none is needed.** The scan's `owned` set exists
+    because a body can move its own binding out and must not then drop it
+    twice. A loan cannot reach that state: it cannot move the pointee out (R5,
+    R6), and a binding its OWNER moved out of is dead, so lending it is R1
+    use-after-move — already rejected, and pinned as such. A repeated write
+    through one view is safe for a third reason: the glue reads the pointee's
+    CURRENT contents, which the previous write already replaced.
+  - **The drop precedes the write**, which B89's truncating `__replace` makes
+    load-bearing rather than cosmetic: the write sets `target.length =
+    value.length` before merging, so a drop emitted after it would destroy
+    slots that no longer exist. Pinned in bytes.
+  - **The same sentence, read the other way.** A loan owns nothing, so it takes
+    no scope-end teardown either. References are transparent (`&mut Holder`
+    *is* `Holder`), so `let v = &mut holder` minted a resource-typed local the
+    planner enrolled as an owner and the emitted program destroyed the borrowed
+    value twice. Fixed here, by the one filter both halves ride.
+  - **Left open, filed rather than patched.** A COMPONENT write — `slot.held =
+    Holder::Empty`, and the same through a view — overwrites a live resource
+    and destroys nothing. R2 is spelled over a binding and R5 is spelled over
+    reading and moving a field, so no rule covers writing over one; it is a
+    different predicate over a different set of programs and wants its own
+    measurement. Pinned `#[ignore]`d as
+    `a_component_write_to_a_resource_field_drops_the_old_value`. The generic
+    twin is open too: a body that writes through a `&mut T` would owe R2's drop
+    at a resource instantiation and cannot emit it, which R11's
+    `check_own_generic_exactly_once` does not yet report.
 - **R3 — parameters.** `self` / `&x` / `&mut x` conventions are loans, unchanged. `own x`
   is a move — and for resources it is *only* a move: where a data `own` argument silently
   copies when not at last use, a resource argument that is not the binding's last use is
