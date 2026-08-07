@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_stream_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -23,21 +25,34 @@ fn write(dir: &Path, relative: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-fn vilan_run_with_timeout(dir: &Path, timeout: Duration) -> String {
+/// Runs `vilan run <dir>` under a liveness bound — a COMPILE plus the program —
+/// and returns its stdout.
+///
+/// The bound is `support::run_liveness()`, not the 45 s literal that stood here
+/// (E40): this test's claim is that the three chunks arrive IN ORDER, which the
+/// output pins on its own, so how long the box takes to build and boot the
+/// server was never part of it. A stream that never closes still fails here,
+/// just later.
+fn vilan_run_with_liveness_bound(dir: &Path) -> String {
+    let liveness = support::run_liveness();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["run", dir.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn vilan run");
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + liveness;
     loop {
         match child.try_wait().expect("poll vilan run") {
             Some(_status) => break,
             None if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("vilan run did not exit within {timeout:?} (stream never closed?)");
+                panic!(
+                    "the build+run did not exit within {liveness:?} (a liveness bound, {:?} \
+                     per reference compile on this machine — stream never closed?)",
+                    support::reference_compile()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }
@@ -126,7 +141,7 @@ fun run_client(port: i32) {
 }
 "#,
     );
-    let stdout = vilan_run_with_timeout(&dir, Duration::from_secs(45));
+    let stdout = vilan_run_with_liveness_bound(&dir);
     let one = stdout.find("one").expect("first chunk missing");
     let two = stdout.find("two").expect("second chunk missing");
     let three = stdout.find("three").expect("third chunk missing");

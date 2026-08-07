@@ -194,9 +194,12 @@ fn watch_round_refreshes_the_sidecar() {
     // lost that race three times in two days — 20.25s local, 20.5s on the
     // ubuntu leg, 20.97s on the windows leg, each a bare overshoot on a round
     // that then completed (backlog E20; the eventual real fix is an injected
-    // change event instead of racing the poller). 120s still fails a genuine
-    // hang promptly enough for CI.
-    let deadline = Duration::from_secs(120);
+    // change event instead of racing the poller). Its replacement, 120 s, was
+    // the same bet at a longer odds, and E39 watched a box carrying five
+    // overlapping suites eat all of it; this is now the family's shared
+    // liveness bound (E40), which is the same conclusion with the number
+    // attached to a measurement instead of to an incident.
+    let deadline = support::WATCH_LIVENESS;
     let round_one = wait_for_contents(&css, ".v1{color:red}\n", deadline);
 
     // A watch round must rewrite the sidecar from the edited source.
