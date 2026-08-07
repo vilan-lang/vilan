@@ -8010,11 +8010,15 @@ fn qualified_generic_static_resolves_inner_trait_statics() {
     // emit the inner `T::rebuild` as an EMPTY function — the accessor resolution
     // discarded the subject's type args entirely. A qualified subject now seeds
     // the matched impl's binder bindings into ITS call's substitution.
+    //
+    // `build` returns `Self`, not `Build`: it is the `wire.vl` shape, and this
+    // program was written in the same stand-in style std was, before B4 §11
+    // gave those declarations their real spelling.
     assert_compiles_and_runs(
         r#"
         import std::print;
         trait Build {
-            fun build(seed: i32): Build;
+            fun build(seed: i32): Self;
         }
         impl i32 with Build {
             fun build(seed: i32): i32 { seed + 1 }
@@ -8785,8 +8789,14 @@ fn ret_participates_in_closure_return_inference() {
 }
 
 // A trait-typed `self` returns through a trait-typed signature (the
-// `impl Iterator<type T> with Iterable<T> { fun iter(self): Iterator<T> { self } }`
+// `impl Iterator<type T> with Iterable<T> { fun iter(self): Self { self } }`
 // shape) — pins the `(Trait, Trait)` reconcile arm the return check surfaced.
+//
+// Spelled `Self`, as std's own `Iterable` is since B4's §11 migration: the
+// declarations always meant "this type", and the trait's name in a return was
+// only ever a stand-in for it. The arm stays load-bearing — the impl's subject
+// IS a trait, so `self` and the declared return are both `Type::Trait` — which
+// is why §11 keeps it priced rather than retiring it with the spelling.
 #[test]
 fn a_trait_typed_self_returns_through_a_trait_typed_signature() {
     assert_compiles(
@@ -8798,11 +8808,11 @@ fn a_trait_typed_self_returns_through_a_trait_typed_signature() {
         }
 
         trait AsWalk<T> {
-        	fun as_walk(self): Walk<T>;
+        	fun as_walk(self): Self;
         }
 
         impl Walk<type T> with AsWalk<T> {
-        	fun as_walk(self): Walk<T> {
+        	fun as_walk(self): Self {
         		self
         	}
         }
@@ -42561,8 +42571,8 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     );
 }
 
-// --- B72: a bare-trait parameter steers to the bound (method-resolution.md
-// --- §10) -------------------------------------------------------------------
+// --- B72 → B4 §12.2: a bare trait is refused at the DECLARATION
+// --- (method-resolution.md §10, trait-objects.md §11–§12) -------------------
 //
 // `fun show(v: A)` called with a `Bag` that implements `A` failed with
 // "Expected A, but got Bag instead" — which reads as though the impl were
@@ -42570,16 +42580,25 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
 // §5.11) and vilan has no trait objects, so the parameter can never accept a
 // concrete value and the declaration is what has to change.
 //
-// A call is the one position that reconciles PARAMETER-FIRST, so it is the one
-// position that ever asks `reconcile_type(Trait, Concrete)` — the direction
-// with no arm. Every other position reconciles value-first and lands on the
-// `(Struct|Enum, Trait)` arm, which accepts; those are pinned below as the
-// standing inconsistency they are, and belong to B4.
+// B72 said so at the CALL, because a call was the one position that reconciled
+// PARAMETER-FIRST and so the one position that ever asked
+// `reconcile_type(Trait, Concrete)` — the direction with no arm. Every other
+// position reconciled value-first, landed on the `(Struct|Enum, Trait)` arm and
+// ACCEPTED: four of six positions took a bare trait silently, and those four
+// acceptances were pinned below as the standing inconsistency they were, filed
+// as B4's to settle.
+//
+// B4 settled it (`proposal/trait-objects.md`, trait objects DECLINED
+// 2026-08-07; §11–§12 ship instead). The steer moved from the call to the
+// DECLARATION, which is where the fix goes and where it fires whether or not
+// anyone ever calls the thing — so the four acceptance pins are inverted here,
+// which is the arc closing rather than a regression, and the steer's own pins
+// now read at the declaration. What survives verbatim is the register: name the
+// rule, then name the declaration that works.
 
 #[test]
 fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
-    // The filed shape. The steer names the trait, the parameter, and the
-    // declaration to write.
+    // The filed shape. Now refused where it is written, not where it is called.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -42588,7 +42607,7 @@ fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "parameter 'v' has bare trait type 'A': a trait is not a value type",
+        "'A' is a trait, not a type: a trait is not a value type",
     );
 }
 
@@ -42603,15 +42622,17 @@ fn b72_the_bare_trait_steer_names_the_generic_to_write() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "`<T: A>` with 'v: T'",
+        "`<T: A>` — and write 'T' here",
     );
 }
 
 #[test]
-fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
-    // The fix belongs at the DECLARATION, not at the call the error anchors on
-    // — so the note points there (and carries its own source, so it renders
-    // when the callee lives in another module).
+fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
+    // B72 anchored at the call and needed a note to reach the parameter that
+    // had to change. The refusal anchors at that parameter, so the note points
+    // at the other thing the reader may not be able to see — the trait — and
+    // carries its own source, so it renders when the trait lives in another
+    // module (the B72 mechanism, pointed one hop further out).
     assert_fails_noting(
         r#"
         trait A { fun name(self): str; }
@@ -42620,18 +42641,17 @@ fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
         fun show(subject: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "has bare trait type 'A'",
-        "subject",
-        "is declared with the trait as its type",
+        "'A' is a trait, not a type",
+        "A",
+        "is declared here, as a trait",
     );
 }
 
 #[test]
 fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
-    // The second surface that reaches the parameter-first reconcile: an
-    // associated function called as `Type::member(..)`. Same path, same steer —
-    // which is the point of fixing the message at the shared site rather than
-    // at the free-function call.
+    // The second surface B72 had to reach separately — an associated function
+    // called as `Type::member(..)` — needs no separate reach now: both are the
+    // same written parameter, refused once at the declaration.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -42641,16 +42661,19 @@ fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
         impl Holder { fun make(v: A): i32 { 1 } }
         fun main() { let n = Holder::make(Bag { n = 1 }); }
         "#,
-        "parameter 'v' has bare trait type 'A'",
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
-    // The steer is for the author who wrote a correct impl and the wrong
-    // signature. When the value does NOT implement the trait, the missing impl
-    // is the likelier mistake, so naming the type it failed to match stays the
-    // more useful report.
+fn b72_the_refusal_does_not_wait_for_an_argument() {
+    // B72's steer was conditional on the argument implementing the trait: at a
+    // call, a non-implementing value made the missing impl the likelier
+    // mistake, so the plain mismatch stayed the better report. A definition-site
+    // rule has no such branch and needs none — `fun show(v: A)` is wrong on its
+    // own terms, before any argument exists, and reports identically whether
+    // the value passed implements `A` or not. That is what makes it one rule
+    // rather than a message.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -42660,7 +42683,23 @@ fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Other { m = 1 }); }
         "#,
-        "Expected A, but got Other instead.",
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_an_uncalled_bare_trait_parameter_is_still_refused() {
+    // The half a use-site steer structurally could not reach: a declaration
+    // nobody calls. B72 was silent here; the rule is not.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { }
+        "#,
+        "'A' is a trait, not a type",
     );
 }
 
@@ -42700,32 +42739,38 @@ fn b72_a_generic_parameter_is_untouched_by_the_steer() {
     );
 }
 
-// The positions that ACCEPT a bare trait today, pinned as the standing
-// inconsistency they are rather than left undescribed. Each reconciles
-// value-first, so each lands on `reconcile_type`'s `(Struct|Enum, Trait)` arm.
-// Refusing them is a language change (a trait type would become illegal in
-// every value position), which is B4's to make — and std itself depends on one
-// of them: `iterator.vl`'s `fun iter(self): Iterator<T>` returns a bare trait.
+// The four positions that used to ACCEPT a bare trait, inverted. Each
+// reconciled value-first and landed on `reconcile_type`'s `(Struct|Enum, Trait)`
+// arm, which returns the CONCRETE side — so the trait was absorbed at the check
+// and then reasserted by the annotation, which is how a value ended up carrying
+// a type it had no implementation for. They are refused at the annotation now,
+// by one rule rather than four checks (`trait-objects.md` §11's table). std's
+// own dependency on the return case — `iterator.vl`'s
+// `fun iter(self): Iterator<T>` — was answered first, by spelling those five
+// declarations `Self`, which is what they always meant (§1.5).
 
 #[test]
-fn b72_a_bare_trait_let_annotation_is_still_accepted() {
-    // `let x: A = bag` compiles; only USING it fails. The spec says this should
-    // be rejected at the annotation (`types.md` §5.11); it is not, and closing
-    // that gap is B4's, not a diagnostic's.
-    assert_compiles(
+fn b72_a_bare_trait_let_annotation_is_refused() {
+    // `let x: A = bag` used to compile, and only USING it failed. The spec has
+    // said since it was written that the ANNOTATION is the error
+    // (`types.md` §5.11); the compiler agrees now.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun main() { let x: A = Bag { n = 1 }; }
         "#,
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
 fn b72_a_bare_trait_value_still_cannot_be_used() {
-    // The refusal that DOES exist, and the one the new steer is worded to
-    // match: the body-side rule, from inside `show`.
+    // The refusal that always existed. The binding now fails one step earlier,
+    // at its annotation, so the use never gets its own report — but the rule
+    // the reader is told is word-for-word the one `MethodLookup::BareTraitValue`
+    // states, which is the point of wording them alike.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -42738,11 +42783,11 @@ fn b72_a_bare_trait_value_still_cannot_be_used() {
 }
 
 #[test]
-fn b72_a_bare_trait_method_parameter_is_still_accepted() {
-    // A METHOD's bare-trait parameter reconciles value-first, so it accepts
-    // where the free function refuses. The asymmetry is real and pinned; see
-    // `method-resolution.md` §10.
-    assert_compiles(
+fn b72_a_bare_trait_method_parameter_is_refused() {
+    // A METHOD's bare-trait parameter reconciled value-first, so it accepted
+    // where the free function refused. The asymmetry is gone: both are written
+    // parameters, and the rule is on the writing.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
@@ -42751,21 +42796,454 @@ fn b72_a_bare_trait_method_parameter_is_still_accepted() {
         impl Holder { fun take(self, v: A): i32 { 1 } }
         fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
         "#,
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_a_bare_trait_return_is_still_accepted() {
-    // std depends on this one: `impl Iterator<type T> with Iterable<T>` returns
-    // `Iterator<T>`, a bare trait. Any refusal of trait types in value position
-    // has to answer for it first.
-    assert_compiles(
+fn b72_a_bare_trait_return_is_refused() {
+    // The position std itself used, and the reason §11 sequenced the `Self`
+    // rewrites before the tightening.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun make(): A { Bag { n = 1 } }
         fun main() { let v = make(); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_field_is_refused() {
+    // The fifth position — the one §2.2's resource leak rode in on.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_generic_argument_is_refused() {
+    // §2.3: `List<A>` type-checked, and then narrowed to `List<Bag>` at the
+    // first element because the `(Struct|Enum, Trait)` arm returns the concrete
+    // side — so a genuinely heterogeneous list built by `push` compiled and ran.
+    // Refused at the argument, by the same rule and at the same arm.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+// The three routes to B55's internal error (§2.1). The B4 amendment recorded
+// one; the paper's P7 found three, byte-identical, and they are exactly the
+// accepting positions of the table above meeting a bounded generic. Each used
+// to abort the build from the TRANSFORMER with "please report this program",
+// with the caret on the trait's own `fun show(self): str;` — inside std, for a
+// std trait — while the message said "at this call". Each is an ordinary
+// declaration error now, at the annotation the author wrote.
+
+#[test]
+fn b4_the_internal_error_route_through_a_binding_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_the_internal_error_route_through_a_field_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_the_internal_error_route_through_a_return_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let s = use_it(make()); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_no_route_to_the_internal_error_survives() {
+    // The half that makes the three above a closure rather than three fixes:
+    // whatever else the programs report, none of them reaches the transformer's
+    // B55 guard. "internal:" in a diagnostic is the string that must not
+    // appear, because it is the one that asks the user to file a bug for their
+    // own mistake.
+    for source in [
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
+        "#,
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        "#,
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let s = use_it(make()); }
+        "#,
+    ] {
+        let diagnostics = compile(source).expect_err("expected a compile error");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("internal:")),
+            "an internal error survived: {diagnostics:#?}"
+        );
+    }
+}
+
+// The positions where a trait is the LEGITIMATE spelling, pinned so the
+// tightening cannot creep into them. Each is a place the trait names a bound or
+// a namespace rather than a value's type, and each is load-bearing today.
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_generic_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_supertrait() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        trait B with A { fun louder(self): str { self.name() } }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Bag with B { }
+        fun main() { print(Bag { n = 1 }.louder()); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_an_impl_subject() {
+    // std's own `impl Iterator<type T> with Iterable<T>` shape — a blanket impl
+    // over a bound, where the subject IS a trait. The `Iterable` surface has to
+    // keep compiling exactly as it did.
+    assert_compiles(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        trait Walk<T> { fun step(self): Option<T>; }
+        trait AsWalk<T> { fun as_walk(self): Self; }
+        impl Walk<type T> with AsWalk<T> { fun as_walk(self): Self { self } }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_qualified_call_head() {
+    // B57's trait-qualified call and B83's trait-provided static both write the
+    // trait's name at the head of a path. A path head selects a namespace; it
+    // is not a value position.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { print(A::name(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_self_defaulted_parameter_stays_legal() {
+    // `trait Add<B = Self>` makes the NAME `B` resolve to the very same
+    // `Type::Trait` that `Self` does — std's operator traits are all written
+    // this way. The refusal keys on the entity the name resolves to, not on the
+    // type it produces, so a generic parameter is never mistaken for the trait.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Combine<B = Self> { fun combine(self, other: B): str; }
+        struct Bag { n: i32 }
+        impl Bag with Combine { fun combine(self, other: Bag): str { "combined" } }
+        fun main() { print(Bag { n = 1 }.combine(Bag { n = 2 })); }
+        main();
+        "#,
+        "combined\n",
+    );
+}
+
+// --- B4 §2.4: two impls of one trait for one type — bycatch, filed not fixed -
+//
+// `trait-objects.md` §2.4 (probe P11) found the gap between two shipped checks:
+// B57 hard-errors on duplicate INHERENT members and on a trait-vs-trait
+// ambiguity, and B74 closed duplicate statics, but the same trait implemented
+// twice for the same type falls between them and resolves by DECLARATION ORDER.
+// The second impl is emitted nowhere and is silently dead, and which one dies
+// depends on the order the modules happened to load in.
+//
+// The paper scoped it OUT of this arc deliberately — §12's S4 files it as its
+// own item ("a backlog entry, not code, in this arc"), §2.4 and §14 both say
+// the same, on the grounds that it is a plain bug independent of B4's outcome
+// and that the fix is B57's existing duplicate machinery reaching one more
+// candidate set. So today's behavior is pinned here rather than left
+// undescribed, with the desired end state `#[ignore]`d beside it.
+
+#[test]
+fn b4_duplicate_trait_impls_resolve_by_declaration_order_today() {
+    // P11, exactly: the first impl wins at a direct call AND through a bounded
+    // generic, and the second is dead without a word.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "first" } }
+        impl Bag with Show { fun show(self): str { "second" } }
+        fun via<T: Show>(v: T): str { v.show() }
+        fun main() { let b = Bag { n = 1 }; print(b.show()); print(via(b)); }
+        main();
+        "#,
+        "first\nfirst\n",
+    );
+}
+
+#[test]
+#[ignore = "B4 §2.4: duplicate trait impls are a silent declaration-order pick; filed as its own item"]
+fn b4_two_impls_of_one_trait_for_one_type_are_an_error() {
+    // The desired end state, in B57/B74's register: a definition-site error at
+    // the second declaration, noting the first. Un-ignore when §2.4's item
+    // ships.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "first" } }
+        impl Bag with Show { fun show(self): str { "second" } }
+        fun main() { let b = Bag { n = 1 }; }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+// --- B4 §2.2: a bare trait annotation must not launder a resource -----------
+//
+// `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis
+// classifies `Type::Trait` as "never a resource by containment", and marks that
+// verdict COMPLETE — correct for the `Self` meaning of `Type::Trait`, a lie for
+// the "a user annotated a value with a trait" meaning. So annotating a
+// resource-carrying value with a bare trait type silently deletes its
+// destructor call and silently licenses a second owner: containment inference
+// (`spec/memory.md` §341-346) cannot see through the trait type, so R1, R2 and
+// R10 never fire and scope-end destruction never happens. This is `spec/
+// memory.md` R12's laundering hazard through a sink R12 does not name, and
+// unlike `any` it does not even produce a diagnostic. Live data loss, in
+// shipped code, with no trait objects anywhere.
+//
+// Each leak case is paired with its CONCRETE control, which passes today and
+// must keep passing: the controls are what make the pins non-vacuous — they
+// prove the destructor machinery is live and that only the trait annotation
+// suppresses it.
+//
+// The fix is the §12.2 tightening (a trait in value position is an error at
+// the annotation), so the closed shape of each leak is a REFUSAL, not a
+// destructor that runs: the resource never gets behind the trait in the first
+// place. Closed by construction rather than by a check per position — which is
+// the argument §2.2 makes for the tightening over any narrower patch.
+
+#[test]
+fn a_resource_binding_runs_its_destructor() {
+    // P8's control arm, concrete annotation: `drop` runs at scope end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Handle = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
+    // P8 row 2. Today this compiles, runs, prints `ok` and NEVER prints
+    // `closing` — one changed word in the annotation deleted the destructor.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Named = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_runs_its_destructor() {
+    // P8's control arm, by containment: an aggregate holding a resource behind
+    // a CONCRETE field is a resource, and its scope end destroys it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
+    // P8 row 4 — the field route, which is the dangerous one: the resource is
+    // reachable, owned, and invisible to containment inference.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_keeps_its_single_owner() {
+    // P9's control arm: through a concrete field, the affine checker sees the
+    // resource and refuses the second owner.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
+        "#,
+        "use of `holder` after it was moved",
+    );
+}
+
+#[test]
+fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
+    // P9. Today this compiles, runs, prints `ok`, and emits
+    // `const holder = [ [ 1 ] ];` — one resource, two live owners, no drop.
+    assert_fails(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
         "#,
     );
 }

@@ -145,9 +145,9 @@ impl JsonValue {
 /// failures with `!` or handle the `Result`.
 trait FromJson {
 	/// Parse a JSON document into a value of this type.
-	fun from_json(text: str): Result<FromJson, str>;
+	fun from_json(text: str): Result<Self, str>;
 	/// Rebuild this type from an already-parsed value (used when nesting).
-	fun from_json_value(value: JsonValue): Result<FromJson, str>;
+	fun from_json_value(value: JsonValue): Result<Self, str>;
 }
 
 /// The scalar leaves check the JSON type before coercing (`Number`/`String`/

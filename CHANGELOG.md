@@ -8,6 +8,22 @@ tracks the latest state.
 
 ## Unreleased
 
+**A trait written where a type belongs is now an error, and it is reported at the annotation.** `let x: Display = bag;` compiled. So did `fun make(): Display`, `struct Holder { item: Display }`, a method's `v: Display` parameter, and `List<Display>`. Only *using* the value failed, and only sometimes — four of six positions took a bare trait silently. The spec has said since it was written that a trait is a bound and not a type; the compiler agrees now, in every value position, whether or not the declaration is ever called.
+
+The reason this is worth a language change rather than a better message is what the acceptance was hiding. A resource behind a bare trait annotation **lost its destructor**. `let handle: Named = Handle { id = 1 }` ran the program, printed nothing, and never closed the handle — where `let handle: Handle = …` closes it — because the resource analysis is asked whether a type carries a resource by containment and answers "no, definitively" for a trait. Nothing could see through the annotation, so the single-owner rule stopped applying too: the same value could be moved twice, compile, and run. One changed word in a type annotation, no diagnostic, live data loss.
+
+Two more things fall out of the same fix. A trait annotation meeting a bounded generic — `let x: Display = bag; use_it(x)` — used to abort the build with an *internal* error that asked you to report your own program as a compiler bug, with the caret pointing inside the standard library; there were three ways in (a binding, a field, a return) and all three are ordinary declaration errors now. And `List<Display>` used to type-check and then quietly narrow to `List<Bag>` at the first element, so a list holding two structurally different values compiled and ran.
+
+The message names the trait, the generic to write instead (`<T: Display>`), and — inside a trait's own declaration — `Self`, which is what a trait naming itself in a return position always meant. The note points at the trait, which may live in another module.
+
+A trait's name stays legal everywhere it names a bound or a namespace rather than a value's type: `<T: Display>`, a supertrait, an `impl` subject (`impl Iterator<type T>`, which blankets over a bound), and the head of a qualified path (`Display::show(x)`). A generic parameter defaulted to the trait — `trait PartialEq<B = Self>`, which is how every operator trait is written — is a parameter, not the trait, and is untouched.
+
+Five declarations in the standard library needed the new spelling, and they are the five that always meant `Self`: `Iterable::iter`, `Wire::rebuild`, and `FromJson`'s two. No call site changed and no emitted output moved — none of the five was ever called through its bare-trait type.
+
+Known, and filed rather than quietly left: two `impl … with` blocks of the same trait for the same type still resolve by declaration order, leaving the second silently dead. It is a plain bug with or without any of the above, and it has its own entry.
+
+---
+
 **Writing a whole value through a `&mut` view replaces it. It used to merge.** `fun replace(v: &mut List<i32>) { v = [9] }` called on `[1, 2, 3]` left the caller's list three elements long — `len()` still said `3`, and `2` and `3` were still in it, behind the `9`. Nothing in the program said "merge", and nothing reported anything.
 
 The write has to keep the pointee's identity — that is how it reaches the caller at all — so it copies the new value's slots into the existing storage rather than rebinding a local. The copying was `Object.assign`, which is a *merge*: it writes the slots the source has and leaves every slot past them exactly where it was. For any aggregate whose width is fixed on both sides — a struct, a tuple, a `Map` — merge and replace are the same operation, which is why this went unnoticed. For the two whose width can shrink they are not, and the tail survived.

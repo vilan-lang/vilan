@@ -1320,3 +1320,139 @@ here is the point: the next person to ask does not have to re-run this sweep.
 | 9.2 | B83 *if built* | Statics excluded either way; B4 does not wait |
 | 4 | object safety *if built* | Compiler-computed; the diagnostic names the disqualifying member |
 | 11 | migration | One slice, not six |
+
+## 15. Implementation notes — the enforce-the-distinction arc (v0.34.0)
+
+Shipped as the `trait-enforce` lane, in the order §12 asked for with the
+paper's own slice numbering rotated to put the leak pin first. Three commits:
+the leak pin (red, `#[ignore]`d), the five `Self` rewrites, then the
+enforcement that closes the pin.
+
+### 15.1 Where the refusal lives, and why there
+
+§2.1 recommended the analyzer over the transformer, at "one of the five
+`continue` sites" where a bare-trait value meets a bound. It went somewhere
+earlier and simpler: the **`prepped_type_locals` drain**
+(`analyzer.rs`, `build()`), the single point at which every written type name
+resolves to a `Type`. §12.2's rule is about the *annotation*, not about the
+bound it later fails to satisfy, so the annotation's own resolution is where it
+belongs — and it is one site rather than five.
+
+That choice is what made §2's four holes close together rather than one at a
+time. A refused annotation resolves to `Type::Unknown`, so the report stands
+alone instead of cascading, and nothing downstream ever sees a value of bare
+trait type: B55's guard is unreachable by any of P7's three routes, the
+resource classification is never asked about a `Type::Trait` field, and
+`List<Trait>` never reaches the `(Struct|Enum, Trait)` arm that narrowed it.
+
+### 15.2 The distinction, drawn on the entity rather than the type
+
+§0's thesis is that one representation carries two meanings. The
+implementation separates them by asking **what the written name resolved to**,
+not what type came back:
+
+```rust
+let names_the_trait =
+    matches!(self.expr_id_to_expr_map.get(&subject_id), Some(Expr::Trait(_)));
+```
+
+Three names resolve to the same `Type::Trait` and only one is the mistake:
+
+| written | resolves to | verdict |
+|---|---|---|
+| `Display` | `Expr::Trait` | refused |
+| `Self` | *no `Expr` at all* — `register_self_type` inserts only a type binding | legitimate |
+| `B` of `trait Add<B = Self>` | `Expr::Generic(trait type id)` | legitimate |
+
+The third was a genuine find and is not in the paper. `register_defaulted_parameter`
+makes the *name* `B` resolve to the default's type id, so for every `= Self`-defaulted
+trait — which is all ten operator traits plus `PartialEq`/`PartialOrd`/`Try` —
+a written `B` is a `Type::Trait` indistinguishable from the trait's own name by
+type alone. A first cut keyed on the spelling (`name != "Self"`) refused all of
+them and took std down. This is the same conflation `written_type_spellings`
+exists to unpick for conformance (§3.5 of the analyzer's own comment); keying on
+the entity subsumes it and needs no spelling test at all.
+
+### 15.3 The trait-legal positions — six, not the two the paper implies
+
+§11's table enumerates the value positions. The complement — where a trait's
+name is legitimate — had to be enumerated too, and it is larger than §1.5 or
+§7.1 suggest. Marked by `walk_trait_position_type_node`, which is the only
+thing the drain consults before refusing:
+
+1. a generic parameter's bound, `<T: Display>` (`register_binder`)
+2. a tuple bound's element bound, `T: (2..: Display)`
+3. a supertrait, `trait Ord with PartialOrd`
+4. an **`impl` subject** — `impl Iterator<type T>` and
+   `impl Iterator<type T> with Iterable<T>`, std's blanket-over-a-bound shape.
+   §7.1 says a trait object "may not be the subject of an `impl`"; a trait
+   already is one, load-bearingly, and the whole iterator-adapter surface is
+   written that way.
+5. the head of a qualified path in **expression** position — `A::pick(bag)`
+   (B57) and `Iterator::from_fn(..)` (B83, off `iterator.vl:137`'s
+   `impl Iterator<type T>`).
+6. the same in **type** position.
+
+(5) and (6) were the miss that mattered: without them, six B57 pins, two B83
+pins and three iterator pins went red, because a path head is not a value
+position and B83's whole finding is that a trait-provided static stays
+reachable through the trait's name. The polarity is deliberate — positions are
+value positions *by default* and must say otherwise — so a type position added
+later is checked until someone argues it out.
+
+### 15.4 What §11 said stays, stays
+
+- **The `(Trait, Trait)` reconcile arm** (`analyzer.rs`, the `l_id == r_id`
+  guard) is still load-bearing, and not only for the pins. `impl Iterator<type T>
+  with Iterable<T> { fun iter(self): Self { self } }` has a trait for its
+  subject, so `self` and the declared return are both `Type::Trait` — spelling
+  the return `Self` changed which *name* is written, not which arm reconciles
+  it. `a_trait_typed_self_returns_through_a_trait_typed_signature` pins it,
+  rewritten to `Self` per §11's note 3.
+- **`MethodLookup::BareTraitValue` is still reachable**, which was worth
+  checking rather than assuming: inside an inherent `impl` on a trait subject,
+  `self` has bare trait type and the scope is an *impl* body, not a trait body,
+  so `is_in_trait_default` correctly says no. `impl Walk<type T> { fun first(self):
+  Option<T> { self.step() } }` reports it today. Not dead code.
+- **B72's call-site steer** (`argument_mismatch`'s `Type::Trait` arm) is, as
+  §11 note 2 predicted, superseded: its only trigger was a *written* bare-trait
+  parameter, which is refused at the declaration now. It is **retained**, per
+  this arc's boundary — the paper prices the steer as moving rather than as
+  removable, and it remains the correct message for any `reconcile_type(Trait,
+  Concrete)` that a future change routes back through a parameter. No live
+  program was found that reaches it; that is recorded, not fixed.
+
+### 15.5 The sweep — the five, plus two the paper could not have seen
+
+§1.5 predicted five `.vl` sites and found exactly five; all five rewrote to
+`Self`, and the corpus goldens are byte-identical, which is §11's
+behavior-preserving claim discharged rather than asserted. The sweep the paper
+did not run was over the **Rust test corpus**, where two programs were written
+in the same stand-in style and flipped with it:
+
+- `a_trait_typed_self_returns_through_a_trait_typed_signature` — the `Iterable`
+  shape, expected by §11 note 3.
+- `qualified_generic_static_resolves_inner_trait_statics` — `trait Build { fun
+  build(seed: i32): Build; }`, the `wire.vl` shape. Not expected, same fix.
+
+Zero flips in `vilan/test`, `examples`, the docs fences, or the benchmarks.
+
+### 15.6 §2.4, scoped out and pinned
+
+§12's S4, §2.4 and §14 all file the duplicate-trait-impl pick as its own item,
+not this arc's code — so today's behavior is **pinned rather than left
+undescribed** (`b4_duplicate_trait_impls_resolve_by_declaration_order_today`
+reproduces P11 exactly: `first` at a direct call and `first` through a bounded
+generic), with the desired end state `#[ignore]`d beside it. Unchanged by this
+arc in either direction.
+
+### 15.7 Residue
+
+- **`List<Trait>` reports twice.** The annotation is refused and the element
+  type resolves to `Unknown`, after which two pushes of different concrete types
+  produce an ordinary "Expected Bag, but got Cup instead." The first report is
+  the real one and carries the fix; the second is the same inference any
+  unannotated list would do. Left as is — suppressing it would mean poisoning
+  the whole application type from one refused argument.
+- **P17's R11 rationale** (§8.1) is untouched, as §14 says it should be: the
+  one-line `memory.md` correction belongs to whoever next edits that paragraph.
