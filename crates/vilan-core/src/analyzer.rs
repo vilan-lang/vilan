@@ -776,6 +776,32 @@ enum ImplMemberResolution {
     Missing,
 }
 
+/// Which tier the competing providers of a `for` subject's protocol member were
+/// found in — the one thing `report_ambiguous_for_each_next`'s wording differs
+/// by. The diagnostic is otherwise identical at both tiers, because the reader's
+/// problem is: two traits, no spelling that names one, declare it inherently.
+#[derive(Debug, Clone, Copy)]
+enum ForEachNextProviders {
+    /// Two traits DECLARE the name and impls of the subject provide the bodies
+    /// (B96) — the same tier the call path's own ambiguity reports on.
+    Declared,
+    /// Neither impl declares it; two traits carry it down as a DEFAULT (B91).
+    InheritedDefaults,
+}
+
+impl ForEachNextProviders {
+    /// How the providers give the member, as the diagnostic says it. The
+    /// declared tier reads exactly as the call path's "both 'A' and 'B' provide
+    /// it"; the inherited tier names its tier, since "provide" alone would send
+    /// the reader looking for a declaration that is not there.
+    fn provision(self) -> &'static str {
+        match self {
+            Self::Declared => "provide it",
+            Self::InheritedDefaults => "provide it as an inherited default",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Trait<'src> {
     pub id: Id,
@@ -17836,12 +17862,13 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// A `for` whose subject reaches its protocol member through TWO inherited
-    /// trait defaults (B91's ambiguous tier, B57 §3's rule one tier down). The
+    /// A `for` whose subject reaches its protocol member through TWO traits —
+    /// either DECLARING it (B96, the tier the call path reports on) or carrying
+    /// it down as an inherited default (B91, B57 §3's rule one tier down). The
     /// CALL form resolves this by naming one — `Trait::next(receiver)` — but a
     /// loop has no spelling that selects a provider, so the steer is the fix
-    /// that works: declare the member inherently, the tier that beats both
-    /// (the B65 lesson, as B83 applied it to statics).
+    /// that works at either tier: declare the member inherently, the tier that
+    /// beats both (the B65 lesson, as B83 applied it to statics).
     fn report_ambiguous_for_each_next(
         &mut self,
         for_each_id: Id,
@@ -17849,6 +17876,7 @@ impl<'src> Analyzer<'src> {
         iterable_type: &Type,
         next_method: &str,
         trait_ids: &[Id],
+        providers_tier: ForEachNextProviders,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
         let providers: Vec<String> = trait_ids
@@ -17859,12 +17887,12 @@ impl<'src> Analyzer<'src> {
             for_each_id,
             iterable_id,
             format!(
-                "`{next_method}` is ambiguous on `{rendered}`: {}{} provide it as an \
-                 inherited default, and a `for` loop has no spelling that names one. \
-                 Declare `{next_method}` on `{rendered}` itself — an inherent member \
-                 beats every trait-provided one",
+                "`{next_method}` is ambiguous on `{rendered}`: {}{} {}, and a `for` loop \
+                 has no spelling that names one. Declare `{next_method}` on `{rendered}` \
+                 itself — an inherent member beats every trait-provided one",
                 if providers.len() == 2 { "both " } else { "" },
                 join_with(&providers, "and"),
+                providers_tier.provision(),
             ),
         );
     }
@@ -25069,9 +25097,25 @@ impl<'src> Analyzer<'src> {
             let next_method = self.for_each_next_method(item_id);
             match &iterable_type {
                 Type::Struct(_, _) | Type::Enum(_, _) => {
-                    if let Some((next_id, impl_subject_id)) =
-                        self.method_member_impl_subject(&iterable_type, next_method)
-                    {
+                    // The declared tier, asked in the form that can tell its two
+                    // failures apart: `method_member_impl_subject` collapses an
+                    // ambiguity into `None`, which sent the loop on to the
+                    // inherited tier and out the "it has no `next`" exit — of a
+                    // type that has two (B96).
+                    let declared = self.resolve_impl_member(&iterable_type, next_method);
+                    if let ImplMemberResolution::AmbiguousTraits(homes) = &declared {
+                        let homes = homes.clone();
+                        self.report_ambiguous_for_each_next(
+                            for_each_id,
+                            iterable_id,
+                            &iterable_type,
+                            next_method,
+                            &homes,
+                            ForEachNextProviders::Declared,
+                        );
+                        continue;
+                    }
+                    if let ImplMemberResolution::Found(next_id, impl_subject_id) = declared {
                         // The protocol is duck-typed on the METHOD NAME
                         // (`iterator-adapters.md` §1), but the lowering still
                         // reads an `Option` tag off what `next` hands back, so a
@@ -25164,6 +25208,7 @@ impl<'src> Analyzer<'src> {
                                 &iterable_type,
                                 next_method,
                                 &ambiguous,
+                                ForEachNextProviders::InheritedDefaults,
                             );
                             continue;
                         }

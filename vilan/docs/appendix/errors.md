@@ -105,6 +105,16 @@ inherent method of its own to outrank them. Say which one you mean with
 your own receiver already substituted in.
 → [Names, modules, and packages](../spec/names.md)
 
+**"`next` is ambiguous on '…': both '…' and '…' provide it, and a `for` loop has no spelling that names one"**
+The loop's counterpart to the message above, for the iterator protocol
+(`next`, or `next_mut` for `for x in &mut subject`). Two traits provide
+the member — declaring it, or supplying it as an inherited default — and
+no inherent member outranks them. A call can pick a provider with
+`Trait::next(receiver)`; a `for` has no such spelling, so the fix is the
+one the message names: declare `next` on the type itself, where it beats
+every trait-provided one.
+→ [Collections](../std/collections.md)
+
 **"'…' is not an inherent member of '…': '…' provides it; call '…' instead"**
 `Type::method(receiver)` means the type's *own* method. This one comes
 from a trait, so name the trait at the path head instead:

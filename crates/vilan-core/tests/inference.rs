@@ -548,6 +548,20 @@ fn assert_fails_with(source: &str, message_part: &str) {
     }
 }
 
+/// Asserts compilation fails and that NO diagnostic mentions `message_part` —
+/// for a fix whose point is that a misleading message is gone, not merely that
+/// a better one was added beside it.
+#[track_caller]
+fn assert_fails_without(source: &str, message_part: &str) {
+    match compile(source) {
+        Ok(_) => panic!("expected a compile error, but it compiled cleanly"),
+        Err(errors) => assert!(
+            errors.iter().all(|error| !error.contains(message_part)),
+            "a diagnostic still contains {message_part:?}; got: {errors:#?}"
+        ),
+    }
+}
+
 #[track_caller]
 fn assert_compiles_browser(source: &str) {
     if let Err(errors) = compile_browser(source) {
@@ -44601,6 +44615,192 @@ fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
         }
         "#,
         "`next` is ambiguous on `Both`",
+    );
+}
+
+// --- B96: two traits DECLARING `next` are ambiguous at the loop too ---
+// The same ambiguity one tier UP from B91's. `method_member_impl_subject`
+// collapses `AmbiguousTraits` into `None`, so the declared tier fell through to
+// the inherited one and out the "it has no `next`" exit — of a type that has
+// two. The loop now asks `resolve_impl_member`, which keeps the two failures
+// apart, and reports at whichever tier the competition is in.
+
+/// Two traits DECLARING `next`, with an impl of each providing a body: the
+/// call path already reports this ("both 'A' and 'B' provide it; call
+/// 'A::next(receiver)' …"), and the loop must too — with the steer that works
+/// for a `for`, which has no spelling that names a provider.
+#[test]
+fn two_declared_nexts_are_ambiguous_at_the_loop() {
+    let two_declared = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Twin with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    // Half one: both providers named, at the DECLARED tier's wording.
+    assert_fails_with(
+        two_declared,
+        "`next` is ambiguous on `Twin`: both 'Early<i32>' and 'Late<i32>' provide it, and a",
+    );
+    // Half two: the inherent-declaration steer — the edit that resolves it.
+    assert_fails_with(
+        two_declared,
+        "Declare `next` on `Twin` itself — an inherent member beats every trait-provided one",
+    );
+    // And NOT the misleading message it used to get (B96's whole point).
+    assert_fails_without(two_declared, "it has no `next");
+}
+
+/// The two tiers say the same thing about the same problem, differing only in
+/// how the providers give the member: B91's ambiguity and B96's share the
+/// providers clause and the steer verbatim, over the same struct name. An
+/// inconsistency here is exactly what made B96 findable.
+#[test]
+fn both_ambiguous_for_each_tiers_share_one_diagnostic_shape() {
+    let declared = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Twin with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    let inherited = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T> { None } }
+        trait Late<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> {}
+        impl Twin with Late<i32> {}
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    let shared_providers = "`next` is ambiguous on `Twin`: both 'Early<i32>' and 'Late<i32>' \
+                            provide it";
+    let shared_steer = ", and a `for` loop has no spelling that names one. Declare `next` on \
+                        `Twin` itself — an inherent member beats every trait-provided one";
+    for source in [declared, inherited] {
+        assert_fails_with(source, shared_providers);
+        assert_fails_with(source, shared_steer);
+    }
+    // The one difference: the inherited tier names its tier, because "provide"
+    // alone would send the reader looking for a declaration that is not there.
+    assert_fails_with(inherited, "provide it as an inherited default, and a");
+    assert_fails_without(declared, "as an inherited default");
+}
+
+/// B57's tiering, unchanged one tier up: an inherent `next` beside TWO traits
+/// declaring the name is not ambiguous — inherent wins, unconditionally
+/// (`method-resolution.md` §3), and the loop stays silent about the traits.
+#[test]
+fn an_inherent_next_beats_two_declared_trait_nexts_at_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Three { at: i32 }
+        impl Three {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl Three with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Three with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut three = Three { at = 0 };
+            for item in three { print(item); }
+            print(99);
+        }
+        "#,
+        "1\n2\n99\n",
+    );
+}
+
+/// ONE trait declaring `next` is not made ambiguous by a second trait the type
+/// also implements: the ambiguity is over the NAME's providers, not over the
+/// impl count. The lower boundary of the new report.
+#[test]
+fn one_declared_next_beside_an_unrelated_trait_still_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Only<T> { fun next(&mut self): Option<T>; }
+        trait Named { fun label(&self): str; }
+
+        struct One { at: i32 }
+        impl One with Only<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl One with Named { fun label(&self): str { "one" } }
+
+        fun main() {
+            mut one = One { at = 0 };
+            for item in one { print(item); }
+            print(one.label());
+        }
+        "#,
+        "1\n2\none\n",
+    );
+}
+
+/// The `next_mut` twin: `for x in &mut subject` looks up a different member
+/// through the same tiering, so the ambiguity — and the steer naming the right
+/// member — has to reach it as well (the B91 `next_mut` pin's precedent).
+#[test]
+fn two_declared_next_muts_are_ambiguous_at_the_mut_loop() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait WalkA<T> { fun next_mut(&mut self): Option<&mut T>; }
+        trait WalkB<T> { fun next_mut(&mut self): Option<&mut T>; }
+
+        struct Bag3 { items: List<i32>, cursor: i32 }
+        impl Bag3 with WalkA<i32> { fun next_mut(&mut self): Option<&mut i32> { None } }
+        impl Bag3 with WalkB<i32> { fun next_mut(&mut self): Option<&mut i32> { None } }
+
+        fun main() {
+            mut bag = Bag3 { items = [1, 2], cursor = 0 };
+            for item in &mut bag { item = *item * 10; }
+        }
+        "#,
+        "`next_mut` is ambiguous on `Bag3`: both 'WalkA<i32>' and 'WalkB<i32>' provide it, \
+         and a `for` loop has no spelling that names one. Declare `next_mut` on `Bag3` \
+         itself — an inherent member beats every trait-provided one",
     );
 }
 
