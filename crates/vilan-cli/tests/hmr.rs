@@ -18,6 +18,14 @@
 //! House process hygiene (the watcher never exits on its own): the legs are
 //! quick-exit (the node server prints and returns), so killing the watcher at
 //! the end orphans nothing.
+//!
+//! Every `deadline` here is `support::WATCH_LIVENESS` — a liveness bound, not a
+//! performance assertion. It was a literal 20 s, which is a *compile* budget on
+//! a contended box, and that is what failed `hmr_swap` under a loaded suite
+//! (E39). Nothing in this file asserts how fast a round is, so the bound only
+//! has to be finite. The per-test margins (`sleep(500/800 ms)`) and the
+//! negative windows (`assert_no`, `!buffer_has`) are a separate shape, recorded
+//! rather than changed here: see `proposal/suite-speed.md` §6.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -300,7 +308,7 @@ fn the_dev_channel_drives_the_watch_round() {
     );
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
@@ -437,7 +445,7 @@ fn a_server_edit_restarts_quietly_and_a_shared_edit_swaps() {
     let lines = drain_stdout(watcher.stdout.take().unwrap());
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
@@ -520,7 +528,7 @@ fn a_client_only_edit_skips_the_server_and_still_updates_the_client() {
     let lines = drain_stdout(watcher.stdout.take().unwrap());
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
@@ -762,7 +770,7 @@ fn run_watch_honors_entry_and_hmr_rounds_work_for_the_chosen_leg() {
     let buffer = collect_stdout(watcher.stdout.take().unwrap());
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         let port = port_from_buffer(&buffer, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
 
@@ -853,7 +861,7 @@ fn a_watch_round_server_bundle_equals_a_one_shot_build() {
     let lines = drain_stdout(watcher.stdout.take().unwrap());
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         wait_for_port(&lines, deadline).expect("the dev channel should announce its port");
         // The server boots only after the round has written every dist bundle.
         assert!(
@@ -902,7 +910,7 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
     );
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Duration::from_secs(20);
+        let deadline = support::WATCH_LIVENESS;
         let port = wait_for_port(&lines, deadline)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
         assert!(

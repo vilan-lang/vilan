@@ -2,8 +2,55 @@
 //!
 //! Not a test target itself (cargo compiles only the top-level `tests/*.rs`);
 //! each suite that needs it declares `mod support;`.
+//!
+//! Every declaring suite compiles the WHOLE module, so a helper only some of
+//! them use is dead code in the rest — hence the module-wide allow. It is not
+//! covering unused code: nothing here is unused by the file as a set.
+#![allow(dead_code)]
 
 use std::process::Child;
+use std::time::Duration;
+
+/// How long a `run --watch` harness waits for something that must eventually
+/// happen — the dev channel's activation line, round 1's `dist/`, a rebuilt
+/// bundle. It is a LIVENESS bound, not a performance assertion: no test in this
+/// family claims how fast a build is, so this number only has to be too large
+/// for a healthy round and finite for a hung one. A green run never pays it.
+///
+/// E39: it used to be 20 s, which under a loaded suite is not too large for a
+/// healthy round. `run --watch`'s first round is a full compile of every leg —
+/// a browser bundle over `std::ui` plus a server — and on a contended box that
+/// alone runs past 20 s, so `hmr_swap` failed on the *machine's* speed while
+/// asserting nothing about it. Same disease as E32's cancellation family
+/// (compile inside the timed window), and the same cure: stop letting a slow
+/// machine compete with a budget that was never measuring it.
+/// `watch_lifecycle.rs` reached this conclusion first — "how long that takes is
+/// not this test's business" — at 60 s.
+///
+/// The number is set from a measurement, not a feeling: one ordinary
+/// `vilan build` of `hmr_swap`'s own two-leg project — the identical work round
+/// 1 does — costs ~34 s wall on a 16-core box carrying a load average of ~38.
+/// 120 s was tried first and is only ~3.5× that, thin enough that a box running
+/// five overlapping suites consumed it. 300 s keeps ~9× headroom at that load
+/// and is still finite, which is the whole job. A green run never pays any of
+/// it: every wait returns the moment its condition holds.
+pub const WATCH_LIVENESS: Duration = Duration::from_secs(300);
+
+/// A budget for a watch round, expressed in units of the round this machine
+/// just paid for. `first_round` is the measured cost of round 1 — a full
+/// compile of every leg, here, now, under whatever load the box is under — so a
+/// later round taking several times that is a stuck watcher, while the same
+/// round on a machine four times slower is not.
+///
+/// This is E32's rule for a test that cannot move its compile out of the timed
+/// window: the compile stays inside, but the budget is calibrated against it
+/// instead of guessed, so it measures the PROGRAM (a rebuild reacting to an
+/// edit) rather than the machine. The floor keeps a suspiciously fast round 1
+/// from producing a hair-trigger budget; the ceiling keeps a pathological one
+/// from producing an unbounded wait.
+pub fn round_budget(first_round: Duration) -> Duration {
+    (first_round * 4).clamp(Duration::from_secs(20), WATCH_LIVENESS)
+}
 
 /// Kills a `run --watch` session, reaps it, and removes the temp script it
 /// leaves behind. Best effort throughout — a teardown must never fail a test.
