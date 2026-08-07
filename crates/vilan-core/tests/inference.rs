@@ -43691,21 +43691,39 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
     );
 }
 
-/// And the half that does NOT, which is why B82 ships as a split rather than a
-/// blanket error. A closure argument to a METHOD's own generic reaches its body
-/// with the parameter still abstract, so the match inside is checked against
-/// nothing — the program below binds `Other::Second`'s payload out of a
-/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
-/// shape, and the routing guide's `swap(route, |current| match current { .. })`
-/// is the documented, shipped use, so a blanket error on a `Type::Generic`
-/// scrutinee takes the guide with it (probed: 3 diagnostics in
-/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
-///
-/// The fix is not at the pattern — it is to instantiate the closure parameter
-/// the way the free-function twin above already does. `#[ignore]`d: it asserts
-/// the diagnostic, and today the program compiles and runs.
+// --- B90: a closure argument to a generic's parameter, substituted ----------
+// B82's residual half, and NOT a pattern-checker gap: the closure's parameter
+// reached its body still typed as the abstract `T`, so the match inside was
+// checked against nothing and `Other::Second`'s payload came out of a
+// `Route::Away`, silently. The root cause is one-shot-ness. An unannotated
+// closure parameter's type slot is filled only while it is `Unknown`, so
+// whoever writes it first wins forever — and both call paths were willing to
+// write it from a substitution they knew to be incomplete:
+//
+//   * the METHOD path bound the callee's own generics from the non-closure
+//     arguments, typed the closure arguments, and only THEN decided to defer
+//     because an argument's type had not landed. On the attempt where
+//     `Route::Away(7)` was still `Unresolved`, `T` was unbound, `render: |T|
+//     i32` typed `current` as the abstract `T`, and the retry that finally knew
+//     `T = Route` found the slot already taken.
+//   * the FREE path walks its parameters positionally and defers at the first
+//     `Unresolved` argument, which is why `apply(value, render)` was right —
+//     but `apply(render, value)`, with the closure standing FIRST, hit the same
+//     wall for the same reason.
+//
+// So the fix is one rule in both places: bind the own generics from the
+// non-closure arguments, and defer BEFORE typing any closure while an
+// argument's type has not landed. `bind_callee_own_generics` is now shared,
+// differing only by whether the parameter list starts with `self`.
+
+/// B90's headline case, `#[ignore]`d until the fix: the wrong enum inside a
+/// closure passed to a METHOD's own generic. `std::ui::View::swap` is exactly
+/// this shape, and the routing guide's `swap(route, |current| match current {
+/// .. })` is the documented, shipped use — which is why B82 refused to make a
+/// `Type::Generic` scrutinee a blanket error (probed then: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`) and left this to
+/// instantiation instead.
 #[test]
-#[ignore]
 fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
     assert_fails_with(
         r#"
@@ -43727,6 +43745,233 @@ fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
         }
         "#,
         "does not belong to the matched enum",
+    );
+    // The half that must keep working — the RIGHT enum, through the same
+    // method. A diagnostic that also rejects this would be no fix at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The substitution reaches the closure parameter as a TYPE, not just as a
+/// pattern scrutinee: a method call on it resolves against the binding. This is
+/// the sharper probe of the two — a pattern can match by coincidence of
+/// representation, but `current.code()` either resolves or does not, and before
+/// the fix it did not ("cannot call method 'code' on T").
+#[test]
+fn a_closure_parameter_typed_by_a_methods_generic_reaches_its_methods() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Home, |current| current.code()));
+        }
+        "#,
+        "7\n0\n",
+    );
+}
+
+/// The ordering edge, both paths. The argument that FIXES the generic used to
+/// have to stand before the closure that consumes it, because the free path
+/// walks parameters positionally; the method path's two-phase binding never had
+/// that constraint and now the free path shares it. `apply(render, value)` is
+/// the same call as `apply(value, render)`.
+#[test]
+fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, render: |T| i32, value: T): i32 { render(value) }
+        }
+
+        fun main() {
+            print(free(|current| current.code(), Route::Away(4)));
+            print(Holder { tag = 0 }.apply(|current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "4\n7\n",
+    );
+    // And the wrong enum is still caught with the arguments in that order.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        fun main() {
+            print(free(|current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "does not belong to the matched enum",
+    );
+}
+
+/// The callee shapes that share the two-phase rule: a STATIC (no `self`, so the
+/// free path's offset), a trait DEFAULT reached through an impl that declares
+/// nothing (Gap E's dispatch, whose parameters are written in the trait's terms),
+/// and a method whose generic comes from the impl's binder rather than its own
+/// list. Each was a separate route to the same abstract-`T` parameter.
+#[test]
+fn every_callee_shape_substitutes_its_closure_arguments_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun statically<T>(value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        trait Applier {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+        impl Holder with Applier {}
+
+        struct Boxed<T> { held: T }
+        impl Boxed<type T> {
+            fun mapped(self, render: |T| i32): i32 { render(self.held) }
+        }
+
+        fun main() {
+            print(Holder::statically(Route::Away(1), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Away(2), |current| current.code()));
+            print(Boxed { held = Route::Away(3) }.mapped(|current| current.code()));
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+/// Nested closures: the inner call's own generic binds from a value whose type
+/// is itself the outer closure's parameter, so the outer substitution has to
+/// have landed before the inner one is attempted. Both parameters used to reach
+/// their bodies abstract.
+#[test]
+fn a_closure_nested_in_a_closure_argument_is_substituted_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current|
+                Holder { tag = 1 }.apply(current, |inner| inner.code())));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The closure's RETURN type is substituted by the same binding, and checked.
+/// `step: |T| T` under `T = Route` is BOTH halves at once — the parameter the
+/// body reads through and the value it must hand back — and they travel through
+/// one `substitute_type` `Type::Closure` arm, so this pins that they cannot
+/// drift apart. (The one-sided `|i32| T` shape was never broken: its parameter
+/// is concrete, so the one-shot slot had nothing abstract to freeze at.)
+#[test]
+fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }
+                .twice(Route::Away(1), |current| Route::Away(current.code() + 1))
+                .code());
+        }
+        "#,
+        "3\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Expected |Route| Route, but got |Route| Other instead.",
     );
 }
 

@@ -17854,7 +17854,7 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Binds a method's own generics from its arguments, parameter-first (so the
+    /// Binds a callee's own generics from its arguments, parameter-first (so the
     /// bindings key on the callee). With `skip_closures`, only non-closure
     /// arguments are used — run first so a closure parameter `|T| ..` is typed with
     /// `T` already known (e.g. `bind_each`'s `|todo| ..`, where `T` is the element
@@ -17865,10 +17865,15 @@ impl<'src> Analyzer<'src> {
     /// that closure's return (`map<U>`'s `U`) cannot bind on this attempt, so
     /// the caller must defer and retry (B19); resolving anyway would freeze the
     /// call's substitution — and its return type — with the generic abstract.
-    fn bind_method_own_generics(
+    ///
+    /// `self_parameter_offset` is 1 for a method (whose first parameter is
+    /// `self`, which no argument stands for) and 0 for a free function or a
+    /// static — the ONE place the two call paths differ, so both can share this.
+    fn bind_callee_own_generics(
         &mut self,
         member_id: Id,
         argument_ids: &[Id],
+        self_parameter_offset: usize,
         skip_closures: bool,
         substitution: &mut SubstitutionContext,
     ) -> bool {
@@ -17894,8 +17899,7 @@ impl<'src> Analyzer<'src> {
             if skip_closures && is_closure {
                 continue;
             }
-            // `+ 1` skips the method's `self` parameter.
-            let Some(parameter_id) = parameter_ids.get(index + 1) else {
+            let Some(parameter_id) = parameter_ids.get(index + self_parameter_offset) else {
                 continue;
             };
             let Some(parameter_type) = self
@@ -17957,6 +17961,65 @@ impl<'src> Analyzer<'src> {
             self.collect_residual_generics(&argument.get_type(self), &mut binders);
         }
         binders
+    }
+
+    /// Whether any of `member_id`'s OWN generic parameters is still unbound in
+    /// `substitution` — i.e. this attempt does not yet know what the method is
+    /// instantiated at.
+    fn own_generics_unbound(&self, member_id: Id, substitution: &SubstitutionContext) -> bool {
+        self.method_signature(member_id)
+            .is_some_and(|(_, own_generics)| {
+                own_generics
+                    .iter()
+                    .any(|generic| !substitution.contains_key(generic))
+            })
+    }
+
+    /// Whether some CLOSURE argument stands before some non-closure argument —
+    /// the one order in which typing the arguments POSITIONALLY types a closure
+    /// before the argument that could bind the generic its parameter is written
+    /// over. With every closure last, positional order already is binding order.
+    fn a_closure_argument_precedes_a_value_argument(&self, argument_ids: &[Id]) -> bool {
+        let is_closure = |argument_id: &Id| {
+            matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            )
+        };
+        let Some(first_closure) = argument_ids.iter().position(is_closure) else {
+            return false;
+        };
+        argument_ids
+            .iter()
+            .skip(first_closure)
+            .any(|argument_id| !is_closure(argument_id))
+    }
+
+    /// Whether some NON-closure argument's type has not landed on this attempt,
+    /// so a generic that argument would bind cannot bind yet. Closure arguments
+    /// are excluded: a closure's own type is `Unresolved` until its body types,
+    /// and its body needs the parameter types this very call is about to supply
+    /// (B19), so a closure is judged after the closures are typed, not before.
+    fn an_argument_type_is_unresolved(
+        &mut self,
+        argument_ids: &[Id],
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        for argument_id in argument_ids {
+            if matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            ) {
+                continue;
+            }
+            if matches!(
+                self.infer_type(*argument_id, &Type::Unknown, substitution),
+                Type::Unresolved
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     fn infer_closure_args_against_params(
@@ -21004,6 +21067,46 @@ impl<'src> Analyzer<'src> {
                             substitution_context.insert(*generic_constraint, *generic_argument_id);
                         }
                     }
+                    // The method path's two-phase rule, shared (B90): bind the
+                    // callee's own generics from the arguments that are NOT
+                    // closures before any closure argument is typed, and defer
+                    // while one of those has not landed. The loop below walks the
+                    // parameters positionally, so a closure standing EARLIER than
+                    // the argument that fixes the generic — `apply<T>(render: |T|
+                    // i32, value: T)` — is reached first and its unannotated
+                    // parameter freezes at the abstract `T`, permanently: the
+                    // slot is filled only while it is still `Unknown`. The
+                    // deferral is the one the loop already performs when it
+                    // reaches an `Unresolved` argument, hoisted ahead of the
+                    // closures rather than added.
+                    //
+                    // Only for that ORDER. When every closure argument already
+                    // stands after the arguments that could bind, the loop's own
+                    // order IS the two-phase order and there is nothing to hoist,
+                    // so the call keeps the exact inference schedule it has
+                    // always had — which matters, because re-inferring an
+                    // argument earlier mints its type id earlier, and
+                    // monomorphization keys on type ids (probed: hoisting
+                    // unconditionally left three corpus goldens
+                    // behaviour-identical but re-keyed, one of them emitting a
+                    // duplicate `Signal::new` instance).
+                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_))
+                        && self.a_closure_argument_precedes_a_value_argument(argument_ids)
+                    {
+                        self.bind_callee_own_generics(
+                            target_id,
+                            argument_ids,
+                            0,
+                            true,
+                            &mut substitution_context,
+                        );
+                        if self.own_generics_unbound(target_id, &substitution_context)
+                            && self
+                                .an_argument_type_is_unresolved(argument_ids, &substitution_context)
+                        {
+                            return Resolution::Deferred;
+                        }
+                    }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -21498,57 +21601,60 @@ impl<'src> Analyzer<'src> {
                     .unwrap_or_default();
                 // Bind the method's own generics from the non-closure arguments
                 // first, so a closure parameter `|T| ..` is typed with `T` known.
-                self.bind_method_own_generics(member_id, argument_ids, true, &mut substitution);
+                self.bind_callee_own_generics(member_id, argument_ids, 1, true, &mut substitution);
+                // If an own generic is still unbound because an argument's type
+                // has not landed, defer so the binding — and any bound-only
+                // generic derived from it (`m<T, S: Source<T>>` called with an
+                // *inferred* argument, whose type lands only later) — completes
+                // on a retry. The free-function path in `resolve_call_subject`
+                // defers the same way; without it the generic stays abstract and
+                // monomorphizes to the empty abstract method.
+                //
+                // Deferring here, BEFORE the closure arguments are typed, is what
+                // the two paths used to disagree about (B90). The free path bails
+                // at the first argument whose type is `Unresolved` and so never
+                // reaches a later closure; this one typed the closures first and
+                // deferred afterwards. That is not harmless, because an
+                // unannotated closure parameter's type slot is a ONE-SHOT channel
+                // — it is filled only while it is still `Unknown` — so typing
+                // `render: |T| i32` against a substitution that does not yet carry
+                // `T` freezes the parameter at the ABSTRACT `T`, and the retry
+                // that finally knows `T = Route` can no longer correct it. The
+                // body then checks against nothing: an enum `match` inside
+                // compiled against the wrong enum and ran.
+                // An argument that IS an unknown closure parameter defers too —
+                // the free-function path's rule (`resolve_call_subject`): its type
+                // lands when the closure's OWNING call resolves. Resolving now
+                // binds nothing, the bounded generic freezes abstract, and the
+                // call monomorphizes to the trait's empty member — the
+                // silent-stub misrender.
+                if self.own_generics_unbound(member_id, &substitution)
+                    && (self.an_argument_type_is_unresolved(argument_ids, &substitution)
+                        || argument_ids
+                            .iter()
+                            .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
+                {
+                    return Resolution::Deferred;
+                }
                 self.infer_closure_args_against_params(member_id, argument_ids, &substitution);
                 // Then bind generics fixed by a closure's return (`derive<U>`'s `U`),
                 // now that the closures are typed.
-                let unresolved_closure_argument = self.bind_method_own_generics(
+                let unresolved_closure_argument = self.bind_callee_own_generics(
                     member_id,
                     argument_ids,
+                    1,
                     false,
                     &mut substitution,
                 );
-                // If an own generic is still unbound because an argument is
-                // unresolved, defer so the binding — and any bound-only generic derived
-                // from it (`m<T, S: Source<T>>` called with an *inferred* argument, whose
-                // type lands only later) — completes on a retry. The free-function path in
-                // `resolve_call_subject` defers the same way; without it the generic stays
-                // abstract and monomorphizes to the empty abstract method. A closure
-                // argument counts too (B19): its body may not have typed on this attempt
-                // (the parameters it needed were only just supplied above), and a generic
-                // fixed only by the closure's RETURN (`map<U>`'s `U`) would otherwise
-                // freeze abstract in the call's substitution and return type.
-                if let Some((_, own_generics)) = self.method_signature(member_id) {
-                    let some_unbound = own_generics
-                        .iter()
-                        .any(|generic| !substitution.contains_key(generic));
-                    if some_unbound
-                        && (unresolved_closure_argument
-                            || argument_ids.iter().any(|argument_id| {
-                                // An argument that IS an unknown closure
-                                // parameter defers too — the free-function
-                                // path's rule (`resolve_call_subject`): its
-                                // type lands when the closure's OWNING call
-                                // resolves. Resolving now binds nothing, the
-                                // bounded generic freezes abstract, and the
-                                // call monomorphizes to the trait's empty
-                                // member — the silent-stub misrender.
-                                self.is_unknown_closure_parameter(*argument_id)
-                                    || (!matches!(
-                                        self.expr_id_to_expr_map.get(argument_id),
-                                        Some(Expr::Closure(_))
-                                    ) && matches!(
-                                        self.infer_type(
-                                            *argument_id,
-                                            &Type::Unknown,
-                                            &substitution
-                                        ),
-                                        Type::Unresolved
-                                    ))
-                            }))
-                    {
-                        return Resolution::Deferred;
-                    }
+                // A closure argument counts too (B19): its body may not have typed
+                // on this attempt (the parameters it needed were only just
+                // supplied above), and a generic fixed only by the closure's
+                // RETURN (`map<U>`'s `U`) would otherwise freeze abstract in the
+                // call's substitution and return type.
+                if unresolved_closure_argument
+                    && self.own_generics_unbound(member_id, &substitution)
+                {
+                    return Resolution::Deferred;
                 }
                 // Keep the own-generic bindings as ordered values too — the
                 // OnConstraint emission re-targets a concrete impl's method,
