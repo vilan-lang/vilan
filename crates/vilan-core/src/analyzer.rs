@@ -2842,32 +2842,57 @@ impl<'src> Analyzer<'src> {
         // The substitution maps iterate in hash order — sort for deterministic
         // diagnostics, and dedup: one call can bind the same constraint along
         // several recorded routes.
-        errors.sort_by_key(|(span, msg, _)| (span.start, span.end, msg.clone()));
+        //
+        // The constraint is in the KEY, not just carried: the dedup collapses on
+        // span and message alone, and two DIFFERENT constraints can share both
+        // — `fun pair<A: Greet, B: Greet>(..)` called as `pair(1, 2)` reports
+        // 'i32' does not implement 'Greet' twice at the one call span, word for
+        // word. The survivor decides which declaration the note below points
+        // at, so without the constraint in the key that was a hash-order pick
+        // between `A` and `B` (16/14 over 30 cold analyses). Least id wins,
+        // which is the first-declared parameter.
+        errors.sort_by_key(|(span, msg, constraint_id)| {
+            (span.start, span.end, msg.clone(), constraint_id.0)
+        });
         errors
             .dedup_by(|(a_span, a_msg, _), (b_span, b_msg, _)| a_span == b_span && a_msg == b_msg);
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
+        //
+        // C1, the same discipline as the sort above: ONE constraint id can have
+        // SEVERAL registration entities, because `impl Subject<type T>`
+        // deliberately inherits the subject's id (`register_subject_binders`, the
+        // relation B77 found) — a user's `impl Set<type T>` is the same id as
+        // `set.vl`'s `struct Set<T: Hashable>`. A `.find()` over the entity map
+        // picked one at random, so WHICH FILE the note pointed at changed run to
+        // run. Take the LEAST entity id instead (B57's tie-break): ids are minted
+        // in walk order, so that is the earliest declaration — which is the one
+        // that actually WRITES the bound, the inheriting binders having only
+        // adopted it.
         let bound_declarations: Vec<(Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(span, msg, constraint_id)| {
-                let note = self
+                let declaration = self
                     .expr_id_to_expr_map
                     .iter()
-                    .find(|(_, expr)| {
+                    .filter(|(_, expr)| {
                         matches!(expr, Expr::Generic(declared) if *declared == constraint_id)
                     })
-                    .and_then(|(entity_id, _)| {
-                        let declaration_span = **self.span_map.get(entity_id)?;
-                        if declaration_span.into_range().is_empty() {
-                            return None;
-                        }
-                        Some(crate::error::Note {
-                            span: declaration_span,
-                            msg: "the bound is declared here".to_string(),
-                            source: self.source_of_id(*entity_id),
-                        })
-                    });
+                    .filter(|(entity_id, _)| {
+                        self.span_map
+                            .get(*entity_id)
+                            .is_some_and(|declaration_span| {
+                                !declaration_span.into_range().is_empty()
+                            })
+                    })
+                    .map(|(entity_id, _)| *entity_id)
+                    .min_by_key(|entity_id| entity_id.0);
+                let note = declaration.map(|entity_id| crate::error::Note {
+                    span: **self.span_map.get(&entity_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: "the bound is declared here".to_string(),
+                    source: self.source_of_id(entity_id),
+                });
                 (span, msg, note)
             })
             .collect();
@@ -6273,7 +6298,8 @@ impl<'src> Analyzer<'src> {
         // An overwrite (R2) drops the binding's OLD value in place — the same
         // binding type. Seed those too, in case the binding is overwritten but
         // later moved out (so it is not in `dropped_bindings`).
-        let overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        let mut overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        overwrites.sort_unstable_by_key(|assignment_id| assignment_id.0);
         for assignment_id in overwrites {
             if let Some(Expr::Assignment(target_id, _)) =
                 self.expr_id_to_expr_map.get(&assignment_id)
@@ -6340,6 +6366,15 @@ impl<'src> Analyzer<'src> {
                     worklist.extend(glue.members.member_type_ids());
                 }
             }
+            // The seed types and the glue's members are both HashSet-ordered,
+            // so this list arrived in hash order — and it is an EDGE LIST that
+            // `platform_color` walks in order under a `visited` once-guard,
+            // which quotes the TRAIL that reached a boundary. Two drop impls
+            // meeting below the same off-platform callee would therefore have
+            // named different chains in the same diagnostic. Order is carried
+            // by nothing here (every successor is walked), so canonical id
+            // order is free.
+            methods.sort_unstable_by_key(|method| method.0);
             if !methods.is_empty() {
                 edges.insert(root, methods);
             }
@@ -10246,7 +10281,7 @@ impl<'src> Analyzer<'src> {
     /// to codegen (so the migration off `*` is byte-identical). Runs after
     /// `infer_borrows`, so `borrows`-call targets are recognized.
     fn rewrite_view_assignment_targets(&mut self) {
-        let assignments: Vec<(Id, Id, Id)> = self
+        let mut assignments: Vec<(Id, Id, Id)> = self
             .expr_id_to_expr_map
             .iter()
             .filter_map(|(id, expr)| match expr {
@@ -10254,6 +10289,16 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             .collect();
+        // The loop MINTS entity ids (`wrap_in_deref`), so a hash-ordered walk
+        // does not merely visit the assignments in an arbitrary order — it
+        // hands each synthetic `Dereference` a different id every run. Nothing
+        // downstream reads those ids in a way that reaches an emitted byte or a
+        // diagnostic today (measured: 20 cold compiles permute all 26 ids and
+        // produce one emission and one diagnostic list), but several passes do
+        // order and tie-break on `Id.0`, so leaving the mint order to a hash
+        // seed is a trap set for whichever of them starts to. Assignment ids
+        // are themselves walk order, so this is source order.
+        assignments.sort_unstable_by_key(|(assignment_id, _, _)| assignment_id.0);
         for (assignment_id, target_id, value_id) in assignments {
             // The target: a bare view writes *through*, so deref it.
             if !matches!(
@@ -26075,6 +26120,77 @@ impl<'src> Program<'src> {
             .resize(self.diagnostics.len(), SourceId(0));
         self.diagnostics.push(error);
         self.diagnostic_sources.push(source);
+    }
+
+    /// Put the diagnostic and warning lists into their ONE canonical order
+    /// (diagnostics-standard.md C1). Called at the end of
+    /// [`crate::post_analysis_passes`] — the last point at which either list
+    /// grows — so every consumer inherits it: the CLI's terminal rendering, the
+    /// language server's publish, and the HMR overlay.
+    ///
+    /// Diagnostics are produced by dozens of checks and many of them walk a
+    /// `HashMap`, so PUSH order was a randomly-seeded artifact. Two things fall
+    /// out of that. The terminal listed the same program's errors in a different
+    /// order run to run — untidy but survivable. And `hmr::render_overlay`
+    /// TRUNCATES at a cap, so *which* errors reached the browser changed run to
+    /// run, which is not. One policy here beats a sort in every producer.
+    ///
+    /// The key is: the file, then the position in it, then what the diagnostic
+    /// renders as. The source must lead — a [`Span`] is a byte offset into its
+    /// own file and carries no file identity, so spans from two files are not
+    /// comparable. The content tail (message, then the note's location and text)
+    /// is what makes this a total order over what a reader actually SEES; the
+    /// note belongs in it because sites like `emit_generic_leak` and
+    /// `emit_r11_violations` deliberately emit several diagnostics that share a
+    /// span and a message and differ only there.
+    ///
+    /// The sort is STABLE, so a producer's own ordering still decides between
+    /// entries this key cannot separate — which is why the local sorts upstream
+    /// (the C1 comments in `check_generic_bound_satisfaction`, the resource
+    /// checks, `init_order`) stay: this normalizes, it does not excuse.
+    pub fn normalize_diagnostic_order(&mut self) {
+        fn key<'a>(
+            error: &'a Error,
+            source: SourceId,
+        ) -> (
+            u32,
+            usize,
+            usize,
+            &'a str,
+            Option<(u32, usize, usize, &'a str)>,
+        ) {
+            (
+                source.0,
+                error.span.start,
+                error.span.end,
+                error.msg.as_str(),
+                error.note.as_ref().map(|note| {
+                    (
+                        note.source.unwrap_or(source).0,
+                        note.span.start,
+                        note.span.end,
+                        note.msg.as_str(),
+                    )
+                }),
+            )
+        }
+        fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
+            // `push_diagnostic` pads lazily, so the attribution vector can be
+            // SHORTER than the list it describes. Materialize the implicit
+            // entry-file tail before permuting, or that tail loses its file.
+            sources.resize(entries.len(), SourceId(0));
+            let mut paired: Vec<(Error, SourceId)> =
+                entries.drain(..).zip(sources.drain(..)).collect();
+            paired.sort_by(|(left, left_source), (right, right_source)| {
+                key(left, *left_source).cmp(&key(right, *right_source))
+            });
+            for (entry, source) in paired {
+                entries.push(entry);
+                sources.push(source);
+            }
+        }
+        sort_in_step(&mut self.diagnostics, &mut self.diagnostic_sources);
+        sort_in_step(&mut self.warnings, &mut self.warning_sources);
     }
 
     /// The program's call graph: ONE build per analysis, shared by everything
