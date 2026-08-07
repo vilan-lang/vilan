@@ -4948,6 +4948,37 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "found by B97: a `ret place` from a loan receiver hands back the storage uncopied"]
+fn a_returned_field_place_copies_out_of_its_receiver() {
+    // Bycatch of B97's measurement (capture-clones.md §9.1), verified, filed.
+    // Rule 1 at the RETURN seam: `fun make(&self): (i32, i32) { self.pair }`
+    // emits `return self[0]`, so the caller's result IS the receiver's field
+    // storage and a later write to the receiver shows through it. The receiver
+    // is a LOAN, so the value leaving the body outlives nothing it owns — the
+    // same "a place read into something that outlives the expression must
+    // copy" the list/struct literal seams already enforce (B54), at the seam
+    // that hands a value back. `capture-clones.md` §7.7's "an owned call result
+    // needs no rule: nothing else names it" is true of the capture pass and
+    // false of this function's own body. Prints 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
     // result's element grew `xs`. Printed 3.
