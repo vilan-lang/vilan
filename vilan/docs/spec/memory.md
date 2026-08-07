@@ -123,9 +123,12 @@ element storage with its receiver. Writing through an element of `xs.map(f)`,
 A **pattern capture** is a binding, so it copies too — and the copy is taken
 when the pattern *matches*. A capture therefore holds what its subject held at
 that moment, and no later write to the subject can reach back into it. This
-holds however the write is spelled, the two that differ underneath included:
-assigning the subject **rebinds** it, while assigning through a **view** of it
-mutates its storage in place. Neither is visible through a capture:
+holds however the write is spelled, and the spellings differ underneath.
+Assigning a whole binding **rebinds** it: a fresh value is installed and
+everything that already read the old one keeps the old one. Every other form
+mutates the storage **in place** — assigning through a **view**, writing a
+**component** of a place (`t.1 = 9`, `h.pair.1 = 9`, `xs[0] = 9`), and calling
+a `&mut self` method that does either. None of it is visible through a capture:
 
 ```vilan
 import std::print;
@@ -146,6 +149,12 @@ fun main() {
 	mut feed = Feed::Ready(["a", "b", "c"], 0);
 	print(feed.step());   // a
 	print(feed.step());   // b
+
+	mut t = (7, 3);
+	if t is (let a, let b) {
+		t.1 = 99;
+		print(b);         // 3 — the component write cannot reach the capture
+	}
 }
 ```
 

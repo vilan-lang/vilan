@@ -50,6 +50,22 @@ Both paths now bind from the non-closure arguments and defer **before** typing a
 
 What must keep working does. `std::ui::View::swap(route, |current| match current { .. })` — how every vilan app dispatches pages, and the reason v0.32.0 refused to make a match against a bare type parameter a blanket error — now gets the *real* check instead of no check. Corpus goldens are byte-identical: the hoist is applied only in the argument order that needs it, because re-inferring an argument earlier mints its type id earlier and monomorphization keys on type ids (applied unconditionally it left three goldens behaviour-identical but re-keyed, one of them emitting a duplicate `Signal::new` instance). Six pins, all planted red.
 
+---
+
+**`if t is (let a, let b) { t.1 = 99; print(b) }` prints `3` now. It printed `99`.** The capture read the value the *same arm* had just written — the bug v0.32.0 fixed for `&mut self`, reaching an ordinary owned local through the one write form that release left out.
+
+The reasoning that stopped it there was right as far as it went. `is` tests and guarded match legs compile a capture to an accessor into the subject — `$a[1]` — substituted wherever the capture is named, which is faithful only if the subject cannot change under it. Assigning a whole binding cannot reach it: `t = (1, 2)` installs a fresh value and everything holding the old one keeps the old one. But that is *one* write form. `t.1 = 99` writes a **component**, which mutates the very storage the accessor points at — and so do `h.pair.1 = 9`, `xs[0] = 9`, a write through a `&mut` taken of the place, and a `&mut self` method called on it. Seven distinct spellings printed the post-write value; all seven print the matched one now.
+
+A capture is read once, when the pattern matches, whenever the storage its subject names can be mutated in place — through a view, as before, or through any of those forms on an owned place. Assigning the whole binding still is not one of them, deliberately: it genuinely leaves a snapshot, and treating it as a write would have cost the sharing that keeps read-only walkers from deep-copying at every level.
+
+That cost was measured rather than assumed. The blunt fix — read *every* pattern capture at the match — is also correct, and was built and rejected on evidence: it moves six corpus goldens, and the diffs are not six added copies. One of them is the `&self` walker v0.32.0 pinned in bytes precisely to protect. Three more abandon the `else if` chain for a flat fallthrough sequence, because a guard that reads a capture now reads a declaration — restructuring matches that have nothing to do with any of this. The shipped rule changes **no** existing corpus byte; one golden moves additively, because the capture fixture gained the new shapes on purpose — the component-write function and the rebinding one sit side by side there, differing by the one line that is the rule.
+
+The three payload shapes keep the doctrine v0.32.0 settled, and each is now pinned on the owned path against its viewed twin: a value materializes, an aggregate copies (it already did), and a resource materializes **bare** — no copy, because there is no copy spelling for a resource and inventing one would mint a second owner with a second destructor. Fifteen pins, planted red on four separate axes.
+
+Found on the way and filed, not fixed: a method returning a `&mut` projection (`fun slot(&mut self): &mut T borrows self`) hands its pattern a subject the capture pass does not recognise as one at all, so *neither* rule fires there — the aggregate capture aliases the receiver outright, which is the original v0.23.6 bug surviving in a third spelling. Pinned `#[ignore]`d. Record: `proposal/capture-clones.md` §7.
+
+---
+
 ## v0.32.0 — 2026-08-06
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.

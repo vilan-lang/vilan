@@ -3732,6 +3732,426 @@ fn a_view_write_drops_the_overwritten_variants_resource() {
 }
 
 // ---------------------------------------------------------------------------
+// B88 (the same seam through an OWNED place). B81 closed the alias path's late
+// read for a writable-view subject and stopped there, because an owned place
+// looked safe: assigning it REBINDS it, installing a fresh value and leaving
+// the subject temp holding the old one. That is true of exactly one write
+// form. A COMPONENT write — `t.1 = 9`, `h.pair.1 = 9`, `xs[0] = 9` — mutates
+// the very object the temp aliases, and so does a `&mut` taken of the place
+// and a `&mut self` method called on it. Captures of a subject some in-place
+// write can reach are now read once, at the match, exactly as a viewed
+// subject's are. See proposal/capture-clones.md §7.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_is_capture_from_a_component_written_place_reads_the_prematch_value() {
+    // B88's filed repro. `b` is an `i32`, so it owes no copy and kept its
+    // accessor `$a[1]`; `t.1 = 99` lowers to `t[1] = 99`, and `$a` IS `t`'s
+    // array, so the deferred read returned the write. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let a, let b) {
+                t.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_place_capture_read_before_and_after_a_component_write_agrees() {
+    // Both orders in one leg, the shape that makes the bug undeniable: a read
+    // BEFORE the write was always right (the accessor had nothing to observe
+    // yet), so the two reads of one binding DISAGREED — 3 then 99. The
+    // binding is one value, so 6, not 102.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let a, let b) {
+                let before = b;
+                t.1 = 99;
+                print(before + b);
+            }
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn a_component_write_through_a_field_path_does_not_reach_a_capture() {
+    // The field arm. A struct field is not patternable, so a field write
+    // reaches this seam through the subject's PATH rather than the capture's:
+    // the subject is `h.pair`, a `Field` place, and `h.pair.1 = 99` writes
+    // into the very array that place names. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32), tag: i32 }
+        fun main() {
+            mut h = Holder { pair = (7, 3), tag = 0 };
+            if h.pair is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_disjoint_field_write_leaves_a_sibling_subject_correct() {
+    // The other side of the field arm, and the honest record of how coarse
+    // the predicate is: the write lands in a DIFFERENT field of the same root,
+    // so it could never have reached this subject and the program was already
+    // right. Root granularity materializes it anyway — a write that reaches
+    // the storage under a second name got that name from a `&mut` of the
+    // ROOT, so the root is the granularity the question can be asked at
+    // soundly. Pinned because the answer must not change either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32), tag: i32 }
+        fun main() {
+            mut h = Holder { pair = (7, 3), tag = 5 };
+            if h.pair is (let a, let b) {
+                h.tag = 1;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_index_write_does_not_reach_a_fixed_array_capture() {
+    // The index arm, at the fixed-array binder — `marr[1] = 99` lowers to
+    // `__at_put(marr, 1, 99)`, an in-place element store into the array the
+    // subject temp aliases. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut marr: [i32; 2] = [7, 3];
+            if marr is let [g, k] {
+                marr[1] = 99;
+                print(k);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_index_write_does_not_reach_a_capture_of_an_indexed_subject() {
+    // The index arm at the SUBJECT instead: `rows[0]` is an `Index` place, and
+    // `rows[0].1 = 99` writes the element it names. `place_root` walks the
+    // subscript, so both sides root at `rows`. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut rows = [(7, 3)];
+            if rows[0] is (let a, let b) {
+                rows[0].1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_nested_component_write_does_not_reach_a_nested_capture() {
+    // Depth on both sides at once: the capture sits inside a nested tuple
+    // pattern and the write reaches it through two components (`n.0.1`).
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut n = ((7, 3), 5);
+            if n is ((let i, let j), let k) {
+                n.0.1 = 99;
+                print(j);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_mut_self_method_call_does_not_reach_a_capture_of_its_receiver() {
+    // The write need not be spelled in the arm at all. `bump` takes `&mut
+    // self` and writes a component through it, so the CALL is the in-place
+    // write and the receiver's root joins the write set — the same arm of
+    // `collect_written_roots` the `own`-parameter capture pins above use.
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Counter { pair: (i32, i32) }
+        impl Counter {
+            fun bump(&mut self) { self.pair.1 = 99 }
+        }
+        fun main() {
+            mut counter = Counter { pair = (7, 3) };
+            if counter.pair is (let p, let q) {
+                counter.bump();
+                print(q);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_write_through_a_mut_view_of_the_subject_does_not_reach_its_captures() {
+    // Why the question is asked at the ROOT and not by walking the arm: the
+    // view is minted OUTSIDE the arm and written INSIDE it, so the write's own
+    // place root is `vv`, not `vt`, and an arm-local write-set walk would see
+    // nothing to report. Taking the `&mut` is itself a recorded write of
+    // `vt`, which is what makes the root question sound. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut vt = (7, 3);
+            let vv = &mut vt;
+            if vt is (let a, let b) {
+                vv.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_capture_from_a_component_written_place_reads_the_prematch_value() {
+    // A guard puts the leg on the alias path too, and its captures carry the
+    // same hole. It is also the ordering-sensitive one (B59): the guard is
+    // walked after `materialize_captures` has re-pointed the alias table, so a
+    // guard that reads a materialized capture takes the prelude shape or names
+    // a binding that has not been declared. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut gl = (7, 3);
+            match gl {
+                (let q, let r) if r > 0 => {
+                    gl.1 = 99;
+                    print(r);
+                }
+                _ => {}
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_leg_on_a_component_written_place_was_already_right() {
+    // The negative half of the diagnosis, the same one B81 pinned through a
+    // view: an unguarded leg compiles through `compile_pattern`, which
+    // declares every capture as a real `const` at leg entry, so it never read
+    // late and never had the bug. Pinned so the fix cannot move it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut ml = (7, 3);
+            match ml {
+                (let s, let v) => {
+                    ml.1 = 99;
+                    print(v);
+                }
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_destructure_from_a_component_written_place_was_already_right() {
+    // The declared path's other spelling, for the same reason: `let (a, b) =
+    // t` reads both slots eagerly, so a later component write has nothing to
+    // reach back into.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut d = (7, 3);
+            let (d1, d2) = d;
+            d.1 = 99;
+            print(d2);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn both_capture_shapes_survive_a_component_write_to_the_place() {
+    // The place twin of `both_capture_shapes_survive_an_in_place_write_
+    // through_the_view`, which is what makes "the two paths are
+    // indistinguishable per shape" a checked claim: the same two payload
+    // shapes, the same two component writes, an owned `mut` local instead of a
+    // `&mut` parameter, and the same answers. `items` is B53's business (an
+    // aggregate capture COPIES, so growing the source to 4 leaves it at 3);
+    // `at` is B88's (a scalar owes no copy, so it kept an accessor and read
+    // the 9). One pin, red either way: 12 without the materialization, 4
+    // without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = (["a", "b", "c"], 0);
+            if pair is (let items, let at) {
+                pair.0.push("d");
+                pair.1 = 9;
+                print(items.len() + at);
+            }
+            print(pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_component_written_place_loans_the_prematch_payload() {
+    // R1/R11 and B65's doctrine at the third subject form. A resource payload
+    // has no copy to make — "there is no user-facing copy spelling in vilan to
+    // name" (affine-moves.md §9.1) — so the capture is materialized WITHOUT
+    // `__clone`: `const c = $a[0]`, which fixes WHICH value is loaned without
+    // minting a second owner to destroy twice. Exactly what the viewed twin
+    // does, and what the whole-assignment place twin already did. 1, not 6.
+    let source = r#"
+        import std::print;
+        resource struct Conn { id: i32 }
+        fun main() {
+            mut slot = (Conn { id = 1 }, 0);
+            if slot is (let c, let at) {
+                slot.1 = 5;
+                print(c.id + at);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the resource capture was materialized WITH a copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n");
+}
+
+#[test]
+fn a_whole_assignment_to_the_subject_still_leaves_its_captures_aliasing() {
+    // The line the rule stops at, and the reason it is not simply "every place
+    // subject materializes". Assigning the whole binding REBINDS it — `t = [
+    // 1, 2 ]` installs a fresh array and the subject temp keeps the old one —
+    // so the accessor is a faithful snapshot and there is nothing to fix. The
+    // capture must therefore stay an accessor: naming it in the output would
+    // mean the predicate had widened to every place subject, which is what
+    // moves six corpus goldens and takes back B53's share elision on the alias
+    // path.
+    let source = r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let first, let kept) {
+                t = (1, 2);
+                print(kept);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("kept"),
+            "a rebinding assignment materialized the capture anyway:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+#[ignore = "B88 bycatch: a `borrows` call subject collects no capture candidates at all"]
+fn a_borrows_call_subject_reads_the_prematch_value() {
+    // Found while scoping B88, verified, filed rather than fixed. A method
+    // returning a `&mut` projection hands the pattern a subject that aliases
+    // the receiver's storage — but the expression is a CALL, and
+    // `is_capture_subject_place` admits places and `*view` only, so this
+    // subject collects no candidates and neither B53's copy nor B81/B88's
+    // materialization ever fires. `const $a = slot(h); … $a[1]` — the same
+    // shape §6.4 found for `*view`, one spelling over. Prints 99.
+    // See proposal/capture-clones.md §7.7.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if h.slot() is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+#[ignore = "B88 bycatch: a `borrows` call subject collects no capture candidates at all"]
+fn a_borrows_call_subject_copies_its_captures() {
+    // The worse half of the same hole, and the one that is B53's ORIGINAL bug
+    // rather than a timing one: the aggregate capture aliases the receiver's
+    // element outright (no `__clone` anywhere in the output), so growing the
+    // source through the receiver grows the capture. Prints 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            if g.slot() is (let xs, let n) {
+                g.cells.0.push(9);
+                print(xs.len());
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B54 / A20 (rule 1 at the STORE seams). A place read into a slot of an
 // aggregate that outlives the expression must copy: a construction literal's
 // element/field/payload (B54), and the argument of a container method that

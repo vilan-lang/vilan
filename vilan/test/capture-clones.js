@@ -45,6 +45,44 @@ function viewed_guarded(pair2) {
 	}
 	return $q;
 }
+function place_component() {
+	let cell = [ [ 1, 2 ], 3 ];
+	const $s = cell;
+	const cells = __clone($s[0]);
+	const weight = $s[1];
+	if (true) {
+		cell[1] = 9;
+		return cells.length + weight;
+	}
+	return 0;
+}
+function place_rebound() {
+	let cell = [ [ 1, 2 ], 3 ];
+	const $t = cell;
+	const cells = __clone($t[0]);
+	if (true) {
+		cell = [ [ 4 ], 5 ];
+		return cells.length + $t[1];
+	}
+	return 0;
+}
+function place_guarded() {
+	let cell = [ [ 1, 2 ], 3 ];
+	const $u = cell;
+	let $v = null;
+	let $w = false;
+	const cells = __clone($u[0]);
+	const weight = $u[1];
+	if (weight > 0) {
+		$w = true;
+		cell[1] = 9;
+		$v = cells.length + weight;
+	}
+	if (!($w)) {
+		$v = 0;
+	}
+	return $v;
+}
 function sum_over(entries2) {
 	let total = 0;
 	for (const entry of entries2) {
@@ -152,3 +190,6 @@ console.log(width(feed));
 let viewed = [ [ 1, 2 ], 3 ];
 console.log(viewed_guarded(viewed));
 console.log(viewed[1]);
+console.log(place_component());
+console.log(place_rebound());
+console.log(place_guarded());
