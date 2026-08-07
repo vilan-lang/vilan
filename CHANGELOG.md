@@ -6,7 +6,7 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
-## Unreleased
+## v0.31.0 — 2026-08-06
 
 **Writing `impl List<type T>` in your own file no longer makes the compiler complain about std's `List`.** Roughly half the time — the same file, the same compiler, a different answer per run — a user impl block on a std container produced "the type of 'result' is never fully determined", pointing at a `mut result = List::new()` line inside `list.vl` that you did not write and cannot annotate. The other half of the runs were clean, which is the tell: the diagnostic was never about your program.
 
