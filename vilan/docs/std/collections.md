@@ -388,9 +388,12 @@ ambiguity the loop reports rather than resolving for you — a `for` has no way 
 name a provider, so declare `next` on the type to settle it.
 
 The name is what resolves, but the **shape is still checked**: the method has to
-return an `Option`, because the loop stops at `None`. A `next` annotated with
-anything else is a compile error rather than a loop that quietly runs zero
-times.
+return an `Option`, because the loop stops at `None`. A `next` that returns
+anything else is a compile error rather than a loop that quietly runs zero times
+— or, worse, throws. The return annotation is optional and the rule does not
+care: annotate it and the annotation is checked, leave it off and the *body* is,
+so `fun next(&mut self) { (self.fn)() }` is fine (it yields an `Option`) and `fun
+next(&mut self) { self.count += 1; }` is not (it yields nothing).
 
 ### What a `for` can iterate
 

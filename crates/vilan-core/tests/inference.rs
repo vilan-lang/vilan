@@ -43655,16 +43655,19 @@ fn a_supertraits_default_next_drives_the_loop_too() {
     );
 }
 
-/// The half of the wrong-signature family the fix deliberately does NOT judge:
-/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
-/// std is written that way and infers `Option<T>`. A body that yields nothing
-/// therefore still reaches the lowering, which reads `undefined[0]` and throws
-/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
-/// than silent, so not the same class as B80 — but it should be a compile
-/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
-/// compiles and the failure is the runtime's.
+// --- B92: an unannotated `next` is read from its body, not waved through -----
+// B80 judged a `next` by its ANNOTATION and deliberately left the unannotated
+// half alone, because `IteratorFromFn::next` in std is written
+// `fun next(&mut self) { (self.fn)() }` and had to stay legal. But "unannotated"
+// was never the reason it is legal — its BODY yields an `Option<T>`, which is
+// what reading the body says. A body that yields nothing infers `void`, reached
+// the lowering, and `undefined[0]` threw `TypeError` at runtime: loud rather
+// than silent, so not B80's class, but still the compiler's job. One rule now
+// covers both spellings; the annotation only decides where the answer is read.
+
+/// B92's headline case, `#[ignore]`d until the fix: a `next` whose body yields
+/// nothing at all.
 #[test]
-#[ignore]
 fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
     assert_fails_with(
         r#"
@@ -43685,7 +43688,125 @@ fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
             }
         }
         "#,
-        "cannot iterate",
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The carve-out, proven rather than asserted: `Iterator::from_fn`'s `next` is
+/// unannotated BY DESIGN and stays legal, because its body yields an `Option`.
+/// This is the pin that would go red if the rule were "unannotated is an error"
+/// instead of "read the body", so it is the one that keeps std compiling.
+#[test]
+fn an_unannotated_next_that_yields_an_option_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut counted = 0;
+            let produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 3 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+    // The same shape written by hand, so the carve-out is the RULE and not a
+    // std-shaped exemption: a user `next` with no annotation whose body yields
+    // an `Option` drives the loop exactly as an annotated one does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self) {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(9);
+        }
+        "#,
+        "1\n2\n9\n",
+    );
+}
+
+/// The rule is the SHAPE, not the emptiness: an unannotated `next` that yields a
+/// perfectly good `i32` is the same error, and it is B80's silent case rather
+/// than B92's loud one — `number[0]` is `undefined`, `undefined !== 0` breaks, so
+/// the loop ran zero times and exited 0. Reading the body closes both at once.
+#[test]
+fn an_unannotated_next_that_yields_a_non_option_is_diagnosed_too() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num { at: i32 }
+        impl Num {
+            fun next(&mut self) { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `i32`",
+    );
+}
+
+/// The check reaches an INHERITED default too (B91's new tier), which it must:
+/// the loop drives whatever body it resolved to, and where that body came from
+/// cannot change what the lowering reads off the result.
+#[test]
+fn an_unannotated_inherited_default_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Blank { fun next(&mut self) { } }
+
+        struct Empty3 { at: i32 }
+        impl Empty3 with Blank {}
+
+        fun main() {
+            mut empty = Empty3 { at = 0 };
+            for item in empty { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The ANNOTATED half keeps its own wording, so the two diagnostics stay
+/// distinguishable: one sends you to the annotation, the other to the body it
+/// was read from. B80's pins cover the behaviour; this pins the split.
+#[test]
+fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num2 { at: i32 }
+        impl Num2 {
+            fun next(&mut self): i32 { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num2 { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
     );
 }
 

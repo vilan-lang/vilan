@@ -17725,32 +17725,52 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// A `for` over a struct or enum whose `next` is DECLARED to return
-    /// something other than `Option<T>`. The name alone resolves the protocol
+    /// A `for` over a struct or enum whose `next` hands back something other
+    /// than `Option<T>`. The name alone resolves the protocol
     /// (`iterator-adapters.md` §1), and the lowering then reads the `Option`
     /// tag off whatever came back: `fun next(&mut self): i32` yields a number,
     /// `number[0]` is `undefined`, `undefined !== 0` breaks — so the loop runs
-    /// ZERO times and exits 0. An UNANNOTATED `next` is not judged here;
-    /// `IteratorFromFn::next` is written that way in std and infers its
-    /// `Option<T>` from its body.
+    /// ZERO times and exits 0. A `next` with no annotation at all is worse: its
+    /// body yields `void`, `undefined[0]` THROWS, and the failure is the
+    /// runtime's rather than the compiler's (B92). Which half it is decides only
+    /// where the diagnostic points the reader — at the annotation, or at the
+    /// body it was read from.
     fn report_for_each_next_not_option(
         &mut self,
         for_each_id: Id,
         iterable_id: Id,
         iterable_type: &Type,
         next_method: &str,
+        next_id: Id,
         return_type: &Type,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
         let returned = self.pretty_print_type(return_type, &HashMap::new());
+        let annotated = matches!(
+            self.expr_id_to_expr_map.get(&next_id),
+            Some(Expr::Function(function_id))
+                if self
+                    .functions
+                    .get(function_id)
+                    .is_some_and(|function| function.return_type_id.is_some())
+        );
+        let (source, steer) = match annotated {
+            true => (
+                format!("its `{next_method}` returns `{returned}`"),
+                "Return an `Option`, or rename the method",
+            ),
+            false => (
+                format!("its `{next_method}` is unannotated and its body yields `{returned}`"),
+                "Yield an `Option` — `Some(value)` while there is one, `None` to stop \
+                 — or rename the method",
+            ),
+        };
         self.report_for_each_error(
             for_each_id,
             iterable_id,
             format!(
-                "cannot iterate `{rendered}`: its `{next_method}` returns \
-                 `{returned}`, but the `for` protocol drives \
-                 `{next_method}(&mut self): Option<T>` and stops at `None`. \
-                 Return an `Option`, or rename the method"
+                "cannot iterate `{rendered}`: {source}, but the `for` protocol drives \
+                 `{next_method}(&mut self): Option<T>` and stops at `None`. {steer}"
             ),
         );
     }
@@ -17830,20 +17850,35 @@ impl<'src> Analyzer<'src> {
         self.structs.get(id).is_some_and(|struct_| struct_.external)
     }
 
-    /// The declared return type of a `for` subject's protocol member, when it
-    /// contradicts `Option<T>` — the payload of
-    /// `report_for_each_next_not_option`. `None` means "no quarrel": either the
-    /// member is unannotated (judged by its body elsewhere) or it already
-    /// returns an `Option`.
+    /// The return type of a `for` subject's protocol member, when it contradicts
+    /// `Option<T>` — the payload of `report_for_each_next_not_option`. `None`
+    /// means "no quarrel": it returns an `Option`, or nothing has landed yet to
+    /// judge.
+    ///
+    /// An UNANNOTATED `next` is read from its BODY rather than waved through
+    /// (B92). Leaving it unjudged was deliberate — `IteratorFromFn::next` in std
+    /// is written `fun next(&mut self) { (self.fn)() }` and is meant to stay
+    /// legal — but "unannotated" was never the reason it is legal: its body
+    /// yields an `Option<T>`, which is exactly what reading the body says. A body
+    /// that yields nothing infers `void`, and the lowering then reads
+    /// `undefined[0]` and throws `TypeError` at runtime. So the rule is one rule
+    /// for both spellings — the protocol drives `next(&mut self): Option<T>` —
+    /// and the annotation only decides where the answer is read from.
     fn for_each_next_non_option_return(&mut self, next_id: Id) -> Option<Type> {
         let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
             return None;
         };
-        let return_type = self
-            .functions
-            .get(function_id)?
-            .return_type_id?
-            .get_type(self);
+        let function = self.functions.get(function_id)?;
+        let (declared, has_body, body_return_id) =
+            (function.return_type_id, function.has_body, function.body.1);
+        let return_type = match declared {
+            Some(declared) => declared.get_type(self),
+            // A bodyless trait REQUIREMENT has nothing to read and nothing to
+            // contradict; conformance makes the impl declare it, and that
+            // declaration is what the loop resolves to.
+            None if !has_body => return None,
+            None => self.infer_type(body_return_id, &Type::Unknown, &HashMap::new()),
+        };
         match &return_type {
             Type::Enum(enum_id, _)
                 if self.enums.get(enum_id).map(|enumeration| enumeration.name)
@@ -17851,7 +17886,8 @@ impl<'src> Analyzer<'src> {
             {
                 None
             }
-            // An unresolved annotation is not evidence of a contradiction.
+            // Neither an unresolved annotation nor a body that has not typed yet
+            // is evidence of a contradiction.
             Type::Unknown | Type::Unresolved | Type::Any => None,
             _ => Some(return_type),
         }
@@ -24986,6 +25022,7 @@ impl<'src> Analyzer<'src> {
                                 iterable_id,
                                 &iterable_type,
                                 next_method,
+                                next_id,
                                 &return_type,
                             );
                             continue;
@@ -25029,6 +25066,7 @@ impl<'src> Analyzer<'src> {
                                 iterable_id,
                                 &iterable_type,
                                 next_method,
+                                next_id,
                                 &return_type,
                             );
                             continue;
