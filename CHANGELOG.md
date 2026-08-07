@@ -20,6 +20,10 @@ Two corpus goldens moved, both by exactly the new write and the small helper beh
 
 ---
 
+**An error in the web playground names the file it is in, even when the program also has a syntax error.** The playground gets one flat list of errors — the entry file's own lex and parse failures first, then everything the analyzer found — but the file each error belongs to is recorded only for the analyzer's half. The playground indexed that record with the *flat* position, so every attribution after a recovered syntax error was off by the number of syntax errors ahead of it, and the visitor's own syntax error could come back labeled with a standard-library file. The language server has always subtracted the prefix; the playground does now too.
+
+---
+
 ## v0.32.0 — 2026-08-06
 
 **A pattern capture taken from `&mut self` is what the pattern matched, not what the arm wrote afterwards.** `if self is Feed::Ready(let items, let at) { self = Feed::Ready(items, at + 1); items[at] }` returned `items[at + 1]` — the capture read the value the *same arm* had just written. Two `step()` calls over `Ready(["a","b","c"], 0)` printed `b`, `c` instead of `a`, `b`. Every writable view was affected: `&mut self`, an ordinary `&mut` parameter, a local bound to `&mut x`, and a `*view` dereference.
