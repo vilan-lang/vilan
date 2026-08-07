@@ -187,6 +187,13 @@ vilan/
 .github/           CI: the test matrix + the release pipeline
 ```
 
+## AI stance
+
+See [AI_stance.md](AI_STANCE.md).
+The short of it is that AI tools have been used extensively for _implementation_,
+but not _design_. Vilan is a for-human language and always will be.
+Had I the resources, Vilan's compiler would be primarily written by hand.
+
 ## Development
 
 ```sh
