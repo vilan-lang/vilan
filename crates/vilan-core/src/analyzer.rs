@@ -9711,6 +9711,40 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The substitution an INHERITED trait default runs under on a concrete
+    /// receiver: the providing impl's own generics bound from the receiver
+    /// (`impl Bag<type T>` against `Bag<i32>` binds `T = i32`), and then the
+    /// TRAIT's parameters bound through the arguments that impl wrote in its
+    /// `with` clause (`impl Empty with Fixed<i32>` binds `Fixed`'s `T = i32`).
+    /// Without the second half a default's own signature stays abstract — its
+    /// `Option<T>` return, its `observer: |T| void` parameter (B23).
+    ///
+    /// Shared by `receiver.member()` and by `for x in receiver`, which drive the
+    /// same defaults through the same `GenericDispatch::OnType` channel.
+    fn inherited_default_bindings(
+        &mut self,
+        subject_type: &Type,
+        impl_subject_id: TypeId,
+        trait_id: Id,
+        trait_arguments: &[TypeId],
+    ) -> SubstitutionContext {
+        let impl_subject = impl_subject_id.get_type(self);
+        let mut bindings: SubstitutionContext = self
+            .reconcile_type(&impl_subject, subject_type, &HashMap::new())
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        let trait_parameter_ids = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        for (parameter_id, argument_id) in trait_parameter_ids.iter().zip(trait_arguments) {
+            let resolved = self.substitute_type(&argument_id.get_type(self), &bindings);
+            bindings.insert(*parameter_id, resolved.get_type_id(self));
+        }
+        bindings
+    }
+
     /// Every inherited default `member_name` reaches on `subject_type`, one per
     /// distinct member: `Ord` requiring `PartialEq` offers `eq` through both,
     /// but it is ONE declaration, so it is one candidate — while two unrelated
@@ -17521,7 +17555,27 @@ impl<'src> Analyzer<'src> {
             Type::Struct(subject_id, subject_arguments)
             | Type::Enum(subject_id, subject_arguments) => {
                 let (subject_id, subject_arguments) = (*subject_id, subject_arguments.clone());
-                let next_id = self.method_member_in_impls(iterable_type, next_method)?;
+                // An INHERITED default drives the loop too (B91), and its payload
+                // is written in the TRAIT's parameters rather than the subject's.
+                // It instantiates through the same two-step substitution the call
+                // path uses — the providing impl's generics from the receiver,
+                // then the trait's parameters from the impl's written arguments —
+                // because one step is not enough: `impl Bag<type T> with Feed<T>`
+                // maps the trait's `T` onto the impl's BINDER, which is abstract
+                // until the receiver grounds it. Without this the binding took the
+                // `Any` fallback and `pair.1` was "cannot access field '1' on T".
+                let Some(next_id) = self.method_member_in_impls(iterable_type, next_method) else {
+                    let (_, impl_subject_id, trait_id, trait_arguments) =
+                        self.method_member_in_inherited_defaults(iterable_type, next_method)?;
+                    let payload = self.trait_next_payload(trait_id, next_method)?;
+                    let bindings = self.inherited_default_bindings(
+                        iterable_type,
+                        impl_subject_id,
+                        trait_id,
+                        &trait_arguments,
+                    );
+                    return Some(self.substitute_type(&payload, &bindings));
+                };
                 let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id)
                 else {
                     return None;
@@ -17573,6 +17627,28 @@ impl<'src> Analyzer<'src> {
         trait_arguments: &[TypeId],
         next_method: &str,
     ) -> Option<Type> {
+        let element = self.trait_next_payload(trait_id, next_method)?;
+        let parameter_ids = self
+            .traits
+            .get(&trait_id)
+            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        let substitution: SubstitutionContext = parameter_ids
+            .into_iter()
+            .zip(trait_arguments.iter().copied())
+            .collect();
+        Some(self.substitute_type(&element, &substitution))
+    }
+
+    /// The payload a trait's protocol member declares, UNSUBSTITUTED: the `T` of
+    /// `next(&mut self): Option<T>` as the trait itself wrote it. `None` when the
+    /// trait has no such member, or declares one that does not return an
+    /// `Option` — which is what makes "this bound gives no iterator" detectable
+    /// rather than silently native. Callers supply the substitution, and which
+    /// one differs: a bare `Self` receiver has only the trait's own arguments,
+    /// an inherited default on a concrete receiver needs the providing impl's
+    /// bindings underneath them (B91).
+    fn trait_next_payload(&mut self, trait_id: Id, next_method: &str) -> Option<Type> {
         let next_id = self.method_member_in_trait(trait_id, next_method)?;
         let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
             return None;
@@ -17588,17 +17664,7 @@ impl<'src> Analyzer<'src> {
         if self.enums.get(&enum_id).map(|enumeration| enumeration.name) != Some("Option") {
             return None;
         }
-        let element = arguments.first()?.get_type(self);
-        let parameter_ids = self
-            .traits
-            .get(&trait_id)
-            .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-            .unwrap_or_default();
-        let substitution: SubstitutionContext = parameter_ids
-            .into_iter()
-            .zip(trait_arguments.iter().copied())
-            .collect();
-        Some(self.substitute_type(&element, &substitution))
+        Some(arguments.first()?.get_type(self))
     }
 
     /// A `for` whose subject is a generic (or a bare trait `Self`) that no
@@ -17659,32 +17725,85 @@ impl<'src> Analyzer<'src> {
         );
     }
 
-    /// A `for` over a struct or enum whose `next` is DECLARED to return
-    /// something other than `Option<T>`. The name alone resolves the protocol
+    /// A `for` over a struct or enum whose `next` hands back something other
+    /// than `Option<T>`. The name alone resolves the protocol
     /// (`iterator-adapters.md` §1), and the lowering then reads the `Option`
     /// tag off whatever came back: `fun next(&mut self): i32` yields a number,
     /// `number[0]` is `undefined`, `undefined !== 0` breaks — so the loop runs
-    /// ZERO times and exits 0. An UNANNOTATED `next` is not judged here;
-    /// `IteratorFromFn::next` is written that way in std and infers its
-    /// `Option<T>` from its body.
+    /// ZERO times and exits 0. A `next` with no annotation at all is worse: its
+    /// body yields `void`, `undefined[0]` THROWS, and the failure is the
+    /// runtime's rather than the compiler's (B92). Which half it is decides only
+    /// where the diagnostic points the reader — at the annotation, or at the
+    /// body it was read from.
     fn report_for_each_next_not_option(
         &mut self,
         for_each_id: Id,
         iterable_id: Id,
         iterable_type: &Type,
         next_method: &str,
+        next_id: Id,
         return_type: &Type,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
         let returned = self.pretty_print_type(return_type, &HashMap::new());
+        let annotated = matches!(
+            self.expr_id_to_expr_map.get(&next_id),
+            Some(Expr::Function(function_id))
+                if self
+                    .functions
+                    .get(function_id)
+                    .is_some_and(|function| function.return_type_id.is_some())
+        );
+        let (source, steer) = match annotated {
+            true => (
+                format!("its `{next_method}` returns `{returned}`"),
+                "Return an `Option`, or rename the method",
+            ),
+            false => (
+                format!("its `{next_method}` is unannotated and its body yields `{returned}`"),
+                "Yield an `Option` — `Some(value)` while there is one, `None` to stop \
+                 — or rename the method",
+            ),
+        };
         self.report_for_each_error(
             for_each_id,
             iterable_id,
             format!(
-                "cannot iterate `{rendered}`: its `{next_method}` returns \
-                 `{returned}`, but the `for` protocol drives \
-                 `{next_method}(&mut self): Option<T>` and stops at `None`. \
-                 Return an `Option`, or rename the method"
+                "cannot iterate `{rendered}`: {source}, but the `for` protocol drives \
+                 `{next_method}(&mut self): Option<T>` and stops at `None`. {steer}"
+            ),
+        );
+    }
+
+    /// A `for` whose subject reaches its protocol member through TWO inherited
+    /// trait defaults (B91's ambiguous tier, B57 §3's rule one tier down). The
+    /// CALL form resolves this by naming one — `Trait::next(receiver)` — but a
+    /// loop has no spelling that selects a provider, so the steer is the fix
+    /// that works: declare the member inherently, the tier that beats both
+    /// (the B65 lesson, as B83 applied it to statics).
+    fn report_ambiguous_for_each_next(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+        trait_ids: &[Id],
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let providers: Vec<String> = trait_ids
+            .iter()
+            .map(|trait_id| format!("'{}'", self.trait_label_for(iterable_type, *trait_id)))
+            .collect();
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "`{next_method}` is ambiguous on `{rendered}`: {}{} provide it as an \
+                 inherited default, and a `for` loop has no spelling that names one. \
+                 Declare `{next_method}` on `{rendered}` itself — an inherent member \
+                 beats every trait-provided one",
+                if providers.len() == 2 { "both " } else { "" },
+                join_with(&providers, "and"),
             ),
         );
     }
@@ -17731,20 +17850,35 @@ impl<'src> Analyzer<'src> {
         self.structs.get(id).is_some_and(|struct_| struct_.external)
     }
 
-    /// The declared return type of a `for` subject's protocol member, when it
-    /// contradicts `Option<T>` — the payload of
-    /// `report_for_each_next_not_option`. `None` means "no quarrel": either the
-    /// member is unannotated (judged by its body elsewhere) or it already
-    /// returns an `Option`.
+    /// The return type of a `for` subject's protocol member, when it contradicts
+    /// `Option<T>` — the payload of `report_for_each_next_not_option`. `None`
+    /// means "no quarrel": it returns an `Option`, or nothing has landed yet to
+    /// judge.
+    ///
+    /// An UNANNOTATED `next` is read from its BODY rather than waved through
+    /// (B92). Leaving it unjudged was deliberate — `IteratorFromFn::next` in std
+    /// is written `fun next(&mut self) { (self.fn)() }` and is meant to stay
+    /// legal — but "unannotated" was never the reason it is legal: its body
+    /// yields an `Option<T>`, which is exactly what reading the body says. A body
+    /// that yields nothing infers `void`, and the lowering then reads
+    /// `undefined[0]` and throws `TypeError` at runtime. So the rule is one rule
+    /// for both spellings — the protocol drives `next(&mut self): Option<T>` —
+    /// and the annotation only decides where the answer is read from.
     fn for_each_next_non_option_return(&mut self, next_id: Id) -> Option<Type> {
         let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
             return None;
         };
-        let return_type = self
-            .functions
-            .get(function_id)?
-            .return_type_id?
-            .get_type(self);
+        let function = self.functions.get(function_id)?;
+        let (declared, has_body, body_return_id) =
+            (function.return_type_id, function.has_body, function.body.1);
+        let return_type = match declared {
+            Some(declared) => declared.get_type(self),
+            // A bodyless trait REQUIREMENT has nothing to read and nothing to
+            // contradict; conformance makes the impl declare it, and that
+            // declaration is what the loop resolves to.
+            None if !has_body => return None,
+            None => self.infer_type(body_return_id, &Type::Unknown, &HashMap::new()),
+        };
         match &return_type {
             Type::Enum(enum_id, _)
                 if self.enums.get(enum_id).map(|enumeration| enumeration.name)
@@ -17752,7 +17886,8 @@ impl<'src> Analyzer<'src> {
             {
                 None
             }
-            // An unresolved annotation is not evidence of a contradiction.
+            // Neither an unresolved annotation nor a body that has not typed yet
+            // is evidence of a contradiction.
             Type::Unknown | Type::Unresolved | Type::Any => None,
             _ => Some(return_type),
         }
@@ -17854,7 +17989,7 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// Binds a method's own generics from its arguments, parameter-first (so the
+    /// Binds a callee's own generics from its arguments, parameter-first (so the
     /// bindings key on the callee). With `skip_closures`, only non-closure
     /// arguments are used — run first so a closure parameter `|T| ..` is typed with
     /// `T` already known (e.g. `bind_each`'s `|todo| ..`, where `T` is the element
@@ -17865,10 +18000,15 @@ impl<'src> Analyzer<'src> {
     /// that closure's return (`map<U>`'s `U`) cannot bind on this attempt, so
     /// the caller must defer and retry (B19); resolving anyway would freeze the
     /// call's substitution — and its return type — with the generic abstract.
-    fn bind_method_own_generics(
+    ///
+    /// `self_parameter_offset` is 1 for a method (whose first parameter is
+    /// `self`, which no argument stands for) and 0 for a free function or a
+    /// static — the ONE place the two call paths differ, so both can share this.
+    fn bind_callee_own_generics(
         &mut self,
         member_id: Id,
         argument_ids: &[Id],
+        self_parameter_offset: usize,
         skip_closures: bool,
         substitution: &mut SubstitutionContext,
     ) -> bool {
@@ -17894,8 +18034,7 @@ impl<'src> Analyzer<'src> {
             if skip_closures && is_closure {
                 continue;
             }
-            // `+ 1` skips the method's `self` parameter.
-            let Some(parameter_id) = parameter_ids.get(index + 1) else {
+            let Some(parameter_id) = parameter_ids.get(index + self_parameter_offset) else {
                 continue;
             };
             let Some(parameter_type) = self
@@ -17957,6 +18096,65 @@ impl<'src> Analyzer<'src> {
             self.collect_residual_generics(&argument.get_type(self), &mut binders);
         }
         binders
+    }
+
+    /// Whether any of `member_id`'s OWN generic parameters is still unbound in
+    /// `substitution` — i.e. this attempt does not yet know what the method is
+    /// instantiated at.
+    fn own_generics_unbound(&self, member_id: Id, substitution: &SubstitutionContext) -> bool {
+        self.method_signature(member_id)
+            .is_some_and(|(_, own_generics)| {
+                own_generics
+                    .iter()
+                    .any(|generic| !substitution.contains_key(generic))
+            })
+    }
+
+    /// Whether some CLOSURE argument stands before some non-closure argument —
+    /// the one order in which typing the arguments POSITIONALLY types a closure
+    /// before the argument that could bind the generic its parameter is written
+    /// over. With every closure last, positional order already is binding order.
+    fn a_closure_argument_precedes_a_value_argument(&self, argument_ids: &[Id]) -> bool {
+        let is_closure = |argument_id: &Id| {
+            matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            )
+        };
+        let Some(first_closure) = argument_ids.iter().position(is_closure) else {
+            return false;
+        };
+        argument_ids
+            .iter()
+            .skip(first_closure)
+            .any(|argument_id| !is_closure(argument_id))
+    }
+
+    /// Whether some NON-closure argument's type has not landed on this attempt,
+    /// so a generic that argument would bind cannot bind yet. Closure arguments
+    /// are excluded: a closure's own type is `Unresolved` until its body types,
+    /// and its body needs the parameter types this very call is about to supply
+    /// (B19), so a closure is judged after the closures are typed, not before.
+    fn an_argument_type_is_unresolved(
+        &mut self,
+        argument_ids: &[Id],
+        substitution: &SubstitutionContext,
+    ) -> bool {
+        for argument_id in argument_ids {
+            if matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Closure(_))
+            ) {
+                continue;
+            }
+            if matches!(
+                self.infer_type(*argument_id, &Type::Unknown, substitution),
+                Type::Unresolved
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     fn infer_closure_args_against_params(
@@ -21004,6 +21202,46 @@ impl<'src> Analyzer<'src> {
                             substitution_context.insert(*generic_constraint, *generic_argument_id);
                         }
                     }
+                    // The method path's two-phase rule, shared (B90): bind the
+                    // callee's own generics from the arguments that are NOT
+                    // closures before any closure argument is typed, and defer
+                    // while one of those has not landed. The loop below walks the
+                    // parameters positionally, so a closure standing EARLIER than
+                    // the argument that fixes the generic — `apply<T>(render: |T|
+                    // i32, value: T)` — is reached first and its unannotated
+                    // parameter freezes at the abstract `T`, permanently: the
+                    // slot is filled only while it is still `Unknown`. The
+                    // deferral is the one the loop already performs when it
+                    // reaches an `Unresolved` argument, hoisted ahead of the
+                    // closures rather than added.
+                    //
+                    // Only for that ORDER. When every closure argument already
+                    // stands after the arguments that could bind, the loop's own
+                    // order IS the two-phase order and there is nothing to hoist,
+                    // so the call keeps the exact inference schedule it has
+                    // always had — which matters, because re-inferring an
+                    // argument earlier mints its type id earlier, and
+                    // monomorphization keys on type ids (probed: hoisting
+                    // unconditionally left three corpus goldens
+                    // behaviour-identical but re-keyed, one of them emitting a
+                    // duplicate `Signal::new` instance).
+                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_))
+                        && self.a_closure_argument_precedes_a_value_argument(argument_ids)
+                    {
+                        self.bind_callee_own_generics(
+                            target_id,
+                            argument_ids,
+                            0,
+                            true,
+                            &mut substitution_context,
+                        );
+                        if self.own_generics_unbound(target_id, &substitution_context)
+                            && self
+                                .an_argument_type_is_unresolved(argument_ids, &substitution_context)
+                        {
+                            return Resolution::Deferred;
+                        }
+                    }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
                         let parameter_name = parameter.name;
@@ -21328,29 +21566,12 @@ impl<'src> Analyzer<'src> {
                                     id,
                                     GenericDispatch::OnType(Some(receiver_type_id), member_name),
                                 );
-                                // Bind the providing impl's generics from the
-                                // receiver, then the TRAIT's parameters through
-                                // the impl's written trait arguments — so the
-                                // default's signature (`observer: |T| void`)
-                                // types concretely and a closure argument's
-                                // parameter grounds (B23).
-                                let impl_subject = impl_subject_id.get_type(self);
-                                let mut bindings: SubstitutionContext = self
-                                    .reconcile_type(&impl_subject, &subject_type, &HashMap::new())
-                                    .map(|(_, bindings)| bindings.into_iter().collect())
-                                    .unwrap_or_default();
-                                let trait_parameter_ids = self
-                                    .traits
-                                    .get(&trait_id)
-                                    .map(|trait_| trait_.generic_parameter_constraint_ids.clone())
-                                    .unwrap_or_default();
-                                for (parameter_id, argument_id) in
-                                    trait_parameter_ids.iter().zip(trait_arguments)
-                                {
-                                    let resolved = self
-                                        .substitute_type(&argument_id.get_type(self), &bindings);
-                                    bindings.insert(*parameter_id, resolved.get_type_id(self));
-                                }
+                                let bindings = self.inherited_default_bindings(
+                                    &subject_type,
+                                    impl_subject_id,
+                                    trait_id,
+                                    &trait_arguments,
+                                );
                                 if !bindings.is_empty() {
                                     self.method_call_substitution.insert(id, bindings);
                                 }
@@ -21498,57 +21719,60 @@ impl<'src> Analyzer<'src> {
                     .unwrap_or_default();
                 // Bind the method's own generics from the non-closure arguments
                 // first, so a closure parameter `|T| ..` is typed with `T` known.
-                self.bind_method_own_generics(member_id, argument_ids, true, &mut substitution);
+                self.bind_callee_own_generics(member_id, argument_ids, 1, true, &mut substitution);
+                // If an own generic is still unbound because an argument's type
+                // has not landed, defer so the binding — and any bound-only
+                // generic derived from it (`m<T, S: Source<T>>` called with an
+                // *inferred* argument, whose type lands only later) — completes
+                // on a retry. The free-function path in `resolve_call_subject`
+                // defers the same way; without it the generic stays abstract and
+                // monomorphizes to the empty abstract method.
+                //
+                // Deferring here, BEFORE the closure arguments are typed, is what
+                // the two paths used to disagree about (B90). The free path bails
+                // at the first argument whose type is `Unresolved` and so never
+                // reaches a later closure; this one typed the closures first and
+                // deferred afterwards. That is not harmless, because an
+                // unannotated closure parameter's type slot is a ONE-SHOT channel
+                // — it is filled only while it is still `Unknown` — so typing
+                // `render: |T| i32` against a substitution that does not yet carry
+                // `T` freezes the parameter at the ABSTRACT `T`, and the retry
+                // that finally knows `T = Route` can no longer correct it. The
+                // body then checks against nothing: an enum `match` inside
+                // compiled against the wrong enum and ran.
+                // An argument that IS an unknown closure parameter defers too —
+                // the free-function path's rule (`resolve_call_subject`): its type
+                // lands when the closure's OWNING call resolves. Resolving now
+                // binds nothing, the bounded generic freezes abstract, and the
+                // call monomorphizes to the trait's empty member — the
+                // silent-stub misrender.
+                if self.own_generics_unbound(member_id, &substitution)
+                    && (self.an_argument_type_is_unresolved(argument_ids, &substitution)
+                        || argument_ids
+                            .iter()
+                            .any(|argument_id| self.is_unknown_closure_parameter(*argument_id)))
+                {
+                    return Resolution::Deferred;
+                }
                 self.infer_closure_args_against_params(member_id, argument_ids, &substitution);
                 // Then bind generics fixed by a closure's return (`derive<U>`'s `U`),
                 // now that the closures are typed.
-                let unresolved_closure_argument = self.bind_method_own_generics(
+                let unresolved_closure_argument = self.bind_callee_own_generics(
                     member_id,
                     argument_ids,
+                    1,
                     false,
                     &mut substitution,
                 );
-                // If an own generic is still unbound because an argument is
-                // unresolved, defer so the binding — and any bound-only generic derived
-                // from it (`m<T, S: Source<T>>` called with an *inferred* argument, whose
-                // type lands only later) — completes on a retry. The free-function path in
-                // `resolve_call_subject` defers the same way; without it the generic stays
-                // abstract and monomorphizes to the empty abstract method. A closure
-                // argument counts too (B19): its body may not have typed on this attempt
-                // (the parameters it needed were only just supplied above), and a generic
-                // fixed only by the closure's RETURN (`map<U>`'s `U`) would otherwise
-                // freeze abstract in the call's substitution and return type.
-                if let Some((_, own_generics)) = self.method_signature(member_id) {
-                    let some_unbound = own_generics
-                        .iter()
-                        .any(|generic| !substitution.contains_key(generic));
-                    if some_unbound
-                        && (unresolved_closure_argument
-                            || argument_ids.iter().any(|argument_id| {
-                                // An argument that IS an unknown closure
-                                // parameter defers too — the free-function
-                                // path's rule (`resolve_call_subject`): its
-                                // type lands when the closure's OWNING call
-                                // resolves. Resolving now binds nothing, the
-                                // bounded generic freezes abstract, and the
-                                // call monomorphizes to the trait's empty
-                                // member — the silent-stub misrender.
-                                self.is_unknown_closure_parameter(*argument_id)
-                                    || (!matches!(
-                                        self.expr_id_to_expr_map.get(argument_id),
-                                        Some(Expr::Closure(_))
-                                    ) && matches!(
-                                        self.infer_type(
-                                            *argument_id,
-                                            &Type::Unknown,
-                                            &substitution
-                                        ),
-                                        Type::Unresolved
-                                    ))
-                            }))
-                    {
-                        return Resolution::Deferred;
-                    }
+                // A closure argument counts too (B19): its body may not have typed
+                // on this attempt (the parameters it needed were only just
+                // supplied above), and a generic fixed only by the closure's
+                // RETURN (`map<U>`'s `U`) would otherwise freeze abstract in the
+                // call's substitution and return type.
+                if unresolved_closure_argument
+                    && self.own_generics_unbound(member_id, &substitution)
+                {
+                    return Resolution::Deferred;
                 }
                 // Keep the own-generic bindings as ordered values too — the
                 // OnConstraint emission re-targets a concrete impl's method,
@@ -24798,6 +25022,7 @@ impl<'src> Analyzer<'src> {
                                 iterable_id,
                                 &iterable_type,
                                 next_method,
+                                next_id,
                                 &return_type,
                             );
                             continue;
@@ -24818,7 +25043,69 @@ impl<'src> Analyzer<'src> {
                             self.method_call_substitution
                                 .insert(for_each_id, bindings.into_iter().collect());
                         }
+                    } else if let [(next_id, impl_subject_id, trait_id, trait_arguments)] = self
+                        .inherited_default_candidates(&iterable_type, next_method)
+                        .as_slice()
+                    {
+                        let (next_id, impl_subject_id, trait_id, trait_arguments) = (
+                            *next_id,
+                            *impl_subject_id,
+                            *trait_id,
+                            trait_arguments.clone(),
+                        );
+                        // Gap E, at the loop (B91). `impl Empty with Fixed<i32> {}`
+                        // declares nothing, so the impl-declared search above finds
+                        // nothing — but the trait's DEFAULT `next` is the type's
+                        // `next` for every other purpose, `empty.next()` included,
+                        // and a protocol duck-typed on the method name cannot mean
+                        // one thing at a call and another at a loop. Re-dispatched
+                        // to this concrete type at codegen, exactly as the call is.
+                        if let Some(return_type) = self.for_each_next_non_option_return(next_id) {
+                            self.report_for_each_next_not_option(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                next_id,
+                                &return_type,
+                            );
+                            continue;
+                        }
+                        self.for_each_next.insert(for_each_id, next_id);
+                        let receiver_type_id = iterable_type.clone().get_type_id(self);
+                        self.generic_dispatch.insert(
+                            for_each_id,
+                            GenericDispatch::OnType(Some(receiver_type_id), next_method),
+                        );
+                        let bindings = self.inherited_default_bindings(
+                            &iterable_type,
+                            impl_subject_id,
+                            trait_id,
+                            &trait_arguments,
+                        );
+                        if !bindings.is_empty() {
+                            self.method_call_substitution.insert(for_each_id, bindings);
+                        }
                     } else if !self.subject_is_natively_iterable(&iterable_type) {
+                        // Two traits offering same-named DEFAULTS are as ambiguous
+                        // as two declaring the name outright (§3, one tier down),
+                        // and saying "it has no `next`" of a type that has two
+                        // sends the reader looking for the wrong edit.
+                        let ambiguous: Vec<Id> = self
+                            .inherited_default_candidates(&iterable_type, next_method)
+                            .iter()
+                            .map(|(_, _, trait_id, _)| *trait_id)
+                            .collect();
+                        if ambiguous.len() > 1 {
+                            self.report_ambiguous_for_each_next(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                &ambiguous,
+                            );
+                            continue;
+                        }
                         // No protocol member and no deliberate native lowering:
                         // the fallback `for...of` would walk the receiver's own
                         // representation. B80 — B56's check, one type-shape over.

@@ -43567,16 +43567,21 @@ fn a_subject_that_declares_next_still_drives_the_loop() {
     );
 }
 
-/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
-/// trait default is reachable as a call (`empty.next()` resolves and returns
-/// `None`) but does not drive a loop — `method_member_candidates` reads the
-/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
-/// nothing. Before the fix the loop fell through to the native `for...of` and
-/// printed the `unused` field; now it is a clean "cannot iterate", which is the
-/// right interim answer but not the right final one. `#[ignore]`d: it asserts
-/// the desired outcome (the default drives the loop, printing `99` only).
+// --- B91: an inherited trait default drives the loop (Gap E, at the `for`) ---
+// A gap B80's check exposed rather than caused. A `next` INHERITED from a trait
+// default is the receiver's `next` everywhere else — `empty.next()` resolves and
+// returns `None`, and Gap E's `method_member_in_inherited_defaults` is what makes
+// it resolve — but the loop asked `method_member_candidates`, which reads each
+// impl's own `declarations`, and `impl Empty with Fixed<i32> {}` declares
+// nothing. B80 turned the silent native `for...of` into a clean "cannot iterate",
+// which was the right interim answer and the wrong final one: a protocol
+// duck-typed on a method NAME cannot mean one thing at a call and another at a
+// loop. The loop now falls back to the same tier the call does, dispatched to the
+// concrete receiver at codegen through the same `GenericDispatch::OnType`.
+
+/// B91's headline case, `#[ignore]`d until the fix: an impl that declares nothing
+/// still iterates, through the default it inherited.
 #[test]
-#[ignore]
 fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
@@ -43598,16 +43603,261 @@ fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     );
 }
 
-/// The half of the wrong-signature family the fix deliberately does NOT judge:
-/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
-/// std is written that way and infers `Option<T>`. A body that yields nothing
-/// therefore still reaches the lowering, which reads `undefined[0]` and throws
-/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
-/// than silent, so not the same class as B80 — but it should be a compile
-/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
-/// compiles and the failure is the runtime's.
+/// The default that actually YIELDS, which the empty one above cannot prove: the
+/// inherited body calls back into the impl's own required member, so the loop has
+/// to reach the default AND the default has to dispatch to this receiver. The
+/// element type has to be right too — it is written in the TRAIT's `T`, bound by
+/// the arguments the impl wrote in its `with` clause.
 #[test]
-#[ignore]
+fn an_inherited_default_that_yields_drives_the_loop_to_its_end() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Countdown<T> {
+            fun tick(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.tick() }
+        }
+
+        struct Down { at: i32 }
+        impl Down with Countdown<i32> {
+            fun tick(&mut self): Option<i32> {
+                if self.at <= 0 { None } else { self.at -= 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { at = 3 };
+            for item in down { print(item + 1); }
+            print(99);
+        }
+        "#,
+        "3\n2\n1\n99\n",
+    );
+}
+
+/// A GENERIC subject, where one substitution step is not enough: `impl Bag<type
+/// T> with Feed<T>` maps the trait's `T` onto the impl's BINDER, which is still
+/// abstract, so the element instantiates only after the receiver binds the binder.
+/// `pair.1` is the probe — with the trait's arguments alone it was "cannot access
+/// field '1' on type T", the B78 shape one tier over.
+#[test]
+fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Feed<T> {
+            fun take(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.take() }
+        }
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+        impl Bag<type T> with Feed<T> {
+            fun take(&mut self): Option<T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in bag { print(pair.1); }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The `next_mut` twin, lending each element by writable view — a separate member
+/// and a separate lookup, so it gets its own pin (the `a_mut_for_loop_over_a_
+/// subject_without_next_mut_is_diagnosed` precedent). The writes land in the
+/// receiver, which is what makes it the `next_mut` protocol rather than `next`.
+#[test]
+fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Walk<T> {
+            fun step(&mut self): Option<&mut T>;
+            fun next_mut(&mut self): Option<&mut T> { self.step() }
+        }
+
+        struct Bag2 { items: List<i32>, cursor: i32 }
+        impl Bag2 with Walk<i32> {
+            fun step(&mut self): Option<&mut i32> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag2 { items = [1, 2, 3], cursor = 0 };
+            for item in &mut bag { item = *item * 10; }
+            print(bag.items[0]);
+            print(bag.items[2]);
+        }
+        "#,
+        "10\n30\n",
+    );
+}
+
+/// B57's tiering, unchanged by the new tier: an inherent `next` beside an
+/// inherited default one is not ambiguous — inherent wins, unconditionally
+/// (`method-resolution.md` §3). The loop consults the inherited tier only when
+/// the declared search comes back empty, which is the same order the call path
+/// uses, so the two cannot disagree about which body runs.
+#[test]
+fn an_inherent_next_beats_an_inherited_default_at_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl Two with Fixed<i32> {}
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(99);
+        }
+        "#,
+        "1\n2\n99\n",
+    );
+}
+
+/// Two traits offering same-named DEFAULTS are as ambiguous as two declaring the
+/// name outright (§3, one tier down), and the loop must not silently pick one.
+/// The call form resolves this by naming a provider — `Trait::next(receiver)` —
+/// and a `for` has no such spelling, so the steer is the edit that works: declare
+/// it inherently, the tier that beats both (B65's lesson, as B83 applied it).
+#[test]
+fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T> { None } }
+        trait Late<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Both { at: i32 }
+        impl Both with Early<i32> {}
+        impl Both with Late<i32> {}
+
+        fun main() {
+            mut both = Both { at = 0 };
+            for item in both { print(item); }
+        }
+        "#,
+        "`next` is ambiguous on `Both`",
+    );
+}
+
+/// The tier's boundaries, both inherited from Gap E's own rules rather than
+/// re-decided here. B80's declared-shape check applies to an inherited default
+/// exactly as to a declared member — the lowering reads an `Option` tag off
+/// whatever comes back, whoever wrote it. And a `[trait_only]` default is not
+/// inherited onto the concrete surface at all (§3.2), so it does not make the
+/// receiver iterable.
+#[test]
+fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Bad { fun next(&mut self): i32 { 0 } }
+
+        struct Nope { at: i32 }
+        impl Nope with Bad {}
+
+        fun main() {
+            mut nope = Nope { at = 0 };
+            for item in nope { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Hidden<T> { [trait_only] fun next(&mut self): Option<T> { None } }
+
+        struct H { at: i32 }
+        impl H with Hidden<i32> {}
+
+        fun main() {
+            mut h = H { at = 0 };
+            for item in h { print(item); }
+        }
+        "#,
+        "it has no `next(&mut self): Option<T>`",
+    );
+}
+
+/// A default inherited through a SUPERTRAIT, which is the same tier reached one
+/// hop further out: `impl Q with Derived<i32>` never names `Base` at all, and
+/// `method_member_in_trait` walks the supertrait closure to find the body.
+#[test]
+fn a_supertraits_default_next_drives_the_loop_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Base<T> { fun next(&mut self): Option<T> { None } }
+        trait Derived<T> with Base<T> {}
+
+        struct Q { at: i32 }
+        impl Q with Derived<i32> {}
+
+        fun main() {
+            mut q = Q { at = 0 };
+            for item in q { print(item); }
+            print(9);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+// --- B92: an unannotated `next` is read from its body, not waved through -----
+// B80 judged a `next` by its ANNOTATION and deliberately left the unannotated
+// half alone, because `IteratorFromFn::next` in std is written
+// `fun next(&mut self) { (self.fn)() }` and had to stay legal. But "unannotated"
+// was never the reason it is legal — its BODY yields an `Option<T>`, which is
+// what reading the body says. A body that yields nothing infers `void`, reached
+// the lowering, and `undefined[0]` threw `TypeError` at runtime: loud rather
+// than silent, so not B80's class, but still the compiler's job. One rule now
+// covers both spellings; the annotation only decides where the answer is read.
+
+/// B92's headline case, `#[ignore]`d until the fix: a `next` whose body yields
+/// nothing at all.
+#[test]
 fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
     assert_fails_with(
         r#"
@@ -43628,7 +43878,125 @@ fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
             }
         }
         "#,
-        "cannot iterate",
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The carve-out, proven rather than asserted: `Iterator::from_fn`'s `next` is
+/// unannotated BY DESIGN and stays legal, because its body yields an `Option`.
+/// This is the pin that would go red if the rule were "unannotated is an error"
+/// instead of "read the body", so it is the one that keeps std compiling.
+#[test]
+fn an_unannotated_next_that_yields_an_option_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut counted = 0;
+            let produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 3 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+    // The same shape written by hand, so the carve-out is the RULE and not a
+    // std-shaped exemption: a user `next` with no annotation whose body yields
+    // an `Option` drives the loop exactly as an annotated one does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self) {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(9);
+        }
+        "#,
+        "1\n2\n9\n",
+    );
+}
+
+/// The rule is the SHAPE, not the emptiness: an unannotated `next` that yields a
+/// perfectly good `i32` is the same error, and it is B80's silent case rather
+/// than B92's loud one — `number[0]` is `undefined`, `undefined !== 0` breaks, so
+/// the loop ran zero times and exited 0. Reading the body closes both at once.
+#[test]
+fn an_unannotated_next_that_yields_a_non_option_is_diagnosed_too() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num { at: i32 }
+        impl Num {
+            fun next(&mut self) { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `i32`",
+    );
+}
+
+/// The check reaches an INHERITED default too (B91's new tier), which it must:
+/// the loop drives whatever body it resolved to, and where that body came from
+/// cannot change what the lowering reads off the result.
+#[test]
+fn an_unannotated_inherited_default_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Blank { fun next(&mut self) { } }
+
+        struct Empty3 { at: i32 }
+        impl Empty3 with Blank {}
+
+        fun main() {
+            mut empty = Empty3 { at = 0 };
+            for item in empty { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The ANNOTATED half keeps its own wording, so the two diagnostics stay
+/// distinguishable: one sends you to the annotation, the other to the body it
+/// was read from. B80's pins cover the behaviour; this pins the split.
+#[test]
+fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num2 { at: i32 }
+        impl Num2 {
+            fun next(&mut self): i32 { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num2 { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
     );
 }
 
@@ -43881,21 +44249,39 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
     );
 }
 
-/// And the half that does NOT, which is why B82 ships as a split rather than a
-/// blanket error. A closure argument to a METHOD's own generic reaches its body
-/// with the parameter still abstract, so the match inside is checked against
-/// nothing — the program below binds `Other::Second`'s payload out of a
-/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
-/// shape, and the routing guide's `swap(route, |current| match current { .. })`
-/// is the documented, shipped use, so a blanket error on a `Type::Generic`
-/// scrutinee takes the guide with it (probed: 3 diagnostics in
-/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
-///
-/// The fix is not at the pattern — it is to instantiate the closure parameter
-/// the way the free-function twin above already does. `#[ignore]`d: it asserts
-/// the diagnostic, and today the program compiles and runs.
+// --- B90: a closure argument to a generic's parameter, substituted ----------
+// B82's residual half, and NOT a pattern-checker gap: the closure's parameter
+// reached its body still typed as the abstract `T`, so the match inside was
+// checked against nothing and `Other::Second`'s payload came out of a
+// `Route::Away`, silently. The root cause is one-shot-ness. An unannotated
+// closure parameter's type slot is filled only while it is `Unknown`, so
+// whoever writes it first wins forever — and both call paths were willing to
+// write it from a substitution they knew to be incomplete:
+//
+//   * the METHOD path bound the callee's own generics from the non-closure
+//     arguments, typed the closure arguments, and only THEN decided to defer
+//     because an argument's type had not landed. On the attempt where
+//     `Route::Away(7)` was still `Unresolved`, `T` was unbound, `render: |T|
+//     i32` typed `current` as the abstract `T`, and the retry that finally knew
+//     `T = Route` found the slot already taken.
+//   * the FREE path walks its parameters positionally and defers at the first
+//     `Unresolved` argument, which is why `apply(value, render)` was right —
+//     but `apply(render, value)`, with the closure standing FIRST, hit the same
+//     wall for the same reason.
+//
+// So the fix is one rule in both places: bind the own generics from the
+// non-closure arguments, and defer BEFORE typing any closure while an
+// argument's type has not landed. `bind_callee_own_generics` is now shared,
+// differing only by whether the parameter list starts with `self`.
+
+/// B90's headline case, `#[ignore]`d until the fix: the wrong enum inside a
+/// closure passed to a METHOD's own generic. `std::ui::View::swap` is exactly
+/// this shape, and the routing guide's `swap(route, |current| match current {
+/// .. })` is the documented, shipped use — which is why B82 refused to make a
+/// `Type::Generic` scrutinee a blanket error (probed then: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`) and left this to
+/// instantiation instead.
 #[test]
-#[ignore]
 fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
     assert_fails_with(
         r#"
@@ -43917,6 +44303,233 @@ fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
         }
         "#,
         "does not belong to the matched enum",
+    );
+    // The half that must keep working — the RIGHT enum, through the same
+    // method. A diagnostic that also rejects this would be no fix at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The substitution reaches the closure parameter as a TYPE, not just as a
+/// pattern scrutinee: a method call on it resolves against the binding. This is
+/// the sharper probe of the two — a pattern can match by coincidence of
+/// representation, but `current.code()` either resolves or does not, and before
+/// the fix it did not ("cannot call method 'code' on T").
+#[test]
+fn a_closure_parameter_typed_by_a_methods_generic_reaches_its_methods() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Home, |current| current.code()));
+        }
+        "#,
+        "7\n0\n",
+    );
+}
+
+/// The ordering edge, both paths. The argument that FIXES the generic used to
+/// have to stand before the closure that consumes it, because the free path
+/// walks parameters positionally; the method path's two-phase binding never had
+/// that constraint and now the free path shares it. `apply(render, value)` is
+/// the same call as `apply(value, render)`.
+#[test]
+fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, render: |T| i32, value: T): i32 { render(value) }
+        }
+
+        fun main() {
+            print(free(|current| current.code(), Route::Away(4)));
+            print(Holder { tag = 0 }.apply(|current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "4\n7\n",
+    );
+    // And the wrong enum is still caught with the arguments in that order.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        fun main() {
+            print(free(|current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "does not belong to the matched enum",
+    );
+}
+
+/// The callee shapes that share the two-phase rule: a STATIC (no `self`, so the
+/// free path's offset), a trait DEFAULT reached through an impl that declares
+/// nothing (Gap E's dispatch, whose parameters are written in the trait's terms),
+/// and a method whose generic comes from the impl's binder rather than its own
+/// list. Each was a separate route to the same abstract-`T` parameter.
+#[test]
+fn every_callee_shape_substitutes_its_closure_arguments_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun statically<T>(value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        trait Applier {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+        impl Holder with Applier {}
+
+        struct Boxed<T> { held: T }
+        impl Boxed<type T> {
+            fun mapped(self, render: |T| i32): i32 { render(self.held) }
+        }
+
+        fun main() {
+            print(Holder::statically(Route::Away(1), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Away(2), |current| current.code()));
+            print(Boxed { held = Route::Away(3) }.mapped(|current| current.code()));
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+/// Nested closures: the inner call's own generic binds from a value whose type
+/// is itself the outer closure's parameter, so the outer substitution has to
+/// have landed before the inner one is attempted. Both parameters used to reach
+/// their bodies abstract.
+#[test]
+fn a_closure_nested_in_a_closure_argument_is_substituted_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current|
+                Holder { tag = 1 }.apply(current, |inner| inner.code())));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The closure's RETURN type is substituted by the same binding, and checked.
+/// `step: |T| T` under `T = Route` is BOTH halves at once — the parameter the
+/// body reads through and the value it must hand back — and they travel through
+/// one `substitute_type` `Type::Closure` arm, so this pins that they cannot
+/// drift apart. (The one-sided `|i32| T` shape was never broken: its parameter
+/// is concrete, so the one-shot slot had nothing abstract to freeze at.)
+#[test]
+fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }
+                .twice(Route::Away(1), |current| Route::Away(current.code() + 1))
+                .code());
+        }
+        "#,
+        "3\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Expected |Route| Route, but got |Route| Other instead.",
     );
 }
 
