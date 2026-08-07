@@ -177,11 +177,22 @@ lands, not a cache entry.
   fenced, so an unfenced browser-only binding in a Node project would
   compile clean and fail at runtime. A library genuinely used on both
   gets two runs, into two files.
+- `--only <Type>`: emit only this declaration and everything reachable
+  from its signatures — base types it `extends`, member types, parameter
+  and return types, generic arguments. Repeatable, and the flags compose
+  into one closure. Omitted: the whole file. A name the file does not
+  declare is an error, so a typo fails instead of quietly writing less
+  than you asked for. Use it when a declaration file is far larger than
+  the slice you need; see [Filtering](#filtering-a-large-declaration-file).
 - `-o, --output <path>`: where to write. Omitted: `<stem>.vl` beside the
   input (`leaflet.d.ts` → `leaflet.vl`).
 - `--stdout`: print instead of writing.
 - `--stats`: also report coverage — how many declarations and members
   bound, and which TypeScript constructs did not.
+
+Attribute order in the output is not stylistic: the parser reads
+`[extern(…)]` before `[platform(…)]`, and the other way round is a parse
+error. Keep the pair in that order if you edit a generated file.
 
 ### What you get
 
@@ -246,6 +257,85 @@ real host calls and become two real bindings of the same symbol — the
 short one keeps the plain name. (`std` does the same by hand: `append` and
 `append_text` both bind `appendChild`.)
 
+### Constructors
+
+TypeScript splits a host class in two: an `interface` for what an
+instance has, and a `declare var` of the same name whose object type
+carries the `new(…)` signature — the static side. bindgen reads the pair
+back together, so a construct signature becomes a real constructor on the
+type it yields:
+
+```ts
+interface Marker {
+    readonly id: string;
+}
+
+declare var Marker: {
+    prototype: Marker;
+    new(id: string): Marker;
+    readonly count: number;
+};
+```
+
+```vilan,norun
+external struct Marker;
+
+impl Marker {
+	[extern(new, "Marker")]
+	[platform("node")]
+	external fun new(id: str): Marker;
+
+	[extern(get, "id")]
+	[platform("node")]
+	external fun id(self): str;
+
+	[extern("Marker.count")]
+	[platform("node")]
+	external fun count(): f64;
+}
+
+fun main() { }
+```
+
+`new` is `Marker::new(…)`; the statics beside it become dotted globals
+reached the same way, `Marker::count()`. `prototype` is the idiom's
+marker, not a binding, and is dropped. A construct signature that names a
+*different* type — `declare var Image: { new(): HTMLImageElement }` —
+binds on that type instead, as `HTMLImageElement::new_image(…)`.
+
+An object-typed global with **no** construct signature is not a class and
+gets a TODO rather than an invented type; so does a global whose
+constructor object is typed by a named interface rather than written
+inline.
+
+### Filtering a large declaration file
+
+A declaration file is often far larger than the part you use, and
+`extends` flattening multiplies it: Vilan has no struct inheritance, so
+every base member is copied into each derived type. `--only` cuts the
+output to a named type and its transitive closure:
+
+```sh
+vilan bindgen lib.dom.d.ts --platform browser --only HTMLCanvasElement -o canvas.vl
+```
+
+What "reachable" means is what *survives* the mapping table, not what the
+TypeScript text mentions. An open union widens to `any`, so
+`RenderingContext = CanvasRenderingContext2D | WebGLRenderingContext | …`
+pulls in none of its members; `T | null` binds as `T`, so `T` is kept. A
+base type is followed for the members flattened out of it, but its own
+name is not emitted unless some signature names it.
+
+Cycles are fine — a `Node` has an `ownerDocument` and a `Document` has a
+`documentElement` — each declaration is visited once.
+
+A caveat worth knowing before reaching for it on the DOM specifically:
+the browser's element types are one strongly-connected component, so
+`--only HTMLCanvasElement` against the real `lib.dom.d.ts` still keeps
+about 900 declarations. The filter is doing its job; the type graph is
+simply that dense. For a third-party library — bindgen's actual target —
+the closure is usually a handful of types.
+
 ### Absence, and why there is no `Option`
 
 Nothing bindgen emits is an `Option<T>`, and that is deliberate. Vilan has
@@ -279,7 +369,7 @@ landmine. The ones you will meet most:
 
 | TypeScript | Why it can't map |
 |---|---|
-| `declare const x: T` | Every `[extern(…)]` form binds a *call* or a receiver's property; none reads a bare global as a value. Bind its members as dotted globals: `[extern("x.member")]`. |
+| `declare const x: T` (a plain global value) | Every `[extern(…)]` form binds a *call* or a receiver's property; none reads a bare global as a value. Bind its members as dotted globals: `[extern("x.member")]`. A global that is a *constructor object* is different — see [Constructors](#constructors). |
 | `{ [key: string]: T }`, `{ [index: number]: T }`, `Record<K, V>` | An open keyed or array-like host object has no Vilan type at a host boundary — see below. |
 | overloads | Vilan has one signature per name. The first wins; the rest are quoted so you can hand-split them into distinct names. |
 | `A \| B` (open unions), intersections | No union or structural types in Vilan; widened to `any`. |

@@ -271,3 +271,94 @@ runs green, and both full-workspace runs finished clean (2439 passed, 0
 failed, 2 skipped each) — including `benchmarks_run_and_report_the_deterministic_counts`
 passing in *both* concurrent runs, which is the E33 collision scenario
 occurring for real and not colliding. Zero flakes.
+
+## 6. The hmr swap e2e's budgets were compile budgets (E39, 2026-08-06)
+
+`hmr_swap`'s `the_swap_protocol_carries_state_across_a_rebuilt_bundle`
+failed in two heavily-loaded full-suite runs and passed 5/5 in isolation —
+E32's disease, in the one shape E32's cure does not fit.
+
+**Where the clock was.** Every wait in the test was a literal
+`Duration::from_secs(20)`, and one of them wrapped `run --watch`'s FIRST
+ROUND: a full compile of both legs (a browser bundle over `std::ui` plus a
+node server) before `dist/client.js` can exist. On a contended box that
+alone runs past 20 s. Reproduced directly, not inferred: with the tree at
+load average ~27 on 16 cores, the test failed at exactly
+`"round 1 should have written dist/client.js"` — in ISOLATION, no other
+copy of itself in sight. The assertion was about the swap protocol and
+said nothing about speed; the number was a performance assertion nobody
+wrote on purpose. A second 20 s window covered the edit's rebuild, and a
+5 s socket read timeout sat inside both.
+
+**Why E32's cure does not transfer, and what replaces it.** E32 could move
+the compile out of the timed window because the claim was about the emitted
+program. Here the claim IS about the watcher compiling, so the compile
+stays inside. Two substitutions instead:
+
+- **A liveness bound where the compile is** (`support::WATCH_LIVENESS`,
+  300 s). Nothing in the family asserts how fast a round is, so the number
+  only has to be too large for a healthy round and finite for a hung one.
+  `watch_lifecycle.rs` had already reached this conclusion in a comment —
+  "how long that takes is not this test's business" — at 60 s. The value is
+  measured, not felt: one ordinary `vilan build` of this test's own two-leg
+  project — the identical work round 1 does — costs **9.3 s** wall on an idle
+  16-core box and **34 s** on the same box at load average ~38. The old 20 s
+  was barely twice the idle cost, which is why load alone could exhaust it.
+  120 s was tried next and is ~3.5× the loaded cost, which a box running five
+  overlapping suites consumed outright (see the stress note below); 300 s is
+  ~9× loaded, ~32× idle.
+- **A calibrated budget for everything after it** (`support::round_budget`).
+  Round 1's cost is now MEASURED, and every later wait is `4 ×` it (floored
+  at 20 s, capped at the liveness bound). Round 1 is this machine's own
+  price, right now, under whatever load it is under, for compiling this
+  project; a rebuild of ONE leg taking several times that is a stuck
+  watcher, while the same rebuild on a four-times-slower machine is not.
+  That is E32's rule — the budget measures the program, not the machine —
+  reached by calibration rather than by excision.
+
+**Two smaller things fell out.** The fixed `sleep(800 ms)` "so the watcher's
+baseline snapshot is taken before the edit" was paying for a bug E20 already
+fixed: the snapshot is taken BEFORE the first build now, never after. It is
+replaced by an event wait on the server leg's boot line (the Node child
+inherits the watcher's stdout — the channel `hmr.rs` already uses for the
+same purpose), which is both correct and the thing the margin was
+approximating. And `http_get` ignored the result of `read_to_end`, so a read
+cut short by the 5 s timeout returned a PARTIAL body — which, in a loop whose
+exit condition is "the bundle differs from A", is indistinguishable from a
+finished rebuild. It now returns `None` on an incomplete read and the poll
+treats that as "not yet"; its timeout is the calibrated budget.
+
+**The family.** `hmr.rs`'s six e2e bodies carried the identical literal
+20 s deadline; all six now take `WATCH_LIVENESS` — a pure failure-bound
+change, no behaviour moved. `hmr_overlay.rs` runs no compiler round and has
+no clock at all. `watch_lifecycle.rs` was already right. What is left,
+recorded and NOT changed: `hmr.rs` still has `sleep(500/800 ms)` margins of
+the same vestigial kind (they are cheap to delete but sit inside sequences
+this lane did not otherwise touch), and its NEGATIVE windows
+(`sse.assert_no(..., 2 s)`, `!buffer_has(..., 700 ms)`) are a different
+failure mode — under load they go vacuously green rather than red, which is
+a weakened assertion, not a flake, and wants its own item.
+
+**Stress validation.** Before the fix, the test failed at round 1 under a
+load average of 27 with no second copy of itself in sight. After it, it
+passed at 43 s wall under load average 46 — the calibrated budget growing
+with the machine because it was measured on it — and then passed **in both**
+of two full `cargo nextest run --workspace` runs started concurrently on the
+same 16-core box (49.6 s and 51.2 s wall, load average ~32), which is the
+shape that produced the original failures. That is the E32 bar, met.
+
+**What the same runs also showed, and it is not a `hmr_swap` fact.** Neither
+concurrent run finished clean, and every failure in both was a *different*
+test dying on its own fixed clock, with a message that names the shape
+outright: `owned_nursery`'s two legs at exactly 20.0 s ("vilan run did not
+exit within 20s"), four `rpc_http` legs at exactly 60.1 s ("vilan run did
+not exit within 60s"), `cancellation`'s fetch leg, and one `split` leg. All
+21 of those tests pass in isolation on the same tree, and each budget wraps
+a `vilan run` — i.e. a COMPILE — which is E32's original diagnosis
+word-for-word, in files E32 did not touch. An earlier attempt at this
+validation on a box that had drifted to five or six overlapping suites (load
+~77, ~5× the cores) showed the same list plus `streaming`, `benchmarks`, two
+more `split` legs and `nested_nurseries_join_inside_out` — and `hmr_swap`
+itself at the then-120 s bound, which is what raised it to 300 s. The
+pattern is a backlog item of its own: the E32 treatment is unfinished in
+roughly a dozen places, and it wants one pass, not per-test patches.

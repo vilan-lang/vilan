@@ -43,6 +43,51 @@ impl Set<type T: Hashable> {
 	fun values(self): List<T> {
 		self.table.values()
 	}
+
+	// `union`/`intersection`/`difference` walk `self.table.values()` rather than
+	// `for x in self` — matching `values()` above, and every other method in this
+	// file. That started as a workaround: the native `for x in set` lowering used
+	// to fire only for an iterable that carried a type on its own expression, so
+	// `self` (or any parameter, call result or `*view`) fell through to a loop
+	// over the struct's one-element backing array. B85 fixed that at the root —
+	// the loop's iterable type now comes from the analyzer — so `for x in self`
+	// is a correct way to write these today. The `.table.values()` form stays
+	// because it is equivalent and rewriting it would be churn, NOT because the
+	// direct form is unsafe.
+
+	/// A new set holding every element that is in `self`, `other`, or both.
+	fun union(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			result.insert(value);
+		}
+		for value in other.table.values() {
+			result.insert(value);
+		}
+		result
+	}
+
+	/// A new set holding only the elements present in BOTH `self` and `other`.
+	fun intersection(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			if other.contains(value) {
+				result.insert(value);
+			}
+		}
+		result
+	}
+
+	/// A new set holding the elements of `self` that are NOT in `other`.
+	fun difference(self, other: Set<T>): Set<T> {
+		mut result: Set<T> = Set::new();
+		for value in self.table.values() {
+			if !other.contains(value) {
+				result.insert(value);
+			}
+		}
+		result
+	}
 }
 
 /// The set half of the explicit termination family, and the end of an iterator

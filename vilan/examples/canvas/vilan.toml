@@ -1,0 +1,10 @@
+# The canvas example: a browser client whose entire host surface is GENERATED.
+# `canvas.vl` is bindgen output, checked in and reviewed like any other source;
+# `board.vl` is the program written against it. A single `browser`-target
+# package, so a plain `vilan build .` emits `board.js` next to `index.html` —
+# no `--target` flag needed. Sources sit at the package root, so `root` is `.`.
+[package]
+name = "canvas_demo"
+root = "."
+entry = "board.vl"
+target = "browser"

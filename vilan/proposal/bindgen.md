@@ -11,6 +11,14 @@
 > (3) v2 direction per owner: an override table + automatic bindgen —
 > v1's explicit checked-in file stands, and is the core v2 needs anyway.
 >
+> v1 SHIPPED 2026-08-06 (v0.30.0) — implementation notes §9, the
+> lib.dom.d.ts probe §10 (notes (1) and (2) are answered there and in
+> §9.4: backed enums do not exist and are filed as their own language
+> question, B76; the array-like row and three siblings are corrected).
+> Owner ruling 2026-08-06: §5 WIDENS to the `declare var X: { new(): X }`
+> constructor idiom — E37(a) GRANTED; the v0.31.0 bindgen-v2 lane builds
+> it with the `--only <Type>` filter (E37(b)).
+>
 > Ground truth for every claim below was read from source, not assumed: std's
 > hand-written bindings (`fetch.vl`, `dom.vl`, `bytes.vl`, `time.vl`, `rpc.vl`,
 > `process/fs.vl`, `process/http.vl`), the parser/analyzer's actual accepted
@@ -501,8 +509,25 @@ note that explicit beats inference for generated code). Concretely:
   `deno`, `bun`, `browser`, or the `@process` family — the exact vocabulary
   `[platform("...")]` fences and manifest layers already share, `docs/spec/
   platform.md:3-4,43`).
-- Every emitted `external fun` is stamped with `[platform("<value>")]`.
-  This is not optional polish — it's the only mechanism that gives
+- Every emitted `external fun` is stamped with `[platform("<value>")]`,
+  **after** its `[extern(…)]` attribute:
+
+  ```
+  [extern(method, "getContext")]
+  [platform("browser")]
+  external fun get_context(self, id: str): CanvasRenderingContext2D;
+  ```
+
+  **Attribute order is fixed, not stylistic.** The parser reads an ordered
+  prefix — `[extern(…)]`, `[must_use]`, `[rpc]`, `[trait_only]`,
+  `[doc(hidden)]`, `[platform(…)]` — and writing `[platform(…)]` first is a
+  parse error, not a differently-formatted equivalent
+  (`crates/vilan-core/src/parsing.rs::parse_function`). Every example in this
+  document and every line bindgen emits follows that order for that reason.
+  This is stated here rather than left implicit because a generated file
+  repeats the pair on every binding, so getting it wrong would be wrong
+  thousands of times over.
+- The fence is not optional polish — it's the only mechanism that gives
   generated bindings any compile-time platform safety net at all. Per
   `platform_color.rs`'s own module doc comment (the actual authority, since
   `docs/spec/platform.md` describes the *fence* mechanism but not what
@@ -1024,3 +1049,192 @@ correct event-handler closure.
    then curates, narrows the `f64`s that are really `i32`s, and names the
    handful of entry points — which is what the DOM binding got and is why it
    is good.
+
+## 11. v2 implementation notes and the re-probe (2026-08-06, E37)
+
+Everything below was **run**, not predicted. The STATUS block is untouched;
+§4's prose gained the attribute-order statement §9.5 said it was missing
+(E37(e)).
+
+### 11.1 E37(a) — the constructor idiom
+
+§10.3 named the shape and left it to the owner. Granted, and built:
+
+- **Recognition.** A `declare const/let/var X: <object type>` whose object type
+  carries **at least one construct signature**. That is the whole signal.
+  `prototype` is *not* required — requiring it would refuse `declare var Image:
+  { new(…): HTMLImageElement }`, a real constructor, for decoration — and when
+  present it is dropped rather than bound, because `X.prototype` yields the
+  shared prototype object and never an instance.
+- **The subject** is the first construct signature's **return type**, which must
+  be a type this file declares. It is deliberately not the global's name: 4 of
+  `lib.dom.d.ts`'s 641 constructor objects name a different type (`Image`,
+  `Audio`, `Option` → `HTMLImageElement`, `HTMLAudioElement`,
+  `HTMLOptionElement`), and 9 more state an applied generic
+  (`ReadableStream<R>`, `CustomEvent<T>`) the interface's own parameters do not
+  reproduce.
+- **Emission** goes into the subject's own `impl`, not a second block. That is
+  load-bearing and the reason is a language fact found here: **vilan does not
+  reject two functions of one name** — in one `impl` or across two on one
+  subject — it takes the last and says nothing (pinned,
+  `tests/bindgen.rs::a_duplicate_function_name_is_silently_shadowed_rather_than_rejected`).
+  `interface Response` has an instance `json()` and its constructor object has a
+  static `json()`; in separate blocks the file would compile with one of them
+  silently absent. One `impl` means one name table, so the renamer sees the
+  collision — and the statics are emitted **last** so the instance side, the
+  primary surface, keeps the plain name.
+- **The `Object()` bag constructor is replaced**, not joined. §9.5 added it to
+  every interface on the `RequestInit` precedent; for a type the host constructs
+  with `new` it is simply wrong (`Object()` returns a plain `{}`).
+- **Overloaded `new`** (7 of 641) follows §3.10 unchanged: first wins, the rest
+  quoted. **Optional constructor parameters** follow §9.3: one binding per
+  arity. **Statics beside `new`** (67 of 641) bind as dotted globals,
+  `[extern("Response.json")]`, self-less — the form §3.7 already specifies.
+
+Three constructs the recognizer **deliberately refuses**, each named in its own
+TODO rather than guessed at:
+
+| construct | why |
+|---|---|
+| object-typed global with no construct signature (`declare var NodeFilter: { readonly SHOW_ALL: … }`) | not a class; there is no type for an `impl` to be written on, and inventing an `external struct` would put a type in the output the host does not have |
+| constructor object whose constructed type is not declared here | nothing for `[extern(new, …)]` to return; v1 does not resolve across files (§2) |
+| `interface FooConstructor { new(): Foo }` + `declare var Foo: FooConstructor` (`lib.es5.d.ts`'s spelling) | the constructor interface is itself a declaration bindgen emits; folding its members into `Foo` while also emitting `FooConstructor` would state the same thing twice. A decision, not a gap |
+
+### 11.2 E37(b) — `--only <Type>`
+
+The answer to §10.5's second caveat. Repeatable; the flags compose into one
+closure. Two properties, both pinned:
+
+- **Reachability is over what survives the mapping table, not over the
+  TypeScript text.** An open union widens to `any` (§3.3) and therefore mentions
+  none of its members; `T | null` binds as `T` and therefore mentions `T`. That
+  single rule is what makes a DOM-scale closure finite rather than "the file".
+  Everything else is walked, including primitives (a `.d.ts` does not declare
+  `string`, so pushing the name costs nothing) — the walk errs toward keeping
+  more than the emitter needs.
+- **An `extends` base is followed for its members and not emitted.** Flattening
+  copies a base's members into the derived type, so their types are reachable;
+  the base's own name reaches the output only if some signature says it.
+  `--only HTMLCanvasElement` therefore emits neither `EventTarget` nor
+  `HTMLElement`, and loses nothing.
+
+A missed reference is a **hard failure by design**: the filtered file names a
+type it does not declare and stops compiling. Softening it — restricting what a
+reference may resolve to, so a gap widened to `any` instead — was written and
+removed, because it turns a closure bug into an "is not declared in this file"
+TODO, which is the one thing that would not be true.
+
+### 11.3 The re-probe — `lib.dom.d.ts`, TypeScript 5.9.3
+
+Same input as §10 (39,429 lines, 2,415 declarations), `npm pack`ed into a
+scratch directory, not vendored.
+
+| | §10 (v1) | v2 |
+|---|---|---|
+| declarations bound | 1,589 / 2,415 — **65.8%** | 2,229 / 2,415 — **92.3%** |
+| members bound | 61,224 / 61,317 — 99.8% | 63,013 / 63,106 — **99.9%** |
+| output | 489,523 lines | 492,986 lines |
+| `vilan check … --platform browser` | exit 0 | **exit 0**, 13.9 s |
+
+§10.3 predicted ~92%. The **residue is 186 declarations, and it is three
+things**, not a long tail:
+
+| count | construct |
+|---|---|
+| **183** | genuine global values — 182 `declare var` (`document`, `window`, `navigator`; 5 of them `typeof` aliases such as `declare var SVGMatrix: typeof DOMMatrix`) plus the file's one `declare const name: void` |
+| 2 | `declare namespace` |
+| 1 | `NodeFilter` — the file's only object-typed global with no construct signature |
+
+That is the whole shortfall. Closing it needs a form that **reads a global**,
+which is a language question (§10.3's "different mechanism"), not a bindgen one.
+Meanwhile the practical cost is small and measured: the canvas example below
+needed exactly **one** hand-written entry binding.
+
+### 11.4 The `--only` measurement, and what it refutes
+
+`--only HTMLCanvasElement` against the full `lib.dom.d.ts`:
+
+| | declarations | lines |
+|---|---|---|
+| whole file | 2,415 | 492,986 |
+| `--only HTMLCanvasElement` | 1,001 | **96,316** |
+
+80% of the output removed, and the closure is **complete**: the filtered file
+introduces *zero* unresolved type references the unfiltered file does not
+already have (9 names unresolved in the full run, 8 of them reachable from the
+canvas surface; the filtered run adds none). It compiles, exit 0.
+
+**And it is still not a reviewable file, which the expectation this was built
+against did not anticipate.** The browser's element types are one
+strongly-connected component. Two edges do it:
+
+```
+Node.ownerDocument   : Document | null   →  Document → (almost everything)
+UIEvent.view         : Window | null     →  Window   → (the rest)
+```
+
+Both are single-present-member absence unions, so both survive the mapping table
+honestly. Seeding from `CanvasRenderingContext2D`, `HTMLElement`, `Element`,
+`Node`, or `MouseEvent` all land on the same 908–1,001 declarations.
+`EventTarget` and `Event` seed 7 declarations / 256 lines; `CanvasGradient`
+seeds 2 / 36. The filter is not the limitation — the graph is.
+
+The useful read is §10.5's third caveat, reached from the other side: for
+`lib.dom.d.ts` specifically, a consumer wants a declaration file scoped to what
+it uses, and `--only` is the right tool for the third-party library bindgen
+actually targets. §7's boundary is untouched and reinforced again.
+
+### 11.5 The canvas demonstration (A17's evidence)
+
+`vilan/examples/canvas/` — a browser package compiled by
+`crates/vilan-cli/tests/examples.rs::every_example_builds`, which walks the
+directory rather than a list, so it was gated the moment it landed
+(`PostBuild::Artifacts(&["board.js"])` pins the emitted bundle).
+
+It lives in `examples/`, not the `vilan/test/` corpus, and that was forced
+rather than chosen: the corpus builds bare `.vl` files with **no manifest and no
+`--platform` flag**, so every program in it is a node build, and three separate
+suites then run the corpus under node. A browser program there would need an
+entry in every skip list to avoid crashing on missing DOM globals.
+
+`canvas.d.ts` (checked in, written here in `lib.dom.d.ts`'s own shape — the
+interface/`declare var` split, the constructor idiom, an open-union `fillStyle`)
+generates `canvas.vl` with:
+
+```
+vilan bindgen canvas.d.ts --platform browser --only HTMLCanvasElement -o canvas.vl
+```
+
+345 lines, 11/11 declarations bound, 47/47 members bound, 3 TODOs. The filter
+does real work in a checked-in artifact: `MediaError`, `HTMLAudioElement`, and
+`Audio` sit in the same file and are absent, and so are `EventTarget` and
+`HTMLElement` — flattened in, never named. `board.vl` draws through it and adds
+one hand-written line, `[extern("document.getElementById")]`, which is §11.3's
+residue made concrete. The emitted JavaScript is what a person would have
+written:
+
+```js
+const canvas = document.getElementById("board");
+canvas.width = 640.0;
+const context = canvas.getContext("2d");
+context.fillStyle = "rebeccapurple";
+context.fillRect(40.0, 60.0, 160.0, 110.0);
+context.beginPath();
+context.arc(300.0, 115.0, 55.0, 0.0, 6.2831853);
+context.fill();
+context.fillText("drawn through generated bindings", 40.0, 250.0);
+canvas.addEventListener("click", (event) => { … });
+```
+
+### 11.6 Open, after v2
+
+1. **Reading a global** (183 declarations, `document`/`window`/`navigator`).
+   No `[extern(…)]` form does it. Its own language question, as §10.3 said.
+2. **A duplicate definition is not a diagnostic** (§11.1). Unrelated to bindgen
+   except that bindgen's collision renamer is the only thing standing between a
+   generated file and a silently missing binding. Worth its own item.
+3. **`--only` cannot bound a closure by depth or by "stop at this type".**
+   Nothing in §11.4's measurement is fixable by a better closure, but a
+   *shallow* mode — emit the named types and treat everything else as an opaque
+   `external struct` with no members — would make a DOM slice reviewable at the
+   cost of the members it drops. Not built; not obviously right.

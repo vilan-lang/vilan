@@ -166,6 +166,10 @@ impl Map<type K: Hashable, type V> {
 	fun is_empty(self): bool
 	fun keys(self): List<K>
 	fun values(self): List<V>
+	fun entries(self): List<(K, V)>
+}
+impl Map<type K: Hashable, type V: PartialEq> {
+	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
@@ -199,6 +203,29 @@ fun main() {
 `keys()` returns the real `K`s (in insertion order), and the key is snapshot
 on insert, so mutating the original afterward can't desync the map.
 
+`entries()` pairs `keys()`/`values()` into one `List<(K, V)>` snapshot, so
+walking both together needs no hand-zipping; `contains_value` (needing
+`V: PartialEq`, unlike the rest of `Map`) is the value-side counterpart to
+`contains_key`:
+
+```vilan
+import std::print;
+import std::map::Map;
+
+fun main() {
+	mut scores: Map<str, i32> = Map::new();
+	scores.insert("alice", 1);
+	scores.insert("bob", 2);
+	mut total = 0;
+	for entry in scores.entries() {
+		total = total + entry.1;   // entry.0 is the key, entry.1 the value
+	}
+	print(total);                        // 3
+	print(scores.contains_value(2));     // true
+	print(scores.contains_value(9));     // false
+}
+```
+
 ## `Set<T>`
 
 ```vilan,fragment
@@ -210,12 +237,37 @@ impl Set<type T: Hashable> {
 	fun len(self): i32
 	fun is_empty(self): bool
 	fun values(self): List<T>
+	fun union(self, other: Set<T>): Set<T>
+	fun intersection(self, other: Set<T>): Set<T>
+	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
 iterates the elements in insertion order.
+
+`union`/`intersection`/`difference` are the standard set operations, each
+returning a new `Set` and leaving both receivers untouched:
+
+```vilan
+import std::print;
+import std::set::Set;
+
+fun main() {
+	mut a: Set<i32> = Set::new();
+	a.insert(1);
+	a.insert(2);
+	a.insert(3);
+	mut b: Set<i32> = Set::new();
+	b.insert(2);
+	b.insert(3);
+	b.insert(4);
+	print(a.union(b).len());          // 4 -- {1, 2, 3, 4}
+	print(a.intersection(b).len());   // 2 -- {2, 3}
+	print(a.difference(b).len());     // 1 -- {1}
+}
+```
 
 ## `Hashable`
 
@@ -300,6 +352,39 @@ name*, so a type with a `next(&mut self): Option<T>` drives a loop whether or
 not it declares the trait. Declaring it is what buys the adapters below — and
 what lets a generic bound accept your type.
 
+The name is what resolves, but the **shape is still checked**: the method has to
+return an `Option`, because the loop stops at `None`. A `next` annotated with
+anything else is a compile error rather than a loop that quietly runs zero
+times.
+
+### What a `for` can iterate
+
+Exactly two things:
+
+- **A type with `next`** (or `next_mut`, for `for e in &mut it`) — the protocol
+  above.
+- **A natively iterable value**: `List<T>`, a fixed array `[T; n]`, a tuple, a
+  `str` (yielding its characters), `Set<T>` (insertion order), and any host type
+  an `external struct` names.
+
+Anything else is a compile error. A struct or enum of your own that provides no
+`next` is *not* iterable — it has no meaning to fall back on, since a struct is
+its fields and an enum is its variant tag at runtime:
+
+```vilan,fragment
+struct Cursor { items: List<i32>, index: i32 }
+
+fun main() {
+	mut walked = Cursor { items = [1, 2], index = 0 };
+	for item in walked {   // cannot iterate `Cursor`: it has no `next`
+		print(item);
+	}
+}
+```
+
+`Map` is in that group: walk it through `entries()`, `keys()` or `values()`, as
+the `Map` section above does.
+
 ### Adapters
 
 Every `Iterator` gets these, as trait defaults — implement `next` and you have
@@ -371,13 +456,26 @@ is already a std type, and vilan's method resolution picks by registration order
 rather than reporting a collision, so the type names stay out of each other's
 way.
 
-**One rough edge to know about.** If an iterator's element type is its own
-generic parameter and you instantiate it at a *tuple*, the `for` binding loses
-the tuple: `for pair in [(1, "a")].iter() { pair.0 }` is rejected with "cannot
-access field '0' on type T". Pull by hand instead —
-`if cursor.next() is Some(let pair) { pair.0 }` — or iterate the `List`
-directly, both of which work. `enumerate` and `zip` are not affected, because
-they name their tuple element structurally.
+A `for` binding gets the element type the iterator was instantiated at, whatever
+shape it is — a tuple, a struct, another container, a closure:
+
+```vilan
+import std::print;
+
+struct Point { x: i32, y: i32 }
+
+fun main() {
+	for pair in [(1, "a"), (2, "b")].iter() {
+		print(pair.0);                          // 1, then 2
+	}
+	for point in [Point { x = 1, y = 2 }].iter() {
+		print(point.x);                         // 1
+	}
+	for inner in [[1, 2, 3], [4]].iter() {
+		print(inner.len());                     // 3, then 1
+	}
+}
+```
 
 ### Terminations
 

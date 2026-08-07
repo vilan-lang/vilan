@@ -3113,6 +3113,435 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 }
 
 // ---------------------------------------------------------------------------
+// B81 (rule 1 through a VIEWED subject). B53 made the alias path COPY what it
+// captures; it left the alias path READING late. Each capture stays an
+// accessor into the subject temp, re-read at every reference, which is a
+// faithful snapshot only while the subject can change by REBINDING — through a
+// `&mut` view it changes IN PLACE (that is how the write reaches the caller),
+// so every deferred read in the leg saw post-write state. Captures of a
+// writable-view subject are now read once, at the match. See
+// proposal/capture-clones.md §6.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
+    // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
+    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to `Object.assign(self,
+    // ..)`, mutating the very array `$a` aliases, so `items[at]` indexed with
+    // the INCREMENTED `at`. Printed "b\nc" for two steps over ["a","b","c"].
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): Option<str> {
+                if self is Feed::Ready(let items, let at) {
+                    self = Feed::Ready(items, at + 1);
+                    Some(items[at])
+                } else {
+                    None
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step().unwrap());
+            print(feed.step().unwrap());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_mut_parameter_subject_is_unchanged() {
+    // The twin that was always right, pinned so the fix cannot move it: a
+    // by-value `mut` parameter IS the callee's own copy (H9), so the subject
+    // rebinds and each call re-reads the caller's untouched value. Not a view,
+    // so no capture materializes and the emitted shape is byte-for-byte what
+    // B53 shipped.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun step(mut feed: Feed): Option<str> {
+            if feed is Feed::Ready(let items, let at) {
+                feed = Feed::Ready(items, at + 1);
+                Some(items[at])
+            } else {
+                None
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(step(feed).unwrap());
+            print(step(feed).unwrap());
+        }
+        "#,
+        "a\na\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_mut_view_parameter_reads_the_prematch_value() {
+    // The same hole reached through an ordinary `&mut` parameter rather than
+    // `&mut self` — the predicate is the parameter's CONVENTION, not the
+    // receiver position. Printed "b\nc".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun step(feed: &mut Feed): str {
+            if feed is Feed::Ready(let items, let at) {
+                feed = Feed::Ready(items, at + 1);
+                items[at]
+            } else {
+                "-"
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(step(&mut feed));
+            print(step(&mut feed));
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
+    // The second seam, and the worse one: `is_place_expr` excludes
+    // `Expr::Dereference`, so a `*view` subject collected NO capture
+    // candidates at all — B53's copy rule was missing wholesale for that
+    // spelling, and even the AGGREGATE capture aliased (`__at($a[1], $a[2])`,
+    // no `__clone` anywhere). Both halves are pinned here: `items` must be a
+    // copy and `at` must be the pre-match index. Printed "a" only after both
+    // fixes; before, "b".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            let view = &mut feed;
+            if *view is Feed::Ready(let items, let at) {
+                view = Feed::Ready(items, at + 1);
+                print(items[at]);
+            }
+        }
+        "#,
+        "a\n",
+    );
+}
+
+#[test]
+fn a_destructure_of_a_dereferenced_view_copies_its_captures() {
+    // The deref seam is not confined to the alias path — the capture pass
+    // gates `Expr::Destructure` on the same predicate, so `let (xs, n) =
+    // *view` collected no candidates either and B53's copy never fired. This
+    // one has nothing to do with reading late: `xs` simply aliased the
+    // subject's element, and growing it through the view grew the capture.
+    // Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = ([1, 2], 3);
+            let view = &mut pair;
+            let (xs, n) = *view;
+            view.0.push(9);
+            print(xs.len());
+            print(n);
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
+    // A guard puts the leg on the alias path too, so it carries the same hole
+    // — and it is the ordering-sensitive one: `materialize_captures` runs
+    // BEFORE the guard is walked and re-points the alias table, so a guard
+    // that reads a materialized capture forces B59's prelude shape or the
+    // emitted guard names a binding that has not been declared yet. Printed
+    // "b\nc".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): str {
+                match self {
+                    Feed::Ready(let items, let at) if at >= 0 => {
+                        self = Feed::Ready(items, at + 1);
+                        items[at]
+                    }
+                    _ => "-",
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step());
+            print(feed.step());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_leg_on_a_viewed_subject_was_already_right() {
+    // The negative half of the diagnosis, pinned: an UNGUARDED leg compiles
+    // through `compile_pattern`, which declares every capture as a real
+    // `const` at leg entry — it never reads late, so it never had the bug.
+    // That asymmetry is what identified the alias path as the seam rather
+    // than the view.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): str {
+                match self {
+                    Feed::Ready(let items, let at) => {
+                        self = Feed::Ready(items, at + 1);
+                        items[at]
+                    }
+                    Feed::Done => "-",
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a", "b", "c"], 0);
+            print(feed.step());
+            print(feed.step());
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+#[test]
+fn both_capture_shapes_survive_an_in_place_write_through_the_view() {
+    // The two payload shapes in one leg, and the sharper form of the write:
+    // not a whole-subject reassignment but COMPONENT writes through the view
+    // (`pair.0.push`, `pair.1 = 9`), which mutate the subject's storage
+    // without going near the subject binding.
+    //
+    // `items` is B53's business — an aggregate capture COPIES, so growing the
+    // source to 4 leaves it at 3. `at` is B81's — a scalar owes no copy, so it
+    // kept an accessor and read the 9. One pin, red either way: 12 without the
+    // materialization, 4 without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun grow(pair: &mut (List<str>, i32)): i32 {
+            if pair is (let items, let at) {
+                pair.0.push("d");
+                pair.1 = 9;
+                items.len() + at
+            } else {
+                -1
+            }
+        }
+        fun main() {
+            mut pair = (["a", "b", "c"], 0);
+            print(grow(&mut pair));
+            print(pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_nested_capture_from_a_viewed_subject_reads_the_prematch_value() {
+    // Every capture in the tree, not just the top level: the inner tuple's
+    // `xs`/`k` and the outer `at` all read through the same subject temp.
+    // 2 + 3 + 4; post-write it was 4 + 7 + 5.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Pair {
+            Two((List<i32>, i32), i32),
+            Neither,
+        }
+        impl Pair {
+            fun step(&mut self): i32 {
+                if self is Pair::Two((let xs, let k), let at) {
+                    self = Pair::Two(([9, 9, 9, 9], 7), 5);
+                    xs.len() + k + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut pair = Pair::Two(([1, 2], 3), 4);
+            print(pair.step());
+        }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn a_viewed_capture_read_before_and_after_the_write_agrees() {
+    // Both orders in one leg. A read BEFORE the write was always right (the
+    // accessor had nothing to observe yet); the bug was only visible AFTER,
+    // which is exactly what makes the two disagree. The binding is one value,
+    // so 3 + 3 — not 3 + 13.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun step(&mut self): i32 {
+                if self is Feed::Ready(let items, let at) {
+                    let before = at;
+                    self = Feed::Ready(items, at + 10);
+                    before + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a"], 3);
+            print(feed.step());
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_viewed_subject_loans_the_prematch_payload() {
+    // R1/R11 and B65's doctrine, at the viewed subject. A resource payload has
+    // no copy to make — "there is no user-facing copy spelling in vilan to
+    // name" (affine-moves.md §9.1), and `x is Some(let r)` is always a LOAN
+    // whatever the subject's form — so the capture is materialized WITHOUT
+    // `__clone`: `const c = $a[1]`, which fixes WHICH value is loaned without
+    // minting a second owner. That is what the place-subject twin below
+    // already does, and matching it is the whole rule. 1 + 0, not 9 + 5.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Conn {
+            id: i32,
+        }
+        enum Slot {
+            Full(Conn, i32),
+            Empty,
+        }
+        impl Slot {
+            fun peek(&mut self): i32 {
+                if self is Slot::Full(let c, let at) {
+                    self = Slot::Full(Conn { id = 9 }, 5);
+                    c.id + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            mut slot = Slot::Full(Conn { id = 1 }, 0);
+            print(slot.peek());
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_place_subject_loans_the_prematch_payload() {
+    // The place twin the rule above is calibrated against: the same program
+    // with an owned `mut` local reads the pre-assignment payload because the
+    // assignment REBINDS and the subject temp keeps the old aggregate. It was
+    // already right, and pinning it is what makes "indistinguishable from the
+    // place path" a checked claim rather than a stated one.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Conn {
+            id: i32,
+        }
+        enum Slot {
+            Full(Conn, i32),
+            Empty,
+        }
+        fun main() {
+            mut slot = Slot::Full(Conn { id = 1 }, 0);
+            if slot is Slot::Full(let c, let at) {
+                slot = Slot::Full(Conn { id = 9 }, 5);
+                print(c.id + at);
+            }
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_readonly_view_subject_keeps_its_shared_accessors() {
+    // The scope line, and the reason the predicate asks about WRITABILITY
+    // rather than view-ness. Nothing can be written through a `&` view, so its
+    // subject temp is a snapshot again and its captures keep the accessor —
+    // and with it B53's SHARE elision, which exists to stop read-only walkers
+    // deep-copying at every level. Widening the rule to every view would have
+    // taken that back for `&self` methods.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun peek(&self): i32 {
+                if self is Feed::Ready(let items, let at) {
+                    items.len() + at
+                } else {
+                    -1
+                }
+            }
+        }
+        fun main() {
+            let feed = Feed::Ready(["a", "b"], 5);
+            print(feed.peek());
+        }
+        "#,
+        "7\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B54 / A20 (rule 1 at the STORE seams). A place read into a slot of an
 // aggregate that outlives the expression must copy: a construction literal's
 // element/field/payload (B54), and the argument of a container method that
@@ -19855,6 +20284,320 @@ fn an_imported_function_coerces_across_modules() {
             let parts = apply("/a/b", segments);
         }
         "#,
+    );
+}
+
+// --- B75: calling a fn-typed binding (fn-coercion.md §4) --------------------
+//
+// `let f = helper; f(1)` used to fail with "cannot call this as a function: it
+// is fn helper(i32): i32". `fn-coercion.md` §4 recorded the opposite ("calling
+// such a binding works as before"), so this was a hole, not a refusal: the call
+// resolver dispatched on the subject's ENTITY (a binding, not a declaration) and
+// never read its TYPE. It reads it now, through the same eligibility predicate
+// B20's coercion uses — one rule for what a `fun` value is, so the two can never
+// disagree. Emission needed nothing: a fn reference already emits as its own
+// (mangled) name, which is why the ANNOTATED form already worked.
+
+#[test]
+fn a_fn_typed_binding_calls() {
+    // The filed shape, end to end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            print(f(1));
+        }
+        main();
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_nested_fn_typed_binding_calls() {
+    // A `fun` declared inside another function (B71's neighbourhood, where this
+    // was found) is the same value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            fun helper(i: i32): i32 {
+                i * 3
+            }
+            let f = helper;
+            print(f(4));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_calls_at_every_arity() {
+    // Arity is the parameter list of the DECLARATION, so zero-, one- and
+    // multi-parameter forms all have to come through the one path — and a
+    // void-returning one has no declared return to read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun nothing(): i32 {
+            7
+        }
+
+        fun two(a: i32, b: i32): i32 {
+            a * b
+        }
+
+        fun shout(text: str) {
+            print(text);
+        }
+
+        fun main() {
+            let n = nothing;
+            let t = two;
+            let s = shout;
+            print(n());
+            print(t(3, 4));
+            s("hi");
+        }
+        main();
+        "#,
+        "7\n12\nhi\n",
+    );
+}
+
+#[test]
+fn a_rebound_fn_typed_binding_still_calls() {
+    // The type rides through a chain of bindings — each `let` copies
+    // `Type::Function(id)`, so the last one resolves the same declaration.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun helper(i: i32): i32 {
+            i + 10
+        }
+
+        fun main() {
+            let f = helper;
+            let g = f;
+            let h = g;
+            print(h(5));
+        }
+        main();
+        "#,
+        "15\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_composes_with_the_b20_coercion() {
+    // The two directions must compose: bind a `fun` unannotated, CALL it, and
+    // also hand the same binding to a closure-typed parameter (where B20's
+    // coercion converts it). One value, both uses, in one program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            transform(value)
+        }
+
+        fun main() {
+            let f = double;
+            print(f(4));
+            print(apply(f, 5));
+        }
+        main();
+        "#,
+        "8\n10\n",
+    );
+}
+
+#[test]
+fn a_closure_typed_parameter_rebinds_and_calls() {
+    // The receiving end: a closure-typed parameter rebound to a plain `let` and
+    // called through the copy. This one always worked (the parameter's declared
+    // type is `Type::Closure`); it pins that widening the call operator did not
+    // disturb it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun double(i: i32): i32 {
+            i * 2
+        }
+
+        fun apply(transform: |i32| i32, value: i32): i32 {
+            let inner = transform;
+            inner(value)
+        }
+
+        fun main() {
+            print(apply(double, 6));
+        }
+        main();
+        "#,
+        "12\n",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arguments() {
+    // Resolving through the declaration is what buys the ordinary checks: a
+    // wrong argument TYPE through a binding reports like any other call.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f("text");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_checks_its_arity() {
+    // The arity check comes from the same path, so it reports the declaration's
+    // parameter count rather than silently accepting.
+    assert_fails_with(
+        r#"
+        fun helper(i: i32): i32 {
+            i + 1
+        }
+
+        fun main() {
+            let f = helper;
+            let bad = f(1, 2);
+        }
+        "#,
+        "Expected 1 argument, but got 2 instead.",
+    );
+}
+
+#[test]
+fn a_fn_typed_binding_types_its_result() {
+    // The call's TYPE is the declaration's return type, not `Unknown`: a `str`
+    // result used as an `i32` has to fail.
+    assert_fails_with(
+        r#"
+        fun name(): str {
+            "x"
+        }
+
+        fun main() {
+            let f = name;
+            let n: i32 = f();
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+// The four functions with no value form (`fn-coercion.md` §1 rules 1-4,
+// `spec/types.md` §5.8). Each is DEFERRED there with its own reason, so a
+// binding cannot hold one to call either — pinned so that widening the call
+// operator can never quietly widen the value form with it. Each message names
+// the disqualifying property, which is what the tour promises ("the compiler
+// will tell you when you hit one").
+
+#[test]
+fn a_generic_fn_typed_binding_does_not_call() {
+    // Rule 2. Left open, this MISCOMPILED: the binding emits the declaration's
+    // name, monomorphization mints instance names from a disjoint pool, and the
+    // call reached a name specialization never produced (`$a is not defined`).
+    assert_fails_with(
+        r#"
+        fun identity<T>(x: T): T {
+            x
+        }
+
+        fun main() {
+            let f = identity;
+            let n = f(1);
+        }
+        "#,
+        "a generic function has no single value",
+    );
+}
+
+#[test]
+fn an_async_fn_typed_binding_does_not_call() {
+    // Rule 4. Left open, this compiled and printed `Promise { 2 }`: a call
+    // through a value is not awaited (the J2 gap), so the promise leaks.
+    assert_fails_with(
+        r#"
+        async fun fetchy(i: i32): i32 {
+            i + 1
+        }
+
+        async fun main() {
+            let f = fetchy;
+            let n = f(1);
+        }
+        "#,
+        "an `async` function has no value form",
+    );
+}
+
+#[test]
+fn a_method_fn_typed_binding_does_not_call() {
+    // Rule 3 — `x.method` as a value means receiver capture, deferred there.
+    // `Bag::bump` types as `fn bump(Bag): i32`, so without the gate it would
+    // have become callable as a side effect of this change.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+
+        impl Bag {
+            fun bump(self): i32 {
+                self.n + 1
+            }
+        }
+
+        fun main() {
+            let f = Bag::bump;
+            let b = Bag { n = 1 };
+            let n = f(b);
+        }
+        "#,
+        "a method has no value form",
+    );
+}
+
+#[test]
+fn an_external_fn_typed_binding_does_not_call() {
+    // Rule 1 — an extern's binding forms are call-shaped, so there is no sound
+    // value to hold.
+    assert_fails_with(
+        r#"
+        [extern("parseInt")]
+        external fun parse_int(text: str): i32;
+
+        fun main() {
+            let f = parse_int;
+            let n = f("12");
+        }
+        "#,
+        "an `external` function has no value form",
     );
 }
 
@@ -37452,6 +38195,581 @@ fn the_std_surface_batch_needs_no_import() {
     );
 }
 
+// --- I4's open tail: Map/Set parity (proposal/std-surface.md §1.2/§3) --------
+//
+// The unranked "Map/Set parity" row v1 left unshipped: `entries`/
+// `contains_value` on `Map`, `union`/`intersection`/`difference` on `Set`.
+// `map`/`filter`/`for_each` on either are deliberately NOT here — the audit
+// never settled what they would return (a `Map`, a `List`, values only, pairs?)
+// and, once `entries()` exists, the composable route
+// (`map.entries().iter()...`) already covers the need with no ambiguity to
+// invent. `str` carries no ranked or unranked gap in the audit (§1.3) — nothing
+// to pin.
+
+#[test]
+fn map_entries_pairs_keys_and_values_in_insertion_order() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("alice", 1);
+            scores.insert("bob", 2);
+            scores.insert("alice", 99);   // overwrite -- position does not move
+            mut order = "";
+            mut total = 0;
+            for entry in scores.entries() {
+                order = order + entry.0;
+                total = total + entry.1;
+            }
+            print(order);                 // alicebob -- alice keeps its first slot
+            print(total);                 // 101 -- the overwritten value, not 1 + 2
+            print(scores.entries().len()); // 2 -- overwrite is not a new pair
+        }
+        "#,
+        "alicebob\n101\n2\n",
+    );
+}
+
+#[test]
+fn map_entries_on_an_empty_map_is_empty() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut empty: Map<str, i32> = Map::new();
+            print(empty.entries().len());   // 0
+            print(empty.entries().is_empty()); // true
+        }
+        "#,
+        "0\ntrue\n",
+    );
+}
+
+#[test]
+fn map_contains_value_compares_by_value_not_by_key() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("x", 5);
+            scores.insert("y", 5);   // a duplicate value under a different key
+            print(scores.contains_value(5));    // true
+            print(scores.contains_value(6));    // false -- absent
+            print(scores.contains_key("z"));    // false -- "z" was never a key
+        }
+        "#,
+        "true\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn map_contains_value_on_an_empty_map_is_false() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut empty: Map<str, i32> = Map::new();
+            print(empty.contains_value(0));
+        }
+        "#,
+        "false\n",
+    );
+}
+
+#[test]
+fn set_union_combines_and_dedupes_the_overlap() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            b.insert(4);
+            let combined = a.union(b);
+            print(combined.len());          // 4 -- {1,2,3,4}, 2 and 3 not doubled
+            print(combined.contains(1));    // true
+            print(combined.contains(4));    // true
+            print(a.len());                 // 3 -- the receiver is untouched
+        }
+        "#,
+        "4\ntrue\ntrue\n3\n",
+    );
+}
+
+#[test]
+fn set_union_with_an_empty_set_is_identity_either_direction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            mut empty: Set<i32> = Set::new();
+            print(a.union(empty).len());       // 2
+            print(empty.union(a).len());       // 2
+            print(empty.union(empty).len());   // 0 -- both sides empty
+        }
+        "#,
+        "2\n2\n0\n",
+    );
+}
+
+#[test]
+fn set_intersection_keeps_only_the_shared_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            b.insert(4);
+            let shared = a.intersection(b);
+            print(shared.len());            // 2
+            print(shared.contains(2));      // true
+            print(shared.contains(1));      // false
+
+            mut disjoint: Set<i32> = Set::new();
+            disjoint.insert(100);
+            print(a.intersection(disjoint).len());   // 0 -- no overlap
+        }
+        "#,
+        "2\ntrue\nfalse\n0\n",
+    );
+}
+
+#[test]
+fn set_difference_keeps_elements_absent_from_the_other_side() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(2);
+            b.insert(3);
+            let remainder = a.difference(b);
+            print(remainder.len());          // 1
+            print(remainder.contains(1));    // true
+            print(remainder.contains(2));    // false
+
+            print(a.difference(a).len());    // 0 -- a set minus itself is empty
+            mut empty: Set<i32> = Set::new();
+            print(a.difference(empty).len()); // 3 -- nothing removed
+        }
+        "#,
+        "1\ntrue\nfalse\n0\n3\n",
+    );
+}
+
+#[test]
+fn the_map_set_parity_batch_needs_only_its_own_type_import() {
+    // Placement pin, mirroring `the_std_surface_batch_needs_no_import`: `map.vl`
+    // pulls `compare::PartialEq` in transitively, so `contains_value` needs no
+    // separate import beyond `Map` itself; `union`/`intersection`/`difference`
+    // carry no extra bound beyond `Set`'s own `T: Hashable`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::set::Set;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+            mut total = 0;
+            for entry in scores.entries() {
+                total = total + entry.1;
+            }
+            print(total);
+            print(scores.contains_value(1));
+
+            mut xs: Set<i32> = Set::new();
+            xs.insert(1);
+            mut ys: Set<i32> = Set::new();
+            ys.insert(2);
+            print(xs.union(ys).len());
+            print(xs.intersection(ys).len());
+            print(xs.difference(ys).len());
+        }
+        "#,
+        "1\ntrue\n2\n0\n1\n",
+    );
+}
+
+// --- B85: `for x in <set>` fires for every form of the iterable ---------------
+//
+// The `Set` loop lowering (`__set_iter`, walking the backing map's values) used
+// to be chosen from a type lookup on the ITERABLE EXPRESSION, and that lookup is
+// silent for every expression that stores no type on its own id — a parameter
+// (`self` above all), a call result, a `*view`. Those loops fell through to a
+// bare `for...of` over the struct's one-element field array, so a 3-element set
+// counted 1, silently. The type now comes from the analyzer's own per-loop
+// record (`for_each_iterable_types`), which is total by construction; these pins
+// cover one shape of iterable each, plus the sibling containers whose loops must
+// keep lowering exactly as before.
+
+#[test]
+fn a_set_loop_over_self_inside_its_own_generic_impl_walks_the_elements() {
+    // The recorded repro (std-surface.md §7.7). `self` is the case std's own
+    // `Set` methods have been routing around via `self.table.values()` by
+    // convention since I4; the direct form is what a user writes first.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun probe(self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            print(s.probe());   // 3, not 1
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_self_yields_the_elements_not_the_backing_field() {
+    // Counting alone would also pass a loop that walked the right NUMBER of
+    // wrong things, so this one sums the elements: the backing-array lowering
+    // yields the `NativeMap` itself, which does not add.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun total(self): i32 {
+                mut sum = 0;
+                for x in self {
+                    sum = sum + 1;
+                }
+                sum
+            }
+        }
+        impl Set<i32> {
+            fun sum(self): i32 {
+                mut sum = 0;
+                for x in self {
+                    sum = sum + x;
+                }
+                sum
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(10);
+            s.insert(20);
+            s.insert(30);
+            print(s.total());   // 3
+            print(s.sum());     // 60 -- real elements, in insertion order
+        }
+        "#,
+        "3\n60\n",
+    );
+}
+
+#[test]
+fn a_set_loop_inside_its_own_impl_builds_a_correct_union() {
+    // The payoff, and the shape that found the bug: a `union` written the direct
+    // way (`for value in self` / `for value in other`) rather than through
+    // `self.table.values()`. The first draft of std's `union` was exactly this
+    // and returned length 1 for a 4-element union. std's existing methods keep
+    // their `.table.values()` idiom (rewriting them would be churn) -- what this
+    // pins is that the convention is no longer load-bearing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun merged(self, other: Set<T>): Set<T> {
+                mut result: Set<T> = Set::new();
+                for value in self {
+                    result.insert(value);
+                }
+                for value in other {
+                    result.insert(value);
+                }
+                result
+            }
+        }
+        fun main() {
+            mut a: Set<i32> = Set::new();
+            a.insert(1);
+            a.insert(2);
+            a.insert(3);
+            mut b: Set<i32> = Set::new();
+            b.insert(3);
+            b.insert(4);
+            print(a.merged(b).len());   // 4, not 1
+        }
+        "#,
+        "4\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_mut_self_receiver_walks_the_elements() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        impl Set<type T: Hashable> {
+            fun probe(&mut self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            print(s.probe());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_plain_parameter_walks_the_elements() {
+    // Not an `impl` at all, and not generic: `self` was only the most common
+    // parameter, never the special one. A concrete `Set<i32>` parameter and a
+    // generic `Set<T>` one were equally broken.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        fun count_concrete(s: Set<i32>): i32 {
+            mut n = 0;
+            for x in s {
+                n = n + 1;
+            }
+            n
+        }
+        fun count_generic<T: Hashable>(s: Set<T>): i32 {
+            mut n = 0;
+            for x in s {
+                n = n + 1;
+            }
+            n
+        }
+        fun main() {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            print(count_concrete(s));
+            print(count_generic(s));
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_over_a_call_result_or_a_view_walks_the_elements() {
+    // The other two forms that store no type on their own expr id. A `let`
+    // binding and a field access always worked (both are recorded), and are
+    // here as the regression half of the same pin.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        struct Holder {
+            inner: Set<i32>,
+        }
+        fun make(): Set<i32> {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s
+        }
+        fun from_call(): i32 {
+            mut n = 0;
+            for x in make() {
+                n = n + 1;
+            }
+            n
+        }
+        fun from_view(s: &Set<i32>): i32 {
+            mut n = 0;
+            for x in *s {
+                n = n + 1;
+            }
+            n
+        }
+        fun from_field(holder: Holder): i32 {
+            mut n = 0;
+            for x in holder.inner {
+                n = n + 1;
+            }
+            n
+        }
+        fun main() {
+            let s = make();
+            print(from_call());                       // call result
+            print(from_view(&s));                     // *view
+            print(from_field(Holder { inner = s }));  // field access
+            mut n = 0;
+            for x in s {                              // plain `let` binding
+                n = n + 1;
+            }
+            print(n);
+        }
+        "#,
+        "3\n3\n3\n3\n",
+    );
+}
+
+#[test]
+fn a_set_loop_survives_nesting_and_a_closure_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        fun make(): Set<i32> {
+            mut s: Set<i32> = Set::new();
+            s.insert(1);
+            s.insert(2);
+            s.insert(3);
+            s
+        }
+        fun main() {
+            mut n = 0;
+            for s in [make(), make()] {
+                for x in s {
+                    n = n + 1;
+                }
+            }
+            print(n);   // 6 -- the loop binding is a `Set`, not an element
+            let count = |s: Set<i32>| {
+                mut c = 0;
+                for x in s {
+                    c = c + 1;
+                }
+                c
+            };
+            print(count(make()));
+        }
+        "#,
+        "6\n3\n",
+    );
+}
+
+#[test]
+fn the_sibling_containers_iterate_inside_their_own_impls_too() {
+    // The sweep's other half. `List` and `str` are JS-native iterables, so their
+    // loops never needed a type-driven lowering and were never broken -- pinned
+    // here so the B85 change is proven not to have moved them either.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        impl List<type T> {
+            fun count(self): i32 {
+                mut n = 0;
+                for x in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        impl str {
+            fun letters(self): i32 {
+                mut n = 0;
+                for c in self {
+                    n = n + 1;
+                }
+                n
+            }
+        }
+        fun main() {
+            print([1, 2, 3].count());
+            print("abc".letters());
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+// Found by B85's sweep as a known bug; closed at the same cut by B80's
+// for-loop rule — the two lanes converged on it from opposite sides.
+fn a_for_loop_over_a_map_is_refused_rather_than_walking_the_backing_field() {
+    // `Map` has NO native loop lowering and no `next` -- it is not iterable at
+    // all. But the analyzer only refuses an uniterable subject when it is a
+    // generic or a bare trait `Self` (B56); a STRUCT with no protocol method
+    // falls through to a native `for...of`, which over `Map`'s flat field array
+    // yields its one backing `NativeMap`. So `for entry in scores` compiles and
+    // "iterates" exactly once, whatever the map holds -- at every call site, not
+    // just inside `Map`'s own impl, so this is B85's neighbour and not B85.
+    //
+    // The fix is B56's own rule ("this is an error, not a silent lowering")
+    // extended from generics to structs, with the natively-iterable built-ins
+    // (`List`, `Set`, `str`, `[T; n]`) as the exception. Giving `Map` a loop
+    // lowering instead would be new surface: std-surface.md §7.7 declined to
+    // settle what `Map` iteration yields (keys? values? pairs?), and
+    // `map.entries()` already covers the need.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::map::Map;
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("a", 1);
+            scores.insert("b", 2);
+            mut n = 0;
+            for entry in scores {
+                n = n + 1;
+            }
+            print(n);
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
 // --- I4: the `to_string()` steering diagnostic (proposal/std-surface.md §5) ---
 //
 // `display.vl` sits outside the always-loaded core set and outside its
@@ -40211,6 +41529,423 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     );
 }
 
+// --- B72: a bare-trait parameter steers to the bound (method-resolution.md
+// --- §10) -------------------------------------------------------------------
+//
+// `fun show(v: A)` called with a `Bag` that implements `A` failed with
+// "Expected A, but got Bag instead" — which reads as though the impl were
+// missing. It is not. A trait is a BOUND, not a type (`spec/types.md` §5.5,
+// §5.11) and vilan has no trait objects, so the parameter can never accept a
+// concrete value and the declaration is what has to change.
+//
+// A call is the one position that reconciles PARAMETER-FIRST, so it is the one
+// position that ever asks `reconcile_type(Trait, Concrete)` — the direction
+// with no arm. Every other position reconciles value-first and lands on the
+// `(Struct|Enum, Trait)` arm, which accepts; those are pinned below as the
+// standing inconsistency they are, and belong to B4.
+
+#[test]
+fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
+    // The filed shape. The steer names the trait, the parameter, and the
+    // declaration to write.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A': a trait is not a value type",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_names_the_generic_to_write() {
+    // The actionable half — without it the message diagnoses without directing.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "`<T: A>` with 'v: T'",
+    );
+}
+
+#[test]
+fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
+    // The fix belongs at the DECLARATION, not at the call the error anchors on
+    // — so the note points there (and carries its own source, so it renders
+    // when the callee lives in another module).
+    assert_fails_noting(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(subject: A): str { "x" }
+        fun main() { let s = show(Bag { n = 1 }); }
+        "#,
+        "has bare trait type 'A'",
+        "subject",
+        "is declared with the trait as its type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
+    // The second surface that reaches the parameter-first reconcile: an
+    // associated function called as `Type::member(..)`. Same path, same steer —
+    // which is the point of fixing the message at the shared site rather than
+    // at the free-function call.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun make(v: A): i32 { 1 } }
+        fun main() { let n = Holder::make(Bag { n = 1 }); }
+        "#,
+        "parameter 'v' has bare trait type 'A'",
+    );
+}
+
+#[test]
+fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
+    // The steer is for the author who wrote a correct impl and the wrong
+    // signature. When the value does NOT implement the trait, the missing impl
+    // is the likelier mistake, so naming the type it failed to match stays the
+    // more useful report.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "Expected A, but got Other instead.",
+    );
+}
+
+#[test]
+fn b72_the_bound_generic_form_is_what_works() {
+    // The steer has to point at something that compiles AND runs — otherwise it
+    // is advice, not a fix. This is the program the message asks for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b72_a_generic_parameter_is_untouched_by_the_steer() {
+    // The steer must not reach a GENERIC parameter whose constraint resolves to
+    // a trait — `Type::Generic(c)` where `c` is the bound's type id is the
+    // normal, working case, and it is one arm away in `reconcile_type`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Other { m: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { let s = show(Other { m = 1 }); }
+        "#,
+        "does not implement trait 'A'",
+    );
+}
+
+// The positions that ACCEPT a bare trait today, pinned as the standing
+// inconsistency they are rather than left undescribed. Each reconciles
+// value-first, so each lands on `reconcile_type`'s `(Struct|Enum, Trait)` arm.
+// Refusing them is a language change (a trait type would become illegal in
+// every value position), which is B4's to make — and std itself depends on one
+// of them: `iterator.vl`'s `fun iter(self): Iterator<T>` returns a bare trait.
+
+#[test]
+fn b72_a_bare_trait_let_annotation_is_still_accepted() {
+    // `let x: A = bag` compiles; only USING it fails. The spec says this should
+    // be rejected at the annotation (`types.md` §5.11); it is not, and closing
+    // that gap is B4's, not a diagnostic's.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_value_still_cannot_be_used() {
+    // The refusal that DOES exist, and the one the new steer is worded to
+    // match: the body-side rule, from inside `show`.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { let x: A = Bag { n = 1 }; let s = x.name(); }
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_method_parameter_is_still_accepted() {
+    // A METHOD's bare-trait parameter reconciles value-first, so it accepts
+    // where the free function refuses. The asymmetry is real and pinned; see
+    // `method-resolution.md` §10.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        struct Holder { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Holder { fun take(self, v: A): i32 { 1 } }
+        fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
+        "#,
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_return_is_still_accepted() {
+    // std depends on this one: `impl Iterator<type T> with Iterable<T>` returns
+    // `Iterator<T>`, a bare trait. Any refusal of trait types in value position
+    // has to answer for it first.
+    assert_compiles(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun main() { let v = make(); }
+        "#,
+    );
+}
+
+// --- B74: the duplicate check reaches statics (method-resolution.md §9) -----
+//
+// B57's duplicate-inherent check filtered `is_self_method`, per its own scope,
+// so two impls declaring the same `fun new()` for one subject stayed a silent
+// pick — the same dead-declaration hazard one receiver position away. An impl's
+// `declarations` is ONE map keyed by name, so receiver position was never part
+// of a member's identity; the filter was doing double duty as "methods only"
+// and "same namespace only", and only the first was meant. The sweep that ran
+// before this landed found ZERO live collisions across std, the corpus, every
+// example and every compiled docs fence — the entire blast radius is the shapes
+// pinned here.
+
+#[test]
+fn b74_two_static_declarations_of_one_name_are_an_error() {
+    // The filed shape. Before this, `Bag::new()` silently took the first.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::new(); }
+        "#,
+        "new",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_the_duplicate_static_error_notes_the_first_declaration() {
+    // The same cross-file-capable note B57 ships for methods (§9(4)): the
+    // second declaration is the anchor, the first gets the note.
+    assert_fails_noting(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 1 } } }
+        impl Bag { fun spawn_here(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::spawn_here(); }
+        "#,
+        "is already defined for 'Bag'",
+        "spawn_here",
+        "is already defined here",
+    );
+}
+
+#[test]
+fn b74_a_static_and_a_method_of_one_name_collide() {
+    // The truth about namespaces, pinned: there is only ONE. `declarations` is
+    // keyed by name alone, and the static is the declaration that dies —
+    // `Bag::tag()` resolves the inherent METHOD first and then fails on arity
+    // ("Expected 1 argument, but got 0"), a report of a declaration that was
+    // never reachable by either call form. So they collide, and the error lands
+    // where the fix does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag { fun tag(): str { "static" } }
+        impl Bag { fun tag(self): str { "method" } }
+        fun main() { let bag = Bag { n = 1 }; }
+        "#,
+        "tag",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_an_extra_static_in_a_trait_impl_block_counts_as_inherent() {
+    // §9(2): "inherent" is a property of the MEMBER. A static written inside a
+    // `with`-clause block that the trait does not declare is the type's own,
+    // and collides with a plain inherent block's same name — the static twin of
+    // `b57_an_extra_method_in_a_trait_impl_block_counts_as_inherent`.
+    assert_fails_spanning_nth(
+        r#"
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        impl Bag with Marker {
+            fun mark(self): str { "m" }
+            fun make(): Bag { Bag { n = 1 } }
+        }
+        impl Bag { fun make(): Bag { Bag { n = 2 } } }
+        fun main() { let bag = Bag::make(); }
+        "#,
+        "make",
+        1,
+        "is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b74_a_trait_provided_static_does_not_collide_with_an_inherent_one() {
+    // The load-bearing negative, and the reason the widening is a filter change
+    // rather than a filter deletion. A trait's STATIC is homed by its trait, so
+    // it never enters the inherent tier: one inherent declaration is left, and
+    // one does not collide. `member_home_trait` reads the trait's declaration
+    // map directly with no receiver filter, which is what makes it home a
+    // static as readily as a method.
+    //
+    // Proven load-bearing against the tree, not by argument: with the homing
+    // guard removed, `vilan/std/src/time.vl`'s inherent `Duration::describe`
+    // collides with the `Wire` trait's `describe` and the corpus goes red.
+    //
+    // The note this pin carried — that `Bag::default()` here resolved to the
+    // TRAIT's static (7) rather than the inherent one, because the static
+    // accessor path never got B57's tiering — is now B83, fixed: it resolves
+    // to the inherent `1`, and the value is pinned so the two facts stay
+    // together. The trait's declaration is still not a DUPLICATE of the
+    // inherent one, which is what B74 claims; it is outranked by it, which is
+    // what B57 claims. Both at once, on one program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag with Default {
+            fun default(): Bag { Bag { n = 7 } }
+        }
+
+        impl Bag {
+            fun default(): Bag { Bag { n = 1 } }
+        }
+
+        fun main() {
+            print(Bag::default().n);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b74_the_same_static_name_on_two_types_is_not_a_duplicate() {
+    // Subject compatibility still gates the pair: `new` on two distinct types
+    // is two declarations, not a duplicate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        struct Box { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Box { fun new(): Box { Box { n = 2 } } }
+        fun main() { print(Bag::new().n); print(Box::new().n); }
+        main();
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b74_a_duplicate_static_on_a_generic_subject_is_an_error() {
+    // Subjects are compared with `compare_type`, so an impl with `type` binders
+    // collides with its twin exactly as a concrete one does.
+    assert_fails_spanning_nth(
+        r#"
+        struct Cell<T> { value: T }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        impl Cell<type T> { fun of(value: T): Cell<T> { Cell { value = value } } }
+        fun main() { let cell = Cell::of(1); }
+        "#,
+        "of",
+        1,
+        "is already defined for",
+    );
+}
+
+#[test]
+fn b74_three_static_declarations_produce_two_errors() {
+    // Each later declaration reports against the FIRST compatible one before
+    // it, so the count follows the declarations, not the pairs.
+    let source = r#"
+        struct Bag { n: i32 }
+        impl Bag { fun new(): Bag { Bag { n = 1 } } }
+        impl Bag { fun new(): Bag { Bag { n = 2 } } }
+        impl Bag { fun new(): Bag { Bag { n = 3 } } }
+        fun main() { let bag = Bag::new(); }
+        "#;
+    match compile(source) {
+        Ok(_) => panic!("expected two duplicate-static errors, but it compiled"),
+        Err(errors) => {
+            let duplicates = errors
+                .iter()
+                .filter(|error| error.contains("is already defined for 'Bag'"))
+                .count();
+            assert_eq!(duplicates, 2, "expected two duplicates; got: {errors:#?}");
+        }
+    }
+}
+
+#[test]
+fn b74_a_static_still_resolves_when_it_is_the_only_one() {
+    // The check must not disturb the ordinary path: one static, one home.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        impl Bag {
+            fun new(n: i32): Bag { Bag { n = n } }
+            fun tag(self): str { "bag" }
+        }
+        fun main() { let bag = Bag::new(4); print(bag.n); print(bag.tag()); }
+        main();
+        "#,
+        "4\nbag\n",
+    );
+}
+
 // --- I5: `Iterator::next` takes `&mut self` (proposal/iterator-adapters.md P1,
 // --- slice S1) --------------------------------------------------------------
 // The trait shipped declaring `fun next(self): Option<T>`, and B29's receiver-
@@ -40454,35 +42189,49 @@ fn list_iter_satisfies_an_iterator_bound() {
     );
 }
 
-// --- Found while building I3 S3: a user `impl List<type T>` makes std's own
-// --- `List` methods report, nondeterministically ------------------------------
+// --- B77: a user `impl List<type T>` made std's own `List` methods report,
+// --- nondeterministically (FIXED) ---------------------------------------------
+//
+// A constraint id does NOT identify one declaring file. `impl Subject<type T>`
+// deliberately inherits the SUBJECT's constraint id (`register_subject_binders`),
+// so a user's `impl List<type T>` is the same id as `list.vl`'s `struct List<T>`
+// — by design, so the binder means exactly what writing the subject's bound out
+// would mean. The residual-generic leak check collapsed that many-to-one
+// relation into a `HashMap<TypeId, SourceId>` via `.collect()`, i.e. last write
+// wins over a randomly-seeded `HashMap` iteration. Whichever entity came last
+// became "the" declaring file, so on ~half of cold compiles the user's file won
+// and every `List<T>` residual inside `list.vl` read as declared elsewhere. The
+// check now keeps the SET of declaring files and asks whether the binding's own
+// file is among them, which is the question the rule always meant to ask and is
+// order-independent.
 
-/// A user-declared `impl List<type T>` block makes the entry-scoped checks
-/// report against std's OWN `List::map` / `List::filter` bodies — "the type of
-/// 'result' is never fully determined" against `mut result = List::new()` in
-/// `list.vl` — on roughly half of otherwise identical compiles of the SAME
-/// source. Two things are wrong at once:
+/// A user-declared `impl List<type T>` block must not make the entry-scoped
+/// checks report against std's OWN `List::map` / `List::filter` bodies — "the
+/// type of 'result' is never fully determined" against `mut result =
+/// List::new()` in `list.vl`. Two things were wrong at once:
 ///
-/// 1. the diagnostic is **spurious**: `result` is fixed by the `result.push(..)`
+/// 1. the diagnostic was **spurious**: `result` is fixed by the `result.push(..)`
 ///    below it and by the declared return type, which is why the other half of
-///    the runs are clean; and
-/// 2. it points into **std**, whose definition-site diagnostics are meant to be
-///    frozen (`analysis-reuse.md` §6) — so a user's impl block is un-freezing
+///    the runs were clean; and
+/// 2. it pointed into **std**, whose definition-site diagnostics are meant to be
+///    frozen (`analysis-reuse.md` §6) — so a user's impl block was un-freezing
 ///    entities it does not own.
 ///
 /// The order-dependence is what makes it worth its own pin: a single compile
-/// proves nothing. It is also **cold-path only** — the base cache
-/// (`analysis-reuse.md` §6.10) serves every compile after the first in a
+/// proves nothing, so this counts. It is also **cold-path only** — the base
+/// cache (`analysis-reuse.md` §6.10) serves every compile after the first in a
 /// process, and a served world is always the clean one, which is why a naive
-/// loop passes 300/300 and proves nothing either. So each attempt clears the
-/// cache first. Measured that way it fails roughly half the time, here and on
-/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predates this arc;
-/// `#[ignore]`d until the cause is found.
+/// loop passed 300/300 and proved nothing either. So each attempt clears the
+/// cache first. Measured that way it failed roughly half the time, here and on
+/// the pre-arc tree (39c951c, 14/30 through the CLI), so it predated the I3 arc
+/// that found it. It is 30/30 clean now, and goes red at ~15/30 if the leak
+/// check is put back on a single declaring source.
 ///
-/// `base_cache_clear` is process-global, which is a second reason this stays
-/// ignored rather than joining the suite.
+/// `base_cache_clear` is process-global. Under nextest each test is its own
+/// process; under plain `cargo test` the worst it does to a concurrent test is
+/// cost it a cold analysis, since the base cache is a reuse cache and no answer
+/// may depend on a hit.
 #[test]
-#[ignore]
 fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
     let source = r#"
         import std::print;
@@ -40497,10 +42246,87 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
             print([1, 2, 3].second_len());
         }
         "#;
-    for attempt in 0..20 {
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
         vilan_core::analyzer::base_cache_clear();
         if let Err(errors) = compile(source) {
-            panic!("attempt {attempt} reported against std: {errors:#?}");
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles reported against std; the first said: {first_report:#?}"
+    );
+}
+
+/// The other half of B77's rule, and the guard that the fix is not a
+/// suppression: sharing a constraint id across files makes a residual legal in
+/// EVERY file that declares it, not in none of them. The user's own impl body
+/// binds `T`, so a `List<T>` binding inside it is as legitimate as the identical
+/// binding inside `list.vl` — and both must stay clean on the same cold compile.
+/// This went red on ~half of cold attempts before the fix, in the runs where
+/// `list.vl` rather than the entry won the collapse.
+#[test]
+fn a_generic_residual_is_legal_in_every_file_that_declares_its_parameter() {
+    let source = r#"
+        import std::print;
+
+        impl List<type T> {
+            fun doubled(self): List<T> {
+                mut copy = List::new();
+                for item in self {
+                    copy.push(item);
+                    copy.push(item);
+                }
+                copy
+            }
+        }
+
+        fun main() {
+            print([1, 2].doubled().len());
+        }
+        "#;
+    let mut spurious = 0;
+    let mut first_report = None;
+    for _attempt in 0..30 {
+        vilan_core::analyzer::base_cache_clear();
+        if let Err(errors) = compile(source) {
+            spurious += 1;
+            first_report.get_or_insert(errors);
+        }
+    }
+    assert_eq!(
+        spurious, 0,
+        "{spurious}/30 cold compiles rejected a legitimate residual; \
+         the first said: {first_report:#?}"
+    );
+}
+
+/// B77's fix must not soften the B16 rule it lives inside: a parameter declared
+/// ONLY in another file still leaks. `Map::new`'s `K`/`V` are declared in
+/// `map.vl` and nowhere in the entry, so the set never contains the entry and
+/// the annotate steer still lands — on the cold path, where B77 lived.
+#[test]
+fn a_leaked_generic_still_reports_on_the_cold_path() {
+    let source = r#"
+        import std::map::Map;
+        fun main() {
+            mut table = Map::new();
+            table.insert("k", 1);
+        }
+        "#;
+    for attempt in 0..5 {
+        vilan_core::analyzer::base_cache_clear();
+        match compile(source) {
+            Ok(_) => panic!("attempt {attempt}: the leaked `Map::new` residual went unreported"),
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("never fully determined")),
+                "attempt {attempt}: wrong diagnostic: {errors:#?}"
+            ),
         }
     }
 }
@@ -40980,50 +42806,67 @@ fn an_adapter_chain_leaves_its_source_list_alone() {
     );
 }
 
-// --- Found while building I3 S4: the protocol loop drops a TUPLE element's
-// --- type when the iterator's element is its own generic parameter -----------
+// --- B78: the protocol loop dropped the element's type when the iterator's
+// --- element IS its own generic parameter (FIXED) ----------------------------
+//
+// `iterable_element_type` reads the element off the DECLARED return type of the
+// subject's `next` — `impl ListIterator<type T> { fun next(..): Option<T> }` —
+// and took that payload verbatim. The payload is written in the SUBJECT's own
+// parameters, so it is abstract until instantiated against the receiver's
+// arguments, exactly like the `Trait` arm one match-arm below (which does
+// substitute, and is why a bounded-generic loop always worked). Untouched, the
+// binding got the bare parameter `T`, and a `T` admits nothing: field access,
+// method call and call-as-a-function all refused it.
+//
+// `enumerate` and `zip` hid the defect for the whole I3 arc because their
+// payloads are STRUCTURAL — `Option<(i32, T)>`, `Option<(T, U)>` — so the loop
+// saw a tuple whose PARTS were abstract, which projects fine, rather than a
+// whole that was. The subject arm now builds the same instantiation context the
+// trait arm does, from the struct's or enum's declared parameters.
 
-/// `for value in it` types `value` as the bare generic parameter (or as `any`)
-/// when `it`'s element type IS that parameter — so a tuple element cannot be
-/// projected: `pair.0` is "cannot access field '0' on type T". The same
-/// iterator pulled by hand is fine, which is what makes this the LOOP's bug
-/// rather than the iterator's:
-///
-/// ```text
-/// if cursor.step() is Some(let pair) { print(pair.0); }   // 1
-/// for pair in cursor { print(pair.0); }                   // cannot access field '0'
-/// ```
-///
-/// It is not std's and not this arc's — the repro below defines its own trait
-/// and its own cursor, and the native `for pair in [(1, "a")]` over a plain
-/// `List` (a different arm entirely) has always worked. What the arc DID is
-/// make the shape reachable: `List::iter()` is the first generically-elemented
-/// iterator in std, so `[(1, "a")].iter().filter(p)` now hits it. An adapter
-/// that names the tuple STRUCTURALLY in its `with` clause is unaffected —
-/// `enumerate` (`Iterator<(i32, T)>`) and `zip` (`Iterator<(T, U)>`) both
-/// project fine — so the defect is exactly the substitution of the loop
-/// binding, not tuples in the protocol.
-///
-/// `#[ignore]`d: it asserts the desired outcome and fails today.
+/// The filed shape: `List::iter()` is std's first generically-elemented
+/// iterator, so `for pair in [(1, "a")].iter()` was the first thing to reach it
+/// — "cannot access field '0' on type T". The same iterator pulled BY HAND was
+/// always fine, which is what places the defect in the loop's binding rather
+/// than in the iterator.
 #[test]
-#[ignore]
 fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
     assert_compiles_and_runs(
         r#"
         import std::print;
         import std::option::Option::{ self, Some, None };
 
-        trait Walk<T> {
-            fun step(&mut self): Option<T>;
+        fun main() {
+            mut pulled = [(1, "a"), (2, "b")].iter();
+            if pulled.next() is Some(let pair) {
+                print(pair.0);
+            }
+            for pair in [(1, "a"), (2, "b")].iter() {
+                print(pair.1);
+            }
         }
+        "#,
+        "1\na\nb\n",
+    );
+}
+
+/// The same defect with no std beyond the loop protocol itself: a user's own
+/// generically-elemented cursor. Neither std's nor the arc's — what the arc did
+/// was make the shape reachable.
+#[test]
+fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
 
         struct Cursor<T> {
             items: List<T>,
             index: i32,
         }
 
-        impl Cursor<type T> with Walk<T> {
-            fun step(&mut self): Option<T> {
+        impl Cursor<type T> {
+            fun next(&mut self): Option<T> {
                 if self.index < self.items.len() {
                     let value = self.items[self.index];
                     self.index = self.index + 1;
@@ -41036,7 +42879,7 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
 
         fun main() {
             mut pulled = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
-            if pulled.step() is Some(let pair) {
+            if pulled.next() is Some(let pair) {
                 print(pair.0);
             }
             mut looped = Cursor { items = [(1, "a"), (2, "b")], index = 0 };
@@ -41046,6 +42889,844 @@ fn a_protocol_loop_keeps_a_tuple_elements_type_through_a_generic() {
         }
         "#,
         "1\na\nb\n",
+    );
+}
+
+/// Not a tuple defect — a BARE-PARAMETER defect. Every element form that a `T`
+/// refuses went red the same way, so each gets a leg: a struct (field access),
+/// a nested container (method call), an `Option` (method call on an enum), and
+/// a closure (call-as-a-function, "cannot call this as a function: it is T").
+#[test]
+fn a_protocol_loop_keeps_every_element_form_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            for point in [Point { x = 1, y = 2 }, Point { x = 3, y = 4 }].iter() {
+                print(point.x);
+            }
+            for inner in [[1, 2, 3], [4]].iter() {
+                print(inner.len());
+            }
+            for maybe in [Some(5), None].iter() {
+                print(maybe.unwrap_or(-1));
+            }
+            for fn in [|n: i32| n + 1].iter() {
+                print(fn(41));
+            }
+        }
+        "#,
+        "1\n3\n3\n1\n5\n-1\n42\n",
+    );
+}
+
+/// A pattern match on the element never went red — an `is` against a bare `T`
+/// checked VACUOUSLY and still ran, which is why an enum element looked
+/// unaffected until a method was called on it. The pin is here so that
+/// leniency, whatever it is worth, stays a decision and not an accident: the
+/// element is a real `Shade` now and both arms still match.
+#[test]
+fn a_protocol_loop_element_matches_its_enum_variants() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Shade { Light, Dark(i32) }
+
+        fun main() {
+            for shade in [Shade::Dark(9), Shade::Light].iter() {
+                if shade is Shade::Dark(let depth) { print(depth); }
+                if shade is Shade::Light { print(0); }
+            }
+        }
+        "#,
+        "9\n0\n",
+    );
+}
+
+/// The subject arm covers ENUMS as well as structs, and an enum-shaped iterator
+/// reaches it by the same road (`Type::Enum(id, arguments)` -> the declared
+/// parameters of `enums[id]`). Same "cannot access field '1' on type T" before.
+#[test]
+fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Feed<T> { Ready(List<T>, i32), Done }
+
+        impl Feed<type T> {
+            fun next(&mut self): Option<T> {
+                if self is Feed::Ready(let items, let at) {
+                    let pulled = if at < items.len() { Some(items[at]) } else { None };
+                    let advanced = if at < items.len() {
+                        Feed::Ready(items, at + 1)
+                    } else {
+                        Feed::Done
+                    };
+                    self = advanced;
+                    pulled
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut feed = Feed::Ready([(1, "a"), (2, "b")], 0);
+            for pair in feed {
+                print(pair.0);
+                print(pair.1);
+            }
+        }
+        "#,
+        "1\na\n2\nb\n",
+    );
+}
+
+/// The `&mut` lending form drives `next_mut(&mut self): Option<&mut T>`
+/// (`iterator-adapters.md` §7) through the same arm, so a GENERIC container
+/// lent by view had the identical defect — the standing `next_mut` pins use a
+/// concrete `Bag` and could not see it.
+#[test]
+fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+
+        impl Bag<type T> {
+            fun next_mut(&mut self): Option<&mut T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor = self.cursor + 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in &mut bag {
+                print(pair.1);
+            }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The element survives an adapter chain, where the subject is a `Filtered<..>`
+/// whose own parameter is bound to the upstream's — one more instantiation hop
+/// than the bare `.iter()` legs above.
+#[test]
+fn a_protocol_loop_keeps_a_tuple_element_through_an_adapter_chain() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in [(1, "a"), (2, "b"), (3, "c")].iter().filter(|p| p.0 > 1) {
+                print(pair.1);
+            }
+            for pair in [(1, "a"), (2, "b")].iter().take(1) {
+                print(pair.0);
+            }
+        }
+        "#,
+        "b\nc\n1\n",
+    );
+}
+
+/// The regression guard on the forms that always worked, and the reason the
+/// defect survived the whole arc: a STRUCTURAL payload projects even without
+/// the instantiation, because only its parts are abstract.
+#[test]
+fn a_structurally_named_tuple_element_still_projects() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+            for pair in ["a", "b"].iter().enumerate() {
+                print(pair.0);
+                print(pair.1);
+            }
+            for pair in [1, 2].iter().zip(["x", "y"].iter()) {
+                print(pair.1);
+            }
+            for pair in [(9, "z")] {
+                print(pair.0);
+            }
+        }
+        "#,
+        "0\na\n1\nb\nx\ny\n9\n",
+    );
+}
+
+// --- B80: a concrete subject with no protocol member ------------------------
+// Found while repairing B78's own pin, which named its protocol method `step`
+// and therefore never reached the protocol at all. `for x in subject` over a
+// CONCRETE struct or enum that has no `next` was not diagnosed — it lowered to
+// a native `for...of`, which in JavaScript walks the receiver's flat FIELD
+// array (a struct) or its `[tag, ..payload]` array (an enum), so the program
+// printed the representation and exited 0.
+//
+// This is P3/B56's defect one type-shape over: B56 closed it for a GENERIC
+// subject (`report_uniterable_for_each`), and the same reasoning applies
+// verbatim to a concrete one. The rule the fix states is name AND shape — the
+// protocol stays duck-typed on the METHOD NAME (`iterator-adapters.md` §1), but
+// the subject must actually carry that method, and a `next` annotated with
+// something other than `Option<T>` is rejected rather than driven.
+//
+// The deliberate native forms are exempt: an `external struct` (a host handle
+// whose runtime shape is JavaScript's — `List`, `str`, `Bytes`, `NativeMap`)
+// and `Set` (the one ordinary vilan struct with a lowering of its own,
+// `__set_iter`). `[T; n]` and tuples never reach the arm.
+
+/// B80's own repro, verbatim from the `#[ignore]`d pin B78's arc filed: before
+/// the fix this printed `[ 1, 2 ]` and `0` — the two fields of `Cursor` — and
+/// exited 0.
+#[test]
+fn a_for_loop_over_a_struct_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in walked {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The enum twin of the same hole, both shapes. A data-less `enum Color` lowers
+/// to `[0]` (the representation rule is a CONJUNCTION — all-data-less AND
+/// any-explicit-discriminant — so a bare data-less enum is still a tagged
+/// array), and printed `0`; a payload variant `Shape::Circle(3)` is `[0, 3]`
+/// and printed `0` then `3`.
+#[test]
+fn a_for_loop_over_an_enum_without_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Color { Red, Green, Blue }
+
+        fun main() {
+            let shade = Color::Red;
+            for value in shade {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun main() {
+            let shape = Shape::Circle(3);
+            for value in shape {
+                print(value);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The protocol resolves on a MEMBER, and a field is not a member: a struct
+/// with a field literally named `next` provides nothing to drive. Before the
+/// fix this printed `5` then `7` — the field array, `next` included.
+#[test]
+fn a_field_named_next_does_not_satisfy_the_for_protocol() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Link { next: i32, value: i32 }
+
+        fun main() {
+            mut link = Link { next = 5, value = 7 };
+            for item in link {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// A fieldless struct is `[]` at runtime, so the fallback loop ran zero times
+/// and exited 0 — silently doing nothing rather than silently doing the wrong
+/// thing. It is the same missing member and gets the same diagnostic. (This is
+/// also why the exemption reads the declared `external` modifier and not
+/// "has no fields": a bodyless `external struct` and `struct Marker {}` are
+/// indistinguishable by field count.)
+#[test]
+fn a_for_loop_over_a_field_less_struct_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Marker {}
+
+        fun main() {
+            mut marker = Marker {};
+            for item in marker {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+/// The name alone used to resolve the protocol, so a `next` DECLARED to return
+/// anything else was driven anyway: the lowering reads the `Option` tag off the
+/// result, `(5)[0]` is `undefined`, `undefined !== 0` breaks, and the loop ran
+/// ZERO times and exited 0. The diagnostic names the return type it found.
+#[test]
+fn a_next_that_does_not_return_option_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self): i32 {
+                self.count += 1;
+                self.count
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
+                print(item);
+            }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+}
+
+/// The `&mut` form drives `next_mut`, so it is a separate member and a separate
+/// diagnostic — including for a subject that has `next` and only `next`, which
+/// is the sharper case: `for item in down` is legal and `for item in &mut down`
+/// is not, and the message must name `next_mut` rather than `next`.
+#[test]
+fn a_mut_for_loop_over_a_subject_without_next_mut_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Cursor { items: List<i32>, index: i32 }
+
+        fun main() {
+            mut walked = Cursor { items = [1, 2], index = 0 };
+            for item in &mut walked {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        struct Down { left: i32 }
+
+        impl Down {
+            fun next(&mut self): Option<i32> {
+                if self.left <= 0 { None } else { self.left = self.left - 1; Some(self.left) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { left = 2 };
+            for item in &mut down {
+                print(item);
+            }
+        }
+        "#,
+        "it has no `next_mut(&mut self): Option<T>`",
+    );
+}
+
+/// A `Map` is an ordinary vilan struct over a `NativeMap`, and it has no `next`
+/// — so the fallback walked its one field and printed the backing map itself
+/// (`Map(1) { 'a' => [ 'a', 1 ] }`), exit 0. It is now diagnosed, and the
+/// message names the three documented ways to walk one.
+#[test]
+fn a_for_loop_over_a_map_is_diagnosed_and_names_its_accessors() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::map::Map;
+
+        fun main() {
+            mut scores: Map<str, i32> = Map::new();
+            scores.insert("alice", 1);
+            for entry in scores {
+                print(entry);
+            }
+        }
+        "#,
+        "`entries()`, `keys()` or `values()`",
+    );
+}
+
+/// The exemption set, end to end and at runtime: an `external struct` whose
+/// runtime shape is the host's (`List` — a JS array; `str` — a JS string,
+/// yielding characters; `Bytes` — a `Uint8Array`), `Set` (the `__set_iter`
+/// lowering over the backing map's stored originals), and the two shapes that
+/// never reach the struct/enum arm at all (`[T; n]` and a tuple). None of these
+/// declares a `next`, and every one of them must keep iterating.
+#[test]
+fn the_deliberate_native_iteration_forms_still_iterate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::bytes::{ Bytes, encode_utf8 };
+
+        fun main() {
+            for item in [1, 2] { print(item); }
+            for character in "ab" { print(character); }
+            let fixed: [i32; 2] = [3, 4];
+            for item in fixed { print(item); }
+            let pair = (5, 6);
+            for item in pair { print(item); }
+            mut seen: Set<i32> = Set::new();
+            seen.insert(7);
+            for item in seen { print(item); }
+            for byte in encode_utf8("h") { print(byte); }
+        }
+        "#,
+        "1\n2\na\nb\n3\n4\n5\n6\n7\n104\n",
+    );
+}
+
+/// The positive control the whole check is measured against: a struct that DOES
+/// declare `next(&mut self): Option<T>` drives the loop exactly as before,
+/// whether the method is inherent or comes with an `Iterator` clause, and so
+/// does `Range` (std's own). An unannotated `next` is not judged on its return
+/// type — `IteratorFromFn::next` is written that way in std and infers its
+/// `Option<T>` from its body — so `Iterator::from_fn` must keep working too.
+#[test]
+fn a_subject_that_declares_next_still_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::range::Range;
+        import std::iterator::Iterator;
+        import std::option::{Option, Some, None};
+
+        struct Countdown { remaining: i32 }
+        impl Countdown with Iterator<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.remaining <= 0 { None } else { self.remaining -= 1; Some(self.remaining) }
+            }
+        }
+
+        struct Inherent { at: i32 }
+        impl Inherent {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut countdown = Countdown { remaining = 2 };
+            for value in countdown { print(value); }
+            mut inherent = Inherent { at = 0 };
+            for value in inherent { print(value); }
+            for value in Range::new(0, 2) { print(value); }
+            mut counted = 0;
+            mut produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 2 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n0\n1\n2\n0\n1\n1\n2\n",
+    );
+}
+
+/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
+/// trait default is reachable as a call (`empty.next()` resolves and returns
+/// `None`) but does not drive a loop — `method_member_candidates` reads the
+/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
+/// nothing. Before the fix the loop fell through to the native `for...of` and
+/// printed the `unused` field; now it is a clean "cannot iterate", which is the
+/// right interim answer but not the right final one. `#[ignore]`d: it asserts
+/// the desired outcome (the default drives the loop, printing `99` only).
+#[test]
+#[ignore]
+fn a_next_inherited_from_a_trait_default_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Empty { unused: i32 }
+        impl Empty with Fixed<i32> {}
+
+        fun main() {
+            mut empty = Empty { unused = 0 };
+            for item in empty { print(item); }
+            print(99);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+/// The half of the wrong-signature family the fix deliberately does NOT judge:
+/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
+/// std is written that way and infers `Option<T>`. A body that yields nothing
+/// therefore still reaches the lowering, which reads `undefined[0]` and throws
+/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
+/// than silent, so not the same class as B80 — but it should be a compile
+/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
+/// compiles and the failure is the runtime's.
+#[test]
+#[ignore]
+fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Odd { count: i32 }
+
+        impl Odd {
+            fun next(&mut self) {
+                self.count += 1;
+            }
+        }
+
+        fun main() {
+            mut odd = Odd { count = 0 };
+            for item in odd {
+                print(item);
+            }
+        }
+        "#,
+        "cannot iterate",
+    );
+}
+
+// --- B82: an enum-variant pattern against a bare generic parameter ----------
+// `resolve_pattern` waved a `Type::Generic` scrutinee through beside `Unknown`
+// and `Any`, so NOTHING was checked and the tag test was emitted anyway. The
+// pattern then matched by coincidence of representation, which is silent wrong
+// code, not a missing diagnostic: a `List<i32>` `[0, 7]` "matched"
+// `Shape::Circle(let radius)` and bound `radius = 7`, and a trait default
+// written over its own `T` matched `Colour::Red` against a `Fruit::Apple(9)`.
+//
+// Whether it is fixable AT the pattern turns on WHICH parameter it is, and the
+// evidence for the split is `std::ui::View::swap` — see the `#[ignore]`d pin at
+// the end of this block. A parameter declared by a scope ENCLOSING the pattern
+// is abstract by construction (the declaration is checked once for all of its
+// instantiations), so it is an error. One that arrived from elsewhere means
+// only "not substituted yet", and the free-function twin already substitutes.
+
+/// B82's core case: a generic function matching on its own `T`-typed parameter.
+/// Every arm of the family is silent wrong code at runtime, not merely
+/// unchecked — `probe([0, 7])` returned `7` and `probe(Fruit::Apple("x"))`
+/// returned the *string* `"x"` from a function declared `: i32`.
+#[test]
+fn an_enum_pattern_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Shape { Circle(i32), Square(i32) }
+
+        fun probe<T>(value: T): i32 {
+            if value is Shape::Circle(let radius) { radius } else { -1 }
+        }
+
+        fun main() { print(probe(Shape::Circle(5))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The `match` form of the same thing — the pattern resolver is shared, and the
+/// pin exists so a future change to one form cannot quietly leave the other.
+#[test]
+fn an_enum_match_arm_on_a_functions_own_type_parameter_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun probe<T>(value: T): i32 {
+            match value {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A trait's own parameter inside a DEFAULT body, which is the sharpest proof
+/// that the abstract check can never be right: the body below is written once
+/// and instantiated at two different enums, so `value is Colour::Red` cannot
+/// have one answer. It had one anyway — `Fruit::Apple(9)` is `[0, 9]`, the tag
+/// test `[0] === 0` passed, and `Basket.describe()` returned 1 where every
+/// reading of the source says 0.
+#[test]
+fn an_enum_pattern_on_a_traits_own_parameter_in_a_default_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple(i32), Pear(i32) }
+
+        trait Tell<T> {
+            fun payload(self): T;
+            fun describe(self): i32 {
+                let value = self.payload();
+                if value is Colour::Red { 1 } else { 0 }
+            }
+        }
+
+        struct Holder { at: i32 }
+        impl Holder with Tell<Colour> { fun payload(self): Colour { Colour::Red } }
+
+        struct Basket { at: i32 }
+        impl Basket with Tell<Fruit> { fun payload(self): Fruit { Fruit::Apple(9) } }
+
+        fun main() {
+            print(Holder { at = 0 }.describe());
+            print(Basket { at = 0 }.describe());
+        }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// A BOUND does not rescue it, which is why the message does not suggest adding
+/// one: a trait bound cannot make a parameter be one particular enum, and the
+/// bounded `T` below is exactly as instantiable at some other implementor.
+#[test]
+fn a_bound_does_not_make_a_type_parameter_matchable() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        trait Tag { fun tag(self): i32; }
+        impl Route with Tag { fun tag(self): i32 { 1 } }
+
+        fun probe<T: Tag>(value: T): i32 {
+            if value is Route::Away(let id) { id } else { 0 }
+        }
+
+        fun main() { print(probe(Route::Away(4))); }
+        "#,
+        "cannot match an enum variant against the generic parameter `T`",
+    );
+}
+
+/// The two concrete diagnostics the generic one now sits beside, neither of
+/// which had a pin: a scrutinee that is a different enum, and one that is not
+/// an enum at all. They are the reason the generic case reads as a hole rather
+/// than a policy — the check exists, it just had nothing to run against.
+#[test]
+fn a_concrete_mismatched_subject_keeps_its_own_pattern_diagnostics() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+        enum Fruit { Apple, Pear }
+
+        fun main() {
+            let value = Fruit::Apple;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "variant 'Colour::Red' does not belong to the matched enum",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Colour { Red, Green }
+
+        fun main() {
+            let value: i32 = 5;
+            if value is Colour::Red { print(1); } else { print(0); }
+        }
+        "#,
+        "cannot match an enum variant against type i32",
+    );
+}
+
+/// What must keep working, and does: an enum PARAMETERIZED by a type parameter
+/// is a `Type::Enum`, not a `Type::Generic`, so `Some(let value)` on an
+/// `Option<T>` inside a generic function is untouched — std's own bodies are
+/// full of it (`Set::to_set`, `View::swap`'s `last_value.read()`). So is an
+/// enum matching its own variants inside its own `impl`, where `self` is the
+/// abstract enum rather than a parameter. And a LITERAL pattern against a `T`
+/// is a different arm entirely, checked by `compare_type` and sound at runtime
+/// (a JS `===` against a number cannot be fooled by a string).
+#[test]
+fn matching_through_a_type_parameter_still_works_where_it_is_sound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        enum Route { Home, Away(i32) }
+
+        impl Route {
+            fun code(self): i32 {
+                if self is Route::Away(let id) { id } else { 0 }
+            }
+        }
+
+        fun first_or<T>(values: List<T>, fallback: T): T {
+            match values.get(0) {
+                Some(let value) => value,
+                None => fallback,
+            }
+        }
+
+        fun literal<T>(value: T): i32 {
+            match value {
+                1 => 10,
+                _ => 30,
+            }
+        }
+
+        fun main() {
+            print(first_or([5, 6], 0));
+            print(first_or(["a"], "z"));
+            print(Route::Away(3).code());
+            print(Route::Home.code());
+            print(literal(1));
+            print(literal("x"));
+        }
+        "#,
+        "5\na\n3\n0\n10\n30\n",
+    );
+}
+
+/// The evidence that decided B82's shape. A closure argument to a FREE
+/// function's generic reaches its body with the parameter already substituted,
+/// so the match inside is checked for real — the wrong enum is rejected by the
+/// pre-existing concrete diagnostic, with no help from B82's arm.
+#[test]
+fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun apply<T>(value: T, render: |T| i32): i32 { render(value) }
+
+        fun main() {
+            print(apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "variant 'Other::First' does not belong to the matched enum",
+    );
+}
+
+/// And the half that does NOT, which is why B82 ships as a split rather than a
+/// blanket error. A closure argument to a METHOD's own generic reaches its body
+/// with the parameter still abstract, so the match inside is checked against
+/// nothing — the program below binds `Other::Second`'s payload out of a
+/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
+/// shape, and the routing guide's `swap(route, |current| match current { .. })`
+/// is the documented, shipped use, so a blanket error on a `Type::Generic`
+/// scrutinee takes the guide with it (probed: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
+///
+/// The fix is not at the pattern — it is to instantiate the closure parameter
+/// the way the free-function twin above already does. `#[ignore]`d: it asserts
+/// the diagnostic, and today the program compiles and runs.
+#[test]
+#[ignore]
+fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }));
+        }
+        "#,
+        "does not belong to the matched enum",
     );
 }
 
@@ -41360,71 +44041,16 @@ fn a_custom_conformer_gets_every_termination_for_free() {
     );
 }
 
-// --- I3 S7: why the eager `List` forms were NOT re-expressed over the
-// --- adapters (proposal/iterator-adapters.md §4 option ii, §8) ---------------
-
-/// §4 ratified re-expressing `List::map`/`filter`/`fold`/`for_each` as
-/// `self.iter().map(fn).to_list()`, and §8 asked for a measurement before that
-/// rewrite landed. The measurement found a blocker the paper did not
-/// anticipate, and it is not the performance one: **an async closure cannot
-/// adapt through an adapter chain.**
-///
-/// Async polymorphism (A.1) instantiates an ASYNC instance of the callee when
-/// the closure argument is async. An adapter STORES the closure in a struct
-/// field and calls it from a trait-dispatched `next`, where there is no single
-/// concrete callee to instantiate — so the pass refuses it:
-///
-/// ```text
-/// an async closure cannot adapt a trait/generic-dispatched call (the concrete
-/// callee varies per instantiation); bind the callee concretely, or declare the
-/// trait parameter `async || T`
-/// ```
-///
-/// The repro below touches no std: it is a user's own eager helper written over
-/// the adapters. With `List::map` re-expressed, the same error lands inside
-/// `list.vl` and `vilan/test/adapt.vl` — the corpus test that exists to pin
-/// adaptation — fails to BUILD. `map`, `filter` and `fold` all break this way;
-/// `for_each` survives, having nothing to return.
-///
-/// So the eager four keep their eager bodies. The collision §4 exists to remove
-/// does not arise in what shipped — `List` does not implement `Iterator`, so the
-/// lazy `map`/`filter` are reachable only through `.iter()`, which is §4's own
-/// "degrades gracefully" state — and `an_async_closure_adapts_map_and_runs_
-/// sequentially` above is the standing guard that the eager path still adapts.
-///
-/// `#[ignore]`d because it asserts the DESIRED outcome: when adaptation learns
-/// to follow a trait-dispatched callee, this goes green and option (ii) becomes
-/// available. The measured cost stands separately and is recorded in the
-/// proposal: the adapter path ran ~5.5x slower than the eager loop on a
-/// 20 000-element `map`→`filter`→`fold` (8-9 ms against 49-50 ms, best of
-/// seven), from two O(n) deep copies the eager form does not pay — `iter()`
-/// snapshots the list, and the terminal's `mut self` copies the chain that
-/// holds it.
-#[test]
-#[ignore]
-fn an_async_closure_adapts_through_an_adapter_chain() {
-    assert_compiles_and_runs(
-        r#"
-        import std::print;
-        import std::time::sleep;
-
-        fun mapped<T, U>(source: List<T>, fn: |T| U): List<U> {
-            source.iter().map(fn).to_list()
-        }
-
-        fun main() {
-            let lengths = mapped(["ab", "cdef"], |url| {
-                let length = url.len();
-                sleep(1);
-                print(length);
-                length
-            });
-            print(lengths);
-        }
-        "#,
-        "2\n4\n[ 2, 4 ]\n",
-    );
-}
+// --- I3 S7: the eager `List` forms are NOT re-expressed over the adapters,
+// --- permanently (proposal/iterator-adapters.md §4 option ii, §8) ------------
+// The owner REFUSED option (ii) on 2026-08-06: an async closure cannot adapt
+// through an adapter chain (the adapter stores it in a struct field and calls
+// it from a trait-dispatched `next`, which adaptation cannot follow), and the
+// adapter path measured ~5.5x slower than the eager loop on a `List` source.
+// The `#[ignore]`d pin that waited on that ruling is retired — it asserted an
+// outcome the project has decided never to want. The eager four keep their
+// eager bodies; `an_async_closure_adapts_map_and_runs_sequentially` above is
+// the standing guard that the eager path still adapts.
 
 // --- Found while building I3 S5: a dispatched method call was colored by a
 // --- same-named STATIC (async_infer's candidate set) --------------------------
@@ -41562,5 +44188,680 @@ fn a_genuinely_async_dispatched_member_still_colors_its_caller() {
         }
         "#,
         "slow\n",
+    );
+}
+
+// --- B79: the enum discriminant family ---------------------------------------
+//
+// `proposal/backed-enums.md` §1.7 surveyed the existing integer discriminant
+// and found it validates nothing: a duplicate MISCOMPILES (two variants become
+// one runtime value and the second `match` arm is dead), a fraction truncates,
+// an overflowing magnitude became `0` — an ordinary discriminant a sibling may
+// hold, which routes an overflow straight into the duplicate hole — and a
+// discriminant that cannot reach the runtime at all is silently discarded.
+//
+// The messages state the rule AS IT STANDS. `backed-enums.md` is a live
+// proposal to widen the production to string backings, and §3.3/§3.7 design
+// exactly these rules for that world too, so none of them foreclose it.
+
+#[test]
+fn b79_two_variants_cannot_share_a_discriminant() {
+    // P5, the live miscompile: `Dup::B` matched `Dup::A`'s arm and the program
+    // printed "a" with exit 0.
+    assert_fails_noting(
+        r#"
+        enum Dup { A = 1, B = 1, C = 2 }
+        fun main() { }
+        "#,
+        "variant 'B' has discriminant 1, which 'A' already uses",
+        "A = 1",
+        "'A' has discriminant 1",
+    );
+}
+
+#[test]
+fn b79_an_implicit_discriminant_collides_just_as_loudly() {
+    // The C-style continuation is part of the value set, so a collision needs
+    // no second `=` to happen: `C` walks onto 1 behind `B = 0`.
+    assert_fails_with(
+        r#"
+        enum Walked { A = 1, B = 0, C }
+        fun main() { }
+        "#,
+        "variant 'C' has discriminant 1, which 'A' already uses",
+    );
+}
+
+#[test]
+fn b79_a_fractional_discriminant_is_rejected_rather_than_truncated() {
+    // P7's first half: `= 1.5` silently became `1`.
+    assert_fails_with(
+        r#"
+        enum Fraction { X = 1.5, Y = 7 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1.5` is not",
+    );
+}
+
+#[test]
+fn b79_a_suffixed_discriminant_is_rejected_rather_than_dropped() {
+    // The same hole one token over, and the reason `1_000` is in it: the
+    // number token's suffix is `_000`, and reducing the WHOLE part alone read
+    // the literal as `1`. `= 1u32` was `1` with the type annotation discarded.
+    assert_fails_with(
+        r#"
+        enum Grouped { A = 1_000, B = 1 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1_000` carries the trailer `_000`",
+    );
+    assert_fails_with(
+        r#"
+        enum Suffixed { A = 1u32, B = 2 }
+        fun main() { }
+        "#,
+        "an enum discriminant must be an integer, and `1u32` carries the trailer `u32`",
+    );
+}
+
+#[test]
+fn b79_an_overflowing_discriminant_is_rejected_rather_than_zeroed() {
+    // P7's second half, and the worse one: `unwrap_or(0)` (`parsing.rs:3315`,
+    // inherited from chumsky and never revisited) turned this into `0`.
+    assert_fails_with(
+        r#"
+        enum Overflow { X = 99999999999999999999, Y = 1 }
+        fun main() { }
+        "#,
+        "the enum discriminant `99999999999999999999` is out of range",
+    );
+    // Both directions of the bound, one past each end.
+    assert_fails_with(
+        r#"
+        enum Under { X = -9223372036854775809 }
+        fun main() { }
+        "#,
+        "the enum discriminant `-9223372036854775809` is out of range",
+    );
+}
+
+#[test]
+fn b79_the_i64_bounds_themselves_are_legal() {
+    // The negative bound is one PAST the positive one, because the minus
+    // applies to the magnitude rather than being parsed into it — the same
+    // rule `-128i8` follows. Off-by-one here would reject a legal program.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }
+        fun main() {
+            print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
+        }
+        "#,
+        "min\n",
+    );
+}
+
+#[test]
+fn b79_a_discriminant_sequence_cannot_run_past_the_bound() {
+    // The continuation has nowhere to go. `discriminant + 1` panicked the
+    // debug compiler here and wrapped the release one.
+    assert_fails_with(
+        r#"
+        enum Edge { A = 9223372036854775807, B }
+        fun main() { }
+        "#,
+        "variant 'B' continues the discriminant sequence past 9223372036854775807",
+    );
+}
+
+#[test]
+fn b79_a_hex_discriminant_is_read_as_hex() {
+    // Not a new spelling — `0xFF` is one integer token everywhere else in the
+    // language, and the analyzer's own range check already reads it as radix
+    // 16. The discriminant path re-implemented literal reading with
+    // `parse::<i64>()`, which FAILS on `0xFF` and fell to `unwrap_or(0)`. The
+    // silent `0` is the bug; reading it is the fix, not a feature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Mask { Low = 0x0F, High = 0xF0 }
+        fun main() {
+            print(match Mask::High { Mask::Low => "low", Mask::High => "high" });
+        }
+        "#,
+        "high\n",
+    );
+}
+
+#[test]
+fn b79_a_payload_variant_cannot_carry_a_discriminant() {
+    // The direct half of §3.3's rule: a bare backing value has nowhere to put
+    // a payload.
+    assert_fails_with(
+        r#"
+        enum Pay { A(str) = 1, B }
+        fun main() { }
+        "#,
+        "variant 'A' carries a payload, so it cannot have an explicit discriminant",
+    );
+}
+
+#[test]
+fn b79_a_discriminant_beside_a_payload_variant_is_rejected() {
+    // P6, and the shape the rule is really about: `is_numeric` is a
+    // CONJUNCTION — all-data-less AND any-explicit-discriminant — so `B`'s
+    // payload flips the whole enum to the tagged form and `A = 1` is inert. It
+    // parsed, it was stored in `EnumVariantDeclaration::discriminant`, and
+    // nothing would ever read it.
+    assert_fails_noting(
+        r#"
+        enum Mixed { A = 1, B(str) }
+        fun main() { }
+        "#,
+        "an explicit discriminant is only meaningful when every variant is data-less, and 'B' \
+         carries a payload",
+        "B(str)",
+        "'B' carries a payload here",
+    );
+}
+
+#[test]
+fn b79_the_still_legal_discriminant_forms_all_compile() {
+    // The negative space, so the family cannot creep: negatives, gaps, a
+    // mixture of explicit and continued values, a payload enum with no
+    // discriminants at all, and a plain enum with none.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Signed { A = -3, B = -1, C = 5, D }
+        enum Gapped { X = 10, Y = 20, Z = 30 }
+        enum Plain { P, Q, R }
+        enum Carried { S(str), T(i32) }
+
+        fun main() {
+            print(match Signed::D { Signed::A => "a", Signed::B => "b", Signed::C => "c", Signed::D => "d" });
+            print(match Gapped::Y { Gapped::X => 1, Gapped::Y => 2, Gapped::Z => 3 });
+            print(match Plain::R { Plain::P => "p", Plain::Q => "q", Plain::R => "r" });
+            print(match Carried::T(7) { Carried::S(let s) => s, Carried::T(let n) => "t" });
+        }
+        "#,
+        "d\n2\nr\nt\n",
+    );
+}
+
+#[test]
+fn b79_a_rejected_discriminant_does_not_also_read_as_a_duplicate() {
+    // The cascade guard. An overflowing magnitude used to BECOME `0`, so the
+    // one mistake reported twice — once as itself and once as a collision with
+    // whatever legitimately holds `0`. A variant with no usable value takes no
+    // part in the uniqueness check.
+    let diagnostics = failure_diagnostics(
+        r#"
+        enum Both { A = 0, B = 99999999999999999999 }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly one diagnostic; got: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].0.contains("is out of range"),
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b79_std_ordering_still_lowers_to_its_bare_discriminant() {
+    // The load-bearing negative for the whole family: `std/src/compare.vl`'s
+    // `Ordering { Less = -1, Equal = 0, Greater = 1 }` is the one enum in the
+    // tree that uses the feature, and the representation rule says it lowers
+    // to the bare integer rather than the `[index]` array.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        fun main() {
+            print(Ordering::Greater);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("console.log(1)"),
+        "Ordering::Greater should lower to the bare `1`, got:\n{javascript}"
+    );
+}
+
+// --- B84: two same-named members in ONE block --------------------------------
+//
+// `impl Bag { fun which(self) … "first"  fun which(self) … "second" }` compiled
+// clean and ran "second". The cross-block shape — the same two declarations in
+// two `impl` blocks — was already a hard error (B57, widened to statics by
+// B74); nothing about the RULE differed, only whether the second declaration
+// survived to be counted. A scope map holds one entry per name, so the second
+// declaration overwrote the first before `collect_declarations` read the map
+// back, and the check had no pair to compare.
+
+#[test]
+fn b84_two_methods_of_one_name_in_one_block_collide() {
+    assert_fails_noting(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "first" }
+            fun which(self): str { "second" }
+        }
+        fun main() { }
+        "#,
+        "'which' is already defined for 'Bag'; remove or rename this one",
+        "which",
+        "'which' is already defined here",
+    );
+}
+
+#[test]
+fn b84_two_statics_of_one_name_in_one_block_collide() {
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun make(): Bag { Bag { n = 1 } }
+            fun make(): Bag { Bag { n = 2 } }
+        }
+        fun main() { }
+        "#,
+        "'make' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_a_static_and_a_method_of_one_name_in_one_block_collide() {
+    // The mixed pair, which B74 established shares ONE namespace: receiver
+    // position is not part of a member's identity, so a `fun tag()` and a
+    // `fun tag(self)` cannot both be reached whether they sit in one block or
+    // two.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Bag { n: i32 }
+        impl Bag {
+            fun tag(): str { "static" }
+            fun tag(self): str { "method" }
+        }
+        fun main() { print(Bag::tag()); }
+        "#,
+        "'tag' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_two_externals_of_one_name_in_one_block_collide() {
+    // The shape bindgen's name table exists to prevent, written by hand: a
+    // constructor object's static binding beside the instance method of the
+    // same name.
+    assert_fails_with(
+        r#"
+        external struct Reply;
+        impl Reply {
+            [extern(method, "json")]
+            external fun json(self): str;
+            [extern("Reply.json")]
+            external fun json(data: str): Reply;
+        }
+        fun main() { }
+        "#,
+        "'json' is already defined for 'Reply'",
+    );
+}
+
+#[test]
+fn b84_a_trait_provided_name_declared_twice_in_one_block_collides() {
+    // The block rule is NOT the inherent rule with a wider input. The inherent
+    // rule exempts a trait-provided name so that two impls of one trait — the
+    // platform twins — stay legal (method-resolution.md §9(6)); inside ONE
+    // block there is no twin to protect, and a name written twice is a mistake
+    // whatever trait homes it.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        impl Bag with Marker {
+            fun mark(self): str { "a" }
+            fun mark(self): str { "b" }
+        }
+        fun main() { }
+        "#,
+        "'mark' is already defined for 'Bag'",
+    );
+}
+
+#[test]
+fn b84_a_trait_declaring_one_name_twice_collides() {
+    // A trait body is a block too, and its declarations went through the same
+    // scope map.
+    assert_fails_with(
+        r#"
+        trait Twice {
+            fun a(self): str;
+            fun a(self): str;
+        }
+        fun main() { }
+        "#,
+        "'a' is already defined for 'trait Twice'",
+    );
+}
+
+#[test]
+fn b84_three_copies_in_one_block_report_twice() {
+    // Each later declaration is reported against the FIRST, matching the
+    // cross-block rule's shape rather than chaining pairwise.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "1" }
+            fun which(self): str { "2" }
+            fun which(self): str { "3" }
+        }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|(message, _)| message.contains("'which' is already defined for 'Bag'"))
+            .count(),
+        2,
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b84_a_same_block_duplicate_is_reported_once_not_twice() {
+    // The two rules overlap on an inherent same-block pair. The inherent check
+    // skips a pair from one block precisely so this stays a single report.
+    let diagnostics = failure_diagnostics(
+        r#"
+        struct Bag { n: i32 }
+        impl Bag {
+            fun which(self): str { "first" }
+            fun which(self): str { "second" }
+        }
+        fun main() { }
+        "#,
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "expected exactly one diagnostic; got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b84_one_name_per_block_across_two_blocks_still_compiles() {
+    // The negative space: the block rule must not reach across blocks, or the
+    // platform twins and every ordinary two-impl type go red. `describe` is
+    // declared once per block, in three blocks, two of them trait impls.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Marker { fun mark(self): str; }
+        trait Label { fun label(self): str; }
+
+        impl Bag { fun describe(self): str { "bag" } }
+        impl Bag with Marker { fun mark(self): str { "m" } }
+        impl Bag with Label { fun label(self): str { "l" } }
+
+        fun main() {
+            let bag = Bag { n = 1 };
+            print(bag.describe());
+            print(bag.mark());
+            print(bag.label());
+        }
+        "#,
+        "bag\nm\nl\n",
+    );
+}
+
+#[test]
+fn b84_two_impls_of_one_trait_are_still_not_a_duplicate() {
+    // §9(6), kept load-bearing: the trait tier dedups by trait, so the name
+    // still has one home. `Into`'s std blanket impl is the live instance, and
+    // a user's own `Into` impl beside it must stay legal.
+    assert_compiles(
+        r#"
+        import std::into::Into;
+
+        struct Celsius { degrees: i32 }
+        struct Fahrenheit { degrees: i32 }
+
+        impl Celsius with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+
+        fun main() { }
+        "#,
+    );
+}
+
+// --- B83: `Type::static()` gets B57's tiering --------------------------------
+//
+// `prepped_static_accessors` was a flat `find_map` in impl-registration order,
+// so a trait-provided static BEAT an inherent one that happened to register
+// later — inherent-over-trait inverted on the one path B57 did not reach
+// (method-resolution.md §S2's residue). The candidate set is unchanged; only
+// the ranking is new.
+
+#[test]
+fn b83_an_inherent_static_outranks_a_trait_provided_one() {
+    // The registration order that used to decide it: the trait impl FIRST.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+        impl Bag { fun default(): Bag { Bag { n = 1 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b83_the_inherent_static_wins_from_either_declaration_order() {
+    // The other order, which happened to be right before — the pair is what
+    // makes the rule a rule rather than a coincidence.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+
+        impl Bag { fun default(): Bag { Bag { n = 1 } } }
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b83_two_traits_providing_one_static_are_ambiguous() {
+    // B57 §4's ambiguity, on the static path. The steer §4 gives a method —
+    // `Trait::member(receiver)` — does NOT exist here: the qualified form
+    // selects an impl THROUGH the receiver, and a static has no receiver. So
+    // the diagnostic names the fix that always works and says outright that
+    // the qualified path is not available, rather than steering at a spelling
+    // that does not resolve.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        trait Beta { fun spawn(): Bag; }
+
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+        impl Bag with Beta { fun spawn(): Bag { Bag { n = 2 } } }
+
+        fun main() { print(Bag::spawn().n); }
+        "#,
+        "'spawn' is ambiguous on 'Bag': both 'Alpha' and 'Beta' provide it as a static, and a \
+         static has no receiver for a `Trait::spawn` path to select through; declare 'Bag''s own \
+         'spawn', which outranks every trait-provided one",
+    );
+}
+
+#[test]
+fn b83_an_inherent_static_resolves_the_two_trait_ambiguity() {
+    // The fix the diagnostic names, proven to work rather than asserted. An
+    // impossible steer is worse than no steer (the B65 lesson).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        trait Beta { fun spawn(): Bag; }
+
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+        impl Bag with Beta { fun spawn(): Bag { Bag { n = 2 } } }
+        impl Bag { fun spawn(): Bag { Bag { n = 9 } } }
+
+        fun main() { print(Bag::spawn().n); }
+        "#,
+        "9\n",
+    );
+}
+
+#[test]
+fn b83_a_lone_trait_provided_static_still_resolves() {
+    // The load-bearing negative. `Type::method` refuses when only a trait
+    // provides it (§3.1) because `Trait::method(receiver)` is the sanctioned
+    // spelling; for a STATIC there is no other spelling at all, so the trait
+    // tier must stay reachable. Tightening this to match the method path would
+    // make every trait-provided static uncallable.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+        impl Bag with Default { fun default(): Bag { Bag { n = 7 } } }
+
+        fun main() { print(Bag::default().n); }
+        "#,
+        "7\n",
+    );
+}
+
+#[test]
+fn b83_a_static_on_a_trait_subject_impl_still_resolves() {
+    // The other shape the static path carries: an impl whose SUBJECT is a
+    // trait (`impl Iterator<type T> { fun from_fn(..) }`), which is how
+    // `Iterator::from_fn` is reached. The tiering runs over the same candidate
+    // set, so a trait-subject impl must keep resolving.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut n = 0;
+            let it = Iterator::from_fn(|| { n = n + 1; if n <= 3 { Some(n) } else { None } });
+            print(it.count());
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b83_two_impls_of_one_trait_do_not_make_a_static_ambiguous() {
+    // §9(6) on the static path: the trait tier dedups by TRAIT, so two impls
+    // of one trait leave the name one home. The subjects differ here, so both
+    // impls are live at once — which is the case a same-subject pair could
+    // never reach.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::default::Default;
+
+        struct Bag { n: i32 }
+        struct Box_ { n: i32 }
+
+        impl Bag with Default { fun default(): Bag { Bag { n = 1 } } }
+        impl Box_ with Default { fun default(): Box_ { Box_ { n = 2 } } }
+
+        fun main() {
+            print(Bag::default().n);
+            print(Box_::default().n);
+        }
+        "#,
+        "1\n2\n",
+    );
+}
+
+#[test]
+fn b83_a_trait_declared_static_is_not_reachable_through_the_trait() {
+    // PROBED, and recorded rather than built: `Trait::static()` does not
+    // resolve, with or without a default body on the trait's declaration. It
+    // cannot, on today's design — `Trait::method(receiver)` picks an impl
+    // through the receiver's type, and a static offers nothing to pick with.
+    // This is why B83's ambiguity diagnostic names an inherent declaration as
+    // the fix rather than a qualified path.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag; }
+        impl Bag with Alpha { fun spawn(): Bag { Bag { n = 1 } } }
+
+        fun main() { print(Alpha::spawn().n); }
+        "#,
+        "cannot find 'spawn' in Alpha",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Bag { n: i32 }
+        trait Alpha { fun spawn(): Bag { Bag { n = 3 } } }
+
+        fun main() { print(Alpha::spawn().n); }
+        "#,
+        "cannot find 'spawn' in Alpha",
+    );
+}
+
+#[test]
+fn b83_a_trait_provided_method_is_still_refused_on_the_type_path() {
+    // §3.1 is untouched: `Type::method` still refuses a trait-only method and
+    // steers to `Trait::method(..)`, which for a METHOD does exist. The static
+    // path's reachable trait tier must not leak into it.
+    assert_fails_with(
+        r#"
+        struct Bag { n: i32 }
+        trait Alpha { fun show(self): str; }
+        impl Bag with Alpha { fun show(self): str { "a" } }
+
+        fun main() { let s = Bag::show(Bag { n = 1 }); }
+        "#,
+        "'show' is not an inherent member of 'Bag'",
     );
 }

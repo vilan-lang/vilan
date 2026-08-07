@@ -30,6 +30,7 @@ fn options() -> Options {
     Options {
         platform: "node".to_string(),
         source_name: "fixture.d.ts".to_string(),
+        only: Vec::new(),
     }
 }
 
@@ -43,10 +44,24 @@ fn bind_for(platform: &str, source: &str) -> String {
         source,
         &Options {
             platform: platform.to_string(),
+            only: Vec::new(),
             source_name: "fixture.d.ts".to_string(),
         },
     )
     .source
+}
+
+/// Generates bindings filtered to `only` and its transitive closure (E37(b)).
+fn bind_only(only: &[&str], source: &str) -> String {
+    generate(source, &only_options(only)).source
+}
+
+fn only_options(only: &[&str]) -> Options {
+    Options {
+        platform: "node".to_string(),
+        source_name: "fixture.d.ts".to_string(),
+        only: only.iter().map(|name| name.to_string()).collect(),
+    }
 }
 
 /// Asserts `needle` appears in the generated output, printing the whole output
@@ -573,6 +588,531 @@ fn a_global_variable_is_diagnosed_because_no_extern_form_reads_one() {
     );
 }
 
+// --- E37(a) the constructor idiom --------------------------------------------
+//
+// `proposal/bindgen.md` §10.3: 641 of `lib.dom.d.ts`'s 824 unbindable globals
+// are ONE shape — a global whose object type carries a construct signature —
+// and it maps onto an extern form that exists precisely for it. Recognizing it
+// took declaration coverage from 65.8% to 92.3%. One test per case.
+
+#[test]
+fn a_bare_constructor_global_binds_extern_new_on_the_type_it_constructs() {
+    let output = bind(
+        "interface Widget { press(): void; }\n\
+         declare var Widget: { prototype: Widget; new(): Widget; };",
+    );
+    assert!(
+        output.contains(
+            "[extern(new, \"Widget\")]\n\t[platform(\"node\")]\n\texternal fun new(): Widget;"
+        ),
+        "{output}"
+    );
+    // The `declare var` is BOUND now, not skipped, and says where it went.
+    assert!(
+        !output.contains("TODO(bindgen): `Widget` is a global"),
+        "{output}"
+    );
+    assert!(output.contains("is a host constructor"), "{output}");
+}
+
+#[test]
+fn a_constructor_global_replaces_the_object_bag_constructor() {
+    // An interface normally gets `[extern("Object")] external fun new()` — a
+    // fresh `{}` to fill in with setters (the `RequestInit` precedent). For a
+    // type the host constructs with `new`, that is not merely redundant, it is
+    // WRONG: `Object()` hands back a plain object, not a `Widget`. And two
+    // functions named `new` in one `impl` would not compile.
+    let output = bind(
+        "interface Widget { press(): void; }\n\
+         declare var Widget: { prototype: Widget; new(): Widget; };",
+    );
+    assert!(!output.contains("[extern(\"Object\")]"), "{output}");
+    assert_eq!(output.matches("external fun new(").count(), 1, "{output}");
+    // Without the constructor global the bag constructor is still there.
+    let plain = bind("interface Widget { press(): void; }");
+    assert!(plain.contains("[extern(\"Object\")]"), "{plain}");
+}
+
+#[test]
+fn a_constructor_global_with_parameters_keeps_them_and_splits_the_arities() {
+    let output = bind(
+        "interface Socket { close(): void; }\n\
+         declare var Socket: { prototype: Socket; new(url: string, protocol?: string): Socket; };",
+    );
+    assert!(
+        output.contains("external fun new(url: str): Socket;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("external fun new_with_protocol(url: str, protocol: str): Socket;"),
+        "{output}"
+    );
+    assert_eq!(
+        output.matches("[extern(new, \"Socket\")]").count(),
+        2,
+        "{output}"
+    );
+}
+
+#[test]
+fn overloaded_construct_signatures_keep_the_first_and_quote_the_rest() {
+    // §3.10's rule applies unchanged: vilan has one signature per name.
+    let output = bind(
+        "interface Blob_ { size(): number; }\n\
+         declare var Blob_: {\n\
+         \tprototype: Blob_;\n\
+         \tnew(): Blob_;\n\
+         \tnew(parts: string[]): Blob_;\n\
+         };",
+    );
+    assert!(output.contains("external fun new(): Blob_;"), "{output}");
+    assert!(
+        output.contains("1 additional overload(s) of `new` not represented"),
+        "{output}"
+    );
+    assert!(output.contains("new(parts: string[]): Blob_"), "{output}");
+    assert_eq!(output.matches("external fun new(").count(), 1, "{output}");
+}
+
+#[test]
+fn statics_beside_new_bind_as_dotted_globals_and_the_instance_side_keeps_its_name() {
+    // `declare var Response: { new(…): Response; json(…): Response; }` sits
+    // beside `interface Response { json(): Promise<any> }` in `lib.dom.d.ts`:
+    // one host name, two different functions. They land in ONE `impl`, so the
+    // collision renamer can see both — and the INSTANCE side keeps the plain
+    // name, because that is the primary surface.
+    let output = bind(
+        "interface Reply { json(): string; }\n\
+         declare var Reply: {\n\
+         \tprototype: Reply;\n\
+         \tnew(): Reply;\n\
+         \tjson(data: string): Reply;\n\
+         \treadonly kind: string;\n\
+         };",
+    );
+    // A static is a dotted global with NO `self` receiver.
+    assert!(
+        output.contains("[extern(\"Reply.json\")]\n\t[platform(\"node\")]\n\texternal fun json_2(data: str): Reply;"),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "[extern(\"Reply.kind\")]\n\t[platform(\"node\")]\n\texternal fun kind(): str;"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "[extern(method, \"json\")]\n\t[platform(\"node\")]\n\texternal fun json(self): str;"
+        ),
+        "{output}"
+    );
+}
+
+#[test]
+fn prototype_is_the_idioms_marker_and_never_becomes_a_binding() {
+    // Reading `X.prototype` hands back the shared prototype object, never an
+    // instance, so binding it as a static typed `X` would be a lie the type
+    // checker could not catch.
+    let output = bind(
+        "interface Widget { press(): void; }\n\
+         declare var Widget: { prototype: Widget; new(): Widget; };",
+    );
+    assert!(!output.contains("prototype"), "{output}");
+}
+
+#[test]
+fn the_constructed_type_need_not_share_the_globals_name() {
+    // `declare var Image: { new(…): HTMLImageElement }` is the same idiom under
+    // an aliased host symbol. The binding belongs on the type it YIELDS, named
+    // after the symbol it constructs with, beside that type's own `new`.
+    let output = bind(
+        "interface HTMLImageElement { src: string; }\n\
+         declare var HTMLImageElement: { prototype: HTMLImageElement; new(): HTMLImageElement; };\n\
+         declare var Image: { new(width?: number): HTMLImageElement; };",
+    );
+    assert!(
+        output.contains("[extern(new, \"HTMLImageElement\")]\n\t[platform(\"node\")]\n\texternal fun new(): HTMLImageElement;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("[extern(new, \"Image\")]\n\t[platform(\"node\")]\n\texternal fun new_image(): HTMLImageElement;"),
+        "{output}"
+    );
+    // One `impl`, so both constructors are reachable as `HTMLImageElement::…`.
+    assert_eq!(
+        output.matches("impl HTMLImageElement {").count(),
+        1,
+        "{output}"
+    );
+}
+
+#[test]
+fn a_generic_constructor_global_keeps_the_declared_return_type() {
+    // `declare var ReadableStream: { new <R>(…): ReadableStream<R> }` — the
+    // construct signature states its OWN applied type, which is not always the
+    // parameters the interface itself declares. Only a signature with no return
+    // type at all falls back to "`new X(…)` yields an `X`".
+    let output = bind(
+        "interface Stream<R> { read(): R; }\n\
+         declare var Stream: { prototype: Stream<any>; new <T>(seed: T): Stream<T>; };",
+    );
+    assert!(
+        output.contains("external fun new<T>(seed: T): Stream<T>;"),
+        "{output}"
+    );
+    // A concrete argument survives too; the fallback would have written `<R>`.
+    let concrete = bind(
+        "interface Stream<R> { read(): R; }\n\
+         declare var ByteStream: { prototype: Stream<any>; new(): Stream<string>; };",
+    );
+    assert!(
+        concrete.contains("external fun new_byte_stream(): Stream<str>;"),
+        "{concrete}"
+    );
+}
+
+#[test]
+fn a_prototype_only_global_is_refused_rather_than_guessed_at() {
+    // No construct signature means it is not a host class. Its members would be
+    // reachable as dotted globals, but there is no TYPE for an `impl` to be
+    // written on, and inventing an `external struct` for it would put a type in
+    // the output that the host does not have. Named, not guessed.
+    let output = bind(
+        "interface Widget { press(): void; }\n\
+         declare var Widget: { prototype: Widget; };",
+    );
+    assert!(
+        output.contains("TODO(bindgen): `Widget` is an object-typed global with no construct"),
+        "{output}"
+    );
+    assert!(!output.contains("[extern(new,"), "{output}");
+    // The interface itself still binds, bag constructor and all.
+    assert!(output.contains("[extern(\"Object\")]"), "{output}");
+}
+
+#[test]
+fn an_object_typed_global_that_is_not_a_constructor_never_false_positives() {
+    // A plain configuration object shares the idiom's SYNTAX — `declare var` of
+    // an object type — and none of its meaning. The construct signature is the
+    // whole signal, so this must produce no constructor at all.
+    let output = bind("declare var config: { debug: boolean; retries: number };");
+    assert!(!output.contains("[extern(new,"), "{output}");
+    assert!(!output.contains("external struct"), "{output}");
+    assert!(
+        output.contains("TODO(bindgen): `config` is an object-typed global with no construct"),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_constructor_global_for_an_undeclared_type_is_diagnosed() {
+    // v1 does not resolve across files (§2), so there is nothing for
+    // `[extern(new, …)]` to return.
+    let output = bind("declare var Widget: { prototype: Widget; new(): Widget; };");
+    assert!(
+        output.contains("TODO(bindgen): `Widget` is a constructor object, but the type it"),
+        "{output}"
+    );
+    // The TODO's prose names `[extern(new, …)]` as the form that would apply;
+    // what must not exist is a BINDING.
+    assert!(!output.contains("external fun new"), "{output}");
+}
+
+#[test]
+fn the_named_constructor_interface_spelling_is_refused_by_name() {
+    // `interface FooConstructor { new(): Foo }` + `declare var Foo:
+    // FooConstructor` is the same idiom spelled with a named type, the way
+    // `lib.es5.d.ts` writes it. Deliberately NOT recognized: the constructor
+    // interface is itself a declaration bindgen emits, and folding its members
+    // into `Foo` while also emitting `FooConstructor` would say the same thing
+    // twice. The refusal is named so it is a decision, not a gap.
+    let output = bind(
+        "interface Widget { press(): void; }\n\
+         interface WidgetConstructor { new(): Widget; }\n\
+         declare var Widget: WidgetConstructor;",
+    );
+    assert!(
+        output.contains("TODO(bindgen): `Widget` is a constructor object typed by the named"),
+        "{output}"
+    );
+    assert!(output.contains("interface `WidgetConstructor`"), "{output}");
+    // `Widget` keeps only the `Object()` bag constructor an interface always
+    // gets; no `[extern(new, …)]` binding was written for it. (The TODO's own
+    // prose names that form, which is why the needle is the ATTRIBUTE LINE.)
+    assert!(!output.contains("\t[extern(new,"), "{output}");
+    assert!(output.contains("[extern(\"Object\")]"), "{output}");
+}
+
+#[test]
+fn a_constructor_global_produces_a_binding_module_that_compiles() {
+    let output = bind(
+        "interface Reply { json(): string; }\n\
+         declare var Reply: { prototype: Reply; new(body: string): Reply; json(data: string): Reply; };\n\
+         interface Img { src: string; }\n\
+         declare var Img: { prototype: Img; new(): Img; };\n\
+         declare var Picture: { new(width?: number): Img; };",
+    );
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
+}
+
+// --- E37(b) the `--only` transitive closure ----------------------------------
+//
+// `proposal/bindgen.md` §10.5's second caveat: size is the real cost of
+// generating from a large declaration file, and the answer is a filter that
+// emits a named type plus everything its signatures reach.
+
+#[test]
+fn only_emits_the_named_type_and_leaves_the_unreachable_out() {
+    let source = "interface Wanted { label: string; }\n\
+                  interface Unwanted { other: string; }";
+    let output = bind_only(&["Wanted"], source);
+    assert!(output.contains("external struct Wanted;"), "{output}");
+    assert!(!output.contains("Unwanted"), "{output}");
+    // …and the unfiltered run does emit it, so the filter is what removed it.
+    assert!(bind(source).contains("external struct Unwanted;"));
+}
+
+#[test]
+fn only_follows_member_parameter_return_and_generic_argument_types() {
+    let output = bind_only(
+        &["Root"],
+        "interface Root {\n\
+         \tfield: ByField;\n\
+         \ttake(value: ByParameter): ByReturn;\n\
+         \tlist(): Holder<ByArgument>;\n\
+         \thandler: (event: ByClosure) => void;\n\
+         }\n\
+         interface Holder<T> { value: T; }\n\
+         interface ByField { a: string; }\n\
+         interface ByParameter { a: string; }\n\
+         interface ByReturn { a: string; }\n\
+         interface ByArgument { a: string; }\n\
+         interface ByClosure { a: string; }\n\
+         interface Unreached { a: string; }",
+    );
+    for reached in [
+        "ByField",
+        "ByParameter",
+        "ByReturn",
+        "ByArgument",
+        "ByClosure",
+        "Holder",
+    ] {
+        assert!(
+            output.contains(&format!("external struct {reached}")),
+            "{reached} should be reachable\n{output}"
+        );
+    }
+    assert!(!output.contains("Unreached"), "{output}");
+}
+
+#[test]
+fn only_follows_an_inheritance_chain_without_emitting_the_bases_themselves() {
+    // `extends` is FLATTENED (a base's members are copied into the derived
+    // type), so a base's member TYPES are reachable — but the base's own name
+    // never appears in the output unless something else mentions it, and
+    // emitting it anyway would double the file for nothing.
+    let output = bind_only(
+        &["Leaf"],
+        "interface Base { root(): FromBase; }\n\
+         interface Middle extends Base { middle(): FromMiddle; }\n\
+         interface Leaf extends Middle { own: string; }\n\
+         interface FromBase { a: string; }\n\
+         interface FromMiddle { a: string; }",
+    );
+    assert!(output.contains("external struct Leaf;"), "{output}");
+    assert!(
+        output.contains("external fun root(self): FromBase;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("external fun middle(self): FromMiddle;"),
+        "{output}"
+    );
+    assert!(!output.contains("external struct Base;"), "{output}");
+    assert!(!output.contains("external struct Middle;"), "{output}");
+}
+
+#[test]
+fn only_terminates_on_a_cycle_and_keeps_both_ends() {
+    // The DOM's real shape: a `Node` has an `ownerDocument`, and a `Document`
+    // has a `documentElement` that is a `Node`. A worklist that did not mark
+    // visited declarations would not return from this.
+    let output = bind_only(
+        &["Node_"],
+        "interface Node_ { owner_document(): Document_; }\n\
+         interface Document_ { document_element(): Node_; }\n\
+         interface Detached { a: string; }",
+    );
+    assert!(output.contains("external struct Node_;"), "{output}");
+    assert!(output.contains("external struct Document_;"), "{output}");
+    assert!(!output.contains("Detached"), "{output}");
+    // Seeding from the other end of the cycle gives the same closure.
+    let reversed = bind_only(
+        &["Document_"],
+        "interface Node_ { owner_document(): Document_; }\n\
+         interface Document_ { document_element(): Node_; }\n\
+         interface Detached { a: string; }",
+    );
+    assert!(reversed.contains("external struct Node_;"), "{reversed}");
+    assert!(
+        reversed.contains("external struct Document_;"),
+        "{reversed}"
+    );
+}
+
+#[test]
+fn only_keeps_a_surviving_union_member_and_drops_an_erased_one() {
+    // Reachability is over what SURVIVES the mapping table, not over the
+    // TypeScript text. `T | null` binds as `T`, so `T` is reachable; an OPEN
+    // union widens to `any` and names nothing, which is the single rule that
+    // keeps a DOM-scale closure finite rather than "the whole file".
+    let output = bind_only(
+        &["Root"],
+        "interface Root { kept: Kept | null; widened: WidenedA | WidenedB; }\n\
+         interface Kept { a: string; }\n\
+         interface WidenedA { a: string; }\n\
+         interface WidenedB { a: string; }",
+    );
+    assert!(output.contains("external struct Kept;"), "{output}");
+    assert!(
+        output.contains("external fun kept(self): Kept;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("external fun widened(self): any;"),
+        "{output}"
+    );
+    assert!(!output.contains("external struct WidenedA;"), "{output}");
+    assert!(!output.contains("external struct WidenedB;"), "{output}");
+    // The closure's own gate: a filtered file that named a type it did not
+    // declare would not compile. Nothing softens that into a TODO, so this
+    // assertion is what a walk that pruned too hard would break.
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
+}
+
+#[test]
+fn only_carries_a_string_literal_union_enum_along_with_its_user() {
+    // The enum is a real declaration the emitted match-wrapper NAMES, so a
+    // closure that dropped it would produce a file that does not compile.
+    let output = bind_only(
+        &["Chart"],
+        "type Align = \"start\" | \"end\";\n\
+         type Unused = \"a\" | \"b\";\n\
+         interface Chart { setAlign(align: Align): void; }",
+    );
+    assert!(output.contains("enum Align {"), "{output}");
+    assert!(output.contains("Align::Start => \"start\","), "{output}");
+    assert!(!output.contains("Unused"), "{output}");
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
+}
+
+#[test]
+fn only_pulls_in_the_host_constructor_of_a_type_it_keeps() {
+    // A type's constructor is part of its surface: `--only Widget` that lost
+    // `declare var Widget` would emit a type nothing can build. The ALIASED
+    // constructor is the case that needs a real edge rather than a name match —
+    // `--only HTMLImageElement` has to find `declare var Image`.
+    let output = bind_only(
+        &["Picture"],
+        "interface Picture { src: string; }\n\
+         declare var Picture: { prototype: Picture; new(): Picture; };\n\
+         declare var Frame: { new(width?: number): Picture; };\n\
+         interface Other { a: string; }\n\
+         declare var Other: { prototype: Other; new(): Other; };",
+    );
+    assert!(output.contains("[extern(new, \"Picture\")]"), "{output}");
+    assert!(output.contains("[extern(new, \"Frame\")]"), "{output}");
+    assert!(!output.contains("Other"), "{output}");
+}
+
+#[test]
+fn only_naming_a_constructor_global_pulls_in_the_type_it_constructs() {
+    // The link runs both ways, or `--only Image` would emit a constructor
+    // returning a type the file never declares.
+    let output = bind_only(
+        &["Image"],
+        "interface HTMLImageElement { src: string; }\n\
+         declare var Image: { new(): HTMLImageElement; };",
+    );
+    assert!(
+        output.contains("external struct HTMLImageElement;"),
+        "{output}"
+    );
+    assert!(output.contains("[extern(new, \"Image\")]"), "{output}");
+}
+
+#[test]
+fn several_only_flags_compose_into_one_closure() {
+    let output = bind_only(
+        &["First", "Second"],
+        "interface First { a: FirstOnly; }\n\
+         interface Second { b: SecondOnly; }\n\
+         interface FirstOnly { a: string; }\n\
+         interface SecondOnly { a: string; }\n\
+         interface Neither { a: string; }",
+    );
+    for kept in ["First", "Second", "FirstOnly", "SecondOnly"] {
+        assert!(
+            output.contains(&format!("external struct {kept};")),
+            "{kept} should be kept\n{output}"
+        );
+    }
+    assert!(!output.contains("Neither"), "{output}");
+}
+
+#[test]
+fn only_keeps_every_overload_of_a_named_function() {
+    let output = bind_only(
+        &["parse"],
+        "declare function parse(source: string): string;\n\
+         declare function parse(source: number): string;\n\
+         declare function other(): void;",
+    );
+    assert!(
+        output.contains("external fun parse(source: str): str;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("1 additional overload(s) of `parse`"),
+        "{output}"
+    );
+    assert!(!output.contains("other"), "{output}");
+}
+
+#[test]
+fn an_only_name_the_file_never_declares_is_reported_rather_than_silently_empty() {
+    // A typo would otherwise write a file quietly missing what was asked for.
+    let generated = generate(
+        "interface Wanted { a: string; }",
+        &only_options(&["Wanted", "Typo"]),
+    );
+    assert_eq!(generated.unknown_only, vec!["Typo".to_string()]);
+    let clean = generate(
+        "interface Wanted { a: string; }",
+        &only_options(&["Wanted"]),
+    );
+    assert!(clean.unknown_only.is_empty());
+}
+
+#[test]
+fn a_filtered_file_says_so_in_its_header() {
+    let output = bind_only(&["Wanted"], "interface Wanted { a: string; }");
+    assert!(output.contains("Filtered to `--only Wanted`"), "{output}");
+    // …and an unfiltered one does not claim to be filtered.
+    assert!(!bind("interface Wanted { a: string; }").contains("Filtered to"));
+}
+
 #[test]
 fn conditional_and_mapped_types_are_diagnosed_at_the_point_of_use() {
     assert_emits(
@@ -632,6 +1172,7 @@ fn the_platform_flag_is_checked_against_the_languages_own_vocabulary() {
             Options {
                 platform: accepted.to_string(),
                 source_name: "x.d.ts".to_string(),
+                only: Vec::new(),
             }
             .validate()
             .is_ok(),
@@ -641,6 +1182,7 @@ fn the_platform_flag_is_checked_against_the_languages_own_vocabulary() {
     let rejected = Options {
         platform: "windows".to_string(),
         source_name: "x.d.ts".to_string(),
+        only: Vec::new(),
     };
     assert!(rejected.validate().is_err());
 }
@@ -766,23 +1308,49 @@ fn fixture_pairs() -> Vec<(PathBuf, PathBuf)> {
     pairs
 }
 
+/// How a fixture is generated. A sibling `<stem>.only` file, one name per line,
+/// makes it a `--only` fixture — so the FILTERED output is byte-pinned too,
+/// which is where a silent regression would otherwise hide (a closure that
+/// quietly starts keeping, or dropping, one more declaration).
+fn fixture_options(input: &Path) -> Options {
+    let only = std::fs::read_to_string(input.with_extension("").with_extension("only"))
+        .map(|text| {
+            text.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Options {
+        platform: "node".to_string(),
+        source_name: input.file_name().unwrap().to_string_lossy().into_owned(),
+        only,
+    }
+}
+
 #[test]
 fn every_fixture_matches_its_golden_byte_for_byte() {
     for (input, golden) in fixture_pairs() {
         let source = std::fs::read_to_string(&input).expect("read fixture");
-        let generated = generate(
-            &source,
-            &Options {
-                platform: "node".to_string(),
-                source_name: input.file_name().unwrap().to_string_lossy().into_owned(),
-            },
+        let options = fixture_options(&input);
+        let flags = options
+            .only
+            .iter()
+            .map(|name| format!(" --only {name}"))
+            .collect::<String>();
+        let generated = generate(&source, &options);
+        assert!(
+            generated.unknown_only.is_empty(),
+            "{} names declarations {} does not have: {:?}",
+            input.with_extension("").with_extension("only").display(),
+            input.display(),
+            generated.unknown_only
         );
         let expected = std::fs::read_to_string(&golden).unwrap_or_default();
         assert_eq!(
             generated.source,
             expected,
             "bindgen output changed for {}.\nRegenerate ONLY after confirming the new output is \
-             correct:\n  vilan bindgen {} --platform node --stdout > {}",
+             correct:\n  vilan bindgen {} --platform node{flags} --stdout > {}",
             input.display(),
             input.display(),
             golden.display()
@@ -797,8 +1365,9 @@ fn regenerating_the_same_input_is_byte_stable() {
     // derive from the input's own structure, not from traversal order.
     for (input, _) in fixture_pairs() {
         let source = std::fs::read_to_string(&input).expect("read fixture");
-        let first = generate(&source, &options()).source;
-        let second = generate(&source, &options()).source;
+        let options = fixture_options(&input);
+        let first = generate(&source, &options).source;
+        let second = generate(&source, &options).source;
         assert_eq!(first, second, "{} regenerated differently", input.display());
     }
 }
@@ -882,6 +1451,57 @@ fn a_vilan_enum_cannot_carry_a_string_backing_value() {
     );
     // The integer form is what the language actually has.
     assert!(compile("enum Ordering { Less = -1, Equal = 0 }\nfun main() {}\n").is_empty());
+}
+
+#[test]
+fn a_duplicate_function_name_is_rejected() {
+    // The LANGUAGE fact the collision renamer exists for, found while building
+    // E37(a) and pinned rather than left as folklore. It was pinned the other
+    // way round: two functions of one name in an `impl` were NOT a diagnostic
+    // — the analyzer accepted them and the LAST definition won, so a generated
+    // file that let a constructor object's static `json` collide with the
+    // instance `json` compiled clean while one of the two bindings simply did
+    // not exist. That is why bindgen emits both into one `impl` sharing one
+    // name table (`unique_name`) rather than into a second block of its own.
+    //
+    // B84 closed it, and this pin was WRITTEN to go red the day it did: the
+    // renamer is now a guard against a compile error rather than against a
+    // silent loss, which is the strictly better world the old comment
+    // predicted. bindgen's own emission is unchanged — `unique_name` already
+    // guaranteed it never produces a duplicate, which `every_golden_compiles`
+    // checks for every fixture.
+    assert!(
+        !compile(
+            "struct Box_ { value: i32 }\n\
+             impl Box_ {\n\
+             \tfun which(self): str { \"first\" }\n\
+             \tfun which(self): str { \"second\" }\n\
+             }\n\
+             fun main() {}\n",
+        )
+        .is_empty(),
+        "vilan accepts a same-block duplicate definition again"
+    );
+    // The cross-block direction, kept: B74 widened the duplicate-inherent
+    // error to statics, so the mixed static/method pair a second
+    // constructor-idiom `impl` would have produced is a hard error too. Both
+    // directions now agree, which is what makes the single-`impl` emission a
+    // hygiene choice rather than a workaround.
+    assert!(
+        !compile(
+            "external struct Reply;\n\
+             impl Reply {\n\
+             \t[extern(method, \"json\")]\n\
+             \texternal fun json(self): str;\n\
+             }\n\
+             impl Reply {\n\
+             \t[extern(\"Reply.json\")]\n\
+             \texternal fun json(data: str): Reply;\n\
+             }\n\
+             fun main() {}\n"
+        )
+        .is_empty()
+    );
 }
 
 #[test]

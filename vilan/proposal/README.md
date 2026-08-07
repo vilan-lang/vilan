@@ -83,6 +83,7 @@ is the historical record everything shipped gets moved into.
 | `split-comment-attachment.md` | shipped arc (2026-08-01, backlog B41) | Mid-construct comments attach to the split element they precede instead of orphaning below the statement. |
 | `ssr.md` | shipped arc (v1, 2026-07-23); open tail, see backlog A7 | Server-side rendering — render and replace, not hydration. |
 | `suite-speed.md` | shipped arc (audit + slices, 2026-08-02; two flakes closed 2026-08-04) | The measured test-suite speed profile and the slice list that reclaimed it (E21/E25–E30); §5 closes two load-dependent flakes, harness clocks and a fixed port (E32/E33). |
+| `top-level-await.md` | draft | Top-level await, the J3 design half — the shipped diagnostic is call-shaped, so module-level `await` already compiles and already miscompiles (Node classification, HMR thunk); recommends closing the hole rather than opening the feature. |
 | `transparent-references.md` | shipped arc (2026-06-21) | Implicit place / explicit value semantics for references. |
 | `transport-robustness.md` | shipped arc (2026-07-11) | Reconnect, backoff, and re-subscription for the transport layer (K6). |
 | `transport-rpc.md` | shipped arc (implemented, the whole arc) | The transport/RPC library's model and philosophy (roadmap P6). |
@@ -101,6 +102,7 @@ is the historical record everything shipped gets moved into.
 | `bindgen.md` | draft — awaiting review | Generate `external` bindings from TypeScript `.d.ts` headers via oxc (E31). |
 | `capture-clones.md` | shipped arc (2026-08-03) | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
+| `backed-enums.md` | draft — awaiting review | A variant carries the value the host speaks (`= "start"`) as a generalization of the integer discriminant (B76); the survey found three silent holes in the discriminant grammar it extends. |
 
 **Not yet in this directory, in flight:** `optimistic-lifecycle.md` (A14's
 remaining "optimistic-write → reconcile lifecycle" bullet) is drafted on the

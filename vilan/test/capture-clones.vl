@@ -23,8 +23,51 @@
 // and for a reason that is NOT about captures — `fallback` is a by-value
 // parameter the function hands back, which rule 1's return clause copies
 // (proposal/element-clones.md §3). B53 closed that leak for captures only.
+//
+// B81 adds the VIEWED subject, where the alias path's deferred read is not a
+// snapshot at all. `step` is it: `&mut self` is written through IN PLACE, so
+// both captures become real declarations beside the subject temp — the `i32`
+// one included, which owes no copy but does owe a READ, and so appears here
+// bare where every other declaration in this file carries `__clone`.
+// `viewed_guarded` is the guarded twin, whose guard reads a materialized
+// capture and therefore takes B59's prelude shape. `width` is the line the
+// rule stops at: nothing can be written through a `&` view, so its captures
+// keep their accessors and the share elision with them — an over-widening to
+// every view turns exactly this function's bytes red.
 import std::io::print;
 import std::option::Option::{ self, Some, None };
+
+enum Feed {
+	Ready(List<str>, i32),
+	Done,
+}
+
+impl Feed {
+	fun step(&mut self): str {
+		if self is Feed::Ready(let items, let at) {
+			self = Feed::Ready(items, at + 1);
+			ret items[at];
+		}
+		"-"
+	}
+
+	fun width(&self): i32 {
+		if self is Feed::Ready(let items, let at) {
+			ret items.len() + at;
+		}
+		0
+	}
+}
+
+fun viewed_guarded(pair: &mut (List<i32>, i32)): i32 {
+	match pair {
+		(let cells, let weight) if weight > 0 => {
+			pair.1 = 9;
+			cells.len() + weight
+		}
+		_ => 0,
+	}
+}
 
 fun sum_over(entries: List<(i32, i32)>): i32 {
 	mut total = 0;
@@ -109,4 +152,11 @@ fun main() {
 	let pair = ([1, 2], 3);
 	print(grow_first(pair));
 	print(pair.0.len());
+	mut feed = Feed::Ready(["a", "b", "c"], 0);
+	print(feed.step());
+	print(feed.step());
+	print(feed.width());
+	mut viewed = ([1, 2], 3);
+	print(viewed_guarded(&mut viewed));
+	print(viewed.1);
 }

@@ -17,6 +17,12 @@
 > gate is the owner's ruling on the `declare var` constructor idiom,
 > which v1's ratified §5 deliberately excluded. The design below stands
 > ready only if that ruling refuses the widening.
+>
+> CLOSED 2026-08-06: the ruling GRANTED the idiom, bindgen v2 shipped it,
+> and `examples/canvas` now draws through generated bindings (345 lines,
+> 11/11 declarations, one hand-written entry-point extern). A17 is closed;
+> nothing here will be hand-built. This document stays as the record of
+> the design that autogeneration made unnecessary.
 
 Ground truth for this proposal was gathered from the shipped browser layer
 (`std/src/browser/dom.vl`, `ui.vl`, `router.vl`, `dev.vl`), the external-struct

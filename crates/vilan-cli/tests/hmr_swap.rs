@@ -47,23 +47,26 @@ fn parse_port(line: &str) -> Option<u16> {
         .ok()
 }
 
-/// A plain HTTP GET against the dev channel, returning the response body bytes.
-fn http_get(port: u16, path: &str) -> Vec<u8> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("send GET");
+/// A plain HTTP GET against the dev channel, returning the response BODY — or
+/// `None` when no whole response arrived inside `timeout`.
+///
+/// A partial read is never handed back (E39). The caller tells bundle B from
+/// bundle A by inequality, and a truncated body differs from A exactly as a
+/// rebuilt one does, so a read cut short by a loaded machine would masquerade
+/// as a finished rebuild and hand the node harness half a bundle. The dev
+/// channel closes each connection after responding, so a complete read ends at
+/// EOF and the timeout is only ever reached by a stall.
+fn http_get(port: u16, path: &str, timeout: Duration) -> Option<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
     let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
+    stream.read_to_end(&mut response).ok()?;
     let separator = b"\r\n\r\n";
-    match response
+    let head_end = response
         .windows(separator.len())
-        .position(|window| window == separator)
-    {
-        Some(index) => response[index + separator.len()..].to_vec(),
-        None => response,
-    }
+        .position(|window| window == separator)?;
+    Some(response[head_end + separator.len()..].to_vec())
 }
 
 fn wait_for_file(path: &Path, deadline: Duration) -> bool {
@@ -75,6 +78,43 @@ fn wait_for_file(path: &Path, deadline: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+/// Waits (bounded) for a stdout line containing `needle`. The Node server leg's
+/// `print` output arrives here too — the child inherits the watcher's piped
+/// stdout — which is what makes "round 1 has finished" an observable EVENT
+/// rather than a guessed margin.
+fn wait_for_line(lines: &mpsc::Receiver<String>, needle: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains(needle) {
+                    return true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    false
+}
+
+/// Waits (bounded) for the dev channel's activation line, returning its port.
+fn wait_for_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u16> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if let Some(port) = parse_port(&line) {
+                    return Some(port);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    None
 }
 
 /// The client app (bundle A). Module bindings span every transfer form — a `mut`
@@ -351,32 +391,47 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
         .spawn()
         .expect("spawn run --watch");
 
+    // Every line, not just the port: the Node server leg inherits the watcher's
+    // stdout, so its boot marker arrives here and makes "round 1 has finished"
+    // an event this test can wait ON rather than wait OUT.
     let stdout = watcher.stdout.take().unwrap();
-    let (sender, receiver) = mpsc::channel();
+    let (sender, lines) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(port) = parse_port(&line) {
-                let _ = sender.send(port);
-            }
+            let _ = sender.send(line);
         }
     });
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let port = receiver
-            .recv_timeout(Duration::from_secs(20))
+        let port = wait_for_port(&lines, support::WATCH_LIVENESS)
             .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
-        let deadline = Duration::from_secs(20);
 
-        // Round 1: wait for dist, plus a margin so the watcher's baseline snapshot
-        // is taken before the edit (so the edit registers as a change).
+        // Round 1 is over once `dist/` has landed AND the server leg has printed
+        // its boot line. What stood here was a fixed 800 ms margin, "so the
+        // watcher's baseline snapshot is taken before the edit": that margin
+        // belonged to a watcher that snapshotted AFTER its first build, and E20
+        // moved the snapshot in front of the build precisely so an edit could no
+        // longer vanish into it — the margin has been paying for a fixed bug.
+        //
+        // Round 1 is also the measurement everything after it is budgeted from
+        // (E39): a full compile of both legs on this machine, under this load,
+        // timed rather than guessed. Its own wait is a liveness bound, because
+        // nothing here asserts how fast a compile is.
+        let round_one_started = Instant::now();
         assert!(
-            wait_for_file(&dir.join("dist/client.js"), deadline),
+            wait_for_file(&dir.join("dist/client.js"), support::WATCH_LIVENESS),
             "round 1 should have written dist/client.js"
         );
-        std::thread::sleep(Duration::from_millis(800));
+        assert!(
+            wait_for_line(&lines, "server up", support::WATCH_LIVENESS),
+            "round 1 should have booted the server leg"
+        );
+        let round_one = round_one_started.elapsed();
+        let budget = support::round_budget(round_one);
 
         // Bundle A: the instrumented client (shim + adopt/expose).
-        let bundle_a = http_get(port, "/bundle/client.js");
+        let bundle_a = http_get(port, "/bundle/client.js", budget)
+            .expect("the dev channel should serve bundle A whole");
         assert!(
             String::from_utf8_lossy(&bundle_a).contains("__hmr_adopt"),
             "bundle A should carry the S2a adopt instrumentation"
@@ -384,17 +439,22 @@ fn the_swap_protocol_carries_state_across_a_rebuilt_bundle() {
         std::fs::write(dir.join("bundleA.mjs"), &bundle_a).unwrap();
 
         // Edit the client → bundle B (cfg's type changes), then poll the served
-        // bundle until it differs from A.
+        // bundle until it differs from A. One round's worth of budget, measured
+        // off round 1: this rebuild compiles ONE leg where round 1 compiled two,
+        // so anything near that multiple is a watcher that stopped reacting.
         write(&dir, "src/client.vl", CLIENT_B);
         let start = Instant::now();
         let bundle_b = loop {
-            let current = http_get(port, "/bundle/client.js");
-            if current != bundle_a && current.contains(&b'{') {
+            if let Some(current) = http_get(port, "/bundle/client.js", budget)
+                && current != bundle_a
+                && current.contains(&b'{')
+            {
                 break current;
             }
             assert!(
-                start.elapsed() < deadline,
-                "the edited client should rebuild into a new bundle"
+                start.elapsed() < budget,
+                "the edited client should rebuild into a new bundle within {budget:?} \
+                 (round 1 itself took {round_one:?})"
             );
             std::thread::sleep(Duration::from_millis(200));
         };

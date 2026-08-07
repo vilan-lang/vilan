@@ -19,6 +19,9 @@ function hash(self) {
 function hash2(self) {
 	return __hash(self);
 }
+function eq(self, b) {
+	return self === b;
+}
 function $a() {
 	const table = new Map();
 	return [ table ];
@@ -36,8 +39,8 @@ function $e(self, key2) {
 	const $f = __map_get(self[0], hash(key2));
 	let $g = null;
 	if ($f[0] === 0) {
-		const entry = $f[1];
-		$g = [ 0, __clone(entry[1]) ];
+		const entry2 = $f[1];
+		$g = [ 0, __clone(entry2[1]) ];
 	} else {
 		$g = [ 1 ];
 	}
@@ -75,8 +78,8 @@ function $q(self, key2) {
 	const $r = __map_get(self[0], hash2(key2));
 	let $s = null;
 	if ($r[0] === 0) {
-		const entry = $r[1];
-		$s = [ 0, __clone(entry[1]) ];
+		const entry2 = $r[1];
+		$s = [ 0, __clone(entry2[1]) ];
 	} else {
 		$s = [ 1 ];
 	}
@@ -95,17 +98,28 @@ function $t(self, fallback) {
 }
 function $w(self) {
 	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[0]));
+	for (const entry2 of __map_values(self[0])) {
+		result.push(__clone(entry2[0]));
 	}
 	return result;
 }
 function $x(self) {
 	let result = [  ];
-	for (const entry of __map_values(self[0])) {
-		result.push(__clone(entry[1]));
+	for (const entry2 of __map_values(self[0])) {
+		result.push(__clone(entry2[1]));
 	}
 	return result;
+}
+function $y(self) {
+	return __map_values(self[0]);
+}
+function $z(self, value2) {
+	for (const entry2 of __map_values(self[0])) {
+		if (eq(entry2[1], value2)) {
+			return true;
+		}
+	}
+	return false;
 }
 let scores = $a();
 $b(scores, "alice", 1);
@@ -148,5 +162,18 @@ for (const value of $x(letters)) {
 }
 console.log(sum);
 console.log($w(letters).length);
+let entry_order = "";
+let entry_total = 0;
+for (const entry of $y(letters)) {
+	entry_order = entry_order + entry[0];
+	entry_total = entry_total + entry[1];
+}
+console.log(entry_order);
+console.log(entry_total);
+console.log($y(letters).length);
+console.log($z(letters, 20));
+console.log($z(letters, 99));
 let empty = $a();
 console.log($n(empty));
+console.log($y(empty).length);
+console.log($z(empty, 0));

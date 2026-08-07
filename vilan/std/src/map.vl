@@ -4,6 +4,7 @@
 // native map; the original key is stored alongside the value so `keys()`
 // returns real `K`s, and mutating the original afterward can't desync the map
 // (value semantics snapshot it on insert).
+import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ None, Some, self };
@@ -62,6 +63,30 @@ impl Map<type K: Hashable, type V> {
 			result.push(entry.1);
 		}
 		result
+	}
+
+	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the
+	/// paired counterpart to `keys()`/`values()`, for walking both together
+	/// without zipping two separate snapshots by hand:
+	/// `for entry in map.entries() { entry.0; entry.1 }`.
+	fun entries(self): List<(K, V)> {
+		self.table.values()
+	}
+}
+
+/// Split into its own bound impl block for the reason `compare.vl`'s `List`
+/// methods are (std-surface.md §1.1): `contains_value` needs `V: PartialEq`,
+/// a bound the unbounded `Map<type K: Hashable, type V>` block above cannot
+/// carry.
+impl Map<type K: Hashable, type V: PartialEq> {
+	/// Whether any stored value equals `value`. For a KEY, use `contains_key`.
+	fun contains_value(self, value: V): bool {
+		for entry in self.table.values() {
+			if entry.1.eq(value) {
+				ret true;
+			}
+		}
+		false
 	}
 }
 

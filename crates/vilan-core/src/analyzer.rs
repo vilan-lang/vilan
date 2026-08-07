@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 use crate::error::{Error, Note};
 use crate::id::Id;
 use crate::node::{
-    BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch, Node, NodeIfBranch,
-    NodeList, Pattern,
+    BinaryOp, Convention, Discriminant, ExternBinding, Func, GenericParameters, ImportBranch, Node,
+    NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -598,6 +598,12 @@ pub struct Struct<'src> {
     pub name_span: Span,
     pub generic_parameter_constraint_ids: Vec<TypeId>,
     pub fields: Vec<Field<'src>>,
+    /// Declared `external` (`docs/spec/types.md:47`): a host type, opaque —
+    /// its runtime representation belongs to JavaScript, not to vilan, so it
+    /// declares no fields and nothing may be assumed about its shape. An
+    /// ordinary struct, by contrast, IS its flat field array at runtime, which
+    /// is what makes a native `for...of` over one meaningless (B80).
+    pub external: bool,
     /// Declared `resource` (destruction.md §3): an explicitly-rooted owned
     /// resource. Containment then infers the class transitively — see
     /// `type_is_resource`.
@@ -728,6 +734,11 @@ struct PreppedIs<'src> {
 pub struct Implementation<'src> {
     pub subject: TypeId,
     pub declarations: IndexMap<&'src str, Id>,
+    /// Every member the block declared, in order, INCLUDING a name declared
+    /// twice (B84) — which `declarations`, being one entry per name, cannot
+    /// represent. The duplicate-inherent check reads this; everything that
+    /// asks "what does this type provide" reads `declarations`.
+    pub declared_members: Vec<(&'src str, Id)>,
     /// The traits this impl provides (`impl Point with Eq + Ord` -> [Eq, Ord]),
     /// resolved during the conformance check. Lets a method call on the subject
     /// fall back to a trait's inherited default methods.
@@ -786,6 +797,10 @@ pub struct Trait<'src> {
     /// The members the trait declares, keyed by name. For a required method
     /// without a default body these point at signature-only functions.
     pub declarations: IndexMap<&'src str, Id>,
+    /// The same members in declaration order, WITH repeats — the record a
+    /// same-block redeclaration survives on (B84). See
+    /// [`Implementation::declared_members`].
+    pub declared_members: Vec<(&'src str, Id)>,
     /// Supertraits (`trait Ord with Eq + PartialOrd`), as the type ids of the
     /// `with` clause. A type implementing this trait must also satisfy these,
     /// and their members are inherited for method resolution.
@@ -1192,6 +1207,16 @@ pub struct Scope<'src> {
     /// declaration, so map consumers (completions, emission order, the
     /// parent-scope memo) are untouched.
     pub local_value_declarations: IndexMap<&'src str, Vec<(usize, Id)>>,
+    /// Item declarations in walk order, EVERY one of them — where
+    /// `name_to_id_map` keeps only the last of a repeated name (B84). The map
+    /// is a lookup index and cannot hold two entries for one name, so reading
+    /// the declarations back off it silently lost a redeclaration before any
+    /// check could see it: two `fun which()` in one `impl` block were one
+    /// declaration by the time `collect_declarations` ran, and the
+    /// duplicate-inherent check (B57/B74) never had a pair to compare. The
+    /// same shape one block over — two `impl` blocks — was always a hard
+    /// error, because there the two live in different scopes.
+    pub declaration_order: Vec<(&'src str, Id)>,
 }
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, plus each
@@ -1500,6 +1525,14 @@ pub struct Analyzer<'src> {
     // For-each loops whose iterable is a custom iterator: the resolved `next`
     // method id, so codegen emits a `next()`/`Some`-matching loop instead.
     for_each_next: HashMap<Id, Id>,
+    // For-each loops → the type the iterable INFERRED to, by loop id. The
+    // transformer's native lowerings are chosen by that type, and it cannot
+    // recover it on its own: an iterable written as a parameter (`self` above
+    // all), a call, an `if`, a block, an `await` or a `*view` stores no type on
+    // its own expr id, so the emission-side lookup came back silent and the
+    // loop fell through to a bare `for...of` (B85). This is the same type the
+    // element and protocol decisions just above are made from, kept.
+    for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` / `for e in &list` — the loop binding is a view of each
     // element rather than a copy. Maps the binding id to whether the view is
     // writable (`&mut`). Drives the indexed-loop lowering + view classification.
@@ -2108,6 +2141,7 @@ impl<'src> Analyzer<'src> {
             untyped_comprehension_binders: HashSet::new(),
             prepped_for_each: Vec::new(),
             for_each_next: HashMap::new(),
+            for_each_iterable_types: HashMap::new(),
             for_each_views: HashMap::new(),
             wrapped_view_captures: HashMap::new(),
             prepped_binary_ops: Vec::new(),
@@ -2842,32 +2876,57 @@ impl<'src> Analyzer<'src> {
         // The substitution maps iterate in hash order — sort for deterministic
         // diagnostics, and dedup: one call can bind the same constraint along
         // several recorded routes.
-        errors.sort_by_key(|(span, msg, _)| (span.start, span.end, msg.clone()));
+        //
+        // The constraint is in the KEY, not just carried: the dedup collapses on
+        // span and message alone, and two DIFFERENT constraints can share both
+        // — `fun pair<A: Greet, B: Greet>(..)` called as `pair(1, 2)` reports
+        // 'i32' does not implement 'Greet' twice at the one call span, word for
+        // word. The survivor decides which declaration the note below points
+        // at, so without the constraint in the key that was a hash-order pick
+        // between `A` and `B` (16/14 over 30 cold analyses). Least id wins,
+        // which is the first-declared parameter.
+        errors.sort_by_key(|(span, msg, constraint_id)| {
+            (span.start, span.end, msg.clone(), constraint_id.0)
+        });
         errors
             .dedup_by(|(a_span, a_msg, _), (b_span, b_msg, _)| a_span == b_span && a_msg == b_msg);
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
+        //
+        // C1, the same discipline as the sort above: ONE constraint id can have
+        // SEVERAL registration entities, because `impl Subject<type T>`
+        // deliberately inherits the subject's id (`register_subject_binders`, the
+        // relation B77 found) — a user's `impl Set<type T>` is the same id as
+        // `set.vl`'s `struct Set<T: Hashable>`. A `.find()` over the entity map
+        // picked one at random, so WHICH FILE the note pointed at changed run to
+        // run. Take the LEAST entity id instead (B57's tie-break): ids are minted
+        // in walk order, so that is the earliest declaration — which is the one
+        // that actually WRITES the bound, the inheriting binders having only
+        // adopted it.
         let bound_declarations: Vec<(Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
             .map(|(span, msg, constraint_id)| {
-                let note = self
+                let declaration = self
                     .expr_id_to_expr_map
                     .iter()
-                    .find(|(_, expr)| {
+                    .filter(|(_, expr)| {
                         matches!(expr, Expr::Generic(declared) if *declared == constraint_id)
                     })
-                    .and_then(|(entity_id, _)| {
-                        let declaration_span = **self.span_map.get(entity_id)?;
-                        if declaration_span.into_range().is_empty() {
-                            return None;
-                        }
-                        Some(crate::error::Note {
-                            span: declaration_span,
-                            msg: "the bound is declared here".to_string(),
-                            source: self.source_of_id(*entity_id),
-                        })
-                    });
+                    .filter(|(entity_id, _)| {
+                        self.span_map
+                            .get(*entity_id)
+                            .is_some_and(|declaration_span| {
+                                !declaration_span.into_range().is_empty()
+                            })
+                    })
+                    .map(|(entity_id, _)| *entity_id)
+                    .min_by_key(|entity_id| entity_id.0);
+                let note = declaration.map(|entity_id| crate::error::Note {
+                    span: **self.span_map.get(&entity_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: "the bound is declared here".to_string(),
+                    source: self.source_of_id(entity_id),
+                });
                 (span, msg, note)
             })
             .collect();
@@ -3478,12 +3537,33 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Duplicate inherent members (B57, `proposal/method-resolution.md` §3/§4):
-    /// two impls that declare the same method name for the same subject, with
-    /// neither name belonging to a trait, leave one of the two declarations
-    /// dead — and which one dies is decided by the order the modules happened
-    /// to load in. Precedence cannot rank them (they are both the type's own),
-    /// so this is a definition-site error, like Rust's E0592: it does not wait
-    /// for a call site to observe it.
+    /// two impls that declare the same name for the same subject, with neither
+    /// name belonging to a trait, leave one of the two declarations dead — and
+    /// which one dies is decided by the order the modules happened to load in.
+    /// Precedence cannot rank them (they are both the type's own), so this is a
+    /// definition-site error, like Rust's E0592: it does not wait for a call
+    /// site to observe it.
+    ///
+    /// **Receiver position is not part of the identity (B74).** An impl's
+    /// `declarations` is one map keyed by name, so a subject has ONE surface: a
+    /// static `fun new()` and a method `fun new(self)` cannot both be reached,
+    /// and today the static is the one that dies — `Bag::new()` resolves the
+    /// inherent method first and then fails on arity, which is a confusing
+    /// report of a declaration that was never reachable. So every inherent
+    /// declaration competes, whatever its receiver. The original check filtered
+    /// `is_self_method` for B57's scope; that filter was doing double duty as
+    /// "methods only" and "same namespace only", and only the first was meant.
+    ///
+    /// **The block boundary is not part of the identity either (B84).** The
+    /// check reads each impl's `declared_members` — the ordered record of what
+    /// the block declared — rather than its `declarations` surface. Reading
+    /// the surface could never see a redeclaration, because a surface is one
+    /// entry per name: two `fun which()` in ONE block overwrote each other in
+    /// the scope map long before `collect_declarations` ran, so the pair the
+    /// check compares never existed and the program compiled to the second
+    /// definition in silence. The same two declarations one block apart were
+    /// always a hard error — nothing about the rule differed, only whether the
+    /// second declaration had survived to be counted.
     ///
     /// A definition-site check, so it joins the family that skips frozen std
     /// entities (S1): a duplicate whose second declaration is std's own is
@@ -3491,60 +3571,133 @@ impl<'src> Analyzer<'src> {
     fn check_duplicate_inherent_members(&mut self) {
         // Group by member name first — only same-named declarations can
         // collide, and the pairwise subject comparison is the expensive half.
-        let mut by_name: IndexMap<&'src str, Vec<usize>> = IndexMap::new();
+        // An impl contributes one entry per DECLARATION, so a block that
+        // declares a name twice appears twice.
+        let mut by_name: IndexMap<&'src str, Vec<(usize, Id)>> = IndexMap::new();
         for (index, implementation) in self.implementations.iter().enumerate() {
-            for name in implementation.declarations.keys() {
-                by_name.entry(name).or_default().push(index);
+            for (name, member_id) in &implementation.declared_members {
+                by_name.entry(name).or_default().push((index, *member_id));
             }
         }
         // (member name, first declaration, second declaration, subject).
         let mut duplicates: Vec<(&'src str, Id, Id, TypeId)> = Vec::new();
-        for (member_name, implementation_indices) in &by_name {
-            if implementation_indices.len() < 2 {
+        for (member_name, declarations) in &by_name {
+            if declarations.len() < 2 {
                 continue;
             }
             // Only inherent declarations compete. A trait's member is RANKED
             // against the type's own, not duplicated (§3), and a `[trait_only]`
-            // one never reaches the type's surface at all.
-            let mut inherent: Vec<(Id, TypeId)> = implementation_indices
+            // one never reaches the type's surface at all. Both tests read the
+            // trait's declaration map directly, so they home a trait's STATIC
+            // (`Default::default`, `Wire::rebuild`) exactly as they home a
+            // method — which is what keeps two impls of one trait from
+            // colliding here now that statics compete.
+            let mut inherent: Vec<(usize, Id, TypeId)> = declarations
                 .iter()
-                .filter_map(|index| {
+                .filter_map(|(index, member_id)| {
                     let implementation = &self.implementations[*index];
-                    let member_id = *implementation.declarations.get(member_name)?;
-                    (self.is_self_method(member_id)
-                        && self
-                            .member_home_trait(implementation, member_name)
-                            .is_none()
+                    (self
+                        .member_home_trait(implementation, member_name)
+                        .is_none()
                         && !self.member_is_trait_only(implementation, member_name))
-                    .then_some((member_id, implementation.subject))
+                    .then_some((*index, *member_id, implementation.subject))
                 })
                 .collect();
             if inherent.len() < 2 {
                 continue;
             }
-            inherent.sort_by_key(|(member_id, _)| self.declaration_order(*member_id));
+            inherent.sort_by_key(|(_, member_id, _)| self.declaration_order(*member_id));
             // Each later declaration is reported against the FIRST subject-
             // compatible one before it, so three copies produce two errors,
-            // each naming the original.
-            for (position, (member_id, subject)) in inherent.iter().enumerate() {
+            // each naming the original. A pair from the SAME block is the block
+            // rule's, already reported by `check_duplicate_block_members`.
+            for (position, (index, member_id, subject)) in inherent.iter().enumerate() {
                 let subject_type = subject.get_type(self);
-                let earlier = inherent[..position].iter().find(|(_, earlier_subject)| {
-                    self.compare_type(
-                        &subject_type,
-                        &earlier_subject.get_type(self),
-                        &HashMap::new(),
-                    )
-                });
-                if let Some((earlier_id, _)) = earlier {
+                let earlier = inherent[..position]
+                    .iter()
+                    .filter(|(earlier_index, _, _)| earlier_index != index)
+                    .find(|(_, _, earlier_subject)| {
+                        self.compare_type(
+                            &subject_type,
+                            &earlier_subject.get_type(self),
+                            &HashMap::new(),
+                        )
+                    });
+                if let Some((_, earlier_id, _)) = earlier {
                     duplicates.push((member_name, *earlier_id, *member_id, *subject));
                 }
             }
         }
-        for (member_name, first_id, second_id, subject) in duplicates {
+        let duplicates = duplicates
+            .into_iter()
+            .map(|(member_name, first_id, second_id, subject)| {
+                let subject_label =
+                    self.pretty_print_type(&subject.get_type(self), &HashMap::new());
+                (member_name, first_id, second_id, subject_label)
+            })
+            .collect();
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// **One block may declare a name once (B84).** Two `fun which()` in one
+    /// `impl` used to overwrite each other in the scope map, so the program
+    /// compiled to the second definition and the first simply did not exist —
+    /// the same two declarations one block apart having always been a hard
+    /// error.
+    ///
+    /// Separate from the inherent check above because it is a separate rule
+    /// with a separate scope, not a case of that one. The inherent rule ranks
+    /// TWO BLOCKS competing for one surface, and deliberately exempts a
+    /// trait-provided name (§3: ranked, not duplicated) so that two impls of
+    /// one trait — the platform twins, §9(6) — stay legal. Neither
+    /// justification reaches inside a single block: there is no second impl to
+    /// be a twin of, and a name the block declares twice is a mistake whatever
+    /// trait homes it. So this one asks only "was it written twice here", and
+    /// the inherent check skips a same-block pair rather than reporting it a
+    /// second time.
+    fn check_duplicate_block_members(&mut self) {
+        let mut duplicates: Vec<(&'src str, Id, Id, String)> = Vec::new();
+        let blocks = self
+            .implementations
+            .iter()
+            .map(|implementation| {
+                (
+                    implementation.declared_members.clone(),
+                    self.pretty_print_type(&implementation.subject.get_type(self), &HashMap::new()),
+                )
+            })
+            .chain(self.traits.values().map(|trait_| {
+                (
+                    trait_.declared_members.clone(),
+                    format!("trait {}", trait_.name),
+                )
+            }))
+            .collect::<Vec<_>>();
+        for (declared_members, subject_label) in blocks {
+            // First declaration per name; every later one is reported against
+            // it, so three copies produce two errors.
+            let mut first_by_name: IndexMap<&'src str, Id> = IndexMap::new();
+            for (member_name, member_id) in declared_members {
+                match first_by_name.get(member_name) {
+                    Some(first_id) => {
+                        duplicates.push((member_name, *first_id, member_id, subject_label.clone()))
+                    }
+                    None => {
+                        first_by_name.insert(member_name, member_id);
+                    }
+                }
+            }
+        }
+        self.report_duplicate_declarations(duplicates);
+    }
+
+    /// The shared reporting half of the two duplicate-declaration rules:
+    /// `(member name, first declaration, second declaration, subject label)`.
+    fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
+        for (member_name, first_id, second_id, subject_label) in duplicates {
             if self.frozen_entity(second_id) {
                 continue;
             }
-            let subject_label = self.pretty_print_type(&subject.get_type(self), &HashMap::new());
             // C3: the FIRST declaration is the whole point of the message —
             // "already defined" is unactionable without saying where. The note
             // carries its own source, so it renders even across files (the
@@ -4232,6 +4385,21 @@ impl<'src> Analyzer<'src> {
             .copied()
             .zip(arguments.iter().copied())
             .collect()
+    }
+
+    /// The declared generic-parameter constraint ids of the struct or enum with
+    /// this id, in order — the left-hand side of an [`instantiation_context`]
+    /// built against a `Type::Struct(id, arguments)` / `Type::Enum(id,
+    /// arguments)`. Empty for an unparameterized or unknown subject, which makes
+    /// the substitution a no-op rather than a special case.
+    fn declared_parameter_constraint_ids(&self, subject_id: Id) -> Vec<TypeId> {
+        if let Some(struct_) = self.structs.get(&subject_id) {
+            return struct_.generic_parameter_constraint_ids.clone();
+        }
+        if let Some(enum_) = self.enums.get(&subject_id) {
+            return enum_.generic_parameter_constraint_ids.clone();
+        }
+        Vec::new()
     }
 
     /// Whether any member (substituted through `context`) is a resource. Returns
@@ -6245,7 +6413,8 @@ impl<'src> Analyzer<'src> {
         // An overwrite (R2) drops the binding's OLD value in place — the same
         // binding type. Seed those too, in case the binding is overwritten but
         // later moved out (so it is not in `dropped_bindings`).
-        let overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        let mut overwrites: Vec<Id> = self.overwrite_drops.iter().copied().collect();
+        overwrites.sort_unstable_by_key(|assignment_id| assignment_id.0);
         for assignment_id in overwrites {
             if let Some(Expr::Assignment(target_id, _)) =
                 self.expr_id_to_expr_map.get(&assignment_id)
@@ -6312,6 +6481,15 @@ impl<'src> Analyzer<'src> {
                     worklist.extend(glue.members.member_type_ids());
                 }
             }
+            // The seed types and the glue's members are both HashSet-ordered,
+            // so this list arrived in hash order — and it is an EDGE LIST that
+            // `platform_color` walks in order under a `visited` once-guard,
+            // which quotes the TRAIL that reached a boundary. Two drop impls
+            // meeting below the same off-platform callee would therefore have
+            // named different chains in the same diagnostic. Order is carried
+            // by nothing here (every successor is walked), so canonical id
+            // order is free.
+            methods.sort_unstable_by_key(|method| method.0);
             if !methods.is_empty() {
                 edges.insert(root, methods);
             }
@@ -8978,6 +9156,35 @@ impl<'src> Analyzer<'src> {
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<ImplMemberCandidate> {
+        // A `[trait_only]` trait method never resolves on the concrete type's
+        // own surface — only through a trait bound (§3.2). An inherent impl has
+        // no trait ids, so a type's *own* method with the same name stays
+        // reachable (the collision-safety point).
+        self.impl_member_candidates(subject_type, member_name, true, false)
+    }
+
+    /// The candidates a `Type::member` path head reaches (B83). It is a
+    /// SUPERSET of the method candidates in two ways, both matching what the
+    /// static accessor has always scanned: a declaration with no `self`
+    /// receiver qualifies (that is the whole point — `Bag::new()`), and a
+    /// `[trait_only]` member is reachable when the path head IS the trait
+    /// (access on the trait itself stays allowed, §3.2).
+    fn static_path_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        subject_is_trait: bool,
+    ) -> Vec<ImplMemberCandidate> {
+        self.impl_member_candidates(subject_type, member_name, false, subject_is_trait)
+    }
+
+    fn impl_member_candidates(
+        &self,
+        subject_type: &Type,
+        member_name: &str,
+        methods_only: bool,
+        allow_trait_only: bool,
+    ) -> Vec<ImplMemberCandidate> {
         let mut candidates: Vec<ImplMemberCandidate> = self
             .implementations
             .iter()
@@ -8989,18 +9196,14 @@ impl<'src> Analyzer<'src> {
                 )
             })
             .filter_map(|implementation| {
-                // A `[trait_only]` trait method never resolves on the concrete
-                // type's own surface — only through a trait bound (§3.2). An
-                // inherent impl has no trait ids, so a type's *own* method with
-                // the same name stays reachable (the collision-safety point).
-                if self.member_is_trait_only(implementation, member_name) {
+                if !allow_trait_only && self.member_is_trait_only(implementation, member_name) {
                     return None;
                 }
                 let member_id = implementation
                     .declarations
                     .get(member_name)
                     .copied()
-                    .filter(|member_id| self.is_self_method(*member_id))?;
+                    .filter(|member_id| !methods_only || self.is_self_method(*member_id))?;
                 Some(ImplMemberCandidate {
                     member_id,
                     impl_subject: implementation.subject,
@@ -9019,7 +9222,13 @@ impl<'src> Analyzer<'src> {
     /// member above them is an ambiguity the call has to resolve by naming one
     /// (`Trait::member(receiver)`).
     fn resolve_impl_member(&self, subject_type: &Type, member_name: &str) -> ImplMemberResolution {
-        let candidates = self.method_member_candidates(subject_type, member_name);
+        self.rank_member_candidates(self.method_member_candidates(subject_type, member_name))
+    }
+
+    /// The tiering itself, over an already-collected candidate list — shared by
+    /// `receiver.member()` and `Type::member()` (B83), which ranked by
+    /// registration order alone until the static path got this.
+    fn rank_member_candidates(&self, candidates: Vec<ImplMemberCandidate>) -> ImplMemberResolution {
         // Tier 1: inherent. Two inherent declarations for one subject are a
         // definition-site error (`check_duplicate_inherent_members`); resolution
         // still takes the first in the deterministic order, so that one error
@@ -9623,6 +9832,16 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Registers an ITEM declaration into a scope: the `name_to_id_map` entry
+    /// (the lookup index, last declaration wins) plus the ordered record of
+    /// every declaration, which is what a redeclaration needs to survive on
+    /// (B84). The value twin is [`Analyzer::declare_scope_value`].
+    fn declare_scope_item(&mut self, scope_id: Id, name: &'src str, id: Id) {
+        let scope = self.mut_scope_for_scope_id(scope_id);
+        scope.name_to_id_map.insert(name, id);
+        scope.declaration_order.push((name, id));
+    }
+
     fn get_scope_id_for_entity(&mut self, entity_id: Id) -> Id {
         self.expr_id_to_scope_id_map
             .get(&entity_id)
@@ -9638,6 +9857,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         }
     }
 
@@ -9721,8 +9941,7 @@ impl<'src> Analyzer<'src> {
             else {
                 return;
             };
-            let scope = analyzer.mut_scope_for_scope_id(module_scope_id);
-            scope.name_to_id_map.insert(name, id);
+            analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
             Node::Export(inner)
@@ -9766,6 +9985,7 @@ impl<'src> Analyzer<'src> {
             name_to_id_map: IndexMap::new(),
             macro_name_to_id: IndexMap::new(),
             local_value_declarations: IndexMap::new(),
+            declaration_order: Vec::new(),
         };
         self.scopes.insert(id, scope);
         self.scopes.get_mut(&id).unwrap()
@@ -9930,6 +10150,27 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// Whether a pattern's subject names existing storage, so its captures bind
+    /// pieces of something with another owner — [`Self::is_place_expr`] plus
+    /// **`*view`**.
+    ///
+    /// B81: a dereference is a place by every test that matters here
+    /// ([`Self::place_root`] and [`Self::readonly_root`] both walk through it),
+    /// and `*v is Some(let x)` reads the borrowed storage exactly as `v.field`
+    /// does — but `is_place_expr` excludes it, so the whole capture pass
+    /// skipped that spelling and its captures aliased outright, the aggregate
+    /// ones included. `is_place_expr` itself stays as it is: rule 2's binding
+    /// pass reads it against rule 3 (`assignment_target_is_view` — a view
+    /// forwarded stays the same view, on purpose), which is a different
+    /// question from the one a pattern subject asks.
+    fn is_capture_subject_place(&self, expr_id: Id) -> bool {
+        self.is_place_expr(expr_id)
+            || matches!(
+                self.expr_id_to_expr_map.get(&expr_id),
+                Some(Expr::Dereference(_))
+            )
+    }
+
     /// The "declare it …" clause for an immutable-root diagnostic, from
     /// [`Self::readonly_root`]'s fix marker. A plain parameter offers BOTH
     /// spellings — `mut` (this function's copy) and `&mut` (the caller's
@@ -10069,6 +10310,35 @@ impl<'src> Analyzer<'src> {
             && !written_roots.contains(&root)
     }
 
+    /// B81: whether a pattern's subject is rooted in a WRITABLE view — a `&mut`
+    /// parameter (`&mut self` included), or a local bound to a `&mut` view.
+    ///
+    /// This is the question the alias path's accessor substitution turns on.
+    /// That path records each capture as an accessor into the subject temp and
+    /// re-reads it at every reference, which is faithful only while the temp is
+    /// a stable snapshot of the subject's VALUE. Against an owned place it is:
+    /// a write to a place REBINDS it (`feed = Feed::Ready(..)` installs a fresh
+    /// aggregate and the temp keeps the old one). Through a view it is not — a
+    /// write through a view is an in-place mutation of the very object the temp
+    /// aliases, because that is how the write reaches the caller — so every
+    /// deferred read in the leg observes POST-write state. Captures of such a
+    /// subject must therefore be read once, at the match
+    /// ([`Program::materialized_captures`]).
+    ///
+    /// Writability is the whole of it: nothing can be written through a `&`
+    /// view, so its temp is a snapshot again and its captures keep the accessor
+    /// (and the SHARE elision that rides on it — the two sets are disjoint,
+    /// since `share_subject_is_stable` admits no writable-view root).
+    fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        let Some(root) = self.place_root(subject_id) else {
+            return false;
+        };
+        if let Some(parameter) = self.parameters.get(&root) {
+            return parameter.convention == Convention::RefMut;
+        }
+        self.view_binding_mutability(root) == Some(true)
+    }
+
     /// Whether a binding holds a view, and if so whether it is writable: `&mut`
     /// → `Some(true)`, `&` → `Some(false)`, an owned value → `None`. Follows
     /// copies between locals (`let w = v`) iteratively with a seen-set: a
@@ -10168,7 +10438,7 @@ impl<'src> Analyzer<'src> {
     /// to codegen (so the migration off `*` is byte-identical). Runs after
     /// `infer_borrows`, so `borrows`-call targets are recognized.
     fn rewrite_view_assignment_targets(&mut self) {
-        let assignments: Vec<(Id, Id, Id)> = self
+        let mut assignments: Vec<(Id, Id, Id)> = self
             .expr_id_to_expr_map
             .iter()
             .filter_map(|(id, expr)| match expr {
@@ -10176,6 +10446,16 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             .collect();
+        // The loop MINTS entity ids (`wrap_in_deref`), so a hash-ordered walk
+        // does not merely visit the assignments in an arbitrary order — it
+        // hands each synthetic `Dereference` a different id every run. Nothing
+        // downstream reads those ids in a way that reaches an emitted byte or a
+        // diagnostic today (measured: 20 cold compiles permute all 26 ids and
+        // produce one emission and one diagnostic list), but several passes do
+        // order and tie-break on `Id.0`, so leaving the mint order to a hash
+        // seed is a trap set for whichever of them starts to. Assignment ids
+        // are themselves walk order, so this is source order.
+        assignments.sort_unstable_by_key(|(assignment_id, _, _)| assignment_id.0);
         for (assignment_id, target_id, value_id) in assignments {
             // The target: a bare view writes *through*, so deref it.
             if !matches!(
@@ -13463,12 +13743,11 @@ impl<'src> Analyzer<'src> {
     /// elements have no other owner. Fixed-array patterns keep their
     /// existing unconditional per-element clone.
     ///
-    /// Returns the copy sites (keyed by how the copy is decided — see
-    /// [`CopyDecision`]) and the SHARED captures, the ones the share elision
-    /// left aliasing their subject. The second set is not codegen's business:
-    /// it is what rule 2's move elision must refuse to move out of, so this
-    /// pass runs BEFORE `compute_clone_sites`.
-    fn compute_capture_clone_sites(&mut self) -> (HashMap<Id, CopyDecision>, HashSet<Id>) {
+    /// Returns a [`CapturePlan`]: the copy sites, the SHARED captures, and
+    /// B81's materialized ones. `shared` is not codegen's business — it is what
+    /// rule 2's move elision must refuse to move out of, so this pass runs
+    /// BEFORE `compute_clone_sites`.
+    fn compute_capture_clone_sites(&mut self) -> CapturePlan {
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -13480,7 +13759,7 @@ impl<'src> Analyzer<'src> {
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::Destructure(value_id, pattern) => {
-                    if self.is_place_expr(*value_id) {
+                    if self.is_capture_subject_place(*value_id) {
                         let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *value_id)));
@@ -13489,7 +13768,7 @@ impl<'src> Analyzer<'src> {
                 Expr::Match(subject_id, legs) => {
                     for leg in legs {
                         self.insert_seam_roots(leg.body, &mut seam_roots);
-                        if self.is_place_expr(*subject_id) {
+                        if self.is_capture_subject_place(*subject_id) {
                             let mut captures = Vec::new();
                             Self::collect_pattern_captures(&leg.pattern, &mut captures);
                             candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
@@ -13497,7 +13776,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 Expr::Is(subject_id, pattern) => {
-                    if self.is_place_expr(*subject_id) {
+                    if self.is_capture_subject_place(*subject_id) {
                         let mut captures = Vec::new();
                         Self::collect_pattern_captures(pattern, &mut captures);
                         candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
@@ -13540,6 +13819,7 @@ impl<'src> Analyzer<'src> {
         let written_roots = self.collect_written_roots();
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
         let mut shared: HashSet<Id> = HashSet::new();
+        let mut materialized: HashSet<Id> = HashSet::new();
         for (capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
                 .variables
@@ -13548,6 +13828,16 @@ impl<'src> Analyzer<'src> {
             else {
                 continue;
             };
+            // B81, and asked FIRST because it is orthogonal to every filter
+            // below: whether a capture must be READ at the match is settled by
+            // the subject alone, where whether it must be COPIED is settled by
+            // its own type. A scalar owes no copy and a resource is forbidden
+            // one, yet both read the wrong slot when a write through the
+            // subject's view mutates it in place mid-leg
+            // ([`Self::subject_is_writable_view`]).
+            if self.subject_is_writable_view(subject_id) {
+                materialized.insert(capture_id);
+            }
             let capture_type = type_id.get_type(self);
             // A bare `T` is admitted without knowing whether it is an
             // aggregate — `__clone` is identity on scalars, so the
@@ -13592,7 +13882,11 @@ impl<'src> Analyzer<'src> {
                 sites.insert(capture_id, copy);
             }
         }
-        (sites, shared)
+        CapturePlan {
+            sites,
+            shared,
+            materialized,
+        }
     }
 
     /// The generic constraints whose binding to a resource type would make
@@ -14054,6 +14348,37 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// Whether `constraint_id` names a generic parameter declared by a scope
+    /// ENCLOSING `scope_id` — a function's own `<T>`, an impl's binder, or a
+    /// trait's parameter seen from inside a default body. Such a parameter is
+    /// abstract at this site by construction: the declaration is checked once
+    /// for all of its instantiations, so nothing downstream can make it
+    /// concrete. A generic that is *not* enclosing arrived from somewhere else
+    /// and means only "not substituted yet" (B82).
+    ///
+    /// The lookup is by name through the scope chain and stops at the first
+    /// binding of that name, so a nearer parameter shadowing this one answers
+    /// `false` — the conservative direction.
+    fn generic_declared_by_enclosing_scope(&self, constraint_id: TypeId, scope_id: Id) -> bool {
+        let Some(name) = self.generic_constraint_names.get(&constraint_id).copied() else {
+            return false;
+        };
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let Some(scope) = self.scopes.get(&id) else {
+                return false;
+            };
+            if let Some(entity_id) = scope.name_to_id_map.get(name).copied() {
+                return matches!(
+                    self.expr_id_to_expr_map.get(&entity_id),
+                    Some(Expr::Generic(found)) if *found == constraint_id
+                );
+            }
+            current = scope.parent_id;
+        }
+        false
+    }
+
     /// Walks the optional generic parameters of a declaration into `scope_id`,
     /// registering each as a `Generic` type bound by its constraint, and
     /// returns the constraint type ids in declaration order.
@@ -14335,22 +14660,27 @@ impl<'src> Analyzer<'src> {
         scope.name_to_id_map.insert(name, expr_id);
     }
 
-    /// Collects the named members declared in a trait/impl body scope,
-    /// excluding the implicit `Self` binding and generic parameters.
-    fn collect_declarations(&self, scope_id: Id) -> IndexMap<&'src str, Id> {
+    /// The members declared in a trait/impl body scope, in declaration order
+    /// and WITH repeats, excluding the implicit `Self` binding and generic
+    /// parameters. Collecting it into an `IndexMap` gives the SURFACE the type
+    /// presents — one entry per name, the last declaration winning — and the
+    /// difference between the two is exactly what the duplicate check needs
+    /// (B84): reading the surface back could never see a redeclaration,
+    /// because a redeclaration is precisely what a surface does not have.
+    fn collect_declared_members(&self, scope_id: Id) -> Vec<(&'src str, Id)> {
         self.scopes
             .get(&scope_id)
             .unwrap()
-            .name_to_id_map
+            .declaration_order
             .iter()
             .filter(|(name, expr_id)| {
-                **name != "Self"
+                *name != "Self"
                     && !matches!(
-                        self.expr_id_to_expr_map.get(*expr_id),
+                        self.expr_id_to_expr_map.get(expr_id),
                         Some(Expr::Generic(_))
                     )
             })
-            .map(|(name, expr_id)| (*name, *expr_id))
+            .copied()
             .collect()
     }
 
@@ -14383,6 +14713,112 @@ impl<'src> Analyzer<'src> {
                 .to_string(),
         });
         0
+    }
+
+    /// The value of an explicit enum discriminant, or `None` with a diagnostic
+    /// when the literal is not the integer the grammar means (B79).
+    ///
+    /// The parser used to reduce this itself, with `.parse::<i64>()
+    /// .unwrap_or(0)` over the number token's WHOLE part alone — which quietly
+    /// accepted three spellings it does not mean: a fraction (`= 1.5` became
+    /// `1`), a type suffix (`= 1u32` became `1`, and `= 1_000` lexes as `1`
+    /// with the suffix `_000`), and a magnitude past `i64` (which became `0`,
+    /// a perfectly ordinary discriminant a sibling may legitimately hold —
+    /// routing an overflow straight into the duplicate hole). Hex is read the
+    /// way every other integer literal in the language is read
+    /// (`0x` + radix 16), not left to fail `parse` into `0`.
+    ///
+    /// The message deliberately states the rule as it stands rather than as a
+    /// permanent one: `proposal/backed-enums.md` is a live proposal to widen
+    /// the production to string backings, and this diagnostic must not
+    /// foreclose it.
+    fn discriminant_value(&mut self, written: &Discriminant<'src>) -> Option<i64> {
+        let mut reject = |msg: String| {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg,
+            });
+            None::<i64>
+        };
+        if written.fraction.is_some() {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` is not"
+            ));
+        }
+        if let Some(suffix) = written.suffix {
+            return reject(format!(
+                "an enum discriminant must be an integer, and `{written}` carries the trailer \
+                 `{suffix}`; write the bare number"
+            ));
+        }
+        let magnitude = match written.whole.strip_prefix("0x") {
+            Some(hex) => u128::from_str_radix(hex, 16),
+            None => written.whole.parse::<u128>(),
+        };
+        // A negative discriminant reaches one past the positive bound, exactly
+        // as the literal `-9223372036854775808` does elsewhere: the minus is
+        // applied to the magnitude, not parsed into it.
+        let bound = if written.negative {
+            1u128 << 63
+        } else {
+            (1u128 << 63) - 1
+        };
+        match magnitude {
+            Ok(magnitude) if magnitude <= bound => Some(match written.negative {
+                true => (magnitude as i64).wrapping_neg(),
+                false => magnitude as i64,
+            }),
+            _ => reject(format!(
+                "the enum discriminant `{written}` is out of range \
+                 (-9223372036854775808 ..= 9223372036854775807)"
+            )),
+        }
+    }
+
+    /// B79's placement rule: an explicit discriminant only means anything when
+    /// EVERY variant is data-less. `is_numeric` is a conjunction — all-data-less
+    /// AND any-explicit-discriminant — so one payload variant flips the whole
+    /// enum to the tagged `[index, ..data]` form and every discriminant in it
+    /// becomes inert. It parsed, it was stored, and nothing will ever read it.
+    ///
+    /// Two shapes, two messages: the discriminant sits on the payload variant
+    /// itself, or on a data-less sibling of one. `proposal/backed-enums.md`
+    /// §3.3 designs the same rule for string backings, so closing it here is
+    /// the integer half of one rule rather than a rule of its own.
+    fn check_discriminant_placement(
+        &mut self,
+        variant_name: &'src str,
+        written: &Discriminant<'src>,
+        has_payload: bool,
+        first_payload_variant: Option<(&'src str, Span)>,
+    ) {
+        if has_payload {
+            self.diagnostics.push(Error {
+                note: None,
+                span: written.span,
+                msg: format!(
+                    "variant '{variant_name}' carries a payload, so it cannot have an explicit \
+                     discriminant"
+                ),
+            });
+            return;
+        }
+        let Some((payload_variant, payload_span)) = first_payload_variant else {
+            return;
+        };
+        self.diagnostics.push(Error {
+            note: Some(crate::error::Note {
+                span: payload_span,
+                msg: format!("'{payload_variant}' carries a payload here"),
+                source: None,
+            }),
+            span: written.span,
+            msg: format!(
+                "an explicit discriminant is only meaningful when every variant is data-less, and \
+                 '{payload_variant}' carries a payload; remove the discriminant, or the payload"
+            ),
+        });
     }
 
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
@@ -15009,8 +15445,7 @@ impl<'src> Analyzer<'src> {
             }
             Node::Func(function) => {
                 let name = function.name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15592,9 +16027,9 @@ impl<'src> Analyzer<'src> {
             Node::Struct(name, generic_parameters, external, resource, body) => {
                 let name_span = name.1;
                 let name = name.0;
+                let external = *external;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15655,6 +16090,7 @@ impl<'src> Analyzer<'src> {
                         name_span,
                         generic_parameter_constraint_ids,
                         fields,
+                        external,
                         resource,
                     },
                 );
@@ -15664,8 +16100,7 @@ impl<'src> Analyzer<'src> {
                 let name_span = name.1;
                 let name = name.0;
                 let resource = *resource;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15679,9 +16114,24 @@ impl<'src> Analyzer<'src> {
                 // C-style discriminants: each unspecified variant continues from
                 // the previous value plus one, starting at 0. The enum is numeric
                 // only if every variant is data-less and one is explicit.
-                let mut next_discriminant: i64 = 0;
+                // `None` once the sequence has run past `i64::MAX` and there is
+                // no next value to hand out — a plain `+ 1` panicked the debug
+                // compiler there and wrapped the release one.
+                let mut next_discriminant: Option<i64> = Some(0);
                 let mut all_data_less = true;
                 let mut any_explicit_discriminant = false;
+                // B79's payload rule: a discriminant only reaches the runtime
+                // when EVERY variant is data-less, so the first payload variant
+                // is what a stray discriminant must be reported against.
+                let first_payload_variant = variants
+                    .0
+                    .iter()
+                    .find(|variant| !variant.0.1.is_empty())
+                    .map(|variant| (variant.0.0, variant.1));
+                // B79's uniqueness rule: value -> the variant that took it
+                // first. Implicit values count — `enum E { A = 1, B = 0, C }`
+                // walks C onto 1 and collides just as loudly.
+                let mut discriminant_owners: IndexMap<i64, (&'src str, Span)> = IndexMap::new();
                 for (variant_index, variant) in variants.0.iter().enumerate() {
                     let variant_name = variant.0.0;
                     let data_type_ids: Vec<TypeId> = variant
@@ -15691,10 +16141,63 @@ impl<'src> Analyzer<'src> {
                         .map(|data_type| self.walk_type_node(data_type, body_scope_id))
                         .collect();
                     all_data_less &= data_type_ids.is_empty();
-                    let explicit_discriminant = variant.0.2;
+                    let explicit_discriminant = variant.0.2.as_ref();
                     any_explicit_discriminant |= explicit_discriminant.is_some();
-                    let discriminant = explicit_discriminant.unwrap_or(next_discriminant);
-                    next_discriminant = discriminant + 1;
+                    if let Some(written) = explicit_discriminant {
+                        self.check_discriminant_placement(
+                            variant_name,
+                            written,
+                            !data_type_ids.is_empty(),
+                            first_payload_variant,
+                        );
+                    }
+                    // `None` when this variant has no usable value: either the
+                    // literal it wrote was rejected above, or the C-style
+                    // sequence it was continuing has no next value. Either way
+                    // it is already diagnosed, and it takes no part in the
+                    // uniqueness check — one bad literal must not also read as
+                    // a duplicate.
+                    let discriminant = match explicit_discriminant {
+                        Some(written) => self.discriminant_value(written),
+                        None => {
+                            if next_discriminant.is_none() {
+                                self.diagnostics.push(Error {
+                                    note: None,
+                                    span: variant.1,
+                                    msg: format!(
+                                        "variant '{variant_name}' continues the discriminant \
+                                         sequence past 9223372036854775807; give it an explicit \
+                                         discriminant"
+                                    ),
+                                });
+                            }
+                            next_discriminant
+                        }
+                    };
+                    if let Some(discriminant) = discriminant {
+                        next_discriminant = discriminant.checked_add(1);
+                        match discriminant_owners.get(&discriminant) {
+                            Some((owner, owner_span)) => self.diagnostics.push(Error {
+                                // Both variants are in the one declaration, so
+                                // the note needs no source of its own.
+                                note: Some(crate::error::Note {
+                                    span: *owner_span,
+                                    msg: format!("'{owner}' has discriminant {discriminant}"),
+                                    source: None,
+                                }),
+                                span: variant.1,
+                                msg: format!(
+                                    "variant '{variant_name}' has discriminant {discriminant}, \
+                                     which '{owner}' already uses; two variants of '{name}' \
+                                     cannot share one"
+                                ),
+                            }),
+                            None => {
+                                discriminant_owners.insert(discriminant, (variant_name, variant.1));
+                            }
+                        }
+                    }
+                    let discriminant = discriminant.unwrap_or(0);
                     let variant_id = self.new_entity_id();
                     self.expr_id_to_expr_map
                         .insert(variant_id, Expr::EnumVariant(id, variant_index));
@@ -15846,7 +16349,9 @@ impl<'src> Analyzer<'src> {
                 }
                 let subject = subject_type_id;
                 self.walk_expr_nodes(&body.0, body_scope_id);
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 let implementation_index = self.implementations.len();
                 // `impl Subject with A + B` must satisfy each trait; record a
                 // conformance check per trait to run once declarations are known.
@@ -15882,6 +16387,7 @@ impl<'src> Analyzer<'src> {
                 self.implementations.push(Implementation {
                     subject,
                     declarations,
+                    declared_members,
                     trait_ids: Vec::new(),
                     trait_args: Vec::new(),
                 });
@@ -15891,8 +16397,7 @@ impl<'src> Analyzer<'src> {
             Node::Trait(name, generic_parameters, supertraits, body) => {
                 let name_span = name.1;
                 let name = name.0;
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
@@ -15925,7 +16430,9 @@ impl<'src> Analyzer<'src> {
                 self.walking_trait_body = true;
                 self.walk_expr_nodes(&body.0, body_scope_id);
                 self.walking_trait_body = was_walking_trait_body;
-                let declarations = self.collect_declarations(body_scope_id);
+                let declared_members = self.collect_declared_members(body_scope_id);
+                let declarations: IndexMap<&'src str, Id> =
+                    declared_members.iter().copied().collect();
                 self.traits.insert(
                     id,
                     Trait {
@@ -15935,6 +16442,7 @@ impl<'src> Analyzer<'src> {
                         generic_parameter_constraint_ids,
                         generic_parameter_names,
                         declarations,
+                        declared_members,
                         supertraits,
                     },
                 );
@@ -16115,8 +16623,7 @@ impl<'src> Analyzer<'src> {
                 Some(Expr::Error)
             }
             Node::Module(name, body) => {
-                let scope = self.mut_scope_for_scope_id(scope_id);
-                scope.name_to_id_map.insert(name, id);
+                self.declare_scope_item(scope_id, name, id);
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 self.module_scope_ids.insert(body_scope_id);
@@ -16564,7 +17071,57 @@ impl<'src> Analyzer<'src> {
                 }
                 match expected_type_id.get_type(self) {
                     Type::Enum(expected_enum_id, _) if expected_enum_id == enum_id => {}
-                    Type::Unknown | Type::Any | Type::Generic(_) => {}
+                    Type::Unknown | Type::Any => {}
+                    // A bare generic parameter used to be waved through with the
+                    // unresolved types above, and it half belongs there. Nothing
+                    // was checked and the tag test was emitted anyway, so the
+                    // pattern matched by coincidence of representation — a
+                    // `List<i32>` `[0, 7]` "matched" `Shape::Circle(let radius)`
+                    // and bound `radius = 7` (B82). But which parameter it is
+                    // decides whether that is fixable HERE:
+                    //
+                    // - One declared by a scope ENCLOSING this pattern — the
+                    //   function's own `<T>`, or a trait's parameter inside a
+                    //   default body — is abstract by construction. The body is
+                    //   checked once for every instantiation at once, so no later
+                    //   pass can make it concrete, and the same default matched
+                    //   `Colour::Red` against a `Fruit::Apple(9)` for a second
+                    //   impl. That is an error. A BOUND does not rescue it: a
+                    //   trait bound cannot make a parameter be one particular
+                    //   enum, so the message does not suggest one.
+                    //
+                    // - One that arrived from elsewhere means only "not
+                    //   substituted yet". A closure argument to a METHOD's own
+                    //   generic reaches its body with the parameter still
+                    //   abstract, which is `std::ui::View::swap`'s shape and
+                    //   the routing guide's `swap(route, |current| match current
+                    //   { .. })` — a match that IS concrete at the call. Left
+                    //   lenient here, and pinned `#[ignore]`d: the fix is to
+                    //   instantiate that parameter (the free-function twin
+                    //   already does, and it gets the real check today).
+                    Type::Generic(constraint_id)
+                        if self.generic_declared_by_enclosing_scope(
+                            constraint_id,
+                            lookup_scope_id,
+                        ) =>
+                    {
+                        let parameter = self
+                            .pretty_print_type(&expected_type_id.get_type(self), &HashMap::new());
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span,
+                            msg: format!(
+                                "cannot match an enum variant against the generic parameter \
+                                 `{parameter}`: `{parameter}` is whatever each instantiation \
+                                 binds it to, so there is nothing here to check the pattern \
+                                 against — the tag test runs anyway and matches any value that \
+                                 happens to share the tag. Match a value of the enum's own type, \
+                                 or move the match to where `{parameter}` is concrete"
+                            ),
+                        });
+                        return None;
+                    }
+                    Type::Generic(_) => {}
                     Type::Enum(_, _) => {
                         self.diagnostics.push(Error {
                             note: None,
@@ -16947,10 +17504,23 @@ impl<'src> Analyzer<'src> {
             }
             // `[T; n]` is a JS array too — iterate its element type `T`.
             Type::Array(element_id, _) => Some(element_id.get_type(self)),
-            // A custom iterator (e.g. `Range`): its element is the payload of
-            // `next(self): Option<T>` (or `next_mut(&mut self): Option<&mut T>` for
-            // a `&mut` view loop), so the binding gets type `T`.
-            Type::Struct(_, _) | Type::Enum(_, _) => {
+            // A custom iterator (e.g. `Range`, `ListIterator<T>`): its element is
+            // the payload of `next(self): Option<T>` (or `next_mut(&mut self):
+            // Option<&mut T>` for a `&mut` view loop), so the binding gets `T`.
+            //
+            // That payload is written in the SUBJECT's OWN parameters (`impl
+            // ListIterator<type T> { fun next(..): Option<T> }`), so it is
+            // abstract until instantiated against the receiver's arguments —
+            // the same step the `Trait` arm below takes with the trait's. Taking
+            // it verbatim typed the binding as the bare parameter `T` (B78), and
+            // a `T` admits nothing: `pair.0` on a `ListIterator<(i32, str)>`
+            // element was "cannot access field '0' on type T". `enumerate`/`zip`
+            // hid it — their payloads are STRUCTURAL (`Option<(i32, T)>`), so
+            // substituting the parts was enough even without substituting the
+            // whole.
+            Type::Struct(subject_id, subject_arguments)
+            | Type::Enum(subject_id, subject_arguments) => {
+                let (subject_id, subject_arguments) = (*subject_id, subject_arguments.clone());
                 let next_id = self.method_member_in_impls(iterable_type, next_method)?;
                 let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id)
                 else {
@@ -16961,15 +17531,16 @@ impl<'src> Analyzer<'src> {
                     .get(function_id)?
                     .return_type_id?
                     .get_type(self);
-                match return_type {
-                    Type::Enum(enum_id, arguments)
-                        if self.enums.get(&enum_id).map(|enumeration| enumeration.name)
-                            == Some("Option") =>
-                    {
-                        arguments.first().map(|element| element.get_type(self))
-                    }
-                    _ => None,
+                let Type::Enum(enum_id, arguments) = return_type else {
+                    return None;
+                };
+                if self.enums.get(&enum_id).map(|enumeration| enumeration.name) != Some("Option") {
+                    return None;
                 }
+                let element = arguments.first()?.get_type(self);
+                let parameter_ids = self.declared_parameter_constraint_ids(subject_id);
+                let substitution = Self::instantiation_context(&parameter_ids, &subject_arguments);
+                Some(self.substitute_type(&element, &substitution))
             }
             // `self` inside a trait default: its type is the declaring trait's
             // abstract `Self`. The element is the payload of the trait's own
@@ -17043,6 +17614,84 @@ impl<'src> Analyzer<'src> {
         next_method: &str,
     ) {
         let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: no bound on it provides \
+                 `{next_method}(&mut self): Option<T>`, and a generic is not \
+                 natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) \
+                 or iterate a concrete container"
+            ),
+        );
+    }
+
+    /// The concrete twin of `report_uniterable_for_each`: a `for` over a named
+    /// struct or enum that provides no `next` and is not one of the deliberate
+    /// native forms. B56 closed this for a GENERIC subject; the concrete path
+    /// never got the check and stayed SILENT (B80) — a vilan struct IS its flat
+    /// field array at runtime and a vilan enum is `[tag, ..payload]`, so
+    /// `for item in Cursor { items = [1, 2], index = 0 }` printed `[ 1, 2 ]`
+    /// then `0` and exited 0, walking the representation.
+    fn report_uniterable_concrete_for_each(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let kind = match iterable_type {
+            Type::Enum(_, _) => "an enum",
+            _ => "a struct",
+        };
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: it has no \
+                 `{next_method}(&mut self): Option<T>`, and {kind} is not \
+                 natively iterable — the loop would walk its representation. \
+                 Implement the iterator protocol on it, or iterate a `List` / \
+                 `Set` / `Range` (a `Map` iterates through `entries()`, \
+                 `keys()` or `values()`)"
+            ),
+        );
+    }
+
+    /// A `for` over a struct or enum whose `next` is DECLARED to return
+    /// something other than `Option<T>`. The name alone resolves the protocol
+    /// (`iterator-adapters.md` §1), and the lowering then reads the `Option`
+    /// tag off whatever came back: `fun next(&mut self): i32` yields a number,
+    /// `number[0]` is `undefined`, `undefined !== 0` breaks — so the loop runs
+    /// ZERO times and exits 0. An UNANNOTATED `next` is not judged here;
+    /// `IteratorFromFn::next` is written that way in std and infers its
+    /// `Option<T>` from its body.
+    fn report_for_each_next_not_option(
+        &mut self,
+        for_each_id: Id,
+        iterable_id: Id,
+        iterable_type: &Type,
+        next_method: &str,
+        return_type: &Type,
+    ) {
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let returned = self.pretty_print_type(return_type, &HashMap::new());
+        self.report_for_each_error(
+            for_each_id,
+            iterable_id,
+            format!(
+                "cannot iterate `{rendered}`: its `{next_method}` returns \
+                 `{returned}`, but the `for` protocol drives \
+                 `{next_method}(&mut self): Option<T>` and stops at `None`. \
+                 Return an `Option`, or rename the method"
+            ),
+        );
+    }
+
+    /// The shared tail of the three `for`-subject diagnostics: anchor the error
+    /// on the iterable expression, falling back to the loop itself.
+    fn report_for_each_error(&mut self, for_each_id: Id, iterable_id: Id, msg: String) {
         let span = **self
             .span_map
             .get(&iterable_id)
@@ -17051,13 +17700,62 @@ impl<'src> Analyzer<'src> {
         self.diagnostics.push(Error {
             note: None,
             span,
-            msg: format!(
-                "cannot iterate `{rendered}`: no bound on it provides \
-                 `{next_method}(&mut self): Option<T>`, and a generic is not \
-                 natively iterable. Add an iterator bound (e.g. `: Iterator<T>`) \
-                 or iterate a concrete container"
-            ),
+            msg,
         });
+    }
+
+    /// Whether a concrete `for` subject with no `next` of its own is one of the
+    /// forms the loop DELIBERATELY lowers to a native `for...of` (B80's
+    /// exemption set — everything outside it is a silent walk of the receiver's
+    /// representation):
+    ///
+    /// - an `external struct`: a host handle whose runtime shape belongs to
+    ///   JavaScript, so `for...of` over it IS the host's own iteration protocol
+    ///   — `List<T>` (a JS array), `str` (a JS string, yielding characters),
+    ///   `Bytes` (a `Uint8Array`), `NativeMap` (a JS `Map`). It declares no
+    ///   vilan fields, so there is no field array to walk by mistake, and a
+    ///   host value that is not iterable throws AT the loop — loud, not silent.
+    /// - `Set<T>`: the one ordinary vilan struct with a lowering of its own,
+    ///   `__set_iter` over the backing map's stored originals
+    ///   (`transformer.rs`'s `is_set_typed`).
+    ///
+    /// `[T; n]` and a tuple are natively iterable too, but they are `Type::Array`
+    /// / `Type::Tuple` and never reach this arm.
+    fn subject_is_natively_iterable(&self, iterable_type: &Type) -> bool {
+        let Type::Struct(id, _) = iterable_type else {
+            return false;
+        };
+        if Some(*id) == self.primitive_struct_ids.get("Set").copied() {
+            return true;
+        }
+        self.structs.get(id).is_some_and(|struct_| struct_.external)
+    }
+
+    /// The declared return type of a `for` subject's protocol member, when it
+    /// contradicts `Option<T>` — the payload of
+    /// `report_for_each_next_not_option`. `None` means "no quarrel": either the
+    /// member is unannotated (judged by its body elsewhere) or it already
+    /// returns an `Option`.
+    fn for_each_next_non_option_return(&mut self, next_id: Id) -> Option<Type> {
+        let Some(Expr::Function(function_id)) = self.expr_id_to_expr_map.get(&next_id) else {
+            return None;
+        };
+        let return_type = self
+            .functions
+            .get(function_id)?
+            .return_type_id?
+            .get_type(self);
+        match &return_type {
+            Type::Enum(enum_id, _)
+                if self.enums.get(enum_id).map(|enumeration| enumeration.name)
+                    == Some("Option") =>
+            {
+                None
+            }
+            // An unresolved annotation is not evidence of a contradiction.
+            Type::Unknown | Type::Unresolved | Type::Any => None,
+            _ => Some(return_type),
+        }
     }
 
     /// If `type_` is a `List` whose element is still an unresolved inference slot
@@ -19735,6 +20433,143 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
+    /// The diagnostic for an argument that does not fit its declared parameter
+    /// — with the BARE TRAIT case steered (B72).
+    ///
+    /// A parameter declared as a bare trait can never accept a concrete value,
+    /// and "Expected A, but got Bag instead" of a `Bag` that plainly `impl`s `A`
+    /// reads as though the impl were missing or wrong. It is neither: a trait is
+    /// a BOUND, not a type — `spec/types.md` §5.5 ("a trait is not a type") and
+    /// §5.11, which lists using one as a type as a normative rejection case —
+    /// and vilan has no trait objects. That is the same rule
+    /// `MethodLookup::BareTraitValue` already states from inside the body; the
+    /// call site simply had no version of it.
+    ///
+    /// Why only here: a CALL is the one position that reconciles
+    /// parameter-first (so bindings key on the callee's generics), which makes
+    /// it the one position that ever asks `reconcile_type(Trait, Concrete)`.
+    /// Every other position — a `let` annotation, a return, a field, a method
+    /// argument — reconciles value-first and lands on the `(Struct|Enum, Trait)`
+    /// arm, which ACCEPTS. Making those agree is a language question (B4), not a
+    /// message question; see `method-resolution.md` §10.
+    fn argument_mismatch(
+        &self,
+        parameter_name: &str,
+        parameter_id: Id,
+        parameter_type: &Type,
+        argument_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> (String, Option<crate::error::Note>) {
+        let expected = self.pretty_print_type(parameter_type, substitution_context);
+        let got = self.pretty_print_type(argument_type, substitution_context);
+        let plain = format!("Expected {expected}, but got {got} instead.");
+        let Type::Trait(trait_id, _) = parameter_type else {
+            return (plain, None);
+        };
+        // Steer only when the value really does implement the trait. When it
+        // does not, the author's mistake is plausibly the missing impl, and
+        // naming the type it failed to match is the more useful report.
+        if !self.type_implements_trait(argument_type, *trait_id) {
+            return (plain, None);
+        }
+        let trait_name = self
+            .traits
+            .get(trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or("trait");
+        // The fix belongs at the DECLARATION, which may be in another file.
+        let note = self
+            .span_map
+            .get(&parameter_id)
+            .map(|span| crate::error::Note {
+                span: **span,
+                msg: format!("'{parameter_name}' is declared with the trait as its type"),
+                source: self.source_of_id(parameter_id),
+            });
+        (
+            format!(
+                "parameter '{parameter_name}' has bare trait type '{trait_name}': a trait is \
+                 not a value type (vilan has no trait objects), so it cannot accept {got}. \
+                 Declare a generic parameter bounded by the trait instead — `<T: \
+                 {trait_name}>` with '{parameter_name}: T'."
+            ),
+            note,
+        )
+    }
+
+    /// The "not callable" message for a call subject that isn't one.
+    ///
+    /// When the subject IS a function, the bare form ("it is `fn id<T>(T): T`")
+    /// reads as a compiler mistake: the thing is spelled `fun` and the user just
+    /// called it. What is actually missing is a VALUE FORM — only the coercible
+    /// set (`fn-coercion.md` §1, `spec/types.md` §5.8) has one, and a binding can
+    /// hold and call exactly those. So name the disqualifying property and the
+    /// fix the docs already promise ("write the small wrapping closure. The
+    /// compiler will tell you when you hit one").
+    fn not_callable_message(&self, subject_type: &Type) -> String {
+        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let base = format!("cannot call this as a function: it is {rendered}");
+        let Type::Function(function_id) = subject_type else {
+            return base;
+        };
+        let Some(function) = self.functions.get(function_id) else {
+            // Not in `functions` at all: an `external fun`, whose binding forms
+            // are call-shaped (a dotted global loses its `this` when detached).
+            return match self.external_functions.get(function_id) {
+                Some(external) => format!(
+                    "{base}; an `external` function has no value form — call \
+                     '{}' directly, or wrap it in a closure",
+                    external.name
+                ),
+                None => base,
+            };
+        };
+        let reason = if !function.generic_parameter_constraint_ids.is_empty() {
+            "a generic function has no single value — which instantiation is meant \
+             would have to be chosen where the value is bound, not where it is called"
+        } else if function.is_async {
+            "an `async` function has no value form — a call through a value is not \
+             awaited, so the call would hand back an unawaited promise"
+        } else if function
+            .parameters
+            .first()
+            .and_then(|parameter_id| self.parameters.get(parameter_id))
+            .is_some_and(|parameter| parameter.name == "self")
+        {
+            "a method has no value form — one would have to capture a receiver"
+        } else {
+            return base;
+        };
+        format!(
+            "{base}; {reason}. Call '{}' directly, or wrap it in a closure",
+            function.name
+        )
+    }
+
+    /// A callable's parameters and own generics, by declaration id. One id
+    /// space serves plain and `external` functions, and a call resolves the
+    /// same way through either — whether it names the declaration
+    /// (`helper(1)`) or reaches it through a function-typed value
+    /// (`let f = helper; f(1)`).
+    fn callable_signature(&self, function_id: Id) -> Option<(Vec<Id>, Vec<TypeId>)> {
+        self.functions
+            .get(&function_id)
+            .map(|function| {
+                (
+                    function.parameters.clone(),
+                    function.generic_parameter_constraint_ids.clone(),
+                )
+            })
+            .or_else(|| {
+                self.external_functions.get(&function_id).map(|external| {
+                    (
+                        external.parameters.clone(),
+                        external.generic_parameter_constraint_ids.clone(),
+                    )
+                })
+            })
+    }
+
     fn wire_call(
         &mut self,
         call_id: Id,
@@ -20086,24 +20921,40 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Resolved;
                 }
                 let function_data = match &target {
-                    Expr::Function(function_id) => {
-                        self.functions.get(function_id).map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        })
+                    Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
+                        self.callable_signature(*function_id)
                     }
-                    Expr::ExternalFunction(external_function_id) => self
-                        .external_functions
-                        .get(external_function_id)
-                        .map(|function| {
-                            (
-                                function.parameters.clone(),
-                                function.generic_parameter_constraint_ids.clone(),
-                            )
-                        }),
-                    _ => None,
+                    // A binding that HOLDS a function (`let f = helper; f(1)` —
+                    // B75). The target is the binding, not the declaration, so
+                    // the arm above finds nothing; the subject's TYPE names the
+                    // function it holds. `fn-coercion.md` §4 already promised
+                    // this ("calling such a binding works as before") — it never
+                    // did, because nothing taught the call operator to read the
+                    // type. Resolving through the declaration is what keeps it a
+                    // call rather than a second, weaker calling convention:
+                    // arity, spread collection and the argument check all come
+                    // from the one path below.
+                    //
+                    // Eligibility is B20's, deliberately: ONE predicate decides
+                    // whether a `fun` is a value at all (`fn-coercion.md` §1), so
+                    // the coercion and the call can never disagree about which
+                    // functions those are. Each exclusion is load-bearing here,
+                    // not inherited ceremony — a generic `fun` has no single
+                    // value to call (the binding, not the call, would have to
+                    // monomorphize, and the emitted reference names a function
+                    // that specialization never produced), and an `async` one
+                    // would hand back an unawaited promise, since a call through
+                    // a value is not awaited (§1 rule 4, the J2 gap). Both keep
+                    // today's error, as do `external` and `self` methods (§1
+                    // rules 1 and 3, both deferred there with their own reasons).
+                    _ => match &subject_type {
+                        Type::Function(function_id)
+                            if self.coercible_function_signature(*function_id).is_some() =>
+                        {
+                            self.callable_signature(*function_id)
+                        }
+                        _ => None,
+                    },
                 };
 
                 if let Some((parameters, generic_parameter_constraint_ids)) = function_data {
@@ -20155,6 +21006,7 @@ impl<'src> Analyzer<'src> {
                     }
                     for (index, parameter_id) in parameters.iter().enumerate() {
                         let parameter = self.parameters.get(parameter_id).unwrap();
+                        let parameter_name = parameter.name;
                         let parameter_type = parameter.type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
                         let argument_type =
@@ -20198,14 +21050,17 @@ impl<'src> Analyzer<'src> {
                                 }
                             }
                             None => {
-                                let expected =
-                                    self.pretty_print_type(&parameter_type, &substitution_context);
-                                let got =
-                                    self.pretty_print_type(&argument_type, &substitution_context);
+                                let (msg, note) = self.argument_mismatch(
+                                    parameter_name,
+                                    *parameter_id,
+                                    &parameter_type,
+                                    &argument_type,
+                                    &substitution_context,
+                                );
                                 self.diagnostics.push(Error {
-                                    note: None,
+                                    note,
                                     span: **self.span_map.get(&argument_id).unwrap(),
-                                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                                    msg,
                                 });
                             }
                         }
@@ -20259,8 +21114,7 @@ impl<'src> Analyzer<'src> {
                     let non_function_message = {
                         let subject_type =
                             self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                        let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
-                        format!("cannot call this as a function: it is {rendered}")
+                        self.not_callable_message(&subject_type)
                     };
                     self.diagnostics.push(Error { note: None,
                         // The SUBJECT is what isn't callable (A1).
@@ -20291,12 +21145,12 @@ impl<'src> Analyzer<'src> {
             }
             _ => {
                 let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-                let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+                let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
                     note: None,
                     // The SUBJECT is what isn't callable (A1) — anchor there.
                     span: **self.span_map.get(&subject_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot call this as a function: it is {rendered}"),
+                    msg,
                 });
                 Resolution::Failed
             }
@@ -23339,35 +24193,32 @@ impl<'src> Analyzer<'src> {
                         .iter()
                         .find(|candidate| candidate.home_trait.is_none())
                         .map(|candidate| (candidate.member_id, Some(candidate.impl_subject)));
+                    // The static path's own resolution, TIERED (B83). It was a
+                    // flat `find_map` in impl-registration order until here, so
+                    // an inherent `fun default()` lost to a trait-provided one
+                    // that happened to register first — inherent-over-trait
+                    // inverted on the one path B57 did not reach. The candidate
+                    // set is unchanged; only the ranking is new.
+                    let static_resolution = match method_candidates.is_empty() {
+                        // Only a trait provides it as a METHOD: refuse, and say
+                        // which path does reach it (handled below).
+                        false => ImplMemberResolution::Missing,
+                        true => self.rank_member_candidates(self.static_path_candidates(
+                            &subject_type,
+                            member_name,
+                            subject_is_trait,
+                        )),
+                    };
+                    let static_member = match &static_resolution {
+                        ImplMemberResolution::Found(member_id, impl_subject) => {
+                            Some((*member_id, Some(*impl_subject)))
+                        }
+                        _ => None,
+                    };
                     let member_id = variant_id
                         .map(|variant| (variant, None))
                         .or(inherent_method)
-                        .or_else(|| {
-                            // Only a trait provides it: refuse, and say which
-                            // path does reach it (handled below).
-                            if !method_candidates.is_empty() {
-                                return None;
-                            }
-                            self.implementations
-                                .iter()
-                                .filter(|x| {
-                                    self.compare_type(
-                                        &subject_type,
-                                        &x.subject.get_type(self),
-                                        &HashMap::new(),
-                                    )
-                                })
-                                .find_map(|x| {
-                                    if !subject_is_trait
-                                        && self.member_is_trait_only(x, member_name)
-                                    {
-                                        return None;
-                                    }
-                                    x.declarations
-                                        .get(member_name)
-                                        .map(|declaration| (*declaration, Some(x.subject)))
-                                })
-                        })
+                        .or(static_member)
                         // `Trait::member(receiver, ..)` (B57 §3.1): the explicit
                         // disambiguator. The trait's attached-static namespace
                         // (`Iterator::from_fn`) was searched above and is
@@ -23412,6 +24263,46 @@ impl<'src> Analyzer<'src> {
                                     }
                                 }
                             }
+                        }
+                        // Two traits provide it as a STATIC, and nothing the
+                        // type owns outranks them (B83). This is B57's §4
+                        // ambiguity on the static path — but the steer §4 gives
+                        // a method, `Trait::member(receiver)`, does not exist
+                        // here: the qualified form selects an impl THROUGH the
+                        // receiver, and a static has no receiver. So the fix
+                        // that always works is the one named, and the missing
+                        // one is named as missing rather than left to be
+                        // hunted for.
+                        None if matches!(
+                            static_resolution,
+                            ImplMemberResolution::AmbiguousTraits(_)
+                        ) =>
+                        {
+                            let ImplMemberResolution::AmbiguousTraits(homes) = &static_resolution
+                            else {
+                                unreachable!("just matched AmbiguousTraits");
+                            };
+                            let subject_str =
+                                self.pretty_print_type(&subject_type, &HashMap::new());
+                            let providers: Vec<String> = homes
+                                .iter()
+                                .map(|trait_id| {
+                                    format!("'{}'", self.trait_label_for(&subject_type, *trait_id))
+                                })
+                                .collect();
+                            self.diagnostics.push(Error {
+                                note: None,
+                                span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "'{member_name}' is ambiguous on '{subject_str}': {}{} \
+                                     provide it as a static, and a static has no receiver for a \
+                                     `Trait::{member_name}` path to select through; declare \
+                                     '{subject_str}''s own '{member_name}', which outranks every \
+                                     trait-provided one",
+                                    if providers.len() == 2 { "both " } else { "" },
+                                    join_with(&providers, "and"),
+                                ),
+                            });
                         }
                         // Every candidate belongs to a trait: `Type::member` no
                         // longer reaches them (§3.1), and the fix is to name the
@@ -23872,6 +24763,16 @@ impl<'src> Analyzer<'src> {
         // (e.g. a `List`) stays a native `for...of`.
         for (for_each_id, iterable_id) in std::mem::take(&mut self.prepped_for_each) {
             let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
+            // Keep it: emission picks its native lowering by this same type, and
+            // it is the only place the type is known. A `for x in <expr>` whose
+            // iterable stores no type on its own expr id — a parameter (`self`
+            // included), a call, an `if`, a block, an `await`, a `*view` — read
+            // back untyped on the emission side, and every type-driven lowering
+            // silently didn't fire (B85: `for x in set` walked the `Set` struct's
+            // one-element backing array instead of its elements).
+            let iterable_type_id = iterable_type.clone().get_type_id(self);
+            self.for_each_iterable_types
+                .insert(for_each_id, iterable_type_id);
             // `for e in &mut container` drives a `next_mut(&mut self): Option<&mut
             // T>` iterator (each binding a writable view); a plain `for x in
             // container` drives `next`. A built-in `List`/`Set` has neither and
@@ -23886,6 +24787,21 @@ impl<'src> Analyzer<'src> {
                     if let Some((next_id, impl_subject_id)) =
                         self.method_member_impl_subject(&iterable_type, next_method)
                     {
+                        // The protocol is duck-typed on the METHOD NAME
+                        // (`iterator-adapters.md` §1), but the lowering still
+                        // reads an `Option` tag off what `next` hands back, so a
+                        // `next` annotated with anything else drives a loop that
+                        // silently runs zero times. Name AND declared shape.
+                        if let Some(return_type) = self.for_each_next_non_option_return(next_id) {
+                            self.report_for_each_next_not_option(
+                                for_each_id,
+                                iterable_id,
+                                &iterable_type,
+                                next_method,
+                                &return_type,
+                            );
+                            continue;
+                        }
                         self.for_each_next.insert(for_each_id, next_id);
                         // Bind the providing impl's generics from the receiver
                         // (`Passthrough<Counting, i32>` against the impl's
@@ -23902,6 +24818,16 @@ impl<'src> Analyzer<'src> {
                             self.method_call_substitution
                                 .insert(for_each_id, bindings.into_iter().collect());
                         }
+                    } else if !self.subject_is_natively_iterable(&iterable_type) {
+                        // No protocol member and no deliberate native lowering:
+                        // the fallback `for...of` would walk the receiver's own
+                        // representation. B80 — B56's check, one type-shape over.
+                        self.report_uniterable_concrete_for_each(
+                            for_each_id,
+                            iterable_id,
+                            &iterable_type,
+                            next_method,
+                        );
                     }
                 }
                 // `for v in self` inside a trait default: `self` is the trait's
@@ -24534,16 +25460,31 @@ impl<'src> Analyzer<'src> {
         // binders); one declared in ANOTHER file (`Map::new`'s `K` reaching a
         // user binding) can never ground there. A generic with no recorded
         // declaration stays lenient.
-        let generic_declaration_sources: HashMap<TypeId, SourceId> = self
-            .expr_id_to_expr_map
-            .iter()
-            .filter_map(|(entity_id, expr)| match expr {
-                Expr::Generic(constraint_id) => self
-                    .source_of_id(*entity_id)
-                    .map(|source| (*constraint_id, source)),
-                _ => None,
-            })
-            .collect();
+        //
+        // One constraint id can be declared in SEVERAL files, so this is a
+        // set per constraint and not a single source (B77). An impl binder
+        // written `impl Subject<type T>` deliberately *inherits* the
+        // subject's own constraint id (`register_subject_binders`) so that
+        // the binder is identical to having written the subject's bound out
+        // — which makes a user's `impl List<type T>` share the exact id of
+        // `list.vl`'s `struct List<T>`. Collapsing that many-to-one relation
+        // into one source is not merely lossy, it is *unstable*: the winner
+        // was whichever entity a randomly-seeded `HashMap` iteration reached
+        // last, so a user's impl block un-froze std's own `List::map` on
+        // roughly half of otherwise identical cold compiles.
+        let mut generic_declaration_sources: HashMap<TypeId, Vec<SourceId>> = HashMap::new();
+        for (entity_id, expr) in &self.expr_id_to_expr_map {
+            if let Expr::Generic(constraint_id) = expr
+                && let Some(source) = self.source_of_id(*entity_id)
+            {
+                let declared_in = generic_declaration_sources
+                    .entry(*constraint_id)
+                    .or_default();
+                if !declared_in.contains(&source) {
+                    declared_in.push(source);
+                }
+            }
+        }
         let variable_ids: Vec<Id> = self.variables.keys().copied().collect();
         for variable_id in variable_ids {
             // The hazard is USES checking vacuously — a binding nothing reads
@@ -24572,10 +25513,16 @@ impl<'src> Analyzer<'src> {
             let Some(source) = self.source_of_id(variable_id) else {
                 continue;
             };
+            // A residual leaks when the parameter is declared somewhere and
+            // NOWHERE is this binding's own file: `Map::new`'s `K` reaching
+            // user code. If any declaration of it is in this file, the
+            // binding sits inside a scope that can still bind it and the
+            // residual is legitimate — which is order-independent, unlike
+            // asking which single file declared it.
             let leaked = residuals.iter().any(|residual| {
                 generic_declaration_sources
                     .get(residual)
-                    .is_some_and(|declared_in| *declared_in != source)
+                    .is_some_and(|declared_in| !declared_in.contains(&source))
             });
             if leaked {
                 let name = self
@@ -25276,6 +26223,24 @@ pub enum CopyDecision {
     UnlessResource(Vec<TypeId>),
 }
 
+/// What `compute_capture_clone_sites` settles about a program's pattern
+/// captures. Three answers to two independent questions — **is this capture
+/// COPIED**, and **when is it READ** — which B53 and B81 answer separately:
+/// copying is decided by the capture's own type (an aggregate copies, a
+/// resource never does), reading by the subject's (an owned place freezes on
+/// rebinding, a `&mut` view does not freeze at all).
+pub struct CapturePlan {
+    /// The captures that copy, keyed by how the copy is decided.
+    pub sites: HashMap<Id, CopyDecision>,
+    /// The captures the SHARE elision left aliasing their subject. Consumed by
+    /// rule 2's move elision, which must refuse to move out of one, and by
+    /// nothing in codegen.
+    pub shared: HashSet<Id>,
+    /// The captures that must be read at the match rather than at each
+    /// reference (B81).
+    pub materialized: HashSet<Id>,
+}
+
 /// How a resource type's members are reached at runtime for destruction.
 #[derive(Debug, Clone)]
 pub enum DropMembers {
@@ -25334,6 +26299,13 @@ pub struct Program<'src> {
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
     pub for_each_next: HashMap<Id, Id>,
+    /// Per `for x in iterable` loop: the type the ITERABLE inferred to. The
+    /// native lowerings are chosen by it (`Set` walks its backing map's values,
+    /// everything else is a plain `for...of`), and emission cannot recover it —
+    /// an iterable written as a parameter (`self`), a call, an `if`, a block, an
+    /// `await` or a `*view` stores no type on its own expr id, so the lookup
+    /// came back silent and the loop fell through to the bare form (B85).
+    pub for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
@@ -25559,6 +26531,19 @@ pub struct Program<'src> {
     /// value says whether the copy is unconditional or re-decided per
     /// monomorphization (see [`CopyDecision`]).
     pub capture_clone_sites: HashMap<Id, CopyDecision>,
+    /// B81: pattern captures the ALIAS path must turn into a real declaration
+    /// even when they owe no copy — the ones whose subject is rooted in a
+    /// writable view (`analyzer.rs::subject_is_writable_view`). That path
+    /// substitutes an accessor into the subject temp at every reference, and a
+    /// write through the view mutates the object that temp aliases IN PLACE, so
+    /// a deferred read returns post-write state: `if self is Feed::Ready(let
+    /// items, let at) { self = Feed::Ready(items, at + 1); items[at] }` read the
+    /// incremented `at`. Declaring the capture reads the slot once, at the
+    /// match, which is what the DECLARED path (`compile_pattern`) always did and
+    /// what makes the two paths agree. Orthogonal to `capture_clone_sites`:
+    /// this set says WHEN, that map says WHETHER TO COPY, and a resource
+    /// capture is in this set and never in that map (R1).
+    pub materialized_captures: HashSet<Id>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
     /// per monomorphization — a generic capture bound at `T` copies for a
@@ -25761,6 +26746,77 @@ impl<'src> Program<'src> {
             .resize(self.diagnostics.len(), SourceId(0));
         self.diagnostics.push(error);
         self.diagnostic_sources.push(source);
+    }
+
+    /// Put the diagnostic and warning lists into their ONE canonical order
+    /// (diagnostics-standard.md C1). Called at the end of
+    /// [`crate::post_analysis_passes`] — the last point at which either list
+    /// grows — so every consumer inherits it: the CLI's terminal rendering, the
+    /// language server's publish, and the HMR overlay.
+    ///
+    /// Diagnostics are produced by dozens of checks and many of them walk a
+    /// `HashMap`, so PUSH order was a randomly-seeded artifact. Two things fall
+    /// out of that. The terminal listed the same program's errors in a different
+    /// order run to run — untidy but survivable. And `hmr::render_overlay`
+    /// TRUNCATES at a cap, so *which* errors reached the browser changed run to
+    /// run, which is not. One policy here beats a sort in every producer.
+    ///
+    /// The key is: the file, then the position in it, then what the diagnostic
+    /// renders as. The source must lead — a [`Span`] is a byte offset into its
+    /// own file and carries no file identity, so spans from two files are not
+    /// comparable. The content tail (message, then the note's location and text)
+    /// is what makes this a total order over what a reader actually SEES; the
+    /// note belongs in it because sites like `emit_generic_leak` and
+    /// `emit_r11_violations` deliberately emit several diagnostics that share a
+    /// span and a message and differ only there.
+    ///
+    /// The sort is STABLE, so a producer's own ordering still decides between
+    /// entries this key cannot separate — which is why the local sorts upstream
+    /// (the C1 comments in `check_generic_bound_satisfaction`, the resource
+    /// checks, `init_order`) stay: this normalizes, it does not excuse.
+    pub fn normalize_diagnostic_order(&mut self) {
+        fn key<'a>(
+            error: &'a Error,
+            source: SourceId,
+        ) -> (
+            u32,
+            usize,
+            usize,
+            &'a str,
+            Option<(u32, usize, usize, &'a str)>,
+        ) {
+            (
+                source.0,
+                error.span.start,
+                error.span.end,
+                error.msg.as_str(),
+                error.note.as_ref().map(|note| {
+                    (
+                        note.source.unwrap_or(source).0,
+                        note.span.start,
+                        note.span.end,
+                        note.msg.as_str(),
+                    )
+                }),
+            )
+        }
+        fn sort_in_step(entries: &mut Vec<Error>, sources: &mut Vec<SourceId>) {
+            // `push_diagnostic` pads lazily, so the attribution vector can be
+            // SHORTER than the list it describes. Materialize the implicit
+            // entry-file tail before permuting, or that tail loses its file.
+            sources.resize(entries.len(), SourceId(0));
+            let mut paired: Vec<(Error, SourceId)> =
+                entries.drain(..).zip(sources.drain(..)).collect();
+            paired.sort_by(|(left, left_source), (right, right_source)| {
+                key(left, *left_source).cmp(&key(right, *right_source))
+            });
+            for (entry, source) in paired {
+                entries.push(entry);
+                sources.push(source);
+            }
+        }
+        sort_in_step(&mut self.diagnostics, &mut self.diagnostic_sources);
+        sort_in_step(&mut self.warnings, &mut self.warning_sources);
     }
 
     /// The program's call graph: ONE build per analysis, shared by everything
@@ -29067,6 +30123,11 @@ fn analyze_over_world<'src>(
     // between them. After conformance, so an impl's `with`-clause traits are
     // resolved onto it and a trait's member is not mistaken for the type's own.
     analyzer.check_duplicate_inherent_members();
+    // One block declaring one name twice (B84) — a different rule with a
+    // different scope, so a trait-provided name collides here even though it
+    // is exempt above. Runs after the inherent check so a program with both
+    // reports them in that order.
+    analyzer.check_duplicate_block_members();
     // With `drop_methods` recorded, build the per-type destruction glue the
     // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
     analyzer.build_drop_glue();
@@ -29330,9 +30391,9 @@ fn analyze_over_world<'src>(
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let (capture_clone_sites, shared_captures) = analyzer.compute_capture_clone_sites();
+    let capture_plan = analyzer.compute_capture_clone_sites();
     let resource_types = analyzer.compute_resource_types();
-    let clone_sites = analyzer.compute_clone_sites(&shared_captures);
+    let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
     let return_clone_sites = analyzer.compute_return_clone_sites();
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
@@ -29562,6 +30623,7 @@ fn analyze_over_world<'src>(
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,
         for_each_next: analyzer.for_each_next,
+        for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,
@@ -29634,7 +30696,8 @@ fn analyze_over_world<'src>(
         clone_sites,
         return_clone_sites,
         parameter_entry_clones,
-        capture_clone_sites,
+        capture_clone_sites: capture_plan.sites,
+        materialized_captures: capture_plan.materialized,
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         overwrite_drops: std::mem::take(&mut analyzer.overwrite_drops),

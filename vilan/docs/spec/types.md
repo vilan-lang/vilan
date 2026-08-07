@@ -47,6 +47,35 @@ variant is a constructor (with payload types) and a static member of the
 enum. An `external struct` declares a host type: no fields, its surface
 defined entirely by externs in impls.
 
+### Enum representation
+
+An enum has one of two runtime representations, and **which one is a
+property of the whole declaration, not of a variant**. An enum is
+*numeric* when both of these hold:
+
+1. every variant is data-less, **and**
+2. at least one variant has an explicit discriminant.
+
+A numeric enum lowers to the bare discriminant: `Ordering::Greater` is
+the value `1`, comparisons and equality are native number comparisons,
+and a `match` tests `subject === 1`. Every other enum lowers to the
+tagged form `[index, …payload]`, and a `match` tests the tag slot.
+
+The conjunction is the part worth stating outright, because both halves
+are easy to trip over:
+
+```vilan,fragment
+enum Level { Low, Mid, High }           // tagged: no explicit discriminant
+enum Level { Low = 0, Mid, High }       // numeric: ONE `= 0` converts all three
+enum Level { Low = 0, Mid(i32) }        // rejected: a payload and a discriminant
+```
+
+Adding `= 0` to a single variant changes the runtime shape of the entire
+enum — including how its values cross a host boundary, since a numeric
+enum reaches an `external fun` as a plain number. Discriminants must be
+unique across the enum, counting the values implicitly continued from
+the previous variant; see the grammar chapter for the full rule.
+
 ## 5.4 Impls
 
 `impl Subject { … }` adds **inherent** members to `Subject`;
@@ -150,6 +179,16 @@ arithmetic traits, `Self`). Compound assignment `x op= e` is exactly
 `bool`; bindings inside an `is` pattern are scoped to nothing (use
 `match` to bind).
 
+A pattern is checked against the type of the value it matches, so an
+enum-variant pattern requires that type to be that enum. A **generic
+parameter of an enclosing declaration** is not: `T` is whatever each
+instantiation binds it to, and the declaration is checked once for all
+of them, so `value is Colour::Red` on a `T`-typed value is a compile
+error — in a generic function's body, and in a trait default over the
+trait's own parameter. Match a value of the enum's own type, or move the
+match to where the parameter is concrete. A bound does not change this:
+a trait bound cannot make a parameter be one particular enum.
+
 ## 5.8 Conversions and coercions
 
 There are **no implicit conversions** between numeric types; use the
@@ -166,6 +205,19 @@ Eligibility: a non-generic, non-method, non-`async`, non-`external`
 `fun` whose signature equals the target closure type. Everything else
 (generics, methods, async functions, externs) requires an explicit
 wrapping closure.
+
+The same eligibility decides what a **function-typed binding** can do. A
+binding that takes its type from the reference rather than an annotation
+keeps the function's own type, and calling it calls that function:
+
+```vilan,fragment
+let f = measure;                       // fun measure(text: str): i32
+let n = f("abc");                      // 3 — arity and argument types
+                                       // are the declaration's
+```
+
+An ineligible `fun` has no value form at all, so it can be neither
+stored nor called this way; the error names which rule it hit.
 
 `any` unifies with every type in both directions (it is produced by
 `panic` and host boundaries; it absorbs rather than converts).
@@ -285,6 +337,8 @@ fun main() {
 Normative rejection cases (each is a compile error):
 
 - Using a trait as a type (`let x: Display = …`).
+- An enum-variant pattern matched against a generic parameter of an
+  enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the
   bound …`).
 - A `match` whose VALUE legs' types don't unify. Diverging legs
@@ -295,5 +349,8 @@ Normative rejection cases (each is a compile error):
 *Implementation note (tracked gaps): a closure bound to a local and
 called directly does not infer its parameter types from the call;
 `effect`'s unannotated closure parameter can type against the impl's
-abstract `T` (B23). Each has a pinned test; the workaround is an
+abstract `T` (B23); and a closure passed to a **method's** own generic
+parameter reaches its body with that parameter still abstract, so a
+pattern inside it is not checked at all — the free-function twin
+substitutes and is. Each has a pinned test; the workaround is an
 annotation or a binding.*

@@ -3836,7 +3836,15 @@ impl<'src> Transformer<'src> {
                     .unwrap_or(js::Node::Void);
                 // `Set` is a vilan struct over a `NativeMap`; iterate the backing
                 // map's stored originals (`set[0].values()`), in insertion order.
-                let t_iterable = if self.is_set_typed(*iterable_id) {
+                //
+                // The type comes from the analyzer's own record for this loop
+                // (`for_each_iterable_types`) rather than from a lookup on the
+                // iterable expression: only the analyzer knows it for the forms
+                // that store no type on their own id — a parameter, and `self`
+                // above all, but equally a call, an `if`, a block, an `await` or
+                // a `*view`. Asking the expression left all of those looking
+                // untyped, and the lowering below silently didn't fire (B85).
+                let t_iterable = if self.for_each_iterates_a_set(id) {
                     self.used_helpers.insert("__set_iter");
                     js::Node::Call(
                         Box::new(js::Node::Local("__set_iter".to_string())),
@@ -4025,12 +4033,13 @@ impl<'src> Transformer<'src> {
                 }));
                 let mut conditions = Vec::new();
                 self.compile_is_pattern(pattern, js::Node::Local(subject_name), &mut conditions);
-                // B53: a capture that owes a copy becomes a real binding here,
-                // beside the subject temp and before the test — the test's
-                // outcome cannot change what the copy holds (a failing test
-                // never reads the capture), and the branch bodies are not
-                // reachable from this arm.
-                self.materialize_capture_clones(pattern, block);
+                // B53/B81: a capture that owes a copy, or that must be read at
+                // the match, becomes a real binding here — beside the subject
+                // temp and before the test. The test's outcome cannot change
+                // what the binding holds (a failing test never reads the
+                // capture), and the branch bodies are not reachable from this
+                // arm.
+                self.materialize_captures(pattern, block);
                 // An irrefutable pattern (binding/wildcard/tuple) is always true.
                 conditions
                     .into_iter()
@@ -4097,11 +4106,12 @@ impl<'src> Transformer<'src> {
                         // guard and body, then clear the aliases after this leg.
                         Some(guard_id) => {
                             self.compile_is_pattern(&leg.pattern, subject, &mut conditions);
-                            // B53: a capture that owes a copy becomes a real
-                            // declaration. WHERE it lands is decided below,
-                            // once the guard has been walked.
+                            // B53/B81: a capture that owes a copy, or that must
+                            // be read at the match, becomes a real declaration.
+                            // WHERE it lands is decided below, once the guard
+                            // has been walked.
                             let mut copies = Vec::new();
-                            self.materialize_capture_clones(&leg.pattern, &mut copies);
+                            self.materialize_captures(&leg.pattern, &mut copies);
                             let mut guard_prelude = Vec::new();
                             let outer_reads = self.is_binding_reads.replace(HashSet::new());
                             guard_condition = self.walk_entity(guard_id, &mut guard_prelude);
@@ -4116,14 +4126,21 @@ impl<'src> Transformer<'src> {
                             // B59: an else-if chain has no statement slot before a
                             // leg's condition, so a guard that needs statements —
                             // its own temporaries (an `is` test, a `?` lift, a
-                            // nested `match`), or a capture's copy it reads — gets
-                            // the leg its own slot instead (see the emission below).
-                            let reads_a_copy = Self::pattern_capture_ids(&leg.pattern)
+                            // nested `match`), or a capture's declaration it reads
+                            // — gets the leg its own slot instead (see the
+                            // emission below). B81 widens the second case from
+                            // copies to every materialized capture: the guard is
+                            // walked AFTER `materialize_captures` has re-pointed
+                            // the alias table, so a guard reading one that was
+                            // left in the body would name an undeclared binding.
+                            let reads_a_declaration = Self::pattern_capture_ids(&leg.pattern)
                                 .into_iter()
                                 .any(|capture| {
-                                    guard_reads.contains(&capture) && self.capture_copies(capture)
+                                    guard_reads.contains(&capture)
+                                        && (self.capture_copies(capture)
+                                            || self.capture_materializes(capture))
                                 });
-                            if guard_prelude.is_empty() && !reads_a_copy {
+                            if guard_prelude.is_empty() && !reads_a_declaration {
                                 // A plain guard stays an expression in the chain's
                                 // condition, and its copies are made on ENTRY to
                                 // the body, after the guard has already decided —
@@ -4141,7 +4158,7 @@ impl<'src> Transformer<'src> {
                         .reduce(|a, b| js::Node::Binary(BinaryOp::And, Box::new(a), Box::new(b)));
                     // B62: the resource payloads this leg captured are destroyed
                     // at its end. Read AFTER the pattern has been compiled, so a
-                    // guarded leg's accessors (and any copy `materialize_capture_clones`
+                    // guarded leg's accessors (and any declaration `materialize_captures`
                     // re-pointed) are final. The teardown wraps the leg BODY only:
                     // a guard that rejects never enters it, so it destroys nothing
                     // and the next leg finds the subject exactly as it was.
@@ -4341,6 +4358,12 @@ impl<'src> Transformer<'src> {
         self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
+    /// B81: whether this capture must become a real declaration on the alias
+    /// path even when it owes no copy — see [`Program::materialized_captures`].
+    fn capture_materializes(&self, capture_id: Id) -> bool {
+        self.program.materialized_captures.contains(&capture_id)
+    }
+
     /// Emits a match as an else-if chain, each leg's test the conjunction of its
     /// pattern and its guard. The shape every match had before B59, and the one
     /// every match without a statement slot still has.
@@ -4430,36 +4453,56 @@ impl<'src> Transformer<'src> {
         }
     }
 
-    /// B53: materialize the copies an ALIASED pattern (`is`, a guarded match
-    /// leg) owes. That path binds nothing — each capture is recorded as an
+    /// Turn an ALIASED pattern's captures (`is`, a guarded match leg) into real
+    /// declarations. That path binds nothing — each capture is recorded as an
     /// accessor into the subject and substituted at every reference — so a
-    /// capture that must copy gets a real declaration here, and its alias
-    /// re-points at the declared name. Captures that share or move keep their
-    /// accessor, which is what keeps the elisions free — and a RESOURCE capture
-    /// never copies (R1), so it stays an accessor, which is what B62's leg
-    /// teardown destroys through.
+    /// capture that owes anything gets a declaration here, and its alias
+    /// re-points at the declared name.
     ///
-    /// WHERE `out` goes decides WHEN the copy happens, and the callers answer
-    /// differently: an `is` test emits into the statements before it (a copy of
-    /// an unmatched payload is `__clone(undefined)`, so a failing test pays
-    /// nothing), while a guarded leg picks between its prelude and its body once
-    /// the guard has been walked (see `Expr::Match`).
-    fn materialize_capture_clones(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
+    /// Two independent reasons to declare one, and they compose into one
+    /// statement:
+    ///
+    /// - **B53 (rule 1) — it COPIES.** The declaration wraps the slot read in
+    ///   `__clone`; the alias alone would hand the body the subject's own
+    ///   storage. Captures that share or move own nothing to copy and keep
+    ///   their accessor, which is what keeps the elisions free — and a RESOURCE
+    ///   capture never copies (R1).
+    /// - **B81 — it must be READ at the match.** A subject rooted in a writable
+    ///   view is mutated IN PLACE when the leg writes through it, so an
+    ///   accessor re-read later in the leg returns post-write state. The
+    ///   declaration freezes the read without touching the value: no `__clone`,
+    ///   so a SHARE stays a share and a resource stays the loan B62's leg
+    ///   teardown destroys through (`capture_drop_nodes` reads the alias table
+    ///   after this runs, so it finds the declared name and destroys the very
+    ///   value the leg captured).
+    ///
+    /// WHERE `out` goes decides WHEN that happens, and the callers answer
+    /// differently: an `is` test emits into the statements before it (reading an
+    /// unmatched payload yields `undefined`, so a failing test pays nothing),
+    /// while a guarded leg picks between its prelude and its body once the guard
+    /// has been walked (see `Expr::Match`).
+    fn materialize_captures(&mut self, pattern: &ExprPattern, out: &mut Vec<js::Node<'src>>) {
         for capture_id in Self::pattern_capture_ids(pattern) {
-            if !self.capture_copies(capture_id) {
+            let copies = self.capture_copies(capture_id);
+            if !copies && !self.capture_materializes(capture_id) {
                 continue;
             }
             let Some(accessor) = self.is_bindings.get(&capture_id).cloned() else {
                 continue;
             };
-            self.used_helpers.insert("__clone");
+            let read = if copies {
+                self.used_helpers.insert("__clone");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__clone".to_string())),
+                    vec![accessor],
+                )
+            } else {
+                accessor
+            };
             let name = self.ng.name_for(capture_id);
             let variable = js::Variable {
                 name: name.clone(),
-                value: Box::new(js::Node::Call(
-                    Box::new(js::Node::Local("__clone".to_string())),
-                    vec![accessor],
-                )),
+                value: Box::new(read),
             };
             let mutable = self
                 .program
@@ -4482,7 +4525,7 @@ impl<'src> Transformer<'src> {
     /// and records each capture as an alias to the subject's payload slot (so
     /// references compile to `t[i]` rather than a binding statement). A capture
     /// that owes a copy is turned into a real binding afterwards by
-    /// `materialize_capture_clones` — the alias alone would hand the body the
+    /// `materialize_captures` — the alias alone would hand the body the
     /// subject's own storage.
     fn compile_is_pattern(
         &mut self,
@@ -6196,12 +6239,21 @@ impl<'src> Transformer<'src> {
             .is_some_and(|type_| matches!(type_, Type::Tuple(_)))
     }
 
-    /// Whether an expression's (monomorphized) type is the built-in `Set` — a
-    /// vilan struct wrapping a `NativeMap` (I1). Its elements are the backing
-    /// map's stored originals, so `for x in set` iterates `set[0].values()`.
-    fn is_set_typed(&self, expr_id: Id) -> bool {
-        self.expr_type_id(expr_id)
-            .map(|type_id| self.resolve_type_id(type_id))
+    /// Whether a `for x in ...` loop's iterable is the built-in `Set` — a vilan
+    /// struct wrapping a `NativeMap` (I1). Its elements are the backing map's
+    /// stored originals, so such a loop iterates `set[0].values()`.
+    ///
+    /// Keyed by the LOOP, not by the iterable expression: the analyzer recorded
+    /// the type it inferred there (`for_each_iterable_types`), which is the only
+    /// total answer. Re-deriving it here from the iterable's own expr id was
+    /// what B85 was — silent for every form that stores no type of its own, so
+    /// `for x in self` inside `Set`'s own impl, `for x in make_set()` and `for
+    /// x in *view` all walked the struct's one-element field array instead.
+    fn for_each_iterates_a_set(&self, for_each_id: Id) -> bool {
+        self.program
+            .for_each_iterable_types
+            .get(&for_each_id)
+            .map(|type_id| self.resolve_type_id(*type_id))
             .and_then(|type_id| self.program.type_id_to_type_map.get(&type_id))
             .is_some_and(|type_| match type_ {
                 Type::Struct(id, _) => self
