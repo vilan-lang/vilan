@@ -46496,3 +46496,232 @@ fn b83_a_trait_provided_method_is_still_refused_on_the_type_path() {
         "'show' is not an inherent member of 'Bag'",
     );
 }
+
+// --- B95: a monomorphized instance is keyed on what its type arguments ARE,
+// --- not on which type ids happen to spell them. Types are deliberately not
+// --- interned (`type_id_for_type`: "each call mints a fresh id"), so writing
+// --- `List<i32>` twice mints two ids for the `i32` inside — and the instance
+// --- key, which used to be `format!("{:?}", type_)`, spells its arguments as
+// --- raw `TypeId`s one level down. Two structurally-equal instantiations
+// --- therefore keyed apart and the SAME body was emitted twice under two
+// --- names. Found by B90's arc (an unconditional hoist re-inferred an argument
+// --- earlier, minted its id earlier, and produced a byte-identical duplicate
+// --- `Signal::new`); the corpus carried 19 such duplicates across five
+// --- programs before the key went structural.
+// ---
+// --- A count, not a run: a duplicate instance is behaviour-identical, so
+// --- `assert_compiles_and_runs` cannot see it. Each shape of nested type id
+// --- gets its own pin, and each merging pin is twinned with a splitting one —
+// --- the key must be COARSER, never wrong.
+
+/// The B95 probe body: a distinctive expression the instance emits once.
+fn b95_program(annotation: &str, first: &str, second: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        fun through<T>(value: T): T {{
+            print(4242);
+            value
+        }}
+        fun main() {{
+            let a: {annotation} = {first};
+            let b: {annotation} = {second};
+            through(a);
+            through(b);
+        }}
+        "#
+    )
+}
+
+/// The filed shape: one nominal type argument, written twice.
+#[test]
+fn b95_two_spellings_of_one_nominal_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("List<i32>", "List::new()", "List::new()"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// Nested one level deeper — the key has to RECURSE, not just resolve the
+/// outermost argument. `List<List<i32>>`'s duplicate id is the inner one.
+#[test]
+fn b95_a_nested_nominal_argument_shares_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("List<List<i32>>", "List::new()", "List::new()"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A tuple's elements are type ids too.
+#[test]
+fn b95_two_spellings_of_one_tuple_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("(i32, str)", r#"(1, "x")"#, r#"(2, "y")"#),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// An array's element type is a type id; its LENGTH is not (it is a `usize`),
+/// which the splitting twin below pins.
+#[test]
+fn b95_two_spellings_of_one_array_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("[i32; 3]", "[1, 2, 3]", "[4, 5, 6]"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A closure type's parameters and return are type ids.
+#[test]
+fn b95_two_spellings_of_one_closure_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("|i32| i32", "|n| n + 1", "|n| n + 2"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The multi-parameter form: two generics, each re-spelled, one instance.
+#[test]
+fn b95_a_two_generic_instantiation_shares_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun pair<T, U>(left: T, right: U): T {
+                print(4242);
+                left
+            }
+            fun main() {
+                let a: List<i32> = List::new();
+                let b: List<str> = List::new();
+                let c: List<i32> = List::new();
+                let d: List<str> = List::new();
+                pair(a, b);
+                pair(c, d);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A METHOD instance, not a free call: the same key is what
+/// `method_call_substitution` flows into.
+#[test]
+fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            struct Holder<T> { value: T }
+            impl Holder<type T> {
+                fun show(self): T {
+                    print(4242);
+                    self.value
+                }
+            }
+            fun main() {
+                let a: Holder<List<i32>> = Holder { value = List::new() };
+                let b: Holder<List<i32>> = Holder { value = List::new() };
+                a.show();
+                b.show();
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The splitting twin: DIFFERENT nominal arguments still get their own
+/// instance. Without this the merging pins above are satisfied by a key that
+/// collapses everything.
+#[test]
+fn b95_different_nominal_arguments_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: List<i32> = List::new();
+                let b: List<str> = List::new();
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The splitting twin for a length that is not a type id: `[i32; 3]` and
+/// `[i32; 4]` are distinct types and must stay distinct instances.
+#[test]
+fn b95_arrays_of_different_lengths_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: [i32; 3] = [1, 2, 3];
+                let b: [i32; 4] = [1, 2, 3, 4];
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The splitting twin for nesting: the recursion must reach the inner
+/// argument in the OTHER direction too — `List<List<i32>>` and
+/// `List<List<str>>` differ only two levels down.
+#[test]
+fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: List<List<i32>> = List::new();
+                let b: List<List<str>> = List::new();
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}

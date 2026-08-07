@@ -6420,11 +6420,102 @@ impl<'src> Transformer<'src> {
     }
 
     /// A stable key identifying a concrete type, used to deduplicate instances.
+    ///
+    /// STRUCTURAL, not id-keyed (B95). The obvious spelling — `format!("{:?}",
+    /// type_)` — looks structural and is not: every nominal `Type` carries its
+    /// arguments as raw [`TypeId`]s, so `Struct(list, [TypeId(42)])` and
+    /// `Struct(list, [TypeId(99)])` key differently even when 42 and 99 both
+    /// denote `i32`. Type ids are minted in inference order, so the same program
+    /// can mint two ids for one type merely because an argument was re-inferred
+    /// earlier — and the instance memo would then emit the SAME body twice under
+    /// two names (a duplicate `Signal::new` was observed that way). Spelling the
+    /// whole shape out makes the key depend on what the type IS.
+    ///
+    /// The recursion is strictly coarsening: equal `Debug` output implies equal
+    /// `Type` values implies an equal structural key, so this can only ever MERGE
+    /// what the old key separated — never split.
+    ///
+    /// Two positions stay id-keyed, deliberately: a `Generic` binder (distinct
+    /// binders are distinct abstract types — following the id would be a lookup
+    /// into itself) and a type id absent from the map (nothing to spell).
     fn type_key(&self, type_id: TypeId) -> String {
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(type_) => format!("{:?}", type_),
-            None => format!("?{}", type_id.0),
+        let mut key = String::new();
+        self.write_type_key(type_id, &mut key);
+        key
+    }
+
+    /// Appends [`Self::type_key`]'s spelling of `type_id` to `out`. Every arm
+    /// opens with a distinct sigil and closes its argument list, so the encoding
+    /// stays injective over shapes.
+    fn write_type_key(&self, type_id: TypeId, out: &mut String) {
+        use std::fmt::Write;
+        // Guards a type-argument cycle; the depth is shared with the rest of the
+        // compiler's recursive walks, and reaching it means the key is truncated
+        // (still sound — a truncated key only merges further).
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            out.push_str("...");
+            return;
+        };
+        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
+            let _ = write!(out, "?{}", type_id.0);
+            return;
+        };
+        match type_ {
+            Type::Struct(id, arguments) => {
+                let _ = write!(out, "S{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Enum(id, arguments) => {
+                let _ = write!(out, "E{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Trait(id, arguments) => {
+                let _ = write!(out, "T{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Tuple(elements) => {
+                out.push_str("Tup");
+                self.write_type_key_arguments(elements, out);
+            }
+            Type::Closure(parameters, return_type_id) => {
+                out.push_str("Fn");
+                self.write_type_key_arguments(parameters, out);
+                out.push_str("->");
+                self.write_type_key(*return_type_id, out);
+            }
+            Type::Array(element_type_id, length) => {
+                out.push_str("Arr[");
+                self.write_type_key(*element_type_id, out);
+                let _ = write!(out, ";{length}]");
+            }
+            Type::Mapped(binder_id, source_type_id, template_type_id) => {
+                let _ = write!(out, "Map(G{},", binder_id.0);
+                self.write_type_key(*source_type_id, out);
+                out.push(',');
+                self.write_type_key(*template_type_id, out);
+                out.push(')');
+            }
+            Type::Generic(constraint_id) => {
+                let _ = write!(out, "G{}", constraint_id.0);
+            }
+            // No nested type ids to spell — `Any`, `Never`, `Function(Id)`,
+            // `Module(Id)`, `Unknown`, `Unresolved`, `Void`. The `#` keeps their
+            // `Debug` spelling from colliding with an arm above.
+            other => {
+                let _ = write!(out, "#{other:?}");
+            }
         }
+    }
+
+    fn write_type_key_arguments(&self, arguments: &[TypeId], out: &mut String) {
+        out.push('(');
+        for (index, argument) in arguments.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            self.write_type_key(*argument, out);
+        }
+        out.push(')');
     }
 
     /// Finds the function implementing `member` for a concrete type, searching
