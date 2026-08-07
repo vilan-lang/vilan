@@ -3683,6 +3683,26 @@ impl<'src> Transformer<'src> {
                         inner
                     };
                     thunk_block.push(js::Node::Return(Box::new(inner)));
+                    // SYNCHRONOUS, and it depends on an invariant held
+                    // elsewhere: a module-level initializer cannot suspend
+                    // (`execution.md` §7.1, enforced await-shaped in
+                    // `async_infer`), so nothing walked into `thunk_block`
+                    // above can be an `await`. When the check was merely
+                    // call-shaped this was reachable, and the result was
+                    // `return await (pending);` inside a non-async arrow — a
+                    // dev bundle that did not parse at all
+                    // (`top-level-await.md` §1.5).
+                    //
+                    // Do not "fix" that by flipping this to `is_async: true`.
+                    // The thunk's value is written into a `const` that every
+                    // later binding reads as a value, and
+                    // `__hmr_adopt_signal`/`__hmr_adopt_shared` do
+                    // `var cell = thunk(); cell[0].v = …` — a promise-shaped
+                    // thunk poisons all three, and the call sites would each
+                    // need an `await`, which is top-level await again on every
+                    // transferable binding in the bundle. If the await rule is
+                    // ever relaxed, this contract is a redesign, not a patch
+                    // (`top-level-await.md` §4.2).
                     let thunk = js::Node::Closure(js::Closure {
                         parameters: Vec::new(),
                         body: thunk_block,

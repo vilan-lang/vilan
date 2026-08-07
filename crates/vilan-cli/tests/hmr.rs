@@ -392,6 +392,103 @@ fn the_dev_channel_drives_the_watch_round() {
     outcome.unwrap();
 }
 
+/// The client leg of the B87 repro: a module-level spawn plus a binding that
+/// AWAITS it. `pending` is a `Task` (not a transferable form, so it is
+/// excluded from adopt), but `value: i32` is `TransferForm::Value`, so it IS
+/// wrapped in the `__hmr_adopt` thunk — which is built `is_async: false`.
+fn awaiting_initializer_source() -> String {
+    "import std::print;\nimport std::task::Task;\nimport std::time::sleep;\n\n     fun ready(): i32 {\n\tsleep(0);\n\t7\n}\n\n     let pending: Task<i32> = async ready();\nlet value: i32 = await pending;\n\n     fun main() {\n\tprint(value);\n}\n"
+        .to_string()
+}
+
+/// B87 — the adopt thunk cannot carry an `await`, and now it never has to.
+///
+/// Before B86a closed the await-shaped hole, a watch round over this program
+/// compiled CLEAN and emitted `return await (pending);` inside the
+/// `is_async: false` thunk: a dev bundle that did not parse at all
+/// (`node --check` → "SyntaxError: Unexpected reserved word"), so the whole
+/// dev loop was dead, not degraded (`top-level-await.md` §1.5).
+///
+/// The adopt contract is deliberately NOT redesigned — the paper records it as
+/// latent, load-bearing only if top-level await is ever allowed (§4.2). What
+/// is claimed instead is that the shape is UNREACHABLE from vilan source, and
+/// that is what this pins: the same watch round now fails at compile, and no
+/// bundle carrying the unparseable shape is ever written.
+#[test]
+fn an_awaiting_initializer_cannot_reach_the_hmr_adopt_thunk() {
+    let dir = temp_project("adopt_await");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &client_source("a", "x1"));
+    write(
+        &dir,
+        "src/server.vl",
+        "import std::print;\n\nfun main() {\n\tprint(\"server\");\n}\n",
+    );
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.js"), deadline),
+            "round 1 should have written dist/client.js"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let mut sse = SseClient::connect(port);
+
+        // The edit that used to produce the unparseable bundle.
+        write(&dir, "src/client.vl", &awaiting_initializer_source());
+
+        // It is refused at COMPILE, and the refusal is the module-init rule —
+        // not some incidental later failure.
+        let error_event = sse.expect_event("error", deadline);
+        assert!(
+            error_event.contains("cannot suspend"),
+            "the round should fail with the module-initializer refusal: {error_event}"
+        );
+
+        // And the bundle on disk is still round 1's — never one carrying the
+        // shape that does not parse. `return await (` is the emitter's
+        // spelling and appears nowhere in the hand-written shim, so it is a
+        // faithful witness for "an await was walked into the thunk".
+        let bundle = std::fs::read_to_string(dir.join("dist/client.js")).expect("read bundle");
+        assert!(
+            !bundle.contains("return await ("),
+            "a bundle carrying `return await (` reached dist/ — the adopt \
+             thunk is synchronous, so this does not parse:\n{bundle}"
+        );
+        assert!(
+            !bundle.contains("pkg::value"),
+            "the awaited binding must never be handed to the adopt thunk:\n{bundle}"
+        );
+        // The same, through the route the browser actually fetches.
+        let served = String::from_utf8_lossy(&http_get(port, "/bundle/client.js")).into_owned();
+        assert!(
+            !served.contains("return await (") && !served.contains("pkg::value"),
+            "the served bundle must not carry the awaited binding's thunk:\n{served}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    let _ = std::fs::remove_dir_all(&dir);
+    outcome.unwrap();
+}
+
 /// A `common` library both legs import (`pkg::common::banner`). Editing it
 /// changes both bundles — the shared-edit row of the §6 matrix.
 fn common_source(banner: &str) -> String {
