@@ -48482,3 +48482,194 @@ fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
         2,
     );
 }
+
+// --- B102: a call's recorded substitution is about the CALLEE, and says
+// --- something. Every entry joins the monomorphization instance key
+// --- (`transformer.rs`'s `emit_instance_with_bits`), so an entry that names a
+// --- constraint the callee's body cannot mention — or that "binds" a
+// --- constraint to itself — splits an instance off from the identical ones it
+// --- belongs with. Between them those two entries were the whole reason B90's
+// --- hoisted pre-binding pass stayed gated on argument order for two cycles;
+// --- with both refused at the record, the hoist is unconditional and all 112
+// --- corpus goldens are byte-identical.
+
+/// The filed shape, minimised. `through` is called at the top level AND from
+/// inside another generic body. At the nested call the pre-binding pass fixes
+/// the parameter's `T` before the positional loop reaches it, so the loop
+/// reconciles the already-substituted parameter against the argument and
+/// reports the CALLER's `U` bound to itself as well — `{T: U, U: U}` against
+/// the outer call's `{T: i32}`. `through`'s body cannot mention `U`; one
+/// instance, not two.
+#[test]
+fn b102_a_callers_generic_does_not_split_the_callees_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun forward<U>(value: U): U {
+                through(value)
+            }
+            fun main() {
+                print(through(1));
+                print(forward(2));
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The splitting twin: the filter drops what the callee cannot mention, and
+/// nothing else. Two genuinely different instantiations still get their own
+/// instance — without this the pin above is satisfied by a key that collapses
+/// every call to one body.
+#[test]
+fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun forward<U>(value: U): U {
+                through(value)
+            }
+            fun main() {
+                print(through(1));
+                print(forward("x"));
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The bound on the filter, and the reason it is written as "the callee's own
+/// constraints" rather than the tempting "anything that binds a generic to
+/// ITSELF". A self-recursive call binds `T` to the enclosing `T`, which IS the
+/// identity — and is real: it says this call instantiates at whatever the
+/// enclosing instance does. `wrap`'s `T` is `wrap`'s own constraint, so the
+/// filter keeps it. The blanket identity filter was tried, and this shape is
+/// what refuted it: the bound went unrecorded and the call reported "cannot
+/// infer 'T' for this call; its bound ': Slot' cannot be checked".
+#[test]
+fn b102_a_self_recursive_call_keeps_its_own_generic_bound() {
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T, depth: i32): View {
+            if depth > 0 {
+                wrap(content, depth - 1)
+            } else {
+                view("p").child(content)
+            }
+        }
+        fun main() {
+            mount("app", wrap("static", 3));
+        }
+        main();
+        "#,
+    )
+    .expect("a self-recursive call still records its own generic");
+}
+
+/// The second writer: return-type-only inference. `Map::new()`'s binders are
+/// fixed by nothing but the expectation, and under an expectation substitution
+/// has already made abstract it unifies `Map<K, V>` with `Map<K, V>` and
+/// "infers" `{K: K, V: V}`. Recording that put a whole instance key's worth of
+/// nothing on the call: the generic body was re-emitted under a generated
+/// instance name instead of staying the one shared source-named declaration
+/// `inherited_substitution` gives it.
+#[test]
+fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            import std::map::Map;
+            import std::reactive::Signal;
+            fun main() {
+                let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+                print(scores.get().len());
+            }
+            "#,
+            "function new",
+        ),
+        1,
+    );
+}
+
+/// An impl hung off a TRAIT binds its binder there — `impl Iterator<type T> {
+/// fun from_fn(fn: || T): FromFn<T> }` — and `impl_binder_generics` read only
+/// `Struct`/`Enum` subjects, so `T` was not among the constraints the call may
+/// bind. Once the record keys on that set, the missing binder took the whole
+/// substitution with it and the static stopped monomorphizing: the emitted
+/// program grew a plain `from_fn` declaration where the instance had been.
+#[test]
+fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            trait Iterator<T> {
+                fun next(self): T;
+            }
+            struct FromFn<T> {
+                fn: || T,
+            }
+            impl FromFn<type T> with Iterator<T> {
+                fun next(self) {
+                    (self.fn)()
+                }
+            }
+            impl Iterator<type T> {
+                fun from_fn(fn: || T): FromFn<T> {
+                    FromFn { fn }
+                }
+            }
+            fun main() {
+                mut i = 0;
+                let naturals = Iterator::from_fn(|| {
+                    i += 1;
+                    i
+                });
+                print(naturals.next());
+            }
+            "#,
+            "function from_fn",
+        ),
+        0,
+    );
+}
+
+/// The whole arc, behaviourally: the shapes above run, and run the same. The
+/// counts are the point (a duplicate instance is behaviour-identical, which is
+/// why the pins above count), but a schedule change that makes every call take
+/// the two-phase order has to keep the programs correct too.
+#[test]
+fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply<T>(render: |T| i32, value: T): i32 {
+            render(value)
+        }
+        fun apply_last<T>(value: T, render: |T| i32): i32 {
+            render(value)
+        }
+        fun main() {
+            print(apply(|n| n * 2, 21));
+            print(apply_last(21, |n| n * 2));
+        }
+        "#,
+        "42\n42\n",
+    );
+}

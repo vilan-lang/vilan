@@ -18753,13 +18753,7 @@ impl<'src> Analyzer<'src> {
         let Some((parameter_ids, own_generics)) = self.method_signature(member_id) else {
             return unresolved_closure_argument;
         };
-        // Bindable here: the method's own generics AND the declaring impl's
-        // binders — a with-clause binder (`impl P with Trait<type S: Sink>`)
-        // appears only in parameter types, so an argument is its ONE binding
-        // channel (subject binders usually bind via the receiver first; an
-        // already-bound id reconciles to itself and re-inserts harmlessly).
-        let mut bindable = own_generics.clone();
-        bindable.extend(self.impl_binder_generics(member_id));
+        let bindable = self.callee_bindable_generics(member_id);
         if bindable.is_empty() {
             return unresolved_closure_argument;
         }
@@ -18803,10 +18797,37 @@ impl<'src> Analyzer<'src> {
         unresolved_closure_argument
     }
 
+    /// Every constraint a call to `member_id` may bind: the callee's OWN
+    /// generics AND the declaring impl's binders — a with-clause binder (`impl P
+    /// with Trait<type S: Sink>`) appears only in parameter types, so an
+    /// argument is its ONE binding channel (subject binders usually bind via the
+    /// receiver first; an already-bound id reconciles to itself and re-inserts
+    /// harmlessly).
+    ///
+    /// It is also exactly the set the callee's BODY can mention, which is why a
+    /// call's RECORDED substitution keys on nothing else (B102).
+    fn callee_bindable_generics(&self, member_id: Id) -> Vec<TypeId> {
+        let Some((_, own_generics)) = self.method_signature(member_id) else {
+            return Vec::new();
+        };
+        let mut bindable = own_generics;
+        bindable.extend(self.impl_binder_generics(member_id));
+        bindable
+    }
+
     /// The generic binder constraint ids of the impl DECLARING `member_id`:
     /// subject binders (`impl Wrapper<type T>`, recoverable from the subject's
     /// type arguments) and with-clause binders (`impl P with Trait<type S:
     /// Bound>`, recoverable from the impl's recorded trait arguments).
+    ///
+    /// The subject may itself be a TRAIT: `impl Iterator<type T> { fun
+    /// from_fn(f: || T): FromFn<T> }` hangs a static off the trait and binds `T`
+    /// there, so the trait's arguments are subject arguments like any other.
+    /// Reading only
+    /// `Struct`/`Enum` lost that binder — and with it, once B102 restricted a
+    /// call's recorded substitution to this set, the static's whole
+    /// instantiation (`iterator.vl`'s `Iterator::from_fn` stopped
+    /// monomorphizing).
     fn impl_binder_generics(&self, member_id: Id) -> Vec<TypeId> {
         let Some(implementation) = self.implementations.iter().find(|implementation| {
             implementation
@@ -18817,7 +18838,7 @@ impl<'src> Analyzer<'src> {
             return Vec::new();
         };
         let mut argument_ids: Vec<TypeId> = Vec::new();
-        if let Type::Struct(_, arguments) | Type::Enum(_, arguments) =
+        if let Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) =
             implementation.subject.get_type(self)
         {
             argument_ids.extend(arguments);
@@ -18845,26 +18866,6 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .any(|generic| !substitution.contains_key(generic))
             })
-    }
-
-    /// Whether some CLOSURE argument stands before some non-closure argument —
-    /// the one order in which typing the arguments POSITIONALLY types a closure
-    /// before the argument that could bind the generic its parameter is written
-    /// over. With every closure last, positional order already is binding order.
-    fn a_closure_argument_precedes_a_value_argument(&self, argument_ids: &[Id]) -> bool {
-        let is_closure = |argument_id: &Id| {
-            matches!(
-                self.expr_id_to_expr_map.get(argument_id),
-                Some(Expr::Closure(_))
-            )
-        };
-        let Some(first_closure) = argument_ids.iter().position(is_closure) else {
-            return false;
-        };
-        argument_ids
-            .iter()
-            .skip(first_closure)
-            .any(|argument_id| !is_closure(argument_id))
     }
 
     /// Whether some NON-closure argument's type has not landed on this attempt,
@@ -19735,8 +19736,21 @@ impl<'src> Analyzer<'src> {
                                     // IS the enclosing `T`. Binding it to the
                                     // expectation dropped its bound (and reported
                                     // the expectation as "missing the bound").
+                                    // And an inference that concludes the
+                                    // generic is ITSELF has inferred nothing
+                                    // (B102): `Map::new()` under an expectation
+                                    // substitution has already made abstract
+                                    // unifies `Map<K, V>` with `Map<K, V>` and
+                                    // reports `{K: K, V: V}`. Recording it would
+                                    // put a whole instance key's worth of
+                                    // nothing on the call — emitting the generic
+                                    // body a second time under an instance name,
+                                    // where before it stayed the one shared
+                                    // declaration `inherited_substitution` gives
+                                    // it.
                                     if return_generics.contains(&constraint_id)
                                         && !self.generic_is_enclosing_binder(constraint_id, id)
+                                        && type_id.get_type(self) != Type::Generic(constraint_id)
                                     {
                                         self.method_call_substitution
                                             .entry(id)
@@ -22003,31 +22017,32 @@ impl<'src> Analyzer<'src> {
                     // reaches an `Unresolved` argument, hoisted ahead of the
                     // closures rather than added.
                     //
-                    // Only for that ORDER. When every closure argument already
-                    // stands after the arguments that could bind, the loop's own
-                    // order IS the two-phase order and there is nothing to hoist,
-                    // so the call keeps the exact inference schedule it has
-                    // always had — which matters, because hoisting
-                    // unconditionally emits a duplicate `Signal::new` and moves
-                    // three corpus goldens (`reactive`, `reactive-flatten`,
-                    // `signal-update`, behaviour-identical, +1 instance each).
+                    // UNCONDITIONAL since B102. For two cycles this ran only
+                    // when a closure argument actually stood before a value one,
+                    // because hoisting on every call emitted a duplicate
+                    // `Signal::new` and moved three corpus goldens (`reactive`,
+                    // `reactive-flatten`, `signal-update` — behaviour-identical,
+                    // +1 instance each). B90 filed the cause as type-id-keyed
+                    // instance identity; B95 refuted that by measurement (with
+                    // the key made structural, un-gating still split the
+                    // instance) and named the real one: substitutions of
+                    // different SHAPE, `{T: i32}` gated against `{T: i32, U:
+                    // i32}` hoisted.
                     //
-                    // B90 filed that as type-id-keyed instance identity, and B95
-                    // proved it is not: with the instance key made STRUCTURAL
-                    // (`transformer.rs`'s `type_key`), un-gating still emits the
-                    // duplicate, and the probe says why — the two instances of
-                    // `Signal::new` carry substitutions of different SHAPE, `{T:
-                    // i32}` gated against `{T: i32, U: i32}` hoisted. The
-                    // pre-binding pass writes a SUPERSET of the substitution the
-                    // positional loop produces, and every entry joins the
-                    // instance key, so a binding the body never mentions splits
-                    // the instance. Closing that wants either a hoist that binds
-                    // exactly what the loop would, or a key restricted to the
-                    // constraints the callee's signature actually names —
-                    // measured work of its own, so the gate stays.
-                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_))
-                        && self.a_closure_argument_precedes_a_value_argument(argument_ids)
-                    {
+                    // B102 traced the extra entry to its writer, and it is not a
+                    // superset this pass produces — it binds exactly `{T: U}`,
+                    // the entry the positional loop would have bound. The extra
+                    // one is the LOOP's, and it exists BECAUSE the parameter is
+                    // already bound: reconciling the substituted parameter
+                    // against the argument reports the caller's own generic
+                    // bound to ITSELF. Recording that is what split the instance,
+                    // and the record is where it is now refused — the call's
+                    // substitution keys on the callee's own constraints, and
+                    // return-type-only inference declines a generic "inferred"
+                    // to be itself. With both, the schedule is free to be the
+                    // two-phase one on every call: all 112 corpus goldens are
+                    // byte-identical with this hoist unconditional.
+                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_)) {
                         self.bind_callee_own_generics(
                             target_id,
                             argument_ids,
@@ -22137,6 +22152,22 @@ impl<'src> Analyzer<'src> {
                     // transformer can monomorphize the call (e.g. `range(0, 9)`
                     // binds `T = i32`, `Box::new(5)` binds the impl's `T`). Key off
                     // the inferred bindings, not the function's own generic list.
+                    //
+                    // On the CALLEE's own constraints and nothing else (B102).
+                    // `substitution_context` is this call's working context, and
+                    // the loop above inserts every binding `reconcile_type`
+                    // reports; once the pre-binding pass has fixed a parameter's
+                    // generic, reconciling that already-substituted parameter
+                    // against the argument reports the CALLER's generic bound to
+                    // itself as well (`through(value)` inside `forward<U>` yields
+                    // `{T: U, U: U}`). The callee's body cannot mention `U`, but
+                    // every recorded entry joins the instance key — so that entry
+                    // alone split `through`'s instance from the identical one the
+                    // outer call emitted. Working context keeps it; the record
+                    // does not.
+                    let bindable = self.callee_bindable_generics(target_id);
+                    substitution_context
+                        .retain(|constraint_id, _| bindable.contains(constraint_id));
                     if !substitution_context.is_empty() {
                         self.method_call_substitution
                             .insert(call_id, substitution_context);
