@@ -387,7 +387,9 @@ handle whose fields are reached through `[extern(get/set, …)]` — survives
 the crossing. The same fact rules out three tempting mappings:
 
 - a TS discriminated union is a tagged *object*, while a Vilan `enum` is
-  `[tag, …payload]`;
+  `[tag, …payload]` — unless it is a **backed** enum, which is the bare
+  backing value and *does* cross (that is what a closed string set maps to,
+  below);
 - `Map<str, T>` is a Vilan struct over a hashed native map, not a plain
   host object;
 - `List<T>` is a real JS array, and an array-*like* (`{[index: number]:
@@ -401,28 +403,35 @@ JS array too.
 
 ### Closed string sets
 
-A named union of string literals gets a real enum plus a wrapper that
-speaks it, because the host boundary still wants the raw string:
+A named union of string literals becomes a **backed enum** — each variant
+carries the host string it stands for, so the enum *is* that string at
+runtime and crosses the boundary unchanged. A parameter takes the enum
+directly, with no wrapper:
 
 ```vilan,norun
+import std::option::Option;
+
 enum Align {
-	Start,
-	End,
+	Start = "start",
+	End = "end",
 }
 
 external struct Chart;
 
 impl Chart {
 	[extern(set, "align")]
+	[platform("node")]
+	external fun set_align(self, value: Align): void;
+
+	// The read direction keeps a guard: the host may answer outside the
+	// set, so the raw `str` is bound and `parse` returns `Option`.
+	[extern(get, "align")]
 	[doc(hidden)]
 	[platform("node")]
-	external fun set_align_raw(self, value: str): void;
+	external fun align_raw(self): str;
 
-	fun set_align(self, value: Align): void {
-		self.set_align_raw(match value {
-			Align::Start => "start",
-			Align::End => "end",
-		})
+	fun align(self): Option<Align> {
+		Align::parse(self.align_raw())
 	}
 }
 

@@ -13,4 +13,5 @@ interface Chart {
     shape: Shape;
     inline(align: "left" | "right"): void;
     maybeAlign(align?: Align): void;
+    getAlign(): Align;
 }

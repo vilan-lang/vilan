@@ -318,28 +318,63 @@ fn nothing_bindgen_emits_ever_mentions_option() {
 }
 
 #[test]
-fn a_string_literal_union_alias_becomes_an_enum_with_a_match_wrapper() {
-    // §3.3's highest-value union case, and the one place bindgen generates real
-    // logic rather than a bare declaration.
+fn a_string_literal_union_alias_becomes_a_backed_enum_with_no_wrapper() {
+    // §4.1. The parameter direction loses its wrapper ENTIRELY: a backed enum
+    // IS the host string at runtime, so the extern takes the enum. The arm
+    // block this used to emit — per parameter, per binding — is gone, and with
+    // it bindgen's one departure from emitting signatures only.
     let output = bind(
         "type Align = \"start\" | \"end\";\ninterface Chart { setAlign(align: Align): void; }",
     );
     assert!(output.contains("enum Align {"), "{output}");
-    assert!(output.contains("\tStart,"), "{output}");
-    assert!(output.contains("\tEnd,"), "{output}");
-    // The host boundary still speaks the raw string, so the extern takes `str`
-    // and is hidden behind the wrapper.
+    assert!(output.contains("\tStart = \"start\","), "{output}");
+    assert!(output.contains("\tEnd = \"end\","), "{output}");
     assert!(
-        output.contains("external fun set_align_raw(self, align: str): void;"),
+        output.contains("external fun set_align(self, align: Align): void;"),
+        "{output}"
+    );
+    assert!(!output.contains("set_align_raw"), "{output}");
+    assert!(!output.contains("match align {"), "{output}");
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_string_literal_union_in_return_position_becomes_a_parse_forwarder() {
+    // §4.1's bigger win, and it is not a deletion: this used to be a TODO —
+    // 375 of them on `lib.dom.d.ts`, construct class "string-literal union
+    // property" — because there was no spelling for string -> variant.
+    //
+    // The extern still binds the raw `str`, and that is §7.2's DEFERRAL rather
+    // than a limitation of the mapping: an `external fun` may not return a
+    // backed enum, because the host may answer outside the set and an
+    // exhaustive `match` has no trap arm. `parse` is where the honest `None`
+    // comes from.
+    let output = bind("type Align = \"start\" | \"end\";\ninterface Chart { getAlign(): Align; }");
+    assert!(
+        output.contains("external fun get_align_raw(self): str;"),
         "{output}"
     );
     assert!(output.contains("[doc(hidden)]"), "{output}");
     assert!(
-        output.contains("fun set_align(self, align: Align): void {"),
+        output.contains("fun get_align(self): Option<Align> {"),
         "{output}"
     );
-    assert!(output.contains("Align::Start => \"start\","), "{output}");
-    assert!(output.contains("Align::End => \"end\","), "{output}");
+    assert!(
+        output.contains("Align::parse(self.get_align_raw())"),
+        "{output}"
+    );
+    // The forwarder needs `Option` in scope, and the file says so.
+    assert!(output.contains("import std::option::Option;"), "{output}");
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
+    // No file WITHOUT a forwarder carries the import.
+    let plain = bind("interface Chart { width(self): void; }");
+    assert!(!plain.contains("import std::option::Option;"), "{plain}");
 }
 
 #[test]
@@ -1000,8 +1035,8 @@ fn only_keeps_a_surviving_union_member_and_drops_an_erased_one() {
 
 #[test]
 fn only_carries_a_string_literal_union_enum_along_with_its_user() {
-    // The enum is a real declaration the emitted match-wrapper NAMES, so a
-    // closure that dropped it would produce a file that does not compile.
+    // The enum is a real declaration the emitted SIGNATURE names, so a closure
+    // that dropped it would produce a file that does not compile.
     let output = bind_only(
         &["Chart"],
         "type Align = \"start\" | \"end\";\n\
@@ -1009,7 +1044,8 @@ fn only_carries_a_string_literal_union_enum_along_with_its_user() {
          interface Chart { setAlign(align: Align): void; }",
     );
     assert!(output.contains("enum Align {"), "{output}");
-    assert!(output.contains("Align::Start => \"start\","), "{output}");
+    assert!(output.contains("\tStart = \"start\","), "{output}");
+    assert!(output.contains("align: Align"), "{output}");
     assert!(!output.contains("Unused"), "{output}");
     assert!(
         compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
@@ -1433,24 +1469,35 @@ fn every_golden_compiles() {
 // --- The owner-note pins on LANGUAGE facts -----------------------------------
 
 #[test]
-fn a_vilan_enum_cannot_carry_a_string_backing_value() {
-    // OWNER NOTE 1. bindgen generates a match-wrapper for a string-literal union
-    // because a BACKED enum — `enum Align { Start = "start" }` — would be the
-    // natural target and does not exist: the discriminant grammar is
-    // `= (-)? integer` only (`parsing.rs::parse_discriminant`). A NUMERIC enum
-    // already lowers to its bare discriminant, so a string-backed one would
-    // lower to its bare string and need no wrapper at all.
+fn a_vilan_enum_carries_a_string_backing_value() {
+    // OWNER NOTE 1, RESOLVED. This pin was written to go RED the day the
+    // language gained backed enums (B76, `proposal/backed-enums.md`), and it
+    // did. Inverted here to assert the new truth, because the fact it guards is
+    // still bindgen's: the generator's whole §3.3 wrapper existed only because
+    // a string-backed enum did not.
     //
-    // If the language gains backed enums, this test goes RED and points
-    // straight at the wrapper machinery that should then be deleted.
-    let errors = compile("enum Align { Start = \"start\", End = \"end\" }\nfun main() {}\n");
+    // A backed enum lowers to its BARE string exactly as a numeric one lowers
+    // to its bare discriminant, which is why the parameter direction needs no
+    // wrapper — the extern takes the enum, because the enum is the string.
     assert!(
-        !errors.is_empty(),
-        "vilan now accepts a string-backed enum — bindgen's match-wrapper (§3.3) should be \
-         replaced by a backed enum, and `proposal/bindgen.md`'s implementation note updated"
+        compile("enum Align { Start = \"start\", End = \"end\" }\nfun main() {}\n").is_empty(),
+        "vilan should accept a string-backed enum"
     );
-    // The integer form is what the language actually has.
+    // The integer form the language always had, unchanged.
     assert!(compile("enum Ordering { Less = -1, Equal = 0 }\nfun main() {}\n").is_empty());
+    // And the one rule bindgen's RETURN direction depends on: §7.2 is
+    // DEFERRED, so an extern may not return a backed enum. If that ever
+    // changes, the `parse` forwarder becomes optional and this goes red.
+    assert!(
+        !compile(
+            "enum Align { Start = \"start\", End = \"end\" }\n\
+             [extern(\"getAlign\")]\n\
+             external fun get_align(): Align;\n\
+             fun main() {}\n"
+        )
+        .is_empty(),
+        "an `external fun` returning a backed enum should still be refused (§7.2)"
+    );
 }
 
 #[test]
@@ -1577,8 +1624,11 @@ fn a_string_literal_variant_that_starts_with_a_digit_stays_a_valid_identifier() 
     // (`lib.dom.d.ts`), and `2d` is not an identifier. Found by the E31 probe:
     // it was the ONE construct that stopped 410k generated lines from parsing.
     let output = bind("type Ctx = \"2d\" | \"webgl\";\ninterface C { use(c: Ctx): void; }");
-    assert!(output.contains("\t_2d,"), "{output}");
-    assert!(output.contains("Ctx::_2d => \"2d\","), "{output}");
+    assert!(output.contains("\t_2d = \"2d\","), "{output}");
+    assert!(
+        output.contains("external fun use_(self, c: Ctx): void;"),
+        "{output}"
+    );
     assert!(
         compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
         "{output}"
