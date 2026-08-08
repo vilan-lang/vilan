@@ -48992,3 +48992,54 @@ fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
         "#,
     );
 }
+
+// --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------
+//
+// The payoff the survey measured: eleven of the fifteen payload-free enums in
+// the whole standard library existed only to be converted to a host string,
+// all in `std/src/style.vl`, 52 `match` arms that delete outright. The strings
+// moved from the wrappers to the declarations, so the TYPE now says at its
+// declaration what was only discoverable by reading a function 300 lines away.
+//
+// These pin the behavior the deletion has to preserve, at the shapes §2.1 calls
+// out as the ones a name convention would have got wrong.
+
+#[test]
+fn b76_style_keyword_enums_carry_their_css_keywords() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, JustifyContent, UserSelect };
+        fun main() {
+            // The five §2.1 names no case convention produces.
+            print(AlignItems::Start.value());
+            print(AlignItems::End.value());
+            print(JustifyContent::Between.value());
+            print(Display::Hidden.value());
+            print(UserSelect::Off.value());
+        }
+        "#,
+        "flex-start\nflex-end\nspace-between\nnone\nnone\n",
+    );
+}
+
+#[test]
+fn b76_style_wrappers_still_write_the_same_declaration() {
+    // The wrappers are one line now (`self.raw("display", value.value())`), and
+    // what they write must not have moved. A class name is a content hash of
+    // `key|declaration`, so these two are the declarations themselves: write
+    // `"inline_block"` instead of `"inline-block"` and both change.
+    // (`vilan/test/style.css` pins the declaration text itself, byte for byte.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, RadialExtent, Style, style };
+        fun main() {
+            let card = const style().display(Display::InlineBlock).align_items(AlignItems::End);
+            print(card.class_list());
+            print(RadialExtent::ClosestCorner.value());
+        }
+        "#,
+        "sfatq7m s1g8z7cm\nclosest-corner\n",
+    );
+}
