@@ -8,6 +8,18 @@ tracks the latest state.
 
 ## Unreleased
 
+**A method that returns one of its receiver's fields hands back a copy, not the field.** `fun make(&self): (i32, i32) { self.pair }` returned the receiver's storage itself, so `let p = h.make(); h.pair.1 = 99` changed `p` — and a `List` field returned the same way grew when the receiver's did. The bare-`self` spelling of the same method, one character apart, already copied.
+
+Every binding, argument pass, field initialization and return copies; a return through a parameter the body does not own has copied since the store rule landed. The exemption that let this through was written for `&`/`&mut` parameters and justified by view projections — "returning through one is an alias on purpose". But a loaned parameter is exactly storage the returning frame does not own, and whether an alias leaves is decided by the *signature*, not by which parameter the body happened to read. A function that returns `(i32, i32)` returns a value; one that returns `&mut (i32, i32)` returns a projection, and that one still hands back the alias, as it must.
+
+The distinction has to be drawn at the signature because references are transparent in the type system: inside `fun copy(&self): Holder { self }`, `self` looks exactly like a view, and the only thing that says the result is a `Holder` by value is the return type. That shape used to alias the receiver too, and copies now.
+
+Nothing in the standard library or the test corpus returns a place through a `&`/`&mut` parameter, so no emitted program changed except the fixture that pins the two shapes side by side.
+
+Known and filed: a by-value function that hands its view parameter straight back is still *classified* as borrowing it, so its result binds as a view (it cannot be `mut`). The value is a copy now, which is the fix; the classification is unchanged from before and only ever restricts, and tightening it turns the program into a view-escape error, which is a different rule's question.
+
+---
+
 **Writing over a resource-holding field destroys what it replaces.** `slot.held = Holder::Empty` used to destroy nothing. The value that had been in `held` was gone from the program and its destructor never ran — no diagnostic, no output, the same silent leak a write through a `&mut` view had until last release, one spelling over.
 
 The rule that governs this ("assigning onto a place that still holds a resource drops the old value first") was written about a *binding*, and implemented about a binding: only `holder = …` enrolled. The neighbouring rule, which makes a resource field readable only by loan and rejects moving one out of a live aggregate, is about *reading* a field. Writing over one fell between them, so nothing covered it — on an owned struct, on a tuple element, on a fixed-array element, and through a `&mut` equally.

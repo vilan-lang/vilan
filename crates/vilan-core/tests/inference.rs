@@ -5232,19 +5232,22 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
 // keeps it (A20, via `own`). See proposal/element-clones.md.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// B100 (the return rule's loan hole). §3 of element-clones.md exempted a
+// `&`/`&mut` parameter from the return copy, framed as "returning through one
+// is rule 3's `borrows` projection, deliberately an alias". That is a fact
+// about the RETURN, not about the place: a function whose signature hands back
+// a VALUE hands back a value, whatever convention the place it read is under.
+// R3's own list calls bare, `&` and `&mut` all loans, and the bare half already
+// copied — the asymmetry was the bug. See proposal/element-clones.md §9.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "found by B97: a `ret place` from a loan receiver hands back the storage uncopied"]
 fn a_returned_field_place_copies_out_of_its_receiver() {
-    // Bycatch of B97's measurement (capture-clones.md §9.1), verified, filed.
-    // Rule 1 at the RETURN seam: `fun make(&self): (i32, i32) { self.pair }`
-    // emits `return self[0]`, so the caller's result IS the receiver's field
-    // storage and a later write to the receiver shows through it. The receiver
-    // is a LOAN, so the value leaving the body outlives nothing it owns — the
-    // same "a place read into something that outlives the expression must
-    // copy" the list/struct literal seams already enforce (B54), at the seam
-    // that hands a value back. `capture-clones.md` §7.7's "an owned call result
-    // needs no rule: nothing else names it" is true of the capture pass and
-    // false of this function's own body. Prints 99.
+    // The filed repro (B97's bycatch), now closed. `fun make(&self): (i32, i32)
+    // { self.pair }` emitted `return self[0]`, so the caller's result WAS the
+    // receiver's field storage and a later write to the receiver showed through
+    // it. Printed 99.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -5255,6 +5258,349 @@ fn a_returned_field_place_copies_out_of_its_receiver() {
         fun main() {
             mut h = Holder { pair = (7, 3) };
             let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_place_copies_out_of_a_mut_receiver() {
+    // `&mut self` is the same loan with a different writability, and the return
+    // seam never asked about writability — the caller's storage outlives the
+    // call either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&mut self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_of_a_view_parameter_copies() {
+    // The free-function spelling: nothing about this is special to a receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun make(h: &Holder): (i32, i32) { h.pair }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = make(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_view_receiver_forwarded_whole_into_a_by_value_return_copies() {
+    // The shape that decides how the exemption is spelled. Asking whether the
+    // returned PLACE is a view answers the wrong question here — references are
+    // transparent, so `self` inside `&self` is a view by every test — while the
+    // signature says plainly that what leaves is a `Holder`, by value. The
+    // exemption reads the signature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let c = h.copy();
+            h.pair.1 = 99;
+            print(c.pair.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_nested_field_of_a_receiver_copies() {
+    // The copy lands at the LEAF, so the depth of the projection is irrelevant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun make(&self): (i32, i32) { self.inner.pair }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { pair = (7, 3) } };
+            let p = h.make();
+            h.inner.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_list_field_of_a_receiver_copies() {
+    // The A20 shape one seam over: the result's ELEMENTS were the receiver's,
+    // so growing the result grew the receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        impl Holder {
+            fun items_of(&self): List<i32> { self.items }
+        }
+        fun main() {
+            mut h = Holder { items = [1, 2] };
+            mut xs = h.items_of();
+            xs.push(9);
+            print(h.items.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_returned_field_copies_in_the_tail_arm_that_owes_it() {
+    // Keyed by the tail LEAF, so an `if`/`match` tail copies only in the arms
+    // that hand back the receiver's storage — the constructed arm stays free.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun pick(&self, first: bool): (i32, i32) {
+                if first { self.pair } else { (0, 0) }
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.pick(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_early_ret_of_a_receivers_field_copies() {
+    // The `ret` statement is a return seam like the tail is; both feed
+    // `return_sites`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&self, early: bool): (i32, i32) {
+                if early { ret self.pair }
+                (0, 0)
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_projection_still_returns_the_alias() {
+    // The elision the rule must not eat, and the reason the exemption exists at
+    // all: a signature that returns `&mut T` hands back an alias on purpose
+    // (rule 3's sanctioned escape), so writing through the result reaches the
+    // receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            h.slot() = (1, 2);
+            print(h.pair.0);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_readonly_borrows_projection_still_returns_the_alias() {
+    // The `&` half of the same exemption — a read-only projection is still a
+    // projection, and its result must keep naming the receiver's storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let v = h.peek();
+            h.pair.1 = 99;
+            print((*v).1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_view_parameter_forwarded_into_a_view_return_still_aliases() {
+    // The exemption's own shape, and the twin of the by-value case above: the
+    // SAME body — a view parameter handed straight back — is an alias here and
+    // a copy there, and only the signature separates them. This is what the
+    // `returns_view` question is for; nothing else in the pass distinguishes
+    // the two, because a `&mut place` leaf is not a place at all and never
+    // reaches the seam.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same(v: &mut Holder): &mut Holder borrows v { v }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = same(&mut h);
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_receiver_forwarded_into_a_view_return_still_aliases() {
+    // The method spelling of the same exemption, which is `copy(&self):
+    // Holder { self }` with one word changed in the return type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = h.me();
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_bare_self_receivers_field_return_was_already_right() {
+    // The neighbour that names the asymmetry: R3 calls bare `self`, `&self` and
+    // `&mut self` all loans, and the bare one already copied. Pinned so the two
+    // stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_own_parameter_still_moves_out_of_a_view_receivers_neighbour() {
+    // The `own` elision, unchanged: the caller already gave the value up, so the
+    // fluent-builder shape stays free. Proven by the ABSENT `__clone`, since
+    // behaviour cannot see the difference.
+    let source = r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun through(own h: Holder): Holder { h }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            let c = through(h);
+            print(c.pair.1);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an `own` parameter's return copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn a_returned_scalar_field_of_a_receiver_needs_no_copy() {
+    // The type filter is unchanged: a scalar read IS the copy, so no `__clone`
+    // is owed and none is emitted.
+    let source = r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder {
+            fun get(&self): i32 { self.n }
+        }
+        fun main() {
+            mut h = Holder { n = 7 };
+            let v = h.get();
+            h.n = 99;
+            print(v);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(!js.contains("__clone"), "a scalar return copied:\n{js}"),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "7\n");
+}
+
+#[test]
+fn a_closure_returning_its_own_view_parameters_field_copies() {
+    // The closure path, already right before the fix (an unannotated closure
+    // parameter is bare) and pinned so the seam's two spellings stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun apply(h: &Holder, f: |&Holder| (i32, i32)): (i32, i32) { f(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = apply(&h, |g| g.pair);
             h.pair.1 = 99;
             print(p.1);
         }

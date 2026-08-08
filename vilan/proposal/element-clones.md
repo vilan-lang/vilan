@@ -291,3 +291,125 @@ local still donates — proven by the absent `__clone`, since behaviour cannot
 see the difference), one the R9 fix above. **No corpus golden moved**: no
 in-tree program returns a capture out of a closure, which is also why this
 survived to be found by review rather than by a failure.
+
+## 9. B100 — the return rule's loan hole, 2026-08-07
+
+> **Status: SHIPPED.** §3's third exemption, refuted. Found by B97's
+> measurement (`capture-clones.md` §9.1) and filed there: `fun make(&self):
+> (i32, i32) { self.pair }` emitted `return self[0]`, so the caller's result
+> WAS the receiver's field storage and a later write to the receiver showed
+> through it. §7.7's "an owned call result needs no rule: nothing else names
+> it" is true of the capture pass and false of that body.
+
+### 9.1 The exemption was about the wrong thing
+
+§3 named three exemptions and §8.1 restated the first two as one fact about
+FRAMES — *the returning frame owns this storage, and it dies at the return*.
+The third was never that fact:
+
+> **A `&`/`&mut` parameter is a borrow.** Returning through one is rule 3's
+> `borrows` projection, an alias on purpose.
+
+A loaned parameter is precisely storage the returning frame does **not** own,
+so it fails §8.1's test outright. What the sentence was really about is the
+RETURN: a function whose signature hands back a view hands back an alias. That
+is a property of the signature, not of the place the body happened to read.
+
+R3's own list is what makes the asymmetry plain — bare, `&` and `&mut`
+parameters are *all* loans, and the bare one already copied. `fun make(self):
+(i32, i32) { self.pair }` returned 3 while `fun make(&self): (i32, i32) {
+self.pair }` returned 99, from bodies that differ by one character.
+
+> **A by-value return of a place the frame does not own copies.** The view
+> exemption is the signature's: `&T` / `&mut T` out is rule 3's projection.
+
+### 9.2 The shapes, measured
+
+Fourteen probes against the pre-fix tree (`next` @ `45f5d66`). Each returns a
+place through a loan and writes the source afterwards; each wants 3.
+
+| shape | body | before |
+|---|---|---|
+| `&self` receiver's field | `self.pair` | 99 |
+| `&mut self` receiver's field | `self.pair` | 99 |
+| `&` free parameter's field | `h.pair` | 99 |
+| **the receiver forwarded whole** | `self`, returning `Holder` | 99 |
+| nested field | `self.inner.pair` | 99 |
+| a `List` field (the A20 shape) | `self.items` | 3 elements, want 2 |
+| a tail `if` arm | `if first { self.pair } …` | 99 |
+| an early `ret` | `ret self.pair` | 99 |
+| `&mut` projection (negative) | `&mut self.pair` + `borrows` | alias, correct |
+| `&` projection (negative) | `&self.pair` + `borrows` | alias, correct |
+| view parameter into a VIEW return (negative) | `v`, returning `&mut Holder` | alias, correct |
+| bare `self` receiver's field (negative) | `self.pair` | 3, already right |
+| `own` parameter (negative) | `items` | moves, already right |
+| scalar field (negative) | `self.n` | no copy owed |
+
+A view LOCAL cannot be returned at all — rule 3's `check_view_escape` rejects
+`let v = &self.pair; v` — so the `None` (local) arm never sees a loan, and the
+"a local is a dead owner" elision needs no amendment.
+
+### 9.3 The candidates, measured before choosing
+
+| | goldens moved | analyzer gate | shapes correct |
+|---|---|---|---|
+| **(a)** every loaned parameter owes a copy; the exemption stays the LEAF's own view-ness | **0** | 1942 pass | 13 / 14 |
+| **(b)** (a), plus: the exemption reads the SIGNATURE (`returns_view`) | **0** | 1942 pass | 14 / 14 |
+| **(c)** (b), plus: `infer_borrows` gated on `returns_view` too | 0 | **1 FAIL** | 13 / 14 |
+
+**(a) leaves one shape**, and it is the shape that decides how the exemption
+is spelled: `fun copy(&self): Holder { self }`. References are transparent, so
+`self` inside `&self` is a view by every test the pass can run — and the
+signature says plainly that what leaves is a `Holder`, by value. Asking the
+LEAF answers the wrong question. `Function::returns_view` is the answer, the
+declared twin of the existing `returns_mut_view`; a closure never has one,
+which is right, because rule 3 forbids a closure returning a view at all.
+
+**(c) is the root-cause fix of a real residual, and it is refused here.** Under
+(b), `infer_borrows` still records `fun copy(&self): Holder { self }` as
+borrowing its receiver (its `Expr::Local` arm asks only whether the forwarded
+name is a view parameter), so the result binds as a view at every call site
+even though it is now a copy. Gating that arm on `returns_view` makes the two
+passes agree — and makes `check_view_escape` **reject the body outright** ("a
+view cannot escape its scope"), turning a program that compiles today into an
+error. That is rule 3's call, not rule 1's, and it wants its own measurement.
+The residual left standing is conservative (a view binding is the more
+restricted one) and unchanged from before this fix. Filed.
+
+**(b) ships.**
+
+### 9.4 Coverage
+
+Sixteen pins in `crates/vilan-core/tests/inference.rs`, three plants:
+
+| plant | red |
+|---|---|
+| the `&`/`&mut` exemption restored | 8 |
+| the exemption reads the LEAF — candidate (a) | 1 (`a_view_receiver_forwarded_whole_into_a_by_value_return_copies`) |
+| the view-return exemption removed | 2 (both forwarded-into-a-view-return pins) |
+
+The pins green under every plant are exactly the ones that pin UNCHANGED
+behavior: the two `&place` projections (a `&mut place` leaf is not a place at
+all, so it never reaches the seam), bare `self`, the `own` parameter, the
+scalar, and the closure.
+
+**No corpus golden moved**, and not by luck: a sweep of every `.vl` in
+`vilan/test` and `vilan/std/src` finds **zero** functions returning a place
+rooted at a `&`/`&mut` parameter. The shape survived to be found by review
+rather than by a failure, exactly as §8.4's closure half did.
+`element-clones.vl` gains `viewed_of` and `viewed_projection` — the same leaf
+shape with opposite answers, `return __clone(holder[0])` against `return
+holder`, so the byte diff between them IS the rule. The golden moved
+**additively**.
+
+### 9.5 The SHARE elision does not twin here
+
+§9.3 of `capture-clones.md` declined to extend the capture pass's SHARE elision
+to `borrows`-call subjects; the return seam declines for a stronger reason.
+SHARE asks whether *nothing can write either side of the alias*, and at a
+return the callee cannot see the answer: `h.make()` followed by `h.pair.1 = 99`
+is the filed repro, and the write is in the caller. A read-only body proves
+nothing about the caller's later writes, so a `&self` receiver earns no
+exemption. The elision that *would* apply is §7's first open item — an escape
+summary consulted at the CALL site, where deadness is visible — and B100's
+copies join that item rather than motivating a new one.

@@ -278,6 +278,14 @@ pub struct Function<'src> {
     /// Whether the (view) return type is `&mut` rather than `&` — so a binding of
     /// the call (`let v = obj.slot()`) is writable through `*v`.
     pub returns_mut_view: bool,
+    /// Whether the return type is a **view at all** (`&T` or `&mut T`) — the
+    /// signature's own statement that what leaves is an alias rather than a
+    /// value (rule 3's sanctioned `borrows` projection). References are
+    /// transparent in the type system, so the declaration is the only record of
+    /// it; `returns_mut_view` is this answer's writability half. B100 reads it
+    /// at the return seam: a **by-value** return of a place the frame does not
+    /// own copies, and this is what says the return is not by value.
+    pub returns_view: bool,
     /// Declared `[must_use]`: dropping a call's result is a warning.
     pub must_use: bool,
     /// Declared `[rpc]`: callable over the wire as part of a service's surface
@@ -11077,6 +11085,18 @@ impl<'src> Analyzer<'src> {
                 }
             }
             // A `&`/`&mut` parameter forwarded straight out (`same(x) = x`).
+            //
+            // Deliberately NOT gated on `Function::returns_view`, though B100
+            // makes that gate tempting: `fun copy(&self): Holder { self }` now
+            // returns a COPY, so calling it a borrow leaves its result
+            // classified as a view at every call site (it cannot be `mut`, and
+            // a write to it lowers as a write-through). Narrowing the arm was
+            // measured and refused — with `borrows` empty, `check_view_escape`
+            // rejects the body outright ("a view cannot escape its scope"),
+            // which answers a *rule 3* question this arc did not ask and breaks
+            // programs that compile today. The stale classification is
+            // conservative (a view binding is the more restricted one) and
+            // unchanged from before B100; filed rather than ridden in.
             Some(Expr::Local(_)) => {
                 if let Some(position) = self.projected_parameter_position(function_id, leaf_id) {
                     positions.insert(position);
@@ -14019,18 +14039,25 @@ impl<'src> Analyzer<'src> {
     fn compute_return_clone_sites(&mut self) -> HashMap<Id, CopyDecision> {
         // Each seam with the closure it belongs to, if any: the capture question
         // only exists inside one, and its answer needs that closure's bindings.
-        let mut seams: Vec<(Id, Option<Id>)> = self
+        // A closure cannot declare a view return — rule 3 rejects a view
+        // escaping, and `check_view_escape` is what enforces it — so the
+        // `returns_view` flag is false for every closure seam.
+        let mut seams: Vec<(Id, Option<Id>, bool)> = self
             .closures
             .values()
-            .map(|closure| (closure.return_, Some(closure.id)))
+            .map(|closure| (closure.return_, Some(closure.id), false))
             .collect();
-        seams.extend(
-            self.return_sites
-                .iter()
-                .map(|(_, value_id)| (*value_id, None)),
-        );
+        seams.extend(self.return_sites.iter().map(|(function_id, value_id)| {
+            (
+                *value_id,
+                None,
+                self.functions
+                    .get(function_id)
+                    .is_some_and(|function| function.returns_view),
+            )
+        }));
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
-        for (seam, closure_id) in seams {
+        for (seam, closure_id, returns_view) in seams {
             let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
             self.collect_tail_leaves(seam, &mut leaves);
@@ -14039,14 +14066,16 @@ impl<'src> Analyzer<'src> {
                     continue;
                 };
                 // Storage the returning frame does not own outlives the return
-                // and must be copied. Three ways that happens:
+                // and must be copied. Two ways that happens:
                 let owes_copy = match self.parameters.get(&root).map(|it| it.convention) {
-                    // A `&`/`&mut` parameter is a borrow — returning through it
-                    // is rule 3's `borrows` projection, deliberately an alias.
-                    Some(Convention::Ref | Convention::RefMut) => false,
-                    // A bare parameter is the CALLER's storage, which outlives
-                    // the call.
-                    Some(Convention::Bare) => true,
+                    // Every LOANED parameter — bare, `&`, `&mut` alike (R3's own
+                    // list) — is the CALLER's storage, which outlives the call.
+                    // B100: the `&`/`&mut` half read as an exemption because a
+                    // `borrows` projection returns an alias on purpose, but that
+                    // is a fact about the RETURN, not about the place; a by-value
+                    // return of a loaned place is the store rule at the return
+                    // seam and copies like any other.
+                    Some(Convention::Ref | Convention::RefMut | Convention::Bare) => true,
                     // An `own` parameter is the callee's own (the caller copied
                     // it in, or donated a dead one), and a local is a dead owner
                     // at the return — so a fluent builder
@@ -14062,10 +14091,13 @@ impl<'src> Analyzer<'src> {
                 if !owes_copy {
                     continue;
                 }
-                // Rule 3 again: a returned view is a `borrows` projection.
-                if self.assignment_target_is_view(leaf)
-                    || self.resource_value_places.contains(&leaf)
-                {
+                // Rule 3: a VIEW return is a `borrows` projection, an alias on
+                // purpose — and the signature is what says so. References are
+                // transparent in the type system, so asking the returned place
+                // whether it is a view answers a different question: `fun
+                // copy(&self): Holder { self }` forwards a loan into a by-value
+                // return, and the caller's result must not be the receiver.
+                if returns_view || self.resource_value_places.contains(&leaf) {
                     continue;
                 }
                 if let Some(type_id) = self.place_value_type_id(leaf) {
@@ -15981,6 +16013,10 @@ impl<'src> Analyzer<'src> {
                             returns_mut_view: matches!(
                                 function.return_type.as_deref().map(|spanned| &spanned.0),
                                 Some(Node::Reference(true, _))
+                            ),
+                            returns_view: matches!(
+                                function.return_type.as_deref().map(|spanned| &spanned.0),
+                                Some(Node::Reference(_, _))
                             ),
                             must_use: function.must_use,
                             platform_fence: function

@@ -101,9 +101,15 @@ list element, a tuple element, a struct field, or a variant payload is stored
 in a slot of a new aggregate that outlives the literal, so it copies there too.
 The same holds for a place handed to a parameter declared `own` — a signature's
 way of saying the callee keeps it, which is how `List::push` is written — and
-for a place a body **returns** that it does not own, i.e. one reached through a
-by-value parameter. Together these are what make "a call owns its result" true,
-which is the premise every elision below rests on:
+for a place a body **returns** that it does not own, which is every place
+reached through a **loaned** parameter: bare, `&`, and `&mut` alike (§6.8's R3
+calls all three loans). What decides is the *return*, not the place: a
+signature that hands back a value hands back a value, so `fun make(&self):
+(i32, i32) { self.pair }` copies, while a signature that hands back a **view**
+(`fun slot(&mut self): &mut (i32, i32) borrows self`) is rule 3's sanctioned
+projection and keeps naming the receiver's storage. Together these are what
+make "a call owns its result" true, which is the premise every elision below
+rests on:
 
 ```vilan
 import std::print;

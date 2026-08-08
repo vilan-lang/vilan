@@ -22,6 +22,14 @@
 // results used to share the receiver's elements; the copies live inside std
 // (`push`'s `own item`, `sort_by`'s `own self`), so what this pins here is the
 // OUTPUT.
+//
+// `viewed_of` / `viewed_projection` are B100: R3 calls bare, `&` and `&mut`
+// parameters all loans, and the return seam had exempted the two spelled with
+// an `&`. A BY-VALUE return of a loaned place copies like any other, so
+// `viewed_of` binds its tail WITH `__clone`; a VIEW return is rule 3's
+// `borrows` projection and still hands back the alias, so `viewed_projection`
+// emits none. Same seam, same leaf shape, opposite answers — and only the
+// return type separates them.
 import std::io::print;
 import std::compare::Ordering;
 import std::option::Option::{ self, Some, None };
@@ -62,6 +70,14 @@ fun first_of(primary: List<i32>, fallback: List<i32>): List<i32> {
 
 fun own_through(own items: List<i32>): List<i32> {
 	items
+}
+
+fun viewed_of(holder: &Holder): List<i32> {
+	holder.items
+}
+
+fun viewed_projection(holder: &mut Holder): &mut Holder borrows holder {
+	holder
 }
 
 fun elements_are_independent() {
@@ -108,5 +124,11 @@ fun main() {
 	mut owned = own_through([1, 2]);
 	owned.push(9);
 	print(owned.len());
+	mut viewer = Holder { items = [1, 2] };
+	mut lifted = viewed_of(&viewer);
+	lifted.push(9);
+	print(viewer.items.len());
+	viewed_projection(&mut viewer).items.push(9);
+	print(viewer.items.len());
 	elements_are_independent();
 }
