@@ -48419,3 +48419,27 @@ fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
         0,
     );
 }
+
+/// The whole arc, behaviourally: the shapes above run, and run the same. The
+/// counts are the point (a duplicate instance is behaviour-identical, which is
+/// why the pins above count), but a schedule change that makes every call take
+/// the two-phase order has to keep the programs correct too.
+#[test]
+fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply<T>(render: |T| i32, value: T): i32 {
+            render(value)
+        }
+        fun apply_last<T>(value: T, render: |T| i32): i32 {
+            render(value)
+        }
+        fun main() {
+            print(apply(|n| n * 2, 21));
+            print(apply_last(21, |n| n * 2));
+        }
+        "#,
+        "42\n42\n",
+    );
+}

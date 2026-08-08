@@ -18490,26 +18490,6 @@ impl<'src> Analyzer<'src> {
             })
     }
 
-    /// Whether some CLOSURE argument stands before some non-closure argument —
-    /// the one order in which typing the arguments POSITIONALLY types a closure
-    /// before the argument that could bind the generic its parameter is written
-    /// over. With every closure last, positional order already is binding order.
-    fn a_closure_argument_precedes_a_value_argument(&self, argument_ids: &[Id]) -> bool {
-        let is_closure = |argument_id: &Id| {
-            matches!(
-                self.expr_id_to_expr_map.get(argument_id),
-                Some(Expr::Closure(_))
-            )
-        };
-        let Some(first_closure) = argument_ids.iter().position(is_closure) else {
-            return false;
-        };
-        argument_ids
-            .iter()
-            .skip(first_closure)
-            .any(|argument_id| !is_closure(argument_id))
-    }
-
     /// Whether some NON-closure argument's type has not landed on this attempt,
     /// so a generic that argument would bind cannot bind yet. Closure arguments
     /// are excluded: a closure's own type is `Unresolved` until its body types,
@@ -21659,25 +21639,32 @@ impl<'src> Analyzer<'src> {
                     // reaches an `Unresolved` argument, hoisted ahead of the
                     // closures rather than added.
                     //
-                    // Only for that ORDER. When every closure argument already
-                    // stands after the arguments that could bind, the loop's own
-                    // order IS the two-phase order and there is nothing to hoist,
-                    // so the call keeps the exact inference schedule it has
-                    // always had — which matters, because hoisting
-                    // unconditionally emits a duplicate `Signal::new` and moves
-                    // three corpus goldens (`reactive`, `reactive-flatten`,
-                    // `signal-update`, behaviour-identical, +1 instance each).
+                    // UNCONDITIONAL since B102. For two cycles this ran only
+                    // when a closure argument actually stood before a value one,
+                    // because hoisting on every call emitted a duplicate
+                    // `Signal::new` and moved three corpus goldens (`reactive`,
+                    // `reactive-flatten`, `signal-update` — behaviour-identical,
+                    // +1 instance each). B90 filed the cause as type-id-keyed
+                    // instance identity; B95 refuted that by measurement (with
+                    // the key made structural, un-gating still split the
+                    // instance) and named the real one: substitutions of
+                    // different SHAPE, `{T: i32}` gated against `{T: i32, U:
+                    // i32}` hoisted.
                     //
-                    // B90 filed that as type-id-keyed instance identity, and B95
-                    // proved it is not: with the instance key made STRUCTURAL
-                    // (`transformer.rs`'s `type_key`), un-gating still emits the
-                    // duplicate, and the probe says why — the two instances of
-                    // `Signal::new` carry substitutions of different SHAPE, `{T:
-                    // i32}` gated against `{T: i32, U: i32}` hoisted. B102 closes
-                    // that at the record (above); the gate comes off with it.
-                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_))
-                        && self.a_closure_argument_precedes_a_value_argument(argument_ids)
-                    {
+                    // B102 traced the extra entry to its writer, and it is not a
+                    // superset this pass produces — it binds exactly `{T: U}`,
+                    // the entry the positional loop would have bound. The extra
+                    // one is the LOOP's, and it exists BECAUSE the parameter is
+                    // already bound: reconciling the substituted parameter
+                    // against the argument reports the caller's own generic
+                    // bound to ITSELF. Recording that is what split the instance,
+                    // and the record is where it is now refused — the call's
+                    // substitution keys on the callee's own constraints, and
+                    // return-type-only inference declines a generic "inferred"
+                    // to be itself. With both, the schedule is free to be the
+                    // two-phase one on every call: all 112 corpus goldens are
+                    // byte-identical with this hoist unconditional.
+                    if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_)) {
                         self.bind_callee_own_generics(
                             target_id,
                             argument_ids,
