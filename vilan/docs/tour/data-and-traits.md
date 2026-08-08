@@ -63,6 +63,44 @@ becomes a compile error. That's the feature.
 `Option` and `Result` are ordinary enums from std, with no special
 cases.
 
+### Backed enums
+
+A variant with no payload can instead carry the value it stands for —
+the number or string the outside world already speaks:
+
+```vilan
+import std::print;
+import std::option::Option;
+
+enum Align {
+	Start = "flex-start",
+	Center = "center",
+	End = "flex-end",
+}
+
+fun main() {
+	// The variant IS its backing value at runtime, so `.value()` is free.
+	print(Align::Start.value());
+
+	// And back, for a value you did not construct — `None` outside the set.
+	print(match Align::parse("center") {
+		Option::Some(let align) => align.value(),
+		Option::None => "unknown",
+	});
+}
+```
+
+The backing value is written, never derived from the name: `Start` is
+`"flex-start"` because that is what CSS calls it. Integers work the same
+way (`enum Ordering { Less = -1, Equal = 0, Greater = 1 }`) and are the
+older half of the same feature.
+
+Two variants may not share a backing value, an enum may not mix strings
+and integers, and a variant with a payload may not have one at all —
+there is nowhere to put a payload in a bare string. `match` still matches
+*variants*: `match align { "flex-start" => … }` is an error, because the
+backing value is a representation, not a second spelling of the name.
+
 ## impl: methods and statics
 
 Methods live in `impl` blocks, separate from the data:

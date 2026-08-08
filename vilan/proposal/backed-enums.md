@@ -972,3 +972,156 @@ is no analogous string story and no proposal for one. If one appears, the
 backing set widens by the same argument that admits `str`. Nothing to decide
 today. Noted only so a future reader does not mistake §3.4's list for a
 closed set on principle rather than on demand.
+
+## 8. Implementation notes (v0.35.0)
+
+Shipped as recorded, every settled recommendation in §3 standing and §7.2
+enforced as deferred. What follows is what the build found — the places
+the paper's design met the code and needed a decision it had not made,
+and the two claims that were re-checked rather than inherited.
+
+### 8.1 What the paper got right, checked against the build
+
+- **§1.4/P2's claim that `match` needs no new codegen is exact, not
+  approximate.** The pin compares two WHOLE emissions — a `match` over a
+  three-variant string-backed enum and a `match` over a raw `str` with a
+  `_` arm — and asserts byte equality. They are identical.
+  `scalar_variant_test` needed a `js::Node::String` where its
+  `js::Node::Number` was, and nothing else.
+- **§5's "the corpus goldens should not move at all for the integer
+  path" held, and then some.** No corpus golden moved for the *string*
+  path either, including `style.mjs` and `style.css` after §4.2's
+  rewrite: styles construct inside `const`, so the eleven wrappers were
+  folded at build time and never reached the emitted output. The wrapper
+  really was pure compile-time translation between two representations
+  that are now one.
+- **§1.6's "the divergence costs nothing today" was re-verified, not
+  assumed.** Still no `[derive(Wire)]` or `[derive(Json)]` enum anywhere
+  in `vilan/std/src/`; `arena.vl:22` remains the only derive site and it
+  is a struct.
+- **§4.2's `−63` for `style.vl` is exactly right** (126 deletions, 63
+  insertions). `RadialExtent`'s inline `match` inside a struct literal
+  did collapse to `geometry = extent.value()`, which is the case §2.1
+  flagged as showing the conversion wants to be an expression.
+
+### 8.2 Decisions the paper left open, and how they were made
+
+**(a) `value()`/`parse()` are generated as vilan SOURCE, not built into
+the compiler.** §3.8 specifies the members and their lowering but not the
+mechanism. Source generation — through the same channel `[derive(..)]`
+uses, collected in its own pass because a backing value is not a derive
+and must be reached however the enum is wrapped — was chosen for one
+reason above the others: it makes §3.8's collision rule fall out of B57
+rather than needing a rule of its own. A user's `fun value(self)` on a
+backed enum meets the duplicate-inherent error, which is precisely "a
+hard error, naming the synthesized member". The `Option` construction,
+monomorphization, demand-driven emission and the docs gate come free.
+
+`value()` still lowers to the identity, as §3.8 requires: the transformer
+folds `x.value()` to `x` (`backed_value_members`), leaving the generated
+body with no callers, so it emits nothing. The body is the semantics the
+fold has to agree with rather than dead weight.
+
+B57's duplicate message gained one case in the process: a
+compiler-synthesized first declaration has no file to point at, so the
+note says what it is instead of pointing the author's own declaration
+back at itself, and a synthesized member now always sorts first so the
+error lands on the declaration the author can edit.
+
+**(b) `parse` is an `if`/`else if` chain, not a `match`.** A `match`
+cannot be written against a NEGATIVE literal pattern, and
+`Ordering { Less = -1 }` is the one backed enum std already shipped. The
+emission is the same `===` chain either way. §3.8's note that a
+module-level lookup object is the better emission for a large variant set
+remains an open implementation choice; no threshold is fixed.
+
+**(c) The integer backing type is `i32`, widening to `i53`.** §3.8 says
+"the enum's backing type" without saying which integer. `i32` is the
+language's default integer, so `Ordering::Greater.value() == 1` needs no
+suffix; `i53` is the widest integer a JS number holds exactly, and a
+backed enum IS a JS number. A discriminant outside `i53` gets NO
+conversions at all — see §8.4.
+
+**(d) A generic enum gets no conversions.** A backed generic enum's
+parameter can only be phantom (§3.3 rejects payloads), and `Enum::parse`
+on one would have no way to bind it. The `[derive(..)]` generators
+already skip generic enums for the same reason. Recorded rather than
+diagnosed: the declaration stays legal and lowers correctly.
+
+**(e) `Wire`/`Json` decode delegates to `parse` rather than matching the
+value inline.** `from_json_value` is
+`Enum::parse(coerce_*(value)).ok_or(..)` and `to_json` is
+`self.value().to_json()`, so neither direction re-implements JSON quoting
+and the unknown-value path is §3.9's `Err` by construction. This required
+the macro reflection surface to grow the two facts a generator needs:
+`Variant.backing` (the literal AS WRITTEN, `""` for none — so an empty
+string backing stays distinguishable) and `EnumItem.backing_type`. Both
+generators are updated in step, the std macros in `json.vl` (what a real
+std runs) and the Rust fallback in `analyzer.rs` (fixture stds and macro
+worlds).
+
+**(f) §7.2's refusal searches the whole return type.** `Option<Align>`
+and `List<Align>` carry a host-supplied backing value in exactly the same
+way as a bare `Align`, and the wrapper path is what each of them wants,
+so the check follows generic arguments, tuple elements and array
+elements. It does NOT follow a nominal struct's fields: a struct crossing
+the boundary is a different hazard, and one the language already has. The
+check runs after the walk, so the refusal does not depend on declaration
+order. Both backings are refused — §7.2 is about the host boundary, not
+about strings — and a sweep found nothing in the tree that flips.
+
+**(g) The `= true` case is refused by the PRODUCTION.** §3.4 rejects
+`bool`, and the parser now commits once it sees `=` rather than
+backtracking, so the message reads "expected an integer, a string" at the
+offending token instead of blaming the `=`.
+
+### 8.3 §4.2's `json.vl` contingency: NOT taken
+
+§4.2 makes `json.vl`'s 15 lines conditional on §7.2 resolving in favour,
+and §7.2 was DEFERRED. The deletion would need `external fun kind(self):
+JsonKind` — an extern returning a backed enum, which is exactly what the
+deferral forbids, and the refusal added in this arc rejects it.
+
+The honest re-read of §4.2's contingency says leave it, and it is left.
+The intrinsic being std's own code does not change the shape of the
+hazard: `kind()` is a `[extern]` binding to a host helper, and the
+compiler cannot tell std's host code from anyone else's. §7.2's own
+sentence — "if the ruling is to forbid it, §4.2 loses `json.vl`'s 15
+lines and nothing else in the paper changes" — is what happened.
+
+Worth recording for whoever takes §7.2 up again: the sweep found
+`kind()` has **no caller outside `json.vl` itself**. Its four predicates
+are called only from within the file (13 sites), so the conversion is a
+one-file change whenever the deferral lifts, and the two members of the
+documented set that never got a predicate (`"object"`, `"null"`) are
+still uncovered. `docs/std/encoding.md:67` documents `value.tag(): str`
+with `kind()`'s vocabulary in its comment — a pre-existing error, filed
+rather than fixed here.
+
+### 8.4 Two limits found, both pre-existing
+
+- **A discriminant past 2^53 is not representable.** `enum E { A =
+  9007199254740993 }` emits the JS number literal
+  `9007199254740993`, which JavaScript reads as `9007199254740992`. The
+  emission is self-consistent (the `match` compares the same literal), so
+  nothing in-tree miscompiles — but a value crossing a host boundary
+  would. This predates backed enums and is untouched by them; the arc's
+  only concession is that `value()`/`parse()` are not synthesized there,
+  rather than being synthesized with a return type that lies.
+- **bindgen's PROPERTIES keep their TODO.** §4.1 specifies the parameter
+  and return directions; a property is both, through separate externs, so
+  one bound type cannot serve it. The TODO now names the spellings that
+  exist (`Enum::parse(..)` to read, `Enum::Variant.value()` to write),
+  which is what it could not say before. Widening the property emitter to
+  a raw pair plus two forwarders is a bindgen question, not a language
+  one.
+
+### 8.5 §7.1 (`Hashable`) — still open, and now stronger
+
+Unchanged and untouched, as §7.1 recommends. Recording the promised
+observation against `hashable-keys.md`: a string-backed enum is a plain
+JS string, which a host `Map` keys natively, and "the enum IS the string"
+is now the shipped pitch — so `Map<Align, T>` failing on a missing
+`Hashable` is the first thing a user will hit. The case for a
+compiler-derived `Hashable` on bare-lowered enums is stronger than the
+paper could state it.

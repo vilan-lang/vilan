@@ -1143,7 +1143,7 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[resource ]enum Name[<…>] { Variant[(payload)][ = discriminant], … }`.
+            // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants) => {
                 if *resource {
                     self.out.push_str("resource ");
@@ -1157,7 +1157,7 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {");
                     self.indent += 1;
                     let mut prev_end = variants.1.into_range().start + 1;
-                    for ((variant_name, payload, discriminant), span) in &variants.0 {
+                    for ((variant_name, payload, backing), span) in &variants.0 {
                         let range = span.into_range();
                         let after_comments = self.flush_comments_before(range.start, prev_end);
                         if self.has_blank_between(after_comments, range.start) {
@@ -1175,9 +1175,11 @@ impl<'src> Printer<'src> {
                             }
                             self.out.push(')');
                         }
-                        if let Some(discriminant) = discriminant {
+                        // `Display` reprints the literal exactly as written —
+                        // quotes and all for a string backing.
+                        if let Some(backing) = backing {
                             self.out.push_str(" = ");
-                            self.out.push_str(&discriminant.to_string());
+                            self.out.push_str(&backing.to_string());
                         }
                         self.out.push(',');
                         self.flush_trailing_comment(range.end);

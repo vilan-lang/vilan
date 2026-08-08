@@ -88,6 +88,20 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
 
+### Backed enums on the wire
+
+A **backed enum** — one whose variants carry an explicit value, `enum
+Align { Start = "flex-start", … }` — encodes as that value rather than as
+its variant name, for both `Json` and `Wire`. `Align::Start` is
+`"flex-start"` on the wire, not `"Start"`, and it decodes through
+`Align::parse`, so a peer sending a value outside the set is a decode
+error rather than a confidently-wrong variant.
+
+**Adding a backing value to an existing derived enum is a wire-format
+break, and so is removing one.** An enum with no backing value keeps the
+externally-tagged form (`"Start"`, or `{"Text":…}` with a payload), so
+the two shapes are not interchangeable across a version.
+
 ## Bytes
 
 An immutable-length byte array (`Uint8Array` underneath), the currency of

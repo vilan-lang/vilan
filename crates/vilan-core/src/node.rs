@@ -871,50 +871,87 @@ impl<'src> Node<'src> {
 }
 
 // One enum variant: name, the types of its optional data, and an optional
-// explicit discriminant (`Less = -1`).
+// explicit backing value (`Less = -1`, `Start = "start"`).
 pub type EnumVariant<'src> = (
     &'src str,
     Vec<Spanned<Node<'src>>>,
-    Option<Discriminant<'src>>,
+    Option<BackingLiteral<'src>>,
 );
 
-// An explicit enum discriminant, `= (-)? NUMBER`, carried in the PARTS THE
-// LEXER SAW rather than as a value (B79). The grammar's production is an
-// integer, but the number token also admits a fraction (`1.5`) and a type
-// suffix (`1u32`), and its whole part may not fit an `i64` — spellings the
-// parser used to reduce to a value with `unwrap_or(0)`, silently turning an
-// overflow into the perfectly ordinary discriminant `0`. Keeping the spelling
-// lets the analyzer reject each one and quote it back.
+// An explicit enum backing value, `= ( (-)? NUMBER | STRING )`
+// (proposal/backed-enums.md §3.1). The production GENERALIZES the integer
+// discriminant that already existed rather than introducing a second kind of
+// enum: a payload-free variant may carry a compile-time-constant scalar, and
+// an enum whose variants carry one lowers to that scalar bare.
+//
+// Both arms are carried in the PARTS THE LEXER SAW rather than as a value
+// (B79). For a number the grammar's production is an integer, but the token
+// also admits a fraction (`1.5`) and a type suffix (`1u32`), and its whole
+// part may not fit an `i64` — spellings the parser used to reduce with
+// `unwrap_or(0)`, silently turning an overflow into the perfectly ordinary
+// discriminant `0`. For a string the text is the raw source slice, escapes
+// unprocessed, exactly as a `Node::String` carries it. Keeping the spelling
+// lets the analyzer reject what the production does not mean and quote it back.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Discriminant<'src> {
-    // A leading `-` on the magnitude.
-    pub negative: bool,
-    // The number token's whole part: decimal digits, or `0x` + hex digits.
-    pub whole: &'src str,
-    // The fractional part, when the literal was written `1.5`.
-    pub fraction: Option<&'src str>,
-    // A trailing type suffix (`1u32`) or unknown trailer (`1_000` lexes as
-    // `1` with the suffix `_000`).
-    pub suffix: Option<&'src str>,
-    // The whole `(-)? NUMBER` span — what a diagnostic points at.
-    pub span: Span,
+pub enum BackingLiteral<'src> {
+    Int {
+        // A leading `-` on the magnitude.
+        negative: bool,
+        // The number token's whole part: decimal digits, or `0x` + hex digits.
+        whole: &'src str,
+        // The fractional part, when the literal was written `1.5`.
+        fraction: Option<&'src str>,
+        // A trailing type suffix (`1u32`) or unknown trailer (`1_000` lexes as
+        // `1` with the suffix `_000`).
+        suffix: Option<&'src str>,
+        // The whole `(-)? NUMBER` span — what a diagnostic points at.
+        span: Span,
+    },
+    Str {
+        // The raw text between the quotes, escapes unprocessed.
+        text: &'src str,
+        // The whole `"…"` span, quotes included.
+        span: Span,
+    },
 }
 
-impl std::fmt::Display for Discriminant<'_> {
+impl BackingLiteral<'_> {
+    // What a diagnostic points at: the literal, not the `=`.
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Int { span, .. } | Self::Str { span, .. } => *span,
+        }
+    }
+}
+
+impl std::fmt::Display for BackingLiteral<'_> {
     // The literal exactly as written, so the formatter round-trips it and a
-    // diagnostic quotes what the author typed.
+    // diagnostic quotes what the author typed — quotes included for a string,
+    // which is what makes `1` and `"1"` distinguishable in a mixed-backing
+    // message.
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.negative {
-            out.write_str("-")?;
+        match self {
+            Self::Int {
+                negative,
+                whole,
+                fraction,
+                suffix,
+                ..
+            } => {
+                if *negative {
+                    out.write_str("-")?;
+                }
+                out.write_str(whole)?;
+                if let Some(fraction) = fraction {
+                    write!(out, ".{fraction}")?;
+                }
+                if let Some(suffix) = suffix {
+                    out.write_str(suffix)?;
+                }
+                Ok(())
+            }
+            Self::Str { text, .. } => write!(out, "\"{text}\""),
         }
-        out.write_str(self.whole)?;
-        if let Some(fraction) = self.fraction {
-            write!(out, ".{fraction}")?;
-        }
-        if let Some(suffix) = self.suffix {
-            out.write_str(suffix)?;
-        }
-        Ok(())
     }
 }
 

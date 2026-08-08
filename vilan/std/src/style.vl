@@ -282,10 +282,10 @@ fun check_not_blank(what: str, value: str) {
 /// keywords. Position (`at 20% 40%`) is deliberately not modelled: the sites
 /// that want it want it computed from custom properties, which is `raw`'s job.
 enum RadialExtent {
-	ClosestSide,
-	ClosestCorner,
-	FarthestSide,
-	FarthestCorner,
+	ClosestSide = "closest-side",
+	ClosestCorner = "closest-corner",
+	FarthestSide = "farthest-side",
+	FarthestCorner = "farthest-corner",
 }
 
 /// A gradient — a `background-image` value, NOT a `Color` (CSS paints an
@@ -323,12 +323,7 @@ impl Gradient {
 	fun radial(extent: RadialExtent): Gradient {
 		Gradient {
 			function = "radial-gradient",
-			geometry = match extent {
-				RadialExtent::ClosestSide => "closest-side",
-				RadialExtent::ClosestCorner => "closest-corner",
-				RadialExtent::FarthestSide => "farthest-side",
-				RadialExtent::FarthestCorner => "farthest-corner",
-			},
+			geometry = extent.value(),
 			stops = "",
 			stop_count = 0,
 			roots = [],
@@ -365,84 +360,84 @@ impl Gradient {
 // --- keyword properties ---------------------------------------------------------
 
 enum Display {
-	Flex,
-	Grid,
-	Block,
-	Inline,
-	InlineBlock,
-	InlineFlex,
-	InlineGrid,
+	Flex = "flex",
+	Grid = "grid",
+	Block = "block",
+	Inline = "inline",
+	InlineBlock = "inline-block",
+	InlineFlex = "inline-flex",
+	InlineGrid = "inline-grid",
 	// `display:none` — named to stay clear of `Option::None` at use sites.
-	Hidden,
+	Hidden = "none",
 }
 
 enum Position {
-	Static,
-	Relative,
-	Absolute,
-	Fixed,
-	Sticky,
+	Static = "static",
+	Relative = "relative",
+	Absolute = "absolute",
+	Fixed = "fixed",
+	Sticky = "sticky",
 }
 
 enum FlexDirection {
-	Row,
-	Column,
-	RowReverse,
-	ColumnReverse,
+	Row = "row",
+	Column = "column",
+	RowReverse = "row-reverse",
+	ColumnReverse = "column-reverse",
 }
 
 enum AlignItems {
-	Start,
-	Center,
-	End,
-	Stretch,
-	Baseline,
+	Start = "flex-start",
+	Center = "center",
+	End = "flex-end",
+	Stretch = "stretch",
+	Baseline = "baseline",
 }
 
 enum JustifyContent {
-	Start,
-	Center,
-	End,
-	Between,
-	Around,
-	Evenly,
+	Start = "flex-start",
+	Center = "center",
+	End = "flex-end",
+	Between = "space-between",
+	Around = "space-around",
+	Evenly = "space-evenly",
 }
 
 enum TextAlign {
-	Left,
-	Center,
-	Right,
+	Left = "left",
+	Center = "center",
+	Right = "right",
 }
 
 enum Cursor {
-	Pointer,
-	Default,
-	Text,
-	NotAllowed,
+	Pointer = "pointer",
+	Default = "default",
+	Text = "text",
+	NotAllowed = "not-allowed",
 }
 
 enum Overflow {
-	Visible,
-	Hidden,
-	Auto,
-	Scroll,
+	Visible = "visible",
+	Hidden = "hidden",
+	Auto = "auto",
+	Scroll = "scroll",
 }
 
 enum WhiteSpace {
-	Normal,
-	Nowrap,
-	Pre,
-	PreWrap,
-	PreLine,
+	Normal = "normal",
+	Nowrap = "nowrap",
+	Pre = "pre",
+	PreWrap = "pre-wrap",
+	PreLine = "pre-line",
 }
 
 enum UserSelect {
-	Auto,
-	Text,
-	All,
+	Auto = "auto",
+	Text = "text",
+	All = "all",
 	// `user-select:none` — named to stay clear of `Option::None` at use
 	// sites, the `Display::Hidden` rule.
-	Off,
+	Off = "none",
 }
 
 // --- the class-name hash --------------------------------------------------------
@@ -656,56 +651,23 @@ impl Style {
 	// --- layout ---
 
 	fun display(self, value: Display): Style {
-		self.raw("display", match value {
-			Display::Flex => "flex",
-			Display::Grid => "grid",
-			Display::Block => "block",
-			Display::Inline => "inline",
-			Display::InlineBlock => "inline-block",
-			Display::InlineFlex => "inline-flex",
-			Display::InlineGrid => "inline-grid",
-			Display::Hidden => "none",
-		})
+		self.raw("display", value.value())
 	}
 
 	fun position(self, value: Position): Style {
-		self.raw("position", match value {
-			Position::Static => "static",
-			Position::Relative => "relative",
-			Position::Absolute => "absolute",
-			Position::Fixed => "fixed",
-			Position::Sticky => "sticky",
-		})
+		self.raw("position", value.value())
 	}
 
 	fun flex_direction(self, value: FlexDirection): Style {
-		self.raw("flex-direction", match value {
-			FlexDirection::Row => "row",
-			FlexDirection::Column => "column",
-			FlexDirection::RowReverse => "row-reverse",
-			FlexDirection::ColumnReverse => "column-reverse",
-		})
+		self.raw("flex-direction", value.value())
 	}
 
 	fun align_items(self, value: AlignItems): Style {
-		self.raw("align-items", match value {
-			AlignItems::Start => "flex-start",
-			AlignItems::Center => "center",
-			AlignItems::End => "flex-end",
-			AlignItems::Stretch => "stretch",
-			AlignItems::Baseline => "baseline",
-		})
+		self.raw("align-items", value.value())
 	}
 
 	fun justify_content(self, value: JustifyContent): Style {
-		self.raw("justify-content", match value {
-			JustifyContent::Start => "flex-start",
-			JustifyContent::Center => "center",
-			JustifyContent::End => "flex-end",
-			JustifyContent::Between => "space-between",
-			JustifyContent::Around => "space-around",
-			JustifyContent::Evenly => "space-evenly",
-		})
+		self.raw("justify-content", value.value())
 	}
 
 	fun gap(self, value: Length): Style {
@@ -908,12 +870,7 @@ impl Style {
 	}
 
 	fun overflow(self, value: Overflow): Style {
-		self.raw("overflow", match value {
-			Overflow::Visible => "visible",
-			Overflow::Hidden => "hidden",
-			Overflow::Auto => "auto",
-			Overflow::Scroll => "scroll",
-		})
+		self.raw("overflow", value.value())
 	}
 
 	// --- color & text ---
@@ -989,22 +946,11 @@ impl Style {
 	}
 
 	fun white_space(self, value: WhiteSpace): Style {
-		self.raw("white-space", match value {
-			WhiteSpace::Normal => "normal",
-			WhiteSpace::Nowrap => "nowrap",
-			WhiteSpace::Pre => "pre",
-			WhiteSpace::PreWrap => "pre-wrap",
-			WhiteSpace::PreLine => "pre-line",
-		})
+		self.raw("white-space", value.value())
 	}
 
 	fun user_select(self, value: UserSelect): Style {
-		self.raw("user-select", match value {
-			UserSelect::Auto => "auto",
-			UserSelect::Text => "text",
-			UserSelect::All => "all",
-			UserSelect::Off => "none",
-		})
+		self.raw("user-select", value.value())
 	}
 
 	/// The unitless form, and the one to prefer: a number inherits as a RATIO
@@ -1023,20 +969,11 @@ impl Style {
 	}
 
 	fun text_align(self, value: TextAlign): Style {
-		self.raw("text-align", match value {
-			TextAlign::Left => "left",
-			TextAlign::Center => "center",
-			TextAlign::Right => "right",
-		})
+		self.raw("text-align", value.value())
 	}
 
 	fun cursor(self, value: Cursor): Style {
-		self.raw("cursor", match value {
-			Cursor::Pointer => "pointer",
-			Cursor::Default => "default",
-			Cursor::Text => "text",
-			Cursor::NotAllowed => "not-allowed",
-		})
+		self.raw("cursor", value.value())
 	}
 
 	fun opacity(self, value: f64): Style {

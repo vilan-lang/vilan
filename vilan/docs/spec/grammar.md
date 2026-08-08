@@ -112,36 +112,60 @@ struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-param
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ "[" "expose" "]" ] IDENT [ ":" type ] ;
 
-enum         = [ "resource" ] "enum" IDENT [ generic-params ]
-               "{" [ variant { "," variant } [ "," ] ] "}" ;
-variant      = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
-               [ "=" discriminant ] ;
-discriminant = [ "-" ] INTEGER ;
-INTEGER      = NUMBER without a fractional part and without a SUFFIX ;
+enum          = [ "resource" ] "enum" IDENT [ generic-params ]
+                "{" [ variant { "," variant } [ "," ] ] "}" ;
+variant       = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+                [ "=" backing-value ] ;
+backing-value = [ "-" ] INTEGER | STRING ;
+INTEGER       = NUMBER without a fractional part and without a SUFFIX ;
 ```
 
 A `;`-bodied struct is legal only for `external` structs (host types). An
-explicit variant discriminant (`= 0`, `= -1`) fixes the variant's integer
-tag.
+explicit variant **backing value** — `= 0`, `= -1`, `= "start"` — fixes
+what the variant *is* at runtime. An enum whose variants carry one is a
+*backed enum* and lowers to that bare value; see §5.3 of the types
+chapter.
 
-The discriminant is an **integer**, not a general `NUMBER`: a fractional
-part (`= 1.5`) and a type suffix (`= 1u32`, and `= 1_000`, which lexes as
-`1` with the trailer `_000`) are both errors rather than being silently
-discarded. Hex is read as hex (`= 0xFF` is 255). The value must fit a
-signed 64-bit integer, and so must the implicit continuation: a variant
-with no discriminant takes the previous variant's plus one, starting at
-0, and running past the bound is an error rather than a wrap.
+The two backing types are the integers and `str`, and nothing else. A
+float is rejected for the same reason its equality is: the lowering is
+`===`, on which `0.1 + 0.2` is a footgun and `NaN` is not even equal to
+itself. `bool` is rejected because `bool` is itself an enum that already
+lowers to native `true`/`false`, so a two-variant bool-backed enum is
+`bool` with extra steps.
 
-**Two variants may not share a discriminant**, whether written or
-continued — `enum Dup { A = 1, B = 1 }` and `enum Walked { A = 1, B = 0,
-C }` are both rejected. Sharing one would make two variants a single
-runtime value (see §5.3 of the types chapter), leaving the second
-`match` arm unreachable in an otherwise exhaustive match.
+An integer backing value is an **integer**, not a general `NUMBER`: a
+fractional part (`= 1.5`) and a type suffix (`= 1u32`, and `= 1_000`,
+which lexes as `1` with the trailer `_000`) are both errors rather than
+being silently discarded. Hex is read as hex (`= 0xFF` is 255). The value
+must fit a signed 64-bit integer, and so must the implicit continuation:
+a variant with no backing value takes the previous variant's plus one,
+starting at 0, and running past the bound is an error rather than a wrap.
 
-**A discriminant is only legal when every variant is data-less.** A
+**A string backing must be written on every variant.** There is no
+successor of `"start"` for the continuation rule to hand out, and the
+string is deliberately not derived from the variant name — the two are
+independent (`AlignItems::Start` is `"flex-start"`, `Display::Hidden` is
+`"none"`), and a naming convention that is right most of the time would
+be silently wrong the rest.
+
+**One enum has one backing type.** The type is fixed by the first
+explicit value in declaration order and every later value must agree:
+`enum X { A = 1, B = "two" }` is rejected. An enum has one runtime
+representation, and a value that is sometimes a number and sometimes a
+string is not a vilan type.
+
+**Two variants may not share a backing value**, whether written or
+continued — `enum Dup { A = 1, B = 1 }`, `enum Walked { A = 1, B = 0,
+C }`, and `enum Align { Start = "a", End = "a" }` are all rejected.
+Sharing one would make two variants a single runtime value (see §5.3 of
+the types chapter), leaving the second `match` arm unreachable in an
+otherwise exhaustive match.
+
+**A backing value is only legal when every variant is data-less.** A
 variant carrying a payload may not carry one, and neither may its
 data-less siblings: an enum with any payload variant uses the tagged
-representation, in which a discriminant has nowhere to go.
+representation, in which a bare backing value has nowhere to put a
+payload.
 
 The leading `resource` modifier marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in the resources

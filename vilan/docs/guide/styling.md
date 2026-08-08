@@ -114,7 +114,10 @@ let primary = const button + style().background(Color::blue(600)).color(Color::w
   and `background_size(str)` sizes it.
 - Keyword properties use enums: `Display`, `Position`, `FlexDirection`,
   `AlignItems`, `JustifyContent`, `TextAlign`, `Cursor`, `Overflow`,
-  `WhiteSpace`, `UserSelect`, `RadialExtent`.
+  `WhiteSpace`, `UserSelect`, `RadialExtent`. Each is a **backed enum**
+  carrying its CSS keyword (`AlignItems::Start` is `"flex-start"`), so the
+  variant *is* the keyword the browser reads — `.value()` hands it back and
+  `Display::parse(text)` goes the other way, `None` outside the set.
 
 ```vilan,browser
 import std::ui::{ view, View, mount_root };

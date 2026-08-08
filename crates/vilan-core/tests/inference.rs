@@ -47567,7 +47567,7 @@ fn b79_a_fractional_discriminant_is_rejected_rather_than_truncated() {
         enum Fraction { X = 1.5, Y = 7 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1.5` is not",
+        "an enum backing value must be an integer or a string, and `1.5` is neither",
     );
 }
 
@@ -47581,14 +47581,14 @@ fn b79_a_suffixed_discriminant_is_rejected_rather_than_dropped() {
         enum Grouped { A = 1_000, B = 1 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1_000` carries the trailer `_000`",
+        "an enum backing value must be an integer or a string, and `1_000` carries the trailer `_000`",
     );
     assert_fails_with(
         r#"
         enum Suffixed { A = 1u32, B = 2 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1u32` carries the trailer `u32`",
+        "an enum backing value must be an integer or a string, and `1u32` carries the trailer `u32`",
     );
 }
 
@@ -47671,23 +47671,22 @@ fn b79_a_payload_variant_cannot_carry_a_discriminant() {
         enum Pay { A(str) = 1, B }
         fun main() { }
         "#,
-        "variant 'A' carries a payload, so it cannot have an explicit discriminant",
+        "variant 'A' carries a payload, so it cannot have an explicit backing value",
     );
 }
 
 #[test]
 fn b79_a_discriminant_beside_a_payload_variant_is_rejected() {
-    // P6, and the shape the rule is really about: `is_numeric` is a
-    // CONJUNCTION — all-data-less AND any-explicit-discriminant — so `B`'s
-    // payload flips the whole enum to the tagged form and `A = 1` is inert. It
-    // parsed, it was stored in `EnumVariantDeclaration::discriminant`, and
-    // nothing would ever read it.
+    // P6, and the shape the rule is really about: `backing` is a CONJUNCTION —
+    // all-data-less AND any-explicit-value — so `B`'s payload flips the whole
+    // enum to the tagged form and `A = 1` is inert. It parsed, it was stored in
+    // `EnumVariantDeclaration::backing_value`, and nothing would ever read it.
     assert_fails_noting(
         r#"
         enum Mixed { A = 1, B(str) }
         fun main() { }
         "#,
-        "an explicit discriminant is only meaningful when every variant is data-less, and 'B' \
+        "an explicit backing value is only meaningful when every variant is data-less, and 'B' \
          carries a payload",
         "B(str)",
         "'B' carries a payload here",
@@ -48671,5 +48670,797 @@ fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
         }
         "#,
         "42\n42\n",
+    );
+}
+
+// --- B76: backed enums — the grammar and its validation ----------------------
+//
+// `proposal/backed-enums.md`, RATIFIED with §7.2 deferred. The discriminant
+// production GENERALIZES: `= ( (-)? INTEGER | STRING )`. This is not a new kind
+// of enum — a payload-free variant may carry a compile-time-constant scalar,
+// and an enum whose variants carry one lowers to that scalar BARE. Everything
+// B79 closed for the integer half applies unchanged to the string half; the
+// rules below are the ones the string half adds.
+
+#[test]
+fn b76_a_string_backed_enum_lowers_to_its_bare_string() {
+    // §3.5, the whole thesis: `Align::Start` IS `"flex-start"` at runtime,
+    // exactly as `Ordering::Greater` IS `1` (P1). No array, no wrapper.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() { print(Align::Start); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"console.log("flex-start")"#),
+        "Align::Start should lower to the bare string, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("[0]"),
+        "no array form should survive, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
+    // §1.4/P2: a string backing needs NO new codegen path. The emitted `match`
+    // is character-for-character the chain a `match` over a raw `str` produces
+    // — `scalar_variant_test` with a `js::Node::String` where the
+    // `js::Node::Number` is — which is what makes the feature a widening rather
+    // than a new lowering. Compared as WHOLE EMISSIONS, so a divergence
+    // anywhere in the shape (a temp, a wrapper, a jump table) fails this.
+    let backed = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "start", End = "end", Center = "center" }
+        fun classify(a: Align): i32 {
+            match a { Align::Start => 0, Align::End => 1, Align::Center => 2 }
+        }
+        fun main() { print(classify(Align::End)); }
+        "#,
+    )
+    .expect("a clean compile");
+    let raw = compile(
+        r#"
+        import std::print;
+        fun classify(a: str): i32 {
+            match a { "start" => 0, "end" => 1, _ => 2 }
+        }
+        fun main() { print(classify("end")); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert_eq!(
+        backed, raw,
+        "a backed enum's match should emit exactly what the raw `str` match emits"
+    );
+}
+
+#[test]
+fn b76_a_string_backed_enum_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end", Center = "center" }
+        fun main() {
+            let a = Align::End;
+            print(match a { Align::Start => "s", Align::End => "e", Align::Center => "c" });
+            print(a == Align::End);
+            print(a != Align::Start);
+            print(a is Align::End);
+        }
+        "#,
+        "e\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn b76_a_backing_value_is_not_a_second_spelling_of_the_variant() {
+    // §1.5/§3.7: exhaustiveness is checked on the variant SET by name, and a
+    // raw literal pattern stays an error for strings exactly as it already is
+    // for integers. The backing value is a representation, not a name.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun f(a: Align): i32 { match a { "start" => 0, _ => 1 } }
+        fun main() { }
+        "#,
+        "cannot match type",
+    );
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun f(a: Align): i32 { match a { Align::Start => 0 } }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'End'",
+    );
+}
+
+#[test]
+fn b76_mixed_backings_in_one_enum_are_rejected() {
+    // §3.2. An enum has ONE runtime representation; a value that is sometimes a
+    // number and sometimes a string is not a vilan type, and `.value()` would
+    // have no return type. Both directions, because either literal could be the
+    // typo — the message names both variants and both spellings.
+    assert_fails_noting(
+        r#"
+        enum X { A = 1, B = "two" }
+        fun main() { }
+        "#,
+        "variant 'B' is backed by a string (`\"two\"`) where 'A' is backed by an integer",
+        "1",
+        "'A' backs 'X' with an integer",
+    );
+    assert_fails_noting(
+        r#"
+        enum Y { A = "one", B = 2 }
+        fun main() { }
+        "#,
+        "variant 'B' is backed by an integer (`2`) where 'A' is backed by a string",
+        "\"one\"",
+        "'A' backs 'Y' with a string",
+    );
+}
+
+#[test]
+fn b76_a_string_backing_must_be_written_on_every_variant() {
+    // §3.1(a). C-style auto-increment is meaningful for integers; there is no
+    // successor of `"start"`. Deriving the string from the variant NAME is the
+    // rejected alternative (§2.1's evidence: five of std's eleven CSS enums have
+    // names no case convention produces).
+    assert_fails_noting(
+        r#"
+        enum X { A = "a", B }
+        fun main() { }
+        "#,
+        "variant 'B' has no backing value, and a string backing has no successor",
+        "\"a\"",
+        "'A' backs 'X' with a string here",
+    );
+    // The integer half is untouched — the sequence continues as it always has.
+    assert_compiles(
+        r#"
+        enum Y { A = 5, B, C }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_two_variants_cannot_share_a_string_backing() {
+    // §3.7, B79's uniqueness rule widened. Two variants sharing a value ARE one
+    // runtime value: the second `match` arm is unreachable and an exhaustive
+    // match returns the wrong answer with exit 0. A CSS keyword collision is a
+    // typo, not an exotic input — std writes `Display::Hidden => "none"` and
+    // `UserSelect::Off => "none"` in different enums today.
+    assert_fails_noting(
+        r#"
+        enum Align { Start = "a", End = "a" }
+        fun main() { }
+        "#,
+        "variant 'End' has backing value \"a\", which 'Start' already uses",
+        "Start = \"a\"",
+        "'Start' has backing value \"a\"",
+    );
+    // The same value in two DIFFERENT enums stays legal — that is the shape
+    // std's `Display::Hidden` / `UserSelect::Off` pair really has.
+    assert_compiles(
+        r#"
+        enum Display { Hidden = "none", Flex = "flex" }
+        enum UserSelect { Off = "none", All = "all" }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_payload_variant_cannot_carry_a_string_backing() {
+    // §3.3, the string half of the rule B79 shipped for integers. A bare
+    // backing value has nowhere to put a payload.
+    assert_fails_with(
+        r#"
+        enum X { A(str) = "a", B = "b" }
+        fun main() { }
+        "#,
+        "variant 'A' carries a payload, so it cannot have an explicit backing value",
+    );
+    assert_fails_noting(
+        r#"
+        enum Y { A = "a", B(i32) }
+        fun main() { }
+        "#,
+        "an explicit backing value is only meaningful when every variant is data-less, and 'B' \
+         carries a payload",
+        "B(i32)",
+        "'B' carries a payload here",
+    );
+}
+
+#[test]
+fn b76_the_backing_type_set_is_str_and_the_integers() {
+    // §3.4. Floats are rejected by the integer rule (their `===` lowering and
+    // `NaN !== NaN` would break both the duplicate check and every variant
+    // test); `bool` never reaches the production at all, `bool` being itself an
+    // enum that already lowers to native `true`/`false`. The production states
+    // its own set rather than deferring to a later rule.
+    assert_fails_with(
+        r#"
+        enum X { A = true, B = false }
+        fun main() { }
+        "#,
+        "expected an integer, a string",
+    );
+    assert_fails_with(
+        r#"
+        enum Y { A = 1.5 }
+        fun main() { }
+        "#,
+        "an enum backing value must be an integer or a string, and `1.5` is neither",
+    );
+}
+
+#[test]
+fn b76_ordering_operators_are_rejected_on_a_string_backing() {
+    // §3.6. `Size::Large < Size::Small` would be TRUE because `"lg" < "sm"`,
+    // and the thing a reader means — order by declaration index — cannot be
+    // provided, because bare lowering erases the index at runtime. `==`/`!=`
+    // stay; the integer form is untouched (P8).
+    for operator in ["<", "<=", ">", ">="] {
+        assert_fails_with(
+            &format!(
+                r#"
+                enum Size {{ Large = "lg", Small = "sm" }}
+                fun f(a: Size, b: Size): bool {{ a {operator} b }}
+                fun main() {{ }}
+                "#
+            ),
+            "`Size` is backed by strings, and a backing value is not an order",
+        );
+    }
+    assert_compiles(
+        r#"
+        enum Size { Large = "lg", Small = "sm" }
+        fun f(a: Size, b: Size): bool { a == b || a != b }
+        fun main() { }
+        "#,
+    );
+    // The integer backing still orders, which is what `std::compare`'s
+    // `PartialOrd` defaults depend on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Level { Low = 0, High = 1 }
+        fun main() { print(Level::Low < Level::High); }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b76_adding_a_string_backing_does_not_move_the_integer_path() {
+    // §5's premise, pinned: the grammar is WIDENED, not altered. Every existing
+    // integer-discriminant enum compiles identically and emits identical
+    // JavaScript.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Ordering2 { Less = -1, Equal = 0, Greater = 1 }
+        fun main() {
+            print(match Ordering2::Greater {
+                Ordering2::Less => "less",
+                Ordering2::Equal => "equal",
+                Ordering2::Greater => "greater",
+            });
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("=== -1") && javascript.contains("=== 0"),
+        "the integer chain should be unchanged, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_keeps_its_array_form() {
+    // §3.1(b): the conjunction stays a conjunction. `enum Plain { A, B }` is
+    // NOT backed, and adding `= 0` to one variant changes the representation of
+    // the whole type — a wart, preserved deliberately, because changing it
+    // would change the runtime representation of every payload-free enum in
+    // every existing program.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Plain { A, B }
+        fun main() { print(match Plain::B { Plain::A => "a", Plain::B => "b" }); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("[0] === 0"),
+        "a plain enum should keep the `[index]` array form, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_backing_string_keeps_its_escapes() {
+    // The literal is carried raw and unescaped at emission like any other
+    // string, so a backing value may hold whatever the host speaks.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Quoted { Tab = "a\tb", Quote = "say \"hi\"" }
+        fun main() {
+            print(match Quoted::Quote { Quoted::Tab => "tab", Quoted::Quote => "quote" });
+            print(Quoted::Tab);
+        }
+        "#,
+        "quote\na\tb\n",
+    );
+}
+
+// --- B76: the conversions — `.value()` out, `Enum::parse` back ---------------
+//
+// §3.8, synthesized on every backed enum rather than opted into by a derive
+// (§7.3 — the backing value is already the opt-in). Written as vilan source, so
+// a user's own `value` meets B57's duplicate-inherent rule; `value()` still
+// costs nothing, because the transformer folds the call to its receiver.
+
+#[test]
+fn b76_value_returns_the_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun main() {
+            print(Align::End.value());
+            print(Level::Low.value());
+        }
+        "#,
+        "flex-end\n-1\n",
+    );
+}
+
+#[test]
+fn b76_value_lowers_to_the_identity() {
+    // The receiver already IS the backing value, so `value.value()` compiles to
+    // `value` — that is what makes std's eleven CSS wrappers delete outright
+    // instead of moving their `match` chains into the emitted output. The
+    // folded-away body then has no callers and emits nothing.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun render(value: Align): str { value.value() }
+        fun main() { print(render(Align::Start)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return value;"),
+        "`value.value()` should compile to `value`, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function value"),
+        "the synthesized `value` body should emit nothing once folded, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_parse_round_trips_and_answers_none_outside_the_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun show(parsed: Option<Align>): str {
+            match parsed { Option::Some(let a) => a.value(), Option::None => "none" }
+        }
+        fun main() {
+            print(show(Align::parse("flex-start")));
+            print(show(Align::parse("flex-end")));
+            print(show(Align::parse("middle")));
+            print(match Level::parse(2) {
+                Option::Some(let l) => l.value(),
+                Option::None => 0,
+            });
+            print(match Level::parse(7) { Option::Some(let l) => l.value(), Option::None => 0 });
+        }
+        "#,
+        "flex-start\nflex-end\nnone\n2\n0\n",
+    );
+}
+
+#[test]
+fn b76_parse_needs_no_option_import_at_the_declaration() {
+    // The synthesized block carries its own `Option`, so a module that declares
+    // a backed enum and never mentions `Option` still compiles.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_user_declared_value_or_parse_is_a_hard_error() {
+    // §3.8's collision rule, reached through B57 rather than through a rule of
+    // its own: a synthesized member that quietly loses is worse than a visible
+    // name clash. The note says the other declaration is the compiler's,
+    // because there is no file to point at.
+    assert_fails_with(
+        r#"
+        enum A { X = "x", Y = "y" }
+        impl A { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+        "'value' is already defined for 'A'",
+    );
+    assert_fails_with(
+        r#"
+        enum B { X = "x", Y = "y" }
+        impl B { fun parse(text: str): str { "nope" } }
+        fun main() { }
+        "#,
+        "'parse' is already defined for 'B'",
+    );
+    // …and the note names the synthesized member rather than pointing the
+    // author's own declaration back at itself.
+    let diagnostics = failure_diagnostics_with_notes(
+        r#"
+        enum C { X = "x", Y = "y" }
+        impl C { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+    );
+    assert!(
+        diagnostics.iter().any(|(_, _, note)| note
+            .as_ref()
+            .is_some_and(|(msg, _, _)| msg.contains("synthesized for 'C' by the compiler"))),
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_gets_no_conversions() {
+    // The negative space: `value`/`parse` exist because a backing value was
+    // written, so a plain enum and a payload enum keep their surfaces free.
+    assert_fails_with(
+        r#"
+        enum Plain { A, B }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+        "value",
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        impl Plain { fun value(self): i32 { 0 } }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_wide_integer_backing_widens_the_conversion_type() {
+    // The backing type is the narrowest plain-JS-number integer that holds
+    // every discriminant: `i32` by default (the language's default integer, so
+    // `Ordering::Greater.value() == 1` needs no suffix), `i53` when a
+    // discriminant does not fit.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Wide { Big = 3000000000, Small = 1 }
+        fun main() { print(Wide::Big.value()); }
+        "#,
+        "3000000000\n",
+    );
+}
+
+#[test]
+fn b76_std_ordering_gains_the_conversions() {
+    // std's one pre-existing backed enum picks them up like any other, and its
+    // `value()` is the identity over the bare discriminant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        import std::option::Option;
+        fun main() {
+            print(Ordering::Greater.value());
+            print(match Ordering::parse(-1) {
+                Option::Some(let o) => o.value(),
+                Option::None => 99,
+            });
+        }
+        "#,
+        "1\n-1\n",
+    );
+}
+
+// --- B76: `Wire`/JSON serialize as the backing value -------------------------
+//
+// §3.9, and the one genuine format change in the arc. Today's derive keys on
+// the variant NAME and ignores the discriminant entirely (P9: `Ordering::
+// Greater` went on the wire as `"Greater"`), so this is a DIVERGENCE rather
+// than an extension — taken now because §1.6 checked it costs nothing: there is
+// no `[derive(Wire)]` or `[derive(Json)]` enum anywhere in `vilan/std/src/`.
+
+#[test]
+fn b76_a_backed_enum_encodes_as_its_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Json)]
+        enum Code { Ok = 200, NotFound = 404 }
+        fun main() {
+            print(Align::Start.to_json());
+            print(Code::NotFound.to_json());
+        }
+        "#,
+        "\"flex-start\"\n404\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_decodes_from_its_backing_value() {
+    // The reverse direction goes through the synthesized `parse`, so a value
+    // outside the set is `Err` rather than a confidently wrong variant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun show(decoded: Result<Align, str>): str {
+            match decoded { Result::Ok(let a) => a.value(), Result::Err(let e) => e }
+        }
+        fun main() {
+            print(show(Align::from_json("\"flex-end\"")));
+            print(show(Align::from_json("\"middle\"")));
+        }
+        "#,
+        "flex-end\nunknown value in JSON for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_round_trips_through_wire() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::json_codec;
+        import std::result::Result;
+        import std::wire::{ Wire, encode, decode };
+        [derive(Wire)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Wire)]
+        struct Holder { align: Align, count: i32 }
+        fun main() {
+            let back: Result<Holder, str> =
+                decode(json_codec(), encode(json_codec(), Holder { align = Align::End, count = 3 }));
+            match back {
+                Result::Ok(let holder) => print(holder.align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+            let bad: Result<Align, str> = decode(json_codec(), encode(json_codec(), "middle"));
+            match bad {
+                Result::Ok(let align) => print(align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "flex-end\nunknown value for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
+    // The negative space, and the reason §3.9 is a divergence and not a
+    // rewrite: an enum with no backing value keeps the externally-tagged form
+    // exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Plain { A, B }
+        [derive(Json)]
+        enum Payload { Text(str), Count(i32) }
+        fun main() {
+            print(Plain::B.to_json());
+            print(Payload::Text("hi").to_json());
+            print(match Plain::from_json("\"A\"") {
+                Result::Ok(Plain::A) => "a",
+                Result::Ok(Plain::B) => "b",
+                Result::Err(let e) => e,
+            });
+        }
+        "#,
+        "\"B\"\n{\"Text\":\"hi\"}\na\n",
+    );
+}
+
+// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
+// enum ------------------------------------------------------------------------
+//
+// The parameter direction is safe — vilan constructs the value, so it is always
+// in the set. The return direction is not, and what happens then is the reason
+// for the deferral: an exhaustive `match` compiles its last arm to a bare
+// `else` (there is no "impossible" trap arm), so a host value outside the set
+// silently takes whichever arm happens to be last. It is not detectably wrong;
+// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
+// `parse()` path, where an out-of-set value honestly yields `None`, until
+// backed enums grow a trap-arm story.
+
+#[test]
+fn b76_an_external_fun_cannot_return_a_backed_enum() {
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
+    );
+    // The message names the way out rather than only the prohibition (B6).
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "convert with `Align::parse`",
+    );
+    // The INTEGER backing is refused for the same reason — §7.2 is about the
+    // host boundary, not about strings.
+    assert_fails_with(
+        r#"
+        enum Code { Ok = 200, NotFound = 404 }
+        [extern("getCode")]
+        external fun get_code(): Code;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Code'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
+    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
+    // exactly the same way, and the wrapper path is what each of them wants.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Option<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_aligns(): List<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_is_the_return_direction_only() {
+    // The parameter direction is the whole point of the feature — the extern
+    // takes the enum, because the enum IS the string — and it stays legal, as
+    // does an unbacked enum in either direction.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("setAlign")]
+        external fun set_align(value: Align): void;
+        fun main() { set_align(Align::Start); }
+        "#,
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        [extern("getPlain")]
+        external fun get_plain(): Plain;
+        fun main() { }
+        "#,
+    );
+    // The refusal does not depend on declaration order.
+    assert_fails_with(
+        r#"
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
+    // What §7.2 steers to, compiled: the extern speaks the host's own type and
+    // `parse` is the guard, answering `None` for a value outside the set.
+    assert_compiles(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        [doc(hidden)]
+        external fun get_align_raw(): str;
+        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
+        fun main() { }
+        "#,
+    );
+}
+
+// --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------
+//
+// The payoff the survey measured: eleven of the fifteen payload-free enums in
+// the whole standard library existed only to be converted to a host string,
+// all in `std/src/style.vl`, 52 `match` arms that delete outright. The strings
+// moved from the wrappers to the declarations, so the TYPE now says at its
+// declaration what was only discoverable by reading a function 300 lines away.
+//
+// These pin the behavior the deletion has to preserve, at the shapes §2.1 calls
+// out as the ones a name convention would have got wrong.
+
+#[test]
+fn b76_style_keyword_enums_carry_their_css_keywords() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, JustifyContent, UserSelect };
+        fun main() {
+            // The five §2.1 names no case convention produces.
+            print(AlignItems::Start.value());
+            print(AlignItems::End.value());
+            print(JustifyContent::Between.value());
+            print(Display::Hidden.value());
+            print(UserSelect::Off.value());
+        }
+        "#,
+        "flex-start\nflex-end\nspace-between\nnone\nnone\n",
+    );
+}
+
+#[test]
+fn b76_style_wrappers_still_write_the_same_declaration() {
+    // The wrappers are one line now (`self.raw("display", value.value())`), and
+    // what they write must not have moved. A class name is a content hash of
+    // `key|declaration`, so these two are the declarations themselves: write
+    // `"inline_block"` instead of `"inline-block"` and both change.
+    // (`vilan/test/style.css` pins the declaration text itself, byte for byte.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, RadialExtent, Style, style };
+        fun main() {
+            let card = const style().display(Display::InlineBlock).align_items(AlignItems::End);
+            print(card.class_list());
+            print(RadialExtent::ClosestCorner.value());
+        }
+        "#,
+        "sfatq7m s1g8z7cm\nclosest-corner\n",
     );
 }

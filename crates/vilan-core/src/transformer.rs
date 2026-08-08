@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic,
-    LiftDispatch, Program, TransferForm, TryDispatch,
+    BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
+    Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
 use crate::id::Id;
@@ -3043,6 +3043,16 @@ impl<'src> Transformer<'src> {
                         // data is a no-op that still evaluates the argument for its
                         // effects. Erasure forces the rewrite here — the generic
                         // sink body cannot drop instantiation-conditionally.
+                        // `x.value()` on a backed enum IS `x` (backed-enums.md
+                        // §3.8): the receiver already holds the backing value
+                        // at runtime, so the conversion is the identity and
+                        // emits nothing. The generated body — a `match` over
+                        // the variants — stays the definition this fold has to
+                        // agree with; folded away, it has no callers left and
+                        // the tree-shake drops it.
+                        if self.program.backed_value_members.contains(&target_id) {
+                            return Some(args.into_iter().next().unwrap_or(js::Node::Void));
+                        }
                         if Some(target_id) == self.drop_fn_id {
                             let arg_node = args.into_iter().next().unwrap_or(js::Node::Void);
                             let argument_type =
@@ -4406,8 +4416,8 @@ impl<'src> Transformer<'src> {
     }
 
     /// The JS value for an enum variant. `bool` lowers to a native boolean
-    /// (`false`/`true`), a numeric (C-like) enum to its integer discriminant, and
-    /// every other enum to an array `[index, ...data]`.
+    /// (`false`/`true`), a BACKED enum to its bare backing value — a number or a
+    /// string — and every other enum to an array `[index, ...data]`.
     fn variant_value(
         &self,
         enum_id: Id,
@@ -4417,30 +4427,40 @@ impl<'src> Transformer<'src> {
         if Some(enum_id) == self.program.bool_enum_id {
             return js::Node::Bool(variant_index == 1);
         }
-        if let Some(discriminant) = self.numeric_enum_discriminant(enum_id, variant_index) {
-            return js::Node::Number(discriminant.to_string(), None);
+        if let Some(value) = self.backed_variant_value(enum_id, variant_index) {
+            return value;
         }
         let mut items = vec![js::Node::Number(variant_index.to_string(), None)];
         items.extend(data);
         js::Node::Array(items)
     }
 
-    /// The integer discriminant of a variant if `enum_id` is a numeric (C-like)
-    /// enum, else `None` (it uses the array representation).
-    fn numeric_enum_discriminant(&self, enum_id: Id, variant_index: usize) -> Option<i64> {
+    /// The bare backing value of a variant if `enum_id` is a backed enum, else
+    /// `None` (it uses the array representation). `Align::Start` is the JS
+    /// string `"start"` exactly as `Ordering::Greater` is the JS number `1`:
+    /// one rule, two literal kinds (backed-enums.md §3.5).
+    fn backed_variant_value(&self, enum_id: Id, variant_index: usize) -> Option<js::Node<'src>> {
         let enum_ = self.program.enums.get(&enum_id)?;
-        if !enum_.is_numeric {
-            return None;
+        enum_.backing?;
+        match &enum_.variants.get(variant_index)?.backing_value {
+            BackingValue::Int(discriminant) => {
+                Some(js::Node::Number(discriminant.to_string(), None))
+            }
+            // The declaration carries the RAW literal text, so it unescapes at
+            // emission exactly like any other string literal.
+            BackingValue::Str(text) => Some(js::Node::String(Cow::Owned(
+                unescape_string(text).into_owned(),
+            ))),
         }
-        enum_
-            .variants
-            .get(variant_index)
-            .map(|variant| variant.discriminant)
     }
 
     /// For a variant of an enum that lowers to a native scalar — `bool`
-    /// (`subject === true`) or a numeric enum (`subject === discriminant`) — the
+    /// (`subject === true`) or a backed enum (`subject === backing value`) — the
     /// equality test. `None` for array-form enums, which test the `[0]` slot.
+    ///
+    /// A string backing needs no new codegen path: this is the same `===` chain
+    /// a `match` over a raw `str` already emits, with a `js::Node::String` where
+    /// the `js::Node::Number` is (§1.4's probe P2).
     fn scalar_variant_test(
         &self,
         enum_id: Id,
@@ -4450,11 +4470,7 @@ impl<'src> Transformer<'src> {
         let value = if Some(enum_id) == self.program.bool_enum_id {
             js::Node::Bool(variant_index == 1)
         } else {
-            js::Node::Number(
-                self.numeric_enum_discriminant(enum_id, variant_index)?
-                    .to_string(),
-                None,
-            )
+            self.backed_variant_value(enum_id, variant_index)?
         };
         Some(js::Node::Binary(
             BinaryOp::Eq,
@@ -6404,10 +6420,13 @@ impl<'src> Transformer<'src> {
     }
 
     /// A type whose `==`/`!=` compares by value in native JS — the scalar
-    /// primitives (`i32`/…/`str`), `bool`, and numeric (C-like) enums, all lowered
-    /// to JS numbers/strings/booleans. A generic `==` monomorphized to one of these
+    /// primitives (`i32`/…/`str`), `bool`, and BACKED enums, all lowered to JS
+    /// numbers/strings/booleans. A generic `==` monomorphized to one of these
     /// stays native rather than dispatching to a `PartialEq` impl (which for a
     /// primitive is native `===` anyway), keeping codegen identical to a direct `==`.
+    ///
+    /// A string-backed enum qualifies for exactly the reason `str` itself does,
+    /// listed two lines up: both sides are JS string primitives (§3.5).
     fn compares_natively(&self, type_id: TypeId) -> bool {
         match self.program.type_id_to_type_map.get(&type_id) {
             Some(Type::Struct(id, _)) => self.program.structs.get(id).is_some_and(|struct_| {
@@ -6419,7 +6438,7 @@ impl<'src> Transformer<'src> {
                         .program
                         .enums
                         .get(id)
-                        .is_some_and(|enum_| enum_.is_numeric)
+                        .is_some_and(|enum_| enum_.backing.is_some())
             }
             _ => false,
         }
