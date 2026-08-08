@@ -43820,27 +43820,30 @@ fn b4_a_self_defaulted_parameter_stays_legal() {
     );
 }
 
-// --- B4 §2.4: two impls of one trait for one type — bycatch, filed not fixed -
+// --- B98 (B4 §2.4): two impls of one trait for one subject ------------------
 //
 // `trait-objects.md` §2.4 (probe P11) found the gap between two shipped checks:
 // B57 hard-errors on duplicate INHERENT members and on a trait-vs-trait
 // ambiguity, and B74 closed duplicate statics, but the same trait implemented
-// twice for the same type falls between them and resolves by DECLARATION ORDER.
-// The second impl is emitted nowhere and is silently dead, and which one dies
-// depends on the order the modules happened to load in.
+// twice for the same type fell between them and resolved by DECLARATION ORDER.
+// The second impl was emitted nowhere and was silently dead, at a direct call
+// and through a bounded generic alike, and which one died depended on the order
+// the modules happened to load in.
 //
-// The paper scoped it OUT of this arc deliberately — §12's S4 files it as its
-// own item ("a backlog entry, not code, in this arc"), §2.4 and §14 both say
-// the same, on the grounds that it is a plain bug independent of B4's outcome
-// and that the fix is B57's existing duplicate machinery reaching one more
-// candidate set. So today's behavior is pinned here rather than left
-// undescribed, with the desired end state `#[ignore]`d beside it.
+// Both of those checks exempt a trait-provided NAME on purpose, so that two
+// impls of one trait stay legal — `method-resolution.md` §9(6)'s platform twins
+// and the std `Into` blanket. B98 is the rule that owns the other side of that
+// exemption: the members stay exempt, the impl PAIR does not.
+//
+// The pair key is `(trait, trait arguments, subject)`, compared for SAMENESS
+// rather than compatibility: a generic position matches only another generic
+// position bound the same way. That is what keeps the three carve-outs below
+// working, each by the rule rather than by exemption.
 
 #[test]
-fn b4_duplicate_trait_impls_resolve_by_declaration_order_today() {
-    // P11, exactly: the first impl wins at a direct call AND through a bounded
-    // generic, and the second is dead without a word.
-    assert_compiles_and_runs(
+fn b98_duplicate_trait_impls_are_refused_at_both_call_paths() {
+    // P11, exactly — the program whose two calls both used to print `first`.
+    assert_fails_with(
         r#"
         import std::print;
         trait Show { fun show(self): str; }
@@ -43851,16 +43854,14 @@ fn b4_duplicate_trait_impls_resolve_by_declaration_order_today() {
         fun main() { let b = Bag { n = 1 }; print(b.show()); print(via(b)); }
         main();
         "#,
-        "first\nfirst\n",
+        "is already implemented for 'Bag'",
     );
 }
 
 #[test]
-#[ignore = "B4 §2.4: duplicate trait impls are a silent declaration-order pick; filed as its own item"]
 fn b4_two_impls_of_one_trait_for_one_type_are_an_error() {
-    // The desired end state, in B57/B74's register: a definition-site error at
-    // the second declaration, noting the first. Un-ignore when §2.4's item
-    // ships.
+    // The end state §2.4 asked for, in B57/B74's register: a definition-site
+    // error at the second impl, noting the first.
     assert_fails_with(
         r#"
         trait Show { fun show(self): str; }
@@ -43871,6 +43872,235 @@ fn b4_two_impls_of_one_trait_for_one_type_are_an_error() {
         "#,
         "is already implemented for 'Bag'",
     );
+}
+
+#[test]
+fn b98_a_duplicate_of_a_std_impl_names_the_module_it_came_from() {
+    // The gap-b shape one family over (`method-resolution.md` §2.1): a user file
+    // re-declaring an impl std already has. The report is B57's cross-file one —
+    // the note renders std's own line, and the one-line form says which module.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        import std::operators::Lift;
+        impl Option<type T> with Lift {}
+        fun main() { }
+        "#,
+        "is already implemented for 'Option<T>' by module 'option'",
+    );
+}
+
+#[test]
+fn b98_one_with_clause_naming_a_trait_twice_is_the_same_pair() {
+    // `impl Bag with Show + Show` — a pair inside one clause. B84's block rule
+    // cannot see it (it reads declared MEMBERS, and there is one `show`), and it
+    // is a duplicate by exactly the same argument as two blocks.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show + Show { fun show(self): str { "x" } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b98_a_trait_subject_gets_the_same_rule() {
+    // The subject may itself BE a trait — std's blanket-over-a-bound shape
+    // (`impl Iterator<type T> with Iterable<T>`), so the `Trait` arm of the
+    // sameness walk carries real weight.
+    assert_fails_with(
+        r#"
+        trait Walk { fun step(self): i32; }
+        trait Marker { fun mark(self): i32; }
+        impl Walk with Marker { fun mark(self): i32 { 1 } }
+        impl Walk with Marker { fun mark(self): i32 { 2 } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Walk'",
+    );
+}
+
+#[test]
+fn b98_two_generic_impls_differing_only_in_binder_name_are_one_impl() {
+    // `impl Pair<type T>` and `impl Pair<type U>` are the same impl written
+    // twice, and the second is dead exactly as P11's is. The subject TYPE IDS
+    // differ here even though the types are equal — types are not interned — so
+    // the rule cannot be identity on the id.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T> with Show { fun show(self): str { "a" } }
+        impl Pair<type U> with Show { fun show(self): str { "b" } }
+        fun main() { }
+        "#,
+        "is already implemented for",
+    );
+}
+
+#[test]
+fn b98_an_elided_self_default_does_not_disguise_a_duplicate() {
+    // `trait Combine<B = Self>`: the `with` clause records the arguments it
+    // WROTE, so `with Combine` records none and `with Combine<Bag>` records one.
+    // They are the same instantiation, and the rule compares the effective
+    // arguments — the written ones padded with the trait's declared defaults,
+    // `= Self` meaning the subject.
+    assert_fails_with(
+        r#"
+        trait Combine<B = Self> { fun combine(self, other: B): str; }
+        struct Bag { n: i32 }
+        impl Bag with Combine { fun combine(self, other: Bag): str { "x" } }
+        impl Bag with Combine<Bag> { fun combine(self, other: Bag): str { "y" } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b98_the_same_trait_at_different_arguments_is_two_impls() {
+    // The reason trait ARGUMENTS are in the pair key: `Into<Bar>` and
+    // `Into<Baz>` are two implementations, not one written twice, and refusing
+    // them would make a parameterized trait implementable once per type.
+    assert_compiles(
+        r#"
+        trait Tag<A> { fun tag(self): A; }
+        struct Bag { n: i32 }
+        struct Cup { n: i32 }
+        impl Bag with Tag<Cup> { fun tag(self): Cup { Cup { n = 1 } } }
+        impl Bag with Tag<Bag> { fun tag(self): Bag { Bag { n = 2 } } }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl() {
+    // The carve-out that would have taken std down: `impl type T with Into<T>`
+    // matches every subject under ordinary type COMPATIBILITY, so a rule built
+    // on `compare_type` would call it a duplicate of every user `Into` impl. It
+    // is an OVERLAP, which is B73's open specificity question — unchanged here,
+    // in both directions (`Into<Fahrenheit>` and the reflexive `Into<Celsius>`).
+    assert_compiles(
+        r#"
+        import std::into::Into;
+        struct Celsius { degrees: i32 }
+        struct Fahrenheit { degrees: i32 }
+        impl Celsius with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+        impl Fahrenheit with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { self }
+        }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_two_bounded_impls_differing_only_in_binder_name_are_one_impl() {
+    // The other direction of the bounds rule, and the case that needs it: an
+    // UNBOUNDED impl binder inherits the subject type's own constraint id (B77),
+    // so two of them are already the same id, while a bound mints a fresh one.
+    // `Pair<type T: Show>` and `Pair<type U: Show>` are therefore two different
+    // ids for one position, and only comparing what they are BOUND by sees it.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        trait Label { fun label(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T: Show> with Label { fun label(self): str { "a" } }
+        impl Pair<type U: Show> with Label { fun label(self): str { "b" } }
+        fun main() { }
+        "#,
+        "is already implemented for",
+    );
+}
+
+#[test]
+fn b98_two_conditional_impls_with_different_bounds_are_two_impls() {
+    // B73 one level in: two generic positions are the same position only when
+    // they carry the same BOUNDS. `Pair<T: Show>` and `Pair<U: Marker>` overlap
+    // wherever a type is both, which is a specificity question and not a repeat.
+    assert_compiles(
+        r#"
+        trait Show { fun show(self): str; }
+        trait Marker { fun mark(self): i32; }
+        trait Label { fun label(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T: Show> with Label { fun label(self): str { "shown" } }
+        impl Pair<type U: Marker> with Label { fun label(self): str { "marked" } }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_one_trait_for_two_subjects_and_two_traits_for_one_subject_stay_legal() {
+    // The family's guard rail: the pair is (trait, subject), so neither half
+    // repeating on its own is a duplicate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Show { fun show(self): str; }
+        trait Label { fun label(self): str; }
+        struct Bag { n: i32 }
+        struct Cup { n: i32 }
+        impl Bag with Show { fun show(self): str { "bag" } }
+        impl Cup with Show { fun show(self): str { "cup" } }
+        impl Bag with Label { fun label(self): str { "labelled" } }
+        fun main() { print(Bag { n = 1 }.show()); print(Cup { n = 2 }.show()); print(Bag { n = 3 }.label()); }
+        main();
+        "#,
+        "bag\ncup\nlabelled\n",
+    );
+}
+
+#[test]
+fn b98_a_third_impl_is_reported_against_the_first() {
+    // B57's counting rule: each later impl is reported against the FIRST it
+    // repeats, so three copies produce two errors rather than one or three.
+    let errors = compile(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "a" } }
+        impl Bag with Show { fun show(self): str { "b" } }
+        impl Bag with Show { fun show(self): str { "c" } }
+        fun main() { }
+        "#,
+    )
+    .expect_err("expected the duplicate impls to be refused");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.contains("is already implemented for 'Bag'"))
+            .count(),
+        2,
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
+    // The carve-out the rule must not break, pinned in BOTH directions:
+    // `browser/ui.vl` and `process/ui.vl` each write `impl View with Slot`,
+    // `impl str with Slot`, `impl Signal<str> with AttrValue` and three more —
+    // the twin MECHANISM (`method-resolution.md` §9(6)). Module resolution is
+    // layered, so exactly one `ui` loads per build and the pairs never meet;
+    // nothing special-cases them, and this is the measurement that says so.
+    // (std's own impls are frozen in a scoped run, so the full-scan half of the
+    // proof lives in `check_scope_differential.rs`, which force-loads every std
+    // module on both legs with the skip disabled.)
+    let source = r#"
+        import std::ui::{ View, view };
+        fun main() { let root: View = view("div"); }
+        "#;
+    assert_compiles_browser(source);
+    assert_compiles(source);
 }
 
 // --- B4 §2.2: a bare trait annotation must not launder a resource -----------

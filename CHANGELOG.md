@@ -8,6 +8,18 @@ tracks the latest state.
 
 ## Unreleased
 
+**Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
+
+A trait has one implementation per type, so the second block is now reported where it is written, with a note pointing at the first and, when the first is in another module, its name. The message asks for the fix the situation actually has: merge the two bodies, or delete the one you don't want.
+
+Only an exact repeat is refused, and the boundary is worth knowing because parameterized traits live on the other side of it. `impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` are two implementations and both stand; the same arguments twice is one implementation written twice. An argument you leave to a `= Self` default counts as the type it defaults to, so `with Combine` and `with Combine<Bag>` on `Bag` are the same implementation and no longer slip past each other. Two generic impls that differ only in what they named their binder — `impl Pair<type T> with Show` and `impl Pair<type U> with Show` — are one impl written twice, and are refused as one.
+
+What is *not* refused is overlap. A blanket implementation and a specific one that both match a type — the standard library's `impl type T with Into<T>` beside a type's own `Into`, or two conditional impls with different bounds — are legal today and still are; which one a call selects is still decided by declaration order. That is a separate question (which of two applicable impls is more specific) and it stays open; this change refuses only the case where there is nothing to choose between.
+
+The standard library's browser and process implementations of `View`, `str`, `Signal<str>` and `List<View>` are not affected: only one of the two layers is ever loaded into a build, so the two halves of a platform pair never meet. Nothing in the standard library, the examples, the documentation, or the regression corpus had to change.
+
+---
+
 **A trait written where a type belongs is now an error, and it is reported at the annotation.** `let x: Display = bag;` compiled. So did `fun make(): Display`, `struct Holder { item: Display }`, a method's `v: Display` parameter, and `List<Display>`. Only *using* the value failed, and only sometimes — four of six positions took a bare trait silently. The spec has said since it was written that a trait is a bound and not a type; the compiler agrees now, in every value position, whether or not the declaration is ever called.
 
 The reason this is worth a language change rather than a better message is what the acceptance was hiding. A resource behind a bare trait annotation **lost its destructor**. `let handle: Named = Handle { id = 1 }` ran the program, printed nothing, and never closed the handle — where `let handle: Handle = …` closes it — because the resource analysis is asked whether a type carries a resource by containment and answers "no, definitively" for a trait. Nothing could see through the annotation, so the single-owner rule stopped applying too: the same value could be moved twice, compile, and run. One changed word in a type annotation, no diagnostic, live data loss.
@@ -20,7 +32,7 @@ A trait's name stays legal everywhere it names a bound or a namespace rather tha
 
 Five declarations in the standard library needed the new spelling, and they are the five that always meant `Self`: `Iterable::iter`, `Wire::rebuild`, and `FromJson`'s two. No call site changed and no emitted output moved — none of the five was ever called through its bare-trait type.
 
-Known, and filed rather than quietly left: two `impl … with` blocks of the same trait for the same type still resolve by declaration order, leaving the second silently dead. It is a plain bug with or without any of the above, and it has its own entry.
+Known, and filed rather than quietly left: two `impl … with` blocks of the same trait for the same type still resolve by declaration order, leaving the second silently dead. It is a plain bug with or without any of the above, and it has its own entry — closed above, in this same release.
 
 ---
 
