@@ -859,3 +859,23 @@ indistinguishable. `component_data` is where the ABSENCE lives: `counted[1] =
 2;` with no drop, inside an aggregate that holds a resource. The golden moved
 **additively** — every pre-existing byte unchanged. **No other corpus golden
 moved.**
+
+### 10.4 Bycatch, verified and filed
+
+Three findings from the measurement, none fixed in this lane:
+
+- **An inferred `List<Resource>` escapes R10 entirely.** `mut arr: List<Guard>
+  = [Guard { .. }]` is rejected as designed; deleting the annotation compiles
+  the same program, and the element is never destroyed. Recorded under R10 in
+  `destruction.md` with the fixed-array contrast.
+- **A by-value function that hands its view parameter straight back is still
+  classified as borrowing it** (`infer_borrows`' `Expr::Local` arm), so its
+  result binds as a view even though B100 now makes it a copy. Refused
+  deliberately: narrowing that arm turns the body into a rule-3 view-escape
+  rejection. `element-clones.md` §9.3 has the measurement; the reason is
+  recorded at the arm.
+- **A compound assignment evaluates an impure index twice.** `ys[bump()] += 1`
+  emits `__at_put(ys, bump(), __at(ys, bump()) + 1)` and has for as long as the
+  synthesized re-read has existed. Pre-existing, unrelated to resources, and
+  the reason B99's drop may re-walk its target place without introducing a new
+  class of defect: the emission was already this shape.

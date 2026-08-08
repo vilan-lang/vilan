@@ -203,6 +203,16 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   reaching a container through a field — `Signal<T>`'s `value: Shared<T>` — is
   rejected too. A member whose type is already concrete is skipped: it is a written
   application in its own right, and would otherwise report twice.
+  - **Bycatch, found 2026-08-07 by B99's arc, filed rather than ridden in.** "The
+    written application" is load-bearing in the wrong direction: an INFERRED
+    `List<Resource>` is never asked. `mut arr: List<Guard> = [Guard { .. }]` is
+    rejected as designed, and `mut arr = [Guard { .. }]` — the same program with
+    the annotation deleted — compiles, and the element is never destroyed (the
+    binding takes no scope-end teardown at all, because a `List` is not a
+    resource by containment). Two rules miss it at once, which is why it is its
+    own item. The fixed-array spelling `[Guard; 2]` is correct in both halves
+    (rejected by nothing, dropped in reverse element order) and is pinned by
+    B99's `an_element_write_drops_the_old_value`.
 - **R11 — generics must be move-clean per instantiation.** Instantiating a type parameter
   with a resource type re-checks the instantiated body under the affine rules (T := the
   resource): every T-typed value used at most once as a move, no captures, no copies.
