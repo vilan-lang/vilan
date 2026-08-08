@@ -48871,3 +48871,124 @@ fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
         "\"B\"\n{\"Text\":\"hi\"}\na\n",
     );
 }
+
+// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
+// enum ------------------------------------------------------------------------
+//
+// The parameter direction is safe — vilan constructs the value, so it is always
+// in the set. The return direction is not, and what happens then is the reason
+// for the deferral: an exhaustive `match` compiles its last arm to a bare
+// `else` (there is no "impossible" trap arm), so a host value outside the set
+// silently takes whichever arm happens to be last. It is not detectably wrong;
+// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
+// `parse()` path, where an out-of-set value honestly yields `None`, until
+// backed enums grow a trap-arm story.
+
+#[test]
+fn b76_an_external_fun_cannot_return_a_backed_enum() {
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
+    );
+    // The message names the way out rather than only the prohibition (B6).
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "convert with `Align::parse`",
+    );
+    // The INTEGER backing is refused for the same reason — §7.2 is about the
+    // host boundary, not about strings.
+    assert_fails_with(
+        r#"
+        enum Code { Ok = 200, NotFound = 404 }
+        [extern("getCode")]
+        external fun get_code(): Code;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Code'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
+    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
+    // exactly the same way, and the wrapper path is what each of them wants.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Option<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_aligns(): List<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_is_the_return_direction_only() {
+    // The parameter direction is the whole point of the feature — the extern
+    // takes the enum, because the enum IS the string — and it stays legal, as
+    // does an unbacked enum in either direction.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("setAlign")]
+        external fun set_align(value: Align): void;
+        fun main() { set_align(Align::Start); }
+        "#,
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        [extern("getPlain")]
+        external fun get_plain(): Plain;
+        fun main() { }
+        "#,
+    );
+    // The refusal does not depend on declaration order.
+    assert_fails_with(
+        r#"
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
+    // What §7.2 steers to, compiled: the extern speaks the host's own type and
+    // `parse` is the guard, answering `None` for a value outside the set.
+    assert_compiles(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        [doc(hidden)]
+        external fun get_align_raw(): str;
+        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
+        fun main() { }
+        "#,
+    );
+}
