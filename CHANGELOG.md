@@ -8,6 +8,16 @@ tracks the latest state.
 
 ## Unreleased
 
+**A generic body that writes through a `&mut T` is refused at a resource instantiation, instead of leaking.** `fun set<T>(slot: &mut T, own value: T) { slot = value }` compiled, and at `T := Database` the value it wrote over was never closed — the write destroys what it replaces, and a body shared across every instantiation cannot run a per-type destructor. The rule that a generic cannot destroy a `T` was already enforced at scope ends and at `own` parameters; it is enforced at writes now too, for a write through a view and for a write over a `T`-typed field alike.
+
+The error lands at the instantiation site, names the assignment inside the body, and steers the two ways out: move the value out on every path, or take a concrete type. A concrete `fun set(slot: &mut Guard, own value: Guard)` is fine and always was — it knows the type, so the destructor is emitted.
+
+Two neighbours fall out of the same fix. A generic that takes no `own` parameter at all was skipped entirely by this check, so `fun clear<T>(slot: &mut Option<T>) { slot = None }` and `fun stash<T>(slot: &mut Option<T>) { let taken = slot.take(); }` both leaked in silence; both are reported now. And the question is asked per instantiation, of the values this instantiation makes into resources — a concrete resource written inside a generic body is ordinary code and stays accepted.
+
+Nothing in the standard library trips it: `Option` is the only container a resource can enter, and its whole surface still instantiates clean.
+
+---
+
 **A method that returns one of its receiver's fields hands back a copy, not the field.** `fun make(&self): (i32, i32) { self.pair }` returned the receiver's storage itself, so `let p = h.make(); h.pair.1 = 99` changed `p` — and a `List` field returned the same way grew when the receiver's did. The bare-`self` spelling of the same method, one character apart, already copied.
 
 Every binding, argument pass, field initialization and return copies; a return through a parameter the body does not own has copied since the store rule landed. The exemption that let this through was written for `&`/`&mut` parameters and justified by view projections — "returning through one is an alias on purpose". But a loaned parameter is exactly storage the returning frame does not own, and whether an alias leaves is decided by the *signature*, not by which parameter the body happened to read. A function that returns `(i32, i32)` returns a value; one that returns `&mut (i32, i32)` returns a projection, and that one still hands back the alias, as it must.

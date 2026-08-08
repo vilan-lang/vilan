@@ -43361,6 +43361,290 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
     );
 }
 
+// --- B101: R2's overwrite through a place the generic body does not own ------
+// B94 and B99 made a write THROUGH a `&mut` and a write OVER a component
+// destroy what they replace. Both drops are per-type glue a generic body cannot
+// emit, so at a resource instantiation the body owes a destruction it cannot
+// run — and `check_own_generic_exactly_once` did not look: its `place_overwrites`
+// was deliberately empty, with the reason recorded in the code. It looks now,
+// at the per-instantiation DELTA place set, so a concrete resource written
+// inside a generic body stays chunk 3's report. See proposal/destruction.md R11.
+
+/// The B101 pin family's shared preamble.
+fn b101_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::{{ Drop, drop }};
+        import std::option::Option::{{ self, Some, None }};
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn b101_a_generic_write_through_a_mut_t_is_rejected() {
+    // The filed shape. `slot = value` inside `&mut T` is B94's write: it
+    // destroys the pointee's outgoing value, which at `T := Guard` is a `Guard`
+    // the shared body cannot destroy. Before this it compiled and printed
+    // "before\nafter\ndropped second" — "first" leaked outright.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `slot`'s previous value (R2)"),
+        "the note names the written place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("slot = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "slot = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_through_a_reborrow_is_rejected() {
+    // The same write under a second name. `binding_or_param_is_view` follows the
+    // copy chain, so a local bound to a `&mut` of the parameter is a loan too —
+    // which is what keeps the question at the place rather than at the
+    // parameter list.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) {
+            let inner = &mut slot;
+            inner = value;
+        }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    let (note_msg, _, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `inner`'s previous value (R2)"),
+        "the note names the re-borrow; got: {note_msg:?}"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_over_a_component_is_rejected() {
+    // B99's arm inside a generic body: `holder.item = value` overwrites a
+    // `T`-typed component, so the same drop is owed and the same body cannot
+    // emit it. The note names the ROOT the component sits in, because the
+    // component itself names no value of its own.
+    let source = b101_program(
+        r#"
+        struct Wrap<type T> { item: T }
+        fun set<T>(holder: &mut Wrap<T>, own value: T) { holder.item = value; }
+        fun main() {
+            mut w = Wrap { item = Guard { label = "first" } };
+            set(&mut w, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut w, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy the value it replaces inside `holder` (R2)"),
+        "the note names the root place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("holder.item = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "holder.item = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_overwrite_with_no_own_parameter_is_rejected() {
+    // The check used to return early unless the body took an `own T`, which was
+    // its original scope surviving as a guard. `clear` declares none and owes
+    // R2's drop anyway — before this it compiled and leaked the payload without
+    // printing anything.
+    let source = b101_program(
+        r#"
+        fun clear<T>(slot: &mut Option<T>) { slot = None; }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            clear(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "clear(&mut o)",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+}
+
+#[test]
+fn b101_a_generic_scope_end_drop_with_no_own_parameter_is_rejected() {
+    // The same guard removal reaches B66's other half: `taken` is a
+    // delta-resource local still owning where its scope ends, in a body that
+    // takes no `own T` at all. One rule, asked wherever it applies.
+    let source = b101_program(
+        r#"
+        fun stash<T>(slot: &mut Option<T>) { let taken = slot.take(); }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            stash(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "stash(&mut o)",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn b101_a_concrete_instantiation_of_the_same_body_is_accepted() {
+    // The negative that keeps the rule about resources: `T := i32` is not a
+    // resource instantiation, nothing is enqueued, and the same body compiles
+    // and runs.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut n = 1;
+            set(&mut n, 2);
+            print(n);
+        }
+        "#,
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_body_with_the_same_write_still_drops() {
+    // The other negative, and the reason the rule is R11's rather than R2's: a
+    // CONCRETE `&mut Guard` body knows the type, so B94's drop is emitted and
+    // the write is correct. Only a shared generic body is asked.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set(slot: &mut Guard, own value: Guard) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            print("before");
+            set(&mut g, Guard { label = "second" });
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped first\nafter\ndropped second\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
+    // Why the question is asked of the DELTA place set and not of concrete
+    // resource-ness. `slot.held` is a `Guard` at every instantiation, so the
+    // emitted body knows the type and B99's drop fires — this is chunk 3's
+    // territory, and re-asking it here would reject a correct program once per
+    // instantiation site. Runs, and destroys all three in order.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        resource struct Slot { held: Guard }
+        fun bump<T>(own value: T, slot: &mut Slot): T {
+            slot.held = Guard { label = "fresh" };
+            value
+        }
+        fun main() {
+            mut s = Slot { held = Guard { label = "old" } };
+            let g = bump(Guard { label = "passed" }, &mut s);
+            drop(g);
+            print("end");
+        }
+        "#,
+        ),
+        "dropped old\ndropped passed\nend\ndropped fresh\n",
+    );
+}
+
+#[test]
+fn b101_a_read_only_generic_view_body_is_accepted() {
+    // A `&T` body that never writes owes nothing, so the widened check must not
+    // reach it — the predicate is the WRITE, not the loan.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun peek<T>(slot: &Option<T>): bool { slot.is_some() }
+        fun main() {
+            let o = Some(Guard { label = "first" });
+            print(peek(&o));
+        }
+        "#,
+        ),
+        "true\ndropped first\n",
+    );
+}
+
+#[test]
+fn b101_the_option_surface_still_instantiates_at_a_resource() {
+    // The std sweep, as a pin: `Option` is the sanctioned resource container
+    // (R10), and its generic surface must stay clean under the widening.
+    // `take`, `replace`, `unwrap`, `is_some`/`is_none` and the `drop` sink are
+    // every generic a resource can reach in std today.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun main() {
+            mut slot = Some(Guard { label = "a" });
+            print(slot.is_some());
+            match slot.take() {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            print(slot.is_none());
+            mut refilled = Some(Guard { label = "b" });
+            match refilled.replace(Guard { label = "c" }) {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            drop(refilled.unwrap());
+        }
+        "#,
+        ),
+        "true\ndropped a\ntrue\ndropped b\ndropped c\n",
+    );
+}
+
 #[test]
 fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
     // B5 — one diagnostic per root cause. The drop plan assumes an affine-valid

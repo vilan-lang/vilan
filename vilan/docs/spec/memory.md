@@ -559,6 +559,23 @@ changes no ownership and is policed by rule 4.
   at the instantiation site. The consequence worth stating: a combinator that
   hands a payload to a closure and then discards it — the closure only *loans*
   it — cannot be resource-clean, whatever its receiver convention.
+
+  Read the same sentence at R2's seam and it reaches **writes**, not only
+  scope ends. Overwriting a `T`-typed place destroys the outgoing value, and a
+  generic body cannot run that destructor either — so a body that writes
+  through a `&mut T`, or over a `T`-typed component, is rejected at a resource
+  instantiation:
+
+  ```vilan,ignore
+  fun set<T>(slot: &mut T, own value: T) { slot = value; }   // rejected at T := a resource
+  fun clear<T>(slot: &mut Option<T>) { slot = None; }        // and so is this
+  ```
+
+  A **loan owns nothing**, but it is not excused either: the value the write
+  replaces belongs to the caller, and somebody must destroy it. The concrete
+  spelling of the same body is fine — `fun set(slot: &mut Guard, own value:
+  Guard)` knows the type and emits the drop — which is the steer: move it out
+  on every path, or take a concrete type.
 - **R12: no coercion to `any`.** A resource passed where `any` is expected
   is an error (`print(db)` included): `any` is a data sink, and the
   discipline must not launder away. Debug-print the fields instead.

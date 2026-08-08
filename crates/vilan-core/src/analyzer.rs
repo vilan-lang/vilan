@@ -464,7 +464,7 @@ struct PlanArm {
 
 /// Which value a generic body would have to destroy and cannot (R11,
 /// destruction.md §6). One rule — "a generic body cannot destroy a `T`" — read
-/// at the two places the drop planner can report it.
+/// at every place the drop planner can schedule a destruction.
 enum GenericLeak {
     /// An `own T` parameter still owned at the body's fall-through end: never
     /// moved out, so the caller's value has no destroyer.
@@ -473,10 +473,16 @@ enum GenericLeak {
     /// a pattern capture that took a consumed subject's payload (B62), or a
     /// `let` local of delta-resource type.
     ScopeEndDrop,
-    /// R2's overwrite drop — the third and last place the planner can schedule a
-    /// destruction. `mut held = a; held = b;` must destroy `a` at the
-    /// assignment, which a generic body cannot do either.
+    /// R2's overwrite drop over a NAME. `mut held = a; held = b;` must destroy
+    /// `a` at the assignment, which a generic body cannot do either — and
+    /// (B101) `slot = value` through a `&mut T` parameter is the same write
+    /// under a name whose value belongs to the caller.
     Overwrite,
+    /// B101: R2's overwrite drop over a COMPONENT — `holder.item = value`,
+    /// where `item` is `T`-typed. The same rule as [`Self::Overwrite`]; it
+    /// reports separately only because the target names no value of its own, so
+    /// the note has to name the place it sits in instead.
+    ComponentOverwrite,
 }
 
 /// A resource binding's move state on the path currently being scanned
@@ -5658,7 +5664,8 @@ impl<'src> Analyzer<'src> {
             .copied()
             .filter(|binding| !self.binding_or_param_is_view(*binding))
             .collect();
-        let place_overwrites = self.collect_place_overwrites(&bindings);
+        let place_overwrites =
+            self.collect_place_overwrites(&bindings, &self.resource_value_places);
         let resources = ResourceOwnership {
             owned_bindings,
             place_overwrites,
@@ -5816,7 +5823,19 @@ impl<'src> Analyzer<'src> {
     /// The target must be a PLACE, because the transformer walks it twice — once
     /// for the drop, once as the write's base — which is free for a name or a
     /// projection and would duplicate a `borrows`-call target.
-    fn collect_place_overwrites(&mut self, bindings: &HashSet<Id>) -> HashMap<Id, TypeId> {
+    ///
+    /// `resource_places` is the *set of place expressions whose value is a
+    /// resource*, and it is a parameter because the question has two answers.
+    /// The whole-program plan asks it of concrete resource-ness
+    /// ([`Analyzer::resource_value_places`]); R11 asks it per instantiation, of
+    /// the DELTA — the places whose resource-ness is caused by binding a type
+    /// parameter to a resource — so that a concrete resource written inside a
+    /// generic body is not re-reported at every instantiation site (B101).
+    fn collect_place_overwrites(
+        &self,
+        bindings: &HashSet<Id>,
+        resource_places: &HashSet<Id>,
+    ) -> HashMap<Id, TypeId> {
         let targets: Vec<(Id, Id)> = self
             .expr_id_to_expr_map
             .iter()
@@ -5851,7 +5870,7 @@ impl<'src> Analyzer<'src> {
                 // The component half: every remaining place is a projection
                 // (`Field` / `TupleIndex` / `Index`), and its value's type is
                 // what decides.
-                self.type_is_resource(type_id)
+                resource_places.contains(&target_id)
             };
             if overwrites_a_resource {
                 overwrites.insert(assignment_id, type_id);
@@ -8309,7 +8328,12 @@ impl<'src> Analyzer<'src> {
             };
             let body_is_move_clean = violations.is_empty();
             self.emit_r11_violations(instance.callee, instance.call_id, violations);
-            self.check_own_generic_exactly_once(&instance, &resource_bindings, body_is_move_clean);
+            self.check_own_generic_exactly_once(
+                &instance,
+                &resource_bindings,
+                &resource_value_places,
+                body_is_move_clean,
+            );
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
 
             // Propagate: the callee's own calls, now under ITS resource
@@ -8352,10 +8376,19 @@ impl<'src> Analyzer<'src> {
     /// problem. `fun use_twice<T>(own x: T): T { let keep = x; x }` is the
     /// case: `keep` still owns only because `x` was used twice, which is
     /// already the error.
+    /// B101 widens it once more, to the third place the drop planner schedules a
+    /// destruction: R2's overwrite through a place the body does not own. A
+    /// generic body that writes through a `&mut T`, or over a `T`-typed
+    /// component, owes the outgoing value's drop at a resource instantiation and
+    /// cannot emit it — the same leak, at the seam B94 and B99 closed for
+    /// concrete code. The set is per-instantiation because the question is: it
+    /// asks the DELTA place set, so a concrete resource overwritten inside a
+    /// generic body stays chunk 3's report with its own in-body span.
     fn check_own_generic_exactly_once(
         &mut self,
         instance: &R11Instance,
         resource_bindings: &HashSet<Id>,
+        resource_value_places: &HashSet<Id>,
         body_is_move_clean: bool,
     ) {
         if Some(instance.callee) == self.drop_fn_id {
@@ -8377,26 +8410,28 @@ impl<'src> Analyzer<'src> {
                 .collect();
             (own_params, function.body.0.clone(), function.body.1)
         };
-        if own_params.is_empty() {
-            return;
-        }
+        // No `own_params.is_empty()` short-circuit: it was this check's original
+        // scope surviving as a guard, and it hid both widenings from a body that
+        // happens to take no `own T`. `fun clear<T>(slot: &mut Option<T>) { slot
+        // = None }` owes R2's drop and declares no `own` parameter at all.
         let mut owned: HashSet<Id> = own_params.iter().copied().collect();
         let mut dropped: HashSet<Id> = HashSet::new();
         let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
         // A loan owns nothing (B94), here as much as in the whole-program plan:
         // a `&mut T` binding in the body is not a value this instantiation would
-        // have to destroy. `place_overwrites` is deliberately empty — a generic
-        // body that WRITES through a `&mut T` would owe R2's drop of the pointee
-        // and cannot emit it, which is a leak this check should report; the set
-        // is per-instantiation type information this pass does not compute, so
-        // it is left to R11's own arc rather than half-answered here.
+        // have to destroy — so it is not an owner, and B101's point is that it is
+        // not excused either. `place_overwrites` answers the two halves of R2 the
+        // scan's own flow cannot: a write THROUGH a `&mut T` (B94's shape) and a
+        // write OVER a `T`-typed component (B99's), both asked of the DELTA place
+        // set so a concrete resource inside the body stays chunk 3's.
         let resources = ResourceOwnership {
             owned_bindings: resource_bindings
                 .iter()
                 .copied()
                 .filter(|binding| !self.binding_or_param_is_view(*binding))
                 .collect(),
-            place_overwrites: HashMap::new(),
+            place_overwrites: self
+                .collect_place_overwrites(resource_bindings, resource_value_places),
         };
         self.plan_scope(
             &[],
@@ -8430,15 +8465,22 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .map(|binding| (binding, binding, GenericLeak::ScopeEndDrop))
             .chain(overwrites.into_keys().filter_map(|assignment| {
-                let Some(Expr::Assignment(target_id, _)) =
+                let Some(&Expr::Assignment(target_id, _)) =
                     self.expr_id_to_expr_map.get(&assignment)
                 else {
                     return None;
                 };
-                let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(target_id) else {
-                    return None;
-                };
-                Some((assignment, *binding, GenericLeak::Overwrite))
+                // A NAME names the value it replaces (a binding this body owns,
+                // or — B101 — the pointee of a `&mut T`); a COMPONENT does not,
+                // so its report names the root it sits in and says so.
+                match self.expr_id_to_expr_map.get(&target_id) {
+                    Some(Expr::Local(binding)) => {
+                        Some((assignment, *binding, GenericLeak::Overwrite))
+                    }
+                    _ => self
+                        .place_root(target_id)
+                        .map(|root| (assignment, root, GenericLeak::ComponentOverwrite)),
+                }
             }))
             .collect();
         leaked.sort_by_key(|(note_anchor, _, _)| {
@@ -8486,6 +8528,13 @@ impl<'src> Analyzer<'src> {
                 format!(
                     "in `{name}`, this assignment would have to destroy `{binding_name}`'s \
                      previous value (R2) before the new one moves in"
+                ),
+            ),
+            GenericLeak::ComponentOverwrite => (
+                "a resource-typed value is overwritten while it still owns a payload".to_string(),
+                format!(
+                    "in `{name}`, this assignment would have to destroy the value it replaces \
+                     inside `{binding_name}` (R2) before the new one moves in"
                 ),
             ),
         };

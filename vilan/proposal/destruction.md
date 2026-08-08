@@ -156,9 +156,7 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
     would destroy the incoming value. Pinned in bytes both ways — a component
     write is a plain slot assignment and never truncates, and the view path
     keeps its `__replace` ordering pin.
-  - **Left open**, unchanged: the generic twin — a body that writes through a
-    `&mut T` would owe R2's drop at a resource instantiation and cannot emit it
-    — is B101, below.
+  - **The generic twin is R11's, and is closed there** (B101, below).
 - **R3 — parameters.** `self` / `&x` / `&mut x` conventions are loans, unchanged. `own x`
   is a move — and for resources it is *only* a move: where a data `own` argument silently
   copies when not at last use, a resource argument that is not the binding's last use is
@@ -214,6 +212,36 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   (function, resource bindings). Fallback if the general check drags in v1: bless
   `Option`'s surface first and ship the general rule as the follow-up — but the general
   rule is the design.
+  *(Amended 2026-08-07 — B101, shipped in the v0.35.0 drop-seams lane.)* The rule
+  reaches R2's seam as well as scope ends. **A generic body that OVERWRITES a
+  `T`-typed place is rejected at a resource instantiation**: `fun set<T>(slot:
+  &mut T, own value: T) { slot = value }` owes the outgoing pointee's drop (R2,
+  as B94 amended it) and `fun set<T>(holder: &mut Wrap<T>, own value: T) {
+  holder.item = value }` owes the outgoing component's (as B99 amended it), and
+  the shared body can emit neither. `check_own_generic_exactly_once`'s
+  `place_overwrites` had been deliberately empty with exactly this reason recorded
+  in the code; it is filled now, from the same `collect_place_overwrites` the
+  whole-program plan uses.
+  - **A loan owns nothing, and is not excused either.** That is B94's sentence
+    read one layer out: the value a generic body writes over belongs to the
+    caller, so it is not this instantiation's to *own* — and somebody must still
+    destroy it, which no shared body can.
+  - **Asked of the DELTA place set**, per the pass's standing rule: a place whose
+    resource-ness is caused by *this* instantiation. A CONCRETE resource
+    overwritten inside a generic body is chunk 3's, already correct (the emitted
+    body knows the type and B99's drop fires), and re-asking it here would reject
+    a correct program once per instantiation site. Plant-proven in both
+    directions.
+  - **The `own_params.is_empty()` short-circuit is gone.** It was this check's
+    original scope surviving as a guard, and it hid *both* widenings from a body
+    that takes no `own T`: `fun clear<T>(slot: &mut Option<T>) { slot = None }`
+    owes R2's drop and declares none, and B66's scope-end half was equally
+    unreachable there (`fun stash<T>(slot: &mut Option<T>) { let taken =
+    slot.take(); }` leaked in silence).
+  - **The std sweep is clean.** `Option` is the only resource-capable generic
+    container (R10 rejects the rest), and its whole surface — `take`, `replace`,
+    `unwrap`, `is_some`/`is_none` — plus the `drop` sink instantiates at a
+    resource with no report. Pinned as a test rather than left as a claim.
 - **R12 — no coercion to `any`.** A resource passed where `any` is expected errors
   (`print(db)` included) — `any` is a data sink; the discipline must not launder away.
   Debug-print fields instead.
