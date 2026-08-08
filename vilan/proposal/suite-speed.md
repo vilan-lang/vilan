@@ -684,3 +684,191 @@ untouched and still stands on its own.
 
 The `macro_std` re-export of `std::set` stays, per the owner's ruling. It no
 longer costs anything worth naming.
+
+## 8.2 The two levers were one and a half: method resolution scanned every impl (E46, 2026-08-07)
+
+E46 filed three numbers off §8.1's post-fix profile —
+`impl_member_candidates` 21%, `method_member_candidates` 17%,
+`get_type_by_type_id` 16% — and read them as two independent levers. The
+profile confirms all three figures exactly and then says they are not
+independent: **three quarters of the third number is the first one**, seen
+from the other side. One fix collects both.
+
+**The instrument.** Callgrind instruction counts, as in §8.1 — the box ran
+between load 3 and load 44 across this work (another agent's suite), so wall
+and CPU are usable only as interleaved minimum-of-N ratios and Ir is the
+only figure that means anything on its own. Debug binary, one `vilan check`
+per program in a fresh process, on §8's three-line per-module programs.
+
+**The filed numbers, verified.** Inclusive Ir, against the pre-E46 tree:
+
+| inclusive                    | `set`  | `rpc_server` |
+|------------------------------|--------|--------------|
+| `impl_member_candidates`     | 21.16% |       25.78% |
+| `method_member_candidates`   | 17.25% |       21.32% |
+| `get_type_by_type_id`        | 15.73% |       18.94% |
+| `type_implements_trait`      |  1.00% |        6.24% |
+
+`method_member_candidates` is not a separate cost — it is the caller that
+reaches `impl_member_candidates` for a `receiver.member()` resolution, and
+its 17% is inside the 21%.
+
+### Lever 1: the scan asked the expensive question first
+
+`impl_member_candidates` iterated all 322 std impls per resolution and, for
+each, compared the receiver against the impl's subject — a recursive type
+walk — *before* asking the cheap question the answer actually turned on:
+does this impl declare the name at all. Almost none of them do, so ~99% of
+the comparisons were performed on impls dropped one line later.
+
+That predicate is also where the un-interned type read lives:
+`implementation.subject.get_type(self)` deep-clones the subject on every
+iteration. Of the **202,424** `get_type` calls an `import std::set`
+analysis performed, **147,657 were this one closure** — 11.73% of the
+analysis against `get_type_by_type_id`'s 15.73% total. Lever 2's headline
+was mostly lever 1's scan.
+
+**The fix** is a name index — `Analyzer::implementations_by_member`,
+member name to the impls declaring it — and the only interesting question
+about it is invalidation, so: **there is nothing to invalidate.** The index
+is written at the ONE place `implementations` grows, from the same
+`declarations` map, in the same statement. `declarations` is final at that
+moment (the later conformance pass fills only `trait_ids` / `trait_args`),
+which is what makes registration-time correctness available at all rather
+than a cache needing a dirty bit.
+
+**The LSP / warm-analysis verdict: the index cannot go stale, and the
+reason is that it has no lifecycle of its own.** There is no separate
+incremental registration path to miss. Every analysis — cold, cache-hit,
+LSP document, macro world — grows `implementations` through the single
+`Node::Impl` walk arm, including `walk_generated_expansion` for derives.
+The base cache clones the whole `Analyzer` (`#[derive(Clone)]`), so the
+index is cloned with the vector it indexes, and a warm analysis walks its
+entry into *that clone*, registering the entry's impls into both. The
+stored world is snapshotted BEFORE the entry walk, so no analysis's entry
+impls can reach another's. The LSP holds a `Program`, never a live
+`Analyzer`, and reads `program.implementations` read-only.
+
+One structural property is worth recording because it decides what needs a
+test: **the index is a pre-filter, never the answer.** Every impl it names
+is still asked for `declarations[member_name]` before becoming a candidate.
+So a row that is too BROAD changes nothing observable, and only a row that
+is too NARROW can lose a candidate. Correctness has one direction, and the
+pin covers it in its sharpest form (`base_cache.rs`,
+`an_entry_declared_impl_resolves_through_a_cache_hit`: a warm analysis
+whose entry declares the impl; plant-proven red by skipping entry-source
+impls at registration). A pin written for the other direction was dropped
+after a planted process-global index failed to turn it red — it could not,
+for exactly this reason.
+
+Behaviour is unchanged by construction: the index row is in registration
+order, so the sequence reaching `sort_by_key`/`dedup_by_key` is the one the
+full scan produced, element for element.
+
+| inclusive Ir, `set` / `rpc_server` | before        | after lever 1 |
+|------------------------------------|---------------|---------------|
+| `impl_member_candidates`           | 21.16 / 25.78 |  0.66 / 0.78  |
+| `method_member_candidates`         | 17.25 / 21.32 |  0.58 / 0.68  |
+| `get_type_by_type_id`              | 15.73 / 18.94 |  4.06 / 4.83  |
+| `type_implements_trait`            |  1.00 /  6.24 |  0.18 / 0.32  |
+| PROGRAM TOTALS (e9 Ir)             | 2.477 / 14.79 | 1.969 / 11.06 |
+
+### Lever 2: the general refactor is unavailable, and it was measured, not felt
+
+After lever 1, `get_type_by_type_id` is 4.06% / 4.83% and what remains is a
+flat tail: the largest single reader is `inherited_default_candidates` at
+0.74%, then `compute_resource` 0.64%, `any_member_resource` 0.32%. There is
+no third hot reader to fix.
+
+Types stay un-interned — B77/B95's in-place resolution doctrine is not
+reopened — so the lever was only ever the read-path clone. **Blast radius,
+measured by making the change and counting:** `get_type_by_type_id`
+returning `&Type` produces **185 compile errors across 218 call sites in
+one file**, of which **71 are hard borrow conflicts** (66 `cannot borrow
+*self as mutable because it is also borrowed as immutable`, 5 closures
+requiring unique access). That is the solver mutating itself all the way
+down the inference path while a type borrow is live; no signature change
+answers it, only a restructuring. Fifteen times the "about a dozen"
+threshold. **Not taken.**
+
+What ships instead is the part where the borrow is free — the seven impl
+scans whose enclosing method is `&self` and which hand the type straight to
+`compare_type` — behind a documented sibling accessor
+(`borrow_type_by_type_id`), framed in the source as a permanent pair with a
+mechanical rule, not a migration with 211 sites outstanding. Alongside it,
+two genuinely dead clones: `any_member_resource` and its transferable twin
+read a member's type before deciding they only wanted its id, so an
+unparameterized aggregate deep-cloned a value nothing looked at.
+
+**Its honest size: 0.33% (`set`) / 0.63% (`rpc_server`) of a cold
+analysis** — split about evenly between the borrows (0.32%) and the dead
+clones (0.31%) on `rpc_server` — and **below the wall-clock instrument's
+noise floor.** Best-of-five interleaved CPU ms moved 0.97x–1.03x with no
+consistent direction; only Ir resolves it (11.064e9 → 10.995e9 on
+`rpc_server`, 1.969e9 → 1.963e9 on `set`; `get_type_by_type_id` 4.83% →
+3.51% and 4.06% → 3.28%). Recorded at that size deliberately: the lever as
+filed was worth 16%, and 15.4 of those 16 points belonged to lever 1.
+
+### §8.1's table, re-measured
+
+Cold `vilan check` per module, fresh process, the two binaries INTERLEAVED
+rep by rep with the minimum of seven taken, CPU ms. The box drifted from
+load 39 to load 10 during the run, which the interleaved minimum is chosen
+to survive; ratios are the meaningful column.
+
+| module        | before CPU ms | after CPU ms | ratio | macro worlds |
+|---------------|---------------|--------------|-------|--------------|
+| `rpc_server`  |        1479.5 |       1075.4 | 1.38x |            3 |
+| `rpc`         |        1324.9 |       1004.9 | 1.32x |            3 |
+| `ui` (node)   |        1226.6 |        932.7 | 1.32x |            3 |
+| `reactive`    |        1153.1 |        851.6 | 1.35x |            3 |
+| `time`        |         832.1 |        617.9 | 1.35x |            2 |
+| `arena`       |         530.2 |        408.6 | 1.30x |            1 |
+| `db`          |         270.9 |        210.1 | 1.29x |            0 |
+| `map`         |         250.1 |        201.5 | 1.24x |            0 |
+| `set`         |         241.7 |        198.0 | 1.22x |            0 |
+| `io`          |         241.4 |        190.6 | 1.27x |            0 |
+| `crypto`      |         240.7 |        194.5 | 1.24x |            0 |
+
+The shape is the opposite of §8.1's and that is the point. E43's fix was
+free where there was no spin to remove, so its control rows moved by under
+2%; this one moves EVERY row, controls included, because every analysis
+resolves methods. There is no anomalous module here — there is a tax that
+was on all of them.
+
+The phase split says where it came off (`VILAN_PHASE_TIMING=1`, one run):
+
+| phase, ms          | `set` before / after | `rpc_server` before / after |
+|--------------------|----------------------|-----------------------------|
+| `load+walk`        |      84.2 / 96.6     |            1001.0 / 891.3   |
+| `base`             |      89.6 / 45.6     |             276.9 / 100.6   |
+| `build`            |       9.2 /  4.8     |              21.4 /  16.4   |
+| `checks`           |      59.3 / 55.1     |             167.2 / 181.9   |
+
+The inference test binary, both builds interleaved, minimum of three, at
+load 36–42: **577.6 → 476.7 CPU s (1.21x)**. Its wall figures under that
+load are noise in both directions and are not quoted.
+
+No behaviour change: inference (1930), corpus, docs, diagnostic_determinism,
+release_emission and base_cache all green and byte-identical, and B57/B83's
+tiering pins — the guard on this exact code — are among them.
+
+### What the profile says next, recorded and not taken
+
+`rpc_server`'s remaining 11.0e9 Ir is no longer solver-shaped. Parsing is
+now the largest single family (`parse_binary_level` 179% inclusive, i.e.
+re-entered per macro world), and `load+walk` is 891 ms of the module's 1190
+— the three macro worlds' nested analyses, each of which re-parses and
+re-walks `macro_std`'s workspace from scratch. That is §8's untouched
+residue in a new guise: macro worlds are excluded from the base cache by a
+blanket `workspace.packages.is_empty()` test they can never satisfy, even
+though every macro world in a process shares one `macro_std`. It is the
+next lever, and it is a caching question, not a solver one.
+
+Inside the analyzer the remainder is flat and small: the largest single
+call site is `inherited_default_candidates`'s filter at 1.08%, which is a
+linear scan over all impls that the member-name index CANNOT serve (it
+looks its member up in the trait, not in the impl's declarations, so the
+name that keys the index is not present on the impl). Fixing it wants a
+second index keyed by trait, for about a point. Filed as a fact, not a
+lever.
