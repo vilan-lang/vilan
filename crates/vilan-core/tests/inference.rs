@@ -4152,28 +4152,53 @@ fn a_view_write_to_a_data_pointee_emits_no_drop() {
     );
 }
 
-#[test]
-#[ignore = "found by B94: a COMPONENT write to a resource-holding field fires no overwrite drop"]
-fn a_component_write_to_a_resource_field_drops_the_old_value() {
-    // Bycatch of B94, verified, filed rather than fixed. R2 is spelled over a
-    // BINDING ("assigning onto a binding that still owns a resource"), and the
-    // planner implements exactly that: only a whole-binding target enrolls. A
-    // component write to an owned place — `b.slot = ..`, and the same through a
-    // view — overwrites a live resource that no rule covers, and it is leaked
-    // outright (this program prints "before\nafter"). Whether that write is
-    // even legal is R5's question, not R2's: R5 makes a resource field
-    // loan-only and rejects moving one OUT of a live aggregate, but says
-    // nothing about writing over one. A different predicate over a different
-    // set of programs — its own measurement, per capture-clones.md §6.5's
-    // standing reason.
-    assert_compiles_and_runs(
+// ---------------------------------------------------------------------------
+// B99 (R2's COMPONENT half). B94 closed the loan half and filed this one: R2 is
+// spelled over a BINDING and R5 over reading and moving a field, so writing
+// over one fell between them and the outgoing value was leaked outright. The
+// rule now reads over the PLACE all the way down — a write over a component
+// whose type is a resource drops what it replaces, owned place and view alike,
+// with no liveness question (R5 makes a resource field loan-only, so a
+// component place always holds a live value). See proposal/destruction.md R2
+// and capture-clones.md §10.
+// ---------------------------------------------------------------------------
+
+/// The B99 pin family's shared preamble: a `Drop`-printing resource, an enum
+/// that holds one, and a struct that holds the enum.
+fn b99_program(body: &str) -> String {
+    format!(
         r#"
         import std::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
-        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
-        enum Holder { Full(Guard), Empty }
-        struct Slot { held: Holder }
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Full(Guard), Empty }}
+        struct Slot {{ held: Holder }}
+        {body}
+        "#
+    )
+}
+
+/// [`b99_program`] compiled, for the pins whose claim is about emitted BYTES.
+fn b99_js(body: &str) -> String {
+    match compile(&b99_program(body)) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+#[test]
+fn a_component_write_to_a_resource_field_drops_the_old_value() {
+    // The filed repro (B94's bycatch), now closed. R2 was implemented over the
+    // BINDING — only a whole-binding target enrolled — so `slot.held = ..`
+    // overwrote a live resource that no rule covered and printed
+    // "before\nafter", leaking the guard. Whether the write is legal at all is
+    // R5's question and R5 permits it (it makes a field loan-only and rejects
+    // moving one OUT; it says nothing about writing over one), which is exactly
+    // why R2 owes the drop.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
         fun main() {
             mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
             print("before");
@@ -4181,7 +4206,257 @@ fn a_component_write_to_a_resource_field_drops_the_old_value() {
             print("after");
         }
         "#,
+        ),
         "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_nested_component_write_drops_the_old_value() {
+    // The projection is asked of the PLACE, not of its depth: `o.inner.held`
+    // names the storage the write clobbers exactly as `slot.held` does.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        struct Outer { inner: Slot }
+        fun main() {
+            mut o = Outer { inner = Slot { held = Holder::Full(Guard { label = "held" }) } };
+            print("before");
+            o.inner.held = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_through_a_view_drops_the_old_value() {
+    // B94's arm composes, and this is the doctrine's own test: the two
+    // spellings are the same expression shape and differ only in what the root
+    // binding is, so the answer must not depend on the root. The predicate is
+    // the component's type, and it never asks.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun clear(s: &mut Slot) { s.held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            clear(&mut slot);
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_tuple_component_write_drops_the_old_value() {
+    // The same rule at the other positional spelling.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut pair = (1, Holder::Full(Guard { label = "held" }));
+            print("before");
+            pair.1 = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn an_element_write_drops_the_old_value() {
+    // The `Index` spelling — a fixed array of resources, which is the only
+    // indexable resource aggregate (R10 rejects the native containers). The
+    // trailing "dropped two"/"dropped three" are the scope-end teardown, in
+    // reverse element order.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut arr: [Guard; 2] = [Guard { label = "one" }, Guard { label = "two" }];
+            print("before");
+            arr[0] = Guard { label = "three" };
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped one\nafter\ndropped two\ndropped three\n",
+    );
+}
+
+#[test]
+fn a_component_write_inside_a_match_arm_drops_the_old_value() {
+    // The write is planned by `plan_expr`, which descends every arm, so a
+    // conditional write is covered without a liveness question — the component
+    // place is live on every path that reaches it.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            let n = 1;
+            print("before");
+            match n { 1 => { slot.held = Holder::Empty; } _ => {} }
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_to_a_data_field_emits_no_drop() {
+    // The negative half, in bytes: the rule fires on the COMPONENT's
+    // resource-ness, not on the fact that its aggregate holds a resource
+    // somewhere. `count` is an `i32` in a struct that also holds a `Holder`, and
+    // its write is the bare slot assignment it always was — which is what keeps
+    // every resource-free corpus program byte-identical.
+    assert_emits_containing(
+        &b99_program(
+            r#"
+        struct Pair { held: Holder, count: i32 }
+        fun main() {
+            mut pair = Pair { held = Holder::Full(Guard { label = "held" }), count = 1 };
+            pair.count = 5;
+            print(pair.count);
+        }
+        "#,
+        ),
+        "pair[1] = 5;",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_write_clobbers_the_slot() {
+    // The ordering is load-bearing rather than cosmetic, for the same reason
+    // B94 pinned it on the view path: the drop's operand IS the slot the write
+    // replaces, so a drop emitted afterwards would destroy the NEW value.
+    // Pinned in bytes, since a runtime pin cannot tell "dropped the old one"
+    // from "dropped a same-shaped new one".
+    let js = b99_js(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            slot.held = Holder::Full(Guard { label = "two" });
+        }
+        "#,
+    );
+    let drop_index = js.find("(slot[0]);").expect("the overwrite drop");
+    let write_index = js.find("slot[0] = [ 0,").expect("the component write");
+    assert!(
+        drop_index < write_index,
+        "the drop must precede the write that clobbers the slot it reads:\n{js}"
+    );
+}
+
+#[test]
+fn a_component_write_drops_in_the_owned_twins_order() {
+    // The whole-binding twin of the same program, so the two spellings can be
+    // compared: both destroy the outgoing value BEFORE the incoming one is
+    // installed, and neither destroys the incoming one until its scope ends.
+    let component = &b99_program(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            print("before");
+            slot.held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    let binding = &b99_program(
+        r#"
+        fun main() {
+            mut held = Holder::Full(Guard { label = "one" });
+            print("before");
+            held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    assert_compiles_and_runs(component, "before\ndropped one\nafter\ndropped two\n");
+    assert_compiles_and_runs(binding, "before\ndropped one\nafter\ndropped two\n");
+}
+
+#[test]
+fn a_write_through_a_view_of_a_component_still_drops() {
+    // The neighbour that was ALREADY right, pinned so the new arm cannot move
+    // it: `&mut slot.held` mints a view whose own write is B94's loan arm, and
+    // it takes the `__replace` path (a whole-value write through a view) rather
+    // than this one. The two spellings agree, which is the point.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            let v = &mut slot.held;
+            v = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_truncating_replace_on_the_view_path() {
+    // B89's interaction, unchanged by B99 and pinned here because the component
+    // arm shares the emission site: a write THROUGH a view still lowers to
+    // `__replace`, which sets `target.length = value.length` before merging, so
+    // a drop emitted after it would destroy slots that no longer exist. A
+    // component write is a plain slot assignment and never truncates — the
+    // ordering is owed for the simpler reason above — so both orders are pinned
+    // from the one emission.
+    let js = b99_js(
+        r#"
+        fun refill(held: &mut Holder) { held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            refill(&mut slot.held);
+        }
+        "#,
+    );
+    let drop_index = js.find("(held);").expect("the overwrite drop");
+    let replace_index = js.find("__replace(held,").expect("the truncating write");
+    assert!(
+        drop_index < replace_index,
+        "the drop must precede `__replace`'s truncation (B89):\n{js}"
+    );
+}
+
+#[test]
+fn a_resource_free_component_write_plans_no_drop_pass_at_all() {
+    // The early return that keeps resource-free programs byte-identical: a
+    // program with no declared resource has no resource type, so the component
+    // arm collects nothing and no `try`/`finally` appears.
+    let js = match compile(
+        r#"
+        import std::print;
+        struct Slot { held: i32 }
+        fun main() {
+            mut slot = Slot { held = 1 };
+            slot.held = 2;
+            print(slot.held);
+        }
+        "#,
+    ) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    };
+    assert!(
+        !js.contains("finally"),
+        "a resource-free program takes no teardown:\n{js}"
     );
 }
 

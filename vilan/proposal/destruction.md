@@ -128,16 +128,37 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
     *is* `Holder`), so `let v = &mut holder` minted a resource-typed local the
     planner enrolled as an owner and the emitted program destroyed the borrowed
     value twice. Fixed here, by the one filter both halves ride.
-  - **Left open, filed rather than patched.** A COMPONENT write — `slot.held =
-    Holder::Empty`, and the same through a view — overwrites a live resource
-    and destroys nothing. R2 is spelled over a binding and R5 is spelled over
-    reading and moving a field, so no rule covers writing over one; it is a
-    different predicate over a different set of programs and wants its own
-    measurement. Pinned `#[ignore]`d as
-    `a_component_write_to_a_resource_field_drops_the_old_value`. The generic
-    twin is open too: a body that writes through a `&mut T` would owe R2's drop
-    at a resource instantiation and cannot emit it, which R11's
-    `check_own_generic_exactly_once` does not yet report.
+  *(Amended 2026-08-07 — B99, measured and shipped in the v0.35.0 drop-seams
+  lane.)* Read the rule over the **place all the way down**: writing over a
+  resource-typed COMPONENT — `slot.held = Holder::Empty`, a tuple element, a
+  fixed-array element — destroys the outgoing value too, on an owned place and
+  through a view alike. R2 had been spelled over a binding and R5 over reading
+  and moving a field, so writing over one fell between them and the value was
+  leaked outright.
+  - **The predicate is the COMPONENT's own type, asked of the projection and
+    not of its root.** That is the whole of the doctrine: `slot.held` and
+    `view.held` are the same expression shape and differ only in what the root
+    binding is, so an answer that consulted the root would make the two
+    spellings distinguishable — the thing B81/B88/B94 exist to forbid. Measured
+    against the alternative (§7.2's discipline): restricting to an owned root
+    costs the view spelling and buys nothing, and it answers the wrong
+    question in both directions — an inferred `List<Guard>` root is not
+    classified a resource while a `&mut Slot` root is.
+  - **No liveness question, and none is needed** — R5 is the reason, read
+    directly. A resource field is loan-only and moving one out of a live
+    aggregate is rejected, so a component place always holds a live value; a
+    root that was moved out is a use-after-move R1 already rejects; and a
+    repeated write is safe because the glue reads the place's CURRENT contents.
+    The same three arguments B94 made for the loan, which is why one collector
+    (`collect_place_overwrites`) now answers both static halves.
+  - **The drop precedes the write**, here for a simpler reason than B94's: the
+    drop's operand IS the slot the write replaces, so a drop emitted after it
+    would destroy the incoming value. Pinned in bytes both ways — a component
+    write is a plain slot assignment and never truncates, and the view path
+    keeps its `__replace` ordering pin.
+  - **Left open**, unchanged: the generic twin — a body that writes through a
+    `&mut T` would owe R2's drop at a resource instantiation and cannot emit it
+    — is B101, below.
 - **R3 — parameters.** `self` / `&x` / `&mut x` conventions are loans, unchanged. `own x`
   is a move — and for resources it is *only* a move: where a data `own` argument silently
   copies when not at last use, a resource argument that is not the binding's last use is

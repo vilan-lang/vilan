@@ -437,6 +437,38 @@ changes no ownership and is policed by rule 4.
   pointee out (R5, R6), and a binding its owner already moved out of is dead,
   so lending it is use-after-move (R1). The drop runs the same per-type glue
   in the same order the owned spelling does.
+
+  The rule is read over the **place**, all the way down: writing over a
+  resource-typed *component* — a field, a tuple element, a fixed-array
+  element — destroys the outgoing value too, whether the aggregate is owned
+  or reached through a view.
+
+  ```vilan
+  import std::print;
+  import std::drop::Drop;
+
+  resource struct Guard { label: str }
+  impl Guard with Drop {
+      fun drop(&mut self) { print(self.label); }
+  }
+
+  struct Slot { held: Guard }
+
+  fun refill(slot: &mut Slot) {
+      slot.held = Guard { label = "replaced" };        // prints "replaced"
+  }
+
+  fun main() {
+      mut slot = Slot { held = Guard { label = "held" } };
+      slot.held = Guard { label = "replaced" };        // prints "held"
+  }
+  ```
+
+  A component asks no liveness question either, and for R5's reason: a
+  resource field is loan-only and cannot be moved out of a live aggregate, so
+  a component place always holds a live value. Only the component's *own*
+  type decides — writing an `i32` field of a struct that happens to hold a
+  resource elsewhere destroys nothing.
 - **R3: parameters.** `self` / bare `x` / `&x` / `&mut x` are loans,
   unchanged (§6.3's table is the by-convention index of this line); `own
   x` is a move, and for a resource *only* a move: an `own` argument that is
@@ -457,7 +489,8 @@ changes no ownership and is policed by rule 4.
 - **R5: fields.** A struct literal moves resources in. A resource field is
   read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
   live aggregate is rejected; v1 has no partial moves. The sanctioned
-  partial move is `Option` (below).
+  partial move is `Option` (below). Writing *over* a resource field is
+  permitted, and is R2's overwrite: the outgoing value is destroyed first.
 - **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm, and each capture
   **owns** what it took — it is destroyed at the end of the arm that bound

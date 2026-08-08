@@ -5650,10 +5650,10 @@ impl<'src> Analyzer<'src> {
             .copied()
             .filter(|binding| !self.binding_or_param_is_view(*binding))
             .collect();
-        let loan_overwrites = self.collect_loan_overwrites(&bindings);
+        let place_overwrites = self.collect_place_overwrites(&bindings);
         let resources = ResourceOwnership {
             owned_bindings,
-            loan_overwrites,
+            place_overwrites,
         };
         // The resource types reached by a `drop(db)` sink call, per enclosing scan
         // root (destruction.md §8 platform coloring): a sink call is invisible to
@@ -5662,7 +5662,7 @@ impl<'src> Analyzer<'src> {
         // source of truth as the scope-end drops (`owned_by_root`).
         let drop_sink_by_root = self.drop_sink_types_by_root();
         if resources.owned_bindings.is_empty()
-            && resources.loan_overwrites.is_empty()
+            && resources.place_overwrites.is_empty()
             && drop_sink_by_root.is_empty()
         {
             return;
@@ -5764,41 +5764,51 @@ impl<'src> Analyzer<'src> {
         self.drop_owned_types_by_root = owned_by_root;
     }
 
-    /// B94 — R2's loan half. A write through a writable view is an **in-place
-    /// mutation of the pointee** (that is how it reaches the caller at all), so
-    /// it overwrites a live resource exactly as `holder = Holder::Empty` does
-    /// on the owned twin; the only difference is that the owner is another
-    /// body's binding, which the scan cannot see. Returns each such assignment
-    /// with the POINTEE type whose outgoing value drops.
+    /// R2's two **static** halves — the writes whose outgoing value has no owner
+    /// in the scanned body's own flow. Returns each such assignment with the type
+    /// whose outgoing value drops.
     ///
-    /// **No liveness question is asked, and none is needed.** The scan's
+    /// - **B94, the LOAN half.** A write through a writable view is an
+    ///   **in-place mutation of the pointee** (that is how it reaches the caller
+    ///   at all), so it overwrites a live resource exactly as `holder =
+    ///   Holder::Empty` does on the owned twin; the only difference is that the
+    ///   owner is another body's binding, which the scan cannot see. The target
+    ///   is a view-typed l-value — `self` inside `&mut self`, a `&mut`
+    ///   parameter, or a local bound to a `&mut` — which is one shape by
+    ///   [`Self::assignment_target_is_view`], the same predicate that later wraps
+    ///   it in the synthetic `Dereference` codegen writes through
+    ///   ([`Self::rewrite_view_assignment_targets`], which runs well after this
+    ///   pass; the assignment's own id is what both agree on).
+    /// - **B99, the COMPONENT half.** `slot.held = Holder::Empty` overwrites a
+    ///   live resource that belongs to the *aggregate*, not to any binding — R2
+    ///   is spelled over a binding and R5 over reading and moving a field, so
+    ///   nothing covered writing over one and the outgoing value was leaked
+    ///   outright. Asked of the PROJECTION and not of its root, which is the
+    ///   whole point: the doctrine `capture-clones.md` §6.2/§7.3/§8 applies to
+    ///   captures says the owned place and the view must be indistinguishable,
+    ///   and here they are the same expression shape — `slot.held` and
+    ///   `view.held` differ only in what the root binding is.
+    ///
+    /// **Neither asks a liveness question, and neither needs one.** The scan's
     /// `owned` set exists because a body can move its own binding out and must
-    /// not then drop it twice; through a loan that is unreachable. This body
-    /// cannot move the pointee out — matching a loan inspects without consuming
-    /// (R6) and a field/element consume is a rejected partial move (R5) — and
-    /// the *owner* cannot either, because a binding moved out is dead: handing
-    /// a `&mut` of it to this call is a use-after-move the checker already
-    /// rejects (pinned: `a_view_write_after_the_owner_moved_out_is_rejected`).
-    /// A repeated write through the same view is safe for a third reason — the
-    /// drop glue reads the pointee's CURRENT contents, which the previous write
-    /// already replaced.
+    /// not then drop it twice; neither of these can reach that state. Through a
+    /// loan: this body cannot move the pointee out — matching a loan inspects
+    /// without consuming (R6) and a field/element consume is a rejected partial
+    /// move (R5) — and the *owner* cannot either, because a binding moved out is
+    /// dead, so handing a `&mut` of it to this call is a use-after-move the
+    /// checker already rejects (pinned:
+    /// `a_view_write_after_the_owner_moved_out_is_rejected`). Over a component:
+    /// R5 is the same answer read directly — a resource field is loan-only and
+    /// moving one out of a live aggregate is rejected, so a component place
+    /// always holds a live value, and a root that was moved out is a
+    /// use-after-move R1 already rejects. A repeated write is safe for a third
+    /// reason in both cases — the drop glue reads the place's CURRENT contents,
+    /// which the previous write already replaced.
     ///
-    /// The target is a view-typed l-value — `self` inside `&mut self`, a `&mut`
-    /// parameter, or a local bound to a `&mut` — which is one shape by
-    /// [`Self::assignment_target_is_view`], the same predicate that later wraps
-    /// it in the synthetic `Dereference` codegen writes through
-    /// ([`Self::rewrite_view_assignment_targets`], which runs well after this
-    /// pass; the assignment's own id is what both agree on). It must also be a
-    /// PLACE, because the transformer walks it twice — once for the drop, once
-    /// as the write's base — which is free for a name and would duplicate a
-    /// `borrows`-call target.
-    ///
-    /// A field or element THROUGH a view (`v.slot = ..`) is deliberately not
-    /// here: `assignment_target_is_view` excludes projections because they are
-    /// ordinary places reached by auto-deref, and overwriting a resource-holding
-    /// COMPONENT is R5's question rather than R2's — a separate hole, filed
-    /// rather than ridden in on this one.
-    fn collect_loan_overwrites(&mut self, bindings: &HashSet<Id>) -> HashMap<Id, TypeId> {
+    /// The target must be a PLACE, because the transformer walks it twice — once
+    /// for the drop, once as the write's base — which is free for a name or a
+    /// projection and would duplicate a `borrows`-call target.
+    fn collect_place_overwrites(&mut self, bindings: &HashSet<Id>) -> HashMap<Id, TypeId> {
         let targets: Vec<(Id, Id)> = self
             .expr_id_to_expr_map
             .iter()
@@ -5806,25 +5816,36 @@ impl<'src> Analyzer<'src> {
                 Expr::Assignment(target_id, _) => Some((*id, *target_id)),
                 _ => None,
             })
-            .filter(|(_, target_id)| {
-                self.is_place_expr(*target_id)
-                    && self.assignment_target_is_view(*target_id)
-                    && self.subject_is_writable_view(*target_id)
-            })
+            .filter(|(_, target_id)| self.is_place_expr(*target_id))
             .collect();
         let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
         for (assignment_id, target_id) in targets {
-            // References are transparent, so the view's own type IS the
-            // pointee's, and a resource-typed binding root answers the
-            // classification question without re-deriving it.
             let Some(type_id) = self.place_value_type_id(target_id) else {
                 continue;
             };
-            let is_resource = match self.expr_id_to_expr_map.get(&target_id) {
-                Some(Expr::Local(binding)) => bindings.contains(binding),
-                _ => self.type_is_resource(type_id),
+            let target_is_name = matches!(
+                self.expr_id_to_expr_map.get(&target_id),
+                Some(Expr::Local(_))
+            );
+            let overwrites_a_resource = if target_is_name {
+                // The loan half. References are transparent, so the view's own
+                // type IS the pointee's, and a resource-typed binding root
+                // answers the classification question without re-deriving it.
+                // A name that is NOT a view is the owned arm's, settled by the
+                // scan's own flow rather than here.
+                let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(&target_id) else {
+                    continue;
+                };
+                bindings.contains(binding)
+                    && self.assignment_target_is_view(target_id)
+                    && self.subject_is_writable_view(target_id)
+            } else {
+                // The component half: every remaining place is a projection
+                // (`Field` / `TupleIndex` / `Index`), and its value's type is
+                // what decides.
+                self.type_is_resource(type_id)
             };
-            if is_resource {
+            if overwrites_a_resource {
                 overwrites.insert(assignment_id, type_id);
             }
         }
@@ -5982,8 +6003,10 @@ impl<'src> Analyzer<'src> {
             // R2: assigning onto a place that still holds a resource drops the
             // old value first (recorded here), then the new value moves in. Two
             // arms, one rule — the owner of the outgoing value is either a
-            // binding this scan tracks, or (B94) another body's, reached through
-            // a loan.
+            // binding this scan tracks, or somebody this scan cannot see: another
+            // body's binding reached through a loan (B94), or the aggregate a
+            // COMPONENT belongs to (B99). The second kind is always live, so it
+            // was settled statically before the scan began.
             Expr::Assignment(target_id, value_id) => {
                 self.plan_expr(value_id, true, resources, owned, dropped, overwrites);
                 match self.expr_id_to_expr_map.get(&target_id) {
@@ -5997,10 +6020,9 @@ impl<'src> Analyzer<'src> {
                         }
                         owned.insert(*binding);
                     }
-                    // The LOAN half (B94): the pointee is always live, so the
-                    // set was settled statically before the scan began.
+                    // The STATIC halves (B94's loan, B99's component).
                     _ => {
-                        if let Some(&type_id) = resources.loan_overwrites.get(&expr_id) {
+                        if let Some(&type_id) = resources.place_overwrites.get(&expr_id) {
                             overwrites.insert(expr_id, type_id);
                         }
                         self.plan_expr(target_id, false, resources, owned, dropped, overwrites);
@@ -8355,7 +8377,7 @@ impl<'src> Analyzer<'src> {
         let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
         // A loan owns nothing (B94), here as much as in the whole-program plan:
         // a `&mut T` binding in the body is not a value this instantiation would
-        // have to destroy. `loan_overwrites` is deliberately empty — a generic
+        // have to destroy. `place_overwrites` is deliberately empty — a generic
         // body that WRITES through a `&mut T` would owe R2's drop of the pointee
         // and cannot emit it, which is a leak this check should report; the set
         // is per-instantiation type information this pass does not compute, so
@@ -8366,7 +8388,7 @@ impl<'src> Analyzer<'src> {
                 .copied()
                 .filter(|binding| !self.binding_or_param_is_view(*binding))
                 .collect(),
-            loan_overwrites: HashMap::new(),
+            place_overwrites: HashMap::new(),
         };
         self.plan_scope(
             &[],
@@ -27066,10 +27088,10 @@ struct WrittenRoots {
 ///
 /// A binding in `owned_bindings` owns its value, so the scanned body's own
 /// flow settles whether it is still live at a write (and whether its scope end
-/// drops it). A loan owns nothing, and B94 is the consequence: a write through
-/// a `&mut` overwrites a value whose owner is another body's binding entirely,
-/// invisible to this scan — so those assignments are recorded up front, by the
-/// static shape of the target rather than by the scan's flow.
+/// drops it). Everything else the scan cannot see the owner of is settled up
+/// front, by the static shape of the target: a loan's pointee belongs to
+/// another body's binding (B94), and a COMPONENT's value belongs to the
+/// aggregate rather than to any binding at all (B99).
 struct ResourceOwnership {
     /// Resource-typed bindings that OWN their value: every resource binding
     /// MINUS the loans. References are transparent (`&mut Holder` has type
@@ -27077,11 +27099,12 @@ struct ResourceOwnership {
     /// owns nothing — enrolling it made its scope end destroy the borrowed
     /// value a second time.
     owned_bindings: HashSet<Id>,
-    /// B94: the assignments that write a resource pointee through a writable
-    /// view, mapped to the pointee type whose outgoing value drops. Static —
-    /// see [`Analyzer::collect_loan_overwrites`] for why no liveness question
-    /// is asked.
-    loan_overwrites: HashMap<Id, TypeId>,
+    /// The assignments whose overwritten value has no owner in this scan's
+    /// flow, mapped to the type whose outgoing value drops: a write through a
+    /// writable view (B94) and a write over a COMPONENT (B99). Static — see
+    /// [`Analyzer::collect_place_overwrites`] for why neither asks a liveness
+    /// question.
+    place_overwrites: HashMap<Id, TypeId>,
 }
 
 /// What `compute_capture_clone_sites` settles about a program's pattern

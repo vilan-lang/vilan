@@ -8,6 +8,18 @@ tracks the latest state.
 
 ## Unreleased
 
+**Writing over a resource-holding field destroys what it replaces.** `slot.held = Holder::Empty` used to destroy nothing. The value that had been in `held` was gone from the program and its destructor never ran — no diagnostic, no output, the same silent leak a write through a `&mut` view had until last release, one spelling over.
+
+The rule that governs this ("assigning onto a place that still holds a resource drops the old value first") was written about a *binding*, and implemented about a binding: only `holder = …` enrolled. The neighbouring rule, which makes a resource field readable only by loan and rejects moving one out of a live aggregate, is about *reading* a field. Writing over one fell between them, so nothing covered it — on an owned struct, on a tuple element, on a fixed-array element, and through a `&mut` equally.
+
+The rule now reads over the whole place: the component's own type is what decides, asked of the projection rather than of whatever binding it hangs off. That is deliberate and it is the point — `slot.held` and `view.held` are the same expression, and an answer that consulted the root would make the two spellings behave differently. Writing an `i32` field of a struct that holds a resource somewhere else still destroys nothing.
+
+No liveness question is asked, and none is needed: a resource field cannot be moved out of a live aggregate, so a component always holds a live value, and a write to a component of something already moved out is a use-after-move error either way. The destructor runs *before* the write, because it reads the very slot the write is about to replace.
+
+No emitted program changed except the resource fixture, which gained the new shapes.
+
+---
+
 **A trait written where a type belongs is now an error, and it is reported at the annotation.** `let x: Display = bag;` compiled. So did `fun make(): Display`, `struct Holder { item: Display }`, a method's `v: Display` parameter, and `List<Display>`. Only *using* the value failed, and only sometimes — four of six positions took a bare trait silently. The spec has said since it was written that a trait is a bound and not a type; the compiler agrees now, in every value position, whether or not the declaration is ever called.
 
 The reason this is worth a language change rather than a better message is what the acceptance was hiding. A resource behind a bare trait annotation **lost its destructor**. `let handle: Named = Handle { id = 1 }` ran the program, printed nothing, and never closed the handle — where `let handle: Handle = …` closes it — because the resource analysis is asked whether a type carries a resource by containment and answers "no, definitively" for a trait. Nothing could see through the annotation, so the single-owner rule stopped applying too: the same value could be moved twice, compile, and run. One changed word in a type annotation, no diagnostic, live data loss.
