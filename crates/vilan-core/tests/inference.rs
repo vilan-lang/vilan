@@ -48763,3 +48763,111 @@ fn b76_std_ordering_gains_the_conversions() {
         "1\n-1\n",
     );
 }
+
+// --- B76: `Wire`/JSON serialize as the backing value -------------------------
+//
+// §3.9, and the one genuine format change in the arc. Today's derive keys on
+// the variant NAME and ignores the discriminant entirely (P9: `Ordering::
+// Greater` went on the wire as `"Greater"`), so this is a DIVERGENCE rather
+// than an extension — taken now because §1.6 checked it costs nothing: there is
+// no `[derive(Wire)]` or `[derive(Json)]` enum anywhere in `vilan/std/src/`.
+
+#[test]
+fn b76_a_backed_enum_encodes_as_its_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Json)]
+        enum Code { Ok = 200, NotFound = 404 }
+        fun main() {
+            print(Align::Start.to_json());
+            print(Code::NotFound.to_json());
+        }
+        "#,
+        "\"flex-start\"\n404\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_decodes_from_its_backing_value() {
+    // The reverse direction goes through the synthesized `parse`, so a value
+    // outside the set is `Err` rather than a confidently wrong variant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun show(decoded: Result<Align, str>): str {
+            match decoded { Result::Ok(let a) => a.value(), Result::Err(let e) => e }
+        }
+        fun main() {
+            print(show(Align::from_json("\"flex-end\"")));
+            print(show(Align::from_json("\"middle\"")));
+        }
+        "#,
+        "flex-end\nunknown value in JSON for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_round_trips_through_wire() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::json_codec;
+        import std::result::Result;
+        import std::wire::{ Wire, encode, decode };
+        [derive(Wire)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Wire)]
+        struct Holder { align: Align, count: i32 }
+        fun main() {
+            let back: Result<Holder, str> =
+                decode(json_codec(), encode(json_codec(), Holder { align = Align::End, count = 3 }));
+            match back {
+                Result::Ok(let holder) => print(holder.align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+            let bad: Result<Align, str> = decode(json_codec(), encode(json_codec(), "middle"));
+            match bad {
+                Result::Ok(let align) => print(align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "flex-end\nunknown value for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
+    // The negative space, and the reason §3.9 is a divergence and not a
+    // rewrite: an enum with no backing value keeps the externally-tagged form
+    // exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Plain { A, B }
+        [derive(Json)]
+        enum Payload { Text(str), Count(i32) }
+        fun main() {
+            print(Plain::B.to_json());
+            print(Payload::Text("hi").to_json());
+            print(match Plain::from_json("\"A\"") {
+                Result::Ok(Plain::A) => "a",
+                Result::Ok(Plain::B) => "b",
+                Result::Err(let e) => e,
+            });
+        }
+        "#,
+        "\"B\"\n{\"Text\":\"hi\"}\na\n",
+    );
+}

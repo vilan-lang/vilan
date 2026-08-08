@@ -28305,6 +28305,20 @@ fn derive_enum_impls(
     enum_name: &str,
     variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
 ) -> String {
+    // §3.9: a BACKED enum serializes AS ITS BACKING VALUE, for both `Json` and
+    // `Wire`. `Align::Start` encodes as `"start"`, not `"Start"`.
+    //
+    // This is a DIVERGENCE from the derive's own history, not an extension of
+    // it: the derive has always keyed on the variant NAME and ignored the
+    // discriminant entirely, so `Ordering::Greater` used to go on the wire as
+    // `"Greater"` and now goes as `1`. §1.6 checked what that costs and the
+    // answer was nothing — there is no `[derive(Wire)]` or `[derive(Json)]`
+    // enum anywhere in `vilan/std/src/`, the only derive sites being structs —
+    // so the divergence is taken now, while it is free, rather than after the
+    // first user ships a format. Adding or removing a backing value on a
+    // derived enum is a wire-format break; that is a sentence in
+    // `docs/std/encoding.md`, not a compiler mechanism.
+    let backing_type = backed_enum_backing_type(variants);
     // (variant name, payload type names — its arity is the length).
     let variants: Vec<(&str, Vec<String>)> = variants
         .0
@@ -28400,6 +28414,45 @@ fn derive_enum_impls(
                 ));
             }
             "Json" | "Wire" => {
+                // §3.9's backed form: the value on the wire IS the backing
+                // value, and it round-trips through the synthesized `parse`.
+                // Both directions delegate — `value()` folds to the identity
+                // and `<backing>::to_json` already escapes correctly — so
+                // neither direction re-implements JSON quoting here.
+                if let Some(backing_type) = &backing_type {
+                    out.push_str(&format!(
+                        "impl {enum_name} with Json {{\n\
+                         \tfun to_json(self): str {{\n\
+                         \t\tself.value().to_json()\n\
+                         \t}}\n\
+                         }}\n"
+                    ));
+                    let coerce = match backing_type.as_str() {
+                        "str" => "coerce_str",
+                        "i53" => "coerce_i53",
+                        _ => "coerce_i32",
+                    };
+                    out.push_str(&format!(
+                        "impl {enum_name} with FromJson {{\n\
+                         \tfun from_json(text: str): Result<{enum_name}, str> {{\n\
+                         \t\t{enum_name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)\n\
+                         \t}}\n\
+                         \tfun from_json_value(value: JsonValue): Result<{enum_name}, str> {{\n\
+                         \t\t{enum_name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {enum_name}\")\n\
+                         \t}}\n\
+                         }}\n"
+                    ));
+                    if *derive == "Wire" {
+                        let first_variant =
+                            variants.first().map(|(name, _)| *name).unwrap_or(enum_name);
+                        out.push_str(&backed_enum_wire_visitor_impls(
+                            enum_name,
+                            backing_type,
+                            first_variant,
+                        ));
+                    }
+                    continue;
+                }
                 // Externally tagged: no payload -> `"V"`; one -> `{"V":<p>}`;
                 // many -> `{"V":[<p0>,<p1>]}`.
                 let mut arms = String::new();
@@ -29107,6 +29160,82 @@ fn struct_wire_visitor_impls(struct_name: &str, fields: &[(&str, String)]) -> St
         "impl {struct_name} with Wire {{\n\
          \tfun describe<S: Serialize>(self, serializer: S) {{\n{describe}\n\t}}\n\
          \tfun rebuild<D: Deserialize>(deserializer: D): {struct_name} {{\n{rebuild}\n\t}}\n\
+         }}\n"
+    )
+}
+
+/// The backing type of a `[derive(..)]` enum's variants, or `None` when the
+/// enum is not backed (backed-enums.md §3.9). Mirrors
+/// [`backed_enum_impl_source`]'s reading of the same declaration: every variant
+/// payload-free and carrying a literal, all of one kind — anything else is
+/// already a hard error at the declaration, and the generators stay silent
+/// there rather than piling a second report on top.
+pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<String> {
+    let Node::Enum(_, generic_parameters, _resource, variants) = &item.0 else {
+        return None;
+    };
+    if generic_parameters.is_some() {
+        return None;
+    }
+    backed_enum_backing_type(variants)
+}
+
+fn backed_enum_backing_type(
+    variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
+) -> Option<String> {
+    let mut written: Vec<(&str, &BackingLiteral<'_>)> = Vec::new();
+    for variant in &variants.0 {
+        let (variant_name, payload, backing) = &variant.0;
+        match backing {
+            Some(backing) if payload.is_empty() => written.push((variant_name, backing)),
+            _ => return None,
+        }
+    }
+    if written.is_empty() {
+        return None;
+    }
+    if written
+        .iter()
+        .all(|(_, backing)| matches!(backing, BackingLiteral::Str { .. }))
+    {
+        return Some("str".to_string());
+    }
+    if written
+        .iter()
+        .all(|(_, backing)| matches!(backing, BackingLiteral::Int { .. }))
+    {
+        return integer_backing_type(&written);
+    }
+    None
+}
+
+/// The §6.1 visitor impls for a BACKED `[derive(Wire)]` enum (§3.9): the
+/// backing value is what crosses, so both directions delegate to the backing
+/// type's own `Wire` impl and to the synthesized `parse`.
+///
+/// The unknown-value path is the one the plain form already had, kept: a host
+/// sending a value outside the set decodes to a reported failure plus a poisoned
+/// zero-construction, not to garbage.
+fn backed_enum_wire_visitor_impls(
+    enum_name: &str,
+    backing_type: &str,
+    first_variant: &str,
+) -> String {
+    format!(
+        "impl {enum_name} with Wire {{\n\
+         \tfun describe<S: Serialize>(self, serializer: S) {{\n\
+         \t\tself.value().describe(serializer);\n\
+         \t}}\n\
+         \tfun rebuild<D: Deserialize>(deserializer: D): {enum_name} {{\n\
+         \t\tlet raw = {backing_type}::rebuild(deserializer);\n\
+         \t\tmatch {enum_name}::parse(raw) {{\n\
+         \t\t\tOption::Some(let variant) => variant,\n\
+         \t\t\tOption::None => {{\n\
+         \t\t\t\tdeserializer.fail(i\"unknown value for enum {enum_name}\");\n\
+         \t\t\t\t{enum_name}::{first_variant}\n\
+         \t\t\t}},\n\
+         \t\t}}\n\
+         \t}}\n\
          }}\n"
     )
 }

@@ -1178,6 +1178,10 @@ impl Expander<'_, '_> {
             // in scope; it reads JSON through methods (`try_parse_json`,
             // `has_field`), so no `parse_json_value`/`panic` import.
             prelude.push_str("import std::json::{ Json, FromJson, JsonValue };\n");
+            // A BACKED enum's decode reads the bare backing value out of the
+            // JSON rather than a variant tag (backed-enums.md §3.9), so the
+            // coercions come along.
+            prelude.push_str("import std::json::{ coerce_i32, coerce_i53, coerce_str };\n");
             prelude.push_str("import std::result::Result;\n");
         }
         if self.rust_traits.contains("Wire") {
@@ -1775,7 +1779,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 .0
                 .iter()
                 .map(|(variant, _)| {
-                    let (variant_name, payload, _discriminant) = variant;
+                    let (variant_name, payload, backing) = variant;
                     array(vec![
                         string_literal(variant_name),
                         array(
@@ -1784,12 +1788,27 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                                 .map(|type_| construct_type_expr(type_, text))
                                 .collect(),
                         ),
+                        // The literal AS WRITTEN (quotes included for a
+                        // string), so a generator splices it straight back into
+                        // source; `""` means no backing value.
+                        string_literal(
+                            &backing
+                                .as_ref()
+                                .map(|backing| backing.to_string())
+                                .unwrap_or_default(),
+                        ),
                     ])
                 })
                 .collect();
             array(vec![
                 discriminant(1),
-                array(vec![string_literal(name.0), array(variants)]),
+                array(vec![
+                    string_literal(name.0),
+                    array(variants),
+                    string_literal(
+                        &crate::analyzer::backed_enum_backing_type_of(item).unwrap_or_default(),
+                    ),
+                ]),
             ])
         }
         Node::Func(function) => array(vec![
