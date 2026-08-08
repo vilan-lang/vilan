@@ -1479,6 +1479,16 @@ pub struct Analyzer<'src> {
     // enum's declared parameters for these args.
     impl_subject_args: HashMap<Id, (TypeId, Vec<TypeId>)>,
     implementations: Vec<Implementation<'src>>,
+    /// Member name -> the indices into `implementations` of every impl that
+    /// DECLARES that name, in registration order — the reverse of each impl's
+    /// `declarations` map, and the only thing member resolution needs to look
+    /// at (`impl_member_candidates`). Written at the one place
+    /// `implementations` grows, so it cannot describe a set of impls that does
+    /// not exist: the two fields are one data structure with two access paths,
+    /// and every lifecycle that carries one carries the other (the base cache
+    /// clones the whole `Analyzer`; a warm analysis walks its entry into that
+    /// clone through the same registration).
+    implementations_by_member: HashMap<&'src str, Vec<usize>>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
     // the entry (index 0, when there are dependencies), each dependency, and `std`
@@ -2162,6 +2172,7 @@ impl<'src> Analyzer<'src> {
             tuple_bounds: HashMap::new(),
             impl_subject_args: HashMap::new(),
             implementations: Vec::new(),
+            implementations_by_member: HashMap::new(),
             module_id_by_name: HashMap::new(),
             packages: Vec::new(),
             package_of_source: HashMap::new(),
@@ -9336,9 +9347,19 @@ impl<'src> Analyzer<'src> {
         methods_only: bool,
         allow_trait_only: bool,
     ) -> Vec<ImplMemberCandidate> {
-        let mut candidates: Vec<ImplMemberCandidate> = self
-            .implementations
+        // Only an impl that DECLARES the name can contribute a candidate, so
+        // the scan is over `implementations_by_member`'s row rather than every
+        // impl in the program — the same impls, reached without asking the
+        // subject comparison (a recursive type walk, and the expensive half)
+        // about the ~99% that were going to be dropped a line later anyway.
+        // The row is in registration order, so the sequence reaching the sort
+        // below is byte-for-byte the one the full scan produced.
+        let Some(declaring) = self.implementations_by_member.get(member_name) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<ImplMemberCandidate> = declaring
             .iter()
+            .map(|index| &self.implementations[*index])
             .filter(|implementation| {
                 self.compare_type(
                     subject_type,
@@ -16754,6 +16775,18 @@ impl<'src> Analyzer<'src> {
                             implementation_index,
                         });
                     }
+                }
+                // The name index, written in the same breath as the impl it
+                // describes — the one and only place `implementations` grows,
+                // so the two can never disagree. `declarations` is final by
+                // now (the later conformance pass only fills `trait_ids` /
+                // `trait_args`), which is what makes a registration-time index
+                // sound rather than a cache in need of invalidation.
+                for member_name in declarations.keys().copied() {
+                    self.implementations_by_member
+                        .entry(member_name)
+                        .or_default()
+                        .push(implementation_index);
                 }
                 self.implementations.push(Implementation {
                     subject,
