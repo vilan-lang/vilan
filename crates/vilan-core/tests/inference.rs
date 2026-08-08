@@ -4152,28 +4152,53 @@ fn a_view_write_to_a_data_pointee_emits_no_drop() {
     );
 }
 
-#[test]
-#[ignore = "found by B94: a COMPONENT write to a resource-holding field fires no overwrite drop"]
-fn a_component_write_to_a_resource_field_drops_the_old_value() {
-    // Bycatch of B94, verified, filed rather than fixed. R2 is spelled over a
-    // BINDING ("assigning onto a binding that still owns a resource"), and the
-    // planner implements exactly that: only a whole-binding target enrolls. A
-    // component write to an owned place — `b.slot = ..`, and the same through a
-    // view — overwrites a live resource that no rule covers, and it is leaked
-    // outright (this program prints "before\nafter"). Whether that write is
-    // even legal is R5's question, not R2's: R5 makes a resource field
-    // loan-only and rejects moving one OUT of a live aggregate, but says
-    // nothing about writing over one. A different predicate over a different
-    // set of programs — its own measurement, per capture-clones.md §6.5's
-    // standing reason.
-    assert_compiles_and_runs(
+// ---------------------------------------------------------------------------
+// B99 (R2's COMPONENT half). B94 closed the loan half and filed this one: R2 is
+// spelled over a BINDING and R5 over reading and moving a field, so writing
+// over one fell between them and the outgoing value was leaked outright. The
+// rule now reads over the PLACE all the way down — a write over a component
+// whose type is a resource drops what it replaces, owned place and view alike,
+// with no liveness question (R5 makes a resource field loan-only, so a
+// component place always holds a live value). See proposal/destruction.md R2
+// and capture-clones.md §10.
+// ---------------------------------------------------------------------------
+
+/// The B99 pin family's shared preamble: a `Drop`-printing resource, an enum
+/// that holds one, and a struct that holds the enum.
+fn b99_program(body: &str) -> String {
+    format!(
         r#"
         import std::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
-        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
-        enum Holder { Full(Guard), Empty }
-        struct Slot { held: Holder }
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Full(Guard), Empty }}
+        struct Slot {{ held: Holder }}
+        {body}
+        "#
+    )
+}
+
+/// [`b99_program`] compiled, for the pins whose claim is about emitted BYTES.
+fn b99_js(body: &str) -> String {
+    match compile(&b99_program(body)) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+#[test]
+fn a_component_write_to_a_resource_field_drops_the_old_value() {
+    // The filed repro (B94's bycatch), now closed. R2 was implemented over the
+    // BINDING — only a whole-binding target enrolled — so `slot.held = ..`
+    // overwrote a live resource that no rule covered and printed
+    // "before\nafter", leaking the guard. Whether the write is legal at all is
+    // R5's question and R5 permits it (it makes a field loan-only and rejects
+    // moving one OUT; it says nothing about writing over one), which is exactly
+    // why R2 owes the drop.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
         fun main() {
             mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
             print("before");
@@ -4181,7 +4206,257 @@ fn a_component_write_to_a_resource_field_drops_the_old_value() {
             print("after");
         }
         "#,
+        ),
         "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_nested_component_write_drops_the_old_value() {
+    // The projection is asked of the PLACE, not of its depth: `o.inner.held`
+    // names the storage the write clobbers exactly as `slot.held` does.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        struct Outer { inner: Slot }
+        fun main() {
+            mut o = Outer { inner = Slot { held = Holder::Full(Guard { label = "held" }) } };
+            print("before");
+            o.inner.held = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_through_a_view_drops_the_old_value() {
+    // B94's arm composes, and this is the doctrine's own test: the two
+    // spellings are the same expression shape and differ only in what the root
+    // binding is, so the answer must not depend on the root. The predicate is
+    // the component's type, and it never asks.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun clear(s: &mut Slot) { s.held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            clear(&mut slot);
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_tuple_component_write_drops_the_old_value() {
+    // The same rule at the other positional spelling.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut pair = (1, Holder::Full(Guard { label = "held" }));
+            print("before");
+            pair.1 = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn an_element_write_drops_the_old_value() {
+    // The `Index` spelling — a fixed array of resources, which is the only
+    // indexable resource aggregate (R10 rejects the native containers). The
+    // trailing "dropped two"/"dropped three" are the scope-end teardown, in
+    // reverse element order.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut arr: [Guard; 2] = [Guard { label = "one" }, Guard { label = "two" }];
+            print("before");
+            arr[0] = Guard { label = "three" };
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped one\nafter\ndropped two\ndropped three\n",
+    );
+}
+
+#[test]
+fn a_component_write_inside_a_match_arm_drops_the_old_value() {
+    // The write is planned by `plan_expr`, which descends every arm, so a
+    // conditional write is covered without a liveness question — the component
+    // place is live on every path that reaches it.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            let n = 1;
+            print("before");
+            match n { 1 => { slot.held = Holder::Empty; } _ => {} }
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_to_a_data_field_emits_no_drop() {
+    // The negative half, in bytes: the rule fires on the COMPONENT's
+    // resource-ness, not on the fact that its aggregate holds a resource
+    // somewhere. `count` is an `i32` in a struct that also holds a `Holder`, and
+    // its write is the bare slot assignment it always was — which is what keeps
+    // every resource-free corpus program byte-identical.
+    assert_emits_containing(
+        &b99_program(
+            r#"
+        struct Pair { held: Holder, count: i32 }
+        fun main() {
+            mut pair = Pair { held = Holder::Full(Guard { label = "held" }), count = 1 };
+            pair.count = 5;
+            print(pair.count);
+        }
+        "#,
+        ),
+        "pair[1] = 5;",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_write_clobbers_the_slot() {
+    // The ordering is load-bearing rather than cosmetic, for the same reason
+    // B94 pinned it on the view path: the drop's operand IS the slot the write
+    // replaces, so a drop emitted afterwards would destroy the NEW value.
+    // Pinned in bytes, since a runtime pin cannot tell "dropped the old one"
+    // from "dropped a same-shaped new one".
+    let js = b99_js(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            slot.held = Holder::Full(Guard { label = "two" });
+        }
+        "#,
+    );
+    let drop_index = js.find("(slot[0]);").expect("the overwrite drop");
+    let write_index = js.find("slot[0] = [ 0,").expect("the component write");
+    assert!(
+        drop_index < write_index,
+        "the drop must precede the write that clobbers the slot it reads:\n{js}"
+    );
+}
+
+#[test]
+fn a_component_write_drops_in_the_owned_twins_order() {
+    // The whole-binding twin of the same program, so the two spellings can be
+    // compared: both destroy the outgoing value BEFORE the incoming one is
+    // installed, and neither destroys the incoming one until its scope ends.
+    let component = &b99_program(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            print("before");
+            slot.held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    let binding = &b99_program(
+        r#"
+        fun main() {
+            mut held = Holder::Full(Guard { label = "one" });
+            print("before");
+            held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    assert_compiles_and_runs(component, "before\ndropped one\nafter\ndropped two\n");
+    assert_compiles_and_runs(binding, "before\ndropped one\nafter\ndropped two\n");
+}
+
+#[test]
+fn a_write_through_a_view_of_a_component_still_drops() {
+    // The neighbour that was ALREADY right, pinned so the new arm cannot move
+    // it: `&mut slot.held` mints a view whose own write is B94's loan arm, and
+    // it takes the `__replace` path (a whole-value write through a view) rather
+    // than this one. The two spellings agree, which is the point.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            let v = &mut slot.held;
+            v = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_truncating_replace_on_the_view_path() {
+    // B89's interaction, unchanged by B99 and pinned here because the component
+    // arm shares the emission site: a write THROUGH a view still lowers to
+    // `__replace`, which sets `target.length = value.length` before merging, so
+    // a drop emitted after it would destroy slots that no longer exist. A
+    // component write is a plain slot assignment and never truncates — the
+    // ordering is owed for the simpler reason above — so both orders are pinned
+    // from the one emission.
+    let js = b99_js(
+        r#"
+        fun refill(held: &mut Holder) { held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            refill(&mut slot.held);
+        }
+        "#,
+    );
+    let drop_index = js.find("(held);").expect("the overwrite drop");
+    let replace_index = js.find("__replace(held,").expect("the truncating write");
+    assert!(
+        drop_index < replace_index,
+        "the drop must precede `__replace`'s truncation (B89):\n{js}"
+    );
+}
+
+#[test]
+fn a_resource_free_component_write_plans_no_drop_pass_at_all() {
+    // The early return that keeps resource-free programs byte-identical: a
+    // program with no declared resource has no resource type, so the component
+    // arm collects nothing and no `try`/`finally` appears.
+    let js = match compile(
+        r#"
+        import std::print;
+        struct Slot { held: i32 }
+        fun main() {
+            mut slot = Slot { held = 1 };
+            slot.held = 2;
+            print(slot.held);
+        }
+        "#,
+    ) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    };
+    assert!(
+        !js.contains("finally"),
+        "a resource-free program takes no teardown:\n{js}"
     );
 }
 
@@ -4957,19 +5232,22 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
 // keeps it (A20, via `own`). See proposal/element-clones.md.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// B100 (the return rule's loan hole). §3 of element-clones.md exempted a
+// `&`/`&mut` parameter from the return copy, framed as "returning through one
+// is rule 3's `borrows` projection, deliberately an alias". That is a fact
+// about the RETURN, not about the place: a function whose signature hands back
+// a VALUE hands back a value, whatever convention the place it read is under.
+// R3's own list calls bare, `&` and `&mut` all loans, and the bare half already
+// copied — the asymmetry was the bug. See proposal/element-clones.md §9.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "found by B97: a `ret place` from a loan receiver hands back the storage uncopied"]
 fn a_returned_field_place_copies_out_of_its_receiver() {
-    // Bycatch of B97's measurement (capture-clones.md §9.1), verified, filed.
-    // Rule 1 at the RETURN seam: `fun make(&self): (i32, i32) { self.pair }`
-    // emits `return self[0]`, so the caller's result IS the receiver's field
-    // storage and a later write to the receiver shows through it. The receiver
-    // is a LOAN, so the value leaving the body outlives nothing it owns — the
-    // same "a place read into something that outlives the expression must
-    // copy" the list/struct literal seams already enforce (B54), at the seam
-    // that hands a value back. `capture-clones.md` §7.7's "an owned call result
-    // needs no rule: nothing else names it" is true of the capture pass and
-    // false of this function's own body. Prints 99.
+    // The filed repro (B97's bycatch), now closed. `fun make(&self): (i32, i32)
+    // { self.pair }` emitted `return self[0]`, so the caller's result WAS the
+    // receiver's field storage and a later write to the receiver showed through
+    // it. Printed 99.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -4980,6 +5258,349 @@ fn a_returned_field_place_copies_out_of_its_receiver() {
         fun main() {
             mut h = Holder { pair = (7, 3) };
             let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_place_copies_out_of_a_mut_receiver() {
+    // `&mut self` is the same loan with a different writability, and the return
+    // seam never asked about writability — the caller's storage outlives the
+    // call either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&mut self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_of_a_view_parameter_copies() {
+    // The free-function spelling: nothing about this is special to a receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun make(h: &Holder): (i32, i32) { h.pair }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = make(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_view_receiver_forwarded_whole_into_a_by_value_return_copies() {
+    // The shape that decides how the exemption is spelled. Asking whether the
+    // returned PLACE is a view answers the wrong question here — references are
+    // transparent, so `self` inside `&self` is a view by every test — while the
+    // signature says plainly that what leaves is a `Holder`, by value. The
+    // exemption reads the signature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let c = h.copy();
+            h.pair.1 = 99;
+            print(c.pair.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_nested_field_of_a_receiver_copies() {
+    // The copy lands at the LEAF, so the depth of the projection is irrelevant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun make(&self): (i32, i32) { self.inner.pair }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { pair = (7, 3) } };
+            let p = h.make();
+            h.inner.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_list_field_of_a_receiver_copies() {
+    // The A20 shape one seam over: the result's ELEMENTS were the receiver's,
+    // so growing the result grew the receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        impl Holder {
+            fun items_of(&self): List<i32> { self.items }
+        }
+        fun main() {
+            mut h = Holder { items = [1, 2] };
+            mut xs = h.items_of();
+            xs.push(9);
+            print(h.items.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_returned_field_copies_in_the_tail_arm_that_owes_it() {
+    // Keyed by the tail LEAF, so an `if`/`match` tail copies only in the arms
+    // that hand back the receiver's storage — the constructed arm stays free.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun pick(&self, first: bool): (i32, i32) {
+                if first { self.pair } else { (0, 0) }
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.pick(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_early_ret_of_a_receivers_field_copies() {
+    // The `ret` statement is a return seam like the tail is; both feed
+    // `return_sites`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&self, early: bool): (i32, i32) {
+                if early { ret self.pair }
+                (0, 0)
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_projection_still_returns_the_alias() {
+    // The elision the rule must not eat, and the reason the exemption exists at
+    // all: a signature that returns `&mut T` hands back an alias on purpose
+    // (rule 3's sanctioned escape), so writing through the result reaches the
+    // receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            h.slot() = (1, 2);
+            print(h.pair.0);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_readonly_borrows_projection_still_returns_the_alias() {
+    // The `&` half of the same exemption — a read-only projection is still a
+    // projection, and its result must keep naming the receiver's storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let v = h.peek();
+            h.pair.1 = 99;
+            print((*v).1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_view_parameter_forwarded_into_a_view_return_still_aliases() {
+    // The exemption's own shape, and the twin of the by-value case above: the
+    // SAME body — a view parameter handed straight back — is an alias here and
+    // a copy there, and only the signature separates them. This is what the
+    // `returns_view` question is for; nothing else in the pass distinguishes
+    // the two, because a `&mut place` leaf is not a place at all and never
+    // reaches the seam.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same(v: &mut Holder): &mut Holder borrows v { v }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = same(&mut h);
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_receiver_forwarded_into_a_view_return_still_aliases() {
+    // The method spelling of the same exemption, which is `copy(&self):
+    // Holder { self }` with one word changed in the return type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = h.me();
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_bare_self_receivers_field_return_was_already_right() {
+    // The neighbour that names the asymmetry: R3 calls bare `self`, `&self` and
+    // `&mut self` all loans, and the bare one already copied. Pinned so the two
+    // stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_own_parameter_still_moves_out_of_a_view_receivers_neighbour() {
+    // The `own` elision, unchanged: the caller already gave the value up, so the
+    // fluent-builder shape stays free. Proven by the ABSENT `__clone`, since
+    // behaviour cannot see the difference.
+    let source = r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun through(own h: Holder): Holder { h }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            let c = through(h);
+            print(c.pair.1);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an `own` parameter's return copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn a_returned_scalar_field_of_a_receiver_needs_no_copy() {
+    // The type filter is unchanged: a scalar read IS the copy, so no `__clone`
+    // is owed and none is emitted.
+    let source = r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder {
+            fun get(&self): i32 { self.n }
+        }
+        fun main() {
+            mut h = Holder { n = 7 };
+            let v = h.get();
+            h.n = 99;
+            print(v);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(!js.contains("__clone"), "a scalar return copied:\n{js}"),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "7\n");
+}
+
+#[test]
+fn a_closure_returning_its_own_view_parameters_field_copies() {
+    // The closure path, already right before the fix (an unannotated closure
+    // parameter is bare) and pinned so the seam's two spellings stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun apply(h: &Holder, f: |&Holder| (i32, i32)): (i32, i32) { f(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = apply(&h, |g| g.pair);
             h.pair.1 = 99;
             print(p.1);
         }
@@ -42737,6 +43358,290 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
         }
         "#,
         "drop first\nend\ndrop second\n",
+    );
+}
+
+// --- B101: R2's overwrite through a place the generic body does not own ------
+// B94 and B99 made a write THROUGH a `&mut` and a write OVER a component
+// destroy what they replace. Both drops are per-type glue a generic body cannot
+// emit, so at a resource instantiation the body owes a destruction it cannot
+// run — and `check_own_generic_exactly_once` did not look: its `place_overwrites`
+// was deliberately empty, with the reason recorded in the code. It looks now,
+// at the per-instantiation DELTA place set, so a concrete resource written
+// inside a generic body stays chunk 3's report. See proposal/destruction.md R11.
+
+/// The B101 pin family's shared preamble.
+fn b101_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::{{ Drop, drop }};
+        import std::option::Option::{{ self, Some, None }};
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn b101_a_generic_write_through_a_mut_t_is_rejected() {
+    // The filed shape. `slot = value` inside `&mut T` is B94's write: it
+    // destroys the pointee's outgoing value, which at `T := Guard` is a `Guard`
+    // the shared body cannot destroy. Before this it compiled and printed
+    // "before\nafter\ndropped second" — "first" leaked outright.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `slot`'s previous value (R2)"),
+        "the note names the written place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("slot = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "slot = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_through_a_reborrow_is_rejected() {
+    // The same write under a second name. `binding_or_param_is_view` follows the
+    // copy chain, so a local bound to a `&mut` of the parameter is a loan too —
+    // which is what keeps the question at the place rather than at the
+    // parameter list.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) {
+            let inner = &mut slot;
+            inner = value;
+        }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    let (note_msg, _, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `inner`'s previous value (R2)"),
+        "the note names the re-borrow; got: {note_msg:?}"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_over_a_component_is_rejected() {
+    // B99's arm inside a generic body: `holder.item = value` overwrites a
+    // `T`-typed component, so the same drop is owed and the same body cannot
+    // emit it. The note names the ROOT the component sits in, because the
+    // component itself names no value of its own.
+    let source = b101_program(
+        r#"
+        struct Wrap<type T> { item: T }
+        fun set<T>(holder: &mut Wrap<T>, own value: T) { holder.item = value; }
+        fun main() {
+            mut w = Wrap { item = Guard { label = "first" } };
+            set(&mut w, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut w, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy the value it replaces inside `holder` (R2)"),
+        "the note names the root place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("holder.item = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "holder.item = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_overwrite_with_no_own_parameter_is_rejected() {
+    // The check used to return early unless the body took an `own T`, which was
+    // its original scope surviving as a guard. `clear` declares none and owes
+    // R2's drop anyway — before this it compiled and leaked the payload without
+    // printing anything.
+    let source = b101_program(
+        r#"
+        fun clear<T>(slot: &mut Option<T>) { slot = None; }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            clear(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "clear(&mut o)",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+}
+
+#[test]
+fn b101_a_generic_scope_end_drop_with_no_own_parameter_is_rejected() {
+    // The same guard removal reaches B66's other half: `taken` is a
+    // delta-resource local still owning where its scope ends, in a body that
+    // takes no `own T` at all. One rule, asked wherever it applies.
+    let source = b101_program(
+        r#"
+        fun stash<T>(slot: &mut Option<T>) { let taken = slot.take(); }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            stash(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "stash(&mut o)",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn b101_a_concrete_instantiation_of_the_same_body_is_accepted() {
+    // The negative that keeps the rule about resources: `T := i32` is not a
+    // resource instantiation, nothing is enqueued, and the same body compiles
+    // and runs.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut n = 1;
+            set(&mut n, 2);
+            print(n);
+        }
+        "#,
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_body_with_the_same_write_still_drops() {
+    // The other negative, and the reason the rule is R11's rather than R2's: a
+    // CONCRETE `&mut Guard` body knows the type, so B94's drop is emitted and
+    // the write is correct. Only a shared generic body is asked.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set(slot: &mut Guard, own value: Guard) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            print("before");
+            set(&mut g, Guard { label = "second" });
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped first\nafter\ndropped second\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
+    // Why the question is asked of the DELTA place set and not of concrete
+    // resource-ness. `slot.held` is a `Guard` at every instantiation, so the
+    // emitted body knows the type and B99's drop fires — this is chunk 3's
+    // territory, and re-asking it here would reject a correct program once per
+    // instantiation site. Runs, and destroys all three in order.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        resource struct Slot { held: Guard }
+        fun bump<T>(own value: T, slot: &mut Slot): T {
+            slot.held = Guard { label = "fresh" };
+            value
+        }
+        fun main() {
+            mut s = Slot { held = Guard { label = "old" } };
+            let g = bump(Guard { label = "passed" }, &mut s);
+            drop(g);
+            print("end");
+        }
+        "#,
+        ),
+        "dropped old\ndropped passed\nend\ndropped fresh\n",
+    );
+}
+
+#[test]
+fn b101_a_read_only_generic_view_body_is_accepted() {
+    // A `&T` body that never writes owes nothing, so the widened check must not
+    // reach it — the predicate is the WRITE, not the loan.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun peek<T>(slot: &Option<T>): bool { slot.is_some() }
+        fun main() {
+            let o = Some(Guard { label = "first" });
+            print(peek(&o));
+        }
+        "#,
+        ),
+        "true\ndropped first\n",
+    );
+}
+
+#[test]
+fn b101_the_option_surface_still_instantiates_at_a_resource() {
+    // The std sweep, as a pin: `Option` is the sanctioned resource container
+    // (R10), and its generic surface must stay clean under the widening.
+    // `take`, `replace`, `unwrap`, `is_some`/`is_none` and the `drop` sink are
+    // every generic a resource can reach in std today.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun main() {
+            mut slot = Some(Guard { label = "a" });
+            print(slot.is_some());
+            match slot.take() {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            print(slot.is_none());
+            mut refilled = Some(Guard { label = "b" });
+            match refilled.replace(Guard { label = "c" }) {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            drop(refilled.unwrap());
+        }
+        "#,
+        ),
+        "true\ndropped a\ntrue\ndropped b\ndropped c\n",
     );
 }
 

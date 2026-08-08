@@ -3773,14 +3773,17 @@ impl<'src> Transformer<'src> {
                 // R2 (destruction.md §5): assigning onto a place that still holds
                 // a resource drops the OLD value first, then moves the new one in.
                 // The analyzer flagged the assignment and resolved the overwritten
-                // value's type; two target shapes reach here and both name the same
-                // storage the write is about to clobber — a resource `Local`, and
+                // value's type; three target shapes reach here and each names the
+                // same storage the write is about to clobber — a resource `Local`,
                 // (B94) the synthetic `Dereference` of a writable view, whose
-                // pointee is the caller's value. The drop is pushed BEFORE the new
-                // value is walked, so it runs before `__replace` truncates the
-                // payload out from under it (B89).
+                // pointee is the caller's value, and (B99) a COMPONENT projection,
+                // whose read is the drop's operand. The drop is pushed BEFORE the
+                // new value is walked, so it runs before the write clobbers the
+                // slot it reads — and, on the view path, before `__replace`
+                // truncates the payload out from under it (B89).
                 if let Some(&type_id) = self.program.overwrite_drops.get(&id) {
-                    let overwritten = match self.program.entity_map.get(target_id) {
+                    let target = *target_id;
+                    let overwritten = match self.program.entity_map.get(&target) {
                         Some(Expr::Local(binding)) => {
                             Some(js::Node::Local(self.ng.name_for(*binding)))
                         }
@@ -3788,6 +3791,9 @@ impl<'src> Transformer<'src> {
                             let operand = *operand;
                             self.walk_entity(operand, block)
                         }
+                        Some(
+                            Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _) | Expr::Index(_, _),
+                        ) => self.walk_entity(target, block),
                         _ => None,
                     };
                     if let Some(overwritten) = overwritten

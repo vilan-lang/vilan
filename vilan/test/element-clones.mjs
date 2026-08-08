@@ -58,6 +58,12 @@ function first_of(primary, fallback) {
 function own_through(items) {
 	return items;
 }
+function viewed_of(holder) {
+	return __clone(holder[0]);
+}
+function viewed_projection(holder) {
+	return holder;
+}
 function elements_are_independent() {
 	let rows = [  ];
 	rows.push([ 1, 2 ]);
@@ -136,4 +142,10 @@ console.log(source.length);
 let owned = own_through([ 1, 2 ]);
 owned.push(9);
 console.log(owned.length);
+let viewer = [ [ 1, 2 ] ];
+let lifted = viewed_of(viewer);
+lifted.push(9);
+console.log(viewer[0].length);
+viewed_projection(viewer)[0].push(9);
+console.log(viewer[0].length);
 elements_are_independent();

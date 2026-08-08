@@ -607,6 +607,7 @@ loans, and the two bugs close on the one line.
 view alike. R2 is written about a binding and R5 about reading and moving a
 field; writing over one falls between them. A different predicate over a
 different set of programs — filed, pinned `#[ignore]`d, not ridden in.
+**CLOSED 2026-08-07 — §10.**
 
 ## 9. B97 — the third subject spelling, 2026-08-07
 
@@ -760,3 +761,121 @@ indistinguishable: `const cells = __clone($x[0]); const weight = $x[1];`, both
 declared, one copied. `owned_call` keeps its accessors. The golden moved
 **additively** — every pre-existing byte unchanged. **No other corpus golden
 moved.**
+
+## 10. B99 — the doctrine one projection down, 2026-08-07
+
+> §8's open item, closed. Not a capture finding either, recorded here for the
+> reason §8 gave: it is the same doctrine, asked of the same seam family. §8
+> said a write through a view must not be distinguishable from a write to the
+> place the view names. B99 is that sentence about the TARGET's shape rather
+> than about its root — a write over a component must not be distinguishable
+> from a write over a binding. The rule and its reasoning live in
+> `destruction.md` §4 R2; this note records only what the arcs share.
+
+### 10.1 The shapes, measured
+
+Eleven probes against the pre-fix tree (`next` @ `45f5d66`, B94 included). Each
+overwrites a resource-typed place and expects the outgoing value's destructor
+to print before the write's own marker.
+
+| shape | write | before |
+|---|---|---|
+| struct field of an owned place | `slot.held = Holder::Empty` | leaked |
+| nested component | `o.inner.held = Holder::Empty` | leaked |
+| **through a `&mut` view** | `s.held = Holder::Empty` | leaked |
+| tuple component | `pair.1 = Holder::Empty` | leaked |
+| element of a fixed array | `arr[0] = Guard { .. }` | leaked |
+| inside a `match` arm | `slot.held = Holder::Empty` | leaked |
+| a bare resource field (no enum) | `slot.guard = Guard { .. }` | leaked |
+| same-width replacement | `slot.held = Holder::Full(..)` | leaked |
+| element of an inferred `List<Guard>` | `arr[0] = Holder::Empty` | leaked |
+| **data component** (negative) | `slot.count = 5` | correct |
+| **`&mut` of the component** (B94) | `let v = &mut slot.held; v = ..` | correct |
+
+The last two were already right and are pinned so the fix cannot move them. The
+`&mut slot.held` neighbour is the whole finding in one program: minting a name
+for the component and writing through it destroyed the outgoing value, and
+writing the component directly did not — two spellings of one write,
+disagreeing.
+
+### 10.2 The candidates, measured before choosing
+
+Each was implemented far enough to rebuild the whole corpus and run the
+analyzer gate.
+
+| | goldens moved | analyzer gate | shapes correct |
+|---|---|---|---|
+| **(a)** the component's own type decides, root-agnostic | **0** | 1930 pass | 11 / 11 |
+| **(b)** (a) restricted to an OWNED root | 0 | 1930 pass | 9 / 11 |
+| **(c)** (a) without `Index` (`Field`/`TupleIndex` only) | 0 | 1930 pass | 10 / 11 |
+
+**(b) is the interesting refutation**, and it is §7.2's lesson again: the
+narrowing costs the view spelling — the exact indistinguishability §8 shipped —
+and it answers the wrong question in *both* directions. A `&mut Slot` root is a
+resource-typed binding (references are transparent), so a root test admits the
+view unless it also filters loans; and an inferred `List<Guard>` root is not
+classified a resource at all, so a root test drops an element write that the
+component's own type answers plainly. The root is a proxy for a question the
+projection already answers.
+
+**(c) is cheap and incomplete.** `Index` is the only remaining component
+spelling, and it is not hypothetical: a fixed array of resources is the one
+indexable resource aggregate (R10 rejects the native containers), and it drops
+its elements at scope end today. Excluding it would have been a special case
+with nothing behind it.
+
+**(a) ships.** None of the three costs a golden, which is the expected shape:
+only a program that declares a resource can reach the arm at all.
+
+### 10.3 What the two static halves share
+
+`collect_loan_overwrites` became `collect_place_overwrites` and answers both:
+the loan half (B94) and the component half (B99) are the two ways the scanned
+body is not the owner of what it overwrites, and both are settled by the
+target's static shape rather than by the scan's flow. The three arguments B94
+made for "no liveness question is needed" are the same three, with R5 supplying
+the first: a component place always holds a live value, because a resource
+field is loan-only and moving one out of a live aggregate is rejected.
+
+Twelve pins in `inference.rs`, four plants:
+
+| plant | red |
+|---|---|
+| the component arm removed | 8 |
+| the component arm restricted to an owned root — candidate (b) | 1 (`a_component_write_through_a_view_drops_the_old_value`) |
+| `Index` excluded from the component arm — candidate (c) | 1 (`an_element_write_drops_the_old_value`) |
+| the write emitted BEFORE the drop | 7 |
+
+The pins green under every plant are exactly the ones that pin UNCHANGED
+behavior: the data component, the resource-free program, the `&mut` of the
+component, and B94's own `__replace` ordering.
+
+`resource.vl` gains `component_owned`, `component_view` and `component_data`,
+the way the fixture did in §2, §6, §7 and §9. `component_owned` and
+`component_view` are the same write twice, differing only in whether the root
+is the place or a `&mut` of it, and the emitted bytes are identical — `$a(slot
+[0]); slot[0] = [ .. ];` — which IS the claim that the spellings are
+indistinguishable. `component_data` is where the ABSENCE lives: `counted[1] =
+2;` with no drop, inside an aggregate that holds a resource. The golden moved
+**additively** — every pre-existing byte unchanged. **No other corpus golden
+moved.**
+
+### 10.4 Bycatch, verified and filed
+
+Three findings from the measurement, none fixed in this lane:
+
+- **An inferred `List<Resource>` escapes R10 entirely.** `mut arr: List<Guard>
+  = [Guard { .. }]` is rejected as designed; deleting the annotation compiles
+  the same program, and the element is never destroyed. Recorded under R10 in
+  `destruction.md` with the fixed-array contrast.
+- **A by-value function that hands its view parameter straight back is still
+  classified as borrowing it** (`infer_borrows`' `Expr::Local` arm), so its
+  result binds as a view even though B100 now makes it a copy. Refused
+  deliberately: narrowing that arm turns the body into a rule-3 view-escape
+  rejection. `element-clones.md` §9.3 has the measurement; the reason is
+  recorded at the arm.
+- **A compound assignment evaluates an impure index twice.** `ys[bump()] += 1`
+  emits `__at_put(ys, bump(), __at(ys, bump()) + 1)` and has for as long as the
+  synthesized re-read has existed. Pre-existing, unrelated to resources, and
+  the reason B99's drop may re-walk its target place without introducing a new
+  class of defect: the emission was already this shape.

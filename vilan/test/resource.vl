@@ -92,6 +92,41 @@ fun loaned() {
 	print("loaned-body");
 }
 
+// B99: R2 over a COMPONENT. Writing over a resource-typed field destroys what
+// it replaces, and the emitted drop reads the slot the write is about to
+// clobber — so it must precede the write. `component_owned` and `component_view`
+// are the SAME function twice, differing only in whether the root is the place
+// or a `&mut` of it, so the byte diff between them IS the claim that the two
+// spellings are indistinguishable.
+fun component_owned() {
+	mut slot = Slot { held = Res { tag = "component-old" } };
+	slot.held = Res { tag = "component-new" };
+	print("component-owned-body");
+}
+
+fun component_view(slot: &mut Slot) {
+	slot.held = Res { tag = "through-view" };
+}
+
+// The data twin, which is where the ABSENCE lives: `count` is not a resource,
+// so its write is the bare slot assignment it always was even though the
+// aggregate around it holds one.
+struct Counted { held: Res, count: i32 }
+
+fun component_data() {
+	mut counted = Counted { held = Res { tag = "counted" }, count = 1 };
+	counted.count = 2;
+	print("component-data-body");
+}
+
+fun component_writes() {
+	component_owned();
+	mut slot = Slot { held = Res { tag = "viewed-old" } };
+	component_view(&mut slot);
+	component_data();
+	print("component-writes-body");
+}
+
 fun main() {
 	locals();
 	print("--");
@@ -108,4 +143,6 @@ fun main() {
 	view_writes();
 	print("--");
 	loaned();
+	print("--");
+	component_writes();
 }

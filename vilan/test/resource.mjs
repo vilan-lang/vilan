@@ -85,6 +85,40 @@ function loaned() {
 		$g(s);
 	}
 }
+function component_owned() {
+	let slot = [ [ "component-old" ] ];
+	try {
+		$a(slot[0]);
+		slot[0] = [ "component-new" ];
+		console.log("component-owned-body");
+	} finally {
+		$g(slot);
+	}
+}
+function component_view(slot) {
+	$a(slot[0]);
+	slot[0] = [ "through-view" ];
+}
+function component_data() {
+	let counted = [ [ "counted" ], 1 ];
+	try {
+		counted[1] = 2;
+		console.log("component-data-body");
+	} finally {
+		$i(counted);
+	}
+}
+function component_writes() {
+	component_owned();
+	let slot = [ [ "viewed-old" ] ];
+	try {
+		component_view(slot);
+		component_data();
+		console.log("component-writes-body");
+	} finally {
+		$g(slot);
+	}
+}
 function $a($b) {
 	drop($b);
 }
@@ -98,6 +132,9 @@ function $e($f) {
 }
 function $g($h) {
 	$a($h[0]);
+}
+function $i($j) {
+	$a($j[0]);
 }
 locals();
 console.log("--");
@@ -114,3 +151,5 @@ console.log("--");
 view_writes();
 console.log("--");
 loaned();
+console.log("--");
+component_writes();

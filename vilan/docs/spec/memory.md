@@ -101,9 +101,15 @@ list element, a tuple element, a struct field, or a variant payload is stored
 in a slot of a new aggregate that outlives the literal, so it copies there too.
 The same holds for a place handed to a parameter declared `own` — a signature's
 way of saying the callee keeps it, which is how `List::push` is written — and
-for a place a body **returns** that it does not own, i.e. one reached through a
-by-value parameter. Together these are what make "a call owns its result" true,
-which is the premise every elision below rests on:
+for a place a body **returns** that it does not own, which is every place
+reached through a **loaned** parameter: bare, `&`, and `&mut` alike (§6.8's R3
+calls all three loans). What decides is the *return*, not the place: a
+signature that hands back a value hands back a value, so `fun make(&self):
+(i32, i32) { self.pair }` copies, while a signature that hands back a **view**
+(`fun slot(&mut self): &mut (i32, i32) borrows self`) is rule 3's sanctioned
+projection and keeps naming the receiver's storage. Together these are what
+make "a call owns its result" true, which is the premise every elision below
+rests on:
 
 ```vilan
 import std::print;
@@ -437,6 +443,38 @@ changes no ownership and is policed by rule 4.
   pointee out (R5, R6), and a binding its owner already moved out of is dead,
   so lending it is use-after-move (R1). The drop runs the same per-type glue
   in the same order the owned spelling does.
+
+  The rule is read over the **place**, all the way down: writing over a
+  resource-typed *component* — a field, a tuple element, a fixed-array
+  element — destroys the outgoing value too, whether the aggregate is owned
+  or reached through a view.
+
+  ```vilan
+  import std::print;
+  import std::drop::Drop;
+
+  resource struct Guard { label: str }
+  impl Guard with Drop {
+      fun drop(&mut self) { print(self.label); }
+  }
+
+  struct Slot { held: Guard }
+
+  fun refill(slot: &mut Slot) {
+      slot.held = Guard { label = "replaced" };        // prints "replaced"
+  }
+
+  fun main() {
+      mut slot = Slot { held = Guard { label = "held" } };
+      slot.held = Guard { label = "replaced" };        // prints "held"
+  }
+  ```
+
+  A component asks no liveness question either, and for R5's reason: a
+  resource field is loan-only and cannot be moved out of a live aggregate, so
+  a component place always holds a live value. Only the component's *own*
+  type decides — writing an `i32` field of a struct that happens to hold a
+  resource elsewhere destroys nothing.
 - **R3: parameters.** `self` / bare `x` / `&x` / `&mut x` are loans,
   unchanged (§6.3's table is the by-convention index of this line); `own
   x` is a move, and for a resource *only* a move: an `own` argument that is
@@ -457,7 +495,8 @@ changes no ownership and is policed by rule 4.
 - **R5: fields.** A struct literal moves resources in. A resource field is
   read only by loan (`self.db.exec(..)`, `&mut self.db`); moving it out of a
   live aggregate is rejected; v1 has no partial moves. The sanctioned
-  partial move is `Option` (below).
+  partial move is `Option` (below). Writing *over* a resource field is
+  permitted, and is R2's overwrite: the outgoing value is destroyed first.
 - **R6: match consumes.** Matching a resource *by value* consumes the
   subject; pattern captures move the payloads into the arm, and each capture
   **owns** what it took — it is destroyed at the end of the arm that bound
@@ -520,6 +559,23 @@ changes no ownership and is policed by rule 4.
   at the instantiation site. The consequence worth stating: a combinator that
   hands a payload to a closure and then discards it — the closure only *loans*
   it — cannot be resource-clean, whatever its receiver convention.
+
+  Read the same sentence at R2's seam and it reaches **writes**, not only
+  scope ends. Overwriting a `T`-typed place destroys the outgoing value, and a
+  generic body cannot run that destructor either — so a body that writes
+  through a `&mut T`, or over a `T`-typed component, is rejected at a resource
+  instantiation:
+
+  ```vilan,ignore
+  fun set<T>(slot: &mut T, own value: T) { slot = value; }   // rejected at T := a resource
+  fun clear<T>(slot: &mut Option<T>) { slot = None; }        // and so is this
+  ```
+
+  A **loan owns nothing**, but it is not excused either: the value the write
+  replaces belongs to the caller, and somebody must destroy it. The concrete
+  spelling of the same body is fine — `fun set(slot: &mut Guard, own value:
+  Guard)` knows the type and emits the drop — which is the steer: move it out
+  on every path, or take a concrete type.
 - **R12: no coercion to `any`.** A resource passed where `any` is expected
   is an error (`print(db)` included): `any` is a data sink, and the
   discipline must not launder away. Debug-print the fields instead.
