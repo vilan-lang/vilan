@@ -1507,6 +1507,16 @@ pub struct Analyzer<'src> {
     // enum's declared parameters for these args.
     impl_subject_args: HashMap<Id, (TypeId, Vec<TypeId>)>,
     implementations: Vec<Implementation<'src>>,
+    /// Member name -> the indices into `implementations` of every impl that
+    /// DECLARES that name, in registration order — the reverse of each impl's
+    /// `declarations` map, and the only thing member resolution needs to look
+    /// at (`impl_member_candidates`). Written at the one place
+    /// `implementations` grows, so it cannot describe a set of impls that does
+    /// not exist: the two fields are one data structure with two access paths,
+    /// and every lifecycle that carries one carries the other (the base cache
+    /// clones the whole `Analyzer`; a warm analysis walks its entry into that
+    /// clone through the same registration).
+    implementations_by_member: HashMap<&'src str, Vec<usize>>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
     // the entry (index 0, when there are dependencies), each dependency, and `std`
@@ -2194,6 +2204,7 @@ impl<'src> Analyzer<'src> {
             tuple_bounds: HashMap::new(),
             impl_subject_args: HashMap::new(),
             implementations: Vec::new(),
+            implementations_by_member: HashMap::new(),
             module_id_by_name: HashMap::new(),
             packages: Vec::new(),
             package_of_source: HashMap::new(),
@@ -3181,7 +3192,7 @@ impl<'src> Analyzer<'src> {
             implementation.trait_ids.contains(&trait_id)
                 && self.compare_type(
                     subject_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
         })
@@ -4773,10 +4784,14 @@ impl<'src> Analyzer<'src> {
     ) -> (bool, bool) {
         let mut all_complete = true;
         for member in members {
-            let member_type = member.get_type(self);
+            // The read is only needed to substitute through a non-empty
+            // context. An unparameterized aggregate's members classify under
+            // their own ids, and reading the type there deep-cloned a value
+            // nothing went on to look at.
             let member_type_id = if context.is_empty() {
                 *member
             } else {
+                let member_type = member.get_type(self);
                 self.substitute_type(&member_type, context)
                     .get_type_id(self)
             };
@@ -5066,10 +5081,14 @@ impl<'src> Analyzer<'src> {
     ) -> (bool, bool) {
         let mut all_complete = true;
         for member in members {
-            let member_type = member.get_type(self);
+            // The read is only needed to substitute through a non-empty
+            // context. An unparameterized aggregate's members classify under
+            // their own ids, and reading the type there deep-cloned a value
+            // nothing went on to look at.
             let member_type_id = if context.is_empty() {
                 *member
             } else {
+                let member_type = member.get_type(self);
                 self.substitute_type(&member_type, context)
                     .get_type_id(self)
             };
@@ -9650,13 +9669,23 @@ impl<'src> Analyzer<'src> {
         methods_only: bool,
         allow_trait_only: bool,
     ) -> Vec<ImplMemberCandidate> {
-        let mut candidates: Vec<ImplMemberCandidate> = self
-            .implementations
+        // Only an impl that DECLARES the name can contribute a candidate, so
+        // the scan is over `implementations_by_member`'s row rather than every
+        // impl in the program — the same impls, reached without asking the
+        // subject comparison (a recursive type walk, and the expensive half)
+        // about the ~99% that were going to be dropped a line later anyway.
+        // The row is in registration order, so the sequence reaching the sort
+        // below is byte-for-byte the one the full scan produced.
+        let Some(declaring) = self.implementations_by_member.get(member_name) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<ImplMemberCandidate> = declaring
             .iter()
+            .map(|index| &self.implementations[*index])
             .filter(|implementation| {
                 self.compare_type(
                     subject_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
             })
@@ -9756,7 +9785,7 @@ impl<'src> Analyzer<'src> {
             .filter(|implementation| {
                 self.compare_type(
                     subject_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
             })
@@ -9831,7 +9860,7 @@ impl<'src> Analyzer<'src> {
             .filter(|implementation| {
                 self.compare_type(
                     subject_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
             })
@@ -10093,7 +10122,7 @@ impl<'src> Analyzer<'src> {
             .filter(|implementation| {
                 self.compare_type(
                     subject_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
             })
@@ -10224,7 +10253,7 @@ impl<'src> Analyzer<'src> {
         for implementation in self.implementations.iter().filter(|implementation| {
             self.compare_type(
                 subject_type,
-                &implementation.subject.get_type(self),
+                implementation.subject.borrow_type(self),
                 &HashMap::new(),
             )
         }) {
@@ -10543,7 +10572,29 @@ impl<'src> Analyzer<'src> {
     }
 
     fn get_type_by_type_id(&self, type_id: TypeId) -> Type {
-        self.type_id_to_type_map.get(&type_id).unwrap().clone()
+        self.borrow_type_by_type_id(type_id).clone()
+    }
+
+    /// The same read WITHOUT the clone — for a caller that only looks at the
+    /// type and does not touch the analyzer again while it does.
+    ///
+    /// Types are deliberately not interned (B77/B95: resolution happens in
+    /// place, so a slot's identity has to outlive its content), which makes
+    /// every read of a slot a deep clone of whatever `Vec` the type carries.
+    /// Making the OWNING read borrow instead is not available: the analyzer
+    /// mutates itself all the way down the inference path, and a live `&Type`
+    /// borrowed out of `type_id_to_type_map` freezes it — 71 of the 218 call
+    /// sites become borrow errors that only a restructuring of the solver
+    /// could answer (E46 lever 2, measured; suite-speed.md §8.2).
+    ///
+    /// So the two accessors are not a migration: they are a permanent pair,
+    /// and the rule for picking one is mechanical. Take the borrow when the
+    /// enclosing method is `&self` and the type is consumed inside one
+    /// expression (a comparison, a match on the discriminant); take the clone
+    /// the moment the analyzer needs `&mut self` again — which is most of the
+    /// solver, and is why the clone stays the default.
+    fn borrow_type_by_type_id(&self, type_id: TypeId) -> &Type {
+        self.type_id_to_type_map.get(&type_id).unwrap()
     }
 
     /// The type of a built-in scalar primitive (`i32`, `str`, ...), which is
@@ -17070,6 +17121,18 @@ impl<'src> Analyzer<'src> {
                         });
                     }
                 }
+                // The name index, written in the same breath as the impl it
+                // describes — the one and only place `implementations` grows,
+                // so the two can never disagree. `declarations` is final by
+                // now (the later conformance pass only fills `trait_ids` /
+                // `trait_args`), which is what makes a registration-time index
+                // sound rather than a cache in need of invalidation.
+                for member_name in declarations.keys().copied() {
+                    self.implementations_by_member
+                        .entry(member_name)
+                        .or_default()
+                        .push(implementation_index);
+                }
                 self.implementations.push(Implementation {
                     subject,
                     declarations,
@@ -21578,7 +21641,7 @@ impl<'src> Analyzer<'src> {
             .filter(|implementation| {
                 self.compare_type(
                     &receiver_type,
-                    &implementation.subject.get_type(self),
+                    implementation.subject.borrow_type(self),
                     &HashMap::new(),
                 )
             })
@@ -27074,6 +27137,12 @@ impl<'src> Analyzer<'src> {
 impl TypeId {
     fn get_type(self, analyzer: &Analyzer) -> Type {
         analyzer.get_type_by_type_id(self)
+    }
+
+    /// The borrowing read — see [`Analyzer::borrow_type_by_type_id`] for when
+    /// this one is available and when it is not.
+    fn borrow_type<'a>(self, analyzer: &'a Analyzer<'_>) -> &'a Type {
+        analyzer.borrow_type_by_type_id(self)
     }
 }
 
