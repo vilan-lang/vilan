@@ -3691,7 +3691,17 @@ impl<'src> Analyzer<'src> {
             if inherent.len() < 2 {
                 continue;
             }
-            inherent.sort_by_key(|(_, member_id, _)| self.declaration_order(*member_id));
+            // A COMPILER-SYNTHESIZED member always ranks first, whatever its
+            // entity id: it is the declaration the author cannot edit, so it
+            // has to be the one the message points AT rather than the one it
+            // points at the author's own code for (backed-enums.md §3.8's
+            // collision rule, reached through B57).
+            inherent.sort_by_key(|(_, member_id, _)| {
+                (
+                    self.source_of_id(*member_id) != Some(DERIVED_SOURCE),
+                    self.declaration_order(*member_id),
+                )
+            });
             // Each later declaration is reported against the FIRST subject-
             // compatible one before it, so three copies produce two errors,
             // each naming the original. A pair from the SAME block is the block
@@ -3783,14 +3793,31 @@ impl<'src> Analyzer<'src> {
             if self.frozen_entity(second_id) {
                 continue;
             }
+            let span = self.declaration_name_span(second_id);
             // C3: the FIRST declaration is the whole point of the message —
             // "already defined" is unactionable without saying where. The note
             // carries its own source, so it renders even across files (the
             // conformance-note shape).
-            let note = Some(crate::error::Note {
-                span: self.declaration_name_span(first_id),
-                msg: format!("'{member_name}' is already defined here"),
-                source: self.source_of_id(first_id),
+            //
+            // A COMPILER-SYNTHESIZED first declaration has no file to point at
+            // (its span indexes a generated template), so the note says what it
+            // is instead. Today that is a backed enum's `value`/`parse`
+            // (backed-enums.md §3.8), which the rule reaches through B57
+            // deliberately: a synthesized member that quietly loses is worse
+            // than a visible name clash.
+            let note = Some(match self.source_of_id(first_id) {
+                Some(DERIVED_SOURCE) => crate::error::Note {
+                    span,
+                    msg: format!(
+                        "'{member_name}' is synthesized for '{subject_label}' by the compiler"
+                    ),
+                    source: None,
+                },
+                first_source => crate::error::Note {
+                    span: self.declaration_name_span(first_id),
+                    msg: format!("'{member_name}' is already defined here"),
+                    source: first_source,
+                },
             });
             // B4: a name the type already has, declared twice, has exactly two
             // fixes — and which one is right is the author's call, not ours.
@@ -3799,7 +3826,6 @@ impl<'src> Analyzer<'src> {
                 .filter(|_| self.source_of_id(first_id) != self.source_of_id(second_id))
                 .map(|module| format!(" by module '{module}'"))
                 .unwrap_or_default();
-            let span = self.declaration_name_span(second_id);
             let diagnostics_before = self.diagnostics.len();
             self.diagnostics.push(Error {
                 note,
@@ -27391,6 +27417,15 @@ pub struct Program<'src> {
     pub method_call_substitution: HashMap<Id, SubstitutionContext>,
     pub global_scope_id: Id,
     pub implementations: Vec<Implementation<'src>>,
+    /// The `value()` members synthesized on backed enums (backed-enums.md
+    /// §3.8), by member id. `x.value()` lowers to `x` — the receiver already IS
+    /// the backing value at runtime — so the transformer folds the call away
+    /// and the generated body then has no callers and emits nothing.
+    ///
+    /// Collected by name-and-subject rather than at generation, and that is
+    /// sound because a SECOND `value` on a backed enum is B57's
+    /// duplicate-inherent error: whatever survives here is the synthesized one.
+    pub backed_value_members: HashSet<Id>,
     // The source `List` intrinsics (`list.vl`), special-cased in codegen
     // (`new` -> `[]`, `push` -> `subject.push(..)`). `None` only if `list.vl`
     // failed to load.
@@ -28737,6 +28772,155 @@ pub(crate) fn service_impl_source(
          }}\n"
     ));
     out
+}
+
+/// The two conversions every backed enum gets, synthesized as vilan source
+/// (`proposal/backed-enums.md` §3.8): an inherent `value()` out and a static
+/// `parse()` back. Empty for every other item — a plain enum, a payload enum,
+/// a struct.
+///
+/// **Synthesized, not derived** (§7.3). The backing value is already the
+/// opt-in — you do not accidentally write `= "start"` — so a `[derive(Backed)]`
+/// marker would be a second switch for one decision.
+///
+/// **Written as source rather than built into the compiler**, for the reason
+/// that decides most of this file's shape: a user who declares their own
+/// `fun value(self)` on a backed enum then meets B57's duplicate-inherent
+/// error naming both declarations, which is exactly the collision rule §3.8
+/// asks for, rather than silently losing to a compiler member. Everything else
+/// — the `Option` construction, monomorphization, demand-driven emission,
+/// hover, the docs gate — follows from being ordinary vilan.
+///
+/// `value()` still costs nothing at runtime: the receiver already IS the
+/// backing value, so the transformer folds `x.value()` to `x`
+/// (`backed_value_members`), and the body below then has no callers and emits
+/// nothing. The body is the SEMANTICS the fold has to agree with, and it is
+/// what runs if the call is ever reached another way.
+///
+/// A GENERIC enum gets nothing: its parameter can only be phantom (a payload
+/// is rejected by §3.3), and `Enum::parse` on one would have no way to bind it.
+/// The `[derive(..)]` generators skip generic enums for the same reason.
+pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
+    let Node::Enum(name, generic_parameters, _resource, variants) = &item.0 else {
+        return String::new();
+    };
+    if generic_parameters.is_some() {
+        return String::new();
+    }
+    // (variant name, the backing literal as written). Every variant must carry
+    // one and they must agree — a disagreement, a payload, or a missing string
+    // is a hard error the walk reports, and this generator stays silent there
+    // rather than emitting source that would report it a second time.
+    let mut written: Vec<(&str, &BackingLiteral<'_>)> = Vec::new();
+    for variant in &variants.0 {
+        let (variant_name, payload, backing) = &variant.0;
+        match backing {
+            Some(backing) if payload.is_empty() => written.push((variant_name, backing)),
+            _ => return String::new(),
+        }
+    }
+    if written.is_empty() {
+        return String::new();
+    }
+    // §3.2's one-backing rule, read here as a precondition: a mixture is
+    // already diagnosed, so generating nothing keeps the errors to one.
+    let all_strings = written
+        .iter()
+        .all(|(_, backing)| matches!(backing, BackingLiteral::Str { .. }));
+    let all_integers = written
+        .iter()
+        .all(|(_, backing)| matches!(backing, BackingLiteral::Int { .. }));
+    let backing_type = if all_strings {
+        "str".to_string()
+    } else if all_integers {
+        match integer_backing_type(&written) {
+            Some(backing_type) => backing_type,
+            None => return String::new(),
+        }
+    } else {
+        return String::new();
+    };
+    let enum_name = name.0;
+    // The literal exactly as written — `Display` quotes a string and reprints
+    // an integer's own spelling (hex stays hex), so the generated source says
+    // what the declaration says.
+    let literal = |backing: &BackingLiteral<'_>| backing.to_string();
+
+    let mut out = format!("impl {enum_name} {{\n");
+    out.push_str(&format!(
+        "\t/// The host value `{enum_name}` is backed by. The enum IS this value \
+         at runtime, so the call costs nothing.\n\
+         \tfun value(self): {backing_type} {{\n\
+         \t\tmatch self {{\n"
+    ));
+    for (variant_name, backing) in &written {
+        out.push_str(&format!(
+            "\t\t\t{enum_name}::{variant_name} => {},\n",
+            literal(backing)
+        ));
+    }
+    out.push_str("\t\t}\n\t}\n\n");
+    // The reverse direction, as an `if`/`else if` chain rather than a `match`:
+    // a `match` cannot be written against a NEGATIVE literal pattern, and
+    // `Ordering { Less = -1 }` is the one backed enum std already ships. The
+    // emission is the same `===` chain either way.
+    out.push_str(&format!(
+        "\t/// The variant backed by `value`, or `None` when it is outside the set.\n\
+         \tfun parse(value: {backing_type}): Option<{enum_name}> {{\n"
+    ));
+    for (index, (variant_name, backing)) in written.iter().enumerate() {
+        let lead = if index == 0 { "\t\tif" } else { " else if" };
+        out.push_str(&format!(
+            "{lead} value == {} {{\n\t\t\tOption::Some({enum_name}::{variant_name})\n\t\t}}",
+            literal(backing)
+        ));
+    }
+    out.push_str(" else {\n\t\t\tOption::None\n\t\t}\n\t}\n}\n\n");
+    out
+}
+
+/// The vilan type of an integer backing: the narrowest plain-JS-number integer
+/// that holds every discriminant. `i32` is the language's default integer, so
+/// it is what `Ordering::Greater.value() == 1` compares against without
+/// friction; `i53` is the widest integer a JS number represents exactly, and a
+/// backed enum IS a JS number. `None` — no conversions at all — when a
+/// discriminant is outside `i53`, because the bare lowering already cannot
+/// represent it and `value()` would be a lie.
+fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<String> {
+    const I53_MAX: i128 = (1 << 53) - 1;
+    let mut lowest: i128 = 0;
+    let mut highest: i128 = 0;
+    for (_, backing) in written {
+        let BackingLiteral::Int {
+            negative,
+            whole,
+            fraction,
+            suffix,
+            ..
+        } = backing
+        else {
+            return None;
+        };
+        // A rejected spelling is already diagnosed; generating nothing keeps
+        // the errors to one.
+        if fraction.is_some() || suffix.is_some() {
+            return None;
+        }
+        let magnitude: i128 = match whole.strip_prefix("0x") {
+            Some(hex) => i128::from_str_radix(hex, 16).ok()?,
+            None => whole.parse::<i128>().ok()?,
+        };
+        let value = if *negative { -magnitude } else { magnitude };
+        lowest = lowest.min(value);
+        highest = highest.max(value);
+    }
+    if lowest >= i32::MIN as i128 && highest <= i32::MAX as i128 {
+        return Some("i32".to_string());
+    }
+    if lowest >= -I53_MAX && highest <= I53_MAX {
+        return Some("i53".to_string());
+    }
+    None
 }
 
 pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> String {
@@ -31661,6 +31845,24 @@ fn analyze_over_world<'src>(
         eprintln!("[vilan leak] {}", crate::leak_tally::report());
     }
 
+    // The synthesized `value()` of every backed enum, for the transformer's
+    // identity fold (backed-enums.md §3.8).
+    let backed_value_members: HashSet<Id> = analyzer
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            matches!(
+                implementation.subject.get_type(&analyzer),
+                Type::Enum(enum_id, _)
+                    if analyzer
+                        .enums
+                        .get(&enum_id)
+                        .is_some_and(|enum_| enum_.backing.is_some())
+            )
+        })
+        .filter_map(|implementation| implementation.declarations.get("value").copied())
+        .collect();
+
     // The phase split, one line per top-level analysis (macro worlds are
     // nested analyses; their line would be noise inside the outer one).
     // Stderr for the same reason the leak line is: `build --stdout`'s
@@ -31708,6 +31910,7 @@ fn analyze_over_world<'src>(
         intrinsics,
         global_scope_id,
         implementations: analyzer.implementations,
+        backed_value_members,
         list_new_fn_id,
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,

@@ -3043,6 +3043,16 @@ impl<'src> Transformer<'src> {
                         // data is a no-op that still evaluates the argument for its
                         // effects. Erasure forces the rewrite here — the generic
                         // sink body cannot drop instantiation-conditionally.
+                        // `x.value()` on a backed enum IS `x` (backed-enums.md
+                        // §3.8): the receiver already holds the backing value
+                        // at runtime, so the conversion is the identity and
+                        // emits nothing. The generated body — a `match` over
+                        // the variants — stays the definition this fold has to
+                        // agree with; folded away, it has no callers left and
+                        // the tree-shake drops it.
+                        if self.program.backed_value_members.contains(&target_id) {
+                            return Some(args.into_iter().next().unwrap_or(js::Node::Void));
+                        }
                         if Some(target_id) == self.drop_fn_id {
                             let arg_node = args.into_iter().next().unwrap_or(js::Node::Void);
                             let argument_type =

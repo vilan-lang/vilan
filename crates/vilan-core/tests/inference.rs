@@ -48581,3 +48581,185 @@ fn b76_a_backing_string_keeps_its_escapes() {
         "quote\na\tb\n",
     );
 }
+
+// --- B76: the conversions — `.value()` out, `Enum::parse` back ---------------
+//
+// §3.8, synthesized on every backed enum rather than opted into by a derive
+// (§7.3 — the backing value is already the opt-in). Written as vilan source, so
+// a user's own `value` meets B57's duplicate-inherent rule; `value()` still
+// costs nothing, because the transformer folds the call to its receiver.
+
+#[test]
+fn b76_value_returns_the_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun main() {
+            print(Align::End.value());
+            print(Level::Low.value());
+        }
+        "#,
+        "flex-end\n-1\n",
+    );
+}
+
+#[test]
+fn b76_value_lowers_to_the_identity() {
+    // The receiver already IS the backing value, so `value.value()` compiles to
+    // `value` — that is what makes std's eleven CSS wrappers delete outright
+    // instead of moving their `match` chains into the emitted output. The
+    // folded-away body then has no callers and emits nothing.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun render(value: Align): str { value.value() }
+        fun main() { print(render(Align::Start)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return value;"),
+        "`value.value()` should compile to `value`, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function value"),
+        "the synthesized `value` body should emit nothing once folded, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_parse_round_trips_and_answers_none_outside_the_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun show(parsed: Option<Align>): str {
+            match parsed { Option::Some(let a) => a.value(), Option::None => "none" }
+        }
+        fun main() {
+            print(show(Align::parse("flex-start")));
+            print(show(Align::parse("flex-end")));
+            print(show(Align::parse("middle")));
+            print(match Level::parse(2) {
+                Option::Some(let l) => l.value(),
+                Option::None => 0,
+            });
+            print(match Level::parse(7) { Option::Some(let l) => l.value(), Option::None => 0 });
+        }
+        "#,
+        "flex-start\nflex-end\nnone\n2\n0\n",
+    );
+}
+
+#[test]
+fn b76_parse_needs_no_option_import_at_the_declaration() {
+    // The synthesized block carries its own `Option`, so a module that declares
+    // a backed enum and never mentions `Option` still compiles.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_user_declared_value_or_parse_is_a_hard_error() {
+    // §3.8's collision rule, reached through B57 rather than through a rule of
+    // its own: a synthesized member that quietly loses is worse than a visible
+    // name clash. The note says the other declaration is the compiler's,
+    // because there is no file to point at.
+    assert_fails_with(
+        r#"
+        enum A { X = "x", Y = "y" }
+        impl A { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+        "'value' is already defined for 'A'",
+    );
+    assert_fails_with(
+        r#"
+        enum B { X = "x", Y = "y" }
+        impl B { fun parse(text: str): str { "nope" } }
+        fun main() { }
+        "#,
+        "'parse' is already defined for 'B'",
+    );
+    // …and the note names the synthesized member rather than pointing the
+    // author's own declaration back at itself.
+    let diagnostics = failure_diagnostics_with_notes(
+        r#"
+        enum C { X = "x", Y = "y" }
+        impl C { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+    );
+    assert!(
+        diagnostics.iter().any(|(_, _, note)| note
+            .as_ref()
+            .is_some_and(|(msg, _, _)| msg.contains("synthesized for 'C' by the compiler"))),
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_gets_no_conversions() {
+    // The negative space: `value`/`parse` exist because a backing value was
+    // written, so a plain enum and a payload enum keep their surfaces free.
+    assert_fails_with(
+        r#"
+        enum Plain { A, B }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+        "value",
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        impl Plain { fun value(self): i32 { 0 } }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_wide_integer_backing_widens_the_conversion_type() {
+    // The backing type is the narrowest plain-JS-number integer that holds
+    // every discriminant: `i32` by default (the language's default integer, so
+    // `Ordering::Greater.value() == 1` needs no suffix), `i53` when a
+    // discriminant does not fit.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Wide { Big = 3000000000, Small = 1 }
+        fun main() { print(Wide::Big.value()); }
+        "#,
+        "3000000000\n",
+    );
+}
+
+#[test]
+fn b76_std_ordering_gains_the_conversions() {
+    // std's one pre-existing backed enum picks them up like any other, and its
+    // `value()` is the identity over the bare discriminant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        import std::option::Option;
+        fun main() {
+            print(Ordering::Greater.value());
+            print(match Ordering::parse(-1) {
+                Option::Some(let o) => o.value(),
+                Option::None => 99,
+            });
+        }
+        "#,
+        "1\n-1\n",
+    );
+}

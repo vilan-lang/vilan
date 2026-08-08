@@ -872,6 +872,9 @@ struct Expander<'r, 'd> {
     rust_source: String,
     rust_traits: std::collections::HashSet<&'static str>,
     rust_any_service: bool,
+    /// Whether this module declared a backed enum, so the generated block gets
+    /// `Option` in scope for its `parse` (backed-enums.md §3.8).
+    backed_enums: bool,
     diagnostics: &'d mut Vec<Error>,
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
@@ -901,16 +904,51 @@ pub(crate) fn expand_source(
         rust_source: String::new(),
         rust_traits: std::collections::HashSet::new(),
         rust_any_service: false,
+        backed_enums: false,
         diagnostics,
         site_counter,
         output: ExpansionOutput::default(),
     };
+    expander.collect_backed_enum_impls(nodes);
     expander.expand_list(nodes, text, depth);
     expander.flush_rust_fallback();
     expander.output
 }
 
 impl Expander<'_, '_> {
+    /// The synthesized `value()` / `parse()` members of every backed enum this
+    /// module declares (backed-enums.md §3.8), collected in ONE pass over the
+    /// item tree rather than inside the macro dispatch below.
+    ///
+    /// Separate because it is not a macro: a backing value is not a `[derive]`
+    /// and does not depend on one, so the generation must reach an enum however
+    /// it is wrapped — exported, derived, attributed, or inside a `mod`. Riding
+    /// the dispatch would have missed `[derive(Debug)] enum Align { .. }`,
+    /// whose arm does not recurse.
+    fn collect_backed_enum_impls(&mut self, nodes: &NodeList) {
+        for node in nodes {
+            self.collect_backed_enum_impls_in(node);
+        }
+    }
+
+    fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>) {
+        match &node.0 {
+            Node::Export(inner)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) => self.collect_backed_enum_impls_in(inner),
+            Node::Module(_, body) => self.collect_backed_enum_impls(&body.0),
+            Node::Enum(..) => {
+                let source = crate::analyzer::backed_enum_impl_source(node);
+                if !source.is_empty() {
+                    self.backed_enums = true;
+                    self.rust_source.push_str(&source);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn expand_list(&mut self, nodes: &NodeList, text: &str, depth: u32) {
         for node in nodes {
             self.expand_item_position(node, nodes, text, depth);
@@ -1152,6 +1190,9 @@ impl Expander<'_, '_> {
         }
         if self.rust_traits.contains("Hashable") {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
+        }
+        if self.backed_enums {
+            prelude.push_str("import std::option::Option;\n");
         }
         if self.rust_any_service {
             prelude.push_str(
