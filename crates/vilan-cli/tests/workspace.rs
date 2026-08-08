@@ -85,15 +85,15 @@ fn workspace_builds_each_host_member() {
     );
     // A bundle per host member; the `none` library is not built on its own.
     assert!(
-        dir.join("dist/server.js").is_file(),
-        "missing dist/server.js"
+        dir.join("dist/server.mjs").is_file(),
+        "missing dist/server.mjs"
     );
     assert!(
         dir.join("dist/client.js").is_file(),
         "missing dist/client.js"
     );
     assert!(
-        !dir.join("dist/common.js").exists(),
+        !dir.join("dist/common.mjs").exists(),
         "the `none` library should not be built standalone"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -266,7 +266,7 @@ fn write_multi_entry_package(dir: &Path) {
 #[test]
 fn a_multi_entry_package_builds_every_entry_into_dist() {
     // `[entry.<name>]` lowers onto the workspace orchestration: one
-    // `dist/<name>.js` per entry, each compiled for its own target — the
+    // `dist/<name>` per entry, each compiled for its own target — the
     // node-only `store.load` is fine because the client never reaches it.
     let dir = temp_project("entries");
     write_multi_entry_package(&dir);
@@ -277,12 +277,144 @@ fn a_multi_entry_package_builds_every_entry_into_dist() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        dir.join("dist/server.js").is_file(),
-        "missing dist/server.js"
+        dir.join("dist/server.mjs").is_file(),
+        "missing dist/server.mjs"
     );
     assert!(
         dir.join("dist/client.js").is_file(),
         "missing dist/client.js"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- B86b: the emitted bundle declares its module kind ------------------------
+//
+// Vilan emits ESM. A process runtime decides ESM-vs-CommonJS BEFORE running a
+// file, from its extension, and only falls back to sniffing the source — and
+// the sniff cannot see vilan's output, because the emitter parenthesizes await
+// operands and `await (x)` is valid CommonJS (a call to a function named
+// `await`). Programs were rescued only by the `import` line a Node extern
+// happens to emit; an extern-free one died with `ReferenceError: await is not
+// defined` (`top-level-await.md` §1.4/§8.1). The extension states the
+// classification instead of leaving it to be guessed.
+
+#[test]
+fn a_process_leg_is_written_mjs_and_a_browser_leg_js() {
+    // The boundary, per leg and in one program: the ruling names the process
+    // legs, and the browser keeps `.js` because a `<script type="module">` tag
+    // declares the module at the load site — no extension carries that weight.
+    let dir = temp_project("leg_extensions");
+    write_multi_entry_package(&dir);
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.join("dist/server.mjs").is_file(),
+        "the node entry must be written `.mjs`, so the runtime classifies it"
+    );
+    assert!(
+        !dir.join("dist/server.js").exists(),
+        "the node entry must NOT also be written `.js`"
+    );
+    assert!(
+        dir.join("dist/client.js").is_file(),
+        "the browser entry keeps `.js` — its `<script type=\"module\"` tag classifies it"
+    );
+    assert!(
+        !dir.join("dist/client.mjs").exists(),
+        "the browser entry must NOT be renamed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lone_package_writes_its_bundle_mjs() {
+    // `build_single` takes the same rule: a bare file / single-entry package
+    // is a node build, and `node <entry>.js` in a directory with no
+    // `package.json` is exactly the classification that failed.
+    let dir = temp_project("single_extension");
+    write(&dir, "vilan.toml", "[package]\nname = \"solo\"\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::print;\n\nfun main() {\n\tprint(\"solo\");\n}\n",
+    );
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.join("src/main.mjs").is_file(),
+        "missing src/main.mjs; got: {:?}",
+        std::fs::read_dir(dir.join("src"))
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+    assert!(
+        !dir.join("src/main.js").exists(),
+        "the `.js` name must be gone"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_emitted_node_bundle_is_classified_as_esm() {
+    // The defect end to end, not merely the filename. An extern-free bundle
+    // carries no `import` line, so nothing tips Node off; appending the exact
+    // construct that defeated detection — a PARENTHESIZED top-level await,
+    // which parses cleanly as CommonJS — asks the runtime what it decided.
+    //
+    // Differential, so the pin cannot pass vacuously: the same bytes under
+    // `.js` must still fail. If that arm ever goes green, the classification
+    // stopped depending on the extension and this pin has stopped testing it.
+    let dir = temp_project("esm_classification");
+    write(&dir, "vilan.toml", "[package]\nname = \"bare\"\n");
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::print;\n\nfun main() {\n\tprint(\"bare\");\n}\n",
+    );
+    let output = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bundle = dir.join("src/main.mjs");
+    let emitted = std::fs::read_to_string(&bundle).expect("read emitted bundle");
+    assert!(
+        !emitted.contains("import "),
+        "this fixture must stay extern-free — an `import` line is an ESM \
+         marker and would mask the classification"
+    );
+    let probe = format!(
+        "{emitted}\nconst __probe = await (Promise.resolve(41));\nconsole.log(__probe + 1);\n"
+    );
+
+    let run = |path: &Path| -> Output {
+        std::fs::write(path, &probe).expect("write probe");
+        Command::new("node").arg(path).output().expect("run node")
+    };
+
+    let as_module = run(&dir.join("src/probe.mjs"));
+    assert!(
+        as_module.status.success() && String::from_utf8_lossy(&as_module.stdout).contains("42"),
+        "the `.mjs` bundle was not classified as ESM:\n{}",
+        String::from_utf8_lossy(&as_module.stderr)
+    );
+
+    let as_script = run(&dir.join("src/probe.js"));
+    assert!(
+        !as_script.status.success()
+            && String::from_utf8_lossy(&as_script.stderr).contains("await is not defined"),
+        "the same bytes under `.js` were expected to fail CommonJS classification \
+         — if this passes, the extension is no longer what decides, and the pin \
+         above proves nothing:\n{}",
+        String::from_utf8_lossy(&as_script.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -346,8 +478,11 @@ fn check_colors_each_entry_against_its_own_target() {
 
 #[test]
 fn colliding_output_names_are_rejected() {
-    // A workspace member named `app` and a sibling's `[entry.app]` would both
-    // write `dist/app.js` — rejected at lowering instead of silently racing.
+    // A workspace member named `app` (node) and a sibling's `[entry.app]`
+    // (browser) — rejected at lowering instead of silently racing. Since the
+    // extension is now the platform's these two no longer overwrite the same
+    // BUNDLE, but everything keyed by the bare name beside it still collides
+    // (`dist/app.css`, `dist/app.chunks.json`), so the name rule stands.
     let dir = temp_project("collide");
     write(
         &dir,
@@ -365,7 +500,7 @@ fn colliding_output_names_are_rejected() {
     let output = vilan(&["build", dir.to_str().unwrap()]);
     assert!(!output.status.success(), "expected a collision failure");
     let text = combined(&output);
-    assert!(text.contains("dist/app.js"), "unexpected output: {text}");
+    assert!(text.contains("dist/app.*"), "unexpected output: {text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -576,7 +711,7 @@ fn body_scoped_imports_load_dependencies_and_siblings() {
         String::from_utf8_lossy(&output.stderr)
     );
     let run = Command::new("node")
-        .arg(dir.join("dist/server.js"))
+        .arg(dir.join("dist/server.mjs"))
         .output()
         .expect("run node");
     assert_eq!(
@@ -633,7 +768,7 @@ fn the_walkthrough_example_builds() {
     );
     assert!(example.join("dist/client.js").is_file());
     assert!(example.join("dist/client.css").is_file());
-    assert!(example.join("dist/server.js").is_file());
+    assert!(example.join("dist/server.mjs").is_file());
 }
 
 // --- A15's follow-up: the manifest-designated default `run` entry -----------
@@ -696,7 +831,7 @@ fn a_multi_entry_package_runs_its_designated_default_entry() {
         "the designated entry should have run: {text}"
     );
     // The non-selected entry still compiles into the project.
-    assert!(dir.join("dist/probe.js").is_file());
+    assert!(dir.join("dist/probe.mjs").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -782,7 +917,7 @@ fn a_failing_build_hook_fails_the_build_and_names_the_command() {
         "the failure should name the command: {text}"
     );
     // The build never happened, and neither did the hook after the failing one.
-    assert!(!dir.join("src/main.js").exists());
+    assert!(!dir.join("src/main.mjs").exists());
     assert!(!dir.join("never-reached").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -822,7 +957,7 @@ fn no_hooks_is_no_change_and_check_never_runs_them() {
     write(&plain, "src/main.vl", &marker_source("APP_RAN"));
     let output = vilan(&["build", plain.to_str().unwrap()]);
     assert!(output.status.success(), "{}", combined(&output));
-    assert!(plain.join("src/main.js").is_file());
+    assert!(plain.join("src/main.mjs").is_file());
     let _ = std::fs::remove_dir_all(&plain);
 
     let checked = temp_project("hook_check");

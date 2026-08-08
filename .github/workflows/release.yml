@@ -28,8 +28,29 @@ jobs:
         with:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
+      # Everything below this line is ci.yml's `test` job, character for
+      # character, and it must stay that way (process.md §7.2 and §8.1;
+      # releases.md §7 step 1). This step ran plain `cargo test` until
+      # 2026-08-07, which made the release gate a WEAKER AND DIFFERENT
+      # instrument from the CI gate: `cargo test` schedules serially per test
+      # binary, nextest interleaves every binary across all cores, and the
+      # interleave surfaces load-dependent failures the serial schedule hides.
+      # That is not hypothetical. On v0.32.0's commit (e0e9e02) this job went
+      # green and published to GitHub Releases, npm, the VS Code Marketplace,
+      # Open VSX and the Homebrew tap while ci.yml on the identical sha was red
+      # on both ubuntu and windows. A tag can be pushed from a commit no PR
+      # ever saw, so this gate is the last thing standing between that commit
+      # and five publishing channels, several of which are one-way. It has to
+      # be the same instrument. Change these two legs and ci.yml's together.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: The suite is green
-        run: cargo test
+        run: cargo nextest run --workspace
+      # nextest does not run doc-tests. Every doc-test set is empty today;
+      # this leg exists so a future doc-test cannot silently stop running.
+      - name: The doc-tests are green
+        run: cargo test --workspace --doc
 
   build:
     needs: gate

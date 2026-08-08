@@ -13,13 +13,15 @@
 // `undefined` binds as the BARE type, and the absence is yours to guard.
 // Each such binding carries a `///` note saying so.
 
+import std::option::Option;
+
 /// `Align` — the closed string set `"start" | "end" | "center"`.
-/// The host boundary still speaks the raw JS string, so every binding that
-/// takes one pairs a private raw extern with a match-wrapper.
+/// A backed enum: each variant IS the host string it names, so it crosses
+/// the boundary unchanged. `parse` guards the return direction.
 enum Align {
-	Start,
-	End,
-	Center,
+	Start = "start",
+	End = "end",
+	Center = "center",
 }
 
 // `Shape` is a transparent alias for `{ … } | { … }`; vilan has no type alias, so every
@@ -37,7 +39,8 @@ impl Chart {
 	external fun new(): Chart;
 
 	// TODO(bindgen): property `align` is the closed string set `Align` — the
-	// raw `str` is bound; convert to and from `Align` at the call site
+	// raw `str` is bound; read it with `Align::parse(..)`, and write
+	// `Align::Variant.value()`
 	[extern(get, "align")]
 	[platform("node")]
 	external fun align(self): str;
@@ -47,18 +50,8 @@ impl Chart {
 	external fun set_align(self, value: str): void;
 
 	[extern(method, "setAlign")]
-	[doc(hidden)]
 	[platform("node")]
-	external fun set_align_2_raw(self, align: str): void;
-
-	/// `set_align_2` — `set_align_2_raw` with its closed string sets spoken as enums.
-	fun set_align_2(self, align: Align): void {
-		self.set_align_2_raw(match align {
-			Align::Start => "start",
-			Align::End => "end",
-			Align::Center => "center",
-		})
-	}
+	external fun set_align_2(self, align: Align): void;
 
 	/// This value may be `null`/`undefined` at the host — the bare type is
 	/// bound (see the header); guard at the call site.
@@ -111,16 +104,17 @@ impl Chart {
 	external fun maybe_align(self): void;
 
 	[extern(method, "maybeAlign")]
+	[platform("node")]
+	external fun maybe_align_with_align(self, align: Align): void;
+
+	[extern(method, "getAlign")]
 	[doc(hidden)]
 	[platform("node")]
-	external fun maybe_align_with_align_raw(self, align: str): void;
+	external fun get_align_raw(self): str;
 
-	/// `maybe_align_with_align` — `maybe_align_with_align_raw` with its closed string sets spoken as enums.
-	fun maybe_align_with_align(self, align: Align): void {
-		self.maybe_align_with_align_raw(match align {
-			Align::Start => "start",
-			Align::End => "end",
-			Align::Center => "center",
-		})
+	/// `get_align` — `get_align_raw` guarded by `Align::parse`: the host may answer
+	/// outside the set, which is `None`.
+	fun get_align(self): Option<Align> {
+		Align::parse(self.get_align_raw())
 	}
 }

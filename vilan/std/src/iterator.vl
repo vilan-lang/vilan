@@ -305,11 +305,11 @@ impl Chained<type I: Iterator<T>, type J: Iterator<T>, type T> with Iterator<T> 
 }
 
 trait Iterable<T> {
-	fun iter(self): Iterator<T>;
+	fun iter(self): Self;
 }
 
 impl Iterator<type T> with Iterable<T> {
-	fun iter(self): Iterator<T> {
+	fun iter(self): Self {
 		self
 	}
 }

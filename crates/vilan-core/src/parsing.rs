@@ -43,7 +43,7 @@
 
 use crate::lexing;
 use crate::node::{
-    BinaryOp, Closure, Convention, Discriminant, ElementBody, ElementChild, ElementHeadItem,
+    BackingLiteral, BinaryOp, Closure, Convention, ElementBody, ElementChild, ElementHeadItem,
     EnumVariant, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
     ImportBranch, MatchLeg, Node, NodeIfBranch, NodeList, Parameter, Pattern, StructField,
     TupleBound,
@@ -3287,8 +3287,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// One enum variant: `name (payload types)? (= discriminant)?`, carrying the
-    /// whole-variant span.
+    /// One enum variant: `name (payload types)? (= backing value)?`, carrying
+    /// the whole-variant span.
     fn parse_enum_variant(&mut self) -> Option<Spanned<EnumVariant<'src>>> {
         let start = self.position;
         let name = self.eat_name()?;
@@ -3298,33 +3298,66 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             Some(types)
         });
-        let discriminant = self.parse_discriminant();
+        let backing = self.parse_backing_literal();
         Some((
-            (name, data.unwrap_or_default(), discriminant),
+            (name, data.unwrap_or_default(), backing),
             self.span_from(start),
         ))
     }
 
-    /// `= (-)? NUMBER` — an explicit enum discriminant, or `None`
-    /// (backtracking) when no `=` follows. The number token is carried
-    /// UNREDUCED: the grammar's production is an integer, but the token also
-    /// admits a fraction and a suffix, and reducing here is what turned an
-    /// overflowing magnitude into `0` (B79). The analyzer reads the value and
+    /// `= ( (-)? NUMBER | STRING )` — an explicit enum backing value, or `None`
+    /// (backtracking) when no `=` follows.
+    ///
+    /// The string arm is `proposal/backed-enums.md` §3.1: a GENERALIZATION of
+    /// the integer discriminant, not a second kind of enum. Both arms are
+    /// carried UNREDUCED — the number token also admits a fraction and a
+    /// suffix, and reducing here is what turned an overflowing magnitude into
+    /// `0` (B79); the string's text is the raw source slice, unescaped at
+    /// emission like any other literal. The analyzer reads the value and
     /// rejects every spelling the production does not mean.
-    fn parse_discriminant(&mut self) -> Option<Discriminant<'src>> {
-        self.attempt(|parser| {
-            parser.expect_op("=")?;
-            let start = parser.position;
-            let negative = parser.eat_op("-");
-            let (whole, fraction, suffix) = parser.eat_number()?;
-            Some(Discriminant {
+    fn parse_backing_literal(&mut self) -> Option<BackingLiteral<'src>> {
+        if !self.peek_is_op("=") {
+            // A speculative head-check that still records the demand, so a
+            // missing list separator after a variant keeps steering to `=` as
+            // well as `,`/`}` (the S5 shape) — `expect_op` did this implicitly
+            // before the production committed after its `=`.
+            self.note_expected("'='");
+            return None;
+        }
+        // COMMITTED once the `=` is seen: nothing else in a variant may follow
+        // one, so a backtrack here would blame the `=` for what came after it
+        // ("found '=' expected ','" pointed at the wrong token). §3.4's type set
+        // is what the failure states — `str` and the integers are the whole of
+        // it, `= true` and `= 1.5f` included by exclusion.
+        self.bump();
+        let start = self.position;
+        if let Some(Token::String(text)) = self.peek() {
+            let text = *text;
+            self.bump();
+            return Some(BackingLiteral::Str {
+                text,
+                span: self.span_from(start),
+            });
+        }
+        let negative = self.eat_op("-");
+        match self.eat_number() {
+            Some((whole, fraction, suffix)) => Some(BackingLiteral::Int {
                 negative,
                 whole,
                 fraction,
                 suffix,
-                span: parser.span_from(start),
-            })
-        })
+                span: self.span_from(start),
+            }),
+            None => {
+                // §3.4's type set, stated as the farthest-failure expectation:
+                // `str` and the integers are the whole of it, so `= true` and
+                // `= 1.5f64` are refused by the production rather than by a
+                // later rule.
+                self.note_expected("an integer");
+                self.note_expected("a string");
+                None
+            }
+        }
     }
 
     // --- impl / trait / mod --------------------------------------------------
@@ -4651,15 +4684,22 @@ mod tests {
             Node::Enum(name, _, resource, variants) => {
                 assert_eq!(name.0, "Sign");
                 assert!(!resource);
-                let (_, less_data, less_disc) = &variants.0[0].0;
+                let (_, less_data, less_backing) = &variants.0[0].0;
                 assert!(less_data.is_empty());
-                let less_disc = less_disc.as_ref().expect("Less has a discriminant");
-                assert!(less_disc.negative);
-                assert_eq!(less_disc.whole, "1");
-                assert_eq!(less_disc.to_string(), "-1");
-                let (_, more_data, more_disc) = &variants.0[2].0;
+                let less_backing = less_backing.as_ref().expect("Less has a backing value");
+                match less_backing {
+                    BackingLiteral::Int {
+                        negative, whole, ..
+                    } => {
+                        assert!(negative);
+                        assert_eq!(*whole, "1");
+                    }
+                    other => panic!("expected an integer backing, got {other:?}"),
+                }
+                assert_eq!(less_backing.to_string(), "-1");
+                let (_, more_data, more_backing) = &variants.0[2].0;
                 assert_eq!(more_data.len(), 2, "More carries two payload types");
-                assert_eq!(*more_disc, None);
+                assert_eq!(*more_backing, None);
             }
             other => panic!("expected Enum, got {other:?}"),
         }
@@ -4667,6 +4707,29 @@ mod tests {
         match only_item("resource enum Handle { Open, Closed }") {
             Node::Enum(_, _, resource, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_variants_carry_string_backing_values() {
+        // backed-enums.md §3.1: the discriminant production GENERALIZES to
+        // `= ( (-)? INTEGER | STRING )`. The literal is carried raw, quotes
+        // reprinted by `Display` so the formatter round-trips it and a
+        // diagnostic can tell `1` from `"1"`.
+        match only_item(r#"enum Align { Start = "flex-start", End = "end" }"#) {
+            Node::Enum(name, _, _, variants) => {
+                assert_eq!(name.0, "Align");
+                let (_, _, start_backing) = &variants.0[0].0;
+                match start_backing.as_ref().expect("Start has a backing value") {
+                    BackingLiteral::Str { text, .. } => assert_eq!(*text, "flex-start"),
+                    other => panic!("expected a string backing, got {other:?}"),
+                }
+                assert_eq!(
+                    start_backing.as_ref().unwrap().to_string(),
+                    "\"flex-start\""
+                );
+            }
+            other => panic!("expected Enum, got {other:?}"),
         }
     }
 

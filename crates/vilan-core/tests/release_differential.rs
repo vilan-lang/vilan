@@ -170,7 +170,7 @@ fn run(javascript: &str, label: &str) -> Result<(String, i32), String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "vilan_release_diff_{}_{unique}_{label}.js",
+        "vilan_release_diff_{}_{unique}_{label}.mjs",
         std::process::id()
     ));
     std::fs::write(&path, javascript).map_err(|error| error.to_string())?;

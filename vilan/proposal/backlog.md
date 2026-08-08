@@ -2206,7 +2206,7 @@ organized by originating section for lookup.
    "decide": root `.gitignore` now carries `vilan/examples/**/dist/`,
    `**/*.js`, `**/*.css`, and `git ls-files vilan/examples` returns only
    `.vl`, `README.md`, `vilan.toml`, three `.html` and two per-example
-   `.gitignore` — zero checked-in emitted JS, `examples/rpc/src/main.js` gone.
+   `.gitignore` — zero checked-in emitted JS, `examples/rpc/src/main.js (now .mjs post-B86b)` gone.
    Docs agree: `tour/platforms.md` calls one-package "the default shape; reach
    past it only when you have a reason" with the workspace as "the advanced
    form", and `tour/hello-vilan.md` starts readers at
@@ -2245,7 +2245,7 @@ organized by originating section for lookup.
    longer teach anything distinct; every survivor gets a manifest header
    comment and a README that says what it demonstrates and how to run it.
    *Sweep item found 2026-07-25 (B33 S2, incidental):*
-   `examples/rpc/src/main.js` is a stale checked-in EMITTED artifact (last
+   `examples/rpc/src/main.js (now .mjs post-B86b)` is a stale checked-in EMITTED artifact (last
    written at e91f6ca; a rebuild differs by +766 lines of newer runtime) —
    decide whether examples check in emitted JS at all (likely: no,
    gitignore `dist/` + stray `.js`) as part of this cleanup.
@@ -4162,3 +4162,29 @@ guessing. One latent bug found by the non-vacuity discipline itself:
 emit_constructor_globals ignored --only (fixed). 26 pins; zero new
 dependencies. The canvas example rides examples/canvas, gated by the
 examples suite the moment it landed.]
+
+
+### Moved at the v0.33.0 cycle close (2026-08-07 — uncut, accumulating on next per the process policy)
+
+Twelve entries closed in one cycle, all filed within the previous two.
+Compact ship records; the tombstones in the distilled file and
+top-level-await.md §9 / capture-clones.md §7 / suite-speed.md §8 carry
+the full detail.
+
+- **B86** — the await-shaped hole + .mjs classification (the ruling's
+  112-golden rename, byte-identical). **B87** — verified unreachable,
+  pinned by the pre-fix repro. **B88** — the measurement duel: the
+  in-place write-set candidate shipped at zero golden movement after
+  unconditional materialization was measured taking back a shipped
+  elision; the arm-scoped form refuted by a two-line counterexample.
+  **B89** — Object.assign was a merge; __replace truncates; the `&mut
+  List` shortening write was the user-visible half. **B90** — the
+  one-shot closure-parameter channel, both call paths unified, the free
+  path's own ordering bug included. **B91** — inherited defaults drive
+  the loop under B57's intact tiering. **B92** — next judged by its
+  body, from_fn carved out by rule not exemption. **B93** — full-tuple
+  keys, property pinned. **E41** — negative windows event-anchored.
+  **E42** — the playground's parse-error prefix subtraction. **J6** —
+  main's contract (the paper's own §4.4 claim was stale, corrected).
+  **E40** (closed last cycle-segment) — calibrated budgets,
+  CI-confirmed.

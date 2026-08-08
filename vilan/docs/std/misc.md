@@ -152,4 +152,5 @@ fun emit(kind: str, line: str)   // compile-time only: append to a build asset
 
 Callable only from `const` evaluation: it's how `std::style` writes the
 CSS file (`emit("css", rule)`). A browser build with emissions produces
-`<entry>.css` beside `<entry>.js`.
+`<entry>.css` beside `<entry>.js` (beside `<entry>.mjs` on a process
+target).

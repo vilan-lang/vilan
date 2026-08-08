@@ -418,3 +418,67 @@ fn a_browser_program_is_rejected_for_node() {
         output.diagnostics
     );
 }
+
+/// A diagnostic is labeled with the file it is IN, even when the visitor's own
+/// program also failed to parse (backlog E42).
+///
+/// `analyze_source` hands back one flat list — the entry's own lex/parse errors
+/// first, then the program's — while the per-diagnostic file record
+/// (`Program::diagnostic_sources`) covers only the program's half. Indexing
+/// that record with the FLAT position shifted every attribution by the number
+/// of parse errors ahead of it, so the visitor's syntax error came back labeled
+/// with a standard-library file. The language server subtracts the prefix; so
+/// does this now.
+///
+/// A single-file playground compile normally attributes everything to
+/// `main.vl`, which is precisely why the shift went unnoticed — with one file
+/// the wrong index still lands on the right answer. The pin registers an extra
+/// TOOLCHAIN module so the program has a second file to be wrong about. That is
+/// also the only coverage `display_path`'s toolchain branch has: `Diagnostic`
+/// promises "a toolchain path for a diagnostic inside std", and nothing else
+/// here produces one.
+///
+/// The injected key is not one of `vilan_embedded_std::FILES`, so `boot()` —
+/// which re-registers every embedded file on every compile — neither clobbers
+/// it nor is clobbered by it, and no other test imports the module.
+#[test]
+fn a_diagnostic_after_a_parse_error_keeps_its_own_file() {
+    let _guard = compiler();
+    vilan_wasm::boot();
+    vilan_core::analyzer::set_document_overlay(
+        std::path::Path::new("/toolchain/std/src/e42_probe.vl"),
+        // One ANALYZER error, so it lands in the program's half of the list
+        // rather than in the entry's parse prefix.
+        Some("fun probe(): i32 {\n    let bad: i32 = \"text\";\n    1\n}\n".to_string()),
+    );
+    // Two parse errors in the entry (the prefix the attribution has to lose),
+    // and one analyzer error that belongs to the injected module.
+    let output = vilan_wasm::compile_program(
+        "import std::e42_probe::probe;\n\nfun main() {\n    let value = probe();\n}\n\n@\n@\n",
+    );
+    let files: Vec<&str> = output
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.file.as_str())
+        .collect();
+    assert_eq!(
+        files,
+        vec!["main.vl", "main.vl", "std/src/e42_probe.vl"],
+        "each diagnostic must name its own file: {:#?}",
+        output.diagnostics
+    );
+    // Spelled out, because the shift is what the assertion above is really
+    // about: the entry's syntax errors are the prefix, and they are the
+    // visitor's own.
+    for diagnostic in output.diagnostics.iter().take(2) {
+        assert!(
+            diagnostic.message.contains("expected a token"),
+            "the prefix must be the entry's parse errors: {diagnostic:#?}"
+        );
+    }
+    let last = output.diagnostics.last().expect("three diagnostics");
+    assert!(
+        last.message.contains("Expected i32, but got str"),
+        "the program's half must be the module's type error: {last:#?}"
+    );
+}

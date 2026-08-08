@@ -123,11 +123,11 @@ enum PostBuild {
 fn post_build(directory: &str) -> PostBuild {
     match directory.rsplit('/').next().unwrap_or(directory) {
         "math" => PostBuild::Run {
-            script: "main.js",
+            script: "main.mjs",
             expected_stdout: "25\n",
         },
         "rpc" => PostBuild::Run {
-            script: "src/main.js",
+            script: "src/main.mjs",
             expected_stdout: concat!(
                 "ok: found ada (@ada)\n",
                 "ok: no such user\n",
@@ -153,7 +153,7 @@ fn post_build(directory: &str) -> PostBuild {
         "canvas" => PostBuild::Artifacts(&["board.js"]),
         "reactive-ui" => PostBuild::Artifacts(&["app.js", "app.css"]),
         "router" => PostBuild::Artifacts(&["app.js"]),
-        "todo" => PostBuild::Artifacts(&["dist/server.js", "dist/client.js", "dist/client.css"]),
+        "todo" => PostBuild::Artifacts(&["dist/server.mjs", "dist/client.js", "dist/client.css"]),
         _ => PostBuild::BuildOnly,
     }
 }

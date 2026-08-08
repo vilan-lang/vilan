@@ -70,6 +70,7 @@ is the historical record everything shipped gets moved into.
 | `p6-followups.md` | shipped arc (complete 2026-07-03) | The post-P6 (transport/RPC) completion ladder. |
 | `platform-coloring.md` | draft / proposed | Function-granular platform checking, successor to `platform-model.md`'s module-granular check. |
 | `platform-model.md` | shipped arc (2026-06-23) | The build model: backends, platforms, and layers. |
+| `process.md` | draft — awaiting owner review | Release cadence (weekly train + urgent triggers), branch protection, merge strategy, contribution scaffolding, and the alpha→beta promise — filed from the owner's 2026-08-07 process ask. |
 | `reactive-batching.md` | shipped arc (2026-07-02) | Deferred notification and the `batch` turn. |
 | `reactive-turns.md` | shipped arc (2026-07-09) | Reactive turns — scoped flush, async turns, replacing global auto-flush (A6). |
 | `releases.md` | active | Installation, versioning, and the release pipeline — the process this project actually runs. |
@@ -103,6 +104,7 @@ is the historical record everything shipped gets moved into.
 | `capture-clones.md` | shipped arc (2026-08-03) | Pattern captures copy on both compile paths — the B53 completion record; §5 holds the B59/B60 finds. |
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
 | `backed-enums.md` | draft — awaiting review | A variant carries the value the host speaks (`= "start"`) as a generalization of the integer discriminant (B76); the survey found three silent holes in the discriminant grammar it extends. |
+| `trait-objects.md` | draft — awaiting review | B4's design paper: recommends declining trait objects on the demand survey and building the missing `Type::Trait` distinction instead — the survey found a live resource leak where a bare trait annotation suppresses a destructor. |
 
 **Not yet in this directory, in flight:** `optimistic-lifecycle.md` (A14's
 remaining "optimistic-write → reconcile lifecycle" bullet) is drafted on the

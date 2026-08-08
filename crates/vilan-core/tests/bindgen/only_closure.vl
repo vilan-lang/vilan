@@ -72,17 +72,8 @@ impl Root {
 	external fun set_widened(self, value: any): void;
 
 	[extern(method, "align")]
-	[doc(hidden)]
 	[platform("node")]
-	external fun align_raw(self, side: str): void;
-
-	/// `align` — `align_raw` with its closed string sets spoken as enums.
-	fun align(self, side: ReachedAlign): void {
-		self.align_raw(match side {
-			ReachedAlign::Start => "start",
-			ReachedAlign::End => "end",
-		})
-	}
+	external fun align(self, side: ReachedAlign): void;
 
 	[extern(method, "inherited")]
 	[platform("node")]
@@ -282,11 +273,11 @@ impl ReachedCycleRight {
 }
 
 /// `ReachedAlign` — the closed string set `"start" | "end"`.
-/// The host boundary still speaks the raw JS string, so every binding that
-/// takes one pairs a private raw extern with a match-wrapper.
+/// A backed enum: each variant IS the host string it names, so it crosses
+/// the boundary unchanged. `parse` guards the return direction.
 enum ReachedAlign {
-	Start,
-	End,
+	Start = "start",
+	End = "end",
 }
 
 // `Root` is a host constructor: its `new` and its statics are bound in

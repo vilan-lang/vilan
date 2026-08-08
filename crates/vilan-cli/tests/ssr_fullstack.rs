@@ -2,7 +2,7 @@
 //! project (one package, two entries), built and run end to end. Two phases
 //! over one build:
 //!
-//! 1. **Server render.** `node dist/server.js` serves the page; a GET asserts the
+//! 1. **Server render.** `node dist/server.mjs` serves the page; a GET asserts the
 //!    served HTML carries the RENDERED content — the signal-fed list items, the
 //!    escaped heading, the `when` branch, the read-once button — spliced into the
 //!    shell at the `<!--ssr-->` marker, all present BEFORE any client JS runs.
@@ -265,7 +265,7 @@ fn ssr_serves_rendered_markup_then_the_client_replaces_it() {
     // The server runs from the project root (it reads `dist/client.js` and
     // `src/app.html` by relative path).
     let mut server = Command::new("node")
-        .arg("dist/server.js")
+        .arg("dist/server.mjs")
         .current_dir(&dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

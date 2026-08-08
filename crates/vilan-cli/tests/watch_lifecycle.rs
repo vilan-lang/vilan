@@ -2,7 +2,7 @@
 //!
 //! `watch_loop` never returns from its loop, so `Ctrl-C` is the only way a watch
 //! session finishes — and before this slice that path ran no cleanup at all,
-//! leaking one `vilan-watch-<pid>.js` per session into the temp directory (S3
+//! leaking one `vilan-watch-<pid>.mjs` per session into the temp directory (S3
 //! delivered only the per-*round* delete, which covers restarts).
 //!
 //! Unix-gated because the pin has to deliver a real interrupt: `SIGINT` via
@@ -63,7 +63,7 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
         .expect("spawn the watcher");
 
     // The round's temp script is keyed by the watcher's pid.
-    let script = std::env::temp_dir().join(format!("vilan-watch-{}.js", watcher.id()));
+    let script = std::env::temp_dir().join(format!("vilan-watch-{}.mjs", watcher.id()));
     wait_for("the watch script to be written", || script.exists());
 
     let signalled = Command::new("kill")

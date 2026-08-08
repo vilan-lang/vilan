@@ -77,6 +77,19 @@ Keyword enums: `Display` (Flex, Block, …), `Position`, `FlexDirection`,
 Text, All, **Off** — `none`, named to stay clear of `Option::None`, like
 `Display::Hidden`).
 
+All eleven are **backed enums**: each variant carries the CSS keyword it
+stands for, so the enum *is* that keyword at runtime and `.value()` hands it
+back. That is why the names need not match the keywords — `AlignItems::Start`
+is `"flex-start"`, `Display::Hidden` is `"none"` — and why passing one costs
+nothing over passing the string.
+
+```vilan,fragment
+Display::Hidden.value()          // "none"
+AlignItems::Start.value()        // "flex-start"
+Display::parse("inline-block")   // Some(Display::InlineBlock)
+Display::parse("nope")           // None
+```
+
 ## Style methods
 
 Every method returns a new `Style` with one more property slot; each slot is

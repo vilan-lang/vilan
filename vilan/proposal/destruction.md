@@ -100,6 +100,63 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   resources.
 - **R2 — overwrite drops.** Assigning onto a binding that still owns a resource drops the
   old value first, then moves the new one in (deterministic; Rust's rule).
+  *(Amended 2026-08-07 — B94, ruled and shipped in the v0.34.0 resources-drop lane.)*
+  Read the rule over the **place**, not the binding: a write **through a
+  writable view** drops the pointee's outgoing value too. A write through a
+  view is an in-place mutation of the pointee — that is how it reaches the
+  caller at all — so it destroys what it replaces exactly as the owned twin
+  does, and the two spellings are indistinguishable by design (the same
+  doctrine `capture-clones.md` §6.2/§7.3 applied to captures). The
+  implementation had taken the rule literally: `plan_resource_drops` tracks
+  bindings the scanned body OWNS, a loan owns nothing, so `self =
+  Holder::Empty` inside `&mut self` planned no drop and the scope-end glue then
+  read the NEW tag and found nothing — a silent leak, unrelated to width (a
+  same-width `Full(g1)` → `Full(g2)` leaked identically).
+  - **No liveness question, and none is needed.** The scan's `owned` set exists
+    because a body can move its own binding out and must not then drop it
+    twice. A loan cannot reach that state: it cannot move the pointee out (R5,
+    R6), and a binding its OWNER moved out of is dead, so lending it is R1
+    use-after-move — already rejected, and pinned as such. A repeated write
+    through one view is safe for a third reason: the glue reads the pointee's
+    CURRENT contents, which the previous write already replaced.
+  - **The drop precedes the write**, which B89's truncating `__replace` makes
+    load-bearing rather than cosmetic: the write sets `target.length =
+    value.length` before merging, so a drop emitted after it would destroy
+    slots that no longer exist. Pinned in bytes.
+  - **The same sentence, read the other way.** A loan owns nothing, so it takes
+    no scope-end teardown either. References are transparent (`&mut Holder`
+    *is* `Holder`), so `let v = &mut holder` minted a resource-typed local the
+    planner enrolled as an owner and the emitted program destroyed the borrowed
+    value twice. Fixed here, by the one filter both halves ride.
+  *(Amended 2026-08-07 — B99, measured and shipped in the v0.35.0 drop-seams
+  lane.)* Read the rule over the **place all the way down**: writing over a
+  resource-typed COMPONENT — `slot.held = Holder::Empty`, a tuple element, a
+  fixed-array element — destroys the outgoing value too, on an owned place and
+  through a view alike. R2 had been spelled over a binding and R5 over reading
+  and moving a field, so writing over one fell between them and the value was
+  leaked outright.
+  - **The predicate is the COMPONENT's own type, asked of the projection and
+    not of its root.** That is the whole of the doctrine: `slot.held` and
+    `view.held` are the same expression shape and differ only in what the root
+    binding is, so an answer that consulted the root would make the two
+    spellings distinguishable — the thing B81/B88/B94 exist to forbid. Measured
+    against the alternative (§7.2's discipline): restricting to an owned root
+    costs the view spelling and buys nothing, and it answers the wrong
+    question in both directions — an inferred `List<Guard>` root is not
+    classified a resource while a `&mut Slot` root is.
+  - **No liveness question, and none is needed** — R5 is the reason, read
+    directly. A resource field is loan-only and moving one out of a live
+    aggregate is rejected, so a component place always holds a live value; a
+    root that was moved out is a use-after-move R1 already rejects; and a
+    repeated write is safe because the glue reads the place's CURRENT contents.
+    The same three arguments B94 made for the loan, which is why one collector
+    (`collect_place_overwrites`) now answers both static halves.
+  - **The drop precedes the write**, here for a simpler reason than B94's: the
+    drop's operand IS the slot the write replaces, so a drop emitted after it
+    would destroy the incoming value. Pinned in bytes both ways — a component
+    write is a plain slot assignment and never truncates, and the view path
+    keeps its `__replace` ordering pin.
+  - **The generic twin is R11's, and is closed there** (B101, below).
 - **R3 — parameters.** `self` / `&x` / `&mut x` conventions are loans, unchanged. `own x`
   is a move — and for resources it is *only* a move: where a data `own` argument silently
   copies when not at last use, a resource argument that is not the binding's last use is
@@ -146,6 +203,16 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   reaching a container through a field — `Signal<T>`'s `value: Shared<T>` — is
   rejected too. A member whose type is already concrete is skipped: it is a written
   application in its own right, and would otherwise report twice.
+  - **Bycatch, found 2026-08-07 by B99's arc, filed rather than ridden in.** "The
+    written application" is load-bearing in the wrong direction: an INFERRED
+    `List<Resource>` is never asked. `mut arr: List<Guard> = [Guard { .. }]` is
+    rejected as designed, and `mut arr = [Guard { .. }]` — the same program with
+    the annotation deleted — compiles, and the element is never destroyed (the
+    binding takes no scope-end teardown at all, because a `List` is not a
+    resource by containment). Two rules miss it at once, which is why it is its
+    own item. The fixed-array spelling `[Guard; 2]` is correct in both halves
+    (rejected by nothing, dropped in reverse element order) and is pinned by
+    B99's `an_element_write_drops_the_old_value`.
 - **R11 — generics must be move-clean per instantiation.** Instantiating a type parameter
   with a resource type re-checks the instantiated body under the affine rules (T := the
   resource): every T-typed value used at most once as a move, no captures, no copies.
@@ -155,6 +222,36 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
   (function, resource bindings). Fallback if the general check drags in v1: bless
   `Option`'s surface first and ship the general rule as the follow-up — but the general
   rule is the design.
+  *(Amended 2026-08-07 — B101, shipped in the v0.35.0 drop-seams lane.)* The rule
+  reaches R2's seam as well as scope ends. **A generic body that OVERWRITES a
+  `T`-typed place is rejected at a resource instantiation**: `fun set<T>(slot:
+  &mut T, own value: T) { slot = value }` owes the outgoing pointee's drop (R2,
+  as B94 amended it) and `fun set<T>(holder: &mut Wrap<T>, own value: T) {
+  holder.item = value }` owes the outgoing component's (as B99 amended it), and
+  the shared body can emit neither. `check_own_generic_exactly_once`'s
+  `place_overwrites` had been deliberately empty with exactly this reason recorded
+  in the code; it is filled now, from the same `collect_place_overwrites` the
+  whole-program plan uses.
+  - **A loan owns nothing, and is not excused either.** That is B94's sentence
+    read one layer out: the value a generic body writes over belongs to the
+    caller, so it is not this instantiation's to *own* — and somebody must still
+    destroy it, which no shared body can.
+  - **Asked of the DELTA place set**, per the pass's standing rule: a place whose
+    resource-ness is caused by *this* instantiation. A CONCRETE resource
+    overwritten inside a generic body is chunk 3's, already correct (the emitted
+    body knows the type and B99's drop fires), and re-asking it here would reject
+    a correct program once per instantiation site. Plant-proven in both
+    directions.
+  - **The `own_params.is_empty()` short-circuit is gone.** It was this check's
+    original scope surviving as a guard, and it hid *both* widenings from a body
+    that takes no `own T`: `fun clear<T>(slot: &mut Option<T>) { slot = None }`
+    owes R2's drop and declares none, and B66's scope-end half was equally
+    unreachable there (`fun stash<T>(slot: &mut Option<T>) { let taken =
+    slot.take(); }` leaked in silence).
+  - **The std sweep is clean.** `Option` is the only resource-capable generic
+    container (R10 rejects the rest), and its whole surface — `take`, `replace`,
+    `unwrap`, `is_some`/`is_none` — plus the `drop` sink instantiates at a
+    resource with no report. Pinned as a test rather than left as a claim.
 - **R12 — no coercion to `any`.** A resource passed where `any` is expected errors
   (`print(db)` included) — `any` is a data sink; the discipline must not launder away.
   Debug-print fields instead.

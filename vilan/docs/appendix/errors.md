@@ -77,12 +77,24 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"parameter '…' has bare trait type '…': a trait is not a value type (vilan has no trait objects)"**
-A parameter was declared with a trait as its type, and called with a
-value that implements it. Traits are **bounds**, not types, so the
-parameter can never accept a concrete value — the impl is fine, the
-signature is not. Write the generic the message spells out:
-`fun show<T: A>(v: T)`. The note points at the declaration to change.
+**"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
+A trait's name was written where a type belongs — a binding's
+annotation, a parameter, a return type, a struct field, or a generic
+argument like `List<Display>`. Traits are **bounds**, not types, so no
+value can ever have that type: the impl is fine, the signature is not.
+Write the generic the message spells out — `fun show<T: A>(v: T)` — or,
+inside the trait's own declaration, write `Self`, which is what a trait
+naming itself in a return position always meant. The note points at the
+trait, which may live in another module. For "one of several things at
+runtime", use an enum.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"cannot call '…' on a value of bare trait type '…'"**
+The same rule reached from the other side: a receiver whose type is a
+bare trait has no concrete implementation to dispatch to. Reachable
+inside an `impl` whose subject is itself a trait, where `self` is
+abstract; elsewhere the annotation that produced the value is refused
+first.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' is already defined for '…'; remove or rename this one"**
@@ -97,6 +109,21 @@ name**: a static `fun new()` and a method `fun new(self)` for the same
 type collide with each other too. Give one of them a different name.
 → [Names, modules, and packages](../spec/names.md)
 
+**"'…' is already implemented for '…'; remove or merge this impl"**
+The same trait is implemented twice for the same type. A trait has one
+implementation per type, so the second block would simply never run —
+neither at `value.method()` nor through a `T: Trait` bound. Merge the two
+bodies into one impl, or delete the one you don't want; the note points
+at the first, and names its module when it lives in another file.
+
+Only an exact repeat is refused. A parameterized trait may be
+implemented once per set of arguments — `impl Bag with Into<Cup>` and
+`impl Bag with Into<Mug>` are two implementations, not one written twice
+— and an argument you leave to a `= Self` default counts as the one it
+defaults to, so `with Combine` and `with Combine<Bag>` are the same
+implementation of `Combine` for `Bag`.
+→ [Data and traits](../tour/data-and-traits.md)
+
 **"'…' is ambiguous on '…': both '…' and '…' provide it; call '…' to pick one"**
 Two traits supply the same method name for this receiver (or, for a
 generic receiver, two arms of its `T: A + B` bound), and the type has no
@@ -104,6 +131,16 @@ inherent method of its own to outrank them. Say which one you mean with
 `Trait::method(receiver, …)` — the message spells both options out with
 your own receiver already substituted in.
 → [Names, modules, and packages](../spec/names.md)
+
+**"`next` is ambiguous on '…': both '…' and '…' provide it, and a `for` loop has no spelling that names one"**
+The loop's counterpart to the message above, for the iterator protocol
+(`next`, or `next_mut` for `for x in &mut subject`). Two traits provide
+the member — declaring it, or supplying it as an inherited default — and
+no inherent member outranks them. A call can pick a provider with
+`Trait::next(receiver)`; a `for` has no such spelling, so the fix is the
+one the message names: declare `next` on the type itself, where it beats
+every trait-provided one.
+→ [Collections](../std/collections.md)
 
 **"'…' is not an inherent member of '…': '…' provides it; call '…' instead"**
 `Type::method(receiver)` means the type's *own* method. This one comes
@@ -410,6 +447,18 @@ thing has no name: an adopted async closure applied directly, a
 `run(value, body)` whose body suspends, or a `nursery` at top level.
 (Creating an async closure at top level is fine; it awaits nothing
 until called.)
+→ [Async](../tour/async.md)
+
+**"the initializer of `…` awaits: a module-level binding cannot suspend"**
+The same rule, reported at an explicit `await` whose operand is not an
+async call — a `Task`-valued binding, a spawn (`await async f()`), or a
+`Task` returned by a plain function. Module initialization is
+synchronous by design, so every one of these is refused wherever the
+`await` sits in the initializer's expression. The note names the fix:
+*spawn* at module level (`let pending: Task<T> = async work();`), which
+starts the work at load without suspending, and `await` the `Task` in
+`main`. An `await` inside a closure the initializer merely *creates* is
+not the initializer's own and stays legal.
 → [Async](../tour/async.md)
 
 **"`…` form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order"**

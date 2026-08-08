@@ -130,13 +130,19 @@ pub fn boot() {
 /// synthetic root is an implementation detail and would only confuse. A
 /// toolchain path keeps enough to be recognizable (`std/src/option.vl`).
 fn display_path(path: &Path) -> String {
+    // Overlay keys are VIRTUAL module identifiers ("std/src/option.vl"),
+    // not OS paths, so the rendered form is slash-joined on every host.
+    // On the wasm32 target this replace is a no-op; it exists for the
+    // native rlib on windows, where PathBuf renders the same key with
+    // backslashes (caught by the E42 pin's first windows CI run).
+    let render = |relative: &Path| relative.to_string_lossy().replace('\\', "/");
     if let Ok(relative) = path.strip_prefix(PROJECT_ROOT) {
-        return relative.to_string_lossy().into_owned();
+        return render(relative);
     }
     if let Ok(relative) = path.strip_prefix(TOOLCHAIN_ROOT) {
-        return relative.to_string_lossy().into_owned();
+        return render(relative);
     }
-    path.to_string_lossy().into_owned()
+    render(path)
 }
 
 /// The entry source's `'static` copy, interned by content: `analyze_source`
@@ -243,9 +249,19 @@ pub fn compile_program_for(source: &str, platform: Platform) -> CompileOutput {
         };
     };
 
+    // `errors` is the ENTRY's own lex/parse errors followed by the program's
+    // (`analyze_source`), while `diagnostic_sources` is parallel to the
+    // program's half alone — so the flat index has to lose that prefix before
+    // it can index the attribution. Feeding it straight in shifted every
+    // attribution by N wherever N parse errors preceded, and a recovered parse
+    // is exactly when a playground program has both (backlog E42). The language
+    // server does the same subtraction in `document.rs`. An index inside the
+    // prefix is the entry's own, which is what `None` means to `convert`.
+    let prefix = errors.len().saturating_sub(program.diagnostics.len());
     for (index, error) in errors.iter().enumerate() {
-        let path = program
-            .source_path(program.diagnostic_source(index))
+        let path = index
+            .checked_sub(prefix)
+            .and_then(|offset| program.source_path(program.diagnostic_source(offset)))
             .map(Path::to_path_buf);
         convert(error, "error", path.as_deref());
     }

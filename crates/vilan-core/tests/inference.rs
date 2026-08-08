@@ -548,6 +548,20 @@ fn assert_fails_with(source: &str, message_part: &str) {
     }
 }
 
+/// Asserts compilation fails and that NO diagnostic mentions `message_part` —
+/// for a fix whose point is that a misleading message is gone, not merely that
+/// a better one was added beside it.
+#[track_caller]
+fn assert_fails_without(source: &str, message_part: &str) {
+    match compile(source) {
+        Ok(_) => panic!("expected a compile error, but it compiled cleanly"),
+        Err(errors) => assert!(
+            errors.iter().all(|error| !error.contains(message_part)),
+            "a diagnostic still contains {message_part:?}; got: {errors:#?}"
+        ),
+    }
+}
+
 #[track_caller]
 fn assert_compiles_browser(source: &str) {
     if let Err(errors) = compile_browser(source) {
@@ -885,7 +899,11 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.js", std::process::id()));
+    // `.mjs`, exactly as the CLI's `run`/`test`/watch scripts: a process
+    // runtime classifies before it parses, and a harness that ran its bundles
+    // as CommonJS could not see an ESM-only defect at all
+    // (`top-level-await.md` §8.1).
+    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -896,6 +914,29 @@ fn run_js(js: &str) -> Result<String, Vec<String>> {
         Ok(output) => Err(vec![String::from_utf8_lossy(&output.stderr).into_owned()]),
         Err(error) => Err(vec![format!("could not run node: {error}")]),
     }
+}
+
+/// Compile and run, returning `(stdout, stderr, exit code)` whatever the exit —
+/// for pinning the entry shim's failure contract (J6), where the exit CODE and
+/// what reached stderr are the claims, not the stdout.
+fn compile_and_run_status(source: &str) -> (String, String, i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let javascript = compile(source).expect("expected a clean compile");
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("vilan_exit_{}_{unique}.mjs", std::process::id()));
+    std::fs::write(&path, javascript).expect("write script");
+    let output = std::process::Command::new("node")
+        .arg(&path)
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
 }
 
 /// Compile, then execute the emitted JS with `node`, returning its stdout. A
@@ -958,7 +999,7 @@ fn compile_and_run_capturing_stderr(source: &str) -> Result<(String, String), Ve
 
     let js = compile(source)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.js", std::process::id()));
+    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.mjs", std::process::id()));
     std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
     let output = std::process::Command::new("node").arg(&path).output();
     let _ = std::fs::remove_file(&path);
@@ -2372,10 +2413,6 @@ fn a_closure_mut_parameter_works_unannotated() {
 }
 
 #[test]
-#[ignore = "pre-existing closure-deferral gap: a binding initialized from a \
-closure parameter typed via a plain function's declared closure type stays \
-unknown — the hand-written `mut x = v;` form fails identically (H9's desugar \
-reproduces it faithfully); un-ignore when the deferral wakes such bindings"]
 fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
     assert_compiles_and_runs(
         r#"
@@ -3126,9 +3163,10 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 #[test]
 fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
     // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
-    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to `Object.assign(self,
-    // ..)`, mutating the very array `$a` aliases, so `items[at]` indexed with
-    // the INCREMENTED `at`. Printed "b\nc" for two steps over ["a","b","c"].
+    // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to a write in place
+    // (`__replace(self, ..)`), mutating the very array `$a` aliases, so
+    // `items[at]` indexed with the INCREMENTED `at`. Printed "b\nc" for two
+    // steps over ["a","b","c"].
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -3542,11 +3580,2034 @@ fn a_readonly_view_subject_keeps_its_shared_accessors() {
 }
 
 // ---------------------------------------------------------------------------
+// B89 (the view write is a REPLACE, not a merge). Writing a whole aggregate
+// through a view has to keep the pointee's identity — that is how the write
+// reaches the caller — so it copies the value's slots into the pointee rather
+// than rebinding. `Object.assign` did the copying, and `Object.assign` is a
+// MERGE: a slot the value does not reach is left standing. Every aggregate
+// whose width can shrink was wrong under it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_shortening_write_through_a_list_view_truncates() {
+    // The directly observable half, and the reason this is not merely an enum
+    // bug: `Object.assign(v, [ 1 ])` over a three-element list overwrote slot 0
+    // and left slots 1 and 2 alone, so the caller's list still had `len() == 3`
+    // and still held `2` and `3`. Nothing in the source says "merge".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun replace(v: &mut List<i32>) {
+            v = [9];
+        }
+        fun main() {
+            mut xs = [1, 2, 3];
+            replace(&mut xs);
+            print(xs.len());
+            print(xs[0]);
+        }
+        "#,
+        "1\n9\n",
+    );
+}
+
+#[test]
+fn a_shortening_reassign_of_a_viewed_enum_leaves_no_stale_payload() {
+    // B89's filed repro. `self = Feed::Done` lowers to a write of `[ 1 ]` over
+    // `[ 0, [ "a" ], 1 ]`; under the merge the payload survived in the trailing
+    // slots — unreachable through the enum's own API (the tag gates every
+    // read), but present, and for a RESOURCE payload it is a live object no
+    // owner can reach. The emitted shape is the pin: the truncating write, and
+    // the helper that truncates.
+    let source = r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun finish(&mut self) {
+                self = Feed::Done;
+            }
+        }
+        fun main() {
+            mut feed = Feed::Ready(["a"], 1);
+            feed.finish();
+            if feed is Feed::Done {
+                print("done");
+            }
+        }
+    "#;
+    assert_emits_containing(source, "__replace(self, [ 1 ]);");
+    assert_emits_containing(
+        source,
+        "if (Array.isArray(target) && Array.isArray(value)) target.length = value.length;",
+    );
+    assert_compiles_and_runs(source, "done\n");
+}
+
+#[test]
+fn a_widening_reassign_of_a_viewed_enum_fills_every_slot() {
+    // The other direction, which the fix must not break: the pointee GROWS, so
+    // setting the length first opens holes that the copy then fills. A payload
+    // read back after the widening write proves no slot was left a hole.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Feed {
+            Ready(List<str>, i32),
+            Done,
+        }
+        impl Feed {
+            fun start(&mut self) {
+                self = Feed::Ready(["a", "b"], 7);
+            }
+        }
+        fun main() {
+            mut feed = Feed::Done;
+            feed.start();
+            if feed is Feed::Ready(let items, let at) {
+                print(items.len());
+                print(at);
+            }
+        }
+        "#,
+        "2\n7\n",
+    );
+}
+
+#[test]
+fn an_equal_width_write_through_a_struct_view_is_unchanged() {
+    // The width-fixed case, pinned so the general form stays a superset of the
+    // merge it replaced: a struct's slots are the same on both sides, so the
+    // merge happened to be right there and the replace must agree with it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Point { x: i32, y: i32 }
+        fun move_to(p: &mut Point) {
+            p = Point { x = 7, y = 8 };
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            move_to(&mut point);
+            print(point.x);
+            print(point.y);
+        }
+        "#,
+        "7\n8\n",
+    );
+}
+
+#[test]
+fn a_shortening_write_through_a_view_truncates_under_const_eval() {
+    // The const-eval interpreter runs the SAME emitted nodes, so it needs the
+    // replace natively — a merge there would fold a stale slot into a literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun replace(v: &mut List<i32>): i32 {
+            v = [9];
+            v.len()
+        }
+        fun main() {
+            print(const {
+                mut xs = [1, 2, 3];
+                replace(&mut xs)
+            });
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_view_write_drops_the_overwritten_variants_resource() {
+    // B94, and the half B89's truncation did NOT fix. R2 (destruction.md §5)
+    // says assigning onto a place that still holds a resource drops the old
+    // value first, and the OWNED-place twin always implemented it:
+    // `holder = Holder::Empty` on a local emits the tag-dispatching drop glue
+    // before the write. Through a `&mut` view it did not — the scan that plans
+    // overwrite drops tracks BINDINGS the scanned body owns, and a loan owns
+    // nothing, so nothing was planned and the scope-end glue then read the NEW
+    // tag and found nothing to drop. The guard was silently leaked (this
+    // program printed "before\nafter"). RULED 2026-08-07: the loan drops what
+    // it overwrites, twinning the owned path — the same indistinguishability
+    // doctrine B81/B88 applied to captures.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop {
+            fun drop(&mut self) {
+                print(i"dropped {self.label}");
+            }
+        }
+        enum Holder {
+            Full(Guard),
+            Empty,
+        }
+        impl Holder {
+            fun clear(&mut self) {
+                self = Holder::Empty;
+            }
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            print("before");
+            holder.clear();
+            print("after");
+        }
+        "#,
+        "before\ndropped held\nafter\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B94 (R2 through a LOAN). The rule: a write through a writable view drops the
+// pointee's outgoing value, exactly as the owned-place twin drops the
+// binding's. Every pin below has its owned twin's answer as the expectation,
+// because "indistinguishable from the owned path" IS the rule — the two write
+// the same storage under different names. See proposal/destruction.md §5 (R2)
+// and proposal/capture-clones.md §8.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
+    // Width was never the mechanism — B89's truncation only made the shrinking
+    // shape LOOK like a width bug. `Full(g1)` -> `Full(g2)` overwrites the same
+    // two slots and leaked just as hard.
+    let program = |write: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Full(Guard), Empty }}
+        impl Holder {{ fun swap(&mut self) {{ self = Holder::Full(Guard {{ label = "second" }}); }} }}
+        fun main() {{
+            mut holder = Holder::Full(Guard {{ label = "first" }});
+            print("before");
+            {write}
+            print("after");
+        }}
+        "#
+        )
+    };
+    // The owned twin first, so the expectation below is its answer verbatim.
+    assert_compiles_and_runs(
+        &program(r#"holder = Holder::Full(Guard { label = "second" });"#),
+        "before\ndropped first\nafter\ndropped second\n",
+    );
+    assert_compiles_and_runs(
+        &program("holder.swap();"),
+        "before\ndropped first\nafter\ndropped second\n",
+    );
+}
+
+#[test]
+fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
+    // The other width direction: a one-slot payload replaced by a three-slot
+    // one. `__replace` GROWS the array here, so nothing is truncated and the
+    // old payload would survive in a reachable slot — the drop is owed for the
+    // ownership reason, not the layout one.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Small(Guard), Big(Guard, i32, i32), Empty }
+        impl Holder {
+            fun grow(&mut self) { self = Holder::Big(Guard { label = "big" }, 1, 2); }
+        }
+        fun main() {
+            mut holder = Holder::Small(Guard { label = "small" });
+            print("before");
+            holder.grow();
+            print("after");
+        }
+        "#,
+        "before\ndropped small\nafter\ndropped big\n",
+    );
+}
+
+#[test]
+fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
+    // No enum tag anywhere: the pointee is the resource itself, so the glue is
+    // an unconditional call rather than a tag test. Same answer as
+    // `overwrite_drops_the_old_value_then_the_new_at_scope_end`, one loan over.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        fun reset(g: &mut Guard) { g = Guard { label = "new" }; }
+        fun main() {
+            mut guard = Guard { label = "old" };
+            print("before");
+            reset(&mut guard);
+            print("after");
+        }
+        "#,
+        "before\ndropped old\nafter\ndropped new\n",
+    );
+}
+
+#[test]
+fn a_view_write_drops_before_the_truncating_replace_clobbers_the_payload() {
+    // The B89 interaction, pinned in BYTES because the runtime answer alone
+    // cannot see the order. `__replace` sets `target.length = value.length`
+    // before merging, so a shrinking write deletes the payload slots outright —
+    // a drop emitted after it would destroy nothing. The resource here sits in
+    // slot 2, BEHIND a `List` payload, so the truncation to one slot takes both.
+    let source = r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(List<i32>, Guard), Empty }
+        impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
+        fun main() {
+            mut holder = Holder::Full([1, 2, 3], Guard { label = "held" });
+            print("before");
+            holder.clear();
+            print("after");
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => {
+            let drop_at = js.find("$a(self);").expect("the overwrite drop is emitted");
+            let write_at = js
+                .find("__replace(self,")
+                .expect("the truncating write is emitted");
+            assert!(
+                drop_at < write_at,
+                "the overwrite drop must precede the truncating write:\n{js}"
+            );
+        }
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "before\ndropped held\nafter\n");
+}
+
+#[test]
+fn a_view_write_drops_the_payload_in_the_owned_paths_order() {
+    // Order is part of the doctrine, not an accident of it: a variant with two
+    // resource slots destroys them in reverse declaration order
+    // (destruction.md §5), and the loan path must print the same sequence as
+    // the owned one because it runs the same per-type glue.
+    let program = |write: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Pair(Guard, Guard), Empty }}
+        impl Holder {{ fun clear(&mut self) {{ self = Holder::Empty; }} }}
+        fun main() {{
+            mut holder = Holder::Pair(Guard {{ label = "a" }}, Guard {{ label = "b" }});
+            print("before");
+            {write}
+            print("after");
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program("holder = Holder::Empty;"),
+        "before\ndropped b\ndropped a\nafter\n",
+    );
+    assert_compiles_and_runs(
+        &program("holder.clear();"),
+        "before\ndropped b\ndropped a\nafter\n",
+    );
+}
+
+#[test]
+fn a_view_write_through_a_mut_parameter_drops_the_old_value() {
+    // The `&mut x` parameter spelling of the same write — `&mut self` is not a
+    // special case, it is one of three names for a writable view.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        fun clear(v: &mut Holder) { v = Holder::Empty; }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            print("before");
+            clear(&mut holder);
+            print("after");
+        }
+        "#,
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_view_write_through_a_mut_local_drops_the_old_value() {
+    // The third spelling: a LOCAL bound to a `&mut`. `*v = ..` is not the
+    // vilan surface ("a view is written through directly"), so the write is
+    // spelled `v = ..` and `view_binding_mutability` is what recognizes it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            let v = &mut holder;
+            print("before");
+            v = Holder::Empty;
+            print("after");
+        }
+        "#,
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_view_write_through_a_nested_reborrow_drops_the_old_value() {
+    // Two loans deep: `outer` re-borrows its own `&mut` into `inner`, which
+    // does the write. The question is asked where the write is, so depth costs
+    // nothing — but a rule keyed on "the receiver is `self`" would miss this.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        fun inner(v: &mut Holder) { v = Holder::Empty; }
+        fun outer(v: &mut Holder) { inner(&mut v); }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            print("before");
+            outer(&mut holder);
+            print("after");
+        }
+        "#,
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn repeated_view_writes_drop_each_outgoing_value_exactly_once() {
+    // The double-drop question asked where it CAN be reached: two writes
+    // through one loan. Each drops what it finds, and what the second finds is
+    // what the first installed — the glue reads the pointee's CURRENT contents,
+    // never a remembered value. "first" and "second" appear once each.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        impl Holder {
+            fun churn(&mut self) {
+                self = Holder::Full(Guard { label = "second" });
+                self = Holder::Empty;
+            }
+        }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "first" });
+            print("before");
+            holder.churn();
+            print("after");
+        }
+        "#,
+        "before\ndropped first\ndropped second\nafter\n",
+    );
+}
+
+#[test]
+fn a_view_write_after_the_owner_moved_out_is_rejected() {
+    // Why the loan arm asks no liveness question, pinned rather than argued.
+    // The owned arm needs one because a body can move its own binding out and
+    // must not then drop it twice; the loan arm cannot reach that state,
+    // because minting the loan of a moved-out binding is itself a use-after-move
+    // R1 already rejects. The owned twin of this program compiles and prints no
+    // second drop (`a_moved_out_binding_is_not_overwrite_dropped`).
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            match holder {
+                Holder::Full(let g) => { print("took"); }
+                Holder::Empty => {}
+            }
+            holder.clear();
+        }
+        "#,
+        "after it was moved",
+    );
+}
+
+#[test]
+fn a_moved_out_binding_is_not_overwrite_dropped() {
+    // The owned twin of the pin above, and the reason the owned arm keeps its
+    // flow-sensitive `owned` set: the match consumed the payload (B62 destroys
+    // it at the leg's end), so the assignment that follows overwrites a binding
+    // that owns nothing and must NOT drop. "dropped held" appears once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard { label: str }
+        impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
+        enum Holder { Full(Guard), Empty }
+        fun main() {
+            mut holder = Holder::Full(Guard { label = "held" });
+            match holder {
+                Holder::Full(let g) => { print("took"); }
+                Holder::Empty => {}
+            }
+            print("before");
+            holder = Holder::Empty;
+            print("after");
+        }
+        "#,
+        "took\ndropped held\nbefore\nafter\n",
+    );
+}
+
+#[test]
+fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
+    // The same confusion in the other direction, found while proving B94 and
+    // fixed by the same sentence: a loan owns nothing, so it destroys nothing
+    // at its scope end either. References are TRANSPARENT — `&mut Holder` has
+    // type `Holder` — so `let v = &mut holder` minted a resource-TYPED local
+    // that the drop planner enrolled as an owner, and the emitted program
+    // destroyed the borrowed value twice ("dropped held" printed twice, on the
+    // struct pointee as well as the enum one).
+    let program = |declaration: &str, borrow: &str| {
+        format!(
+            r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Full(Guard), Empty }}
+        fun main() {{
+            {declaration}
+            let v = {borrow};
+            print("hi");
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(
+        &program(
+            r#"mut holder = Holder::Full(Guard { label = "held" });"#,
+            "&mut holder",
+        ),
+        "hi\ndropped held\n",
+    );
+    assert_compiles_and_runs(
+        &program(r#"mut guard = Guard { label = "held" };"#, "&mut guard"),
+        "hi\ndropped held\n",
+    );
+    // The read-only loan too — `&` was never writable, but it was just as
+    // wrongly enrolled as an owner.
+    assert_compiles_and_runs(
+        &program(r#"mut guard = Guard { label = "held" };"#, "&guard"),
+        "hi\ndropped held\n",
+    );
+}
+
+#[test]
+fn a_view_write_to_a_data_pointee_emits_no_drop() {
+    // The negative half, in bytes: the rule fires on the pointee's RESOURCE-ness,
+    // not on the fact that a write goes through a view. A data pointee's write
+    // is the bare `__replace` it always was, which is what keeps every
+    // resource-free corpus program byte-identical.
+    assert_emits_containing(
+        r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder { fun clear(&mut self) { self = Holder { n = 0 }; } }
+        fun main() {
+            mut holder = Holder { n = 7 };
+            holder.clear();
+            print(holder.n);
+        }
+        "#,
+        "function clear(self) {\n\t__replace(self, [ 0 ]);\n}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B99 (R2's COMPONENT half). B94 closed the loan half and filed this one: R2 is
+// spelled over a BINDING and R5 over reading and moving a field, so writing
+// over one fell between them and the outgoing value was leaked outright. The
+// rule now reads over the PLACE all the way down — a write over a component
+// whose type is a resource drops what it replaces, owned place and view alike,
+// with no liveness question (R5 makes a resource field loan-only, so a
+// component place always holds a live value). See proposal/destruction.md R2
+// and capture-clones.md §10.
+// ---------------------------------------------------------------------------
+
+/// The B99 pin family's shared preamble: a `Drop`-printing resource, an enum
+/// that holds one, and a struct that holds the enum.
+fn b99_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        enum Holder {{ Full(Guard), Empty }}
+        struct Slot {{ held: Holder }}
+        {body}
+        "#
+    )
+}
+
+/// [`b99_program`] compiled, for the pins whose claim is about emitted BYTES.
+fn b99_js(body: &str) -> String {
+    match compile(&b99_program(body)) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+}
+
+#[test]
+fn a_component_write_to_a_resource_field_drops_the_old_value() {
+    // The filed repro (B94's bycatch), now closed. R2 was implemented over the
+    // BINDING — only a whole-binding target enrolled — so `slot.held = ..`
+    // overwrote a live resource that no rule covered and printed
+    // "before\nafter", leaking the guard. Whether the write is legal at all is
+    // R5's question and R5 permits it (it makes a field loan-only and rejects
+    // moving one OUT; it says nothing about writing over one), which is exactly
+    // why R2 owes the drop.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            slot.held = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_nested_component_write_drops_the_old_value() {
+    // The projection is asked of the PLACE, not of its depth: `o.inner.held`
+    // names the storage the write clobbers exactly as `slot.held` does.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        struct Outer { inner: Slot }
+        fun main() {
+            mut o = Outer { inner = Slot { held = Holder::Full(Guard { label = "held" }) } };
+            print("before");
+            o.inner.held = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_through_a_view_drops_the_old_value() {
+    // B94's arm composes, and this is the doctrine's own test: the two
+    // spellings are the same expression shape and differ only in what the root
+    // binding is, so the answer must not depend on the root. The predicate is
+    // the component's type, and it never asks.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun clear(s: &mut Slot) { s.held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            clear(&mut slot);
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_tuple_component_write_drops_the_old_value() {
+    // The same rule at the other positional spelling.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut pair = (1, Holder::Full(Guard { label = "held" }));
+            print("before");
+            pair.1 = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn an_element_write_drops_the_old_value() {
+    // The `Index` spelling — a fixed array of resources, which is the only
+    // indexable resource aggregate (R10 rejects the native containers). The
+    // trailing "dropped two"/"dropped three" are the scope-end teardown, in
+    // reverse element order.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut arr: [Guard; 2] = [Guard { label = "one" }, Guard { label = "two" }];
+            print("before");
+            arr[0] = Guard { label = "three" };
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped one\nafter\ndropped two\ndropped three\n",
+    );
+}
+
+#[test]
+fn a_component_write_inside_a_match_arm_drops_the_old_value() {
+    // The write is planned by `plan_expr`, which descends every arm, so a
+    // conditional write is covered without a liveness question — the component
+    // place is live on every path that reaches it.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            let n = 1;
+            print("before");
+            match n { 1 => { slot.held = Holder::Empty; } _ => {} }
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_to_a_data_field_emits_no_drop() {
+    // The negative half, in bytes: the rule fires on the COMPONENT's
+    // resource-ness, not on the fact that its aggregate holds a resource
+    // somewhere. `count` is an `i32` in a struct that also holds a `Holder`, and
+    // its write is the bare slot assignment it always was — which is what keeps
+    // every resource-free corpus program byte-identical.
+    assert_emits_containing(
+        &b99_program(
+            r#"
+        struct Pair { held: Holder, count: i32 }
+        fun main() {
+            mut pair = Pair { held = Holder::Full(Guard { label = "held" }), count = 1 };
+            pair.count = 5;
+            print(pair.count);
+        }
+        "#,
+        ),
+        "pair[1] = 5;",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_write_clobbers_the_slot() {
+    // The ordering is load-bearing rather than cosmetic, for the same reason
+    // B94 pinned it on the view path: the drop's operand IS the slot the write
+    // replaces, so a drop emitted afterwards would destroy the NEW value.
+    // Pinned in bytes, since a runtime pin cannot tell "dropped the old one"
+    // from "dropped a same-shaped new one".
+    let js = b99_js(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            slot.held = Holder::Full(Guard { label = "two" });
+        }
+        "#,
+    );
+    let drop_index = js.find("(slot[0]);").expect("the overwrite drop");
+    let write_index = js.find("slot[0] = [ 0,").expect("the component write");
+    assert!(
+        drop_index < write_index,
+        "the drop must precede the write that clobbers the slot it reads:\n{js}"
+    );
+}
+
+#[test]
+fn a_component_write_drops_in_the_owned_twins_order() {
+    // The whole-binding twin of the same program, so the two spellings can be
+    // compared: both destroy the outgoing value BEFORE the incoming one is
+    // installed, and neither destroys the incoming one until its scope ends.
+    let component = &b99_program(
+        r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "one" }) };
+            print("before");
+            slot.held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    let binding = &b99_program(
+        r#"
+        fun main() {
+            mut held = Holder::Full(Guard { label = "one" });
+            print("before");
+            held = Holder::Full(Guard { label = "two" });
+            print("after");
+        }
+        "#,
+    );
+    assert_compiles_and_runs(component, "before\ndropped one\nafter\ndropped two\n");
+    assert_compiles_and_runs(binding, "before\ndropped one\nafter\ndropped two\n");
+}
+
+#[test]
+fn a_write_through_a_view_of_a_component_still_drops() {
+    // The neighbour that was ALREADY right, pinned so the new arm cannot move
+    // it: `&mut slot.held` mints a view whose own write is B94's loan arm, and
+    // it takes the `__replace` path (a whole-value write through a view) rather
+    // than this one. The two spellings agree, which is the point.
+    assert_compiles_and_runs(
+        &b99_program(
+            r#"
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            print("before");
+            let v = &mut slot.held;
+            v = Holder::Empty;
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped held\nafter\n",
+    );
+}
+
+#[test]
+fn a_component_write_drops_before_the_truncating_replace_on_the_view_path() {
+    // B89's interaction, unchanged by B99 and pinned here because the component
+    // arm shares the emission site: a write THROUGH a view still lowers to
+    // `__replace`, which sets `target.length = value.length` before merging, so
+    // a drop emitted after it would destroy slots that no longer exist. A
+    // component write is a plain slot assignment and never truncates — the
+    // ordering is owed for the simpler reason above — so both orders are pinned
+    // from the one emission.
+    let js = b99_js(
+        r#"
+        fun refill(held: &mut Holder) { held = Holder::Empty; }
+        fun main() {
+            mut slot = Slot { held = Holder::Full(Guard { label = "held" }) };
+            refill(&mut slot.held);
+        }
+        "#,
+    );
+    let drop_index = js.find("(held);").expect("the overwrite drop");
+    let replace_index = js.find("__replace(held,").expect("the truncating write");
+    assert!(
+        drop_index < replace_index,
+        "the drop must precede `__replace`'s truncation (B89):\n{js}"
+    );
+}
+
+#[test]
+fn a_resource_free_component_write_plans_no_drop_pass_at_all() {
+    // The early return that keeps resource-free programs byte-identical: a
+    // program with no declared resource has no resource type, so the component
+    // arm collects nothing and no `try`/`finally` appears.
+    let js = match compile(
+        r#"
+        import std::print;
+        struct Slot { held: i32 }
+        fun main() {
+            mut slot = Slot { held = 1 };
+            slot.held = 2;
+            print(slot.held);
+        }
+        "#,
+    ) {
+        Ok(js) => js,
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    };
+    assert!(
+        !js.contains("finally"),
+        "a resource-free program takes no teardown:\n{js}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B88 (the same seam through an OWNED place). B81 closed the alias path's late
+// read for a writable-view subject and stopped there, because an owned place
+// looked safe: assigning it REBINDS it, installing a fresh value and leaving
+// the subject temp holding the old one. That is true of exactly one write
+// form. A COMPONENT write — `t.1 = 9`, `h.pair.1 = 9`, `xs[0] = 9` — mutates
+// the very object the temp aliases, and so does a `&mut` taken of the place
+// and a `&mut self` method called on it. Captures of a subject some in-place
+// write can reach are now read once, at the match, exactly as a viewed
+// subject's are. See proposal/capture-clones.md §7.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_is_capture_from_a_component_written_place_reads_the_prematch_value() {
+    // B88's filed repro. `b` is an `i32`, so it owes no copy and kept its
+    // accessor `$a[1]`; `t.1 = 99` lowers to `t[1] = 99`, and `$a` IS `t`'s
+    // array, so the deferred read returned the write. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let a, let b) {
+                t.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_place_capture_read_before_and_after_a_component_write_agrees() {
+    // Both orders in one leg, the shape that makes the bug undeniable: a read
+    // BEFORE the write was always right (the accessor had nothing to observe
+    // yet), so the two reads of one binding DISAGREED — 3 then 99. The
+    // binding is one value, so 6, not 102.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let a, let b) {
+                let before = b;
+                t.1 = 99;
+                print(before + b);
+            }
+        }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn a_component_write_through_a_field_path_does_not_reach_a_capture() {
+    // The field arm. A struct field is not patternable, so a field write
+    // reaches this seam through the subject's PATH rather than the capture's:
+    // the subject is `h.pair`, a `Field` place, and `h.pair.1 = 99` writes
+    // into the very array that place names. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32), tag: i32 }
+        fun main() {
+            mut h = Holder { pair = (7, 3), tag = 0 };
+            if h.pair is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_disjoint_field_write_leaves_a_sibling_subject_correct() {
+    // The other side of the field arm, and the honest record of how coarse
+    // the predicate is: the write lands in a DIFFERENT field of the same root,
+    // so it could never have reached this subject and the program was already
+    // right. Root granularity materializes it anyway — a write that reaches
+    // the storage under a second name got that name from a `&mut` of the
+    // ROOT, so the root is the granularity the question can be asked at
+    // soundly. Pinned because the answer must not change either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32), tag: i32 }
+        fun main() {
+            mut h = Holder { pair = (7, 3), tag = 5 };
+            if h.pair is (let a, let b) {
+                h.tag = 1;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_index_write_does_not_reach_a_fixed_array_capture() {
+    // The index arm, at the fixed-array binder — `marr[1] = 99` lowers to
+    // `__at_put(marr, 1, 99)`, an in-place element store into the array the
+    // subject temp aliases. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut marr: [i32; 2] = [7, 3];
+            if marr is let [g, k] {
+                marr[1] = 99;
+                print(k);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_index_write_does_not_reach_a_capture_of_an_indexed_subject() {
+    // The index arm at the SUBJECT instead: `rows[0]` is an `Index` place, and
+    // `rows[0].1 = 99` writes the element it names. `place_root` walks the
+    // subscript, so both sides root at `rows`. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut rows = [(7, 3)];
+            if rows[0] is (let a, let b) {
+                rows[0].1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_nested_component_write_does_not_reach_a_nested_capture() {
+    // Depth on both sides at once: the capture sits inside a nested tuple
+    // pattern and the write reaches it through two components (`n.0.1`).
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut n = ((7, 3), 5);
+            if n is ((let i, let j), let k) {
+                n.0.1 = 99;
+                print(j);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_mut_self_method_call_does_not_reach_a_capture_of_its_receiver() {
+    // The write need not be spelled in the arm at all. `bump` takes `&mut
+    // self` and writes a component through it, so the CALL is the in-place
+    // write and the receiver's root joins the write set — the same arm of
+    // `collect_written_roots` the `own`-parameter capture pins above use.
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Counter { pair: (i32, i32) }
+        impl Counter {
+            fun bump(&mut self) { self.pair.1 = 99 }
+        }
+        fun main() {
+            mut counter = Counter { pair = (7, 3) };
+            if counter.pair is (let p, let q) {
+                counter.bump();
+                print(q);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_write_through_a_mut_view_of_the_subject_does_not_reach_its_captures() {
+    // Why the question is asked at the ROOT and not by walking the arm: the
+    // view is minted OUTSIDE the arm and written INSIDE it, so the write's own
+    // place root is `vv`, not `vt`, and an arm-local write-set walk would see
+    // nothing to report. Taking the `&mut` is itself a recorded write of
+    // `vt`, which is what makes the root question sound. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut vt = (7, 3);
+            let vv = &mut vt;
+            if vt is (let a, let b) {
+                vv.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_capture_from_a_component_written_place_reads_the_prematch_value() {
+    // A guard puts the leg on the alias path too, and its captures carry the
+    // same hole. It is also the ordering-sensitive one (B59): the guard is
+    // walked after `materialize_captures` has re-pointed the alias table, so a
+    // guard that reads a materialized capture takes the prelude shape or names
+    // a binding that has not been declared. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut gl = (7, 3);
+            match gl {
+                (let q, let r) if r > 0 => {
+                    gl.1 = 99;
+                    print(r);
+                }
+                _ => {}
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_leg_on_a_component_written_place_was_already_right() {
+    // The negative half of the diagnosis, the same one B81 pinned through a
+    // view: an unguarded leg compiles through `compile_pattern`, which
+    // declares every capture as a real `const` at leg entry, so it never read
+    // late and never had the bug. Pinned so the fix cannot move it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut ml = (7, 3);
+            match ml {
+                (let s, let v) => {
+                    ml.1 = 99;
+                    print(v);
+                }
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_destructure_from_a_component_written_place_was_already_right() {
+    // The declared path's other spelling, for the same reason: `let (a, b) =
+    // t` reads both slots eagerly, so a later component write has nothing to
+    // reach back into.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut d = (7, 3);
+            let (d1, d2) = d;
+            d.1 = 99;
+            print(d2);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn both_capture_shapes_survive_a_component_write_to_the_place() {
+    // The place twin of `both_capture_shapes_survive_an_in_place_write_
+    // through_the_view`, which is what makes "the two paths are
+    // indistinguishable per shape" a checked claim: the same two payload
+    // shapes, the same two component writes, an owned `mut` local instead of a
+    // `&mut` parameter, and the same answers. `items` is B53's business (an
+    // aggregate capture COPIES, so growing the source to 4 leaves it at 3);
+    // `at` is B88's (a scalar owes no copy, so it kept an accessor and read
+    // the 9). One pin, red either way: 12 without the materialization, 4
+    // without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun main() {
+            mut pair = (["a", "b", "c"], 0);
+            if pair is (let items, let at) {
+                pair.0.push("d");
+                pair.1 = 9;
+                print(items.len() + at);
+            }
+            print(pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_component_written_place_loans_the_prematch_payload() {
+    // R1/R11 and B65's doctrine at the third subject form. A resource payload
+    // has no copy to make — "there is no user-facing copy spelling in vilan to
+    // name" (affine-moves.md §9.1) — so the capture is materialized WITHOUT
+    // `__clone`: `const c = $a[0]`, which fixes WHICH value is loaned without
+    // minting a second owner to destroy twice. Exactly what the viewed twin
+    // does, and what the whole-assignment place twin already did. 1, not 6.
+    let source = r#"
+        import std::print;
+        resource struct Conn { id: i32 }
+        fun main() {
+            mut slot = (Conn { id = 1 }, 0);
+            if slot is (let c, let at) {
+                slot.1 = 5;
+                print(c.id + at);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the resource capture was materialized WITH a copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n");
+}
+
+#[test]
+fn a_whole_assignment_to_the_subject_still_leaves_its_captures_aliasing() {
+    // The line the rule stops at, and the reason it is not simply "every place
+    // subject materializes". Assigning the whole binding REBINDS it — `t = [
+    // 1, 2 ]` installs a fresh array and the subject temp keeps the old one —
+    // so the accessor is a faithful snapshot and there is nothing to fix. The
+    // capture must therefore stay an accessor: naming it in the output would
+    // mean the predicate had widened to every place subject, which is what
+    // moves six corpus goldens and takes back B53's share elision on the alias
+    // path.
+    let source = r#"
+        import std::print;
+        fun main() {
+            mut t = (7, 3);
+            if t is (let first, let kept) {
+                t = (1, 2);
+                print(kept);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("kept"),
+            "a rebinding assignment materialized the capture anyway:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+// ---------------------------------------------------------------------------
+// B97 (the THIRD subject spelling: a `borrows` CALL). A method returning a
+// `&mut` projection hands the pattern a subject that aliases the receiver's
+// storage, but the expression is a CALL — and `is_capture_subject_place`
+// admitted places and `*view` only, so the subject collected no candidates at
+// all and BOTH rules were missing at once: B53's copy and B81/B88's
+// materialization. Measured before shipping (proposal/capture-clones.md §9),
+// and the doctrine per payload shape is twinned below onto this path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_borrows_call_subject_reads_the_prematch_value() {
+    // The VALUE half of the doctrine (§7.5): a scalar owes no copy, so the
+    // declaration alone fixes the timing. Before B97 this subject collected no
+    // candidates whatever — `const $a = slot(h); … $a[1]` — so the capture
+    // re-read the mutated slot and printed 99, the same shape §6.4 found for
+    // `*view`, one spelling over.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if h.slot() is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_subject_copies_its_captures() {
+    // The AGGREGATE half (§7.5), and the worse of the two because it is B53's
+    // ORIGINAL bug rather than a timing one: the capture aliased the
+    // receiver's element outright (no `__clone` anywhere in the output), so
+    // growing the source through the receiver grew the capture. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            if g.slot() is (let xs, let n) {
+                g.cells.0.push(9);
+                print(xs.len());
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload() {
+    // The RESOURCE half of the doctrine (§7.5), twinned onto the third path.
+    // R1 forbids the copy and B65 forbids inventing one ("there is no
+    // user-facing copy spelling in vilan to name", affine-moves.md §9.1), so
+    // the capture is materialized BARE — `const c = $a[0]`, no `__clone` — which
+    // fixes WHICH value is loaned without minting a second owner to destroy
+    // twice. Both halves asserted: the value (1, not 6) and the absent copy.
+    let source = r#"
+        import std::print;
+        resource struct Conn { id: i32 }
+        struct Holder { slot: (Conn, i32) }
+        impl Holder {
+            fun view(&mut self): &mut (Conn, i32) borrows self { &mut self.slot }
+        }
+        fun main() {
+            mut holder = Holder { slot = (Conn { id = 1 }, 0) };
+            if holder.view() is (let c, let at) {
+                holder.slot.1 = 5;
+                print(c.id + at);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "the resource capture was materialized WITH a copy:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "1\n");
+}
+
+#[test]
+fn both_capture_shapes_survive_a_write_through_a_borrows_call_subject() {
+    // The two-shape twin of `both_capture_shapes_survive_a_component_write_to_
+    // the_place` and its viewed sibling — what makes "the three paths are
+    // indistinguishable per shape" a checked claim rather than a story. Same
+    // two payload shapes, same two writes, a `borrows`-call subject instead of
+    // a place or a `&mut` parameter, same answers. Red on either axis: 12
+    // without the materialization, 4 without the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (List<str>, i32) }
+        impl Holder {
+            fun view(&mut self): &mut (List<str>, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut holder = Holder { pair = (["a", "b", "c"], 0) };
+            if holder.view() is (let items, let at) {
+                holder.pair.0.push("d");
+                holder.pair.1 = 9;
+                print(items.len() + at);
+            }
+            print(holder.pair.0.len());
+        }
+        "#,
+        "3\n4\n",
+    );
+}
+
+#[test]
+fn a_readonly_borrows_call_subject_materializes_when_a_write_reaches_the_receiver() {
+    // Why the rule is not simply `returns_mut_view`, measured (§9): a `&`
+    // projection cannot be written THROUGH, but the receiver it projects can
+    // still be written under its own name while the leg is live, and the temp
+    // aliases the receiver's storage either way. B81's writable-view arm does
+    // not cover this, so the second arm asks B88's root question — of the
+    // arguments the callee projects, which is where the receiver is visible.
+    // Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if h.peek() is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_free_function_borrows_call_subject_reads_the_prematch_value() {
+    // The receiver is not special — `borrows` names a parameter POSITION, and
+    // the projection is read at the call site from whatever argument sits
+    // there. A rule keyed on "the subject is a method call on a place" would
+    // miss this. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun slot(h: &mut Holder): &mut (i32, i32) borrows h { &mut h.pair }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            if slot(&mut h) is (let a, let b) {
+                h.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_guarded_leg_over_a_borrows_call_subject_reads_the_prematch_value() {
+    // B59's placement question on the third path: a guard that reads a
+    // materialized capture takes the prelude shape, and the leg still sees the
+    // pre-write value. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            print(match h.slot() {
+                (let a, let b) if b > 0 => {
+                    h.pair.1 = 99;
+                    b
+                }
+                _ => 0,
+            });
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_unguarded_match_over_a_borrows_call_subject_copies_its_aggregate_capture() {
+    // The unguarded leg never had the TIMING bug — `compile_pattern` declares
+    // every capture as a real `const` at leg entry — but it had the COPY one,
+    // because the copy question is settled by the candidate set both paths
+    // share. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            match g.slot() {
+                (let xs, let n) => {
+                    g.cells.0.push(9);
+                    print(xs.len());
+                }
+            }
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_let_destructure_of_a_borrows_call_copies_its_aggregate_capture() {
+    // §6.4's other half at this spelling: the capture pass gates
+    // `Expr::Destructure` on the same predicate, so `let (xs, n) = h.slot()`
+    // never copied either and growing the element through the receiver grew
+    // the capture. Printed 3.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            let (xs, n) = g.slot();
+            g.cells.0.push(9);
+            print(xs.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_chained_borrows_projection_subject_reads_the_prematch_value() {
+    // Why the writable-view arm is kept alongside the root question, measured
+    // rather than argued (§9). A CHAINED projection's receiver is another
+    // call, and a call has no place root — so the root arm finds nothing to
+    // ask about and the subject would keep its accessor. B81's arm needs no
+    // write to be found: a `&mut` projection is a writable view by
+    // construction, whatever it was projected from. Printed 99 without it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Outer { inner: Inner }
+        impl Outer {
+            fun inner_mut(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Inner {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut o = Outer { inner = Inner { pair = (7, 3) } };
+            if o.inner_mut().slot() is (let a, let b) {
+                o.inner.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_readonly_projection_of_a_writable_one_reads_the_prematch_value() {
+    // The same arm read ONE LEVEL UP, and the shape that shows the two halves
+    // are not the same question. `peek()` returns `&`, so the outer call is
+    // not itself a writable view; its receiver is `inner_mut()`, which is —
+    // and the storage the temp aliases is therefore writable after all. The
+    // root arm cannot reach it (the receiver is a call, so it has no root),
+    // and the outer call's own convention says the wrong thing. Printed 99
+    // without the recursion into the projected receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Outer { inner: Inner }
+        impl Outer {
+            fun inner_mut(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Inner {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut o = Outer { inner = Inner { pair = (7, 3) } };
+            if o.inner_mut().peek() is (let a, let b) {
+                o.inner.pair.1 = 99;
+                print(b);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_wrapped_view_capture_over_a_borrows_call_is_not_copied() {
+    // The line the widening had to stop at, and the one the measurement found
+    // (§9): admitting `borrows` calls newly reaches `Option<&mut T>` returns,
+    // whose `Some(let v)` capture IS a view. References are transparent, so
+    // `&mut List<i32>` is an aggregate by every type test in the pass and the
+    // first candidate copied it — which deep-copies the borrowed storage, so
+    // `v[0] = 77` landed on the copy and the caller's list never changed
+    // (`option-view.vl`, 77 -> 1, a semantic break rather than a cost).
+    // A view aliases on purpose: it never copies.
+    let source = r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun inner_mut(&mut self): Option<&mut Inner> { Some(&mut self.inner) }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 1 } };
+            match h.inner_mut() {
+                Some(let v) => { v.n = 77; }
+                None => {}
+            }
+            print(h.inner.n);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a view capture was copied, which breaks the alias:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "77\n");
+}
+
+#[test]
+fn an_owned_call_subject_still_binds_without_copying() {
+    // The elision the widening must not take back, in bytes: a call returning
+    // an OWNED value produces storage of its own, so its elements have no
+    // second owner and B53 §2's "destructuring a FRESH value binds without
+    // copying" stands. `call_returns_view` is what separates the two, not
+    // "the subject is a call".
+    let source = r#"
+        import std::print;
+        fun make(): (List<i32>, i32) { ([1, 2], 3) }
+        fun main() {
+            if make() is (let xs, let n) {
+                print(xs.len() + n);
+            }
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an owned call result's capture was copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "5\n");
+}
+
+#[test]
+fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
+    // The neighbour that was already right and must stay right: nothing writes
+    // the receiver while the leg is live, so the aggregate capture's copy is
+    // the only thing owed and the answer never depended on the timing.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { cells: (List<i32>, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (List<i32>, i32) borrows self { &mut self.cells }
+        }
+        fun main() {
+            mut g = Holder { cells = ([1, 2], 3) };
+            if g.slot() is (let xs, let n) {
+                print(xs.len() + n);
+            }
+        }
+        "#,
+        "5\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B54 / A20 (rule 1 at the STORE seams). A place read into a slot of an
 // aggregate that outlives the expression must copy: a construction literal's
 // element/field/payload (B54), and the argument of a container method that
 // keeps it (A20, via `own`). See proposal/element-clones.md.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// B100 (the return rule's loan hole). §3 of element-clones.md exempted a
+// `&`/`&mut` parameter from the return copy, framed as "returning through one
+// is rule 3's `borrows` projection, deliberately an alias". That is a fact
+// about the RETURN, not about the place: a function whose signature hands back
+// a VALUE hands back a value, whatever convention the place it read is under.
+// R3's own list calls bare, `&` and `&mut` all loans, and the bare half already
+// copied — the asymmetry was the bug. See proposal/element-clones.md §9.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_returned_field_place_copies_out_of_its_receiver() {
+    // The filed repro (B97's bycatch), now closed. `fun make(&self): (i32, i32)
+    // { self.pair }` emitted `return self[0]`, so the caller's result WAS the
+    // receiver's field storage and a later write to the receiver showed through
+    // it. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_place_copies_out_of_a_mut_receiver() {
+    // `&mut self` is the same loan with a different writability, and the return
+    // seam never asked about writability — the caller's storage outlives the
+    // call either way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&mut self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_field_of_a_view_parameter_copies() {
+    // The free-function spelling: nothing about this is special to a receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun make(h: &Holder): (i32, i32) { h.pair }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = make(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_view_receiver_forwarded_whole_into_a_by_value_return_copies() {
+    // The shape that decides how the exemption is spelled. Asking whether the
+    // returned PLACE is a view answers the wrong question here — references are
+    // transparent, so `self` inside `&self` is a view by every test — while the
+    // signature says plainly that what leaves is a `Holder`, by value. The
+    // exemption reads the signature.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let c = h.copy();
+            h.pair.1 = 99;
+            print(c.pair.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_nested_field_of_a_receiver_copies() {
+    // The copy lands at the LEAF, so the depth of the projection is irrelevant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { pair: (i32, i32) }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun make(&self): (i32, i32) { self.inner.pair }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { pair = (7, 3) } };
+            let p = h.make();
+            h.inner.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_list_field_of_a_receiver_copies() {
+    // The A20 shape one seam over: the result's ELEMENTS were the receiver's,
+    // so growing the result grew the receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { items: List<i32> }
+        impl Holder {
+            fun items_of(&self): List<i32> { self.items }
+        }
+        fun main() {
+            mut h = Holder { items = [1, 2] };
+            mut xs = h.items_of();
+            xs.push(9);
+            print(h.items.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn a_returned_field_copies_in_the_tail_arm_that_owes_it() {
+    // Keyed by the tail LEAF, so an `if`/`match` tail copies only in the arms
+    // that hand back the receiver's storage — the constructed arm stays free.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun pick(&self, first: bool): (i32, i32) {
+                if first { self.pair } else { (0, 0) }
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.pick(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn an_early_ret_of_a_receivers_field_copies() {
+    // The `ret` statement is a return seam like the tail is; both feed
+    // `return_sites`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(&self, early: bool): (i32, i32) {
+                if early { ret self.pair }
+                (0, 0)
+            }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make(true);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_projection_still_returns_the_alias() {
+    // The elision the rule must not eat, and the reason the exemption exists at
+    // all: a signature that returns `&mut T` hands back an alias on purpose
+    // (rule 3's sanctioned escape), so writing through the result reaches the
+    // receiver.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun slot(&mut self): &mut (i32, i32) borrows self { &mut self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            h.slot() = (1, 2);
+            print(h.pair.0);
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn a_readonly_borrows_projection_still_returns_the_alias() {
+    // The `&` half of the same exemption — a read-only projection is still a
+    // projection, and its result must keep naming the receiver's storage.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun peek(&self): &(i32, i32) borrows self { &self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let v = h.peek();
+            h.pair.1 = 99;
+            print((*v).1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_view_parameter_forwarded_into_a_view_return_still_aliases() {
+    // The exemption's own shape, and the twin of the by-value case above: the
+    // SAME body — a view parameter handed straight back — is an alias here and
+    // a copy there, and only the signature separates them. This is what the
+    // `returns_view` question is for; nothing else in the pass distinguishes
+    // the two, because a `&mut place` leaf is not a place at all and never
+    // reaches the seam.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same(v: &mut Holder): &mut Holder borrows v { v }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = same(&mut h);
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_receiver_forwarded_into_a_view_return_still_aliases() {
+    // The method spelling of the same exemption, which is `copy(&self):
+    // Holder { self }` with one word changed in the return type.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let w = h.me();
+            w.pair.1 = 99;
+            print(h.pair.1);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_bare_self_receivers_field_return_was_already_right() {
+    // The neighbour that names the asymmetry: R3 calls bare `self`, `&self` and
+    // `&mut self` all loans, and the bare one already copied. Pinned so the two
+    // stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun make(self): (i32, i32) { self.pair }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = h.make();
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_returned_own_parameter_still_moves_out_of_a_view_receivers_neighbour() {
+    // The `own` elision, unchanged: the caller already gave the value up, so the
+    // fluent-builder shape stays free. Proven by the ABSENT `__clone`, since
+    // behaviour cannot see the difference.
+    let source = r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun through(own h: Holder): Holder { h }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            let c = through(h);
+            print(c.pair.1);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an `own` parameter's return copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn a_returned_scalar_field_of_a_receiver_needs_no_copy() {
+    // The type filter is unchanged: a scalar read IS the copy, so no `__clone`
+    // is owed and none is emitted.
+    let source = r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder {
+            fun get(&self): i32 { self.n }
+        }
+        fun main() {
+            mut h = Holder { n = 7 };
+            let v = h.get();
+            h.n = 99;
+            print(v);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(!js.contains("__clone"), "a scalar return copied:\n{js}"),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "7\n");
+}
+
+#[test]
+fn a_closure_returning_its_own_view_parameters_field_copies() {
+    // The closure path, already right before the fix (an unannotated closure
+    // parameter is bare) and pinned so the seam's two spellings stay one rule.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun apply(h: &Holder, f: |&Holder| (i32, i32)): (i32, i32) { f(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = apply(&h, |g| g.pair);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
 
 #[test]
 fn a_list_literal_element_copies_its_source_place() {
@@ -7359,11 +9420,15 @@ fn qualified_generic_static_resolves_inner_trait_statics() {
     // emit the inner `T::rebuild` as an EMPTY function — the accessor resolution
     // discarded the subject's type args entirely. A qualified subject now seeds
     // the matched impl's binder bindings into ITS call's substitution.
+    //
+    // `build` returns `Self`, not `Build`: it is the `wire.vl` shape, and this
+    // program was written in the same stand-in style std was, before B4 §11
+    // gave those declarations their real spelling.
     assert_compiles_and_runs(
         r#"
         import std::print;
         trait Build {
-            fun build(seed: i32): Build;
+            fun build(seed: i32): Self;
         }
         impl i32 with Build {
             fun build(seed: i32): i32 { seed + 1 }
@@ -8134,8 +10199,14 @@ fn ret_participates_in_closure_return_inference() {
 }
 
 // A trait-typed `self` returns through a trait-typed signature (the
-// `impl Iterator<type T> with Iterable<T> { fun iter(self): Iterator<T> { self } }`
+// `impl Iterator<type T> with Iterable<T> { fun iter(self): Self { self } }`
 // shape) — pins the `(Trait, Trait)` reconcile arm the return check surfaced.
+//
+// Spelled `Self`, as std's own `Iterable` is since B4's §11 migration: the
+// declarations always meant "this type", and the trait's name in a return was
+// only ever a stand-in for it. The arm stays load-bearing — the impl's subject
+// IS a trait, so `self` and the declared return are both `Type::Trait` — which
+// is why §11 keeps it priced rather than retiring it with the spelling.
 #[test]
 fn a_trait_typed_self_returns_through_a_trait_typed_signature() {
     assert_compiles(
@@ -8147,11 +10218,11 @@ fn a_trait_typed_self_returns_through_a_trait_typed_signature() {
         }
 
         trait AsWalk<T> {
-        	fun as_walk(self): Walk<T>;
+        	fun as_walk(self): Self;
         }
 
         impl Walk<type T> with AsWalk<T> {
-        	fun as_walk(self): Walk<T> {
+        	fun as_walk(self): Self {
         		self
         	}
         }
@@ -22885,6 +24956,387 @@ fn creating_an_async_closure_in_an_initializer_stays_legal() {
     );
 }
 
+// --- B86: the rule is AWAIT-shaped, not call-shaped ---------------------------
+//
+// The shipped check walked `initializer_calls_of`, so it only ever saw an
+// async CALL. An `await` whose operand is not a call — a `Task`-valued
+// binding, a spawn, a `Task` returned by a plain sync function — slipped
+// through, compiled clean, and emitted a genuine top-level `await` into the
+// bundle (`top-level-await.md` §1.3), which then miscompiled on the Node leg
+// (§1.4) and failed to parse at all under HMR (§1.5). These pin every row of
+// §5.2's boundary table, per case.
+
+/// `ready` + a module-level spawn, the shared preamble for the rows below.
+const AWAIT_SHAPED_PREAMBLE: &str = r#"
+        import std::print;
+        import std::task::Task;
+        import std::time::{ sleep_for, Duration };
+
+        fun ready(): i32 {
+            sleep_for(Duration::millis(1));
+            7
+        }
+"#;
+
+#[test]
+fn awaiting_a_task_valued_module_binding_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_valued_module_binding_steers_to_main() {
+    // The second message form: the operand is right there and already
+    // spawned, so the steer is to move the `await`, not to restructure.
+    assert_fails_noting(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = await pending;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "a module-level binding cannot suspend",
+        "await pending",
+        "hold `pending` here and `await` it in `main`",
+    );
+}
+
+#[test]
+fn awaiting_a_spawn_in_an_initializer_is_rejected() {
+    // The sharpest hole: `async ready()` is a CREATION, so the call to
+    // `ready` lives inside the spawned closure and never entered the
+    // initializer's direct call set.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async ready();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async ready()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_an_async_block_in_an_initializer_is_rejected() {
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let value: i32 = await async {{ 7 }};
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await async { 7 }",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_task_from_a_sync_function_is_rejected() {
+    // `spawn_it` is not async — it returns a `Task`. The call check sees a
+    // sync callee and passes; the await check is what refuses it.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        fun spawn_it(): Task<i32> {{
+            async ready()
+        }}
+
+        let value: i32 = await spawn_it();
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await spawn_it()",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_nested_in_an_initializer_expression_is_rejected() {
+    // Any `await` REACHABLE in the initializer's own expression tree — not
+    // just one at its root.
+    assert_fails_spanning(
+        &format!(
+            "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let value: i32 = (await pending) + 1;
+
+        fun main() {{
+            print(value);
+        }}
+        "
+        ),
+        "await pending",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn awaiting_a_non_task_in_an_initializer_is_rejected() {
+    // `await` on a plain value is legal JS and legal vilan inside a function;
+    // at module level it is still a suspension point, so it is still refused
+    // — and the steer stays true (it never claims the operand is a spawn).
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        let plain: i32 = 7;
+        let value: i32 = await plain;
+
+        fun main() {
+            print(value);
+        }
+        "#,
+        "await plain",
+        "a module-level binding cannot suspend",
+    );
+}
+
+#[test]
+fn an_await_inside_a_closure_created_by_an_initializer_stays_legal() {
+    // THE BOUNDARY, kept deliberately where the call-shaped check had it: a
+    // closure's body is not the initializer. Creating the closure suspends
+    // nothing at load, so the initializer does not await — only calling it
+    // does, and that happens wherever the caller is.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let later = || {{ await pending }};
+
+        async fun main() {{
+            print(await later());
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_await_inside_an_async_block_in_an_initializer_stays_legal() {
+    // Same boundary through the `async { .. }` spelling: the block lowers to
+    // a closure, which is its own unit.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+        let wrapped: Task<i32> = async {{ await pending }};
+
+        async fun main() {{
+            print(await wrapped);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn spawning_at_module_level_stays_legal() {
+    // The idiom the diagnostic steers to, and the reason the null
+    // recommendation holds: the work starts at load, only the observation
+    // moves into `main`.
+    assert_compiles(&format!(
+        "{AWAIT_SHAPED_PREAMBLE}
+        let pending: Task<i32> = async ready();
+
+        async fun main() {{
+            print(await pending);
+        }}
+        "
+    ));
+}
+
+#[test]
+fn an_explicit_await_on_an_async_call_keeps_the_call_message() {
+    // `await ready()` is BOTH an await and an async call. The call form names
+    // the callee, so it wins — and it must be the ONLY diagnostic, not a pair
+    // for one line.
+    // `warm` takes an argument so the call site's snippet (`warm(1)`) is
+    // distinct from its declaration — the span must land on the call.
+    let source = r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        fun warm(seed: i32): i32 {
+            sleep_for(Duration::millis(1));
+            seed
+        }
+
+        let value: i32 = await warm(1);
+
+        fun main() {
+            print(value);
+        }
+        "#;
+    assert_fails_spanning(source, "warm(1)", "calls `warm`, which is async");
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| {
+            message.contains("cannot await (module initialization is synchronous)")
+                || message.contains("cannot suspend")
+        })
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "one refusal per binding, not a pair for one line"
+    );
+}
+
+// --- J6: `main`'s promise gets a contract ------------------------------------
+//
+// An async `main` is emitted as a fire-and-forget IIFE, and its promise used to
+// be DISCARDED. What a failing `main` then did was the HOST's policy, not
+// vilan's: Node >= 15 rethrows an unhandled rejection and exits non-zero, but
+// it buries the program's error under `UnhandledPromiseRejection` and an
+// engine-internal stack, and a host configured otherwise exits 0. A sync `main`
+// that panics has always terminated with the message and a non-zero code, and
+// async `main` is what the language steers people to instead of top-level
+// await (`top-level-await.md` §4.4/§8.3) — so the two must agree.
+
+#[test]
+fn a_rejecting_async_main_exits_nonzero_with_the_error_surfaced() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("before");
+            panic("boom");
+            print("after");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a rejecting `main` must exit 1; stderr: {stderr}");
+    assert!(
+        stderr.contains("boom"),
+        "the program's own error must reach stderr: {stderr}"
+    );
+    // The point is not merely a non-zero code — Node already gave one. It is
+    // that the failure is OURS to report, so the host's unhandled-rejection
+    // wrapper is gone and what remains is the message.
+    assert!(
+        !stderr.contains("UnhandledPromiseRejection")
+            && !stderr.contains("ERR_UNHANDLED_REJECTION"),
+        "the error must be surfaced by the shim, not left to the host's \
+         unhandled-rejection path: {stderr}"
+    );
+    assert!(
+        stdout.contains("before") && !stdout.contains("after"),
+        "output before the failure must still flush, and nothing after it \
+         may run: {stdout:?}"
+    );
+}
+
+#[test]
+fn a_resolving_async_main_exits_zero() {
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ok");
+        }
+        "#,
+    );
+    assert_eq!(code, 0, "a resolving `main` must exit 0; stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn a_panicking_sync_main_is_unchanged() {
+    // The contract async `main` was brought level WITH; it must not move.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::{ print, panic };
+
+        fun main() {
+            print("before");
+            panic("boom");
+        }
+        "#,
+    );
+    assert_eq!(code, 1, "a panicking sync `main` still exits 1: {stderr}");
+    assert!(stderr.contains("boom"), "and still says why: {stderr}");
+    assert!(stdout.contains("before"));
+}
+
+#[test]
+fn an_async_main_that_keeps_working_is_not_cut_short() {
+    // THE SERVER-LEG CARVE, in the form a test can hold: the shim attaches a
+    // handler, it does not `await`. A `main` that suspends and resumes — the
+    // shape a listening server generalizes — runs to completion, and a `main`
+    // that never settles is likewise never hurried. Had the shim awaited the
+    // IIFE (or exited on settle), this would truncate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            print("start");
+            sleep_for(Duration::millis(30));
+            print("middle");
+            sleep_for(Duration::millis(30));
+            print("end");
+        }
+        "#,
+        "start\nmiddle\nend\n",
+    );
+}
+
+#[test]
+fn the_browser_leg_gets_no_exit_handler() {
+    // The browser has no exit code, and its own unhandled-rejection path
+    // already reports to the console — so there is nothing to attach, and
+    // `process` does not exist to reference.
+    let emitted = compile_browser(
+        r#"
+        import std::print;
+        import std::time::{ sleep_for, Duration };
+
+        async fun main() {
+            sleep_for(Duration::millis(1));
+            print("ui");
+        }
+        "#,
+    )
+    .expect("expected a clean browser compile");
+    assert!(
+        !emitted.contains("process.exit"),
+        "the browser bundle must not reference `process`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("})();"),
+        "the browser entry stays the bare fire-and-forget IIFE:\n{emitted}"
+    );
+}
+
 // --- The i53/u53 rename (numeric-types.md §8) --------------------------------
 //
 // The f64-backed wide integers are named for the precision they deliver
@@ -31146,7 +33598,6 @@ fn r11_indirect_generic_chain_is_rejected() {
 // internal moves escape. Un-ignore when the scan recurses through closure
 // nesting.
 #[test]
-#[ignore]
 fn r11_nested_closure_internal_double_move_is_rejected() {
     assert_fails_with(
         r#"
@@ -40910,6 +43361,290 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
     );
 }
 
+// --- B101: R2's overwrite through a place the generic body does not own ------
+// B94 and B99 made a write THROUGH a `&mut` and a write OVER a component
+// destroy what they replace. Both drops are per-type glue a generic body cannot
+// emit, so at a resource instantiation the body owes a destruction it cannot
+// run — and `check_own_generic_exactly_once` did not look: its `place_overwrites`
+// was deliberately empty, with the reason recorded in the code. It looks now,
+// at the per-instantiation DELTA place set, so a concrete resource written
+// inside a generic body stays chunk 3's report. See proposal/destruction.md R11.
+
+/// The B101 pin family's shared preamble.
+fn b101_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::{{ Drop, drop }};
+        import std::option::Option::{{ self, Some, None }};
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn b101_a_generic_write_through_a_mut_t_is_rejected() {
+    // The filed shape. `slot = value` inside `&mut T` is B94's write: it
+    // destroys the pointee's outgoing value, which at `T := Guard` is a `Guard`
+    // the shared body cannot destroy. Before this it compiled and printed
+    // "before\nafter\ndropped second" — "first" leaked outright.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `slot`'s previous value (R2)"),
+        "the note names the written place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("slot = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "slot = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_through_a_reborrow_is_rejected() {
+    // The same write under a second name. `binding_or_param_is_view` follows the
+    // copy chain, so a local bound to a `&mut` of the parameter is a loan too —
+    // which is what keeps the question at the place rather than at the
+    // parameter list.
+    let source = b101_program(
+        r#"
+        fun set<T>(slot: &mut T, own value: T) {
+            let inner = &mut slot;
+            inner = value;
+        }
+        fun main() {
+            mut g = Guard { label = "first" };
+            set(&mut g, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut g, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    let (note_msg, _, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy `inner`'s previous value (R2)"),
+        "the note names the re-borrow; got: {note_msg:?}"
+    );
+}
+
+#[test]
+fn b101_a_generic_write_over_a_component_is_rejected() {
+    // B99's arm inside a generic body: `holder.item = value` overwrites a
+    // `T`-typed component, so the same drop is owed and the same body cannot
+    // emit it. The note names the ROOT the component sits in, because the
+    // component itself names no value of its own.
+    let source = b101_program(
+        r#"
+        struct Wrap<type T> { item: T }
+        fun set<T>(holder: &mut Wrap<T>, own value: T) { holder.item = value; }
+        fun main() {
+            mut w = Wrap { item = Guard { label = "first" } };
+            set(&mut w, Guard { label = "second" });
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "set(&mut w, Guard { label = \"second\" })",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+    let rejections = r11_rejections(&source);
+    assert_eq!(rejections.len(), 1, "one rejection; got: {rejections:#?}");
+    let (note_msg, note_range, _) = rejections[0].2.as_ref().expect("a note into the body");
+    assert!(
+        note_msg.contains("would have to destroy the value it replaces inside `holder` (R2)"),
+        "the note names the root place and the rule; got: {note_msg:?}"
+    );
+    let assignment_at = source.find("holder.item = value").unwrap();
+    assert_eq!(
+        *note_range,
+        assignment_at..assignment_at + "holder.item = value".len(),
+        "the note spans the assignment"
+    );
+}
+
+#[test]
+fn b101_a_generic_overwrite_with_no_own_parameter_is_rejected() {
+    // The check used to return early unless the body took an `own T`, which was
+    // its original scope surviving as a guard. `clear` declares none and owes
+    // R2's drop anyway — before this it compiled and leaked the payload without
+    // printing anything.
+    let source = b101_program(
+        r#"
+        fun clear<T>(slot: &mut Option<T>) { slot = None; }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            clear(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "clear(&mut o)",
+        "a resource-typed value is overwritten while it still owns a payload",
+    );
+}
+
+#[test]
+fn b101_a_generic_scope_end_drop_with_no_own_parameter_is_rejected() {
+    // The same guard removal reaches B66's other half: `taken` is a
+    // delta-resource local still owning where its scope ends, in a body that
+    // takes no `own T` at all. One rule, asked wherever it applies.
+    let source = b101_program(
+        r#"
+        fun stash<T>(slot: &mut Option<T>) { let taken = slot.take(); }
+        fun main() {
+            mut o = Some(Guard { label = "first" });
+            stash(&mut o);
+        }
+        "#,
+    );
+    assert_fails_spanning(
+        &source,
+        "stash(&mut o)",
+        "a resource-typed value still owns its payload where its scope ends",
+    );
+}
+
+#[test]
+fn b101_a_concrete_instantiation_of_the_same_body_is_accepted() {
+    // The negative that keeps the rule about resources: `T := i32` is not a
+    // resource instantiation, nothing is enqueued, and the same body compiles
+    // and runs.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set<T>(slot: &mut T, own value: T) { slot = value; }
+        fun main() {
+            mut n = 1;
+            set(&mut n, 2);
+            print(n);
+        }
+        "#,
+        ),
+        "2\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_body_with_the_same_write_still_drops() {
+    // The other negative, and the reason the rule is R11's rather than R2's: a
+    // CONCRETE `&mut Guard` body knows the type, so B94's drop is emitted and
+    // the write is correct. Only a shared generic body is asked.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun set(slot: &mut Guard, own value: Guard) { slot = value; }
+        fun main() {
+            mut g = Guard { label = "first" };
+            print("before");
+            set(&mut g, Guard { label = "second" });
+            print("after");
+        }
+        "#,
+        ),
+        "before\ndropped first\nafter\ndropped second\n",
+    );
+}
+
+#[test]
+fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
+    // Why the question is asked of the DELTA place set and not of concrete
+    // resource-ness. `slot.held` is a `Guard` at every instantiation, so the
+    // emitted body knows the type and B99's drop fires — this is chunk 3's
+    // territory, and re-asking it here would reject a correct program once per
+    // instantiation site. Runs, and destroys all three in order.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        resource struct Slot { held: Guard }
+        fun bump<T>(own value: T, slot: &mut Slot): T {
+            slot.held = Guard { label = "fresh" };
+            value
+        }
+        fun main() {
+            mut s = Slot { held = Guard { label = "old" } };
+            let g = bump(Guard { label = "passed" }, &mut s);
+            drop(g);
+            print("end");
+        }
+        "#,
+        ),
+        "dropped old\ndropped passed\nend\ndropped fresh\n",
+    );
+}
+
+#[test]
+fn b101_a_read_only_generic_view_body_is_accepted() {
+    // A `&T` body that never writes owes nothing, so the widened check must not
+    // reach it — the predicate is the WRITE, not the loan.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun peek<T>(slot: &Option<T>): bool { slot.is_some() }
+        fun main() {
+            let o = Some(Guard { label = "first" });
+            print(peek(&o));
+        }
+        "#,
+        ),
+        "true\ndropped first\n",
+    );
+}
+
+#[test]
+fn b101_the_option_surface_still_instantiates_at_a_resource() {
+    // The std sweep, as a pin: `Option` is the sanctioned resource container
+    // (R10), and its generic surface must stay clean under the widening.
+    // `take`, `replace`, `unwrap`, `is_some`/`is_none` and the `drop` sink are
+    // every generic a resource can reach in std today.
+    assert_compiles_and_runs(
+        &b101_program(
+            r#"
+        fun main() {
+            mut slot = Some(Guard { label = "a" });
+            print(slot.is_some());
+            match slot.take() {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            print(slot.is_none());
+            mut refilled = Some(Guard { label = "b" });
+            match refilled.replace(Guard { label = "c" }) {
+                Some(let g) => drop(g),
+                None => {},
+            }
+            drop(refilled.unwrap());
+        }
+        "#,
+        ),
+        "true\ndropped a\ntrue\ndropped b\ndropped c\n",
+    );
+}
+
 #[test]
 fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
     // B5 — one diagnostic per root cause. The drop plan assumes an affine-valid
@@ -41529,8 +44264,8 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
     );
 }
 
-// --- B72: a bare-trait parameter steers to the bound (method-resolution.md
-// --- §10) -------------------------------------------------------------------
+// --- B72 → B4 §12.2: a bare trait is refused at the DECLARATION
+// --- (method-resolution.md §10, trait-objects.md §11–§12) -------------------
 //
 // `fun show(v: A)` called with a `Bag` that implements `A` failed with
 // "Expected A, but got Bag instead" — which reads as though the impl were
@@ -41538,16 +44273,25 @@ fn b57_a_trait_qualified_call_rejects_an_unimplementing_receiver() {
 // §5.11) and vilan has no trait objects, so the parameter can never accept a
 // concrete value and the declaration is what has to change.
 //
-// A call is the one position that reconciles PARAMETER-FIRST, so it is the one
-// position that ever asks `reconcile_type(Trait, Concrete)` — the direction
-// with no arm. Every other position reconciles value-first and lands on the
-// `(Struct|Enum, Trait)` arm, which accepts; those are pinned below as the
-// standing inconsistency they are, and belong to B4.
+// B72 said so at the CALL, because a call was the one position that reconciled
+// PARAMETER-FIRST and so the one position that ever asked
+// `reconcile_type(Trait, Concrete)` — the direction with no arm. Every other
+// position reconciled value-first, landed on the `(Struct|Enum, Trait)` arm and
+// ACCEPTED: four of six positions took a bare trait silently, and those four
+// acceptances were pinned below as the standing inconsistency they were, filed
+// as B4's to settle.
+//
+// B4 settled it (`proposal/trait-objects.md`, trait objects DECLINED
+// 2026-08-07; §11–§12 ship instead). The steer moved from the call to the
+// DECLARATION, which is where the fix goes and where it fires whether or not
+// anyone ever calls the thing — so the four acceptance pins are inverted here,
+// which is the arc closing rather than a regression, and the steer's own pins
+// now read at the declaration. What survives verbatim is the register: name the
+// rule, then name the declaration that works.
 
 #[test]
 fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
-    // The filed shape. The steer names the trait, the parameter, and the
-    // declaration to write.
+    // The filed shape. Now refused where it is written, not where it is called.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -41556,7 +44300,7 @@ fn b72_a_bare_trait_parameter_steers_to_a_bound_generic() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "parameter 'v' has bare trait type 'A': a trait is not a value type",
+        "'A' is a trait, not a type: a trait is not a value type",
     );
 }
 
@@ -41571,15 +44315,17 @@ fn b72_the_bare_trait_steer_names_the_generic_to_write() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "`<T: A>` with 'v: T'",
+        "`<T: A>` — and write 'T' here",
     );
 }
 
 #[test]
-fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
-    // The fix belongs at the DECLARATION, not at the call the error anchors on
-    // — so the note points there (and carries its own source, so it renders
-    // when the callee lives in another module).
+fn b72_the_bare_trait_refusal_notes_the_trait_declaration() {
+    // B72 anchored at the call and needed a note to reach the parameter that
+    // had to change. The refusal anchors at that parameter, so the note points
+    // at the other thing the reader may not be able to see — the trait — and
+    // carries its own source, so it renders when the trait lives in another
+    // module (the B72 mechanism, pointed one hop further out).
     assert_fails_noting(
         r#"
         trait A { fun name(self): str; }
@@ -41588,18 +44334,17 @@ fn b72_the_bare_trait_steer_notes_the_parameter_declaration() {
         fun show(subject: A): str { "x" }
         fun main() { let s = show(Bag { n = 1 }); }
         "#,
-        "has bare trait type 'A'",
-        "subject",
-        "is declared with the trait as its type",
+        "'A' is a trait, not a type",
+        "A",
+        "is declared here, as a trait",
     );
 }
 
 #[test]
 fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
-    // The second surface that reaches the parameter-first reconcile: an
-    // associated function called as `Type::member(..)`. Same path, same steer —
-    // which is the point of fixing the message at the shared site rather than
-    // at the free-function call.
+    // The second surface B72 had to reach separately — an associated function
+    // called as `Type::member(..)` — needs no separate reach now: both are the
+    // same written parameter, refused once at the declaration.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -41609,16 +44354,19 @@ fn b72_a_bare_trait_parameter_on_a_static_steers_too() {
         impl Holder { fun make(v: A): i32 { 1 } }
         fun main() { let n = Holder::make(Bag { n = 1 }); }
         "#,
-        "parameter 'v' has bare trait type 'A'",
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
-    // The steer is for the author who wrote a correct impl and the wrong
-    // signature. When the value does NOT implement the trait, the missing impl
-    // is the likelier mistake, so naming the type it failed to match stays the
-    // more useful report.
+fn b72_the_refusal_does_not_wait_for_an_argument() {
+    // B72's steer was conditional on the argument implementing the trait: at a
+    // call, a non-implementing value made the missing impl the likelier
+    // mistake, so the plain mismatch stayed the better report. A definition-site
+    // rule has no such branch and needs none — `fun show(v: A)` is wrong on its
+    // own terms, before any argument exists, and reports identically whether
+    // the value passed implements `A` or not. That is what makes it one rule
+    // rather than a message.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -41628,7 +44376,23 @@ fn b72_a_non_implementing_argument_keeps_the_plain_mismatch() {
         fun show(v: A): str { "x" }
         fun main() { let s = show(Other { m = 1 }); }
         "#,
-        "Expected A, but got Other instead.",
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_an_uncalled_bare_trait_parameter_is_still_refused() {
+    // The half a use-site steer structurally could not reach: a declaration
+    // nobody calls. B72 was silent here; the rule is not.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show(v: A): str { "x" }
+        fun main() { }
+        "#,
+        "'A' is a trait, not a type",
     );
 }
 
@@ -41668,32 +44432,38 @@ fn b72_a_generic_parameter_is_untouched_by_the_steer() {
     );
 }
 
-// The positions that ACCEPT a bare trait today, pinned as the standing
-// inconsistency they are rather than left undescribed. Each reconciles
-// value-first, so each lands on `reconcile_type`'s `(Struct|Enum, Trait)` arm.
-// Refusing them is a language change (a trait type would become illegal in
-// every value position), which is B4's to make — and std itself depends on one
-// of them: `iterator.vl`'s `fun iter(self): Iterator<T>` returns a bare trait.
+// The four positions that used to ACCEPT a bare trait, inverted. Each
+// reconciled value-first and landed on `reconcile_type`'s `(Struct|Enum, Trait)`
+// arm, which returns the CONCRETE side — so the trait was absorbed at the check
+// and then reasserted by the annotation, which is how a value ended up carrying
+// a type it had no implementation for. They are refused at the annotation now,
+// by one rule rather than four checks (`trait-objects.md` §11's table). std's
+// own dependency on the return case — `iterator.vl`'s
+// `fun iter(self): Iterator<T>` — was answered first, by spelling those five
+// declarations `Self`, which is what they always meant (§1.5).
 
 #[test]
-fn b72_a_bare_trait_let_annotation_is_still_accepted() {
-    // `let x: A = bag` compiles; only USING it fails. The spec says this should
-    // be rejected at the annotation (`types.md` §5.11); it is not, and closing
-    // that gap is B4's, not a diagnostic's.
-    assert_compiles(
+fn b72_a_bare_trait_let_annotation_is_refused() {
+    // `let x: A = bag` used to compile, and only USING it failed. The spec has
+    // said since it was written that the ANNOTATION is the error
+    // (`types.md` §5.11); the compiler agrees now.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun main() { let x: A = Bag { n = 1 }; }
         "#,
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
 fn b72_a_bare_trait_value_still_cannot_be_used() {
-    // The refusal that DOES exist, and the one the new steer is worded to
-    // match: the body-side rule, from inside `show`.
+    // The refusal that always existed. The binding now fails one step earlier,
+    // at its annotation, so the use never gets its own report — but the rule
+    // the reader is told is word-for-word the one `MethodLookup::BareTraitValue`
+    // states, which is the point of wording them alike.
     assert_fails_with(
         r#"
         trait A { fun name(self): str; }
@@ -41706,11 +44476,11 @@ fn b72_a_bare_trait_value_still_cannot_be_used() {
 }
 
 #[test]
-fn b72_a_bare_trait_method_parameter_is_still_accepted() {
-    // A METHOD's bare-trait parameter reconciles value-first, so it accepts
-    // where the free function refuses. The asymmetry is real and pinned; see
-    // `method-resolution.md` §10.
-    assert_compiles(
+fn b72_a_bare_trait_method_parameter_is_refused() {
+    // A METHOD's bare-trait parameter reconciled value-first, so it accepted
+    // where the free function refused. The asymmetry is gone: both are written
+    // parameters, and the rule is on the writing.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
@@ -41719,21 +44489,684 @@ fn b72_a_bare_trait_method_parameter_is_still_accepted() {
         impl Holder { fun take(self, v: A): i32 { 1 } }
         fun main() { let h = Holder { n = 0 }; let n = h.take(Bag { n = 1 }); }
         "#,
+        "'A' is a trait, not a type",
     );
 }
 
 #[test]
-fn b72_a_bare_trait_return_is_still_accepted() {
-    // std depends on this one: `impl Iterator<type T> with Iterable<T>` returns
-    // `Iterator<T>`, a bare trait. Any refusal of trait types in value position
-    // has to answer for it first.
-    assert_compiles(
+fn b72_a_bare_trait_return_is_refused() {
+    // The position std itself used, and the reason §11 sequenced the `Self`
+    // rewrites before the tightening.
+    assert_fails_with(
         r#"
         trait A { fun name(self): str; }
         struct Bag { n: i32 }
         impl Bag with A { fun name(self): str { "bag" } }
         fun make(): A { Bag { n = 1 } }
         fun main() { let v = make(); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_field_is_refused() {
+    // The fifth position — the one §2.2's resource leak rode in on.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b72_a_bare_trait_generic_argument_is_refused() {
+    // §2.3: `List<A>` type-checked, and then narrowed to `List<Bag>` at the
+    // first element because the `(Struct|Enum, Trait)` arm returns the concrete
+    // side — so a genuinely heterogeneous list built by `push` compiled and ran.
+    // Refused at the argument, by the same rule and at the same arm.
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { mut xs: List<A> = []; xs.push(Bag { n = 1 }); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+// The three routes to B55's internal error (§2.1). The B4 amendment recorded
+// one; the paper's P7 found three, byte-identical, and they are exactly the
+// accepting positions of the table above meeting a bounded generic. Each used
+// to abort the build from the TRANSFORMER with "please report this program",
+// with the caret on the trait's own `fun show(self): str;` — inside std, for a
+// std trait — while the message said "at this call". Each is an ordinary
+// declaration error now, at the annotation the author wrote.
+
+#[test]
+fn b4_the_internal_error_route_through_a_binding_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_the_internal_error_route_through_a_field_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_the_internal_error_route_through_a_return_is_a_clean_refusal() {
+    assert_fails_with(
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let s = use_it(make()); }
+        "#,
+        "'A' is a trait, not a type",
+    );
+}
+
+#[test]
+fn b4_no_route_to_the_internal_error_survives() {
+    // The half that makes the three above a closure rather than three fixes:
+    // whatever else the programs report, none of them reaches the transformer's
+    // B55 guard. "internal:" in a diagnostic is the string that must not
+    // appear, because it is the one that asks the user to file a bug for their
+    // own mistake.
+    for source in [
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let x: A = Bag { n = 1 }; let s = use_it(x); }
+        "#,
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        struct Holder { item: A }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let h = Holder { item = Bag { n = 1 } }; let s = use_it(h.item); }
+        "#,
+        r#"
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun make(): A { Bag { n = 1 } }
+        fun use_it<T: A>(v: T): str { v.name() }
+        fun main() { let s = use_it(make()); }
+        "#,
+    ] {
+        let diagnostics = compile(source).expect_err("expected a compile error");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("internal:")),
+            "an internal error survived: {diagnostics:#?}"
+        );
+    }
+}
+
+// The positions where a trait is the LEGITIMATE spelling, pinned so the
+// tightening cannot creep into them. Each is a place the trait names a bound or
+// a namespace rather than a value's type, and each is load-bearing today.
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_generic_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun show<T: A>(v: T): str { v.name() }
+        fun main() { print(show(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_supertrait() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        trait B with A { fun louder(self): str { self.name() } }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        impl Bag with B { }
+        fun main() { print(Bag { n = 1 }.louder()); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_an_impl_subject() {
+    // std's own `impl Iterator<type T> with Iterable<T>` shape — a blanket impl
+    // over a bound, where the subject IS a trait. The `Iterable` surface has to
+    // keep compiling exactly as it did.
+    assert_compiles(
+        r#"
+        import std::option::Option::{ self, Some, None };
+        trait Walk<T> { fun step(self): Option<T>; }
+        trait AsWalk<T> { fun as_walk(self): Self; }
+        impl Walk<type T> with AsWalk<T> { fun as_walk(self): Self { self } }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b4_a_trait_stays_legal_as_a_qualified_call_head() {
+    // B57's trait-qualified call and B83's trait-provided static both write the
+    // trait's name at the head of a path. A path head selects a namespace; it
+    // is not a value position.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait A { fun name(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with A { fun name(self): str { "bag" } }
+        fun main() { print(A::name(Bag { n = 1 })); }
+        main();
+        "#,
+        "bag\n",
+    );
+}
+
+#[test]
+fn b4_a_self_defaulted_parameter_stays_legal() {
+    // `trait Add<B = Self>` makes the NAME `B` resolve to the very same
+    // `Type::Trait` that `Self` does — std's operator traits are all written
+    // this way. The refusal keys on the entity the name resolves to, not on the
+    // type it produces, so a generic parameter is never mistaken for the trait.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Combine<B = Self> { fun combine(self, other: B): str; }
+        struct Bag { n: i32 }
+        impl Bag with Combine { fun combine(self, other: Bag): str { "combined" } }
+        fun main() { print(Bag { n = 1 }.combine(Bag { n = 2 })); }
+        main();
+        "#,
+        "combined\n",
+    );
+}
+
+// --- B98 (B4 §2.4): two impls of one trait for one subject ------------------
+//
+// `trait-objects.md` §2.4 (probe P11) found the gap between two shipped checks:
+// B57 hard-errors on duplicate INHERENT members and on a trait-vs-trait
+// ambiguity, and B74 closed duplicate statics, but the same trait implemented
+// twice for the same type fell between them and resolved by DECLARATION ORDER.
+// The second impl was emitted nowhere and was silently dead, at a direct call
+// and through a bounded generic alike, and which one died depended on the order
+// the modules happened to load in.
+//
+// Both of those checks exempt a trait-provided NAME on purpose, so that two
+// impls of one trait stay legal — `method-resolution.md` §9(6)'s platform twins
+// and the std `Into` blanket. B98 is the rule that owns the other side of that
+// exemption: the members stay exempt, the impl PAIR does not.
+//
+// The pair key is `(trait, trait arguments, subject)`, compared for SAMENESS
+// rather than compatibility: a generic position matches only another generic
+// position bound the same way. That is what keeps the three carve-outs below
+// working, each by the rule rather than by exemption.
+
+#[test]
+fn b98_duplicate_trait_impls_are_refused_at_both_call_paths() {
+    // P11, exactly — the program whose two calls both used to print `first`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "first" } }
+        impl Bag with Show { fun show(self): str { "second" } }
+        fun via<T: Show>(v: T): str { v.show() }
+        fun main() { let b = Bag { n = 1 }; print(b.show()); print(via(b)); }
+        main();
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b4_two_impls_of_one_trait_for_one_type_are_an_error() {
+    // The end state §2.4 asked for, in B57/B74's register: a definition-site
+    // error at the second impl, noting the first.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "first" } }
+        impl Bag with Show { fun show(self): str { "second" } }
+        fun main() { let b = Bag { n = 1 }; }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b98_a_duplicate_of_a_std_impl_names_the_module_it_came_from() {
+    // The gap-b shape one family over (`method-resolution.md` §2.1): a user file
+    // re-declaring an impl std already has. The report is B57's cross-file one —
+    // the note renders std's own line, and the one-line form says which module.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        import std::operators::Lift;
+        impl Option<type T> with Lift {}
+        fun main() { }
+        "#,
+        "is already implemented for 'Option<T>' by module 'option'",
+    );
+}
+
+#[test]
+fn b98_one_with_clause_naming_a_trait_twice_is_the_same_pair() {
+    // `impl Bag with Show + Show` — a pair inside one clause. B84's block rule
+    // cannot see it (it reads declared MEMBERS, and there is one `show`), and it
+    // is a duplicate by exactly the same argument as two blocks.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show + Show { fun show(self): str { "x" } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b98_a_trait_subject_gets_the_same_rule() {
+    // The subject may itself BE a trait — std's blanket-over-a-bound shape
+    // (`impl Iterator<type T> with Iterable<T>`), so the `Trait` arm of the
+    // sameness walk carries real weight.
+    assert_fails_with(
+        r#"
+        trait Walk { fun step(self): i32; }
+        trait Marker { fun mark(self): i32; }
+        impl Walk with Marker { fun mark(self): i32 { 1 } }
+        impl Walk with Marker { fun mark(self): i32 { 2 } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Walk'",
+    );
+}
+
+#[test]
+fn b98_two_generic_impls_differing_only_in_binder_name_are_one_impl() {
+    // `impl Pair<type T>` and `impl Pair<type U>` are the same impl written
+    // twice, and the second is dead exactly as P11's is. The subject TYPE IDS
+    // differ here even though the types are equal — types are not interned — so
+    // the rule cannot be identity on the id.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T> with Show { fun show(self): str { "a" } }
+        impl Pair<type U> with Show { fun show(self): str { "b" } }
+        fun main() { }
+        "#,
+        "is already implemented for",
+    );
+}
+
+#[test]
+fn b98_an_elided_self_default_does_not_disguise_a_duplicate() {
+    // `trait Combine<B = Self>`: the `with` clause records the arguments it
+    // WROTE, so `with Combine` records none and `with Combine<Bag>` records one.
+    // They are the same instantiation, and the rule compares the effective
+    // arguments — the written ones padded with the trait's declared defaults,
+    // `= Self` meaning the subject.
+    assert_fails_with(
+        r#"
+        trait Combine<B = Self> { fun combine(self, other: B): str; }
+        struct Bag { n: i32 }
+        impl Bag with Combine { fun combine(self, other: Bag): str { "x" } }
+        impl Bag with Combine<Bag> { fun combine(self, other: Bag): str { "y" } }
+        fun main() { }
+        "#,
+        "is already implemented for 'Bag'",
+    );
+}
+
+#[test]
+fn b98_the_same_trait_at_different_arguments_is_two_impls() {
+    // The reason trait ARGUMENTS are in the pair key: `Into<Bar>` and
+    // `Into<Baz>` are two implementations, not one written twice, and refusing
+    // them would make a parameterized trait implementable once per type.
+    assert_compiles(
+        r#"
+        trait Tag<A> { fun tag(self): A; }
+        struct Bag { n: i32 }
+        struct Cup { n: i32 }
+        impl Bag with Tag<Cup> { fun tag(self): Cup { Cup { n = 1 } } }
+        impl Bag with Tag<Bag> { fun tag(self): Bag { Bag { n = 2 } } }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_the_std_into_blanket_is_not_a_duplicate_of_a_user_impl() {
+    // The carve-out that would have taken std down: `impl type T with Into<T>`
+    // matches every subject under ordinary type COMPATIBILITY, so a rule built
+    // on `compare_type` would call it a duplicate of every user `Into` impl. It
+    // is an OVERLAP, which is B73's open specificity question — unchanged here,
+    // in both directions (`Into<Fahrenheit>` and the reflexive `Into<Celsius>`).
+    assert_compiles(
+        r#"
+        import std::into::Into;
+        struct Celsius { degrees: i32 }
+        struct Fahrenheit { degrees: i32 }
+        impl Celsius with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { Fahrenheit { degrees = self.degrees * 2 } }
+        }
+        impl Fahrenheit with Into<Fahrenheit> {
+            fun into(self): Fahrenheit { self }
+        }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_two_bounded_impls_differing_only_in_binder_name_are_one_impl() {
+    // The other direction of the bounds rule, and the case that needs it: an
+    // UNBOUNDED impl binder inherits the subject type's own constraint id (B77),
+    // so two of them are already the same id, while a bound mints a fresh one.
+    // `Pair<type T: Show>` and `Pair<type U: Show>` are therefore two different
+    // ids for one position, and only comparing what they are BOUND by sees it.
+    assert_fails_with(
+        r#"
+        trait Show { fun show(self): str; }
+        trait Label { fun label(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T: Show> with Label { fun label(self): str { "a" } }
+        impl Pair<type U: Show> with Label { fun label(self): str { "b" } }
+        fun main() { }
+        "#,
+        "is already implemented for",
+    );
+}
+
+#[test]
+fn b98_two_conditional_impls_with_different_bounds_are_two_impls() {
+    // B73 one level in: two generic positions are the same position only when
+    // they carry the same BOUNDS. `Pair<T: Show>` and `Pair<U: Marker>` overlap
+    // wherever a type is both, which is a specificity question and not a repeat.
+    assert_compiles(
+        r#"
+        trait Show { fun show(self): str; }
+        trait Marker { fun mark(self): i32; }
+        trait Label { fun label(self): str; }
+        struct Pair<T> { value: T }
+        impl Pair<type T: Show> with Label { fun label(self): str { "shown" } }
+        impl Pair<type U: Marker> with Label { fun label(self): str { "marked" } }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b98_one_trait_for_two_subjects_and_two_traits_for_one_subject_stay_legal() {
+    // The family's guard rail: the pair is (trait, subject), so neither half
+    // repeating on its own is a duplicate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        trait Show { fun show(self): str; }
+        trait Label { fun label(self): str; }
+        struct Bag { n: i32 }
+        struct Cup { n: i32 }
+        impl Bag with Show { fun show(self): str { "bag" } }
+        impl Cup with Show { fun show(self): str { "cup" } }
+        impl Bag with Label { fun label(self): str { "labelled" } }
+        fun main() { print(Bag { n = 1 }.show()); print(Cup { n = 2 }.show()); print(Bag { n = 3 }.label()); }
+        main();
+        "#,
+        "bag\ncup\nlabelled\n",
+    );
+}
+
+#[test]
+fn b98_a_third_impl_is_reported_against_the_first() {
+    // B57's counting rule: each later impl is reported against the FIRST it
+    // repeats, so three copies produce two errors rather than one or three.
+    let errors = compile(
+        r#"
+        trait Show { fun show(self): str; }
+        struct Bag { n: i32 }
+        impl Bag with Show { fun show(self): str { "a" } }
+        impl Bag with Show { fun show(self): str { "b" } }
+        impl Bag with Show { fun show(self): str { "c" } }
+        fun main() { }
+        "#,
+    )
+    .expect_err("expected the duplicate impls to be refused");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.contains("is already implemented for 'Bag'"))
+            .count(),
+        2,
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b98_the_platform_twins_are_not_a_duplicate_on_either_leg() {
+    // The carve-out the rule must not break, pinned in BOTH directions:
+    // `browser/ui.vl` and `process/ui.vl` each write `impl View with Slot`,
+    // `impl str with Slot`, `impl Signal<str> with AttrValue` and three more —
+    // the twin MECHANISM (`method-resolution.md` §9(6)). Module resolution is
+    // layered, so exactly one `ui` loads per build and the pairs never meet;
+    // nothing special-cases them, and this is the measurement that says so.
+    // (std's own impls are frozen in a scoped run, so the full-scan half of the
+    // proof lives in `check_scope_differential.rs`, which force-loads every std
+    // module on both legs with the skip disabled.)
+    let source = r#"
+        import std::ui::{ View, view };
+        fun main() { let root: View = view("div"); }
+        "#;
+    assert_compiles_browser(source);
+    assert_compiles(source);
+}
+
+// --- B4 §2.2: a bare trait annotation must not launder a resource -----------
+//
+// `proposal/trait-objects.md` §2.2 (probes P8/P9): the resource analysis
+// classifies `Type::Trait` as "never a resource by containment", and marks that
+// verdict COMPLETE — correct for the `Self` meaning of `Type::Trait`, a lie for
+// the "a user annotated a value with a trait" meaning. So annotating a
+// resource-carrying value with a bare trait type silently deletes its
+// destructor call and silently licenses a second owner: containment inference
+// (`spec/memory.md` §341-346) cannot see through the trait type, so R1, R2 and
+// R10 never fire and scope-end destruction never happens. This is `spec/
+// memory.md` R12's laundering hazard through a sink R12 does not name, and
+// unlike `any` it does not even produce a diagnostic. Live data loss, in
+// shipped code, with no trait objects anywhere.
+//
+// Each leak case is paired with its CONCRETE control, which passes today and
+// must keep passing: the controls are what make the pins non-vacuous — they
+// prove the destructor machinery is live and that only the trait annotation
+// suppresses it.
+//
+// The fix is the §12.2 tightening (a trait in value position is an error at
+// the annotation), so the closed shape of each leak is a REFUSAL, not a
+// destructor that runs: the resource never gets behind the trait in the first
+// place. Closed by construction rather than by a check per position — which is
+// the argument §2.2 makes for the tightening over any narrower patch.
+
+#[test]
+fn a_resource_binding_runs_its_destructor() {
+    // P8's control arm, concrete annotation: `drop` runs at scope end.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Handle = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+fn a_bare_trait_binding_cannot_swallow_a_resources_destructor() {
+    // P8 row 2. Today this compiles, runs, prints `ok` and NEVER prints
+    // `closing` — one changed word in the annotation deleted the destructor.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        fun main() {
+            let handle: Named = Handle { id = 1 };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_runs_its_destructor() {
+    // P8's control arm, by containment: an aggregate holding a resource behind
+    // a CONCRETE field is a resource, and its scope end destroys it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "ok\nclosing\n",
+    );
+}
+
+#[test]
+fn a_bare_trait_field_cannot_swallow_a_resources_destructor() {
+    // P8 row 4 — the field route, which is the dangerous one: the resource is
+    // reachable, owned, and invisible to containment inference.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            print("ok");
+        }
+        main();
+        "#,
+        "a trait is not a value type (vilan has no trait objects)",
+    );
+}
+
+#[test]
+fn a_resource_field_keeps_its_single_owner() {
+    // P9's control arm: through a concrete field, the affine checker sees the
+    // resource and refuses the second owner.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Handle }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
+        "#,
+        "use of `holder` after it was moved",
+    );
+}
+
+#[test]
+fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
+    // P9. Today this compiles, runs, prints `ok`, and emits
+    // `const holder = [ [ 1 ] ];` — one resource, two live owners, no drop.
+    assert_fails(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Handle { id: i32 }
+        impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
+        trait Named { fun name(self): str; }
+        impl Handle with Named { fun name(self): str { "h" } }
+        struct Holder { item: Named }
+        fun main() {
+            let holder = Holder { item = Handle { id = 1 } };
+            let first = holder;
+            let second = holder;
+            print("ok");
+        }
+        main();
         "#,
     );
 }
@@ -43377,16 +46810,21 @@ fn a_subject_that_declares_next_still_drives_the_loop() {
     );
 }
 
-/// A gap B80's check exposed rather than caused: a `next` INHERITED from a
-/// trait default is reachable as a call (`empty.next()` resolves and returns
-/// `None`) but does not drive a loop — `method_member_candidates` reads the
-/// impl's own `declarations`, and an `impl Empty with Fixed<i32> {}` declares
-/// nothing. Before the fix the loop fell through to the native `for...of` and
-/// printed the `unused` field; now it is a clean "cannot iterate", which is the
-/// right interim answer but not the right final one. `#[ignore]`d: it asserts
-/// the desired outcome (the default drives the loop, printing `99` only).
+// --- B91: an inherited trait default drives the loop (Gap E, at the `for`) ---
+// A gap B80's check exposed rather than caused. A `next` INHERITED from a trait
+// default is the receiver's `next` everywhere else — `empty.next()` resolves and
+// returns `None`, and Gap E's `method_member_in_inherited_defaults` is what makes
+// it resolve — but the loop asked `method_member_candidates`, which reads each
+// impl's own `declarations`, and `impl Empty with Fixed<i32> {}` declares
+// nothing. B80 turned the silent native `for...of` into a clean "cannot iterate",
+// which was the right interim answer and the wrong final one: a protocol
+// duck-typed on a method NAME cannot mean one thing at a call and another at a
+// loop. The loop now falls back to the same tier the call does, dispatched to the
+// concrete receiver at codegen through the same `GenericDispatch::OnType`.
+
+/// B91's headline case, `#[ignore]`d until the fix: an impl that declares nothing
+/// still iterates, through the default it inherited.
 #[test]
-#[ignore]
 fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     assert_compiles_and_runs(
         r#"
@@ -43408,16 +46846,447 @@ fn a_next_inherited_from_a_trait_default_drives_the_loop() {
     );
 }
 
-/// The half of the wrong-signature family the fix deliberately does NOT judge:
-/// an UNANNOTATED `next` is left to its body, because `IteratorFromFn::next` in
-/// std is written that way and infers `Option<T>`. A body that yields nothing
-/// therefore still reaches the lowering, which reads `undefined[0]` and throws
-/// `TypeError: Cannot read properties of undefined` at runtime. Loud rather
-/// than silent, so not the same class as B80 — but it should be a compile
-/// error. `#[ignore]`d: it asserts the diagnostic, and today the program
-/// compiles and the failure is the runtime's.
+/// The default that actually YIELDS, which the empty one above cannot prove: the
+/// inherited body calls back into the impl's own required member, so the loop has
+/// to reach the default AND the default has to dispatch to this receiver. The
+/// element type has to be right too — it is written in the TRAIT's `T`, bound by
+/// the arguments the impl wrote in its `with` clause.
 #[test]
-#[ignore]
+fn an_inherited_default_that_yields_drives_the_loop_to_its_end() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Countdown<T> {
+            fun tick(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.tick() }
+        }
+
+        struct Down { at: i32 }
+        impl Down with Countdown<i32> {
+            fun tick(&mut self): Option<i32> {
+                if self.at <= 0 { None } else { self.at -= 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut down = Down { at = 3 };
+            for item in down { print(item + 1); }
+            print(99);
+        }
+        "#,
+        "3\n2\n1\n99\n",
+    );
+}
+
+/// A GENERIC subject, where one substitution step is not enough: `impl Bag<type
+/// T> with Feed<T>` maps the trait's `T` onto the impl's BINDER, which is still
+/// abstract, so the element instantiates only after the receiver binds the binder.
+/// `pair.1` is the probe — with the trait's arguments alone it was "cannot access
+/// field '1' on type T", the B78 shape one tier over.
+#[test]
+fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Feed<T> {
+            fun take(&mut self): Option<T>;
+            fun next(&mut self): Option<T> { self.take() }
+        }
+
+        struct Bag<T> { items: List<T>, cursor: i32 }
+        impl Bag<type T> with Feed<T> {
+            fun take(&mut self): Option<T> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { items = [(1, "a"), (2, "b")], cursor = 0 };
+            for pair in bag { print(pair.1); }
+        }
+        "#,
+        "a\nb\n",
+    );
+}
+
+/// The `next_mut` twin, lending each element by writable view — a separate member
+/// and a separate lookup, so it gets its own pin (the `a_mut_for_loop_over_a_
+/// subject_without_next_mut_is_diagnosed` precedent). The writes land in the
+/// receiver, which is what makes it the `next_mut` protocol rather than `next`.
+#[test]
+fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Walk<T> {
+            fun step(&mut self): Option<&mut T>;
+            fun next_mut(&mut self): Option<&mut T> { self.step() }
+        }
+
+        struct Bag2 { items: List<i32>, cursor: i32 }
+        impl Bag2 with Walk<i32> {
+            fun step(&mut self): Option<&mut i32> {
+                if self.cursor < self.items.len() {
+                    let index = self.cursor;
+                    self.cursor += 1;
+                    Some(&mut self.items[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut bag = Bag2 { items = [1, 2, 3], cursor = 0 };
+            for item in &mut bag { item = *item * 10; }
+            print(bag.items[0]);
+            print(bag.items[2]);
+        }
+        "#,
+        "10\n30\n",
+    );
+}
+
+/// B57's tiering, unchanged by the new tier: an inherent `next` beside an
+/// inherited default one is not ambiguous — inherent wins, unconditionally
+/// (`method-resolution.md` §3). The loop consults the inherited tier only when
+/// the declared search comes back empty, which is the same order the call path
+/// uses, so the two cannot disagree about which body runs.
+#[test]
+fn an_inherent_next_beats_an_inherited_default_at_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Fixed<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl Two with Fixed<i32> {}
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(99);
+        }
+        "#,
+        "1\n2\n99\n",
+    );
+}
+
+/// Two traits offering same-named DEFAULTS are as ambiguous as two declaring the
+/// name outright (§3, one tier down), and the loop must not silently pick one.
+/// The call form resolves this by naming a provider — `Trait::next(receiver)` —
+/// and a `for` has no such spelling, so the steer is the edit that works: declare
+/// it inherently, the tier that beats both (B65's lesson, as B83 applied it).
+#[test]
+fn two_inherited_default_nexts_are_ambiguous_at_the_loop() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T> { None } }
+        trait Late<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Both { at: i32 }
+        impl Both with Early<i32> {}
+        impl Both with Late<i32> {}
+
+        fun main() {
+            mut both = Both { at = 0 };
+            for item in both { print(item); }
+        }
+        "#,
+        "`next` is ambiguous on `Both`",
+    );
+}
+
+// --- B96: two traits DECLARING `next` are ambiguous at the loop too ---
+// The same ambiguity one tier UP from B91's. `method_member_impl_subject`
+// collapses `AmbiguousTraits` into `None`, so the declared tier fell through to
+// the inherited one and out the "it has no `next`" exit — of a type that has
+// two. The loop now asks `resolve_impl_member`, which keeps the two failures
+// apart, and reports at whichever tier the competition is in.
+
+/// Two traits DECLARING `next`, with an impl of each providing a body: the
+/// call path already reports this ("both 'A' and 'B' provide it; call
+/// 'A::next(receiver)' …"), and the loop must too — with the steer that works
+/// for a `for`, which has no spelling that names a provider.
+#[test]
+fn two_declared_nexts_are_ambiguous_at_the_loop() {
+    let two_declared = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Twin with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    // Half one: both providers named, at the DECLARED tier's wording.
+    assert_fails_with(
+        two_declared,
+        "`next` is ambiguous on `Twin`: both 'Early<i32>' and 'Late<i32>' provide it, and a",
+    );
+    // Half two: the inherent-declaration steer — the edit that resolves it.
+    assert_fails_with(
+        two_declared,
+        "Declare `next` on `Twin` itself — an inherent member beats every trait-provided one",
+    );
+    // And NOT the misleading message it used to get (B96's whole point).
+    assert_fails_without(two_declared, "it has no `next");
+}
+
+/// The two tiers say the same thing about the same problem, differing only in
+/// how the providers give the member: B91's ambiguity and B96's share the
+/// providers clause and the steer verbatim, over the same struct name. An
+/// inconsistency here is exactly what made B96 findable.
+#[test]
+fn both_ambiguous_for_each_tiers_share_one_diagnostic_shape() {
+    let declared = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Twin with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    let inherited = r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T> { None } }
+        trait Late<T> { fun next(&mut self): Option<T> { None } }
+
+        struct Twin { at: i32 }
+        impl Twin with Early<i32> {}
+        impl Twin with Late<i32> {}
+
+        fun main() {
+            mut twin = Twin { at = 0 };
+            for item in twin { print(item); }
+        }
+        "#;
+    let shared_providers = "`next` is ambiguous on `Twin`: both 'Early<i32>' and 'Late<i32>' \
+                            provide it";
+    let shared_steer = ", and a `for` loop has no spelling that names one. Declare `next` on \
+                        `Twin` itself — an inherent member beats every trait-provided one";
+    for source in [declared, inherited] {
+        assert_fails_with(source, shared_providers);
+        assert_fails_with(source, shared_steer);
+    }
+    // The one difference: the inherited tier names its tier, because "provide"
+    // alone would send the reader looking for a declaration that is not there.
+    assert_fails_with(inherited, "provide it as an inherited default, and a");
+    assert_fails_without(declared, "as an inherited default");
+}
+
+/// B57's tiering, unchanged one tier up: an inherent `next` beside TWO traits
+/// declaring the name is not ambiguous — inherent wins, unconditionally
+/// (`method-resolution.md` §3), and the loop stays silent about the traits.
+#[test]
+fn an_inherent_next_beats_two_declared_trait_nexts_at_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Early<T> { fun next(&mut self): Option<T>; }
+        trait Late<T> { fun next(&mut self): Option<T>; }
+
+        struct Three { at: i32 }
+        impl Three {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl Three with Early<i32> { fun next(&mut self): Option<i32> { None } }
+        impl Three with Late<i32> { fun next(&mut self): Option<i32> { None } }
+
+        fun main() {
+            mut three = Three { at = 0 };
+            for item in three { print(item); }
+            print(99);
+        }
+        "#,
+        "1\n2\n99\n",
+    );
+}
+
+/// ONE trait declaring `next` is not made ambiguous by a second trait the type
+/// also implements: the ambiguity is over the NAME's providers, not over the
+/// impl count. The lower boundary of the new report.
+#[test]
+fn one_declared_next_beside_an_unrelated_trait_still_drives_the_loop() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Only<T> { fun next(&mut self): Option<T>; }
+        trait Named { fun label(&self): str; }
+
+        struct One { at: i32 }
+        impl One with Only<i32> {
+            fun next(&mut self): Option<i32> {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+        impl One with Named { fun label(&self): str { "one" } }
+
+        fun main() {
+            mut one = One { at = 0 };
+            for item in one { print(item); }
+            print(one.label());
+        }
+        "#,
+        "1\n2\none\n",
+    );
+}
+
+/// The `next_mut` twin: `for x in &mut subject` looks up a different member
+/// through the same tiering, so the ambiguity — and the steer naming the right
+/// member — has to reach it as well (the B91 `next_mut` pin's precedent).
+#[test]
+fn two_declared_next_muts_are_ambiguous_at_the_mut_loop() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait WalkA<T> { fun next_mut(&mut self): Option<&mut T>; }
+        trait WalkB<T> { fun next_mut(&mut self): Option<&mut T>; }
+
+        struct Bag3 { items: List<i32>, cursor: i32 }
+        impl Bag3 with WalkA<i32> { fun next_mut(&mut self): Option<&mut i32> { None } }
+        impl Bag3 with WalkB<i32> { fun next_mut(&mut self): Option<&mut i32> { None } }
+
+        fun main() {
+            mut bag = Bag3 { items = [1, 2], cursor = 0 };
+            for item in &mut bag { item = *item * 10; }
+        }
+        "#,
+        "`next_mut` is ambiguous on `Bag3`: both 'WalkA<i32>' and 'WalkB<i32>' provide it, \
+         and a `for` loop has no spelling that names one. Declare `next_mut` on `Bag3` \
+         itself — an inherent member beats every trait-provided one",
+    );
+}
+
+/// The tier's boundaries, both inherited from Gap E's own rules rather than
+/// re-decided here. B80's declared-shape check applies to an inherited default
+/// exactly as to a declared member — the lowering reads an `Option` tag off
+/// whatever comes back, whoever wrote it. And a `[trait_only]` default is not
+/// inherited onto the concrete surface at all (§3.2), so it does not make the
+/// receiver iterable.
+#[test]
+fn an_inherited_default_next_keeps_the_tiers_own_boundaries() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Bad { fun next(&mut self): i32 { 0 } }
+
+        struct Nope { at: i32 }
+        impl Nope with Bad {}
+
+        fun main() {
+            mut nope = Nope { at = 0 };
+            for item in nope { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Hidden<T> { [trait_only] fun next(&mut self): Option<T> { None } }
+
+        struct H { at: i32 }
+        impl H with Hidden<i32> {}
+
+        fun main() {
+            mut h = H { at = 0 };
+            for item in h { print(item); }
+        }
+        "#,
+        "it has no `next(&mut self): Option<T>`",
+    );
+}
+
+/// A default inherited through a SUPERTRAIT, which is the same tier reached one
+/// hop further out: `impl Q with Derived<i32>` never names `Base` at all, and
+/// `method_member_in_trait` walks the supertrait closure to find the body.
+#[test]
+fn a_supertraits_default_next_drives_the_loop_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::{Option, Some, None};
+
+        trait Base<T> { fun next(&mut self): Option<T> { None } }
+        trait Derived<T> with Base<T> {}
+
+        struct Q { at: i32 }
+        impl Q with Derived<i32> {}
+
+        fun main() {
+            mut q = Q { at = 0 };
+            for item in q { print(item); }
+            print(9);
+        }
+        "#,
+        "9\n",
+    );
+}
+
+// --- B92: an unannotated `next` is read from its body, not waved through -----
+// B80 judged a `next` by its ANNOTATION and deliberately left the unannotated
+// half alone, because `IteratorFromFn::next` in std is written
+// `fun next(&mut self) { (self.fn)() }` and had to stay legal. But "unannotated"
+// was never the reason it is legal — its BODY yields an `Option<T>`, which is
+// what reading the body says. A body that yields nothing infers `void`, reached
+// the lowering, and `undefined[0]` threw `TypeError` at runtime: loud rather
+// than silent, so not B80's class, but still the compiler's job. One rule now
+// covers both spellings; the annotation only decides where the answer is read.
+
+/// B92's headline case, `#[ignore]`d until the fix: a `next` whose body yields
+/// nothing at all.
+#[test]
 fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
     assert_fails_with(
         r#"
@@ -43438,7 +47307,125 @@ fn an_unannotated_next_that_yields_nothing_is_diagnosed() {
             }
         }
         "#,
-        "cannot iterate",
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The carve-out, proven rather than asserted: `Iterator::from_fn`'s `next` is
+/// unannotated BY DESIGN and stays legal, because its body yields an `Option`.
+/// This is the pin that would go red if the rule were "unannotated is an error"
+/// instead of "read the body", so it is the one that keeps std compiling.
+#[test]
+fn an_unannotated_next_that_yields_an_option_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::iterator::Iterator;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut counted = 0;
+            let produced = Iterator::from_fn(|| {
+                counted += 1;
+                if counted > 3 { None } else { Some(counted) }
+            });
+            for value in produced { print(value); }
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+    // The same shape written by hand, so the carve-out is the RULE and not a
+    // std-shaped exemption: a user `next` with no annotation whose body yields
+    // an `Option` drives the loop exactly as an annotated one does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        struct Two { at: i32 }
+        impl Two {
+            fun next(&mut self) {
+                if self.at >= 2 { None } else { self.at += 1; Some(self.at) }
+            }
+        }
+
+        fun main() {
+            mut two = Two { at = 0 };
+            for item in two { print(item); }
+            print(9);
+        }
+        "#,
+        "1\n2\n9\n",
+    );
+}
+
+/// The rule is the SHAPE, not the emptiness: an unannotated `next` that yields a
+/// perfectly good `i32` is the same error, and it is B80's silent case rather
+/// than B92's loud one — `number[0]` is `undefined`, `undefined !== 0` breaks, so
+/// the loop ran zero times and exited 0. Reading the body closes both at once.
+#[test]
+fn an_unannotated_next_that_yields_a_non_option_is_diagnosed_too() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num { at: i32 }
+        impl Num {
+            fun next(&mut self) { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `i32`",
+    );
+}
+
+/// The check reaches an INHERITED default too (B91's new tier), which it must:
+/// the loop drives whatever body it resolved to, and where that body came from
+/// cannot change what the lowering reads off the result.
+#[test]
+fn an_unannotated_inherited_default_next_is_diagnosed() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        trait Blank { fun next(&mut self) { } }
+
+        struct Empty3 { at: i32 }
+        impl Empty3 with Blank {}
+
+        fun main() {
+            mut empty = Empty3 { at = 0 };
+            for item in empty { print(item); }
+        }
+        "#,
+        "its `next` is unannotated and its body yields `void`",
+    );
+}
+
+/// The ANNOTATED half keeps its own wording, so the two diagnostics stay
+/// distinguishable: one sends you to the annotation, the other to the body it
+/// was read from. B80's pins cover the behaviour; this pins the split.
+#[test]
+fn an_annotated_non_option_next_keeps_its_own_diagnostic() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        struct Num2 { at: i32 }
+        impl Num2 {
+            fun next(&mut self): i32 { self.at += 1; self.at }
+        }
+
+        fun main() {
+            mut num = Num2 { at = 0 };
+            for item in num { print(item); }
+        }
+        "#,
+        "its `next` returns `i32`",
     );
 }
 
@@ -43691,21 +47678,39 @@ fn a_closure_argument_to_a_free_functions_generic_gets_the_real_check() {
     );
 }
 
-/// And the half that does NOT, which is why B82 ships as a split rather than a
-/// blanket error. A closure argument to a METHOD's own generic reaches its body
-/// with the parameter still abstract, so the match inside is checked against
-/// nothing — the program below binds `Other::Second`'s payload out of a
-/// `Route::Away` and prints `7`, silently. `std::ui::View::swap` is exactly this
-/// shape, and the routing guide's `swap(route, |current| match current { .. })`
-/// is the documented, shipped use, so a blanket error on a `Type::Generic`
-/// scrutinee takes the guide with it (probed: 3 diagnostics in
-/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`).
-///
-/// The fix is not at the pattern — it is to instantiate the closure parameter
-/// the way the free-function twin above already does. `#[ignore]`d: it asserts
-/// the diagnostic, and today the program compiles and runs.
+// --- B90: a closure argument to a generic's parameter, substituted ----------
+// B82's residual half, and NOT a pattern-checker gap: the closure's parameter
+// reached its body still typed as the abstract `T`, so the match inside was
+// checked against nothing and `Other::Second`'s payload came out of a
+// `Route::Away`, silently. The root cause is one-shot-ness. An unannotated
+// closure parameter's type slot is filled only while it is `Unknown`, so
+// whoever writes it first wins forever — and both call paths were willing to
+// write it from a substitution they knew to be incomplete:
+//
+//   * the METHOD path bound the callee's own generics from the non-closure
+//     arguments, typed the closure arguments, and only THEN decided to defer
+//     because an argument's type had not landed. On the attempt where
+//     `Route::Away(7)` was still `Unresolved`, `T` was unbound, `render: |T|
+//     i32` typed `current` as the abstract `T`, and the retry that finally knew
+//     `T = Route` found the slot already taken.
+//   * the FREE path walks its parameters positionally and defers at the first
+//     `Unresolved` argument, which is why `apply(value, render)` was right —
+//     but `apply(render, value)`, with the closure standing FIRST, hit the same
+//     wall for the same reason.
+//
+// So the fix is one rule in both places: bind the own generics from the
+// non-closure arguments, and defer BEFORE typing any closure while an
+// argument's type has not landed. `bind_callee_own_generics` is now shared,
+// differing only by whether the parameter list starts with `self`.
+
+/// B90's headline case, `#[ignore]`d until the fix: the wrong enum inside a
+/// closure passed to a METHOD's own generic. `std::ui::View::swap` is exactly
+/// this shape, and the routing guide's `swap(route, |current| match current {
+/// .. })` is the documented, shipped use — which is why B82 refused to make a
+/// `Type::Generic` scrutinee a blanket error (probed then: 3 diagnostics in
+/// `docs/guide/routing.md`, 2 in `docs/guide/dev-loop.md`) and left this to
+/// instantiation instead.
 #[test]
-#[ignore]
 fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
     assert_fails_with(
         r#"
@@ -43727,6 +47732,233 @@ fn a_closure_argument_to_a_methods_generic_gets_the_real_check() {
         }
         "#,
         "does not belong to the matched enum",
+    );
+    // The half that must keep working — the RIGHT enum, through the same
+    // method. A diagnostic that also rejects this would be no fix at all.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The substitution reaches the closure parameter as a TYPE, not just as a
+/// pattern scrutinee: a method call on it resolves against the binding. This is
+/// the sharper probe of the two — a pattern can match by coincidence of
+/// representation, but `current.code()` either resolves or does not, and before
+/// the fix it did not ("cannot call method 'code' on T").
+#[test]
+fn a_closure_parameter_typed_by_a_methods_generic_reaches_its_methods() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Home, |current| current.code()));
+        }
+        "#,
+        "7\n0\n",
+    );
+}
+
+/// The ordering edge, both paths. The argument that FIXES the generic used to
+/// have to stand before the closure that consumes it, because the free path
+/// walks parameters positionally; the method path's two-phase binding never had
+/// that constraint and now the free path shares it. `apply(render, value)` is
+/// the same call as `apply(value, render)`.
+#[test]
+fn a_closure_argument_is_substituted_before_the_argument_that_fixes_the_generic() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, render: |T| i32, value: T): i32 { render(value) }
+        }
+
+        fun main() {
+            print(free(|current| current.code(), Route::Away(4)));
+            print(Holder { tag = 0 }.apply(|current| match current {
+                Route::Home => 0,
+                Route::Away(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "4\n7\n",
+    );
+    // And the wrong enum is still caught with the arguments in that order.
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        fun free<T>(render: |T| i32, value: T): i32 { render(value) }
+
+        fun main() {
+            print(free(|current| match current {
+                Other::First => 0,
+                Other::Second(let id) => id,
+            }, Route::Away(7)));
+        }
+        "#,
+        "does not belong to the matched enum",
+    );
+}
+
+/// The callee shapes that share the two-phase rule: a STATIC (no `self`, so the
+/// free path's offset), a trait DEFAULT reached through an impl that declares
+/// nothing (Gap E's dispatch, whose parameters are written in the trait's terms),
+/// and a method whose generic comes from the impl's binder rather than its own
+/// list. Each was a separate route to the same abstract-`T` parameter.
+#[test]
+fn every_callee_shape_substitutes_its_closure_arguments_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun statically<T>(value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        trait Applier {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+        impl Holder with Applier {}
+
+        struct Boxed<T> { held: T }
+        impl Boxed<type T> {
+            fun mapped(self, render: |T| i32): i32 { render(self.held) }
+        }
+
+        fun main() {
+            print(Holder::statically(Route::Away(1), |current| current.code()));
+            print(Holder { tag = 0 }.apply(Route::Away(2), |current| current.code()));
+            print(Boxed { held = Route::Away(3) }.mapped(|current| current.code()));
+        }
+        "#,
+        "1\n2\n3\n",
+    );
+}
+
+/// Nested closures: the inner call's own generic binds from a value whose type
+/// is itself the outer closure's parameter, so the outer substitution has to
+/// have landed before the inner one is attempted. Both parameters used to reach
+/// their bodies abstract.
+#[test]
+fn a_closure_nested_in_a_closure_argument_is_substituted_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun apply<T>(self, value: T, render: |T| i32): i32 { render(value) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }.apply(Route::Away(7), |current|
+                Holder { tag = 1 }.apply(current, |inner| inner.code())));
+        }
+        "#,
+        "7\n",
+    );
+}
+
+/// The closure's RETURN type is substituted by the same binding, and checked.
+/// `step: |T| T` under `T = Route` is BOTH halves at once — the parameter the
+/// body reads through and the value it must hand back — and they travel through
+/// one `substitute_type` `Type::Closure` arm, so this pins that they cannot
+/// drift apart. (The one-sided `|i32| T` shape was never broken: its parameter
+/// is concrete, so the one-shot slot had nothing abstract to freeze at.)
+#[test]
+fn a_closure_arguments_return_type_is_checked_against_the_generics_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        impl Route {
+            fun code(self): i32 { if self is Route::Away(let id) { id } else { 0 } }
+        }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            print(Holder { tag = 0 }
+                .twice(Route::Away(1), |current| Route::Away(current.code() + 1))
+                .code());
+        }
+        "#,
+        "3\n",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        enum Route { Home, Away(i32) }
+        enum Other { First, Second(i32) }
+
+        struct Holder { tag: i32 }
+        impl Holder {
+            fun twice<T>(self, seed: T, step: |T| T): T { step(step(seed)) }
+        }
+
+        fun main() {
+            let made = Holder { tag = 0 }.twice(Route::Away(1), |current| Other::Second(3));
+            print(1);
+        }
+        "#,
+        "Expected |Route| Route, but got |Route| Other instead.",
     );
 }
 
@@ -44240,7 +48472,7 @@ fn b79_a_fractional_discriminant_is_rejected_rather_than_truncated() {
         enum Fraction { X = 1.5, Y = 7 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1.5` is not",
+        "an enum backing value must be an integer or a string, and `1.5` is neither",
     );
 }
 
@@ -44254,14 +48486,14 @@ fn b79_a_suffixed_discriminant_is_rejected_rather_than_dropped() {
         enum Grouped { A = 1_000, B = 1 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1_000` carries the trailer `_000`",
+        "an enum backing value must be an integer or a string, and `1_000` carries the trailer `_000`",
     );
     assert_fails_with(
         r#"
         enum Suffixed { A = 1u32, B = 2 }
         fun main() { }
         "#,
-        "an enum discriminant must be an integer, and `1u32` carries the trailer `u32`",
+        "an enum backing value must be an integer or a string, and `1u32` carries the trailer `u32`",
     );
 }
 
@@ -44344,23 +48576,22 @@ fn b79_a_payload_variant_cannot_carry_a_discriminant() {
         enum Pay { A(str) = 1, B }
         fun main() { }
         "#,
-        "variant 'A' carries a payload, so it cannot have an explicit discriminant",
+        "variant 'A' carries a payload, so it cannot have an explicit backing value",
     );
 }
 
 #[test]
 fn b79_a_discriminant_beside_a_payload_variant_is_rejected() {
-    // P6, and the shape the rule is really about: `is_numeric` is a
-    // CONJUNCTION — all-data-less AND any-explicit-discriminant — so `B`'s
-    // payload flips the whole enum to the tagged form and `A = 1` is inert. It
-    // parsed, it was stored in `EnumVariantDeclaration::discriminant`, and
-    // nothing would ever read it.
+    // P6, and the shape the rule is really about: `backing` is a CONJUNCTION —
+    // all-data-less AND any-explicit-value — so `B`'s payload flips the whole
+    // enum to the tagged form and `A = 1` is inert. It parsed, it was stored in
+    // `EnumVariantDeclaration::backing_value`, and nothing would ever read it.
     assert_fails_noting(
         r#"
         enum Mixed { A = 1, B(str) }
         fun main() { }
         "#,
-        "an explicit discriminant is only meaningful when every variant is data-less, and 'B' \
+        "an explicit backing value is only meaningful when every variant is data-less, and 'B' \
          carries a payload",
         "B(str)",
         "'B' carries a payload here",
@@ -44863,5 +49094,1278 @@ fn b83_a_trait_provided_method_is_still_refused_on_the_type_path() {
         fun main() { let s = Bag::show(Bag { n = 1 }); }
         "#,
         "'show' is not an inherent member of 'Bag'",
+    );
+}
+
+/// The number of interned types left behind by analyzing `source` — a
+/// deterministic, load-independent measure of how much work the constraint
+/// fixpoint did. Every attempt mints fresh type ids unconditionally, so a
+/// fixpoint that keeps retrying a stuck constraint set grows this table in
+/// direct proportion to the passes it ran.
+fn interned_type_count(source: &str) -> usize {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let program = program.expect("the probe programs must analyze");
+            assert!(
+                errors.is_empty(),
+                "the probe programs must be clean: {errors:?}"
+            );
+            program.type_id_to_type_map.len()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the probe worker must not panic")
+}
+
+#[test]
+fn the_constraint_fixpoint_stops_when_it_settles() {
+    // E43 (`suite-speed.md` §8). `import std::set` leaves ten constraints
+    // permanently deferred — legitimately unresolvable, committed to defaults
+    // by `finalize_build`. The solving loop is supposed to notice it has
+    // settled and stop; instead it counted every attempt's unconditional
+    // type-id MINTING as progress, so its quiescence test could never pass and
+    // it ran to `max_iterations` — ~14 000 passes over those ten constraints,
+    // ~2.2 s of a ~2.4 s import, and the same bill again inside every macro
+    // world (`macro_std` re-exports `std::set`, so `[derive(Debug)]` paid it
+    // twice over).
+    //
+    // `std::map` is the control: the same 111 lines, the same shape, no stuck
+    // constraints — and it always converged. Pinning `set` AGAINST `map`
+    // states the property that actually matters ("set costs what map costs")
+    // and stays honest as std grows, where an absolute bound would rot.
+    let set = interned_type_count(
+        "import std::set::Set;\n\nfun main() {\n\tmut s: Set<i32> = Set::new();\n\ts.insert(1);\n}\n",
+    );
+    let map = interned_type_count(
+        "import std::map::Map;\n\nfun main() {\n\tmut m: Map<str, i32> = Map::new();\n\tm.insert(\"a\", 1);\n}\n",
+    );
+    assert!(
+        set < map * 2,
+        "a settled fixpoint must stop: `import std::set` interned {set} types \
+         against `import std::map`'s {map}. A ratio this large means the loop is \
+         spinning on permanently deferred constraints again (E43)."
+    );
+}
+
+// --- B95: a monomorphized instance is keyed on what its type arguments ARE,
+// --- not on which type ids happen to spell them. Types are deliberately not
+// --- interned (`type_id_for_type`: "each call mints a fresh id"), so writing
+// --- `List<i32>` twice mints two ids for the `i32` inside — and the instance
+// --- key, which used to be `format!("{:?}", type_)`, spells its arguments as
+// --- raw `TypeId`s one level down. Two structurally-equal instantiations
+// --- therefore keyed apart and the SAME body was emitted twice under two
+// --- names. Found by B90's arc (an unconditional hoist re-inferred an argument
+// --- earlier, minted its id earlier, and produced a byte-identical duplicate
+// --- `Signal::new`); the corpus carried 19 such duplicates across five
+// --- programs before the key went structural.
+// ---
+// --- A count, not a run: a duplicate instance is behaviour-identical, so
+// --- `assert_compiles_and_runs` cannot see it. Each shape of nested type id
+// --- gets its own pin, and each merging pin is twinned with a splitting one —
+// --- the key must be COARSER, never wrong.
+
+/// The B95 probe body: a distinctive expression the instance emits once.
+fn b95_program(annotation: &str, first: &str, second: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        fun through<T>(value: T): T {{
+            print(4242);
+            value
+        }}
+        fun main() {{
+            let a: {annotation} = {first};
+            let b: {annotation} = {second};
+            through(a);
+            through(b);
+        }}
+        "#
+    )
+}
+
+/// The filed shape: one nominal type argument, written twice.
+#[test]
+fn b95_two_spellings_of_one_nominal_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("List<i32>", "List::new()", "List::new()"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// Nested one level deeper — the key has to RECURSE, not just resolve the
+/// outermost argument. `List<List<i32>>`'s duplicate id is the inner one.
+#[test]
+fn b95_a_nested_nominal_argument_shares_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("List<List<i32>>", "List::new()", "List::new()"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A tuple's elements are type ids too.
+#[test]
+fn b95_two_spellings_of_one_tuple_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("(i32, str)", r#"(1, "x")"#, r#"(2, "y")"#),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// An array's element type is a type id; its LENGTH is not (it is a `usize`),
+/// which the splitting twin below pins.
+#[test]
+fn b95_two_spellings_of_one_array_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("[i32; 3]", "[1, 2, 3]", "[4, 5, 6]"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A closure type's parameters and return are type ids.
+#[test]
+fn b95_two_spellings_of_one_closure_type_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            &b95_program("|i32| i32", "|n| n + 1", "|n| n + 2"),
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The multi-parameter form: two generics, each re-spelled, one instance.
+#[test]
+fn b95_a_two_generic_instantiation_shares_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun pair<T, U>(left: T, right: U): T {
+                print(4242);
+                left
+            }
+            fun main() {
+                let a: List<i32> = List::new();
+                let b: List<str> = List::new();
+                let c: List<i32> = List::new();
+                let d: List<str> = List::new();
+                pair(a, b);
+                pair(c, d);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// A METHOD instance, not a free call: the same key is what
+/// `method_call_substitution` flows into.
+#[test]
+fn b95_two_spellings_of_a_method_receiver_share_an_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            struct Holder<T> { value: T }
+            impl Holder<type T> {
+                fun show(self): T {
+                    print(4242);
+                    self.value
+                }
+            }
+            fun main() {
+                let a: Holder<List<i32>> = Holder { value = List::new() };
+                let b: Holder<List<i32>> = Holder { value = List::new() };
+                a.show();
+                b.show();
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The splitting twin: DIFFERENT nominal arguments still get their own
+/// instance. Without this the merging pins above are satisfied by a key that
+/// collapses everything.
+#[test]
+fn b95_different_nominal_arguments_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: List<i32> = List::new();
+                let b: List<str> = List::new();
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The splitting twin for a length that is not a type id: `[i32; 3]` and
+/// `[i32; 4]` are distinct types and must stay distinct instances.
+#[test]
+fn b95_arrays_of_different_lengths_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: [i32; 3] = [1, 2, 3];
+                let b: [i32; 4] = [1, 2, 3, 4];
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The splitting twin for nesting: the recursion must reach the inner
+/// argument in the OTHER direction too — `List<List<i32>>` and
+/// `List<List<str>>` differ only two levels down.
+#[test]
+fn b95_nested_arguments_that_differ_deep_still_split_the_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun main() {
+                let a: List<List<i32>> = List::new();
+                let b: List<List<str>> = List::new();
+                through(a);
+                through(b);
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+// --- B102: a call's recorded substitution is about the CALLEE, and says
+// --- something. Every entry joins the monomorphization instance key
+// --- (`transformer.rs`'s `emit_instance_with_bits`), so an entry that names a
+// --- constraint the callee's body cannot mention — or that "binds" a
+// --- constraint to itself — splits an instance off from the identical ones it
+// --- belongs with. Between them those two entries were the whole reason B90's
+// --- hoisted pre-binding pass stayed gated on argument order for two cycles;
+// --- with both refused at the record, the hoist is unconditional and all 112
+// --- corpus goldens are byte-identical.
+
+/// The filed shape, minimised. `through` is called at the top level AND from
+/// inside another generic body. At the nested call the pre-binding pass fixes
+/// the parameter's `T` before the positional loop reaches it, so the loop
+/// reconciles the already-substituted parameter against the argument and
+/// reports the CALLER's `U` bound to itself as well — `{T: U, U: U}` against
+/// the outer call's `{T: i32}`. `through`'s body cannot mention `U`; one
+/// instance, not two.
+#[test]
+fn b102_a_callers_generic_does_not_split_the_callees_instance() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun forward<U>(value: U): U {
+                through(value)
+            }
+            fun main() {
+                print(through(1));
+                print(forward(2));
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        1,
+    );
+}
+
+/// The splitting twin: the filter drops what the callee cannot mention, and
+/// nothing else. Two genuinely different instantiations still get their own
+/// instance — without this the pin above is satisfied by a key that collapses
+/// every call to one body.
+#[test]
+fn b102_a_different_instantiation_through_a_forwarder_still_splits() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            fun through<T>(value: T): T {
+                print(4242);
+                value
+            }
+            fun forward<U>(value: U): U {
+                through(value)
+            }
+            fun main() {
+                print(through(1));
+                print(forward("x"));
+            }
+            "#,
+            "console.log(4242)",
+        ),
+        2,
+    );
+}
+
+/// The bound on the filter, and the reason it is written as "the callee's own
+/// constraints" rather than the tempting "anything that binds a generic to
+/// ITSELF". A self-recursive call binds `T` to the enclosing `T`, which IS the
+/// identity — and is real: it says this call instantiates at whatever the
+/// enclosing instance does. `wrap`'s `T` is `wrap`'s own constraint, so the
+/// filter keeps it. The blanket identity filter was tried, and this shape is
+/// what refuted it: the bound went unrecorded and the call reported "cannot
+/// infer 'T' for this call; its bound ': Slot' cannot be checked".
+#[test]
+fn b102_a_self_recursive_call_keeps_its_own_generic_bound() {
+    compile_browser(
+        r#"
+        import std::ui::{ Slot, mount, view, View };
+        fun wrap<T: Slot>(content: T, depth: i32): View {
+            if depth > 0 {
+                wrap(content, depth - 1)
+            } else {
+                view("p").child(content)
+            }
+        }
+        fun main() {
+            mount("app", wrap("static", 3));
+        }
+        main();
+        "#,
+    )
+    .expect("a self-recursive call still records its own generic");
+}
+
+/// The second writer: return-type-only inference. `Map::new()`'s binders are
+/// fixed by nothing but the expectation, and under an expectation substitution
+/// has already made abstract it unifies `Map<K, V>` with `Map<K, V>` and
+/// "infers" `{K: K, V: V}`. Recording that put a whole instance key's worth of
+/// nothing on the call: the generic body was re-emitted under a generated
+/// instance name instead of staying the one shared source-named declaration
+/// `inherited_substitution` gives it.
+#[test]
+fn b102_a_static_the_call_cannot_instantiate_stays_one_declaration() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            import std::map::Map;
+            import std::reactive::Signal;
+            fun main() {
+                let scores: Signal<Map<str, i32>> = Signal::new(Map::new());
+                print(scores.get().len());
+            }
+            "#,
+            "function new",
+        ),
+        1,
+    );
+}
+
+/// An impl hung off a TRAIT binds its binder there — `impl Iterator<type T> {
+/// fun from_fn(fn: || T): FromFn<T> }` — and `impl_binder_generics` read only
+/// `Struct`/`Enum` subjects, so `T` was not among the constraints the call may
+/// bind. Once the record keys on that set, the missing binder took the whole
+/// substitution with it and the static stopped monomorphizing: the emitted
+/// program grew a plain `from_fn` declaration where the instance had been.
+#[test]
+fn b102_a_static_on_a_trait_monomorphizes_through_its_binder() {
+    assert_eq!(
+        emitted_occurrences(
+            r#"
+            import std::print;
+            trait Iterator<T> {
+                fun next(self): T;
+            }
+            struct FromFn<T> {
+                fn: || T,
+            }
+            impl FromFn<type T> with Iterator<T> {
+                fun next(self) {
+                    (self.fn)()
+                }
+            }
+            impl Iterator<type T> {
+                fun from_fn(fn: || T): FromFn<T> {
+                    FromFn { fn }
+                }
+            }
+            fun main() {
+                mut i = 0;
+                let naturals = Iterator::from_fn(|| {
+                    i += 1;
+                    i
+                });
+                print(naturals.next());
+            }
+            "#,
+            "function from_fn",
+        ),
+        0,
+    );
+}
+
+/// The whole arc, behaviourally: the shapes above run, and run the same. The
+/// counts are the point (a duplicate instance is behaviour-identical, which is
+/// why the pins above count), but a schedule change that makes every call take
+/// the two-phase order has to keep the programs correct too.
+#[test]
+fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun apply<T>(render: |T| i32, value: T): i32 {
+            render(value)
+        }
+        fun apply_last<T>(value: T, render: |T| i32): i32 {
+            render(value)
+        }
+        fun main() {
+            print(apply(|n| n * 2, 21));
+            print(apply_last(21, |n| n * 2));
+        }
+        "#,
+        "42\n42\n",
+    );
+}
+
+// --- B76: backed enums — the grammar and its validation ----------------------
+//
+// `proposal/backed-enums.md`, RATIFIED with §7.2 deferred. The discriminant
+// production GENERALIZES: `= ( (-)? INTEGER | STRING )`. This is not a new kind
+// of enum — a payload-free variant may carry a compile-time-constant scalar,
+// and an enum whose variants carry one lowers to that scalar BARE. Everything
+// B79 closed for the integer half applies unchanged to the string half; the
+// rules below are the ones the string half adds.
+
+#[test]
+fn b76_a_string_backed_enum_lowers_to_its_bare_string() {
+    // §3.5, the whole thesis: `Align::Start` IS `"flex-start"` at runtime,
+    // exactly as `Ordering::Greater` IS `1` (P1). No array, no wrapper.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() { print(Align::Start); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"console.log("flex-start")"#),
+        "Align::Start should lower to the bare string, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("[0]"),
+        "no array form should survive, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
+    // §1.4/P2: a string backing needs NO new codegen path. The emitted `match`
+    // is character-for-character the chain a `match` over a raw `str` produces
+    // — `scalar_variant_test` with a `js::Node::String` where the
+    // `js::Node::Number` is — which is what makes the feature a widening rather
+    // than a new lowering. Compared as WHOLE EMISSIONS, so a divergence
+    // anywhere in the shape (a temp, a wrapper, a jump table) fails this.
+    let backed = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "start", End = "end", Center = "center" }
+        fun classify(a: Align): i32 {
+            match a { Align::Start => 0, Align::End => 1, Align::Center => 2 }
+        }
+        fun main() { print(classify(Align::End)); }
+        "#,
+    )
+    .expect("a clean compile");
+    let raw = compile(
+        r#"
+        import std::print;
+        fun classify(a: str): i32 {
+            match a { "start" => 0, "end" => 1, _ => 2 }
+        }
+        fun main() { print(classify("end")); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert_eq!(
+        backed, raw,
+        "a backed enum's match should emit exactly what the raw `str` match emits"
+    );
+}
+
+#[test]
+fn b76_a_string_backed_enum_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end", Center = "center" }
+        fun main() {
+            let a = Align::End;
+            print(match a { Align::Start => "s", Align::End => "e", Align::Center => "c" });
+            print(a == Align::End);
+            print(a != Align::Start);
+            print(a is Align::End);
+        }
+        "#,
+        "e\ntrue\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn b76_a_backing_value_is_not_a_second_spelling_of_the_variant() {
+    // §1.5/§3.7: exhaustiveness is checked on the variant SET by name, and a
+    // raw literal pattern stays an error for strings exactly as it already is
+    // for integers. The backing value is a representation, not a name.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun f(a: Align): i32 { match a { "start" => 0, _ => 1 } }
+        fun main() { }
+        "#,
+        "cannot match type",
+    );
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun f(a: Align): i32 { match a { Align::Start => 0 } }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'End'",
+    );
+}
+
+#[test]
+fn b76_mixed_backings_in_one_enum_are_rejected() {
+    // §3.2. An enum has ONE runtime representation; a value that is sometimes a
+    // number and sometimes a string is not a vilan type, and `.value()` would
+    // have no return type. Both directions, because either literal could be the
+    // typo — the message names both variants and both spellings.
+    assert_fails_noting(
+        r#"
+        enum X { A = 1, B = "two" }
+        fun main() { }
+        "#,
+        "variant 'B' is backed by a string (`\"two\"`) where 'A' is backed by an integer",
+        "1",
+        "'A' backs 'X' with an integer",
+    );
+    assert_fails_noting(
+        r#"
+        enum Y { A = "one", B = 2 }
+        fun main() { }
+        "#,
+        "variant 'B' is backed by an integer (`2`) where 'A' is backed by a string",
+        "\"one\"",
+        "'A' backs 'Y' with a string",
+    );
+}
+
+#[test]
+fn b76_a_string_backing_must_be_written_on_every_variant() {
+    // §3.1(a). C-style auto-increment is meaningful for integers; there is no
+    // successor of `"start"`. Deriving the string from the variant NAME is the
+    // rejected alternative (§2.1's evidence: five of std's eleven CSS enums have
+    // names no case convention produces).
+    assert_fails_noting(
+        r#"
+        enum X { A = "a", B }
+        fun main() { }
+        "#,
+        "variant 'B' has no backing value, and a string backing has no successor",
+        "\"a\"",
+        "'A' backs 'X' with a string here",
+    );
+    // The integer half is untouched — the sequence continues as it always has.
+    assert_compiles(
+        r#"
+        enum Y { A = 5, B, C }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_two_variants_cannot_share_a_string_backing() {
+    // §3.7, B79's uniqueness rule widened. Two variants sharing a value ARE one
+    // runtime value: the second `match` arm is unreachable and an exhaustive
+    // match returns the wrong answer with exit 0. A CSS keyword collision is a
+    // typo, not an exotic input — std writes `Display::Hidden => "none"` and
+    // `UserSelect::Off => "none"` in different enums today.
+    assert_fails_noting(
+        r#"
+        enum Align { Start = "a", End = "a" }
+        fun main() { }
+        "#,
+        "variant 'End' has backing value \"a\", which 'Start' already uses",
+        "Start = \"a\"",
+        "'Start' has backing value \"a\"",
+    );
+    // The same value in two DIFFERENT enums stays legal — that is the shape
+    // std's `Display::Hidden` / `UserSelect::Off` pair really has.
+    assert_compiles(
+        r#"
+        enum Display { Hidden = "none", Flex = "flex" }
+        enum UserSelect { Off = "none", All = "all" }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_payload_variant_cannot_carry_a_string_backing() {
+    // §3.3, the string half of the rule B79 shipped for integers. A bare
+    // backing value has nowhere to put a payload.
+    assert_fails_with(
+        r#"
+        enum X { A(str) = "a", B = "b" }
+        fun main() { }
+        "#,
+        "variant 'A' carries a payload, so it cannot have an explicit backing value",
+    );
+    assert_fails_noting(
+        r#"
+        enum Y { A = "a", B(i32) }
+        fun main() { }
+        "#,
+        "an explicit backing value is only meaningful when every variant is data-less, and 'B' \
+         carries a payload",
+        "B(i32)",
+        "'B' carries a payload here",
+    );
+}
+
+#[test]
+fn b76_the_backing_type_set_is_str_and_the_integers() {
+    // §3.4. Floats are rejected by the integer rule (their `===` lowering and
+    // `NaN !== NaN` would break both the duplicate check and every variant
+    // test); `bool` never reaches the production at all, `bool` being itself an
+    // enum that already lowers to native `true`/`false`. The production states
+    // its own set rather than deferring to a later rule.
+    assert_fails_with(
+        r#"
+        enum X { A = true, B = false }
+        fun main() { }
+        "#,
+        "expected an integer, a string",
+    );
+    assert_fails_with(
+        r#"
+        enum Y { A = 1.5 }
+        fun main() { }
+        "#,
+        "an enum backing value must be an integer or a string, and `1.5` is neither",
+    );
+}
+
+#[test]
+fn b76_ordering_operators_are_rejected_on_a_string_backing() {
+    // §3.6. `Size::Large < Size::Small` would be TRUE because `"lg" < "sm"`,
+    // and the thing a reader means — order by declaration index — cannot be
+    // provided, because bare lowering erases the index at runtime. `==`/`!=`
+    // stay; the integer form is untouched (P8).
+    for operator in ["<", "<=", ">", ">="] {
+        assert_fails_with(
+            &format!(
+                r#"
+                enum Size {{ Large = "lg", Small = "sm" }}
+                fun f(a: Size, b: Size): bool {{ a {operator} b }}
+                fun main() {{ }}
+                "#
+            ),
+            "`Size` is backed by strings, and a backing value is not an order",
+        );
+    }
+    assert_compiles(
+        r#"
+        enum Size { Large = "lg", Small = "sm" }
+        fun f(a: Size, b: Size): bool { a == b || a != b }
+        fun main() { }
+        "#,
+    );
+    // The integer backing still orders, which is what `std::compare`'s
+    // `PartialOrd` defaults depend on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Level { Low = 0, High = 1 }
+        fun main() { print(Level::Low < Level::High); }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b76_adding_a_string_backing_does_not_move_the_integer_path() {
+    // §5's premise, pinned: the grammar is WIDENED, not altered. Every existing
+    // integer-discriminant enum compiles identically and emits identical
+    // JavaScript.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Ordering2 { Less = -1, Equal = 0, Greater = 1 }
+        fun main() {
+            print(match Ordering2::Greater {
+                Ordering2::Less => "less",
+                Ordering2::Equal => "equal",
+                Ordering2::Greater => "greater",
+            });
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("=== -1") && javascript.contains("=== 0"),
+        "the integer chain should be unchanged, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_keeps_its_array_form() {
+    // §3.1(b): the conjunction stays a conjunction. `enum Plain { A, B }` is
+    // NOT backed, and adding `= 0` to one variant changes the representation of
+    // the whole type — a wart, preserved deliberately, because changing it
+    // would change the runtime representation of every payload-free enum in
+    // every existing program.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Plain { A, B }
+        fun main() { print(match Plain::B { Plain::A => "a", Plain::B => "b" }); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("[0] === 0"),
+        "a plain enum should keep the `[index]` array form, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_backing_string_keeps_its_escapes() {
+    // The literal is carried raw and unescaped at emission like any other
+    // string, so a backing value may hold whatever the host speaks.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Quoted { Tab = "a\tb", Quote = "say \"hi\"" }
+        fun main() {
+            print(match Quoted::Quote { Quoted::Tab => "tab", Quoted::Quote => "quote" });
+            print(Quoted::Tab);
+        }
+        "#,
+        "quote\na\tb\n",
+    );
+}
+
+// --- B76: the conversions — `.value()` out, `Enum::parse` back ---------------
+//
+// §3.8, synthesized on every backed enum rather than opted into by a derive
+// (§7.3 — the backing value is already the opt-in). Written as vilan source, so
+// a user's own `value` meets B57's duplicate-inherent rule; `value()` still
+// costs nothing, because the transformer folds the call to its receiver.
+
+#[test]
+fn b76_value_returns_the_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun main() {
+            print(Align::End.value());
+            print(Level::Low.value());
+        }
+        "#,
+        "flex-end\n-1\n",
+    );
+}
+
+#[test]
+fn b76_value_lowers_to_the_identity() {
+    // The receiver already IS the backing value, so `value.value()` compiles to
+    // `value` — that is what makes std's eleven CSS wrappers delete outright
+    // instead of moving their `match` chains into the emitted output. The
+    // folded-away body then has no callers and emits nothing.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun render(value: Align): str { value.value() }
+        fun main() { print(render(Align::Start)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("return value;"),
+        "`value.value()` should compile to `value`, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function value"),
+        "the synthesized `value` body should emit nothing once folded, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_parse_round_trips_and_answers_none_outside_the_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Level { Low = -1, High = 2 }
+        fun show(parsed: Option<Align>): str {
+            match parsed { Option::Some(let a) => a.value(), Option::None => "none" }
+        }
+        fun main() {
+            print(show(Align::parse("flex-start")));
+            print(show(Align::parse("flex-end")));
+            print(show(Align::parse("middle")));
+            print(match Level::parse(2) {
+                Option::Some(let l) => l.value(),
+                Option::None => 0,
+            });
+            print(match Level::parse(7) { Option::Some(let l) => l.value(), Option::None => 0 });
+        }
+        "#,
+        "flex-start\nflex-end\nnone\n2\n0\n",
+    );
+}
+
+#[test]
+fn b76_parse_needs_no_option_import_at_the_declaration() {
+    // The synthesized block carries its own `Option`, so a module that declares
+    // a backed enum and never mentions `Option` still compiles.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_user_declared_value_or_parse_is_a_hard_error() {
+    // §3.8's collision rule, reached through B57 rather than through a rule of
+    // its own: a synthesized member that quietly loses is worse than a visible
+    // name clash. The note says the other declaration is the compiler's,
+    // because there is no file to point at.
+    assert_fails_with(
+        r#"
+        enum A { X = "x", Y = "y" }
+        impl A { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+        "'value' is already defined for 'A'",
+    );
+    assert_fails_with(
+        r#"
+        enum B { X = "x", Y = "y" }
+        impl B { fun parse(text: str): str { "nope" } }
+        fun main() { }
+        "#,
+        "'parse' is already defined for 'B'",
+    );
+    // …and the note names the synthesized member rather than pointing the
+    // author's own declaration back at itself.
+    let diagnostics = failure_diagnostics_with_notes(
+        r#"
+        enum C { X = "x", Y = "y" }
+        impl C { fun value(self): str { "nope" } }
+        fun main() { }
+        "#,
+    );
+    assert!(
+        diagnostics.iter().any(|(_, _, note)| note
+            .as_ref()
+            .is_some_and(|(msg, _, _)| msg.contains("synthesized for 'C' by the compiler"))),
+        "got: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_gets_no_conversions() {
+    // The negative space: `value`/`parse` exist because a backing value was
+    // written, so a plain enum and a payload enum keep their surfaces free.
+    assert_fails_with(
+        r#"
+        enum Plain { A, B }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+        "value",
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        impl Plain { fun value(self): i32 { 0 } }
+        fun main() { let x = Plain::A.value(); }
+        "#,
+    );
+}
+
+#[test]
+fn b76_a_wide_integer_backing_widens_the_conversion_type() {
+    // The backing type is the narrowest plain-JS-number integer that holds
+    // every discriminant: `i32` by default (the language's default integer, so
+    // `Ordering::Greater.value() == 1` needs no suffix), `i53` when a
+    // discriminant does not fit.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Wide { Big = 3000000000, Small = 1 }
+        fun main() { print(Wide::Big.value()); }
+        "#,
+        "3000000000\n",
+    );
+}
+
+#[test]
+fn b76_std_ordering_gains_the_conversions() {
+    // std's one pre-existing backed enum picks them up like any other, and its
+    // `value()` is the identity over the bare discriminant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::Ordering;
+        import std::option::Option;
+        fun main() {
+            print(Ordering::Greater.value());
+            print(match Ordering::parse(-1) {
+                Option::Some(let o) => o.value(),
+                Option::None => 99,
+            });
+        }
+        "#,
+        "1\n-1\n",
+    );
+}
+
+// --- B76: `Wire`/JSON serialize as the backing value -------------------------
+//
+// §3.9, and the one genuine format change in the arc. Today's derive keys on
+// the variant NAME and ignores the discriminant entirely (P9: `Ordering::
+// Greater` went on the wire as `"Greater"`), so this is a DIVERGENCE rather
+// than an extension — taken now because §1.6 checked it costs nothing: there is
+// no `[derive(Wire)]` or `[derive(Json)]` enum anywhere in `vilan/std/src/`.
+
+#[test]
+fn b76_a_backed_enum_encodes_as_its_backing_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Json)]
+        enum Code { Ok = 200, NotFound = 404 }
+        fun main() {
+            print(Align::Start.to_json());
+            print(Code::NotFound.to_json());
+        }
+        "#,
+        "\"flex-start\"\n404\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_decodes_from_its_backing_value() {
+    // The reverse direction goes through the synthesized `parse`, so a value
+    // outside the set is `Err` rather than a confidently wrong variant.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun show(decoded: Result<Align, str>): str {
+            match decoded { Result::Ok(let a) => a.value(), Result::Err(let e) => e }
+        }
+        fun main() {
+            print(show(Align::from_json("\"flex-end\"")));
+            print(show(Align::from_json("\"middle\"")));
+        }
+        "#,
+        "flex-end\nunknown value in JSON for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_round_trips_through_wire() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::json_codec;
+        import std::result::Result;
+        import std::wire::{ Wire, encode, decode };
+        [derive(Wire)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Wire)]
+        struct Holder { align: Align, count: i32 }
+        fun main() {
+            let back: Result<Holder, str> =
+                decode(json_codec(), encode(json_codec(), Holder { align = Align::End, count = 3 }));
+            match back {
+                Result::Ok(let holder) => print(holder.align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+            let bad: Result<Align, str> = decode(json_codec(), encode(json_codec(), "middle"));
+            match bad {
+                Result::Ok(let align) => print(align.value()),
+                Result::Err(let reason) => print(reason),
+            }
+        }
+        "#,
+        "flex-end\nunknown value for enum Align\n",
+    );
+}
+
+#[test]
+fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
+    // The negative space, and the reason §3.9 is a divergence and not a
+    // rewrite: an enum with no backing value keeps the externally-tagged form
+    // exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result;
+        [derive(Json)]
+        enum Plain { A, B }
+        [derive(Json)]
+        enum Payload { Text(str), Count(i32) }
+        fun main() {
+            print(Plain::B.to_json());
+            print(Payload::Text("hi").to_json());
+            print(match Plain::from_json("\"A\"") {
+                Result::Ok(Plain::A) => "a",
+                Result::Ok(Plain::B) => "b",
+                Result::Err(let e) => e,
+            });
+        }
+        "#,
+        "\"B\"\n{\"Text\":\"hi\"}\na\n",
+    );
+}
+
+// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
+// enum ------------------------------------------------------------------------
+//
+// The parameter direction is safe — vilan constructs the value, so it is always
+// in the set. The return direction is not, and what happens then is the reason
+// for the deferral: an exhaustive `match` compiles its last arm to a bare
+// `else` (there is no "impossible" trap arm), so a host value outside the set
+// silently takes whichever arm happens to be last. It is not detectably wrong;
+// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
+// `parse()` path, where an out-of-set value honestly yields `None`, until
+// backed enums grow a trap-arm story.
+
+#[test]
+fn b76_an_external_fun_cannot_return_a_backed_enum() {
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
+    );
+    // The message names the way out rather than only the prohibition (B6).
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        fun main() { }
+        "#,
+        "convert with `Align::parse`",
+    );
+    // The INTEGER backing is refused for the same reason — §7.2 is about the
+    // host boundary, not about strings.
+    assert_fails_with(
+        r#"
+        enum Code { Ok = 200, NotFound = 404 }
+        [extern("getCode")]
+        external fun get_code(): Code;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Code'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
+    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
+    // exactly the same way, and the wrapper path is what each of them wants.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_align(): Option<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+    assert_fails_with(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        external fun get_aligns(): List<Align>;
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_refusal_is_the_return_direction_only() {
+    // The parameter direction is the whole point of the feature — the extern
+    // takes the enum, because the enum IS the string — and it stays legal, as
+    // does an unbacked enum in either direction.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        [extern("setAlign")]
+        external fun set_align(value: Align): void;
+        fun main() { set_align(Align::Start); }
+        "#,
+    );
+    assert_compiles(
+        r#"
+        enum Plain { A, B }
+        [extern("getPlain")]
+        external fun get_plain(): Plain;
+        fun main() { }
+        "#,
+    );
+    // The refusal does not depend on declaration order.
+    assert_fails_with(
+        r#"
+        [extern("getAlign")]
+        external fun get_align(): Align;
+        enum Align { Start = "start", End = "end" }
+        fun main() { }
+        "#,
+        "cannot return the backed enum 'Align'",
+    );
+}
+
+#[test]
+fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
+    // What §7.2 steers to, compiled: the extern speaks the host's own type and
+    // `parse` is the guard, answering `None` for a value outside the set.
+    assert_compiles(
+        r#"
+        import std::option::Option;
+        enum Align { Start = "start", End = "end" }
+        [extern("getAlign")]
+        [doc(hidden)]
+        external fun get_align_raw(): str;
+        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
+        fun main() { }
+        "#,
+    );
+}
+
+// --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------
+//
+// The payoff the survey measured: eleven of the fifteen payload-free enums in
+// the whole standard library existed only to be converted to a host string,
+// all in `std/src/style.vl`, 52 `match` arms that delete outright. The strings
+// moved from the wrappers to the declarations, so the TYPE now says at its
+// declaration what was only discoverable by reading a function 300 lines away.
+//
+// These pin the behavior the deletion has to preserve, at the shapes §2.1 calls
+// out as the ones a name convention would have got wrong.
+
+#[test]
+fn b76_style_keyword_enums_carry_their_css_keywords() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, JustifyContent, UserSelect };
+        fun main() {
+            // The five §2.1 names no case convention produces.
+            print(AlignItems::Start.value());
+            print(AlignItems::End.value());
+            print(JustifyContent::Between.value());
+            print(Display::Hidden.value());
+            print(UserSelect::Off.value());
+        }
+        "#,
+        "flex-start\nflex-end\nspace-between\nnone\nnone\n",
+    );
+}
+
+#[test]
+fn b76_style_wrappers_still_write_the_same_declaration() {
+    // The wrappers are one line now (`self.raw("display", value.value())`), and
+    // what they write must not have moved. A class name is a content hash of
+    // `key|declaration`, so these two are the declarations themselves: write
+    // `"inline_block"` instead of `"inline-block"` and both change.
+    // (`vilan/test/style.css` pins the declaration text itself, byte for byte.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::style::{ AlignItems, Display, RadialExtent, Style, style };
+        fun main() {
+            let card = const style().display(Display::InlineBlock).align_items(AlignItems::End);
+            print(card.class_list());
+            print(RadialExtent::ClosestCorner.value());
+        }
+        "#,
+        "sfatq7m s1g8z7cm\nclosest-corner\n",
     );
 }

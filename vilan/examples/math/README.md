@@ -21,5 +21,5 @@ vilan run .      # 25
 vilan test .     # ok    math/square_test.vl
 ```
 
-`vilan build .` writes `main.js` beside the source; it is generated and not
+`vilan build .` writes `main.mjs` beside the source; it is generated and not
 checked in.

@@ -777,7 +777,14 @@ impl<'p, 'src> State<'p, 'src> {
                 boundary_errors.push((*call_id, *target));
             }
         }
-        boundary_errors.sort_by_key(|(site, _)| self.span_of(*site).start);
+        // The key is the WHOLE tuple, because `dedup` compares the whole tuple
+        // (backlog B93, E38's family): keyed on `span.start` alone, two distinct
+        // tuples sharing a start can interleave with a repeat of the first, and
+        // `dedup` — which only collapses ADJACENT equals — then lets the repeat
+        // through. `span.start` stays the leading component so the order is the
+        // one the diagnostics were always emitted in; the ids only break its
+        // ties, and break them the same way every run.
+        boundary_errors.sort_by_key(|(site, callee)| (self.span_of(*site).start, site.0, callee.0));
         boundary_errors.dedup();
         for (site, callee) in boundary_errors {
             let name = self.const_only_name(callee, emit_id);
@@ -861,7 +868,17 @@ impl<'p, 'src> State<'p, 'src> {
             escapes.push((closure_id, None));
         }
 
-        escapes.sort_by_key(|(site, _)| self.span_of(*site).start);
+        // The whole tuple keys the sort, for the reason above (B93): this list
+        // is the one that can actually repeat a tuple — a reference reachable
+        // from two owners is pushed twice — so an interleaving neighbour at the
+        // same `span.start` is exactly what would defeat the `dedup`.
+        escapes.sort_by_key(|(site, function_id)| {
+            (
+                self.span_of(*site).start,
+                site.0,
+                function_id.map(|function_id| function_id.0),
+            )
+        });
         escapes.dedup();
         for (site, function_id) in escapes {
             let subject = match function_id {

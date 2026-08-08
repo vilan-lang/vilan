@@ -145,9 +145,9 @@ impl JsonValue {
 /// failures with `!` or handle the `Result`.
 trait FromJson {
 	/// Parse a JSON document into a value of this type.
-	fun from_json(text: str): Result<FromJson, str>;
+	fun from_json(text: str): Result<Self, str>;
 	/// Rebuild this type from an already-parsed value (used when nesting).
-	fun from_json_value(value: JsonValue): Result<FromJson, str>;
+	fun from_json_value(value: JsonValue): Result<Self, str>;
 }
 
 /// The scalar leaves check the JSON type before coercing (`Number`/`String`/
@@ -848,6 +848,38 @@ macro fun enum_json_impls(target: EnumItem): str {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
+	// A BACKED enum encodes AS ITS BACKING VALUE (proposal/backed-enums.md
+	// §3.9): `Align::Start` is `"start"` on the wire, not `"Start"`, and it
+	// round-trips through the synthesized `parse`. Both directions delegate —
+	// `value()` folds to the identity and the backing type's own `to_json`
+	// already escapes correctly — so neither re-implements JSON quoting.
+	if target.backing_type != "" {
+		mut coerce = "coerce_i32";
+		if target.backing_type == "str" {
+			coerce = "coerce_str";
+		} else if target.backing_type == "i53" {
+			coerce = "coerce_i53";
+		}
+		let backed_result = i"Result<{target.name}, str>";
+		let backed_to_json = fun_of("to_json").parameter("self").returns("str").expr("self.value().to_json()");
+		let backed_from_json = fun_of("from_json")
+			.parameter("text: str")
+			.returns(backed_result)
+			.expr(i"{target.name}::from_json_value(text.try_parse_json().ok_or(\"not valid JSON\")!)");
+		let backed_from_json_value = fun_of("from_json_value")
+			.parameter("value: JsonValue")
+			.returns(backed_result)
+			.expr(i"{target.name}::parse({coerce}(value)).ok_or(\"unknown value in JSON for enum {target.name}\")");
+		ret impl_of(target.name)
+			.implements("Json")
+			.method(backed_to_json)
+			.render()
+			+ impl_of(target.name)
+				.implements("FromJson")
+				.method(backed_from_json)
+				.method(backed_from_json_value)
+				.render();
+	}
 	// Externally tagged: no payload -> `"V"`; one -> `{"V":<p>}`;
 	// many -> `{"V":[<p0>,<p1>]}`.
 	mut to_arms = match_of("self");
@@ -928,6 +960,41 @@ macro fun enum_wire_impls(target: EnumItem): str {
 	// An empty enum gets no impls (nothing to construct).
 	if target.variants.len() == 0 {
 		ret "";
+	}
+	// §3.9's backed form: the backing value is what crosses, so both directions
+	// delegate to the backing type's own `Wire` impl and to `parse`. The
+	// unknown-value path is the tagged form's, kept: a host sending a value
+	// outside the set decodes to a reported failure plus a poisoned
+	// zero-construction of the first variant, never to garbage.
+	if target.backing_type != "" {
+		mut first_variant = "";
+		for variant in target.variants {
+			if first_variant == "" {
+				first_variant = variant.name;
+			}
+		}
+		mut rebuild_body: List<str> = [];
+		rebuild_body.push(i"let raw = {target.backing_type}::rebuild(deserializer);");
+		rebuild_body.push(i"match {target.name}::parse(raw) \{");
+		rebuild_body.push(i"\tOption::Some(let variant) => variant,");
+		rebuild_body.push("\tOption::None => {");
+		rebuild_body.push(i"\t\tdeserializer.fail(\"unknown value for enum {target.name}\");");
+		rebuild_body.push(i"\t\t{target.name}::{first_variant}");
+		rebuild_body.push("\t},");
+		rebuild_body.push("}");
+		let backed_describe = fun_of("describe")
+			.generics("<S: Serialize>")
+			.parameter("self")
+			.parameter("serializer: S")
+			.expr("self.value().describe(serializer)");
+		mut backed_rebuild = fun_of("rebuild")
+			.generics("<D: Deserialize>")
+			.parameter("deserializer: D")
+			.returns(target.name);
+		for line in rebuild_body {
+			backed_rebuild = backed_rebuild.line(line);
+		}
+		ret impl_of(target.name).implements("Wire").method(backed_describe).method(backed_rebuild).render();
 	}
 	mut describe_arms = match_of("self");
 	for variant in target.variants {
@@ -1018,7 +1085,7 @@ macro fun Json(item: Item): Source {
 		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + struct_json_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + enum_json_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + enum_json_impls(target));
 	}
 	source("")
 }
@@ -1030,7 +1097,7 @@ macro fun Wire(item: Item): Source {
 		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + struct_json_impls(target) + struct_wire_impls(target));
 	}
 	if item.as_enum() is Some(let target) {
-		ret source("import std::json::{ Json, FromJson, JsonValue };\n" + "import std::result::Result;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + enum_json_impls(target) + enum_wire_impls(target));
+		ret source("import std::json::{ Json, FromJson, JsonValue, coerce_i32, coerce_i53, coerce_str };\n" + "import std::result::Result;\n" + "import std::option::Option;\n" + "import std::wire::{ Wire, Serialize, Deserialize, Serializer, Deserializer };\n" + enum_json_impls(target) + enum_wire_impls(target));
 	}
 	source("")
 }

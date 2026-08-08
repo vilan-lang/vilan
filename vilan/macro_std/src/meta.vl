@@ -52,15 +52,27 @@ export struct StructItem {
 	fields: List<Field>,
 }
 
-// One enum variant: its name and its payload types (empty for a bare variant).
+// One enum variant: its name, its payload types (empty for a bare variant), and
+// its explicit backing value AS WRITTEN — `"start"` (quotes included), `-1`,
+// `0xFF` — or `""` when the variant carries none (proposal/backed-enums.md
+// §3.1). The literal is carried rather than a value so a generator can splice it
+// straight back into source; an empty string backing renders as `"\"\""`, so
+// `""` is unambiguously "no backing value".
 export struct Variant {
 	name: str,
 	payload: List<TypeExpr>,
+	backing: str,
 }
 
+// A declared enum. `backing_type` is the vilan type its variants are backed by
+// — `"str"`, `"i32"`, `"i53"` — or `""` when the enum is not backed. A
+// generator that keys on it is choosing between the tagged form and the bare
+// backing value (backed-enums.md §3.9); a mixed or malformed declaration is a
+// hard error at the enum, so this reads `""` there and generators stay quiet.
 export struct EnumItem {
 	name: str,
 	variants: List<Variant>,
+	backing_type: str,
 }
 
 export struct FunctionItem {

@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch, Intrinsic,
-    LiftDispatch, Program, TransferForm, TryDispatch,
+    BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
+    Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
 use crate::id::Id;
@@ -1276,6 +1276,19 @@ fn helper_source(name: &str) -> &'static str {
         "__nursery_of" => {
             "function __nursery_of(option) {\n\treturn option[0] === 0 ? option[1] : undefined;\n}"
         }
+        // Writing a whole aggregate through a view: REPLACE the pointee's
+        // contents, keeping its identity so every alias sees the new value.
+        // `Object.assign` alone is a merge — it never removes a slot the source
+        // does not reach — so the length is set first (backlog B89). Both sides
+        // are arrays for every aggregate the view machinery reaches (structs,
+        // tuples, enums and `List` are arrays; a `Map` is a one-slot array); the
+        // guard keeps an object-backed pointee on the plain merge.
+        "__replace" => {
+            "function __replace(target, value) {\n\
+             \tif (Array.isArray(target) && Array.isArray(value)) target.length = value.length;\n\
+             \treturn Object.assign(target, value);\n\
+             }"
+        }
         "__clone" => {
             "function __clone(value) {\n\
              \tif (Array.isArray(value)) return value.map(__clone);\n\
@@ -1752,16 +1765,75 @@ impl<'src> Transformer<'src> {
         self.restore_instance(saved_instance);
 
         // An async `main` (it awaits) runs inside an invoked async arrow, since
-        // top-level `await` isn't assumed: `(async () => { .. })()`.
+        // module initialization is synchronous and there is no top-level await
+        // to lift it into (`execution.md` §7.1): `(async () => { .. })()`.
+        //
+        // That promise used to be DISCARDED (J6). A rejection then reached the
+        // host only as an unhandled-rejection event, so what a failing `main`
+        // did was the host's default policy rather than vilan's: Node ≥15
+        // happens to rethrow and exit non-zero, but it buries the program's
+        // error under `UnhandledPromiseRejection` and an engine-internal
+        // stack, and a host configured otherwise (or an older Node) exits 0.
+        // A *sync* `main` that panics has always terminated with the message
+        // and a non-zero code, and async `main` is the substitute vilan steers
+        // people to instead of top-level await — so the two must agree.
+        //
+        // `.catch` and not `await`: attaching a handler does not delay
+        // anything, so a `main` that never settles (a listening server) is
+        // untouched — it keeps running, and the handler simply never fires.
+        // `process.exit` rather than `exitCode`, for the same reason in
+        // reverse: a rejection while some other handle is still live (that
+        // same listener) would otherwise set a code and then hang forever.
+        // The unwind through `main` has already run its `finally` blocks by
+        // the time the handler sees the error, so exiting here does not skip
+        // teardown the way §7.1's exit-code path would.
         if main_is_async {
-            t_main_fn_body = vec![js::Node::Call(
+            let invocation = js::Node::Call(
                 Box::new(js::Node::Closure(js::Closure {
                     parameters: Vec::new(),
                     body: t_main_fn_body,
                     is_async: true,
                 })),
                 Vec::new(),
-            )];
+            );
+            // The browser has no exit code; its unhandled-rejection path
+            // already reports to the console, so there is nothing to add.
+            t_main_fn_body = if self.program.platform.has_process_exit() {
+                let error_name = self.ng.next_name();
+                vec![js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(invocation),
+                        "catch".to_string(),
+                    )),
+                    vec![js::Node::Closure(js::Closure {
+                        parameters: vec![js::Parameter {
+                            name: error_name.clone(),
+                        }],
+                        body: vec![
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("console".to_string())),
+                                    "error".to_string(),
+                                )),
+                                vec![js::Node::Call(
+                                    Box::new(js::Node::Local("String".to_string())),
+                                    vec![js::Node::Local(error_name)],
+                                )],
+                            ),
+                            js::Node::Call(
+                                Box::new(js::Node::Property(
+                                    Box::new(js::Node::Local("process".to_string())),
+                                    "exit".to_string(),
+                                )),
+                                vec![js::Node::Number("1".to_string(), None)],
+                            ),
+                        ],
+                        is_async: false,
+                    })],
+                )]
+            } else {
+                vec![invocation]
+            };
         }
 
         // Assembly-time tree-shake: keep a binding's declaration only when
@@ -2320,7 +2392,7 @@ impl<'src> Transformer<'src> {
     /// pointee is abstract there, so it cannot be added to `primitive_views`; the
     /// classification is re-made here against the concrete type, so a scalar
     /// pointee uses the `(base, key)` representation its (concrete) caller passed
-    /// rather than the aggregate `Object.assign` path.
+    /// rather than the aggregate `__replace` path.
     fn generic_ref_param_is_scalar(&self, binding: Id) -> bool {
         self.program
             .parameters
@@ -2533,7 +2605,7 @@ impl<'src> Transformer<'src> {
 
     /// Whether an expression is a `Shared::write()` call — a single-slot view of
     /// the cell's `v` slot. Writing through it rebinds the slot (`cell.v = x`),
-    /// distinct from both the `(base, key)` and aggregate-`Object.assign` views.
+    /// distinct from both the `(base, key)` and aggregate-`__replace` views.
     fn is_shared_write(&self, operand: Id) -> bool {
         let Some(Expr::Call(call_id)) = self.program.entity_map.get(&operand) else {
             return false;
@@ -2971,6 +3043,16 @@ impl<'src> Transformer<'src> {
                         // data is a no-op that still evaluates the argument for its
                         // effects. Erasure forces the rewrite here — the generic
                         // sink body cannot drop instantiation-conditionally.
+                        // `x.value()` on a backed enum IS `x` (backed-enums.md
+                        // §3.8): the receiver already holds the backing value
+                        // at runtime, so the conversion is the identity and
+                        // emits nothing. The generated body — a `match` over
+                        // the variants — stays the definition this fold has to
+                        // agree with; folded away, it has no callers left and
+                        // the tree-shake drops it.
+                        if self.program.backed_value_members.contains(&target_id) {
+                            return Some(args.into_iter().next().unwrap_or(js::Node::Void));
+                        }
                         if Some(target_id) == self.drop_fn_id {
                             let arg_node = args.into_iter().next().unwrap_or(js::Node::Void);
                             let argument_type =
@@ -3624,6 +3706,26 @@ impl<'src> Transformer<'src> {
                         inner
                     };
                     thunk_block.push(js::Node::Return(Box::new(inner)));
+                    // SYNCHRONOUS, and it depends on an invariant held
+                    // elsewhere: a module-level initializer cannot suspend
+                    // (`execution.md` §7.1, enforced await-shaped in
+                    // `async_infer`), so nothing walked into `thunk_block`
+                    // above can be an `await`. When the check was merely
+                    // call-shaped this was reachable, and the result was
+                    // `return await (pending);` inside a non-async arrow — a
+                    // dev bundle that did not parse at all
+                    // (`top-level-await.md` §1.5).
+                    //
+                    // Do not "fix" that by flipping this to `is_async: true`.
+                    // The thunk's value is written into a `const` that every
+                    // later binding reads as a value, and
+                    // `__hmr_adopt_signal`/`__hmr_adopt_shared` do
+                    // `var cell = thunk(); cell[0].v = …` — a promise-shaped
+                    // thunk poisons all three, and the call sites would each
+                    // need an `await`, which is top-level await again on every
+                    // transferable binding in the bundle. If the await rule is
+                    // ever relaxed, this contract is a redesign, not a patch
+                    // (`top-level-await.md` §4.2).
                     let thunk = js::Node::Closure(js::Closure {
                         parameters: Vec::new(),
                         body: thunk_block,
@@ -3668,24 +3770,36 @@ impl<'src> Transformer<'src> {
                 }
             }
             Expr::Assignment(target_id, value_id) => {
-                // R2 (destruction.md §5): assigning onto a binding that still owns
+                // R2 (destruction.md §5): assigning onto a place that still holds
                 // a resource drops the OLD value first, then moves the new one in.
-                // The analyzer flagged the assignment; the target is a resource
-                // `Local` (only those are recorded).
-                if self.program.overwrite_drops.contains(&id) {
-                    let overwrite = match self.program.entity_map.get(target_id) {
-                        Some(Expr::Local(binding)) => self
-                            .program
-                            .variables
-                            .get(binding)
-                            .map(|variable| (*binding, variable.type_id)),
+                // The analyzer flagged the assignment and resolved the overwritten
+                // value's type; three target shapes reach here and each names the
+                // same storage the write is about to clobber — a resource `Local`,
+                // (B94) the synthetic `Dereference` of a writable view, whose
+                // pointee is the caller's value, and (B99) a COMPONENT projection,
+                // whose read is the drop's operand. The drop is pushed BEFORE the
+                // new value is walked, so it runs before the write clobbers the
+                // slot it reads — and, on the view path, before `__replace`
+                // truncates the payload out from under it (B89).
+                if let Some(&type_id) = self.program.overwrite_drops.get(&id) {
+                    let target = *target_id;
+                    let overwritten = match self.program.entity_map.get(&target) {
+                        Some(Expr::Local(binding)) => {
+                            Some(js::Node::Local(self.ng.name_for(*binding)))
+                        }
+                        Some(Expr::Dereference(operand)) => {
+                            let operand = *operand;
+                            self.walk_entity(operand, block)
+                        }
+                        Some(
+                            Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _) | Expr::Index(_, _),
+                        ) => self.walk_entity(target, block),
                         _ => None,
                     };
-                    if let Some((binding, type_id)) = overwrite {
-                        let target = js::Node::Local(self.ng.name_for(binding));
-                        if let Some(drop) = self.resource_drop_of(type_id, target) {
-                            block.push(drop);
-                        }
+                    if let Some(overwritten) = overwritten
+                        && let Some(drop) = self.resource_drop_of(type_id, overwritten)
+                    {
+                        block.push(drop);
                     }
                 }
                 let value = self.walk_entity(*value_id, block).unwrap_or(js::Node::Void);
@@ -3693,8 +3807,9 @@ impl<'src> Transformer<'src> {
                 // Writing a *whole value* through a view. A `Shared` write is a
                 // single-slot view (`cell.v`): rebind the slot, so every handle to
                 // the cell sees the new value (`cell.v = value`). An ordinary
-                // aggregate view copies the fields in place (`Object.assign`), so
-                // the target and its aliases update rather than rebinding a local.
+                // aggregate view REPLACES the pointee's contents in place
+                // (`__replace`), so the target and its aliases update rather than
+                // rebinding a local.
                 // A primitive view's `*c` is a `[0]` slot write — the normal path.
                 if let Some(Expr::Dereference(operand)) = self.program.entity_map.get(target_id) {
                     if self.is_shared_write(*operand) {
@@ -3710,9 +3825,20 @@ impl<'src> Transformer<'src> {
                         return Some(js::Node::Assignment(Box::new(slot), Box::new(value)));
                     }
                     if !self.derefs_scalar_view(*operand) {
+                        // `Object.assign` was the write for years and is a MERGE:
+                        // it copies the value's slots over the pointee's and
+                        // leaves any TRAILING slot the value does not reach
+                        // standing (backlog B89). Every aggregate whose width can
+                        // shrink is wrong under it — an enum reassigned to a
+                        // shorter variant keeps the old payload in the tail
+                        // (unreachable through the enum's API, but present), and a
+                        // `&mut List<T>` written with a shorter list keeps its old
+                        // elements outright (`len` still counts them). The write
+                        // means REPLACE, so it emits replace.
                         let base = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
+                        self.used_helpers.insert("__replace");
                         return Some(js::Node::Call(
-                            Box::new(js::Node::Local("Object.assign".to_string())),
+                            Box::new(js::Node::Local("__replace".to_string())),
                             vec![base, value],
                         ));
                     }
@@ -4296,8 +4422,8 @@ impl<'src> Transformer<'src> {
     }
 
     /// The JS value for an enum variant. `bool` lowers to a native boolean
-    /// (`false`/`true`), a numeric (C-like) enum to its integer discriminant, and
-    /// every other enum to an array `[index, ...data]`.
+    /// (`false`/`true`), a BACKED enum to its bare backing value — a number or a
+    /// string — and every other enum to an array `[index, ...data]`.
     fn variant_value(
         &self,
         enum_id: Id,
@@ -4307,30 +4433,40 @@ impl<'src> Transformer<'src> {
         if Some(enum_id) == self.program.bool_enum_id {
             return js::Node::Bool(variant_index == 1);
         }
-        if let Some(discriminant) = self.numeric_enum_discriminant(enum_id, variant_index) {
-            return js::Node::Number(discriminant.to_string(), None);
+        if let Some(value) = self.backed_variant_value(enum_id, variant_index) {
+            return value;
         }
         let mut items = vec![js::Node::Number(variant_index.to_string(), None)];
         items.extend(data);
         js::Node::Array(items)
     }
 
-    /// The integer discriminant of a variant if `enum_id` is a numeric (C-like)
-    /// enum, else `None` (it uses the array representation).
-    fn numeric_enum_discriminant(&self, enum_id: Id, variant_index: usize) -> Option<i64> {
+    /// The bare backing value of a variant if `enum_id` is a backed enum, else
+    /// `None` (it uses the array representation). `Align::Start` is the JS
+    /// string `"start"` exactly as `Ordering::Greater` is the JS number `1`:
+    /// one rule, two literal kinds (backed-enums.md §3.5).
+    fn backed_variant_value(&self, enum_id: Id, variant_index: usize) -> Option<js::Node<'src>> {
         let enum_ = self.program.enums.get(&enum_id)?;
-        if !enum_.is_numeric {
-            return None;
+        enum_.backing?;
+        match &enum_.variants.get(variant_index)?.backing_value {
+            BackingValue::Int(discriminant) => {
+                Some(js::Node::Number(discriminant.to_string(), None))
+            }
+            // The declaration carries the RAW literal text, so it unescapes at
+            // emission exactly like any other string literal.
+            BackingValue::Str(text) => Some(js::Node::String(Cow::Owned(
+                unescape_string(text).into_owned(),
+            ))),
         }
-        enum_
-            .variants
-            .get(variant_index)
-            .map(|variant| variant.discriminant)
     }
 
     /// For a variant of an enum that lowers to a native scalar — `bool`
-    /// (`subject === true`) or a numeric enum (`subject === discriminant`) — the
+    /// (`subject === true`) or a backed enum (`subject === backing value`) — the
     /// equality test. `None` for array-form enums, which test the `[0]` slot.
+    ///
+    /// A string backing needs no new codegen path: this is the same `===` chain
+    /// a `match` over a raw `str` already emits, with a `js::Node::String` where
+    /// the `js::Node::Number` is (§1.4's probe P2).
     fn scalar_variant_test(
         &self,
         enum_id: Id,
@@ -4340,11 +4476,7 @@ impl<'src> Transformer<'src> {
         let value = if Some(enum_id) == self.program.bool_enum_id {
             js::Node::Bool(variant_index == 1)
         } else {
-            js::Node::Number(
-                self.numeric_enum_discriminant(enum_id, variant_index)?
-                    .to_string(),
-                None,
-            )
+            self.backed_variant_value(enum_id, variant_index)?
         };
         Some(js::Node::Binary(
             BinaryOp::Eq,
@@ -4358,8 +4490,9 @@ impl<'src> Transformer<'src> {
         self.copy_applies(self.program.capture_clone_sites.get(&capture_id))
     }
 
-    /// B81: whether this capture must become a real declaration on the alias
-    /// path even when it owes no copy — see [`Program::materialized_captures`].
+    /// B81/B88: whether this capture must become a real declaration on the
+    /// alias path even when it owes no copy — see
+    /// [`Program::materialized_captures`].
     fn capture_materializes(&self, capture_id: Id) -> bool {
         self.program.materialized_captures.contains(&capture_id)
     }
@@ -4467,14 +4600,16 @@ impl<'src> Transformer<'src> {
     ///   storage. Captures that share or move own nothing to copy and keep
     ///   their accessor, which is what keeps the elisions free — and a RESOURCE
     ///   capture never copies (R1).
-    /// - **B81 — it must be READ at the match.** A subject rooted in a writable
-    ///   view is mutated IN PLACE when the leg writes through it, so an
-    ///   accessor re-read later in the leg returns post-write state. The
-    ///   declaration freezes the read without touching the value: no `__clone`,
-    ///   so a SHARE stays a share and a resource stays the loan B62's leg
-    ///   teardown destroys through (`capture_drop_nodes` reads the alias table
-    ///   after this runs, so it finds the declared name and destroys the very
-    ///   value the leg captured).
+    /// - **B81/B88 — it must be READ at the match.** A subject whose storage a
+    ///   write can reach IN PLACE — through a writable view, or through a
+    ///   COMPONENT write / `&mut` / `&mut self` call on an owned place — is
+    ///   mutated under the temp, so an accessor re-read later in the leg
+    ///   returns post-write state. The declaration freezes the read without
+    ///   touching the value: no `__clone`, so a SHARE stays a share and a
+    ///   resource stays the loan B62's leg teardown destroys through
+    ///   (`capture_drop_nodes` reads the alias table after this runs, so it
+    ///   finds the declared name and destroys the very value the leg
+    ///   captured).
     ///
     /// WHERE `out` goes decides WHEN that happens, and the callers answer
     /// differently: an `is` test emits into the statements before it (reading an
@@ -6291,10 +6426,13 @@ impl<'src> Transformer<'src> {
     }
 
     /// A type whose `==`/`!=` compares by value in native JS — the scalar
-    /// primitives (`i32`/…/`str`), `bool`, and numeric (C-like) enums, all lowered
-    /// to JS numbers/strings/booleans. A generic `==` monomorphized to one of these
+    /// primitives (`i32`/…/`str`), `bool`, and BACKED enums, all lowered to JS
+    /// numbers/strings/booleans. A generic `==` monomorphized to one of these
     /// stays native rather than dispatching to a `PartialEq` impl (which for a
     /// primitive is native `===` anyway), keeping codegen identical to a direct `==`.
+    ///
+    /// A string-backed enum qualifies for exactly the reason `str` itself does,
+    /// listed two lines up: both sides are JS string primitives (§3.5).
     fn compares_natively(&self, type_id: TypeId) -> bool {
         match self.program.type_id_to_type_map.get(&type_id) {
             Some(Type::Struct(id, _)) => self.program.structs.get(id).is_some_and(|struct_| {
@@ -6306,18 +6444,109 @@ impl<'src> Transformer<'src> {
                         .program
                         .enums
                         .get(id)
-                        .is_some_and(|enum_| enum_.is_numeric)
+                        .is_some_and(|enum_| enum_.backing.is_some())
             }
             _ => false,
         }
     }
 
     /// A stable key identifying a concrete type, used to deduplicate instances.
+    ///
+    /// STRUCTURAL, not id-keyed (B95). The obvious spelling — `format!("{:?}",
+    /// type_)` — looks structural and is not: every nominal `Type` carries its
+    /// arguments as raw [`TypeId`]s, so `Struct(list, [TypeId(42)])` and
+    /// `Struct(list, [TypeId(99)])` key differently even when 42 and 99 both
+    /// denote `i32`. Type ids are minted in inference order, so the same program
+    /// can mint two ids for one type merely because an argument was re-inferred
+    /// earlier — and the instance memo would then emit the SAME body twice under
+    /// two names (a duplicate `Signal::new` was observed that way). Spelling the
+    /// whole shape out makes the key depend on what the type IS.
+    ///
+    /// The recursion is strictly coarsening: equal `Debug` output implies equal
+    /// `Type` values implies an equal structural key, so this can only ever MERGE
+    /// what the old key separated — never split.
+    ///
+    /// Two positions stay id-keyed, deliberately: a `Generic` binder (distinct
+    /// binders are distinct abstract types — following the id would be a lookup
+    /// into itself) and a type id absent from the map (nothing to spell).
     fn type_key(&self, type_id: TypeId) -> String {
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(type_) => format!("{:?}", type_),
-            None => format!("?{}", type_id.0),
+        let mut key = String::new();
+        self.write_type_key(type_id, &mut key);
+        key
+    }
+
+    /// Appends [`Self::type_key`]'s spelling of `type_id` to `out`. Every arm
+    /// opens with a distinct sigil and closes its argument list, so the encoding
+    /// stays injective over shapes.
+    fn write_type_key(&self, type_id: TypeId, out: &mut String) {
+        use std::fmt::Write;
+        // Guards a type-argument cycle; the depth is shared with the rest of the
+        // compiler's recursive walks, and reaching it means the key is truncated
+        // (still sound — a truncated key only merges further).
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            out.push_str("...");
+            return;
+        };
+        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
+            let _ = write!(out, "?{}", type_id.0);
+            return;
+        };
+        match type_ {
+            Type::Struct(id, arguments) => {
+                let _ = write!(out, "S{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Enum(id, arguments) => {
+                let _ = write!(out, "E{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Trait(id, arguments) => {
+                let _ = write!(out, "T{}", id.0);
+                self.write_type_key_arguments(arguments, out);
+            }
+            Type::Tuple(elements) => {
+                out.push_str("Tup");
+                self.write_type_key_arguments(elements, out);
+            }
+            Type::Closure(parameters, return_type_id) => {
+                out.push_str("Fn");
+                self.write_type_key_arguments(parameters, out);
+                out.push_str("->");
+                self.write_type_key(*return_type_id, out);
+            }
+            Type::Array(element_type_id, length) => {
+                out.push_str("Arr[");
+                self.write_type_key(*element_type_id, out);
+                let _ = write!(out, ";{length}]");
+            }
+            Type::Mapped(binder_id, source_type_id, template_type_id) => {
+                let _ = write!(out, "Map(G{},", binder_id.0);
+                self.write_type_key(*source_type_id, out);
+                out.push(',');
+                self.write_type_key(*template_type_id, out);
+                out.push(')');
+            }
+            Type::Generic(constraint_id) => {
+                let _ = write!(out, "G{}", constraint_id.0);
+            }
+            // No nested type ids to spell — `Any`, `Never`, `Function(Id)`,
+            // `Module(Id)`, `Unknown`, `Unresolved`, `Void`. The `#` keeps their
+            // `Debug` spelling from colliding with an arm above.
+            other => {
+                let _ = write!(out, "#{other:?}");
+            }
         }
+    }
+
+    fn write_type_key_arguments(&self, arguments: &[TypeId], out: &mut String) {
+        out.push('(');
+        for (index, argument) in arguments.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            self.write_type_key(*argument, out);
+        }
+        out.push(')');
     }
 
     /// Finds the function implementing `member` for a concrete type, searching

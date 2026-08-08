@@ -7,7 +7,7 @@
 # `import common::greeting`.
 #
 #   vilan build .   compiles each member for its target into `dist/`
-#                   (`dist/server.js` for Node, `dist/client.js` for the browser)
+#                   (`dist/server.mjs` for Node, `dist/client.js` for the browser)
 #   vilan run .     builds both and starts the Node server, which serves the
 #                   client bundle (the workspace's single `node` member is run)
 [project]

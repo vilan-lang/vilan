@@ -319,6 +319,12 @@ fn respond_404(stream: &mut TcpStream) {
 pub struct LegArtifact {
     pub name: String,
     pub is_browser: bool,
+    /// The extension this leg's bundle is written to `dist/` with, taken from
+    /// its `Platform::script_extension` at compile time — a process leg gets
+    /// `.mjs` so the runtime classifies it as ESM without sniffing, a browser
+    /// leg keeps `.js`. Carried rather than re-derived so the watch round's
+    /// writer and the restart's launcher cannot disagree about the name.
+    pub script_extension: &'static str,
     pub bundle: String,
     pub css: Option<String>,
     /// The sources this artifact was compiled from — each loaded file's path
@@ -581,6 +587,7 @@ mod tests {
         LegArtifact {
             name: name.to_string(),
             is_browser,
+            script_extension: if is_browser { "js" } else { "mjs" },
             bundle: bundle.to_string(),
             css: css.map(str::to_string),
             sources: BTreeMap::new(),

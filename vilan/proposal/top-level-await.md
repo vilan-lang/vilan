@@ -1,6 +1,14 @@
 # Top-level await — the design half (J3)
 
-> Status: DRAFT (awaiting owner review) — filed from backlog J3; design before code per the entry.
+> Status: RATIFIED 2026-08-07 (owner review) — §8.2: the null
+> recommendation IS the owner's position ("Null is fine") — the hole
+> closes, TLA stays shut; no revisit trigger named, so the default
+> stands (revisit on real user demand). §8.1: the owner ruled **.mjs**
+> for Node-leg build artifacts — AGAINST this draft's marker
+> recommendation, which was held loosely; the implementation follows
+> the ruling. B86/J6 unblocked; B87 verified-unreachable rides B86.
+>
+> Prior status: DRAFT (awaiting owner review) — filed from backlog J3; design before code per the entry.
 >
 > Origin: backlog J3 (`backlog-2026-07-18.md:718-721`), the standing other
 > half of a 2026-07-14 fix. The diagnostic half shipped in the v0.4.0
@@ -920,3 +928,96 @@ than the existing fix-it machinery does.
 **Recommendation: ship the note text in S2, and let a code action follow
 if the diagnostic turns out to fire often.** Prose first is the cheaper
 experiment.
+
+## 9. Implementation note — 2026-08-07 (the async-entry lane)
+
+Appended after the fact; §§0–8 are the survey as written and are left
+as they stood. Shipped: B86a (the hole), B86b (the classification), B87
+(verified unreachable), J6 (`main`'s promise). Slices S1–S4 all landed.
+
+**§5.2 — the rule is await-shaped.** The call graph already walked each
+initializer's expression and already declined to descend into a closure
+it merely creates, which is exactly the boundary §5.2 asks for; it just
+dropped its `has_await` flag for initializers. It now records the await
+*sites* (the span the refusal wants) and `async_infer` reports the
+first per binding, beside the existing call check. Where both apply the
+call form wins — it names the callee — so a binding never reports a
+pair for one line. Every row of §5.2's table is pinned per case, red
+under two opposing plants: the call-shaped regression, and an
+over-widening that reaches into created closures.
+
+One row §5.2 did not list: `await` of a **non-`Task`** (`let plain: i32
+= 7; let value = await plain;`) compiles today and is now refused too —
+it is still a suspension point at load. It also fixes the note's
+wording: the steer must not claim the operand is a spawn, so the
+general fact about spawning is stated as a general fact.
+
+**The sweep found zero flips**, as §6 predicted — std, corpus,
+examples, docs.
+
+**§8.1 / §5.3(b) — `.mjs` on the process legs.** Implemented per the
+ruling, and wider than §5.3(b)(1)'s temp paths: `build` artifacts move
+too. The extension is derived once from the platform
+(`Platform::script_extension`), covering Node, Deno and Bun — §5.3(b)
+says "Node", but Deno and Bun classify the same way and the `.js`
+hazard is identical. The **browser leg keeps `.js`**, pinned in both
+directions: a `<script type="module">` tag declares the module at the
+load site, and every emitted browser bundle in the tree is loaded that
+way.
+
+Two corrections to §6's migration claim, both in the direction of *more*
+churn than it estimated:
+
+- "§5.3(a) touches only temp filenames … the corpus gate is neutral by
+  construction" holds for the temp paths, but the corpus builds bare
+  `.vl` files at the **default platform (Node)**, so all 112 goldens are
+  process-leg artifacts and renamed to `.mjs`. Their **bytes are
+  unchanged** — the byte gate confirms it, and the rename is a pure
+  `git mv`.
+- Two launch paths reconstructed `dist/<name>.js` from their own format
+  string rather than reading the writer's; they now share one helper.
+
+**New finding — the output-collision rule changed shape.** Two build
+units sharing a name were rejected because they would overwrite the
+same bundle. On *different* platforms they no longer would. The rule
+still stands, for a different reason: everything keyed by the bare name
+beside the bundle still collides (`<name>.css`, `<name>.chunks.json`).
+The check is unchanged; only its message stopped naming one extension.
+
+**§1.5 / §4.2 — B87 is verified unreachable, not redesigned.** The
+adopt contract is untouched and stays recorded as latent. §1.5's P10 is
+confirmed exactly, including the emitted key
+(`__hmr_adopt("pkg::value", …, () => { return await (pending); })`).
+One detail worth adding to P10: `node --check` on that bundle as a
+**`.js`** *passes* — CommonJS reads `await (pending)` as a call to a
+function named `await`, the very ambiguity of §1.4. The SyntaxError
+appears only when it is parsed as a module, which is how the browser
+and `import()` of a Blob URL load it. The two miscompiles share a root.
+
+**§8.3 / J6 — `main`'s promise.** §4.4's "a rejection surfaces through
+the `__Task` unhandled-error path or not at all" is **stale as
+written**: `main`'s IIFE is not a `__Task`, so a rejection is a genuine
+host unhandled rejection, and Node ≥ 15 rethrows it and exits 1 by
+default. Measured before the fix: exit **1**, but with the program's
+error buried under `UnhandledPromiseRejection` and an engine-internal
+stack. So the wart was real but narrower than filed — it was *whose
+policy decides* and *what the user sees*, not the exit code on a
+current Node.
+
+The shim attaches `.catch`; it does not await. That is what carves the
+server leg for free — attaching delays nothing, so a `main` that never
+settles keeps running and the handler never fires. The handler calls
+`process.exit(1)` rather than setting `exitCode`, for the mirror-image
+reason: a rejection while a listener is still live would set a status
+and then hang forever (measured). The unwind has already run `main`'s
+`finally` blocks by then, so §7.1's teardown-before-exit concern does
+not apply.
+
+§5.5's note that "`main`'s IIFE should collapse if TLA is allowed"
+still stands and is now cheaper to act on: the discarded promise it
+called a wart is fixed independently.
+
+**Left open.** §8.4 (the `lazy` rider) is untouched — `lazy` is still
+dormant, and the await check will need to see through a `lazy`
+initializer when S2 lands. §8.5 (a fix-it code action) not taken, per
+its own recommendation.

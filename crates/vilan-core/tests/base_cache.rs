@@ -332,3 +332,47 @@ fn derive_entries_cache_and_derived_impls_survive_the_hit() {
     );
     assert_ne!(cached_error.0, "[]", "and it must actually error");
 }
+
+/// The member-name index (E46 lever 1) rides the world's lifecycle. Member
+/// resolution scans `implementations_by_member` rather than every impl, so the
+/// index must cover the impls the ENTRY declares — which arrive after the base
+/// world was stored, registered into this analysis's own clone of it.
+///
+/// This is the only direction that can go wrong, and it is worth saying why.
+/// The index is a PRE-FILTER, never the answer: every impl it names is still
+/// asked for `declarations[member_name]` before it becomes a candidate. So an
+/// index row that is too BROAD — one naming an impl that does not declare the
+/// name, whatever the cause — changes nothing observable, while a row that is
+/// too NARROW silently loses a candidate and the method stops resolving. That
+/// asymmetry is what this pin covers, in its sharpest form: a warm analysis
+/// whose entry declares the impl, which must compile and emit what a cold
+/// build emits.
+#[test]
+fn an_entry_declared_impl_resolves_through_a_cache_hit() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+    const ENTRY_IMPL: &str = "import std::print;\nstruct Widget { n: i32 }\nimpl Widget { fun doubled(self): i32 { self.n * 2 } }\nfun main() { print(Widget { n = 21 }.doubled()); }\n";
+
+    // A first analysis of the same import set stores the base world.
+    let _ = observe(PROGRAM_A);
+    let (hits_before, _) = stats();
+    let cached = observe(ENTRY_IMPL);
+    let (hits_after, _) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "the entry-impl program must hit"
+    );
+    assert_eq!(
+        cached.0, "[]",
+        "an entry-declared method must resolve through a hit"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe(ENTRY_IMPL);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.2, fresh.2, "emitted JS differs cached vs fresh");
+    assert!(cached.2.is_some(), "and it must actually have emitted");
+}

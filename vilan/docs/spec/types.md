@@ -51,30 +51,68 @@ defined entirely by externs in impls.
 
 An enum has one of two runtime representations, and **which one is a
 property of the whole declaration, not of a variant**. An enum is
-*numeric* when both of these hold:
+*backed* when both of these hold:
 
 1. every variant is data-less, **and**
-2. at least one variant has an explicit discriminant.
+2. at least one variant has an explicit backing value.
 
-A numeric enum lowers to the bare discriminant: `Ordering::Greater` is
-the value `1`, comparisons and equality are native number comparisons,
-and a `match` tests `subject === 1`. Every other enum lowers to the
-tagged form `[index, …payload]`, and a `match` tests the tag slot.
+A backed enum lowers to the bare backing value: `Ordering::Greater` *is*
+the value `1` and `Align::Start` *is* the string `"flex-start"`,
+comparisons and equality are native scalar comparisons, and a `match`
+tests `subject === 1` / `subject === "flex-start"`. Every other enum
+lowers to the tagged form `[index, …payload]`, and a `match` tests the
+tag slot.
 
 The conjunction is the part worth stating outright, because both halves
 are easy to trip over:
 
 ```vilan,fragment
-enum Level { Low, Mid, High }           // tagged: no explicit discriminant
-enum Level { Low = 0, Mid, High }       // numeric: ONE `= 0` converts all three
-enum Level { Low = 0, Mid(i32) }        // rejected: a payload and a discriminant
+enum Level { Low, Mid, High }           // tagged: no explicit backing value
+enum Level { Low = 0, Mid, High }       // backed: ONE `= 0` converts all three
+enum Level { Low = 0, Mid(i32) }        // rejected: a payload and a backing value
 ```
 
 Adding `= 0` to a single variant changes the runtime shape of the entire
-enum — including how its values cross a host boundary, since a numeric
-enum reaches an `external fun` as a plain number. Discriminants must be
-unique across the enum, counting the values implicitly continued from
-the previous variant; see the grammar chapter for the full rule.
+enum — including how its values cross a host boundary, since a backed
+enum reaches an `external fun` as a plain number or string. Backing
+values must be unique across the enum, counting the values implicitly
+continued from the previous variant; see the grammar chapter for the full
+rule.
+
+### Backed-enum conversions
+
+Every backed enum gets two members, synthesized by the compiler — no
+`derive` marker, because writing `= "start"` is already the opt-in:
+
+```vilan,fragment
+enum Align { Start = "flex-start", End = "flex-end" }
+
+Align::Start.value()            // "flex-start" — the backing type
+Align::parse("flex-start")      // Some(Align::Start)
+Align::parse("middle")          // None
+```
+
+`value()` returns the enum's backing type (`str`, or the narrowest of
+`i32`/`i53` that holds every discriminant) and costs nothing: the
+receiver already *is* that value, so the call lowers to the receiver.
+`parse` is a static returning `Option<Self>` — the house form for a
+fallible parse, matching `str::parse_i32`. Declaring your own `value` or
+`parse` on a backed enum is a duplicate-member error.
+
+Two rules follow from the backing value being a *representation* rather
+than a second name for the variant. A `match` still matches variants, not
+values — `match align { "flex-start" => … }` is an error, exactly as
+`match ordering { 1 => … }` already was. And `<`, `<=`, `>`, `>=` are
+rejected on a **string** backing: they would compare the strings
+lexicographically (`Size::Large < Size::Small` because `"lg" < "sm"`),
+and ordering by declaration index cannot be offered, because bare
+lowering erases the index. Integer backings order as before.
+
+An `external fun` may take a backed enum but may **not return one**: the
+host can answer with a value outside the set, and an exhaustive `match`
+compiles its last arm to a bare `else`, so a bogus value would silently
+become whichever variant happened to be last. Bind the backing type and
+convert with `parse`, which answers `None`.
 
 ## 5.4 Impls
 
@@ -94,6 +132,24 @@ binder's bounds hold. Members may be functions (with or without
 `self`). A function without `self` is a **static**, reached as
 `Subject::name(…)`.
 
+A trait has **one implementation per subject**: writing
+`impl Bag with Show` twice is a compile error at the second one, since
+nothing would rank them and the second would never run. Two impls are the
+same implementation when they name the same trait with the same
+arguments for the same subject, up to the naming of their own binders —
+so `impl Pair<type T> with Show` and `impl Pair<type U> with Show` are one
+impl written twice, and an argument left to a `= Self` default is the type
+it defaults to (`with Combine` is `with Combine<Bag>` on subject `Bag`).
+A trait parameterized differently is a different implementation:
+`impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both stand.
+
+*Implementation note (tracked): the rule refuses only exact repeats, not
+OVERLAP. A blanket impl and a specific one that both match a type — the
+`impl type T with Into<T>` of `std::into` beside a type's own `Into` impl,
+or two conditional impls with different bounds — are accepted, and which
+one a call selects is still decided by declaration order. A specificity
+rule is owed.*
+
 *Implementation note (soundness gap, tracked): a conditional impl's
 bounds are not yet re-checked when the impl is selected through a
 GENERIC bound: `List<B>` can satisfy a `Marker` bound via
@@ -110,6 +166,18 @@ requires `Y`. A trait's generic parameters may carry defaults
 `Self` in a trait body denotes the implementing type. Traits are used as
 **bounds**; a trait is not a type: `let x: Display` is a compile error
 (no trait objects).
+
+That rule is enforced **at the annotation**, in every value position — a
+binding, a parameter, a return type, a field, a generic argument
+(`List<Display>`) — and reported where the trait's name is written,
+whether or not the declaration is ever used. A trait's name stays legal
+in the positions that name a bound or a namespace rather than a value's
+type: a generic parameter's bound (`<T: Display>`), a supertrait, an
+`impl` subject (`impl Iterator<type T>`, which blankets over a bound),
+and the head of a qualified path (`Display::show(x)`). Inside a trait's
+own declaration, write `Self` for "the implementing type"; a generic
+parameter defaulted to it (`trait PartialEq<B = Self>`) is a parameter,
+not the trait, and is unaffected.
 
 A trait parameter's bound is in scope inside the trait's own default
 bodies, exactly as a function's or impl's is inside theirs (§5.6): a
@@ -336,7 +404,10 @@ fun main() {
 
 Normative rejection cases (each is a compile error):
 
-- Using a trait as a type (`let x: Display = …`).
+- Using a trait as a type, in any value position — a binding, a
+  parameter, a return type, a field, a generic argument (`let x: Display
+  = …`, `fun f(v: Display)`, `fun make(): Display`, `struct H { item:
+  Display }`, `List<Display>`). Reported at the annotation (§5.5).
 - An enum-variant pattern matched against a generic parameter of an
   enclosing declaration (§5.7).
 - An unsatisfied bound at a call (`generic parameter 'T' is missing the

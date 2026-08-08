@@ -319,14 +319,17 @@ const chunks = globalThis.__vilan_chunks;
 	// created. Without it the whole shell is built first and the fetch trails it.
 	console.log("preloaded-before-the-shell", stub.first_element_saw_a_fetch());
 	console.log("boot", stub.page());
-	await stub.settle();
+	// Anchored on the boot chunk's own render: `import()` cannot resolve within
+	// this turn, so the line above always sees the placeholder, and the line
+	// below always sees the section — however long the fetch takes.
+	await stub.rendered("scale 6");
 	console.log("home", stub.page());
 
 	// Navigating: the signal does not advance until the chunk does, so the
 	// PREVIOUS page is what is on screen — the whole loading story.
 	stub.go("/docs/3");
 	console.log("fetching", stub.page());
-	await stub.settle();
+	await stub.rendered("page 3");
 	console.log("docs", stub.page());
 
 	// Only what was navigated to was ever fetched.
@@ -376,13 +379,17 @@ require("./app.js");
 const chunks = globalThis.__vilan_chunks;
 
 (async () => {
-	await stub.settle();
+	await stub.rendered("scale 6");
 	console.log("home", stub.page());
 
 	const real = chunks.url[2];
 	chunks.url[2] = "app.Route_Missing.js";
 	stub.go("/nope");
-	await stub.settle();
+	// The failure's own render is the anchor: `chunk_error()` is written on the
+	// rejection path, strictly after the registry has dropped the in-flight
+	// entry, so observing `!` also puts the `still-pending` read behind the
+	// delete rather than beside it.
+	await stub.rendered("<p>!</p>");
 	// The navigation did not happen: the previous page is still on screen, the
 	// pending flag is back down (it must not stick), and the reason reached the
 	// app — `!` renders only for a non-empty message.
@@ -393,7 +400,7 @@ const chunks = globalThis.__vilan_chunks;
 	// the same arm refetches — a retry is a link click, not an API.
 	chunks.url[2] = real;
 	stub.go("/nope");
-	await stub.settle();
+	await stub.rendered("Nothing here");
 	console.log("retried", stub.page());
 })();
 "#,
@@ -426,11 +433,11 @@ require("./app.js");
 const chunks = globalThis.__vilan_chunks;
 
 (async () => {
-	await stub.settle();
+	await stub.rendered("scale 6");
 	stub.go("/docs/1");
-	await stub.settle();
+	await stub.rendered("page 1");
 	stub.go("/");
-	await stub.settle();
+	await stub.rendered("scale 6");
 	console.log("home", stub.page());
 
 	// NotFound's chunk is the slow one, and its arrival is the harness's to
@@ -451,12 +458,16 @@ const chunks = globalThis.__vilan_chunks;
 	// A second navigation, to code that is already here, wins immediately —
 	// and ends the wait, since the fetch it supersedes can no longer land.
 	stub.go("/docs/2");
-	await stub.settle();
+	await stub.rendered("page 2");
 	console.log("superseded", stub.page());
 
-	// …and when the superseded chunk finally arrives, it must NOT swap.
+	// …and when the superseded chunk finally arrives, it must NOT swap. The
+	// window this negative needs is opened by an event the harness itself
+	// causes — `land()` resolving the arm's in-flight promise, which queues the
+	// app's continuation — and closed by draining turns until the DOM stops
+	// changing. Nothing here waits for a duration, so load cannot shorten it.
 	await land();
-	await stub.settle();
+	await stub.quiet();
 	console.log("stale-arrival", stub.page());
 })();
 "#,
@@ -899,7 +910,7 @@ fn a_split_builds_chunks_are_servable_through_the_manifest() {
 
     let dist = staged.join("dist");
     let mut server = Command::new("node")
-        .arg(Path::new("dist").join("server.js"))
+        .arg(Path::new("dist").join("server.mjs"))
         .current_dir(&staged)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -971,10 +982,20 @@ fn split_off_a_browser_leg_stops_the_build() {
 }
 
 /// The DOM/history stub the split bundle runs against — `router.rs`'s, plus a
-/// settle step (a chunk arrives on a microtask rather than inline), a
-/// `location`/`popstate` driver, and one instrument: whether a chunk fetch was
+/// `location`/`popstate` driver, one instrument (whether a chunk fetch was
 /// already in flight when the FIRST element was created, which is how the boot
-/// preload is observed.
+/// preload is observed), and the two waits every content assertion here is
+/// anchored on.
+///
+/// The waits are EVENTS, not a clock (E45, E41's shape applied here). A chunk
+/// arrives asynchronously — a real `import()` off disk, then a microtask segment
+/// that swaps the view — and the wait this replaces was `setTimeout(50)`: on a
+/// loaded box the fetch outran it and the assertion sampled the *pending
+/// placeholder* where the resolved section belongs, which is exactly the failure
+/// E45 recorded across three lanes. `rendered(needle)` instead resolves on the
+/// DOM MUTATION that puts `needle` on the page, so a slow box only waits longer,
+/// and a render that never comes fails loudly with the page it was left with —
+/// it can neither pass vacuously nor fail spuriously.
 const STUB: &str = r#"class StubElement {
 	constructor(tagName) {
 		this.tagName = tagName;
@@ -987,14 +1008,15 @@ const STUB: &str = r#"class StubElement {
 		this.style = { setProperty() {} };
 	}
 	get textContent() { return this._text; }
-	set textContent(value) { this._text = value; this.children = []; }
-	setAttribute(name, value) { this.attributes[name] = value; }
+	set textContent(value) { this._text = value; this.children = []; touched(); }
+	setAttribute(name, value) { this.attributes[name] = value; touched(); }
 	appendChild(child) {
 		if (child.parent) {
 			child.parent.children = child.parent.children.filter((c) => c !== child);
 		}
 		child.parent = this;
 		this.children.push(child);
+		touched();
 		return child;
 	}
 	remove() {
@@ -1002,14 +1024,24 @@ const STUB: &str = r#"class StubElement {
 			this.parent.children = this.parent.children.filter((c) => c !== this);
 		}
 		this.parent = null;
+		touched();
 	}
-	replaceChildren() { this.children = []; }
+	replaceChildren() { this.children = []; touched(); }
 	addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
 	render() {
 		const inner = this.children.map((child) => child.render()).join("");
 		return `<${this.tagName}>${this._text}${inner}</${this.tagName}>`;
 	}
 }
+
+// Every write to the tree bumps `mutations` and wakes whoever is waiting on the
+// next render. This is the observable event a chunk's arrival ends in.
+let mutations = 0;
+const watchers = [];
+const touched = () => {
+	mutations += 1;
+	for (const watcher of watchers.splice(0)) watcher();
+};
 
 const root = new StubElement("div");
 let first_element_saw_a_fetch = null;
@@ -1031,9 +1063,50 @@ global.history = { pushState(state, title, path) { global.location.pathname = pa
 const popstate = [];
 global.window = { addEventListener: (event, handler) => { if (event === "popstate") popstate.push(handler); } };
 
+const page = () => root.children.map((child) => child.render()).join("");
+// One turn of the loop: `setImmediate` runs after every microtask queued so
+// far, and reactive's continuation segments settle on microtasks
+// (`std/reactive.vl`), so a turn boundary drains the whole render a resolved
+// chunk schedules. A turn is not a duration — this waits for the queue, not for
+// the clock.
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+
 module.exports = {
-	page: () => root.children.map((child) => child.render()).join(""),
-	settle: () => new Promise((resolve) => setTimeout(resolve, 50)),
+	page,
+	// Waits for the render that puts `needle` on the page. Returns after the
+	// mutation that lands it PLUS one turn, so the surrounding synchronous
+	// render batch and any microtask that follows it are complete before the
+	// page is sampled. The deadline is a failure mode, not the wait: nothing
+	// here passes because it expired.
+	rendered: (needle, deadline_ms = 30000) =>
+		new Promise((resolve, reject) => {
+			const done = () => turn().then(resolve);
+			if (page().includes(needle)) return done();
+			const timer = setTimeout(() => {
+				reject(new Error(
+					`the render carrying ${JSON.stringify(needle)} never arrived within ` +
+					`${deadline_ms}ms; the page is ${JSON.stringify(page())}`,
+				));
+			}, deadline_ms);
+			const watcher = () => {
+				if (!page().includes(needle)) return watchers.push(watcher);
+				clearTimeout(timer);
+				done();
+			};
+			watchers.push(watcher);
+		}),
+	// For an assertion that the page must NOT change: drains turns until one
+	// passes with no mutation at all. Used only after the event whose effect is
+	// being denied has already been observed (a chunk that landed by the
+	// harness's own hand), so this closes a window that is already open rather
+	// than standing in for the arrival itself.
+	quiet: async (turns = 3) => {
+		for (let index = 0; index < turns; index += 1) {
+			const before = mutations;
+			await turn();
+			if (mutations === before) return;
+		}
+	},
 	go: (path) => {
 		global.location.pathname = path;
 		for (const handler of popstate) handler({});

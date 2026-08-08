@@ -145,6 +145,31 @@ impl Platform {
         )
     }
 
+    /// The file extension an emitted bundle for this platform must carry.
+    ///
+    /// A process runtime decides whether a file is ESM or CommonJS **before
+    /// running it**, from the extension (or the nearest `package.json`'s
+    /// `type`), and only falls back to sniffing the source. Vilan always emits
+    /// ESM, and the sniff cannot be relied on: the emitter parenthesizes await
+    /// operands, and `await (x)` is valid CommonJS — it parses as a call to a
+    /// function named `await` — so detection never fires and the program dies
+    /// at runtime with `ReferenceError: await is not defined`
+    /// (`top-level-await.md` §1.4). Today's rescue is incidental, the `import`
+    /// line a Node extern happens to emit. `.mjs` states the classification
+    /// instead of hoping it is guessed.
+    ///
+    /// The browser needs no such marker and keeps `.js`: every emitted bundle
+    /// is loaded by a `<script type="module">` tag, which declares its
+    /// module-ness at the load site, and browsers do not sniff.
+    pub fn script_extension(self) -> &'static str {
+        match self {
+            Platform::Node { .. } | Platform::Deno { .. } | Platform::Bun { .. } => "mjs",
+            // `None` emits nothing (the CLI refuses to build it); `.js` is the
+            // inert answer for the one caller that asks before checking.
+            Platform::Browser | Platform::None => "js",
+        }
+    }
+
     /// How specifically this platform matches `pattern` (higher = more specific),
     /// or `None` if it doesn't match. An exact-version pattern outranks any-version.
     pub fn matches(self, pattern: PlatformPattern) -> Option<u8> {

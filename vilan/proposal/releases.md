@@ -94,7 +94,36 @@ extension, and std move together, because they are coupled in fact
 
 - `0.MINOR.PATCH`, tags `v0.2.0`, `v0.2.1`, …
 - Pre-1.0 semantics: minor bumps may break anything (the alpha promise);
-  patch bumps are fixes. Bump minor liberally.
+  patch bumps are fixes.
+- **Bump on the train, not on the landing.** This bullet read "bump minor
+  liberally" until 2026-08-07, which was right when a cut followed every
+  cycle and is wrong now. Ratified policy (`proposal/process.md` §1):
+  cycles keep landing on `next` the day they finish, `## Unreleased` grows
+  for a week, and the minor bump happens **at most weekly** — at the train,
+  ratified as **Saturday** — or immediately when one of three urgent
+  conditions fires:
+  - **U1** — a miscompile in a shipped release: the compiler accepts a
+    program, the program runs, and the answer is wrong, reachable from
+    ordinary code.
+  - **U2** — a security issue in the toolchain, in a published artifact, or
+    in the install path (`install.sh` / `install.ps1` / `vilan upgrade` /
+    the tap formula).
+  - **U3** — a broken toolchain: the released binary fails to install,
+    fails to start, or cannot compile a hello on a supported platform.
+
+  Everything else waits. A fix being *good* is not a trigger; a fix being
+  good is why there is a train. Two properties make it a train rather than
+  a schedule: **it may be skipped** — a week that produced nothing a user
+  can observe gets no tag, because a release with nothing in it spends the
+  pipeline and five one-way publishing channels to teach users that
+  upgrading is meaningless — and **it is never delayed for a feature**, so
+  work that is not on `next` on cut day rides the next train. That second
+  property is what makes "cut less often" cost nothing: nobody is ever
+  waiting on the cut, because the cut is never waiting on anyone.
+
+  A patch between trains carries **exactly one thing** — the fix for the
+  U1/U2/U3 condition plus its changelog entry, nothing else — and is cut
+  from a release branch, not from `next`. See §7.3.
 - The first public release is **v0.2.0** (0.1.0 was the pre-public
   internal number; a visible jump marks the boundary).
 - `vilan --version` prints `vilan 0.2.0 (<short-sha>)` so bug reports
@@ -120,7 +149,10 @@ extension, and std move together, because they are coupled in fact
     same reason; the manifest inside carries the version).
   - `sha256sums.txt`.
 - **The install script** —
-  `curl -fsSL https://github.com/ReedSyllas/vilan/releases/latest/download/install.sh | sh`:
+  `curl -fsSL https://github.com/ReedSyllas/vilan/releases/latest/download/install.sh | sh`
+  (the url as published then; the project now lives at `vilan-lang/vilan`,
+  and the current one-liner is in the README — this one still resolves,
+  through the transfer's permanent redirect):
   detects OS/arch, downloads the right tarball, unpacks `vilan` and
   `vilan-lsp` into `~/.vilan/bin`, prints the PATH line to add. The
   script itself is a release asset (and lives in the repo under
@@ -169,8 +201,26 @@ is proven. Homebrew tap alongside it.
 
 `.github/workflows/release.yml`, triggered by pushing a `v*` tag:
 
-1. **Gate**: full `cargo test` on linux (the suite: 669 tests, corpus,
-   docs gate, walkthrough build, hygiene).
+1. **Gate**: the suite on linux, run with **exactly the command `ci.yml`
+   runs** — `cargo nextest run --workspace`, plus the
+   `cargo test --workspace --doc` leg that nextest does not cover. The
+   corpus, the docs gate, the walkthrough build and hygiene are all inside
+   it; the count is not worth writing down here (it was 669 when this
+   paragraph was first written and 3,046 on ubuntu at v0.32.0), but the
+   *command* is, because it was wrong for a month.
+
+   Until 2026-08-07 this step ran plain `cargo test`, and the two gates
+   were therefore different instruments. `cargo test` schedules serially
+   per binary; nextest interleaves every binary across all cores, which
+   surfaces load-dependent failures the serial schedule hides. On the
+   v0.32.0 commit (`e0e9e02`) that difference published a release: the
+   `gate` job went green and shipped to GitHub Releases, npm, the VS Code
+   Marketplace, Open VSX and the Homebrew tap, while `ci.yml` on the
+   identical sha was **red on both ubuntu and windows**. A release gate
+   weaker than the CI gate is not a gate. Keep the two commands identical,
+   character for character, and change them together
+   (`proposal/process.md` §7.2 and §8.1 — the highest-priority item in
+   that paper).
 2. **Changelog check**: `CHANGELOG.md` contains a section for this
    version.
 3. **Build matrix**: the targets above, `--release` with
@@ -183,8 +233,10 @@ is proven. Homebrew tap alongside it.
 5. **Publish**: `gh release create v<version>` with the changelog
    section as the release notes, all assets attached.
 
-**Standing pre-tag step: the reconciliation sweep.** Added 2026-08-03, after
-a records-reconciliation pass found the record drifting in both directions
+### 7.1 The reconciliation sweep, and where each part runs
+
+**The standing pre-tag step.** Added 2026-08-03, after a
+records-reconciliation pass found the record drifting in both directions
 under concurrent sessions — a shipped item with no backlog marker, and
 (separately) a marker dated days before the code it names actually merged.
 Before cutting, not after CI has already tagged something wrong:
@@ -203,15 +255,137 @@ Before cutting, not after CI has already tagged something wrong:
     `proposal/backlog.md`, per that file's restructure convention (the
     distilled file keeps a one-line tombstone, nothing is deleted).
 
-A release that ships with a wrong changelog section or a stale backlog is a
-smaller problem than one that has already tagged, so this runs before step
-2's changelog check, not after.
+**The sweep splits along its seam** (ratified 2026-08-07,
+`proposal/process.md` §6.1; in practice since the v0.33.0 close). The sweep
+was written when a cut followed a cycle, so it reads as "the cycle just
+ended, close its markers". Under accumulated cycles the procedure is still
+exactly right — it was never scoped to one cycle, it is scoped to
+everything under `## Unreleased` — but the three parts no longer run at the
+same moment. **(b) and (c) are about the *record*; (a) is about the *tag*.**
 
-Cutting a release is then: run the reconciliation sweep above, update
-`CHANGELOG.md` + bump versions (one
-script: `scripts/bump-version.sh` rewrites the three crate manifests and
-the extension's `package.json`), commit, tag, push the tag. Everything
-after is CI.
+- **(b) and (c) run per cycle**, at cycle close. Marker-closing and
+  body-moving are done best while the lane that shipped the item is still
+  in living memory, and they grow linearly with the number of cycles
+  accumulated. Left at cut time they turn a weekly cut into a two-hour
+  records exercise, which is the one way "cut less often" could make things
+  worse.
+- **(a) runs per cut**, over the whole accumulated `## Unreleased` section,
+  and it *cannot* move: it needs the commit that will become the tag, which
+  is only known at cut time. It also becomes **more** valuable under
+  accumulation, not less. With one cycle per cut, an Unreleased entry whose
+  commit never landed is a rare accident; with a week of entries written by
+  five lanes, the ancestor check is the only thing standing between the
+  changelog and a public claim about code sitting on an unmerged branch.
+  **The check is per entry and it is not optional.**
+
+A release that ships with a wrong changelog section or a stale backlog is a
+smaller problem than one that has already tagged, so the sweep runs before
+step 2's changelog check, not after.
+
+### 7.2 Cutting a release: the whole sequence
+
+Steps 1–5 above are what CI does once a `v*` tag exists. This is what the
+person cutting does, start to finish. It is written down here because until
+2026-08-07 the second half of it lived nowhere but a comment in the pages
+repo's `docs.yml` header.
+
+1. **Sweep (a).** Ancestor-verify every `## Unreleased` entry against the
+   commit that will become the tag (§7.1). (b) and (c) are already done, per
+   cycle.
+2. **Bump.** `scripts/bump-version.sh <version>` — it rewrites every
+   `crates/*/Cargo.toml`, refreshes `Cargo.lock`'s workspace-member
+   entries, and runs `npm version` in `editors/vscode` so the extension's
+   `package.json` and `package-lock.json` stay in step. One version for the
+   whole toolchain, per §4.
+3. **Retitle and order.** `## Unreleased` becomes `## v<version> — <date>`.
+   At 2.7 cuts a day that section held one or two entries; at a weekly
+   train it holds fifteen, so the retitle is also an **ordering** step. The
+   order is the one a reader wants: breaking changes first, then
+   miscompiles, then features, then diagnostics and tooling — separated by
+   the `---` rules the changelog already uses between related entries.
+4. **Commit, tag, push.** A `release: v<version>` commit on `next`, tagged
+   `v<version>`; push `next` and the tag.
+5. **Watch `release.yml`.** The tag push is the trigger. Ten assets, five
+   publish channels, several of them one-way — an npm version can be
+   deprecated but never replaced. Do not walk away from a red publish leg.
+6. **Fold `main`.** Merge the tag into `main` with a merge commit
+   (`Merge v<version> — main catches the release train`) and push. This is
+   not cosmetic: the book builds from `vilan@main`, so nothing published
+   after this point is current until the fold lands.
+7. **Dispatch the book — FIRST.**
+   `gh workflow run docs.yml -R vilan-lang/vilan-lang.github.io`, and wait
+   for it to go green. It checks out `vilan@main`, rebuilds the book with
+   mdBook, and commits the result into the pages repo. (A daily cron is the
+   safety net for a missed dispatch, not a substitute for it.)
+8. **Dispatch the site — SECOND.**
+   `gh workflow run deploy.yml -R vilan-lang/website`. **The order is
+   load-bearing in both directions.** It must come *after* the release
+   because the site installs the toolchain from `releases/latest` and pulls
+   the playground wasm from that same release — the cut is the site's
+   version lever. It must come *after* the docs build because both
+   workflows push commits to `vilan-lang.github.io` and they sit in
+   different concurrency groups (`docs-build` and `site-deploy`), so
+   nothing serializes them for you; run them together and two pushes race
+   the same repo.
+9. **Verify the manifest.** Fetch `/playground/manifest.json` from the live
+   site: `compiler` must read the new tag and `versions[]` must list it
+   first. This is the end-to-end proof that the new wasm actually reached
+   Pages — the site deploy's own green is necessary and not sufficient.
+   Trust `gh run list` on the pages repo over the `pages/builds/latest`
+   endpoint, which lags the Actions-based Pages deployment.
+10. **Refresh the local toolchain — both paths.** A development machine
+    typically has *two* `vilan` binaries: one from `cargo install`
+    (`~/.cargo/bin`) and one from the install script or
+    `scripts/install-dev.sh` (`~/.vilan/bin`). Which one wins depends on
+    the shell — interactive and non-interactive shells can resolve `PATH`
+    differently, and a build script or an editor-spawned process is not the
+    terminal. Refresh **both** locations, `vilan` and `vilan-lsp` together,
+    and restart the language server; otherwise a stale compiler quietly
+    shadows the release that was just cut, and the next thing verified is
+    verified against the wrong binary. `vilan --version` prints the commit
+    sha, which is the reliable check.
+
+Everything from step 5 onward is the part that used to be tribal knowledge.
+
+**A consequence worth stating plainly: the public site's freshness is now
+the cut cadence.** The website deploy installs the toolchain from the latest
+tagged release and takes the playground wasm from that same release, so
+under a weekly train a visitor meets a playground up to a week behind
+`main`. That is a deliberate trade — predictably a week behind beats
+randomly four hours behind — but it is a known one, and it is the reason
+step 8 cannot simply be skipped between trains.
+
+### 7.3 Patches between trains: `release/0.MINOR`
+
+Every tag in this repository's history sits on `next`'s own line —
+`release: v0.32.0` is a commit on `next`, tagged there, and `main` is a
+merge of it. That topology has nowhere to put a patch: cherry-picking a fix
+onto `next` and tagging drags in a week of unreleased work, which is exactly
+what the train exists to avoid. Ratified 2026-08-07
+(`proposal/process.md` §1.5, open question 8), the minimal addition:
+
+1. **At each train, do nothing extra.** No branch is created
+   speculatively.
+2. **When a patch is needed, branch `release/0.MINOR` from the tag** —
+   lazily, only now, only because a patch exists.
+3. **Cherry-pick the fix onto it.** The fix should land on `next` first and
+   be cherry-picked *from* there. Bump to `0.MINOR.PATCH` with
+   `scripts/bump-version.sh`, write the changelog section, tag
+   `v0.MINOR.PATCH` **on that branch**, and push the tag. `release.yml`
+   triggers on `v*` regardless of branch, so the pipeline needs no change
+   at all — steps 5 through 10 of §7.2 run exactly as they do for a train.
+4. **Merge `release/0.MINOR` back into `next` with `--no-ff`** — never
+   rebase it — so the fix and its changelog entry cannot be lost at the
+   next train. Where `next` already carries the fix, the merge is trivial
+   and the changelog entry unions the way lane merges already do.
+5. **Delete `release/0.MINOR` once the next train ships.** It is a
+   scaffold, not a maintained branch. This project does not backport and
+   should not pretend it might.
+
+A patch carries **exactly one thing**: the U1/U2/U3 fix and its changelog
+entry. That exclusivity is the whole promise of a patch release — "this
+changes one behavior, the broken one" — and it is what makes a patch safe to
+take without reading.
 
 ## 8. Delivery
 

@@ -444,3 +444,431 @@ window (the `vilan build`-then-`node` shape), and every one of them survived
 both concurrent suites. They are worth converting if CI ever flags one, and
 worth nothing before that. E41's vacuously-green negative windows in
 `hmr.rs` are untouched.
+
+## 8. The import-cost cliff is one mechanism: `std::set`, reached through every macro world (E43, 2026-08-07)
+
+E43 filed two data points — `std::set` and `std::time` each ~6 s to import
+where `std::print`/`std::http`/`std::fetch`/`std::task` cost ~0.25 s — and
+guessed they were one mechanism. They are. This is the measurement-first
+pass that found it, and the fix it points at is not contained, so the
+diagnosis is recorded here rather than attempted.
+
+**The instrument.** One `vilan check` per std module on a three-line program
+importing exactly that module, each in a FRESH PROCESS — the base cache
+(S3c) is process-global, so a new process is a cold cache, the out-of-process
+equivalent of the `base_cache_clear()` the B77 pins use. `VILAN_PHASE_TIMING=1`
+splits each analysis into `load+walk` / `base` (the pre-entry
+`resolve_world()`) / `build` / `checks`. Best of two reps, debug binary,
+quiet box. The instrument was re-verified working (E35 had fixed it
+panicking warm analyses): every run produced a program and `no errors`.
+
+One further column is doing the real work: **macro worlds**. A macro world is
+a nested `analyze_source`, and its phase line is suppressed — but its
+`post-passes` line is not, so counting those lines counts the nested
+analyses. The CLI calls `analyze` directly, so on this path every
+`post-passes` line is one macro world.
+
+| module (44 measured)  | cold ms | load+walk | base   | build  | checks | macro worlds |
+|-----------------------|---------|-----------|--------|--------|--------|--------------|
+| `ui` (node layer)     |    9830 |    9421.9 |  169.4 |   10.2 |  151.0 |            3 |
+| `rpc_server`          |    9795 |    9249.0 |  240.6 |    9.4 |  155.5 |            3 |
+| `rpc`                 |    9707 |    9224.3 |  200.3 |    7.9 |  169.5 |            3 |
+| `router` (browser)    |    9699 |    9287.9 |  180.3 |    9.0 |  138.3 |            3 |
+| `reactive`            |    9471 |    9193.2 |  113.4 |    5.4 |   98.9 |            3 |
+| `ui` (browser layer)  |    9406 |    9021.8 |  164.9 |    8.8 |  131.6 |            3 |
+| `time`                |    6467 |    6231.4 |   95.9 |    4.6 |   84.8 |            2 |
+| `arena`               |    3473 |    3303.3 |   83.5 |    4.1 |   52.3 |            1 |
+| `set`                 |    2494 |      92.5 | 1095.8 | 1063.3 |  212.8 |            0 |
+| `crypto`              |     522 |     171.6 |  201.3 |    7.1 |   92.6 |            0 |
+| `dev` (browser)       |     424 |     119.0 |  144.2 |   10.8 |   99.7 |            0 |
+| `db`                  |     391 |     103.8 |  121.2 |    6.7 |  120.9 |            0 |
+| the other 32 modules  | 233–326 |      ~90  |   ~85  |    ~4  |   ~55  |            0 |
+
+The macro-world column predicts the cliff exactly: ~3.1 s each, and nothing
+else in the table moves. `time` is not a heavy module — it reaches two
+macro-defining files. Worlds are cached per macro-DEFINING FILE, which is
+why the count is not the number of `[derive(..)]`/`[extern(..)]` sites
+(`rpc` has 18 sites and 3 worlds).
+
+**Two shapes, one hot ingredient.** Un-suppressing the nested phase line
+shows a macro world spends its time where `std::set` does — not in loading
+or walking, but in constraint solving, and it pays the fixpoint twice, once
+in `resolve_world()` and again in the post-entry `build()`:
+
+| analysis                       | load+walk | base   | build  | checks |
+|--------------------------------|-----------|--------|--------|--------|
+| the macro world of `[derive(Debug)]` |    64.4 | 3193.5 | 2922.0 |  503.7 |
+| `reactive`'s three worlds      | 25–51     | 1269–2086 | 1383–1497 | 235–263 |
+| `import std::set` (no macros)  |      92.5 | 1095.8 | 1063.3 |  212.8 |
+
+The reason both shapes are the same shape: **`macro_std/src/lib.vl` does
+`export import std::set;`**. Every macro world's workspace is `[macro_std]`,
+so every macro world analyzes `std::set` — and macro worlds can never reuse
+the base cache, because `base_cacheable` requires `workspace.packages`
+to be empty. Each one pays `std::set` from scratch.
+
+**Proven by ablation**, on CPU seconds rather than wall (the box was loaded;
+CPU time is the load-robust metric — three reps, tight):
+
+| macro_std variant, compiling one `[derive(Debug)]` | CPU s        |
+|----------------------------------------------------|--------------|
+| stock                                               | 5.18 / 5.26 / 5.19 |
+| without `export import std::set`                    | 0.93 / 0.93 / 0.78 |
+| without `std::set` AND `std::map`                   | 0.85 / 0.78 / 0.80 |
+
+`std::set` alone is the whole cliff; `std::map` is innocent (it imports for
+262 ms on its own, against `set`'s 2494 ms, at the same 111 lines).
+
+**This is not only a suite cost.** The same measurement says a plain user
+program whose only unusual feature is `[derive(Debug)]` pays ~3.4 s wall /
+5.2 s CPU to compile, and a second derive resolving to a second defining
+file pays ~6.3 s. That is a compiler-UX defect, not a test-harness one.
+
+**Why nothing is fixed here.** The contained-looking fix — dropping
+`std::set` from `macro_std`'s re-exports — treats a consumer, not the cause,
+and changes a published surface macro authors may bind. The cause is that
+`std::set` costs ~2.2 s of constraint solving where every other std module
+costs ~0.09 s, and that lives in the solver's handling of its `Hashable`
+bound graph, not in any one line of `set.vl`. It was NOT the `impl List<type
+T: Hashable>` tail (removing it changes nothing measurable), so localizing it
+wants a profiler run on a quiet box. Two structural facts belong with it
+whenever it is taken up: the fixpoint runs twice over the same constraint set
+(`resolve_world()` then `build()`), and macro worlds are excluded from the
+base cache by a blanket `workspace.packages.is_empty()` test that a
+macro-world workspace can never satisfy even though every macro world in a
+process shares the same `macro_std`.
+
+## 8.1 It was not the `Hashable` bound graph: the fixpoint could not stop (E43, 2026-08-07)
+
+§8 left the cause as "`std::set` costs ~2.2 s of constraint solving … in the
+solver's handling of its `Hashable` bound graph". That guess was wrong, and
+the profile says so plainly. Nothing about `set`'s constraints is expensive.
+The solving loop simply never stopped running them.
+
+**The instrument.** The box was at load 30–38 (another agent's suite), so
+wall and CPU are both unusable and every number here is a **callgrind
+instruction count** — deterministic, and identical under any load. Debug
+binary, one `vilan check` per program in a fresh process. Ir tracks wall
+faithfully on the quiet baseline: `set` measured 9.36x `map` in Ir against
+the 9.5x §8 measured in milliseconds.
+
+**Where the 2.2 s went.** `import std::set` costs 23.4e9 Ir against
+`import std::map`'s 2.49e9 at the same 111 lines. The differential, by
+inclusive cost, is not spread around — it is two constraint kinds:
+
+| inclusive Ir                | set    | map    | ratio  |
+|-----------------------------|--------|--------|--------|
+| `resolve_for_each_item`     | 8.11e9 | 2.4e6  | 3431x  |
+| `resolve_method_arg_check`  | 8.22e9 | 8.9e6  |  922x  |
+| `resolve_constraints`       | 16.6e9 | 67.7e6 |  245x  |
+| `infer_type_path`           | 10.3e9 | 108e6  |   95x  |
+
+Those two kinds are 70% of the whole analysis. But their *per-call* cost is
+ordinary — what differs is how often they run. `resolve_for_each_item` is
+called **115,433 times for `set` and 24 times for `map`**, over five `for…in`
+loops against `map`'s four. The solver was re-running a handful of
+constraints tens of thousands of times.
+
+**Why.** Instrumenting the fixpoint's own loop gave the mechanism directly:
+
+```
+set  base : iterations=14022  max=14022  backstops=14012  deferred_left=10
+set  build: iterations=14842  max=14842  backstops=14840  deferred_left=10
+map  base : iterations=17     max=14044  backstops=5      deferred_left=0
+```
+
+`std::set` leaves **ten constraints permanently deferred** — legitimately
+unresolvable, and `finalize_build` commits them to defaults. The loop is
+supposed to notice it has settled. Instead it ran to `max_iterations`
+(`2 * entity count + 16`), every pass re-running those ten through full
+recursive `infer_type`. That is the entire cliff. `map` leaves nothing
+deferred, so it never entered the spin — which is the whole of why the two
+files differed. `[derive(Debug)]` showed the same shape twice, once per
+macro world (16,286 and 17,730 passes).
+
+The quiescence test could never pass. Its third progress signal (S3b) counted
+every write into `type_id_to_type_map`, and `type_id_for_type` mints a fresh
+id — and writes it — on **every attempt, unconditionally**. The signal was
+therefore lit on every pass, forever.
+
+**The fix** splits the signal into the two shapes it was conflating.
+*Refining* a slot in place (an `Unknown` closure parameter becoming concrete
+while the attempt that filled it defers) is progress on its face — every
+holder of that slot sees the new type — and it is monotone and finite, so it
+buys unlimited further passes. `write_type_slot` now owns that definition and
+counts exactly these: not a fresh mint (a new id has no readers), not an
+idempotent rewrite (it tells readers what they already knew). *Minting* slots
+a later attempt consumes is also real — it is the two-phase chained-`map`
+stall, where the pass that instantiates `map`'s signature resolves nothing
+and the pass after it succeeds on what that left behind — but every attempt
+mints, so it can never be counted directly. Hence the asymmetry: a fruitless
+backstop buys exactly **one** more pass. If the second also resolves, wakes
+and refines nothing, it consumed none of the first's mints and left a
+structurally identical batch of its own; the state is stationary and every
+later pass would repeat it. `max_iterations` goes back to being only the
+safety net against a non-converging bug, which is all it was meant to be.
+
+Both sides of that one-pass grace are pinned, each planted red: restoring the
+mint turns `the_constraint_fixpoint_stops_when_it_settles` red (`set` interns
+122,561 types against `map`'s 7,270), and dropping the grace to zero turns
+`mapped_maps_thread_the_element_type` and
+`a_slot_grounded_list_maps_a_field_closure` red — the two chained-`map` cases
+S3b was written for. Five unit tests pin `write_type_slot`'s rule directly.
+
+**Before / after, in Ir:**
+
+| program                        | before   | after   | ratio |
+|--------------------------------|----------|---------|-------|
+| `import std::set`              | 23.40e9  | 2.50e9  | 9.4x  |
+| a `[derive(Debug)]` program    | 29.94e9  | 4.84e9  | 6.2x  |
+| `import std::map` (the control)| 2.49e9   | 2.49e9  | 1.00x |
+
+`set` now costs what `map` costs — 2.496e9 against 2.492e9, a 0.2% gap. The
+cliff is not reduced, it is gone: there is no longer anything anomalous about
+`std::set`. The `[derive(Debug)]` headline is the user-facing one, and it is
+the same fix seen through two macro worlds. The inference test binary itself
+runs 188 s → 110 s.
+
+**§8's table, re-measured.** In CPU ms, the two binaries INTERLEAVED rep by
+rep with the minimum of five taken — the box was at load 22–38 throughout, so
+the absolute figures sit well above §8's quiet-box wall times and only the
+ratios are meaningful. Every row §8 called a cliff collapses; every row it
+called ordinary is untouched, which is the shape the diagnosis predicts.
+
+| module        | before CPU ms | after CPU ms | ratio | macro worlds |
+|---------------|---------------|--------------|-------|--------------|
+| `ui` (node)   |       14742.1 |       1749.4 | 8.43x |            3 |
+| `rpc_server`  |       16994.5 |       2523.0 | 6.74x |            3 |
+| `rpc`         |       15461.5 |       2229.5 | 6.94x |            3 |
+| `reactive`    |       15312.1 |       1904.3 | 8.04x |            3 |
+| `time`        |       10283.3 |       1412.4 | 7.28x |            2 |
+| `arena`       |        5439.3 |        915.3 | 5.94x |            1 |
+| `set`         |        4009.8 |        415.0 | 9.66x |            0 |
+| `crypto`      |         397.7 |        402.9 | 0.99x |            0 |
+| `db`          |         441.8 |        440.3 | 1.00x |            0 |
+| `map`         |         430.9 |        422.2 | 1.02x |            0 |
+| `io`          |         387.1 |        392.1 | 0.99x |            0 |
+
+The macro-world column no longer predicts anything: a world now costs what
+any other analysis costs. The four modules with no worlds and no `std::set`
+move by less than 2%, which is this instrument's noise floor — the fix is
+free where there was no spin to remove.
+
+No behavior change: the same ten constraints stay deferred and reach the same
+defaults; inference (1866), corpus, docs and diagnostic_determinism are green
+and byte-identical.
+
+### The fixpoint-twice question: measured, and there is nothing to ship
+
+§8 filed "the fixpoint runs twice over the same constraint set
+(`resolve_world()` then `build()`)" as a structural fact to take up. It was
+an artifact of the spin. The two runs' costs, in Ir:
+
+| leg                                   | before   | after   |
+|---------------------------------------|----------|---------|
+| `analyze_over_world` (the base leg)   | 12.11e9  | 612e6   |
+| `build`                               | 10.00e9  | 69.6e6  |
+| — of which `finalize_build`           | 64.1e6   | 64.1e6  |
+| — leaving `build`'s own fixpoint      | ~9.94e9  | **5.5e6** |
+
+Before, the two legs cost the same because *both* ran to `max_iterations`.
+After, the second fixpoint costs **5.5 million Ir against the first's 612
+million** — 0.9% of the first leg and 0.2% of the analysis. The two runs'
+inputs genuinely do differ (the second sees the entry's constraints, which is
+the point of the S3 split), and resolution is monotone, so the second run
+finds the work already done and settles in ~5 passes. Sharing them would save
+0.2%, at the cost of the split that S3 exists for. **Verdict: nothing to
+ship, and nothing left open.** The remaining §8 residue — macro worlds
+excluded from the base cache by `workspace.packages.is_empty()` — is
+untouched and still stands on its own.
+
+The `macro_std` re-export of `std::set` stays, per the owner's ruling. It no
+longer costs anything worth naming.
+
+## 8.2 The two levers were one and a half: method resolution scanned every impl (E46, 2026-08-07)
+
+E46 filed three numbers off §8.1's post-fix profile —
+`impl_member_candidates` 21%, `method_member_candidates` 17%,
+`get_type_by_type_id` 16% — and read them as two independent levers. The
+profile confirms all three figures exactly and then says they are not
+independent: **three quarters of the third number is the first one**, seen
+from the other side. One fix collects both.
+
+**The instrument.** Callgrind instruction counts, as in §8.1 — the box ran
+between load 3 and load 44 across this work (another agent's suite), so wall
+and CPU are usable only as interleaved minimum-of-N ratios and Ir is the
+only figure that means anything on its own. Debug binary, one `vilan check`
+per program in a fresh process, on §8's three-line per-module programs.
+
+**The filed numbers, verified.** Inclusive Ir, against the pre-E46 tree:
+
+| inclusive                    | `set`  | `rpc_server` |
+|------------------------------|--------|--------------|
+| `impl_member_candidates`     | 21.16% |       25.78% |
+| `method_member_candidates`   | 17.25% |       21.32% |
+| `get_type_by_type_id`        | 15.73% |       18.94% |
+| `type_implements_trait`      |  1.00% |        6.24% |
+
+`method_member_candidates` is not a separate cost — it is the caller that
+reaches `impl_member_candidates` for a `receiver.member()` resolution, and
+its 17% is inside the 21%.
+
+### Lever 1: the scan asked the expensive question first
+
+`impl_member_candidates` iterated all 322 std impls per resolution and, for
+each, compared the receiver against the impl's subject — a recursive type
+walk — *before* asking the cheap question the answer actually turned on:
+does this impl declare the name at all. Almost none of them do, so ~99% of
+the comparisons were performed on impls dropped one line later.
+
+That predicate is also where the un-interned type read lives:
+`implementation.subject.get_type(self)` deep-clones the subject on every
+iteration. Of the **202,424** `get_type` calls an `import std::set`
+analysis performed, **147,657 were this one closure** — 11.73% of the
+analysis against `get_type_by_type_id`'s 15.73% total. Lever 2's headline
+was mostly lever 1's scan.
+
+**The fix** is a name index — `Analyzer::implementations_by_member`,
+member name to the impls declaring it — and the only interesting question
+about it is invalidation, so: **there is nothing to invalidate.** The index
+is written at the ONE place `implementations` grows, from the same
+`declarations` map, in the same statement. `declarations` is final at that
+moment (the later conformance pass fills only `trait_ids` / `trait_args`),
+which is what makes registration-time correctness available at all rather
+than a cache needing a dirty bit.
+
+**The LSP / warm-analysis verdict: the index cannot go stale, and the
+reason is that it has no lifecycle of its own.** There is no separate
+incremental registration path to miss. Every analysis — cold, cache-hit,
+LSP document, macro world — grows `implementations` through the single
+`Node::Impl` walk arm, including `walk_generated_expansion` for derives.
+The base cache clones the whole `Analyzer` (`#[derive(Clone)]`), so the
+index is cloned with the vector it indexes, and a warm analysis walks its
+entry into *that clone*, registering the entry's impls into both. The
+stored world is snapshotted BEFORE the entry walk, so no analysis's entry
+impls can reach another's. The LSP holds a `Program`, never a live
+`Analyzer`, and reads `program.implementations` read-only.
+
+One structural property is worth recording because it decides what needs a
+test: **the index is a pre-filter, never the answer.** Every impl it names
+is still asked for `declarations[member_name]` before becoming a candidate.
+So a row that is too BROAD changes nothing observable, and only a row that
+is too NARROW can lose a candidate. Correctness has one direction, and the
+pin covers it in its sharpest form (`base_cache.rs`,
+`an_entry_declared_impl_resolves_through_a_cache_hit`: a warm analysis
+whose entry declares the impl; plant-proven red by skipping entry-source
+impls at registration). A pin written for the other direction was dropped
+after a planted process-global index failed to turn it red — it could not,
+for exactly this reason.
+
+Behaviour is unchanged by construction: the index row is in registration
+order, so the sequence reaching `sort_by_key`/`dedup_by_key` is the one the
+full scan produced, element for element.
+
+| inclusive Ir, `set` / `rpc_server` | before        | after lever 1 |
+|------------------------------------|---------------|---------------|
+| `impl_member_candidates`           | 21.16 / 25.78 |  0.66 / 0.78  |
+| `method_member_candidates`         | 17.25 / 21.32 |  0.58 / 0.68  |
+| `get_type_by_type_id`              | 15.73 / 18.94 |  4.06 / 4.83  |
+| `type_implements_trait`            |  1.00 /  6.24 |  0.18 / 0.32  |
+| PROGRAM TOTALS (e9 Ir)             | 2.477 / 14.79 | 1.969 / 11.06 |
+
+### Lever 2: the general refactor is unavailable, and it was measured, not felt
+
+After lever 1, `get_type_by_type_id` is 4.06% / 4.83% and what remains is a
+flat tail: the largest single reader is `inherited_default_candidates` at
+0.74%, then `compute_resource` 0.64%, `any_member_resource` 0.32%. There is
+no third hot reader to fix.
+
+Types stay un-interned — B77/B95's in-place resolution doctrine is not
+reopened — so the lever was only ever the read-path clone. **Blast radius,
+measured by making the change and counting:** `get_type_by_type_id`
+returning `&Type` produces **185 compile errors across 218 call sites in
+one file**, of which **71 are hard borrow conflicts** (66 `cannot borrow
+*self as mutable because it is also borrowed as immutable`, 5 closures
+requiring unique access). That is the solver mutating itself all the way
+down the inference path while a type borrow is live; no signature change
+answers it, only a restructuring. Fifteen times the "about a dozen"
+threshold. **Not taken.**
+
+What ships instead is the part where the borrow is free — the seven impl
+scans whose enclosing method is `&self` and which hand the type straight to
+`compare_type` — behind a documented sibling accessor
+(`borrow_type_by_type_id`), framed in the source as a permanent pair with a
+mechanical rule, not a migration with 211 sites outstanding. Alongside it,
+two genuinely dead clones: `any_member_resource` and its transferable twin
+read a member's type before deciding they only wanted its id, so an
+unparameterized aggregate deep-cloned a value nothing looked at.
+
+**Its honest size: 0.33% (`set`) / 0.63% (`rpc_server`) of a cold
+analysis** — split about evenly between the borrows (0.32%) and the dead
+clones (0.31%) on `rpc_server` — and **below the wall-clock instrument's
+noise floor.** Best-of-five interleaved CPU ms moved 0.97x–1.03x with no
+consistent direction; only Ir resolves it (11.064e9 → 10.995e9 on
+`rpc_server`, 1.969e9 → 1.963e9 on `set`; `get_type_by_type_id` 4.83% →
+3.51% and 4.06% → 3.28%). Recorded at that size deliberately: the lever as
+filed was worth 16%, and 15.4 of those 16 points belonged to lever 1.
+
+### §8.1's table, re-measured
+
+Cold `vilan check` per module, fresh process, the two binaries INTERLEAVED
+rep by rep with the minimum of seven taken, CPU ms. The box drifted from
+load 39 to load 10 during the run, which the interleaved minimum is chosen
+to survive; ratios are the meaningful column.
+
+| module        | before CPU ms | after CPU ms | ratio | macro worlds |
+|---------------|---------------|--------------|-------|--------------|
+| `rpc_server`  |        1479.5 |       1075.4 | 1.38x |            3 |
+| `rpc`         |        1324.9 |       1004.9 | 1.32x |            3 |
+| `ui` (node)   |        1226.6 |        932.7 | 1.32x |            3 |
+| `reactive`    |        1153.1 |        851.6 | 1.35x |            3 |
+| `time`        |         832.1 |        617.9 | 1.35x |            2 |
+| `arena`       |         530.2 |        408.6 | 1.30x |            1 |
+| `db`          |         270.9 |        210.1 | 1.29x |            0 |
+| `map`         |         250.1 |        201.5 | 1.24x |            0 |
+| `set`         |         241.7 |        198.0 | 1.22x |            0 |
+| `io`          |         241.4 |        190.6 | 1.27x |            0 |
+| `crypto`      |         240.7 |        194.5 | 1.24x |            0 |
+
+The shape is the opposite of §8.1's and that is the point. E43's fix was
+free where there was no spin to remove, so its control rows moved by under
+2%; this one moves EVERY row, controls included, because every analysis
+resolves methods. There is no anomalous module here — there is a tax that
+was on all of them.
+
+The phase split says where it came off (`VILAN_PHASE_TIMING=1`, one run):
+
+| phase, ms          | `set` before / after | `rpc_server` before / after |
+|--------------------|----------------------|-----------------------------|
+| `load+walk`        |      84.2 / 96.6     |            1001.0 / 891.3   |
+| `base`             |      89.6 / 45.6     |             276.9 / 100.6   |
+| `build`            |       9.2 /  4.8     |              21.4 /  16.4   |
+| `checks`           |      59.3 / 55.1     |             167.2 / 181.9   |
+
+The inference test binary, both builds interleaved, minimum of three, at
+load 36–42: **577.6 → 476.7 CPU s (1.21x)**. Its wall figures under that
+load are noise in both directions and are not quoted.
+
+No behaviour change: inference (1930), corpus, docs, diagnostic_determinism,
+release_emission and base_cache all green and byte-identical, and B57/B83's
+tiering pins — the guard on this exact code — are among them.
+
+### What the profile says next, recorded and not taken
+
+`rpc_server`'s remaining 11.0e9 Ir is no longer solver-shaped. Parsing is
+now the largest single family (`parse_binary_level` 179% inclusive, i.e.
+re-entered per macro world), and `load+walk` is 891 ms of the module's 1190
+— the three macro worlds' nested analyses, each of which re-parses and
+re-walks `macro_std`'s workspace from scratch. That is §8's untouched
+residue in a new guise: macro worlds are excluded from the base cache by a
+blanket `workspace.packages.is_empty()` test they can never satisfy, even
+though every macro world in a process shares one `macro_std`. It is the
+next lever, and it is a caching question, not a solver one.
+
+Inside the analyzer the remainder is flat and small: the largest single
+call site is `inherited_default_candidates`'s filter at 1.08%, which is a
+linear scan over all impls that the member-name index CANNOT serve (it
+looks its member up in the trait, not in the impl's declarations, so the
+name that keys the index is not present on the impl). Fixing it wants a
+second index keyed by trait, for about a point. Filed as a fact, not a
+lever.

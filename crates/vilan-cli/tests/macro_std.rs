@@ -83,7 +83,7 @@ main();
         String::from_utf8_lossy(&output.stderr)
     );
     let run = Command::new("node")
-        .arg(dir.join("dist/app.js"))
+        .arg(dir.join("dist/app.mjs"))
         .output()
         .expect("run node");
     assert_eq!(
@@ -186,7 +186,7 @@ main();
         String::from_utf8_lossy(&output.stderr)
     );
     let run = Command::new("node")
-        .arg(dir.join("dist/app.js"))
+        .arg(dir.join("dist/app.mjs"))
         .output()
         .expect("run node");
     assert_eq!(
@@ -350,7 +350,7 @@ main();
         String::from_utf8_lossy(&output.stderr)
     );
     let run = Command::new("node")
-        .arg(dir.join("src/main.js"))
+        .arg(dir.join("src/main.mjs"))
         .output()
         .expect("run node");
     let shape = "impl Probe with Marker {\n\tfun eq(self, other: Probe): bool {\n\t\tself.x == other.x && self.y == other.y\n\t}\n}\n";

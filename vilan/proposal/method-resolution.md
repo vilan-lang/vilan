@@ -572,6 +572,16 @@ load both, and it leaves the std blanket `impl type T with Into<T>`
 behaving exactly as it does today for a type that also writes its own
 `Into` impl — a specificity question, which §3(b) declines.
 
+> Still true at METHOD resolution, where it was written, and now with a
+> declaration-site rule beside it: B98 (`trait-objects.md` §15.8) refuses
+> an exact repeat of one `(trait, arguments, subject)` pair. It refuses
+> nothing this paragraph protects — the twins never coexist in a build, so
+> no pair forms; a generic subject never matches a concrete one, so the
+> blanket forms no pair with a user's `Into` impl; and the OVERLAP the
+> last sentence names is untouched, still declaration order, still B73's.
+
+
+
 ### The agreement check (§6 / S4), as run
 
 The probe compared the tiered resolver against the old flat scan at every
@@ -720,6 +730,12 @@ written to go red the day this landed — now asserts the error under the
 name `a_duplicate_function_name_is_rejected`.
 
 ## 12. B83: the static path gets the tiering
+
+> RULED 2026-08-08 (owner): CLOSED AS DESIGNED — no trait-qualified
+> static syntax; the inherent declaration IS the disambiguator (it
+> outranks both trait tiers, which the shipped diagnostic already
+> steers to). Revisit only if a real user collision demands the
+> qualified spelling. The sweep found zero in-tree collisions.
 
 §S2's residue, filed as B83 by B74's arc. `prepped_static_accessors`
 resolved `Type::member` with a flat `find_map` over `implementations` in

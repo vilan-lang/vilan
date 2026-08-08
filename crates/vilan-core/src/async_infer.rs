@@ -282,14 +282,33 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         program.push_diagnostic(error, source);
     }
 
-    // --- Module-level initializers cannot await (backlog §J.3): they run at
-    // module load, where there is no enclosing function to become async and
-    // no top-level await in the emission model. A call to an
-    // (inferred-)async function here would leave a live promise typed as
-    // `T` — `state + 1` on it is garbage — so it is refused cleanly.
+    // --- Module-level initializers cannot suspend (backlog §J.3,
+    // `top-level-await.md`): they run at module load, where there is no
+    // enclosing function to become async. Initialization is synchronous *on
+    // purpose* — not for want of an emission model — because the order it
+    // runs in is derived (B33), and suspending a derived sequence makes an
+    // unrelated binding's completion depend on an order the user never wrote.
+    //
+    // The rule is AWAIT-shaped, and it takes two complementary checks:
+    //
+    //   - the CALL check catches the implicit await — a call to an
+    //     (inferred-)async function, which would leave a live promise typed
+    //     as `T` (`state + 1` on it is garbage);
+    //   - the AWAIT check catches the explicit one, whose operand is not a
+    //     call at all: `await` of a `Task`-valued binding, of a spawn, of a
+    //     `Task` returned by a plain sync function. A call-shaped check is
+    //     blind to every one of those, and they emitted real top-level await
+    //     (`top-level-await.md` §1.3) — ungated, and miscompiled on the Node
+    //     and HMR legs.
+    //
     // Creating an async closure (or an `async { .. }` block) in an
-    // initializer stays legal: nothing awaits at load. `const` initializers
-    // never reach here (they are compile-time; the graph skips them).
+    // initializer stays legal, and so does *spawning* — `let pending:
+    // Task<T> = async f();` — because nothing suspends at load. That is why
+    // the await check reads the graph's initializer awaits, which do not
+    // descend into a created closure: the closure's body is not the
+    // initializer. `const` initializers never reach here (they are
+    // compile-time; the graph skips them).
+    //
     // F6 gates the check exactly as it gates emission and coloring: a
     // binding the entry never reaches never runs, so it cannot await —
     // with no user `main` (a library, a fragment) every binding is checked,
@@ -297,7 +316,8 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     let running_bindings = crate::platform_color::entry_function(program)
         .map(|entry| crate::platform_color::reachable_bindings(program, graph, entry, &[]));
     let initializer_adaptive = adaptive_params_of(program);
-    let mut initializer_awaits: Vec<(crate::error::Error, SourceId)> = Vec::new();
+    let module_bindings: HashSet<Id> = program.module_level_bindings().into_iter().collect();
+    let mut initializer_refusals: Vec<(crate::error::Error, SourceId)> = Vec::new();
     for binding in program.module_level_bindings() {
         if running_bindings
             .as_ref()
@@ -305,6 +325,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         {
             continue;
         }
+        let refusals_before = initializer_refusals.len();
         for call in graph.initializer_calls_of(binding) {
             let async_target = match call.target {
                 // A call whose async closure arguments ADAPT the callee
@@ -381,7 +402,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                 Some(name) => format!("calls `{name}`, which is async"),
                 None => "runs a closure that awaits".to_string(),
             };
-            initializer_awaits.push(anchored(
+            initializer_refusals.push(anchored(
                 program,
                 call.call_id,
                 format!(
@@ -392,8 +413,64 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                 None,
             ));
         }
+
+        // The explicit `await`, whose operand is not an async call. Only when
+        // the call check stayed silent: `await ready()` is BOTH an await and
+        // an async call, and the call form's message names the callee, so it
+        // is the better of the two — one refusal per binding, never a pair
+        // for one line. One error per binding, at its first `await`: further
+        // awaits in the same initializer are the same defect with the same
+        // fix.
+        if initializer_refusals.len() == refusals_before {
+            if let Some(&await_id) = graph.initializer_awaits_of(binding).first() {
+                let binding_name = program
+                    .variables
+                    .get(&binding)
+                    .map(|variable| variable.name)
+                    .unwrap_or("_");
+                // Two steers, both true of what the user wrote. When the
+                // operand names a module-level binding it is already there
+                // and already initialized (B33 orders it first), so the fix
+                // is to move only the `await`. Otherwise the operand is an
+                // expression — a spawn, or a call returning a `Task` — and
+                // the fix is to bind it first.
+                let awaited_binding = match program.entity_map.get(&await_id) {
+                    Some(Expr::Await(operand_id)) => match program.entity_map.get(operand_id) {
+                        Some(Expr::Local(target) | Expr::Variable(target))
+                            if module_bindings.contains(target) =>
+                        {
+                            program.variables.get(target).map(|variable| variable.name)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // The trailing clause is a general fact about module-level
+                // spawning, not a claim about the operand — `await` on a
+                // non-`Task` is legal too, and the steer must stay true there.
+                let steer = match awaited_binding {
+                    Some(name) => format!(
+                        "hold `{name}` here and `await` it in `main` — spawning at module \
+                         level does not suspend, so the work still starts at load"
+                    ),
+                    None => "bind the `Task` here (`let pending: Task<T> = async …;`) and \
+                             `await` it in `main` — spawning at module level does not \
+                             suspend, so the work still starts at load"
+                        .to_string(),
+                };
+                initializer_refusals.push(anchored(
+                    program,
+                    await_id,
+                    format!(
+                        "the initializer of `{binding_name}` awaits: a module-level binding \
+                         cannot suspend (module initialization is synchronous)"
+                    ),
+                    Some(crate::error::Note::here(span_of(program, await_id), steer)),
+                ));
+            }
+        }
     }
-    for (error, source) in initializer_awaits {
+    for (error, source) in initializer_refusals {
         program.push_diagnostic(error, source);
     }
 
