@@ -225,6 +225,13 @@ against the bound there. The one `describe` body is then specialized per
 implementing type, so `self.item().label()` reaches `Dog`'s `label` in one
 and `Cat`'s in the other.
 
+Each impl picks its own argument, but a type implements a given trait
+**once**: a second `impl Robot with Greet` is a compile error at the
+second block, because nothing would rank the two and one of them would
+simply never run. Merge the bodies, or delete the copy you don't want.
+Different arguments are different implementations, so `impl DogBox with
+Holder<Dog>` and `impl DogBox with Holder<Cat>` would both be fine.
+
 Traits are like interfaces, with two differences. They're implemented
 explicitly (`impl Robot with Greet`), never structurally. And they
 appear as *bounds* on generics (`T: Greet`) rather than as standalone

@@ -94,6 +94,24 @@ binder's bounds hold. Members may be functions (with or without
 `self`). A function without `self` is a **static**, reached as
 `Subject::name(…)`.
 
+A trait has **one implementation per subject**: writing
+`impl Bag with Show` twice is a compile error at the second one, since
+nothing would rank them and the second would never run. Two impls are the
+same implementation when they name the same trait with the same
+arguments for the same subject, up to the naming of their own binders —
+so `impl Pair<type T> with Show` and `impl Pair<type U> with Show` are one
+impl written twice, and an argument left to a `= Self` default is the type
+it defaults to (`with Combine` is `with Combine<Bag>` on subject `Bag`).
+A trait parameterized differently is a different implementation:
+`impl Bag with Into<Cup>` and `impl Bag with Into<Mug>` both stand.
+
+*Implementation note (tracked): the rule refuses only exact repeats, not
+OVERLAP. A blanket impl and a specific one that both match a type — the
+`impl type T with Into<T>` of `std::into` beside a type's own `Into` impl,
+or two conditional impls with different bounds — are accepted, and which
+one a call selects is still decided by declaration order. A specificity
+rule is owed.*
+
 *Implementation note (soundness gap, tracked): a conditional impl's
 bounds are not yet re-checked when the impl is selected through a
 GENERIC bound: `List<B>` can satisfy a `Marker` bound via

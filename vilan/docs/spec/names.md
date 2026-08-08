@@ -135,7 +135,10 @@ Two declarations at the same level are an error rather than a silent
 pick. Two *inherent* declarations of one name for one subject are rejected
 at the definition site, before any call resolves them. Two *traits*
 providing one name, with no inherent method above them, make each call an
-ambiguity error — as does a `T: A + B` bound whose two arms supply it.
+ambiguity error — as does a `T: A + B` bound whose two arms supply it. Two
+impls of **one** trait for one subject are rejected at the definition site
+too, by the coherence rule of §5.4: rule 2 above says "the method a trait
+provides", and a trait provides one.
 
 ```vilan
 import std::print;

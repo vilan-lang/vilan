@@ -1444,7 +1444,8 @@ not this arc's code — so today's behavior is **pinned rather than left
 undescribed** (`b4_duplicate_trait_impls_resolve_by_declaration_order_today`
 reproduces P11 exactly: `first` at a direct call and `first` through a bounded
 generic), with the desired end state `#[ignore]`d beside it. Unchanged by this
-arc in either direction.
+arc in either direction. (Shipped one cycle later as B98 — §15.8, where both
+pins are renamed and un-ignored.)
 
 ### 15.7 Residue
 
@@ -1456,3 +1457,95 @@ arc in either direction.
   the whole application type from one refused argument.
 - **P17's R11 rationale** (§8.1) is untouched, as §14 says it should be: the
   one-line `memory.md` correction belongs to whoever next edits that paragraph.
+
+### 15.8 §2.4 shipped — the pair key, and the three carve-outs (B98, v0.35.0)
+
+§2.4's own item, taken up as the `dup-trait-impls` lane. §2.4 predicted "B57's
+existing duplicate machinery reaching one more candidate set"; the built thing
+is a rule of its own beside that machinery, for a reason the prediction could
+not see: B57's candidate set is *members*, and the two shipped rules
+deliberately **exempt** a trait-provided member so that two impls of one trait
+stay legal (`method-resolution.md` §9(6) — the platform twins and the std
+`Into` blanket). Reaching the exempted set would have undone the exemption. So
+`check_duplicate_trait_impls` keys on the impl PAIR while the members stay
+exempt: same family, same diagnostic shape, opposite side of the same
+exemption. It reports at the `with`-clause trait name, notes the first, and
+carries B57's cross-file `by module '…'` clause.
+
+**The pair key is `(trait, trait arguments, subject)` — arguments IN.** The
+question §2.4 left open. Distinct instantiations are distinct implementations:
+refusing `impl Bag with Into<Cup>` beside `impl Bag with Into<Mug>` would make
+a parameterized trait implementable once per type, which is not what `Into`
+means. `Into<Cup>` twice is one impl written twice. Two measurements shaped the
+comparison:
+
+- **Arguments are the EFFECTIVE ones, not the written ones.** A `with` clause
+  records what it wrote, so `with Combine` records none and `with Combine<Bag>`
+  records one, for the same instantiation of `trait Combine<B = Self>`. The
+  trait's declared parameter constraint id *is* its default, and a `= Self`
+  default resolves to `Trait(the trait's own id, [])` — measured, not assumed —
+  so padding the written list with the declared defaults, `= Self` meaning the
+  subject, makes the two compare as the one they are.
+- **The comparison is SAMENESS, not `compare_type`.** Ordinary comparison is
+  compatibility: a generic is a hole to be filled and an unbounded one matches
+  anything, so a `compare_type` key calls std's `impl type T with Into<T>` a
+  duplicate of every user `Into` impl in the program. A generic position
+  matches only another generic position, bound the same way.
+
+**Three carve-outs, each falling out of that rule rather than out of an
+exemption:**
+
+1. **The platform twins.** `browser/ui.vl` and `process/ui.vl` both write
+   `impl View with Slot`, `impl str with Slot`, `impl Signal<str> with
+   AttrValue` and three more. Probed rather than assumed: dumping every
+   registered `(trait, subject)` pair on each leg shows exactly one impl per
+   pair per build, on both — §2's layered `resolve_module_in_roots` finding,
+   confirmed live. The check compares within a platform leg because only one leg
+   exists. Pinned in both directions, and the full-scan half (where std's own
+   entities are not skipped) rides `check_scope_differential.rs`'s
+   `every_std_module_is_clean_under_full_scan`, which force-loads every std
+   module on each platform.
+2. **The std `Into` blanket.** A generic subject against a concrete one is not
+   a repeat, so `impl type T with Into<T>` and `impl Foo with Into<Bar>` never
+   form a pair. B57's own B73 pin
+   (`b84_two_impls_of_one_trait_are_still_not_a_duplicate`) holds unchanged.
+3. **Blanket-vs-specific OVERLAP stays legal, and stays B73's.** Two generic
+   positions are the same position only when their BOUNDS agree, so
+   `impl Pair<type T: Show>` and `impl Pair<type U: Marker>` are two
+   overlapping impls rather than one written twice. Which of two applicable
+   impls wins is still declaration order, exactly as before.
+
+**Bounds, not identity, is what makes (3) work in both directions**, and the
+non-vacuity check is what found why: an *unbounded* impl binder INHERITS the
+subject type's own constraint id (B77's finding), so `impl Pair<type T>` and
+`impl Pair<type U>` already share one id, while a bound mints a fresh one. The
+pin that proves the bounds comparison therefore has to be bounded
+(`b98_two_bounded_impls_differing_only_in_binder_name_are_one_impl`); the
+unbounded pair would pass under identity too. Types are not interned either,
+so equal types have unequal ids and identity was never available as the rule.
+
+**The sweep: one flip, and it is the pin that recorded the bug.**
+`b4_duplicate_trait_impls_resolve_by_declaration_order_today` — rewritten as
+`b98_duplicate_trait_impls_are_refused_at_both_call_paths`, keeping P11's exact
+program — and the `#[ignore]`d
+`b4_two_impls_of_one_trait_for_one_type_are_an_error` un-ignored as written.
+Zero flips in std (both legs, scoped and full-scan), the corpus and its
+goldens, every docs fence, the examples, and the other 1,929 inference
+programs. §2.1's gap-b analogue does not exist for impl pairs: nothing in the
+tree re-implements a std trait for a std type. 14 pins; 5 plants, each rule
+red on its own (the check itself, the sameness comparison, the default
+padding, the arguments in the key, the bounds comparison).
+
+**Residue.**
+
+- **A pretty-printed generic subject shows the LAST binder name registered for
+  the constraint** — `impl Pair<type T>`/`impl Pair<type U>` both print
+  `Pair<U>`, because `generic_constraint_names` is keyed on the inherited
+  constraint id and the second binder overwrites the first. Cosmetic,
+  pre-existing, and visible in this diagnostic's subject label because it is
+  the first one to print a duplicated generic subject.
+- **A clause writing more arguments than the trait declares** is an arity error
+  elsewhere; the key keeps the extras so two such clauses still compare by what
+  they wrote.
+- **B73 is now the only silent declaration-order pick left in the family**, and
+  the spec says so out loud (`spec/types.md` §5.4's implementation note).

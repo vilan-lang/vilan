@@ -109,6 +109,21 @@ name**: a static `fun new()` and a method `fun new(self)` for the same
 type collide with each other too. Give one of them a different name.
 → [Names, modules, and packages](../spec/names.md)
 
+**"'…' is already implemented for '…'; remove or merge this impl"**
+The same trait is implemented twice for the same type. A trait has one
+implementation per type, so the second block would simply never run —
+neither at `value.method()` nor through a `T: Trait` bound. Merge the two
+bodies into one impl, or delete the one you don't want; the note points
+at the first, and names its module when it lives in another file.
+
+Only an exact repeat is refused. A parameterized trait may be
+implemented once per set of arguments — `impl Bag with Into<Cup>` and
+`impl Bag with Into<Mug>` are two implementations, not one written twice
+— and an argument you leave to a `= Self` default counts as the one it
+defaults to, so `with Combine` and `with Combine<Bag>` are the same
+implementation of `Combine` for `Bag`.
+→ [Data and traits](../tour/data-and-traits.md)
+
 **"'…' is ambiguous on '…': both '…' and '…' provide it; call '…' to pick one"**
 Two traits supply the same method name for this receiver (or, for a
 generic receiver, two arms of its `T: A + B` bound), and the type has no

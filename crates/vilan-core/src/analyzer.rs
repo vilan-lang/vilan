@@ -854,6 +854,34 @@ pub struct TraitImplCheck<'src> {
     // Index into `implementations` of the impl this check belongs to, so the
     // resolved trait id can be recorded back onto it.
     pub implementation_index: usize,
+    // The impl block's own entity id — the only id an impl has, and what the
+    // frozen-source skip and the declaration ordering key on (B98).
+    pub impl_id: Id,
+}
+
+/// One `impl Subject with Trait` clause, recorded once its trait resolves: the
+/// `(trait, subject)` pair the coherence rule is keyed on (B98), plus where it
+/// was written.
+///
+/// Separate from [`Implementation`] because an impl BLOCK is not a named
+/// declaration — it has no name span of its own, and one block may name several
+/// traits, each of which is its own pair. Separate from [`TraitImplCheck`]
+/// because that queue is drained inside `build()` and the rule is a post-build
+/// definition-site check, like the two duplicate rules it sits beside.
+#[derive(Debug, Clone)]
+struct TraitImplSite {
+    trait_id: Id,
+    /// The trait's arguments as WRITTEN (`with Into<Bar>` -> `[Bar]`), in the
+    /// impl's own generic terms. Empty when the clause named none — which is
+    /// not the same as the trait having none (`trait Add<B = Self>`), so the
+    /// rule compares [`Analyzer::effective_trait_arguments`], not these.
+    arguments: Vec<TypeId>,
+    subject: TypeId,
+    /// The impl block's entity id (see [`TraitImplCheck::impl_id`]).
+    impl_id: Id,
+    /// The span of the trait's name in the `with` clause — where a second impl
+    /// of the pair is reported, and where the first one's note points.
+    span: Span,
 }
 
 /// One required trait member the impl provides by NAME, recorded during the
@@ -1726,6 +1754,10 @@ pub struct Analyzer<'src> {
     // analyzer typed against.
     bound_dispatch_traits: HashMap<Id, Id>,
     prepped_trait_impls: Vec<TraitImplCheck<'src>>,
+    // Every `impl Subject with Trait` clause whose trait resolved, recorded as
+    // the (trait, subject) pair the coherence rule is keyed on (B98). Consumed
+    // post-build by `check_duplicate_trait_impls`.
+    trait_impl_sites: Vec<TraitImplSite>,
     // Required trait members an impl provides by name, recorded during the
     // conformance loop for full per-member signature checking (B29), consumed
     // post-build by `check_trait_conformance`.
@@ -2219,6 +2251,7 @@ impl<'src> Analyzer<'src> {
             spread_spans: HashMap::new(),
             bound_dispatch_traits: HashMap::new(),
             prepped_trait_impls: Vec::new(),
+            trait_impl_sites: Vec::new(),
             conformance_signature_checks: Vec::new(),
             prepped_type_locals: Vec::new(),
             written_type_spellings: Vec::new(),
@@ -3735,6 +3768,291 @@ impl<'src> Analyzer<'src> {
         self.report_duplicate_declarations(duplicates);
     }
 
+    /// **One trait, one subject, one impl (B98).** Two `impl Bag with Show`
+    /// blocks used to be no error at all: the trait tier dedups by trait, so the
+    /// name kept one home, `b.show()` picked whichever impl registered first,
+    /// and the second was emitted nowhere and silently dead — at a direct call
+    /// and through a bounded generic alike (`trait-objects.md` §2.4, probe P11).
+    /// B57 hard-errors on duplicate INHERENT members and B84 on a name written
+    /// twice in one block; the same trait implemented twice for one subject fell
+    /// between them, because both of those deliberately exempt a trait-provided
+    /// name (`method-resolution.md` §9(6)). This is the rule that owns that
+    /// exemption's other side: the MEMBERS stay exempt, the impl PAIR does not.
+    ///
+    /// **The pair key is `(trait, trait arguments, subject)`.** Arguments are in
+    /// the key because distinct instantiations are distinct implementations:
+    /// `impl Foo with Into<Bar>` and `impl Foo with Into<Baz>` are two impls,
+    /// while `Into<Bar>` twice is one written twice. The arguments compared are
+    /// the EFFECTIVE ones ([`Self::effective_trait_arguments`]), so an elided
+    /// `= Self` default does not disguise a duplicate as a different
+    /// instantiation.
+    ///
+    /// **Three carve-outs, each by the same rule rather than by exemption:**
+    ///
+    /// - **Platform twins.** `browser/ui.vl` and `process/ui.vl` both write
+    ///   `impl View with Slot` — that IS the twin mechanism (§9(6)), and the
+    ///   check must not see it as a duplicate. It cannot: module resolution is
+    ///   layered (`PackageSpec::search_roots`), so exactly one file named `ui`
+    ///   loads per build and the two impls never land in `self.implementations`
+    ///   together (`method-resolution.md` §2). Nothing here special-cases them;
+    ///   the pairs are compared within one platform leg because only one leg
+    ///   exists. Pinned on both legs.
+    /// - **The std `Into` blanket.** `impl type T with Into<T>` has a GENERIC
+    ///   subject; a user's `impl Foo with Into<Bar>` has a concrete one, and a
+    ///   generic position matches only another generic position, so the pair
+    ///   never forms. This is deliberate and load-bearing: a blanket impl
+    ///   OVERLAPPING a specific one is B73's specificity question, which stays
+    ///   open and stays out of this rule — an overlap resolves exactly as it did
+    ///   before, and only an exact repeat is refused.
+    /// - **Two conditional impls with different bounds.**
+    ///   `impl Pair<type T: Show>` and `impl Pair<type U: Marker>` are two
+    ///   overlapping impls, not one written twice, which is why two generic
+    ///   positions match only when their BOUNDS agree — B73 again, one level in.
+    ///
+    /// A definition-site check, so it joins the family that skips frozen std
+    /// entities (S1) and runs post-build, once subjects and `with`-clause traits
+    /// have resolved.
+    fn check_duplicate_trait_impls(&mut self) {
+        // Declaration order is the entity id (§9(1)): textual order within a
+        // file, canonical module order across them, so the same program always
+        // reports the same one of a pair as the second.
+        let mut sites = std::mem::take(&mut self.trait_impl_sites);
+        sites.sort_by_key(|site| (site.impl_id.0, site.span.start));
+        let mut duplicates: Vec<(&'src str, TraitImplSite, TraitImplSite)> = Vec::new();
+        for (position, site) in sites.iter().enumerate() {
+            // Each later impl is reported against the FIRST one it repeats, so
+            // three copies produce two errors, each naming the original.
+            let Some(first) = sites[..position]
+                .iter()
+                .find(|earlier| self.same_trait_instantiation(earlier, site))
+            else {
+                continue;
+            };
+            let Some(trait_) = self.traits.get(&site.trait_id) else {
+                continue;
+            };
+            duplicates.push((trait_.name, first.clone(), site.clone()));
+        }
+        for (trait_name, first, second) in duplicates {
+            if self.frozen_entity(second.impl_id) {
+                continue;
+            }
+            let subject_label =
+                self.pretty_print_type(&second.subject.get_type(self), &HashMap::new());
+            // C3, as B57: the first impl is the whole point of the message. The
+            // note carries its own source, so it renders across files too.
+            let note = Some(crate::error::Note {
+                span: first.span,
+                msg: format!("'{trait_name}' is already implemented here"),
+                source: self.source_of_id(first.impl_id),
+            });
+            let elsewhere = self.other_module_clause(first.impl_id, second.impl_id);
+            let diagnostics_before = self.diagnostics.len();
+            self.diagnostics.push(Error {
+                note,
+                span: second.span,
+                msg: format!(
+                    "'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; \
+                     remove or merge this impl"
+                ),
+            });
+            if let Some(source) = self.source_of_id(second.impl_id) {
+                self.attribute_new_diagnostics(diagnostics_before, source);
+            }
+        }
+    }
+
+    /// Whether two `with` clauses implement the SAME trait instantiation for the
+    /// same subject — the pair key of [`Self::check_duplicate_trait_impls`].
+    fn same_trait_instantiation(&self, first: &TraitImplSite, second: &TraitImplSite) -> bool {
+        first.trait_id == second.trait_id
+            && self.same_impl_type(first.subject, second.subject, &mut Vec::new())
+            && self.same_impl_types(
+                &self.effective_trait_arguments(first),
+                &self.effective_trait_arguments(second),
+                &mut Vec::new(),
+            )
+    }
+
+    /// The trait arguments an impl actually instantiates: the ones its `with`
+    /// clause wrote, padded to the trait's arity with the trait's own declared
+    /// defaults.
+    ///
+    /// A default is registered as the parameter's constraint id, so padding is
+    /// just reading it back — except for `= Self`, which resolves to the trait's
+    /// own abstract type (`trait Add<B = Self>` -> `Trait(add_id, [])`) and
+    /// means the SUBJECT at an impl. Without that substitution
+    /// `impl Bag with Combine` and `impl Bag with Combine<Bag>` would compare as
+    /// different instantiations of the one they both are.
+    fn effective_trait_arguments(&self, site: &TraitImplSite) -> Vec<TypeId> {
+        let Some(trait_) = self.traits.get(&site.trait_id) else {
+            return site.arguments.clone();
+        };
+        trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .enumerate()
+            .map(|(position, declared_id)| match site.arguments.get(position) {
+                Some(written_id) => *written_id,
+                None if matches!(declared_id.get_type(self), Type::Trait(id, _) if id == site.trait_id) => {
+                    site.subject
+                }
+                None => *declared_id,
+            })
+            .chain(
+                // A clause that wrote MORE arguments than the trait declares is
+                // already an arity error elsewhere; keep them so two such
+                // clauses still compare by what they wrote.
+                site.arguments
+                    .iter()
+                    .skip(trait_.generic_parameter_constraint_ids.len())
+                    .copied(),
+            )
+            .collect()
+    }
+
+    /// Structural identity of two types written in impl position, up to renaming
+    /// of the impls' own generic parameters.
+    ///
+    /// Deliberately NOT [`Self::compare_type`], which is compatibility: it
+    /// treats a generic as a hole to be filled, so an unbounded one matches
+    /// anything and std's `impl type T with Into<T>` would read as a duplicate
+    /// of every user `Into` impl in the program. What this rule needs is
+    /// sameness — a parameter matches only another parameter, and only one bound
+    /// the same way, so a blanket impl OVERLAPPING a specific one (B73) is not a
+    /// repeat of it.
+    ///
+    /// `comparing` is the pair stack: a bound may name the parameter it bounds,
+    /// so the walk can meet a pair it is already inside. Assuming such a pair
+    /// equal is the standard co-inductive reading and is what makes this
+    /// terminate.
+    fn same_impl_type(
+        &self,
+        left: TypeId,
+        right: TypeId,
+        comparing: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        if left == right {
+            return true;
+        }
+        if comparing.contains(&(left, right)) {
+            return true;
+        }
+        comparing.push((left, right));
+        let same =
+            self.same_impl_type_shape(&left.get_type(self), &right.get_type(self), comparing);
+        comparing.pop();
+        same
+    }
+
+    fn same_impl_type_shape(
+        &self,
+        left: &Type,
+        right: &Type,
+        comparing: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        match (left, right) {
+            // A position that never resolved is not evidence of anything: a
+            // program that already failed to type earns no coherence error on
+            // top of the one it has.
+            (Type::Unknown | Type::Unresolved, _) | (_, Type::Unknown | Type::Unresolved) => false,
+            // Two impl parameters are the same position when they are bound the
+            // same way — `impl Pair<type T>` and `impl Pair<type U>` are one
+            // impl written twice. Different bounds are two overlapping impls
+            // (B73), and a parameter against a concrete type is the blanket-
+            // over-specific overlap (B73 again). Neither is a repeat.
+            (Type::Generic(left_id), Type::Generic(right_id)) => {
+                self.same_generic_bounds(*left_id, *right_id, comparing)
+            }
+            (Type::Generic(_), _) | (_, Type::Generic(_)) => false,
+            (Type::Struct(left_id, left_arguments), Type::Struct(right_id, right_arguments)) => {
+                left_id == right_id
+                    && self.same_impl_types(left_arguments, right_arguments, comparing)
+            }
+            (Type::Enum(left_id, left_arguments), Type::Enum(right_id, right_arguments)) => {
+                left_id == right_id
+                    && self.same_impl_types(left_arguments, right_arguments, comparing)
+            }
+            // The subject may itself BE a trait — std's blanket-over-a-bound
+            // `impl Iterator<type T> with Iterable<T>`.
+            (Type::Trait(left_id, left_arguments), Type::Trait(right_id, right_arguments)) => {
+                left_id == right_id
+                    && self.same_impl_types(left_arguments, right_arguments, comparing)
+            }
+            (Type::Tuple(left_items), Type::Tuple(right_items)) => {
+                self.same_impl_types(left_items, right_items, comparing)
+            }
+            (Type::Array(left_item, left_length), Type::Array(right_item, right_length)) => {
+                left_length == right_length
+                    && self.same_impl_type(*left_item, *right_item, comparing)
+            }
+            (
+                Type::Closure(left_parameters, left_return),
+                Type::Closure(right_parameters, right_return),
+            ) => {
+                self.same_impl_types(left_parameters, right_parameters, comparing)
+                    && self.same_impl_type(*left_return, *right_return, comparing)
+            }
+            (
+                Type::Mapped(left_binder, left_source, left_template),
+                Type::Mapped(right_binder, right_source, right_template),
+            ) => {
+                self.same_impl_type(*left_binder, *right_binder, comparing)
+                    && self.same_impl_type(*left_source, *right_source, comparing)
+                    && self.same_impl_type(*left_template, *right_template, comparing)
+            }
+            // `Void`, `Any`, `Never`, `Function`, `Module` — nothing to walk.
+            _ => left == right,
+        }
+    }
+
+    /// Argument lists, pairwise. A different arity is a different type: an
+    /// erased `List` is not provably the same impl as `List<i32>`, and this rule
+    /// only ever refuses what it can prove.
+    fn same_impl_types(
+        &self,
+        left: &[TypeId],
+        right: &[TypeId],
+        comparing: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(left_id, right_id)| self.same_impl_type(*left_id, *right_id, comparing))
+    }
+
+    /// Whether two generic parameters carry the same bounds — same traits, same
+    /// order, same arguments. An unbounded parameter has none, so two of them
+    /// agree.
+    fn same_generic_bounds(
+        &self,
+        left: TypeId,
+        right: TypeId,
+        comparing: &mut Vec<(TypeId, TypeId)>,
+    ) -> bool {
+        let left_bounds = self.generic_bound_traits(left);
+        let right_bounds = self.generic_bound_traits(right);
+        left_bounds.len() == right_bounds.len()
+            && left_bounds.iter().zip(right_bounds.iter()).all(
+                |((left_trait, left_arguments), (right_trait, right_arguments))| {
+                    left_trait == right_trait
+                        && self.same_impl_types(left_arguments, right_arguments, comparing)
+                },
+            )
+    }
+
+    /// B57's cross-file clause — ` by module 'option'` when the earlier
+    /// declaration is in another file, empty when it is in this one. The note
+    /// renders the real excerpt either way; the clause is what makes the
+    /// one-line form say where.
+    fn other_module_clause(&self, first_id: Id, second_id: Id) -> String {
+        self.module_name_of_id(first_id)
+            .filter(|_| self.source_of_id(first_id) != self.source_of_id(second_id))
+            .map(|module| format!(" by module '{module}'"))
+            .unwrap_or_default()
+    }
+
     /// The shared reporting half of the two duplicate-declaration rules:
     /// `(member name, first declaration, second declaration, subject label)`.
     fn report_duplicate_declarations(&mut self, duplicates: Vec<(&'src str, Id, Id, String)>) {
@@ -3753,11 +4071,7 @@ impl<'src> Analyzer<'src> {
             });
             // B4: a name the type already has, declared twice, has exactly two
             // fixes — and which one is right is the author's call, not ours.
-            let elsewhere = self
-                .module_name_of_id(first_id)
-                .filter(|_| self.source_of_id(first_id) != self.source_of_id(second_id))
-                .map(|module| format!(" by module '{module}'"))
-                .unwrap_or_default();
+            let elsewhere = self.other_module_clause(first_id, second_id);
             let span = self.declaration_name_span(second_id);
             let diagnostics_before = self.diagnostics.len();
             self.diagnostics.push(Error {
@@ -16752,6 +17066,7 @@ impl<'src> Analyzer<'src> {
                             span: trait_.1,
                             source_id: self.current_source_id,
                             implementation_index,
+                            impl_id: id,
                         });
                     }
                 }
@@ -24832,15 +25147,26 @@ impl<'src> Analyzer<'src> {
         // its diagnostics) still runs below — an unknown trait is skipped here
         // silently and diagnosed there.
         for check_index in 0..self.prepped_trait_impls.len() {
-            let (trait_name, scope_id, implementation_index, trait_arguments, span, source_id) = {
+            let (
+                trait_name,
+                scope_id,
+                implementation_index,
+                subject_type_id,
+                trait_arguments,
+                span,
+                source_id,
+                impl_id,
+            ) = {
                 let check = &self.prepped_trait_impls[check_index];
                 (
                     check.trait_name,
                     check.scope_id,
                     check.implementation_index,
+                    check.subject_type_id,
                     check.trait_arguments.clone(),
                     check.span,
                     check.source_id,
+                    check.impl_id,
                 )
             };
             let Some(trait_id) = self.try_get_expr_id_by_name(trait_name, scope_id) else {
@@ -24849,6 +25175,15 @@ impl<'src> Analyzer<'src> {
             if !self.traits.contains_key(&trait_id) {
                 continue;
             }
+            // The coherence rule's raw material (B98): one entry per resolved
+            // `with` clause, whatever impl block it belongs to.
+            self.trait_impl_sites.push(TraitImplSite {
+                trait_id,
+                arguments: trait_arguments.clone(),
+                subject: subject_type_id,
+                impl_id,
+                span,
+            });
             if let Some(implementation) = self.implementations.get_mut(implementation_index) {
                 implementation.trait_ids.push(trait_id);
                 implementation.trait_args.push((trait_id, trait_arguments));
@@ -30997,6 +31332,11 @@ fn analyze_over_world<'src>(
     // is exempt above. Runs after the inherent check so a program with both
     // reports them in that order.
     analyzer.check_duplicate_block_members();
+    // One trait implemented twice for one subject (B98) — the third member of
+    // the family, and the one that owns the exemption the other two make: they
+    // let a trait-provided NAME repeat so that two impls of one trait stay
+    // legal, and this decides when two such impls are one impl written twice.
+    analyzer.check_duplicate_trait_impls();
     // With `drop_methods` recorded, build the per-type destruction glue the
     // transformer emits as `__drop_<type>` helpers (destruction.md §5/§7).
     analyzer.build_drop_glue();
