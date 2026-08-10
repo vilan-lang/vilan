@@ -1,0 +1,47 @@
+import std::print;
+import std::map::Map;
+import std::set::Set;
+
+// A bare-lowered enum IS its backing value at runtime — a plain JS string or
+// number — so the backing value is its canonical key and it needs no
+// `[derive(Hashable)]` to be a `Map` key or a `Set` member. Both backings are
+// here, plus the C-style tail: one explicit value converts the whole
+// declaration, so `Walked::B` is bare-lowered even though only `A` is written.
+enum Align {
+	Start = "flex-start",
+	End = "flex-end",
+}
+
+enum Level {
+	Low = 0,
+	High = 1,
+}
+
+enum Walked {
+	A = 5,
+	B,
+	C,
+}
+
+fun main() {
+	mut widths: Map<Align, i32> = Map::new();
+	widths.insert(Align::Start, 1);
+	widths.insert(Align::End, 2);
+	print(widths.get(Align::Start).unwrap_or(0));
+	print(widths.get(Align::End).unwrap_or(0));
+	print(widths.contains_key(Align::Start));
+	print(widths.len());
+
+	mut levels: Set<Level> = Set::new();
+	levels.insert(Level::High);
+	// The same variant twice is the same key, so the set does not grow.
+	levels.insert(Level::High);
+	print(levels.contains(Level::High));
+	print(levels.contains(Level::Low));
+	print(levels.len());
+
+	mut walked: Set<Walked> = Set::new();
+	walked.insert(Walked::B);
+	print(walked.contains(Walked::B));
+	print(walked.contains(Walked::C));
+}
