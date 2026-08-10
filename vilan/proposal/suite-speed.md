@@ -1091,3 +1091,197 @@ it the first compile in a test process is the only one.
   disk-serialization with a worse correctness profile (`World.program` is a
   `JsProgram<'static>` over leaked text, not a string). Recorded as the
   boundary of this lever, not as a next step.
+
+## 10. The id-keyed tables were paying SipHash's setup for four-byte keys (E48, 2026-08-10)
+
+§9 closed with the largest thing left: SipHash at **13.2%** of `rpc_server`'s
+remaining 10.2e9 Ir, against ~90 analyzer tables keyed on `Id`, `TypeId` and
+`SourceId`. That reading was right and slightly conservative — it counted four
+SipHash functions, and the full family (adding `Hasher::finish`,
+`Hasher::reset`, `RandomState::build_hasher` and the helpers inlined into
+them) is **16.7%**. The table count was conservative too: the survey found
+**594** hash tables in the eleven modules that matter, **513** of them keyed on
+one of those three `u32` newtypes.
+
+The diagnosis is one sentence. SipHash-1-3's cost is dominated by its setup —
+load two 64-bit keys, buffer the input, run the finalization rounds — and that
+setup is the same for four bytes as for four kilobytes. Against a `u32` key the
+setup **is** the work.
+
+**The instrument.** The E43 method: one cold `vilan check` per module in a
+fresh process on a three-line program importing exactly that module. Ir is a
+callgrind instruction count (deterministic); CPU ms is the interleaved minimum
+of seven, before and after alternating on every rep so the box's drift lands on
+both. Everything is measured twice, once on the debug binary (comparable with
+§9's table) and once on `--release` (what a user actually runs), because the
+two answer different questions and one of them could have embarrassed the
+other.
+
+### The seam: eleven import lines, not 594 declarations
+
+`crates/vilan-core/src/fx.rs` implements the hash — rotate, xor, multiply, once
+per word — and eleven modules swap
+
+```rust
+use std::collections::{HashMap, HashSet};
+// for
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
+```
+
+so every `HashMap<Id, _>` and `HashSet<TypeId>` in the body converts without
+being edited. That is the whole adoption: analyzer.rs (382 tables),
+transformer.rs (52), async_infer.rs (51), context.rs (29), const_eval.rs (20),
+init_order.rs (19), call_graph.rs (16), macros.rs (13), platform_color.rs (9),
+chunks.rs (2), type_.rs (1). The only mechanical follow-on is that
+`HashMap::new()` does not exist for a non-`RandomState` hasher, so 459
+construction sites become `::default()`.
+
+What deliberately did NOT move: `bindgen`, `manifest` and `interpreter` are
+string-keyed end to end and off the cold path; and the three process-global
+caches keyed on content hashes and paths (`parse_clean_cached`,
+`load_package_module`, `interned_display_name`) shadow the file-level import
+inside their own functions, so they kept `std`'s hasher without needing an
+exception.
+
+Two decisions inside `fx.rs` are argued from vilan's keys rather than
+inherited, and both are pinned:
+
+- **No finalizing rotate.** `hashbrown` takes the bucket index from the hash's
+  LOW bits, and multiplication by an odd constant is a bijection modulo any
+  power of two — so dense sequential ids land one per bucket with zero
+  collisions. Measured over 4096 keys in 4096 buckets: **4096/4096** without a
+  finalizer against **3931/4096** with one. The price is strided keys
+  (512/4096 against 3889), which vilan's allocators (`entity_id += 1`,
+  `type_id += 1`) cannot produce. Both rows are tests; the first was watched
+  red under a planted `rotate_left(20)`.
+- **Fast, not adversarial-proof.** vilan has no surface where untrusted source
+  reaches a hash table on a machine the attacker does not own — the playground
+  is the `wasm32` build in the visitor's own tab. Recorded in the file header
+  as the assumption to revisit if that ever changes.
+
+### The determinism doctrine nearly lost its instrument, and this is the proof
+
+A constant seed is *more* deterministic than `RandomState`, which is exactly
+why it is dangerous here. E38/E44 made diagnostics and emission hash-order
+independent, and the `diagnostic_determinism` harness proves that by running 30
+cold analyses in one process and demanding one rendering — which only means
+something because `RandomState` reseeded every table and made an
+order-dependent answer *disagree with itself*. Under a constant seed such an
+answer is stably wrong, and thirty attempts agree on it.
+
+That is not a worry, it is a measurement. Planting E38's regression (removing
+the `normalize_diagnostic_order` call from `post_analysis_passes`):
+
+| harness state                    | result                       |
+|----------------------------------|------------------------------|
+| plant + `enable_seed_shuffle()`  | **2 of 4 pins red**          |
+| plant, shuffle off               | **4 of 4 green**             |
+
+So `fx::enable_seed_shuffle` — one seed per table from a process counter,
+exactly `RandomState`'s behaviour — is load-bearing, and `diagnostic_determinism`
+calls it. `VILAN_HASH_SHUFFLE=1` turns it on for a whole suite run, which
+restores the old net on demand over every test rather than just this one.
+
+### Before / after
+
+Cold `vilan check` per module, fresh process. Ir is the primary column.
+
+**Debug binary** (§9's instrument, so these rows compose with §9's):
+
+| module                           | before Ir | after Ir | Ir ratio | CPU ms ratio |
+|----------------------------------|-----------|----------|----------|--------------|
+| `reactive`                       |   7.955e9 |  6.325e9 |    1.258 |        1.181 |
+| `ui` (node)                      |   9.135e9 |  7.292e9 |    1.253 |        1.140 |
+| `rpc`                            |   9.605e9 |  7.679e9 |    1.251 |        1.170 |
+| `rpc_server`                     |  10.510e9 |  8.432e9 |    1.246 |        1.182 |
+| `[derive(Debug, PartialEq)]`     |   5.138e9 |  4.129e9 |    1.244 |        1.176 |
+| `time`                           |   6.218e9 |  4.984e9 |    1.248 |        1.180 |
+| `[derive(Debug)]`                |   4.030e9 |  3.285e9 |    1.227 |        1.123 |
+| `arena`                          |   4.573e9 |  3.735e9 |    1.224 |        1.131 |
+| `set`                            |   2.131e9 |  1.783e9 |    1.195 |        1.116 |
+| `map`                            |   2.125e9 |  1.779e9 |    1.195 |        1.139 |
+| `io`                             |   2.036e9 |  1.713e9 |    1.188 |        1.142 |
+
+**Release binary** — the one that decides whether this pays:
+
+| module                           | before Ir | after Ir | Ir ratio | CPU ms ratio |
+|----------------------------------|-----------|----------|----------|--------------|
+| `reactive`                       |   1.005e9 |  0.749e9 |    1.342 |        1.199 |
+| `ui` (node)                      |   1.150e9 |  0.860e9 |    1.337 |        1.236 |
+| `rpc`                            |   1.225e9 |  0.923e9 |    1.327 |        1.183 |
+| `rpc_server`                     |   1.354e9 |  1.032e9 |    1.312 |        1.202 |
+| `[derive(Debug, PartialEq)]`     |   0.660e9 |  0.504e9 |    1.310 |        1.172 |
+| `time`                           |   0.794e9 |  0.601e9 |    1.321 |        1.190 |
+| `[derive(Debug)]`                |   0.525e9 |  0.410e9 |    1.280 |        1.159 |
+| `arena`                          |   0.599e9 |  0.468e9 |    1.280 |        1.135 |
+| `set`                            |   0.303e9 |  0.249e9 |    1.215 |        1.094 |
+| `map`                            |   0.303e9 |  0.249e9 |    1.214 |        1.091 |
+| `io`                             |   0.291e9 |  0.242e9 |    1.203 |        1.113 |
+
+**This lever has no control row, and that is the point.** §9's base-cache work
+bought 13–20% wherever a second macro world followed and exactly 0% on
+`set`/`map`/`io`; those three were its controls. Here they gain 1.20x too,
+because every analysis keys tables on ids whether or not it compiles a macro
+world. The single-world loss §9 had to report honestly has no counterpart:
+nothing in this table gets slower.
+
+The long-lived multi-analysis case gains as much, which §9's lever did not
+(1.022x there). The `inference` binary — 2077 compiler-behaviour tests in one
+process, base cache warm throughout — over an interleaved minimum of three,
+both binaries passing all 2077:
+
+| inference binary | before  | after   | ratio |
+|------------------|---------|---------|-------|
+| CPU s            |  488.39 |  415.42 | 1.176 |
+| wall s           |   35.60 |   30.34 | 1.173 |
+
+### The mechanism check
+
+Self-cost by family on the debug `rpc_server` profile, which is where the
+2.078e9 saving comes from:
+
+| family                       | before          | after           | delta      |
+|------------------------------|-----------------|-----------------|------------|
+| SipHash (all of it)          | 1754M (16.69%)  |  404M ( 4.79%)  | **−1350M** |
+| `fx.rs`                      |    0M           |   88M ( 1.04%)  |      +88M  |
+| `__memcpy_avx_unaligned_erms`|  733M ( 6.97%)  |  558M ( 6.61%)  |    −175M   |
+| PROGRAM TOTAL                | 10.510e9        | 8.432e9         | −2078M     |
+
+The hash functions themselves are −1262M net, 61% of the program's saving. The
+`memcpy` drop is the second-order effect of a `BuildHasher` that is 8 bytes
+where `RandomState` is 16 — every table clone the base cache trades on copies
+less — and the remaining ~640M is the `hashbrown` probe machinery around a
+hasher that now inlines to three arithmetic instructions. The 404M of SipHash
+still in the profile is the string-, path- and content-keyed tables left on
+`std`'s hasher on purpose.
+
+**One honest caveat about the debug column.** Part of its saving is
+`precondition_check` (1598M → 1247M, −351M across the family), which is a
+debug-build artifact riding along behind the `memcpy` reduction —
+the same artifact §9 warned not to count. It would have been fair to worry that
+the debug ratios therefore overstate the win. They do not: the release
+measurement, which has no `precondition_check` at all, is **larger** (1.20–1.34x
+against 1.19–1.26x), because in release SipHash's setup is a bigger share of a
+smaller total.
+
+### The verdict
+
+E48's bar was "if the win measures under ~5% total, say so honestly and let the
+owner decide whether the churn pays". It is not under 5%. Every module measured
+gains **17–25% of its instructions in release** and 9–24% of its CPU, with no
+row anywhere getting slower, and the same lever carries a warm long-lived
+process at 1.18x. The churn is 459 mechanical `::new()` → `::default()` edits
+and eleven import lines; the judgement it asks for is whether ~180 lines of
+hasher belong in the tree, and the numbers say yes.
+
+### What the profile says next, recorded and not taken
+
+- **`__memcpy_avx_unaligned_erms` is now the largest single entry** at 6.6% of
+  the debug profile, and it is the world clones the base cache trades on. That
+  is §9's boundary restated: it shrinks by cloning less, not by hashing faster.
+- **Hashing is no longer the headline.** The whole remaining hash surface —
+  404M SipHash plus 88M `fx` — is 5.8% of a debug cold analysis, and the
+  SipHash half of it is the string-keyed tables this lane deliberately left
+  alone. Converting those would chase ~4% and would trade away the
+  collision-resistance argument in `fx.rs`'s header for it. Recorded as
+  measured and not worth it.
