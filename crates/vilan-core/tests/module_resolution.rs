@@ -1554,13 +1554,10 @@ fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
             call_go,
             "`..` splices a tuple's elements into a tuple construction",
         ),
-        (
-            "the `external` backed-return deferral",
-            "enum Align { Left = \"left\", Right = \"right\" }\nexternal fun pick(): Align;\n"
-                .to_string(),
-            "import pkg::m::pick;\nfun main() { let a = pick(); }\n",
-            "is `external`, so it cannot return the backed enum 'Align'",
-        ),
+        // The `external` backed-return row retired at the merge: backed-enums
+        // §9's ratified lift DELETED that refusal (the trap arm covers the
+        // boundary now), so its program compiles by design and there is no
+        // diagnostic left to attribute.
     ];
     // Every row is checked before anything is asserted, so a plant that breaks
     // attribution reports which families it broke rather than only the first.
