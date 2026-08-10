@@ -594,6 +594,28 @@ enum ResourceMoveViolation {
     },
 }
 
+impl ResourceMoveViolation {
+    /// The entity the violation is SPANNED at — the offending use, not the
+    /// binding it offends against. Both emitters read it: the whole-program one
+    /// to place the diagnostic (in the file that entity was walked from, B112),
+    /// R11's to anchor its in-body note. Kept in one place because the two had
+    /// the same nine-arm table written out twice, and a drifting arm would put
+    /// a diagnostic in the wrong file.
+    fn anchor(&self) -> Id {
+        match self {
+            ResourceMoveViolation::UseAfterMove { use_id, .. } => *use_id,
+            ResourceMoveViolation::Capture { reference_id, .. } => *reference_id,
+            ResourceMoveViolation::PartialMove { at }
+            | ResourceMoveViolation::ConditionalMove { at, .. }
+            | ResourceMoveViolation::LoopMove { at, .. }
+            | ResourceMoveViolation::LoanConsumed { at, .. }
+            | ResourceMoveViolation::LoanedCaptureConsumed { at, .. }
+            | ResourceMoveViolation::ModuleLevelMove { at, .. }
+            | ResourceMoveViolation::ModuleLevelOverwrite { at, .. } => *at,
+        }
+    }
+}
+
 /// One generic instantiation to re-check under R11 (destruction.md §4): a
 /// callee whose generic parameters `resources` are bound to resource types at
 /// this instantiation, so its body must be move-clean with those parameters
@@ -1405,10 +1427,12 @@ pub struct Analyzer<'src> {
     /// cached (a later query rooted elsewhere could reach the cut node acyclically).
     resource_classification: HashMap<TypeId, bool>,
     /// Every written generic type application (`List<Database>`, `Option<i32>`,
-    /// …) as `(resolved TypeId, span)`, collected at `walk_type_node` and checked
-    /// once types resolve: R10 (destruction.md §4) rejects a resource type
-    /// argument to a native container / external generic.
-    generic_type_applications: Vec<(TypeId, Span)>,
+    /// …) as `(resolved TypeId, span, the file the span indexes)`, collected at
+    /// `walk_type_node` and checked once types resolve: R10 (destruction.md §4)
+    /// rejects a resource type argument to a native container / external
+    /// generic. The source rides along because the check runs after `build()`,
+    /// long after the walk that could have told it (B112).
+    generic_type_applications: Vec<(TypeId, Span, SourceId)>,
     /// The container instantiations R10 has already reported, by structural key
     /// (`container_structure_key`). R11's per-instantiation half runs after the
     /// whole-program one and consults it, so a `List<Guard>` the caller was
@@ -5430,7 +5454,7 @@ impl<'src> Analyzer<'src> {
         // fact reported once however many ids carry it.
         let mut reported_instantiations: HashSet<TypeId> = HashSet::new();
         let mut reported_structures: HashSet<String> = HashSet::new();
-        for (type_id, span) in applications {
+        for (type_id, span, source) in applications {
             let Some(found) =
                 self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
             else {
@@ -5440,18 +5464,19 @@ impl<'src> Analyzer<'src> {
             if !reported_instantiations.insert(found.container_type) {
                 continue;
             }
-            self.report_container_resource(&found, type_id, span, None);
+            self.report_container_resource(&found, type_id, span, source, None);
         }
-        // The inferred tier. Sorted by span so "the earliest site" is a real
-        // answer and not a hash order (C1, determinism); the entity id breaks
-        // ties totally.
+        // The inferred tier. Sorted by file, then span, so "the earliest site"
+        // is a real answer and not a hash order (C1, determinism) — the file
+        // leads because offsets from two files do not compare; the entity id
+        // breaks ties totally.
         let mut sites = self.inferred_container_sites();
-        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
+        sites.sort_unstable_by_key(|(id, _, span, source)| (source.0, span.start, span.end, id.0));
         // One descent per distinct site TYPE: the sites are many and the types
         // few (every read of one binding repeats its type), and only the first
         // site of a type could ever be the earliest.
         let mut examined: HashSet<TypeId> = HashSet::new();
-        for (_, type_id, span) in sites {
+        for (_, type_id, span, source) in sites {
             if !examined.insert(type_id) {
                 continue;
             }
@@ -5464,14 +5489,14 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             reported_instantiations.insert(found.container_type);
-            self.report_container_resource(&found, type_id, span, None);
+            self.report_container_resource(&found, type_id, span, source, None);
         }
         // The receiver of a NATIVE method call, whose type nothing else records.
         // `[Guard { .. }].len()` binds no name, and a list literal carries no
         // type entry of its own — but the call's method substitution binds
         // `List`'s own parameter, which IS the receiver's type, spelled by the
         // solver instead of by the program.
-        for (container_id, arguments, span) in self.container_receiver_sites(&containers) {
+        for (container_id, arguments, span, source) in self.container_receiver_sites(&containers) {
             let container_type = Type::Struct(container_id, arguments).get_type_id(self);
             let Some(found) = self.container_resource_at(
                 container_type,
@@ -5484,26 +5509,27 @@ impl<'src> Analyzer<'src> {
             if !reported_structures.insert(self.container_structure_key(found.container_type)) {
                 continue;
             }
-            self.report_container_resource(&found, container_type, span, None);
+            self.report_container_resource(&found, container_type, span, source, None);
         }
         self.reported_container_structures = reported_structures;
     }
 
     /// Every method call whose substitution instantiates a REJECTING container's
     /// own type parameters, as `(container id, its arguments here, the call's
-    /// span)`. The receiver's type by another route: a native method has no body
-    /// for R11 to scan and its receiver expression carries no recorded type, so
-    /// this is the only place `[Guard { .. }].len()`'s `List<Guard>` is written
-    /// down anywhere.
+    /// span, the call's file)`. The receiver's type by another route: a native
+    /// method has no body for R11 to scan and its receiver expression carries no
+    /// recorded type, so this is the only place `[Guard { .. }].len()`'s
+    /// `List<Guard>` is written down anywhere.
     fn container_receiver_sites(
         &self,
         containers: &[(Id, &'static str)],
-    ) -> Vec<(Id, Vec<TypeId>, Span)> {
+    ) -> Vec<(Id, Vec<TypeId>, Span, SourceId)> {
         let mut sites = Vec::new();
         for (call_id, substitution) in &self.method_call_substitution {
             let Some(span) = self.span_map.get(call_id) else {
                 continue;
             };
+            let source = self.source_of_id(*call_id).unwrap_or(SourceId(0));
             for (container_id, _) in containers.iter().copied() {
                 let constraints = self.declared_parameter_constraint_ids(container_id);
                 if constraints.is_empty()
@@ -5519,11 +5545,15 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .map(|constraint| substitution.get(constraint).copied().unwrap_or(*constraint))
                     .collect();
-                sites.push((container_id, arguments, **span));
+                sites.push((container_id, arguments, **span, source));
             }
         }
-        sites.sort_unstable_by_key(|(container_id, arguments, span)| {
+        // The file leads the key: two files' byte offsets are not comparable
+        // (E38's C1 rule), so ordering by span alone was only ever an answer
+        // for a single-file program.
+        sites.sort_unstable_by_key(|(container_id, arguments, span, source)| {
             (
+                source.0,
                 span.start,
                 span.end,
                 container_id.0,
@@ -5575,28 +5605,49 @@ impl<'src> Analyzer<'src> {
     /// maximal rather than a curated set of "origins": R10 is a fact about a
     /// type, so under-collecting is a hole and over-collecting costs nothing
     /// once the caller dedups per found container.
-    fn inferred_container_sites(&self) -> Vec<(Id, TypeId, Span)> {
-        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
+    ///
+    /// Each site carries the FILE its span indexes into, because the check runs
+    /// after `build()` and nothing else there could tell (B112) — and because
+    /// "the earliest site" is only an answer once the file leads the key: a
+    /// span is a byte offset into its own file and two files' offsets are not
+    /// comparable (E38, diagnostics-standard.md C1).
+    fn inferred_container_sites(&self) -> Vec<(Id, TypeId, Span, SourceId)> {
+        let mut sites: Vec<(Id, TypeId, Span, SourceId)> = Vec::new();
+        let push = |sites: &mut Vec<_>, id: Id, type_id: TypeId, span: Span| {
+            sites.push((
+                id,
+                type_id,
+                span,
+                self.source_of_id(id).unwrap_or(SourceId(0)),
+            ));
+        };
         for expr_id in self.expr_id_to_expr_map.keys().copied() {
             if let Some(type_id) = self.resolved_type_id_of(expr_id)
                 && let Some(span) = self.span_map.get(&expr_id)
             {
-                sites.push((expr_id, type_id, **span));
+                push(&mut sites, expr_id, type_id, **span);
             }
         }
         for variable in self.variables.values() {
-            sites.push((variable.id, variable.type_id, variable.name_span));
+            push(
+                &mut sites,
+                variable.id,
+                variable.type_id,
+                variable.name_span,
+            );
         }
         for parameter in self.parameters.values() {
             if let Some(span) = self.span_map.get(&parameter.id) {
-                sites.push((parameter.id, parameter.type_id, **span));
+                push(&mut sites, parameter.id, parameter.type_id, **span);
             }
         }
         sites
     }
 
     /// R10's diagnostic. `site_type_id` is the type the search started at (the
-    /// head whose name the reached-through path reads from); `at_instantiation`
+    /// head whose name the reached-through path reads from); `source` is the file
+    /// `span` indexes into, which every tier carries down from its own collection
+    /// site because the check runs after `build()` (B112); `at_instantiation`
     /// carries R11's extra clause — the generic body's name, the in-body span the
     /// note anchors at, and that body's entity id (for the note's file) — when
     /// the container exists only under a generic instantiation.
@@ -5605,6 +5656,7 @@ impl<'src> Analyzer<'src> {
         found: &ContainerResource<'src>,
         site_type_id: TypeId,
         span: Span,
+        source: SourceId,
         at_instantiation: Option<(&'src str, Span, Id)>,
     ) {
         let container_name = found.container_name;
@@ -5622,41 +5674,36 @@ impl<'src> Analyzer<'src> {
         // is in `std`, so the primary stays in user code (A2) and the note names
         // the file it points into.
         let note = match at_instantiation {
-            Some((callee, body_span, callee_id)) => {
-                let note_source = self.source_of_id(callee_id);
-                Some(crate::error::Note {
-                    span: body_span,
-                    msg: format!("in `{callee}`, that `{container_name}` is built here"),
-                    source: (note_source != Some(self.current_source_id))
-                        .then_some(note_source)
-                        .flatten(),
-                })
-            }
+            Some((callee, body_span, callee_id)) => Some(crate::error::Note {
+                span: body_span,
+                msg: format!("in `{callee}`, that `{container_name}` is built here"),
+                source: self.note_source_against(callee_id, source),
+            }),
             None => found.declared_at.map(|(owner_id, member_span)| {
                 let member = found.field_path.last().copied().unwrap_or("it");
-                let note_source = self.source_of_id(owner_id);
                 crate::error::Note {
                     span: member_span,
                     msg: format!("`{member}` is that `{container_name}` here"),
-                    source: (note_source != Some(self.current_source_id))
-                        .then_some(note_source)
-                        .flatten(),
+                    source: self.note_source_against(owner_id, source),
                 }
             }),
         };
         let instantiated = at_instantiation
             .map(|(callee, _, _)| format!(" this instantiation of `{callee}` builds one, and"))
             .unwrap_or_default();
-        self.diagnostics.push(Error {
-            note,
-            span,
-            msg: format!(
-                "`{container_name}` cannot hold the resource `{rendered}`{reached}:{instantiated} \
-                 a native container's internals are host code the move checker cannot see (v1); \
-                 `Option` is the sanctioned resource container, or hold the resource in \
-                 a struct field"
-            ),
-        });
+        self.push_in_source(
+            Error {
+                note,
+                span,
+                msg: format!(
+                    "`{container_name}` cannot hold the resource `{rendered}`{reached}:\
+                     {instantiated} a native container's internals are host code the move \
+                     checker cannot see (v1); `Option` is the sanctioned resource container, \
+                     or hold the resource in a struct field"
+                ),
+            },
+            source,
+        );
     }
 
     /// `container_resource_in` at a fresh path and cycle guard — the entry point
@@ -8875,6 +8922,9 @@ impl<'src> Analyzer<'src> {
     /// the diagnostics vocabulary, with the use-after-move note channel).
     fn emit_resource_move_violations(&mut self, violations: Vec<ResourceMoveViolation>) {
         for violation in violations {
+            // The whole-program scan crosses every file, so each diagnostic is
+            // placed in the one its own span indexes into (B112).
+            let anchor = violation.anchor();
             let error = match violation {
                 ResourceMoveViolation::UseAfterMove {
                     use_id,
@@ -9020,7 +9070,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             };
-            self.diagnostics.push(error);
+            self.push_anchored(error, anchor);
         }
     }
 
@@ -9325,27 +9375,26 @@ impl<'src> Analyzer<'src> {
             ),
         };
         let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
-        let call_source = self.source_of_id(instance.call_id);
-        let note_span = **self.span_map.get(&note_anchor).unwrap_or(&&EMPTY_SPAN);
-        let note_source = self.source_of_id(note_anchor);
+        // The primary is the INSTANTIATION site, so it belongs to the file that
+        // wrote it — an imported module, not the entry (B112).
+        let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
-            span: note_span,
+            span: **self.span_map.get(&note_anchor).unwrap_or(&&EMPTY_SPAN),
             msg: detail,
-            source: if note_source.is_some() && note_source != call_source {
-                note_source
-            } else {
-                None
-            },
+            source: self.note_source_against(note_anchor, call_source),
         };
-        self.diagnostics.push(Error {
-            span: site,
-            msg: format!(
-                "`{name}` is not move-clean when instantiated with a resource: {summary}, and a \
-                 generic body cannot destroy a `T`; move it out on every path, or take a concrete \
-                 type"
-            ),
-            note: Some(note),
-        });
+        self.push_anchored(
+            Error {
+                span: site,
+                msg: format!(
+                    "`{name}` is not move-clean when instantiated with a resource: {summary}, \
+                     and a generic body cannot destroy a `T`; move it out on every path, or \
+                     take a concrete type"
+                ),
+                note: Some(note),
+            },
+            instance.call_id,
+        );
     }
 
     /// R11-keyed rejection of `drop(x)` forwarding under a RESOURCE instantiation
@@ -9407,6 +9456,9 @@ impl<'src> Analyzer<'src> {
         }
         sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
         let call_span = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        // The primary is the INSTANTIATION, so it belongs to the caller's file —
+        // which is not the entry when the instantiating code was imported (B112).
+        let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let callee_name = self
             .functions
             .get(&instance.callee)
@@ -9449,6 +9501,7 @@ impl<'src> Analyzer<'src> {
                 &found,
                 instantiated,
                 call_span,
+                call_source,
                 Some((callee_name, body_span, instance.callee)),
             );
         }
@@ -9494,28 +9547,26 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.name)
             .unwrap_or("this generic");
         let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
-        let call_source = self.source_of_id(instance.call_id);
-        let note_span = **self.span_map.get(&drop_call_id).unwrap_or(&&EMPTY_SPAN);
-        let note_source = self.source_of_id(drop_call_id);
+        // The primary is the INSTANTIATION site: the caller's file (B112).
+        let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
         let note = crate::error::Note {
-            span: note_span,
+            span: **self.span_map.get(&drop_call_id).unwrap_or(&&EMPTY_SPAN),
             msg: format!("in `{name}`, this `drop` would consume a resource in an erased body"),
-            source: if note_source.is_some() && note_source != call_source {
-                note_source
-            } else {
-                None
-            },
+            source: self.note_source_against(drop_call_id, call_source),
         };
-        self.diagnostics.push(Error {
-            span: site,
-            msg: format!(
-                "`{name}` is not move-clean when instantiated with a resource: this \
-                 instantiation would pass a resource to `drop<T>`, whose erased body has no \
-                 concrete destructor; destroy at a concrete type, or move the value out to the \
-                 caller"
-            ),
-            note: Some(note),
-        });
+        self.push_anchored(
+            Error {
+                span: site,
+                msg: format!(
+                    "`{name}` is not move-clean when instantiated with a resource: this \
+                     instantiation would pass a resource to `drop<T>`, whose erased body has no \
+                     concrete destructor; destroy at a concrete type, or move the value out to \
+                     the caller"
+                ),
+                note: Some(note),
+            },
+            instance.call_id,
+        );
     }
 
     /// The resource bindings this instantiation introduces: variables and
@@ -9972,15 +10023,14 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.name)
             .unwrap_or("this generic");
         let site = **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN);
-        let call_source = self.source_of_id(call_id);
+        // The primary is the INSTANTIATION site: the caller's file (B112).
+        let call_source = self.source_of_id(call_id).unwrap_or(SourceId(0));
         for violation in violations {
-            let (body_id, summary, detail) = match &violation {
-                ResourceMoveViolation::UseAfterMove {
-                    use_id, binding, ..
-                } => {
+            let anchor = violation.anchor();
+            let (summary, detail) = match &violation {
+                ResourceMoveViolation::UseAfterMove { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *use_id,
                         "a resource-typed value is used more than once",
                         format!(
                             "in `{name}`, `{binding_name}` is used here after it was moved: a \
@@ -9988,18 +10038,16 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::PartialMove { at } => (
-                    *at,
+                ResourceMoveViolation::PartialMove { .. } => (
                     "a resource-typed field is moved out of a live aggregate",
                     format!(
                         "in `{name}`, a resource field is moved out of a live aggregate here: v1 \
                          has no partial moves"
                     ),
                 ),
-                ResourceMoveViolation::ConditionalMove { at, binding } => {
+                ResourceMoveViolation::ConditionalMove { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a resource-typed value is moved on one path but not all",
                         format!(
                             "in `{name}`, `{binding_name}` is moved on one path through this branch \
@@ -10007,10 +10055,9 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::LoopMove { at, binding } => {
+                ResourceMoveViolation::LoopMove { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a resource-typed value is moved inside a loop",
                         format!(
                             "in `{name}`, `{binding_name}` is declared outside a loop and moved \
@@ -10018,10 +10065,9 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::LoanConsumed { at, binding } => {
+                ResourceMoveViolation::LoanConsumed { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a loaned resource-typed parameter is moved out",
                         format!(
                             "in `{name}`, the loaned parameter `{binding_name}` is moved out here: \
@@ -10029,10 +10075,9 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::LoanedCaptureConsumed { at, binding, .. } => {
+                ResourceMoveViolation::LoanedCaptureConsumed { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a capture of a loaned resource-typed subject is moved out",
                         format!(
                             "in `{name}`, the capture `{binding_name}` is moved out here: its \
@@ -10040,13 +10085,9 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::Capture {
-                    reference_id,
-                    binding,
-                } => {
+                ResourceMoveViolation::Capture { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *reference_id,
                         "a resource-typed value is captured by a closure",
                         format!(
                             "in `{name}`, `{binding_name}` is captured by a closure here: a \
@@ -10057,10 +10098,9 @@ impl<'src> Analyzer<'src> {
                 // Module-level resources are never in a generic body's delta set,
                 // so this cannot arise from an R11 instantiation scan (empty set);
                 // handled for exhaustiveness.
-                ResourceMoveViolation::ModuleLevelMove { at, binding } => {
+                ResourceMoveViolation::ModuleLevelMove { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a module-level resource is moved",
                         format!(
                             "in `{name}`, the module-level resource `{binding_name}` is moved here: \
@@ -10068,10 +10108,9 @@ impl<'src> Analyzer<'src> {
                         ),
                     )
                 }
-                ResourceMoveViolation::ModuleLevelOverwrite { at, binding } => {
+                ResourceMoveViolation::ModuleLevelOverwrite { binding, .. } => {
                     let binding_name = self.binding_name(*binding);
                     (
-                        *at,
                         "a module-level resource is overwritten",
                         format!(
                             "in `{name}`, the module-level resource `{binding_name}` is overwritten \
@@ -10080,28 +10119,25 @@ impl<'src> Analyzer<'src> {
                     )
                 }
             };
-            let body_span = **self.span_map.get(&body_id).unwrap_or(&&EMPTY_SPAN);
-            let note_source = self.source_of_id(body_id);
             let note = crate::error::Note {
-                span: body_span,
+                span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
                 msg: detail,
                 // The generic body may live in another file than the
                 // instantiation; name it when so (else the same-file default).
-                source: if note_source.is_some() && note_source != call_source {
-                    note_source
-                } else {
-                    None
-                },
+                source: self.note_source_against(anchor, call_source),
             };
-            self.diagnostics.push(Error {
-                span: site,
-                msg: format!(
-                    "`{name}` is not move-clean when instantiated with a resource: {summary}; a \
-                     generic used with a resource type argument must use each resource value at \
-                     most once, and never copy or capture it"
-                ),
-                note: Some(note),
-            });
+            self.push_anchored(
+                Error {
+                    span: site,
+                    msg: format!(
+                        "`{name}` is not move-clean when instantiated with a resource: \
+                         {summary}; a generic used with a resource type argument must use each \
+                         resource value at most once, and never copy or capture it"
+                    ),
+                    note: Some(note),
+                },
+                call_id,
+            );
         }
     }
 
@@ -19032,7 +19068,10 @@ impl<'src> Analyzer<'src> {
                 // once types resolve, `check_container_resource_arguments` inspects
                 // the head and arguments. Recording every application keeps the
                 // check total (an inferred instantiation is R11's concern, later).
-                self.generic_type_applications.push((type_id, node.1));
+                // The span belongs to the file being walked, and the check runs
+                // long after that is knowable from anywhere else (B112).
+                self.generic_type_applications
+                    .push((type_id, node.1, self.current_source_id));
                 // The REFERENCE is the head name, not the whole application. The
                 // arguments were just walked and recorded their own references;
                 // recording `node.1` here — which reaches to the closing `>` —
@@ -22066,6 +22105,79 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Attributes the diagnostics pushed since `from` to the file entity
+    /// `anchor` was walked from — the ONE attribution move a whole-program
+    /// check makes (backlog B112).
+    ///
+    /// A check that runs after `build()` has no file walk to inherit a mark
+    /// from, so `current_source_id` is whatever `analyze` left it at (the
+    /// entry). Every such diagnostic therefore claimed the entry file while
+    /// its span indexed a module — an `R10` violation written in an imported
+    /// module drew its label over whatever the entry happens to hold at those
+    /// offsets, which is the exact harm E16/E1 exist to stop.
+    ///
+    /// Raised against GENERATED code, the whole diagnostic re-anchors at the
+    /// attribute that wrote it (standard A2) rather than claiming a template
+    /// no file holds — deliberately identical to the in-walk
+    /// `redirect_derived_range`, so generated code reports the same way
+    /// whichever pass noticed the problem.
+    fn attribute_diagnostics_to_anchor(&mut self, from: usize, anchor: Id) {
+        if self.diagnostics.len() <= from {
+            return;
+        }
+        match self.source_of_id(anchor) {
+            Some(DERIVED_SOURCE) => self.redirect_derived_diagnostics(from, anchor),
+            Some(source) => self.attribute_new_diagnostics(from, source),
+            // A synthetic entity belongs to no walk; the entry is the fallback.
+            None => {}
+        }
+    }
+
+    /// [`Self::attribute_diagnostics_to_anchor`] for the single-push case every
+    /// whole-program check is: raise `error` about `anchor`, in `anchor`'s own
+    /// file.
+    fn push_anchored(&mut self, error: Error, anchor: Id) {
+        let from = self.diagnostics.len();
+        self.diagnostics.push(error);
+        self.attribute_diagnostics_to_anchor(from, anchor);
+    }
+
+    /// [`Self::push_anchored`] for a site that recorded its span's SOURCE
+    /// rather than an entity to look one up from — a written type application,
+    /// whose candidate list is `(type, span, source)` triples captured during
+    /// the walk that saw them.
+    ///
+    /// A generated span ([`DERIVED_SOURCE`]) keeps the entry fallback here:
+    /// re-anchoring at the attribute needs an entity id to find the origin
+    /// range by, and a bare source cannot supply one. Every site that HAS an
+    /// id uses [`Self::push_anchored`], which does re-anchor.
+    fn push_in_source(&mut self, error: Error, source: SourceId) {
+        let from = self.diagnostics.len();
+        self.diagnostics.push(error);
+        if source != DERIVED_SOURCE {
+            self.attribute_new_diagnostics(from, source);
+        }
+    }
+
+    /// The file a whole-program check's SECONDARY note points into, in the
+    /// form [`crate::error::Note`] wants: `None` when the note shares the
+    /// diagnostic's own file, `Some` when it is genuinely elsewhere.
+    ///
+    /// The comparison is against the DIAGNOSTIC's source, not
+    /// `current_source_id` — those were the same thing only while every
+    /// post-`build()` diagnostic claimed the entry. A note beside a violation
+    /// in one module must read as same-file, and a note in the ENTRY beside a
+    /// violation in a module must name the entry rather than collapsing to
+    /// `None` and re-rendering itself in the module.
+    fn note_source_against(
+        &self,
+        note_anchor: Id,
+        diagnostic_source: SourceId,
+    ) -> Option<SourceId> {
+        self.source_of_id(note_anchor)
+            .filter(|source| *source != diagnostic_source)
+    }
+
     /// The source file an entity was walked from (`Program::source_of`, but
     /// usable during `build()`). `None` for synthetic entities.
     fn source_of_id(&self, id: Id) -> Option<SourceId> {
@@ -22126,17 +22238,7 @@ impl<'src> Analyzer<'src> {
             let resolution = self.try_resolve(&constraint);
             // Attribute anything this constraint reported to its anchor's file
             // (a type error inside an imported module must publish there, E1).
-            if self.diagnostics.len() > diagnostics_before {
-                match self.source_of_id(constraint.anchor()) {
-                    // Raised against GENERATED code: re-anchor at the
-                    // attribute that generated it (standard A2).
-                    Some(source) if source == DERIVED_SOURCE => {
-                        self.redirect_derived_diagnostics(diagnostics_before, constraint.anchor());
-                    }
-                    Some(source) => self.attribute_new_diagnostics(diagnostics_before, source),
-                    None => {}
-                }
-            }
+            self.attribute_diagnostics_to_anchor(diagnostics_before, constraint.anchor());
             let waiting_on = self.current_waiting_on.take().unwrap_or_default();
             match resolution {
                 Resolution::Resolved | Resolution::Failed => progress = true,
