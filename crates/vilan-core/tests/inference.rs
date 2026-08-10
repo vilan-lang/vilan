@@ -35074,6 +35074,220 @@ fn containment_only_resource_drops_its_fields() {
     );
 }
 
+// === B113: the PLAIN-struct containment matrix, verified 2026-08-10 ============
+// B109's arc observed a struct with a resource FIELD running no scope-end
+// destructor and corrected a draft pin to match. The observation was PROBE
+// IDIOM, not a defect (destruction.md §3): its probe wrote `impl Res { fun
+// drop(own self) }` — an inherent method that happens to be spelled `drop` —
+// where the language hook is `impl Res with Drop { fun drop(&mut self) }`, so
+// no destructor was ever registered and none could run. The control that
+// exonerates containment is `b113_an_inherent_method_named_drop_never_runs`
+// below: the SAME idiom is equally silent on a bare resource with no
+// containing struct at all.
+//
+// Every shape below tears down correctly, and each is its own pin per the
+// per-case rule. The declared-`resource` twin is
+// `containment_only_resource_drops_its_fields` directly above; the enum-payload
+// shape is `drop_enum_payload_drops_with_the_value`; the fixed-array shape is
+// `an_element_write_drops_the_old_value`'s trailing teardown.
+
+/// The B113 matrix's shared prelude: a leaf resource that announces its
+/// teardown. Each shape supplies its own containing type, which is the one
+/// variable under test.
+fn b113_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Leaf {{ tag: str }}
+        impl Leaf with Drop {{ fun drop(&mut self) {{ print(self.tag); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn b113_a_plain_struct_with_a_resource_field_drops_it_at_scope_end() {
+    // THE question B113 asks. A struct with no `resource` modifier of its own is
+    // a resource by containment (destruction.md §3), so its local takes the
+    // scope-end teardown and the contained leaf is destroyed.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            let bag = Bag { item = Leaf { tag = "leaf" } };
+            print("body");
+        }
+        "#,
+        ),
+        "body\nleaf\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_struct_drops_its_resource_fields_in_reverse_declaration_order() {
+    // The order rule (§5) does not care that the aggregate is a resource only by
+    // inference: fields drop in reverse declaration order either way.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { first: Leaf, second: Leaf }
+        fun main() {
+            let bag = Bag { first = Leaf { tag = "first" }, second = Leaf { tag = "second" } };
+            print("body");
+        }
+        "#,
+        ),
+        "body\nsecond\nfirst\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_struct_nested_in_a_plain_struct_drops_transitively() {
+    // Containment is RECURSIVE: neither aggregate is declared `resource`, and
+    // the leaf is two levels down. The trailing field drops before the nested
+    // aggregate's, whose own fields then drop in reverse — one order rule
+    // applied at each level.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Inner { one: Leaf, two: Leaf }
+        struct Outer { inner: Inner, tail: Leaf }
+        fun main() {
+            let outer = Outer {
+                inner = Inner { one = Leaf { tag = "one" }, two = Leaf { tag = "two" } },
+                tail = Leaf { tag = "tail" },
+            };
+            print("body");
+        }
+        "#,
+        ),
+        "body\ntail\ntwo\none\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_containment_struct_moved_into_an_own_parameter_drops_in_the_callee() {
+    // R3 + §5: the move hands ownership to the callee, whose scope end runs the
+    // teardown — so the leaf is destroyed BEFORE the caller's next statement.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun sink(own bag: Bag) { print("in-sink"); }
+        fun main() {
+            let bag = Bag { item = Leaf { tag = "leaf" } };
+            sink(bag);
+            print("after");
+        }
+        "#,
+        ),
+        "in-sink\nleaf\nafter\n",
+    );
+}
+
+#[test]
+fn b113_overwriting_a_plain_containment_struct_drops_the_old_value() {
+    // R2 over an inferred resource: the outgoing aggregate's field is destroyed
+    // at the write, the incoming one at the scope end.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            mut bag = Bag { item = Leaf { tag = "first" } };
+            print("before");
+            bag = Bag { item = Leaf { tag = "second" } };
+            print("after");
+        }
+        "#,
+        ),
+        "before\nfirst\nafter\nsecond\n",
+    );
+}
+
+#[test]
+fn b113_a_returned_plain_containment_struct_drops_at_the_callers_scope_end() {
+    // R4: the return moves the aggregate out, so the callee's scope end must NOT
+    // destroy it — the single teardown belongs to the caller's binding.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun make(): Bag { Bag { item = Leaf { tag = "leaf" } } }
+        fun main() {
+            let bag = make();
+            print("body");
+        }
+        "#,
+        ),
+        "body\nleaf\n",
+    );
+}
+
+#[test]
+fn b113_a_tuple_local_drops_its_resource_members_in_reverse_order() {
+    // The positional aggregate, which had only a component-WRITE pin
+    // (`a_tuple_component_write_drops_the_old_value`) and no scope-end one: a
+    // tuple is a value aggregate, so any resource member marks the whole.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        fun main() {
+            let pair = (Leaf { tag = "a" }, Leaf { tag = "b" });
+            print("body");
+        }
+        "#,
+        ),
+        "body\nb\na\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_containment_struct_is_move_only() {
+    // The other half of "containment decides": inference does not buy teardown
+    // alone, it buys the whole R-rule surface. A plain struct holding a resource
+    // moves on binding exactly as a declared one does.
+    assert_fails_with(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            let a = Bag { item = Leaf { tag = "leaf" } };
+            let b = a;
+            print(a.item.tag);
+        }
+        "#,
+        ),
+        "after it was moved",
+    );
+}
+
+#[test]
+fn b113_an_inherent_method_named_drop_never_runs() {
+    // The control that diagnoses B109's observation, and the reason it is filed
+    // here rather than as a defect. `impl Leaf { fun drop(own self) }` declares
+    // an ordinary method whose name happens to be `drop`; the language hook is
+    // the TRAIT impl (`impl Leaf with Drop`, `&mut self` — a by-value receiver
+    // on the trait is rejected by `a_drop_impl_with_a_by_value_receiver_is_rejected`).
+    // So no destructor is registered and nothing runs — and the subject here is
+    // a BARE resource local with no containing struct at all, which is what
+    // clears containment: the silence is identical with and without it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Leaf { tag: str }
+        impl Leaf { fun drop(own self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let leaf = Leaf { tag = "leaf" };
+            print("body");
+        }
+        "#,
+        "body\n",
+    );
+}
+
 #[test]
 fn drop_runs_on_early_ret() {
     // A resource owned at an early `ret` drops on the way out — and on the
