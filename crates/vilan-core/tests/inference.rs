@@ -51200,6 +51200,110 @@ fn b76_the_parse_path_is_the_non_panicking_alternative() {
     );
 }
 
+// --- B76 §4.2/§9.6: `json.vl`'s kind() family ---------------------------------
+//
+// §4.2's contingency, taken now that §7.2 has lifted. `kind()` returns the
+// backed enum `JsonKind` and the four `is_*` predicates delete; §9.6's corrected
+// shape is that the 13 in-file sites are `==` comparisons, NOT a match — so
+// they pay nothing (`$a === "number"` either way), they gain no trap, and
+// §4.2's "covered for free by exhaustiveness" was wrong about them.
+//
+// What the closed type buys is that `Object` and `Null` — the two members of
+// the documented set that never got a predicate — are now as usable as the
+// other four.
+
+#[test]
+fn b76_json_kind_is_a_backed_enum_carrying_the_intrinsic_strings() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let value = parse_json_value("{\"n\":1,\"s\":\"x\",\"b\":true,\"a\":[],\"z\":null}");
+            print(value.kind() == JsonKind::Object);
+            print(value.field("n").kind() == JsonKind::Number);
+            print(value.field("s").kind() == JsonKind::String);
+            print(value.field("b").kind() == JsonKind::Bool);
+            print(value.field("a").kind() == JsonKind::Array);
+            // The two members that never got a predicate, now first-class.
+            print(value.field("z").kind() == JsonKind::Null);
+            print(JsonKind::Number.value());
+        }
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\nnumber\n",
+    );
+}
+
+#[test]
+fn b76_json_kind_comparisons_emit_what_the_predicates_compiled_to() {
+    // §9.6's first claim, checked in bytes: the site is the same `===` against
+    // the same literal `is_number()`'s body used to compile to, and the wrapper
+    // is no longer emitted at all (emission is demand-driven, §8.2(a)). That is
+    // why the rewrite is a net REDUCTION rather than a cost.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() { print(parse_json_value("1").kind() == JsonKind::Number); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"__json_kind("#),
+        "the intrinsic should still be the whole of it, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains(r#" === "number""#),
+        "the comparison should be against the raw string, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function is_number"),
+        "the deleted predicate should emit nothing, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an `==` is not a match, so §9.6 pays no trap cost, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
+    // The honest edge, recorded rather than papered over. A `JsonValue` is
+    // whatever the host handed over, so `field()` on an absent key is
+    // `undefined`, whose kind is none of the six. `==` answers `false` — the
+    // behavior the `is_*` predicates had — and an exhaustive `match` over
+    // `JsonKind` is the construct that says so instead of guessing, which is
+    // exactly what §9's trap is for.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let absent = parse_json_value("{}").field("nope");
+            print(absent.kind() == JsonKind::Null);
+            print(absent.kind() == JsonKind::Object);
+            print(match absent.kind() {
+                JsonKind::Null => "null",
+                JsonKind::Bool => "bool",
+                JsonKind::Number => "number",
+                JsonKind::String => "string",
+                JsonKind::Array => "array",
+                JsonKind::Object => "object",
+            });
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "false\nfalse\n",
+        "`==` should answer false for a kind outside the set"
+    );
+    assert!(
+        stderr.contains(r#"JsonKind: "undefined" is not one of its values"#),
+        "an exhaustive match should trap naming the raw kind, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
 // --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------
 //
 // The payoff the survey measured: eleven of the fifteen payload-free enums in

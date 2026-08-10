@@ -64,8 +64,9 @@ external struct JsonValue;
 fun parse_json_value(text: str): JsonValue  // throws on malformed text
 str.try_parse_json(): Option<JsonValue>     // the safe form
 
-value.kind(): str        // "object"|"array"|"string"|"number"|"boolean"|"null"
-value.is_number(): bool  // and is_string / is_bool / is_array, off kind()
+enum JsonKind { Null, Bool, Number, String, Array, Object }
+
+value.kind(): JsonKind
 value.is_null(): bool
 value.field(name: str): JsonValue
 value.has_field(name: str): bool
@@ -74,9 +75,18 @@ value.tag(): str         // an enum discriminator, NOT a type — see below
 ```
 
 `kind()` is the value's JSON type, normalized: the host's `typeof` calls
-both an array and `null` an `"object"`, so the four `is_*` predicates read
-`kind()` instead. `is_null()` is the exception — it tests the value against
-`null` directly.
+both an array and `null` an `"object"`, so the intrinsic names those two
+itself. `JsonKind` is a **backed enum** carrying exactly those strings, so
+`value.kind() == JsonKind::Number` is one comparison against `"number"` —
+the set is closed in the type system rather than in a doc comment, and
+`Object` and `Null` are as usable as the other four. `is_null()` is a
+separate intrinsic: it tests the value against `null` directly.
+
+The set is closed over JSON, not over every `JsonValue`. `value.field(name)`
+for a key the object does not have is the host's `undefined`, whose kind is
+none of the six — `==` answers `false` for it, as it always did, and an
+exhaustive `match` over `JsonKind` panics naming it. `has_field` is the
+check that keeps you out of that case.
 
 `tag()` answers a different question and is not a spelling of `kind()`: it
 reads an **externally-tagged enum's discriminator** — the string itself for a
@@ -87,17 +97,17 @@ throws. Reach for `kind()` unless you are decoding an enum by hand.
 
 ```vilan
 import std::print;
-import std::json::parse_json_value;
+import std::json::{ JsonKind, parse_json_value };
 
 fun main() {
 	let value = parse_json_value("{\"name\":\"ada\",\"tags\":[\"x\",\"y\"]}");
-	print(value.kind());               // object
-	print(value.field("name").kind()); // string
-	print(value.has_field("age"));     // false
+	print(value.kind() == JsonKind::Object);        // true
+	print(value.field("name").kind().value());      // string
+	print(value.has_field("age"));                  // false
 
 	for element in value.field("tags").elements() {
-		if element.is_string() {
-			print(element.kind()); // string, twice
+		if element.kind() == JsonKind::String {
+			print(element.kind().value()); // string, twice
 		}
 	}
 
