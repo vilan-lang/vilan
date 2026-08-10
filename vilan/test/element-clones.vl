@@ -30,6 +30,17 @@
 // `borrows` projection and still hands back the alias, so `viewed_projection`
 // emits none. Same seam, same leaf shape, opposite answers — and only the
 // return type separates them.
+//
+// `reference_of` / `called_of` are B109: the same seam through leaves that name
+// storage without BEING places — a `&place`, and a `borrows` call. Their bytes
+// are `viewed_of`'s, which is the claim: read through the view and the three
+// spellings are indistinguishable.
+//
+// `scalar_of` / `scalar_projection` are B108, the crossing where the copy is a
+// READ. A scalar view is a `(base, key)` pair at runtime and `__clone` cannot
+// collapse one, so a by-value return emits `cell[0]` / `value[0][value[1]]` —
+// the value — while the `borrows` twin one line down emits the pair itself.
+// Again only the return type separates them.
 import std::io::print;
 import std::compare::Ordering;
 import std::option::Option::{ self, Some, None };
@@ -78,6 +89,30 @@ fun viewed_of(holder: &Holder): List<i32> {
 
 fun viewed_projection(holder: &mut Holder): &mut Holder borrows holder {
 	holder
+}
+
+fun items_view(holder: &Holder): &List<i32> borrows holder {
+	&holder.items
+}
+
+fun reference_of(holder: &Holder): List<i32> {
+	&holder.items
+}
+
+fun called_of(holder: &Holder): List<i32> {
+	items_view(holder)
+}
+
+fun scalar_of(cell: &Cell): i32 {
+	&cell.n
+}
+
+fun scalar_projection(cell: &mut Cell): &mut i32 borrows cell {
+	&mut cell.n
+}
+
+fun scalar_forward(value: &mut i32): i32 {
+	value
 }
 
 fun elements_are_independent() {
@@ -130,5 +165,16 @@ fun main() {
 	print(viewer.items.len());
 	viewed_projection(&mut viewer).items.push(9);
 	print(viewer.items.len());
+	let referenced = reference_of(&viewer);
+	print(referenced.len());
+	let called = called_of(&viewer);
+	print(called.len());
+	mut cell = Cell { n = 5 };
+	print(scalar_of(&cell));
+	let slot = scalar_projection(&mut cell);
+	slot = 7;
+	print(cell.n);
+	mut counter = 3;
+	print(scalar_forward(&mut counter));
 	elements_are_independent();
 }

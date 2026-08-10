@@ -36,6 +36,23 @@ Two shapes disappear with the last generated body. The return direction used to 
 
 The generated file is still ordinary source you own. Where you would rather have `None` than a panic for a value the host might legitimately answer with, hand-edit the binding back to the guarded shape — bind the `str`, forward through `parse`. That edit is now yours to make rather than the generator's to assume.
 
+---
+
+**Returning `&self.inner` from a by-value signature now hands back a value.** `fun grab(&self): Inner { &self.inner }` gave the caller the receiver's field itself, so a later write to `h.inner` showed through the result — while `fun grab(&self): Inner { self.inner }`, one character away, copied as the rule says. The copy rule reads the *return*, not the leaf, and the leaf is where it stopped looking: a reference is not a place, so nothing in the return seam ever saw it. The same hole sat one indirection over, behind a `borrows` call: `fun get(h: &Holder): (i32, i32) { peek(h) }` handed back whatever `peek` projected out of `h`.
+
+Both return their own value now. A returned expression can *name* storage without being a place, and the seam reads through it to find out whose: a reference names what it points at, and a `borrows` call names the arguments its callee projects — which the call site can see, because the receiver is right there in it. Chains (`o.mid_mut().slot()`) are followed to the end. What is *not* copied is unchanged and deliberate: a call with no `borrows` clause owns its result, and a projection of a **local** is a dead owner donating its storage on the way out.
+
+**A `&mut i32` forwarded out of a by-value return is an `i32` again.** `fun same(v: &mut i32): i32 { v }` printed `[ [ 5 ], 0 ]` — a scalar view's runtime representation, leaking through a signature that promised a number. The copy machinery is shaped for aggregates and a scalar has no aggregate to copy, so the seam had nothing to do and did nothing. But a scalar's copy is its **read**, and that is what it emits now — for the plain spelling, for `&self.n`, for a scalar `borrows` call, and for a generic `fun same<T>(v: &T): T { v }` at any scalar `T`, which previously deep-copied the pair instead of collapsing it.
+
+**A resource can no longer slip out of a loan behind a `&`.** `fun take(&self): Guard { &self.g }` compiled, handed back the `Guard`, and ran no destructor at all — the resource left its owner uncopied *and* undestroyed. Its twin without the `&` has always been refused ("cannot move a resource field out of a live aggregate"), and both now get the same answer: a resource cannot copy, so a by-value return of one out of a loan is a move out of a loan. Under a **view** return the identical body is still rule 3's sanctioned projection and still compiles — the return type is what decides, as it does for every other case here.
+
+One conservatism is worth naming because it is visible: a by-value return whose tail is a reference or a `borrows` call is still *classified* as projecting its parameter, so its result cannot be `mut` and counts as a live view for the invalidation rule, even though the value is now a copy. That refuses some programs it does not have to and mis-copies none; loosening it is a separate question with its own consequences.
+
+Nothing in the standard library, the examples, the documentation, or the regression corpus returns a place through a reference or a `borrows` call, so nothing had to change and no emitted output moved.
+
+---
+
+
 **`Map<Align, T>` compiles.** A backed enum is now a `Map` key and a `Set` member with nothing to remember — no `[derive(Hashable)]`, no import, no ceremony. This was the first thing anyone was going to try after `enum Align { Start = "flex-start" }` shipped, and it met `Error: 'Align' does not implement trait 'Hashable'`, which is a strange answer when the enum *is* the string `"flex-start"` and the host's own `Map` keys strings by value.
 
 The reason it works is the reason `value()` costs nothing: the enum is not a wrapper around the backing value, it *is* the backing value. Hashing it and hashing that value are the same operation on the same runtime datum, so `Align::Start.hash()` and `Align::Start.value().hash()` are one key. The implementation is written by the compiler beside `value()` and `parse()`, off the same opt-in — writing `= "flex-start"` is what makes the enum that value, so it is also what makes the value its key. Both backings come along, integer and string, and so does the C-style tail: `enum Walked { A = 5, B, C }` is bare-lowered because one explicit value converts the whole declaration, so it keys too.

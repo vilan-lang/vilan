@@ -5864,13 +5864,30 @@ fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B108 / B109 (B104's bycatch, both of them rule 1's). The return seam reached
+// only leaves that are PLACES, so two leaf shapes handed back a caller's
+// storage untouched — `&self.inner` (a `&place`, whose `place_root` is `None`)
+// and `peek(h)` (a `borrows` call, likewise) — and a THIRD leaf, the scalar
+// view, reached the seam but fell out of the copy's type filter and handed back
+// its `(base, key)` pair as the value.
+//
+// One rule for all three: the seam reads THROUGH a view leaf to the storage it
+// names (`returned_value_places`, the return twin of B97's
+// `capture_subject_places`), and materializes a VALUE there — `__clone` for a
+// cloneable aggregate, the READ for a scalar (a scalar's copy IS its read,
+// B81). A RESOURCE crosses out of the loan instead, which the move scan judges
+// exactly as it judges the bare place twin. The borrow CLASSIFICATION is
+// untouched: gating it too was measured and refused (it turns seven compiling
+// shapes into "a view cannot escape its scope" and reddens B104's own chain
+// pin). See proposal/element-clones.md §11.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "B104 bycatch: a scalar `&mut` forwarded into a by-value return hands back the (base, key) pair"]
 fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
-    // Found measuring B104, pre-existing: `same(&mut n)` prints `[ [ 5 ], 0 ]`
-    // — the view's runtime pair, not the i32 the signature promises. Rule 1's
-    // copy does not reach a scalar, and nothing else reads through it at the
-    // return seam.
+    // B108's filed repro. Printed `[ [ 5 ], 0 ]` — the view's runtime pair, not
+    // the i32 the signature promises. The copy machinery is aggregate-shaped
+    // and `__clone` cannot collapse a pair; the crossing emits the read.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -5886,11 +5903,77 @@ fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
 }
 
 #[test]
-#[ignore = "B104 bycatch: a `&place` leaf in a by-value return is not a place, so rule 1 never copies it"]
+fn a_generic_view_forwarded_into_a_by_value_return_reads_at_a_scalar() {
+    // B108's second shape, and the reason the read cannot be decided where the
+    // copy is: a generic `&T` is a `(base, key)` pair at exactly its scalar
+    // instantiations and the aggregate's own reference everywhere else, which
+    // is abstract in the analyzer. Printed `[ [ 5 ], 0 ]` — and `__clone`,
+    // which rule 1 does insert here (`Type::Generic` is admitted), deep-COPIED
+    // the pair rather than collapsing it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun same<T>(v: &T): T { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&n);
+            print(m);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_scalar_reference_leaf_in_a_by_value_return_reads_the_place() {
+    // The `&place` spelling of the same crossing, which is B108 and B109 at
+    // once: `&self.n` lowers to the pair `[self, 0]`, and by-value out it must
+    // be the field READ. Printed `[ [ 99 ], 0 ]` — the pair, and a LIVE one, so
+    // the later write showed through it too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder {
+            fun grab(&self): i32 { &self.n }
+        }
+        fun main() {
+            mut h = Holder { n = 3 };
+            let v = h.grab();
+            h.n = 99;
+            print(v);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_scalar_borrows_call_leaf_in_a_by_value_return_reads_the_place() {
+    // The third spelling: a `borrows` call returning `&i32`, one indirection
+    // over. Same pair, same live alias, same read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { n: i32 }
+        fun peek(h: &Holder): &i32 borrows h { &h.n }
+        fun get(h: &Holder): i32 { peek(h) }
+        fun main() {
+            mut h = Holder { n = 3 };
+            let v = get(&h);
+            h.n = 99;
+            print(v);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
 fn a_reference_leaf_in_a_by_value_return_copies() {
-    // Found measuring B104, pre-existing (a residual of B100 rather than of the
-    // classification): `&self.inner` is not a place, so `compute_return_clone_sites`
-    // never sees it and the caller's result IS the receiver's field. Prints 99.
+    // B109's filed repro. `&self.inner` is not a place, so
+    // `compute_return_clone_sites` never saw it and the caller's result WAS the
+    // receiver's field. Printed 99.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -5911,12 +5994,15 @@ fn a_reference_leaf_in_a_by_value_return_copies() {
 }
 
 #[test]
-#[ignore = "B104 bycatch: a borrows-call leaf in a by-value return is not a place either"]
 fn a_borrows_call_leaf_in_a_by_value_return_copies() {
-    // The same hole one indirection over: the tail is a call, so rule 1 has no
-    // place to copy and the by-value signature hands back the callee's alias.
-    // Prints 99. The classification stays a view, which is what keeps this
-    // merely wrong rather than unsound.
+    // B109's second shape, one indirection over: the tail is a call, so rule 1
+    // had no place to copy and the by-value signature handed back the callee's
+    // alias. Printed 99. Which places a call names is read from the callee's
+    // `borrows` clause at the call site — B97's answer, asked at a return.
+    //
+    // The classification stays a VIEW here (B104's ungated Call arm, whose own
+    // pin is the `mut` twin of this program): conservative, and the copy is
+    // what makes it merely conservative rather than wrong.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -5931,6 +6017,295 @@ fn a_borrows_call_leaf_in_a_by_value_return_copies() {
         }
         "#,
         "3\n",
+    );
+}
+
+#[test]
+fn a_mut_reference_leaf_in_a_by_value_return_copies() {
+    // The `&mut` spelling of B109's first shape — one character apart, same
+    // answer, because what decides is the SIGNATURE (B100's finding) and not
+    // the leaf's own view-ness.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&mut self): Inner { &mut self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_free_parameters_reference_leaf_in_a_by_value_return_copies() {
+    // Nothing here is special to a receiver: a free `&` parameter is the same
+    // loan, and `place_root` walks to it the same way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun grab_of(h: &Holder): Inner { &h.inner }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = grab_of(&h);
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_nested_reference_leaf_in_a_by_value_return_copies() {
+    // Depth is the place walk's business, not the seam's: `&self.mid.inner`
+    // roots at `self` like `&self.inner` does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Mid { inner: Inner }
+        struct Holder { mid: Mid }
+        impl Holder {
+            fun grab(&self): Inner { &self.mid.inner }
+        }
+        fun main() {
+            mut h = Holder { mid = Mid { inner = Inner { n = 3 } } };
+            let i = h.grab();
+            h.mid.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_tail_if_arms_reference_leaf_in_a_by_value_return_copies() {
+    // The seam is keyed by the LEAF, so a tail `if` copies per arm — the same
+    // reason B100 pinned its own conditional shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner, other: Inner }
+        impl Holder {
+            fun grab(&self, first: bool): Inner {
+                if first { &self.inner } else { &self.other }
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 }, other = Inner { n = 5 } };
+            let i = h.grab(true);
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_method_leaf_in_a_by_value_return_copies() {
+    // The method spelling of the call shape: the projected argument is the
+    // receiver, at position 0 of the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun peek(&self): &Inner borrows self { &self.inner }
+            fun grab(&self): Inner { self.peek() }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_chain_leaf_in_a_by_value_return_copies() {
+    // The CHAIN, which is what makes the read-through recursive: the outer
+    // call's projected argument is itself a call, and only one more step
+    // reaches a place at all. Without the recursion this hands back the alias.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Mid { inner: Inner }
+        struct Outer { mid: Mid }
+        impl Mid {
+            fun slot(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Outer {
+            fun mid_mut(&mut self): &mut Mid borrows self { &mut self.mid }
+        }
+        fun grab(o: &mut Outer): Inner { o.mid_mut().slot() }
+        fun main() {
+            mut o = Outer { mid = Mid { inner = Inner { n = 3 } } };
+            let i = grab(&mut o);
+            o.mid.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_on_a_local_in_a_by_value_return_copies_nothing() {
+    // The elision the new arms must not eat, and it is B100's own: the frame is
+    // a dead owner at the return, so a projection of a LOCAL donates its
+    // storage. Reading through the call reaches `h`, a local, and stops.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun peek(h: &Holder): &Inner borrows h { &h.inner }
+        fun make(): Inner { let h = Holder { inner = Inner { n = 3 } }; peek(&h) }
+        fun main() { print(make().n); }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a dead owner's donation copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn an_owned_call_leaf_in_a_by_value_return_copies_nothing() {
+    // The other half of "a call owns its result": a callee with no `borrows`
+    // clause projects nothing, so reading through it names no place and the
+    // seam has nothing to copy.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun fresh(): Inner { Inner { n = 3 } }
+        fun grab(h: &Holder): Inner { fresh() }
+        fun main() {
+            let h = Holder { inner = Inner { n = 1 } };
+            print(grab(&h).n);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an owned call result copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn a_reference_leaf_in_a_view_return_still_aliases() {
+    // Rule 3's sanctioned projection, unchanged: the signature returns a view,
+    // so nothing crosses and `&mut self.inner` stays the alias it is for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun peek(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            h.peek().n = 99;
+            print(h.inner.n);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_reference_leaf_handing_back_a_resource_is_refused() {
+    // R1: a resource cannot copy, so the crossing is a MOVE out of the loan —
+    // and `&self.g` is `self.g` with a `&` in front of it, which the move scan
+    // already refuses as a partial move. Before the fix this compiled and
+    // printed the tag with no `drop` at all: the resource left the loan
+    // uncopied AND undestroyed.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self): Guard { &self.g }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take().tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn a_borrows_call_leaf_handing_back_a_resource_is_refused() {
+    // The call spelling of the same crossing: the place it names is the loaned
+    // parameter itself, so the diagnostic is R3's — the same one the bare
+    // forwarder `fun take(&self): Guard { self }` already gets.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        fun peek(h: &Holder): &Guard borrows h { &h.g }
+        fun take(h: &Holder): Guard { peek(h) }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(take(&h).tag);
+        }
+        "#,
+        "cannot move the resource `h` out of this function",
+    );
+}
+
+#[test]
+fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
+    // And the CROSSING is what decides, not the reference: under a view return
+    // the very same `&self.g` is rule 3's projection, moves nothing, and stays
+    // legal — the two programs differ only in the return type. (The owner's
+    // scope-end teardown is `destruction.md`'s subject, not this seam's.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun peek(&self): &Guard borrows self { &self.g }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.peek().tag);
+        }
+        "#,
+        "a\n",
     );
 }
 

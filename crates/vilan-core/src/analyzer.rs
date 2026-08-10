@@ -430,6 +430,14 @@ struct MoveScan<'a> {
     /// test's expression id. Precomputed because classification is `&mut self`
     /// and the scan is `&self` — the same reason `resource_bindings` is.
     is_refinements: &'a HashMap<Id, IsRefinement>,
+    /// B109: the places a by-value return hands back THROUGH a view leaf —
+    /// `&self.g`'s operand, a `borrows` call's projected arguments. Reading one
+    /// is ordinarily a loan, but at this seam the value crosses out of the view,
+    /// so for a resource it is a move and the ordinary rules judge it (R1's
+    /// partial move, R3's move out of a loan). Whole-program, like
+    /// `loaned_captures`: whether a leaf crosses is a property of its own
+    /// signature, not of the scan root.
+    value_crossings: &'a HashSet<Id>,
 }
 
 /// One arm's outcome, for R7's cross-arm comparison and the continuation merge.
@@ -6887,15 +6895,52 @@ impl<'src> Analyzer<'src> {
         // The concrete scan knows no generic resources, so the empty constraint
         // set makes `type_is_resource_with` agree with `type_is_resource`.
         let is_refinements = self.collect_is_refinements(&HashSet::new(), &mut HashMap::new());
+        let value_crossings = self.compute_return_value_crossings();
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
             resource_value_places: &resource_value_places,
             module_level_bindings: &module_level_bindings,
             loaned_captures: &loaned_captures,
             is_refinements: &is_refinements,
+            value_crossings: &value_crossings,
         };
         let violations = self.scan_bodies_for_moves(&scan);
         self.emit_resource_move_violations(violations);
+    }
+
+    /// The places a by-value return hands back through a VIEW leaf (B109) — the
+    /// `&place` operands and the `borrows`-call projected arguments rule 1's
+    /// return clause now copies. A resource cannot copy, so this is the set the
+    /// move scan judges as consumed: `fun take(&self): Guard { &self.g }` is
+    /// `fun take(&self): Guard { self.g }` with a `&` in front of it, and the
+    /// two must answer alike (R1's partial move; R3's move out of a loan for a
+    /// whole loaned parameter).
+    ///
+    /// A view RETURN is excluded — rule 3's sanctioned projection, where the
+    /// reference stays a reference and nothing crosses.
+    fn compute_return_value_crossings(&self) -> HashSet<Id> {
+        let mut crossings = HashSet::new();
+        for function in self.functions.values() {
+            if !function.has_body || function.returns_view {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(function.body.1, &mut leaves);
+            for leaf in leaves {
+                // Only the view leaves cross. A place leaf is already scanned as
+                // a returned place, and re-marking it would say nothing new.
+                if !matches!(
+                    self.expr_id_to_expr_map.get(&leaf),
+                    Some(Expr::Reference(..)) | Some(Expr::Call(..))
+                ) {
+                    continue;
+                }
+                let mut named = Vec::new();
+                self.returned_value_places(leaf, &mut named);
+                crossings.extend(named);
+            }
+        }
+        crossings
     }
 
     /// Drop planning (destruction.md §5, §7). Computes, for the whole program:
@@ -8152,6 +8197,12 @@ impl<'src> Analyzer<'src> {
         let Some(expr) = self.expr_id_to_expr_map.get(&expr_id).cloned() else {
             return;
         };
+        // B109: a place a by-value return hands back through a view leaf is
+        // consumed there, whatever position the walk reached it in — `&self.g`
+        // is scanned as the operand of a (loaning) reference, and a `borrows`
+        // call's projected argument as a (loaning) argument, but the RETURN
+        // crosses both out of the view and hands back the value.
+        let consuming = consuming || scan.value_crossings.contains(&expr_id);
         match expr {
             // --- resource places (leaves) ---
             Expr::Local(binding) => {
@@ -9534,8 +9585,10 @@ impl<'src> Analyzer<'src> {
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
         let mut enqueued: HashSet<(Id, Vec<TypeId>)> = HashSet::new();
         // B65 rides R11 unchanged, like every other rule: a capture's loan-ness
-        // is whole-program, so the same set serves every instantiation.
+        // is whole-program, so the same set serves every instantiation. B109's
+        // return crossings ride it for the same reason.
         let loaned_captures = self.collect_loaned_pattern_captures();
+        let value_crossings = self.compute_return_value_crossings();
 
         // Seed: every call in the program, under NO known generic-resources — so
         // only a parameter bound to a CONCRETE resource seeds a check. (A call
@@ -9583,6 +9636,7 @@ impl<'src> Analyzer<'src> {
                     module_level_bindings: &no_module_level,
                     loaned_captures: &loaned_captures,
                     is_refinements: &is_refinements,
+                    value_crossings: &value_crossings,
                 };
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
@@ -11894,6 +11948,104 @@ impl<'src> Analyzer<'src> {
             return vec![subject_id];
         };
         self.projected_argument_ids(*call_id)
+    }
+
+    /// The places a RETURN leaf hands back — the same question
+    /// [`Self::capture_subject_places`] asks of a pattern subject, asked of a
+    /// tail leaf (B109, `element-clones.md` §11).
+    ///
+    /// Rule 1's return clause reached only leaves that are PLACES, and two leaf
+    /// shapes name storage without being one: `&self.inner` (a `&place`, whose
+    /// `place_root` is `None`) and `peek(h)` (a `borrows` call, likewise). Under
+    /// a by-value signature the caller's result then WAS the receiver's storage.
+    /// Both are read through here: a `&place` names its operand, and a
+    /// `borrows` call names the arguments the callee projects — recursively, so
+    /// a chain (`o.mid_mut().slot()`) reaches the parameter at its root.
+    ///
+    /// Anything else is itself, which is today's behaviour for a place leaf and
+    /// yields a rootless expression (a literal, an OWNED call) that the
+    /// ownership test below rejects — a call owns its result, so nothing else
+    /// names it.
+    fn returned_value_places(&self, leaf_id: Id, places: &mut Vec<Id>) {
+        match self.expr_id_to_expr_map.get(&leaf_id) {
+            Some(Expr::Reference(operand, _)) => places.push(*operand),
+            Some(Expr::Call(call_id)) => {
+                for projected in self.projected_argument_ids(*call_id) {
+                    self.returned_value_places(projected, places);
+                }
+            }
+            _ => places.push(leaf_id),
+        }
+    }
+
+    /// The type of the VALUE a return leaf hands back — what rule 1's copy is a
+    /// copy OF. A place carries its own type; the two view leaves B109 reads
+    /// through do not reliably carry one, and their answers are elsewhere: a
+    /// `&place`'s value is its operand's place type, and a `borrows` call's is
+    /// its callee's declared return type, whose pointee the type system has
+    /// already collapsed (`&(i32, i32)` is recorded as `(i32, i32)`).
+    ///
+    /// Asked of the leaf's own recorded type only as a fallback, which is what
+    /// keeps an unusual leaf (an `await`, a `*view`) from silently getting the
+    /// receiver's type instead of the result's.
+    fn returned_value_type_id(&self, leaf_id: Id) -> Option<TypeId> {
+        match self.expr_id_to_expr_map.get(&leaf_id) {
+            Some(Expr::Reference(operand, _)) => {
+                let operand = *operand;
+                self.place_value_type_id(operand)
+                    .or_else(|| self.place_value_type_id(leaf_id))
+            }
+            Some(Expr::Call(call_id)) => {
+                let call_id = *call_id;
+                self.place_value_type_id(leaf_id)
+                    .or_else(|| self.call_declared_return_type_id(call_id))
+            }
+            _ => self.place_value_type_id(leaf_id),
+        }
+    }
+
+    /// A call's callee-declared return type, for a leaf that carries no recorded
+    /// type of its own.
+    fn call_declared_return_type_id(&self, call_id: Id) -> Option<TypeId> {
+        let function_call = self.function_calls.get(&call_id)?;
+        let Expr::Local(callee_id) = self.expr_id_to_expr_map.get(&function_call.subject_id)?
+        else {
+            return None;
+        };
+        self.functions.get(callee_id)?.return_type_id
+    }
+
+    /// Whether a returned place is storage the returning frame does not own, so
+    /// rule 1's return clause owes a copy of it. `declared_inside` is the
+    /// closure's own bindings when the seam is a closure's (B64).
+    fn returned_place_owes_a_copy(
+        &self,
+        place_id: Id,
+        declared_inside: Option<&HashSet<Id>>,
+    ) -> bool {
+        let Some(root) = self.place_root(place_id) else {
+            return false;
+        };
+        match self.parameters.get(&root).map(|it| it.convention) {
+            // Every LOANED parameter — bare, `&`, `&mut` alike (R3's own list) —
+            // is the CALLER's storage, which outlives the call. B100: the
+            // `&`/`&mut` half read as an exemption because a `borrows`
+            // projection returns an alias on purpose, but that is a fact about
+            // the RETURN, not about the place; a by-value return of a loaned
+            // place is the store rule at the return seam and copies like any
+            // other.
+            Some(Convention::Ref | Convention::RefMut | Convention::Bare) => true,
+            // An `own` parameter is the callee's own (the caller copied it in,
+            // or donated a dead one), and a local is a dead owner at the return
+            // — so a fluent builder (`fun with(own self, …): Self { … self }`)
+            // and every `mut result = …; result` stay free. Unless a CLOSURE is
+            // returning it and it belongs to the frame around the closure, which
+            // does not die here and can be handed the same storage again on the
+            // next call.
+            Some(Convention::Own) | None => {
+                declared_inside.is_some_and(|declared| !declared.contains(&root))
+            }
+        }
     }
 
     /// The argument PLACES a view-returning call projects — the callee's
@@ -15575,7 +15727,14 @@ impl<'src> Analyzer<'src> {
     /// hand back a parameter's storage owe a copy. Leaf ids never collide with
     /// `clone_sites`' — an expression occupies exactly one syntactic position,
     /// and a return leaf is not also an initializer or an argument.
-    fn compute_return_clone_sites(&mut self) -> HashMap<Id, CopyDecision> {
+    ///
+    /// Returns the clone sites and, beside them, EVERY leaf that owes a copy —
+    /// the seams where a value must be materialized whatever the leaf's runtime
+    /// representation is. A cloneable aggregate clones; a scalar VIEW leaf reads
+    /// through the `(base, key)` pair instead, which only the transformer can
+    /// decide because a generic `&T` is a pair at one instantiation and an
+    /// aggregate at the next (B108, `element-clones.md` §11).
+    fn compute_return_clone_sites(&mut self) -> (HashMap<Id, CopyDecision>, HashSet<Id>) {
         // Each seam with the closure it belongs to, if any: the capture question
         // only exists inside one, and its answer needs that closure's bindings.
         // A closure cannot declare a view return — rule 3 rejects a view
@@ -15596,37 +15755,21 @@ impl<'src> Analyzer<'src> {
             )
         }));
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
+        let mut view_reads: HashSet<Id> = HashSet::new();
         for (seam, closure_id, returns_view) in seams {
             let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
             self.collect_tail_leaves(seam, &mut leaves);
             for leaf in leaves {
-                let Some(root) = self.place_root(leaf) else {
-                    continue;
-                };
                 // Storage the returning frame does not own outlives the return
-                // and must be copied. Two ways that happens:
-                let owes_copy = match self.parameters.get(&root).map(|it| it.convention) {
-                    // Every LOANED parameter — bare, `&`, `&mut` alike (R3's own
-                    // list) — is the CALLER's storage, which outlives the call.
-                    // B100: the `&`/`&mut` half read as an exemption because a
-                    // `borrows` projection returns an alias on purpose, but that
-                    // is a fact about the RETURN, not about the place; a by-value
-                    // return of a loaned place is the store rule at the return
-                    // seam and copies like any other.
-                    Some(Convention::Ref | Convention::RefMut | Convention::Bare) => true,
-                    // An `own` parameter is the callee's own (the caller copied
-                    // it in, or donated a dead one), and a local is a dead owner
-                    // at the return — so a fluent builder
-                    // (`fun with(own self, …): Self { … self }`) and every
-                    // `mut result = …; result` stay free. Unless a CLOSURE is
-                    // returning it and it belongs to the frame around the
-                    // closure, which does not die here and can be handed the
-                    // same storage again on the next call.
-                    Some(Convention::Own) | None => declared_inside
-                        .as_ref()
-                        .is_some_and(|declared| !declared.contains(&root)),
-                };
+                // and must be copied — asked of every place the leaf HANDS BACK,
+                // which for a `&place` or a `borrows` call is not the leaf
+                // itself (B109).
+                let mut named = Vec::new();
+                self.returned_value_places(leaf, &mut named);
+                let owes_copy = named
+                    .iter()
+                    .any(|place| self.returned_place_owes_a_copy(*place, declared_inside.as_ref()));
                 if !owes_copy {
                     continue;
                 }
@@ -15636,10 +15779,28 @@ impl<'src> Analyzer<'src> {
                 // whether it is a view answers a different question: `fun
                 // copy(&self): Holder { self }` forwards a loan into a by-value
                 // return, and the caller's result must not be the receiver.
-                if returns_view || self.resource_value_places.contains(&leaf) {
+                //
+                // A RESOURCE cannot copy (R1), and it does not silently alias
+                // either: the crossing is a move out of a loan, which
+                // `check_resource_moves` refuses at the place the leaf names
+                // (B109's `return_value_crossings`).
+                if returns_view
+                    || self.resource_value_places.contains(&leaf)
+                    || named
+                        .iter()
+                        .any(|place| self.resource_value_places.contains(place))
+                {
                     continue;
                 }
-                if let Some(type_id) = self.place_value_type_id(leaf) {
+                // Every leaf that owes a copy is a seam the transformer must
+                // materialize a VALUE at, whatever representation it has. Only
+                // the cloneable-aggregate ones clone; a scalar VIEW leaf reads
+                // instead (B108 — a scalar's copy IS its read), which is a
+                // question the type filter below cannot answer because a
+                // generic `&T` is a pair at one instantiation and an aggregate
+                // at the next.
+                view_reads.insert(leaf);
+                if let Some(type_id) = self.returned_value_type_id(leaf) {
                     candidates.push((leaf, type_id));
                 }
             }
@@ -15660,7 +15821,7 @@ impl<'src> Analyzer<'src> {
             };
             sites.insert(value_id, decision);
         }
-        sites
+        (sites, view_reads)
     }
 
     /// B53 (rule 1): a pattern capture binding an aggregate element of a
@@ -29007,6 +29168,14 @@ pub struct Program<'src> {
     // `compute_return_clone_sites`; a separate map from `clone_sites` so the
     // two hooks never double-wrap one expression.
     pub return_clone_sites: HashMap<Id, CopyDecision>,
+    /// B108/B109: the same return leaves, before the copy's TYPE filter — every
+    /// seam where a value must be materialized out of storage the frame does not
+    /// own. A cloneable aggregate is in `return_clone_sites` too and clones; a
+    /// scalar VIEW leaf is not, and reads through its `(base, key)` pair instead,
+    /// because a scalar's copy IS its read (B81). Only the transformer can tell
+    /// the two apart for a generic `&T`, whose pointee is abstract here and a
+    /// pair at exactly its scalar instantiations.
+    pub return_view_reads: HashSet<Id>,
     /// H9: `mut` parameters of aggregate type — the transformer emits
     /// `x = __clone(x)` at body entry for each (see
     /// `compute_parameter_entry_clones`; scalar `mut` parameters with views
@@ -33327,7 +33496,7 @@ fn analyze_over_world<'src>(
     let capture_plan = analyzer.compute_capture_clone_sites();
     let resource_types = analyzer.compute_resource_types();
     let clone_sites = analyzer.compute_clone_sites(&capture_plan.shared);
-    let return_clone_sites = analyzer.compute_return_clone_sites();
+    let (return_clone_sites, return_view_reads) = analyzer.compute_return_clone_sites();
     let parameter_entry_clones = analyzer.compute_parameter_entry_clones();
     let (boxed_locals, generic_referenced_roots) = analyzer.compute_boxed_locals();
     let primitive_views = analyzer.compute_primitive_views();
@@ -33648,6 +33817,7 @@ fn analyze_over_world<'src>(
         return_sites: analyzer.return_sites.clone(),
         clone_sites,
         return_clone_sites,
+        return_view_reads,
         parameter_entry_clones,
         capture_clone_sites: capture_plan.sites,
         materialized_captures: capture_plan.materialized,

@@ -111,6 +111,18 @@ projection and keeps naming the receiver's storage. Together these are what
 make "a call owns its result" true, which is the premise every elision below
 rests on:
 
+The return reads **through** a view to reach the place, because a returned
+expression can name storage without being a place: `fun grab(&self): Inner {
+&self.inner }` hands back a reference, and `fun get(h: &Holder): (i32, i32) {
+peek(h) }` hands back what the `borrows` callee projected — which is `h`'s
+storage, named in the call. Both copy, exactly as the bare `self.inner` /
+`h.pair` spellings do; only the return type tells them apart from the
+projections one line away. And a **scalar**'s copy is its *read*: a scalar view
+is a `(base, key)` pair at runtime, so `fun same(v: &mut i32): i32 { v }` hands
+back the `i32` it promises rather than the pair. A **resource** crosses no such
+seam at all — it cannot copy (§6.8's R1), so handing one back out of a loan is
+a move out of a loan and is refused, with or without the `&`.
+
 ```vilan
 import std::print;
 
@@ -305,6 +317,14 @@ it does for the copy in §6.1: `fun copy(&self): Holder { self }` hands back a
 value — the return copies it out of the loan — and projects nothing, so its
 result is an ordinary owned binding (`mut c = h.copy()` is legal). Change the
 return type to `&mut Holder` and the same body is a projection.
+
+That agreement is exact for a **forwarded parameter** and conservative for the
+other leaf shapes: a by-value return whose tail is `&self.inner`, a `borrows`
+call, or a wrapped `Some(&mut self.x)` still *projects* at the call site, even
+though §6.1's copy has already taken the value out of the loan. The result is
+therefore a value that is treated as a view — `mut` is refused on it, and rule
+4 counts it live — which restricts more programs than it must and mis-copies
+none.
 
 At the call site the returned view obeys the same second-class rules,
 with the borrow anchored to the projected argument: the argument's place
