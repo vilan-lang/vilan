@@ -32,7 +32,9 @@
 //! language server shows on hover), computed caller-ward from the seeds so
 //! every function gets a shortest witness chain to the layer it requires.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::analyzer::{GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
@@ -64,7 +66,7 @@ pub fn check(program: &mut Program, platform: Platform, graph: &CallGraph) {
     let mut diagnostics = check_fences(program, graph);
     if let Some(entry) = entry_function(program) {
         let mut traversal = Traversal::new(program, graph, Some(platform));
-        traversal.walk(entry, &SubstitutionContext::new(), None);
+        traversal.walk(entry, &SubstitutionContext::default(), None);
         diagnostics.extend(traversal.diagnostics);
     }
     // Each violation goes in with the file its anchor span indexes into — the
@@ -142,7 +144,7 @@ fn check_fences(program: &Program, graph: &CallGraph) -> Vec<(Error, SourceId)> 
                 function: function.name.to_string(),
                 fence: fence_label.clone(),
             };
-            traversal.walk(*id, &SubstitutionContext::new(), None);
+            traversal.walk(*id, &SubstitutionContext::default(), None);
             diagnostics.extend(traversal.diagnostics);
         }
     }
@@ -172,9 +174,9 @@ pub(crate) fn reachable_bindings(
     extra_roots: &[Id],
 ) -> HashSet<Id> {
     let mut traversal = Traversal::new(program, graph, None);
-    traversal.walk(entry, &SubstitutionContext::new(), None);
+    traversal.walk(entry, &SubstitutionContext::default(), None);
     for root in extra_roots {
-        traversal.walk(*root, &SubstitutionContext::new(), None);
+        traversal.walk(*root, &SubstitutionContext::default(), None);
     }
     traversal.reached_bindings
 }
@@ -219,11 +221,11 @@ impl<'a, 'src> Traversal<'a, 'src> {
             program,
             graph,
             platform,
-            visited: HashSet::new(),
+            visited: HashSet::default(),
             trail: Vec::new(),
             diagnostics: Vec::new(),
             module_bindings: program.module_level_bindings().into_iter().collect(),
-            reached_bindings: HashSet::new(),
+            reached_bindings: HashSet::default(),
             origin: Origin::Entry,
         }
     }
@@ -309,13 +311,13 @@ impl<'a, 'src> Traversal<'a, 'src> {
         // initializers are never generic, so they walk context-free.
         for (reference, global) in self.graph.global_references_of(node) {
             let arrived = self.arrival(*reference);
-            self.walk(*global, &SubstitutionContext::new(), arrived);
+            self.walk(*global, &SubstitutionContext::default(), arrived);
         }
         // A function passed as a value charges at the reference site; with no
         // call record there is no binding to thread.
         for (reference, function) in self.graph.function_references_of(node) {
             let arrived = self.arrival(*reference);
-            self.walk(*function, &SubstitutionContext::new(), arrived);
+            self.walk(*function, &SubstitutionContext::default(), arrived);
         }
         // Creating a closure charges its body (v1 creator rule); a closure
         // inherits its creator's bindings — its body uses the enclosing `T`s.
@@ -325,7 +327,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
             }
         }
         for closure in self.graph.initializer_closures_of(node).to_vec() {
-            self.walk(closure, &SubstitutionContext::new(), None);
+            self.walk(closure, &SubstitutionContext::default(), None);
         }
         // Synthetic destruction edges (destruction.md §8): the transformer inserts
         // the teardown at each scope exit, so this walk can't see the call
@@ -335,7 +337,7 @@ impl<'a, 'src> Traversal<'a, 'src> {
         // site — like a created closure.
         if let Some(drop_methods) = self.program.drop_call_edges.get(&node) {
             for drop_method in drop_methods.clone() {
-                self.walk(drop_method, &SubstitutionContext::new(), None);
+                self.walk(drop_method, &SubstitutionContext::default(), None);
             }
         }
 
@@ -474,7 +476,7 @@ pub fn requirements(program: &Program) -> HashMap<Id, String> {
     universe.extend(program.external_functions.keys().copied());
     universe.extend(program.module_level_bindings());
 
-    let mut callers: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut callers: HashMap<Id, Vec<Id>> = HashMap::default();
     for id in &universe {
         for (callee, _) in edges(program, graph, *id) {
             callers.entry(callee).or_default().push(*id);
@@ -488,10 +490,10 @@ pub fn requirements(program: &Program) -> HashMap<Id, String> {
         }
     }
 
-    let mut lines: HashMap<Id, Vec<String>> = HashMap::new();
+    let mut lines: HashMap<Id, Vec<String>> = HashMap::default();
     for (label, sources) in &seeds {
         // node → the callee it acquired this label from (`None` = seeded).
-        let mut witness: HashMap<Id, Option<Id>> = HashMap::new();
+        let mut witness: HashMap<Id, Option<Id>> = HashMap::default();
         let mut queue: VecDeque<Id> = VecDeque::new();
         for source in sources {
             witness.insert(*source, None);

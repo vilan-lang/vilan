@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
+
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -34,7 +36,7 @@ thread_local! {
     /// The `(operation, generic constraint id)` pairs currently being resolved on
     /// the active recursion path, so a cyclic mapping terminates.
     static RESOLVING_GENERICS: std::cell::RefCell<HashSet<(u8, TypeId)>> =
-        std::cell::RefCell::new(HashSet::new());
+        std::cell::RefCell::new(HashSet::default());
 }
 
 /// Marks one generic constraint id as being resolved (for a given operation) while a
@@ -526,8 +528,8 @@ struct MoveFlow {
 impl MoveFlow {
     fn new() -> Self {
         MoveFlow {
-            moved: HashMap::new(),
-            decl_loop_depth: HashMap::new(),
+            moved: HashMap::default(),
+            decl_loop_depth: HashMap::default(),
         }
     }
 }
@@ -1515,7 +1517,7 @@ pub struct Analyzer<'src> {
     // both keep full checking. Definition-site checks skip entities from
     // these sources via `frozen_entity`; the std-clean invariant that makes
     // that sound is pinned in `check_scope_differential.rs`.
-    std_sources: std::collections::HashSet<SourceId>,
+    std_sources: HashSet<SourceId>,
     // Counts every write into `type_id_to_type_map` that CHANGES what a slot
     // held — the constraint fixpoint's third progress signal (S3b): an attempt
     // that refines a type without resolving still moves the world, and the exit
@@ -2240,23 +2242,23 @@ impl<'src> Analyzer<'src> {
             assignment_values: IndexMap::new(),
             closures: IndexMap::new(),
             diagnostics: Vec::new(),
-            wire_names: HashSet::new(),
+            wire_names: HashSet::default(),
             drop_impls_to_check: Vec::new(),
             drop_method_checks: Vec::new(),
             wire_types_to_check: Vec::new(),
-            hashable_names: HashSet::new(),
+            hashable_names: HashSet::default(),
             hashable_types_to_check: Vec::new(),
             partialeq_types_to_check: Vec::new(),
-            resource_classification: HashMap::new(),
+            resource_classification: HashMap::default(),
             generic_type_applications: Vec::new(),
-            reported_container_structures: HashSet::new(),
-            resource_value_places: HashSet::new(),
-            dropped_bindings: HashSet::new(),
-            overwrite_drops: HashMap::new(),
-            drop_methods: HashMap::new(),
-            drop_glue: HashMap::new(),
-            drop_owned_types_by_root: HashMap::new(),
-            drop_call_edges: HashMap::new(),
+            reported_container_structures: HashSet::default(),
+            resource_value_places: HashSet::default(),
+            dropped_bindings: HashSet::default(),
+            overwrite_drops: HashMap::default(),
+            drop_methods: HashMap::default(),
+            drop_glue: HashMap::default(),
+            drop_owned_types_by_root: HashMap::default(),
+            drop_call_edges: HashMap::default(),
             rpc_signatures_to_check: Vec::new(),
             expose_fields_to_check: Vec::new(),
             return_type_stack: Vec::new(),
@@ -2264,14 +2266,14 @@ impl<'src> Analyzer<'src> {
             warning_sources: Vec::new(),
             entity_id: 0,
             enums: IndexMap::new(),
-            expr_id_to_expr_map: HashMap::new(),
-            expr_id_to_scope_id_map: HashMap::new(),
-            expr_id_to_type_id_map: HashMap::new(),
-            member_name_spans: HashMap::new(),
+            expr_id_to_expr_map: HashMap::default(),
+            expr_id_to_scope_id_map: HashMap::default(),
+            expr_id_to_type_id_map: HashMap::default(),
+            member_name_spans: HashMap::default(),
             current_source_id: SourceId(0),
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
-            std_sources: std::collections::HashSet::new(),
+            std_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
             source_texts: Vec::new(),
@@ -2282,69 +2284,69 @@ impl<'src> Analyzer<'src> {
             current_waiting_on: None,
             function_calls: IndexMap::new(),
             functions: IndexMap::new(),
-            generic_constraint_names: HashMap::new(),
-            generic_dispatch: HashMap::new(),
-            generic_bounds: HashMap::new(),
-            tuple_bounds: HashMap::new(),
-            impl_subject_args: HashMap::new(),
+            generic_constraint_names: HashMap::default(),
+            generic_dispatch: HashMap::default(),
+            generic_bounds: HashMap::default(),
+            tuple_bounds: HashMap::default(),
+            impl_subject_args: HashMap::default(),
             implementations: Vec::new(),
-            implementations_by_member: HashMap::new(),
-            module_id_by_name: HashMap::new(),
+            implementations_by_member: HashMap::default(),
+            module_id_by_name: HashMap::default(),
             packages: Vec::new(),
-            package_of_source: HashMap::new(),
+            package_of_source: HashMap::default(),
             modules: IndexMap::new(),
             parameters: IndexMap::new(),
-            primitive_struct_ids: HashMap::new(),
+            primitive_struct_ids: HashMap::default(),
             bool_enum_id: None,
-            list_element_slots: HashMap::new(),
+            list_element_slots: HashMap::default(),
             prepped_assignments: Vec::new(),
-            compound_reread_ids: HashSet::new(),
-            reported_literal_errors: HashSet::new(),
-            binding_annotation_view: HashMap::new(),
+            compound_reread_ids: HashSet::default(),
+            reported_literal_errors: HashSet::default(),
+            binding_annotation_view: HashMap::default(),
             prepped_imports: Vec::new(),
-            macro_item_invocations: HashSet::new(),
-            macro_signatures: HashMap::new(),
-            macro_expression_expansions: HashMap::new(),
-            macro_failed_sites: HashSet::new(),
-            module_scope_ids: HashSet::new(),
+            macro_item_invocations: HashSet::default(),
+            macro_signatures: HashMap::default(),
+            macro_expression_expansions: HashMap::default(),
+            macro_failed_sites: HashSet::default(),
+            module_scope_ids: HashSet::default(),
             prepped_locals: Vec::new(),
-            untyped_comprehension_binders: HashSet::new(),
+            untyped_comprehension_binders: HashSet::default(),
             prepped_for_each: Vec::new(),
-            for_each_next: HashMap::new(),
-            for_each_iterable_types: HashMap::new(),
-            for_each_views: HashMap::new(),
-            wrapped_view_captures: HashMap::new(),
+            for_each_next: HashMap::default(),
+            for_each_iterable_types: HashMap::default(),
+            for_each_views: HashMap::default(),
+            wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
             std_export_index: None,
             std_trait_method_index: None,
             derived_origins: Vec::new(),
-            closure_parameter_fill_sites: HashMap::new(),
+            closure_parameter_fill_sites: HashMap::default(),
             prepped_binder_inheritance: Vec::new(),
-            binary_op_dispatch: HashMap::new(),
-            bitwise_u32: HashSet::new(),
-            bitwise_generic_lhs: HashMap::new(),
-            integer_division: HashSet::new(),
-            division_generic_lhs: HashMap::new(),
+            binary_op_dispatch: HashMap::default(),
+            bitwise_u32: HashSet::default(),
+            bitwise_generic_lhs: HashMap::default(),
+            integer_division: HashSet::default(),
+            division_generic_lhs: HashMap::default(),
             prepped_number_literals: Vec::new(),
-            parameter_contexts: HashMap::new(),
+            parameter_contexts: HashMap::default(),
             prepped_context_clauses: Vec::new(),
-            async_values: HashSet::new(),
-            sync_values: HashSet::new(),
-            async_fields: HashSet::new(),
-            async_returning: HashSet::new(),
+            async_values: HashSet::default(),
+            sync_values: HashSet::default(),
+            async_fields: HashSet::default(),
+            async_returning: HashSet::default(),
             return_sites: Vec::new(),
-            method_call_substitution: HashMap::new(),
-            expected_types: HashMap::new(),
+            method_call_substitution: HashMap::default(),
+            expected_types: HashMap::default(),
             prepped_static_accessors: Vec::new(),
-            static_subject_bindings: HashMap::new(),
-            trait_qualified_calls: HashMap::new(),
-            own_generic_call_bindings: HashMap::new(),
-            spread_packs: HashMap::new(),
-            spread_elements: HashSet::new(),
-            spread_spans: HashMap::new(),
-            bound_dispatch_traits: HashMap::new(),
+            static_subject_bindings: HashMap::default(),
+            trait_qualified_calls: HashMap::default(),
+            own_generic_call_bindings: HashMap::default(),
+            spread_packs: HashMap::default(),
+            spread_elements: HashSet::default(),
+            spread_spans: HashMap::default(),
+            bound_dispatch_traits: HashMap::default(),
             prepped_trait_impls: Vec::new(),
             trait_impl_sites: Vec::new(),
             conformance_signature_checks: Vec::new(),
@@ -2352,21 +2354,21 @@ impl<'src> Analyzer<'src> {
             written_type_spellings: Vec::new(),
             prepped_type_static_accessors: Vec::new(),
             prepped_uses: Vec::new(),
-            reference_count: HashMap::new(),
-            resolved_types: HashMap::new(),
-            tuple_element_types: HashMap::new(),
+            reference_count: HashMap::default(),
+            resolved_types: HashMap::default(),
+            tuple_element_types: HashMap::default(),
             scope_id: 0,
             scopes: IndexMap::new(),
-            span_map: HashMap::new(),
-            struct_initializer_to_def: HashMap::new(),
+            span_map: HashMap::default(),
+            struct_initializer_to_def: HashMap::default(),
             structs: IndexMap::new(),
             traits: IndexMap::new(),
-            type_id_to_type_map: HashMap::new(),
+            type_id_to_type_map: HashMap::default(),
             type_id: 0,
             variables: IndexMap::new(),
             walking_trait_body: false,
-            trait_body_scopes: HashSet::new(),
-            trait_position_type_ids: HashSet::new(),
+            trait_body_scopes: HashSet::default(),
+            trait_position_type_ids: HashSet::default(),
             panic_fn_id: None,
             asset_emit_fn_id: None,
             const_exprs: Vec::new(),
@@ -2378,14 +2380,14 @@ impl<'src> Analyzer<'src> {
             hmr_take_fn_id: None,
             drop_trait_id: None,
             drop_fn_id: None,
-            drop_sink_value_types: HashMap::new(),
+            drop_sink_value_types: HashMap::default(),
             lift_binder_stack: Vec::new(),
             lift_region_frames: Vec::new(),
-            try_dispatch: HashMap::new(),
-            lift_dispatch: HashMap::new(),
+            try_dispatch: HashMap::default(),
+            lift_dispatch: HashMap::default(),
             promise_struct_id: None,
             task_struct_id: None,
-            bumps_tabled: HashSet::new(),
+            bumps_tabled: HashSet::default(),
         }
     }
 
@@ -2532,7 +2534,7 @@ impl<'src> Analyzer<'src> {
             // Reconcile subject-first so the bindings key on the impl's
             // binders (`impl Box2<type X>` against `Box2<Cat>` binds X = Cat).
             let Some((_unified, bindings)) =
-                self.reconcile_type(&subject_type, value_type, &SubstitutionContext::new())
+                self.reconcile_type(&subject_type, value_type, &SubstitutionContext::default())
             else {
                 continue;
             };
@@ -2598,7 +2600,11 @@ impl<'src> Analyzer<'src> {
                             if indeterminate(&required_type) || indeterminate(&provided_type) {
                                 continue;
                             }
-                            if !self.compare_type(&required_type, &provided_type, &HashMap::new()) {
+                            if !self.compare_type(
+                                &required_type,
+                                &provided_type,
+                                &HashMap::default(),
+                            ) {
                                 continue 'candidates;
                             }
                         }
@@ -2628,7 +2634,7 @@ impl<'src> Analyzer<'src> {
         // Every id that is an element of some tuple construction — written, or
         // synthesized by a spread call site's collection (§S.1), which is the
         // desugar that makes `f(..pair)` legal.
-        let mut in_a_construction: HashSet<Id> = HashSet::new();
+        let mut in_a_construction: HashSet<Id> = HashSet::default();
         // Constructions holding a spread, with their element count: an abstract
         // pack is admissible only where it is the lone part.
         let mut constructions: Vec<Vec<Id>> = Vec::new();
@@ -2676,7 +2682,7 @@ impl<'src> Analyzer<'src> {
             let operand_type = self.expand_mapped(operand_type);
             if let Type::Generic(constraint_id) = operand_type {
                 if !self.tuple_bounds.contains_key(&constraint_id) {
-                    let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                    let label = self.pretty_print_type(&operand_type, &HashMap::default());
                     errors.push((span, Self::not_a_tuple_message(&label)));
                     continue;
                 }
@@ -2689,7 +2695,7 @@ impl<'src> Analyzer<'src> {
                     .filter(|items| items.contains(&id))
                     .all(|items| items.len() == 1);
                 if !alone {
-                    let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                    let label = self.pretty_print_type(&operand_type, &HashMap::default());
                     errors.push((
                         span,
                         format!(
@@ -2703,7 +2709,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             if !matches!(operand_type, Type::Tuple(_)) {
-                let label = self.pretty_print_type(&operand_type, &HashMap::new());
+                let label = self.pretty_print_type(&operand_type, &HashMap::default());
                 errors.push((span, Self::not_a_tuple_message(&label)));
             }
         }
@@ -2794,7 +2800,7 @@ impl<'src> Analyzer<'src> {
                     else {
                         continue;
                     };
-                    let type_label = self.pretty_print_type(&value_type, &HashMap::new());
+                    let type_label = self.pretty_print_type(&value_type, &HashMap::default());
                     // A generic argument fails by MISSING the bound on its own
                     // declaration — name that fix; a concrete one by missing
                     // the impl.
@@ -2850,7 +2856,7 @@ impl<'src> Analyzer<'src> {
                     continue;
                 }
                 let generic_label =
-                    self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::new());
+                    self.pretty_print_type(&Type::Generic(constraint_id), &HashMap::default());
                 let bound_labels: Vec<String> = bound_traits
                     .iter()
                     .filter_map(|(trait_id, arguments)| {
@@ -2930,14 +2936,14 @@ impl<'src> Analyzer<'src> {
             let enum_name = enum_.name;
             let declared_constraints = enum_.generic_parameter_constraint_ids.clone();
             let payload_type_ids = variant.data_type_ids.clone();
-            let mut bindings: SubstitutionContext = SubstitutionContext::new();
+            let mut bindings: SubstitutionContext = SubstitutionContext::default();
             for (payload_type_id, argument_id) in payload_type_ids.iter().zip(&argument_ids) {
                 let payload_type = payload_type_id.get_type(self);
                 // `infer_type`, not `type_of_expr`: an identifier argument's
                 // own expr id carries no type entry — the type lives on the
                 // binding it references.
                 let argument_type =
-                    self.infer_type(*argument_id, &payload_type, &SubstitutionContext::new());
+                    self.infer_type(*argument_id, &payload_type, &SubstitutionContext::default());
                 if matches!(argument_type, Type::Unresolved | Type::Unknown) {
                     continue;
                 }
@@ -3024,7 +3030,7 @@ impl<'src> Analyzer<'src> {
                     else {
                         continue;
                     };
-                    let type_label = self.pretty_print_type(&argument_type, &HashMap::new());
+                    let type_label = self.pretty_print_type(&argument_type, &HashMap::default());
                     let msg = if matches!(argument_type, Type::Generic(_)) {
                         format!(
                             "generic parameter '{type_label}' is missing the bound \
@@ -3133,7 +3139,7 @@ impl<'src> Analyzer<'src> {
             .as_ref()
             .and_then(|(trait_id, arguments)| self.bound_trait_label(*trait_id, arguments));
         let bound_label = requirement.label(element_label.as_deref());
-        let value_label = self.pretty_print_type(value_type, &HashMap::new());
+        let value_label = self.pretty_print_type(value_type, &HashMap::default());
 
         if let Type::Generic(forwarded_constraint_id) = value_type {
             let Some(forwarded) = self.tuple_bounds.get(forwarded_constraint_id).cloned() else {
@@ -3237,7 +3243,7 @@ impl<'src> Analyzer<'src> {
                 ) {
                     continue;
                 }
-                let element_type_label = self.pretty_print_type(&element_type, &HashMap::new());
+                let element_type_label = self.pretty_print_type(&element_type, &HashMap::default());
                 let trait_label = self
                     .bound_trait_label(required_trait_id, &grounded_arguments)
                     .unwrap_or_else(|| "the element bound".to_string());
@@ -3262,7 +3268,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|argument| {
                 let argument = argument.get_type(self);
-                self.pretty_print_type(&argument, &HashMap::new())
+                self.pretty_print_type(&argument, &HashMap::default())
             })
             .collect();
         Some(format!("{name}<{}>", rendered.join(", ")))
@@ -3277,7 +3283,7 @@ impl<'src> Analyzer<'src> {
                 && self.compare_type(
                     subject_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
         })
     }
@@ -3582,7 +3588,7 @@ impl<'src> Analyzer<'src> {
         let checks = std::mem::take(&mut self.drop_impls_to_check);
         for (subject_type_id, span, drop_method_id) in checks {
             let subject_type = subject_type_id.get_type(self);
-            let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+            let rendered = self.pretty_print_type(&subject_type, &HashMap::default());
             // `Drop` is implementable only for a resource.
             if !self.type_is_resource(subject_type_id) {
                 self.diagnostics.push(Error {
@@ -3808,7 +3814,7 @@ impl<'src> Analyzer<'src> {
                         self.compare_type(
                             &subject_type,
                             &earlier_subject.get_type(self),
-                            &HashMap::new(),
+                            &HashMap::default(),
                         )
                     });
                 if let Some((_, earlier_id, _)) = earlier {
@@ -3820,7 +3826,7 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .map(|(member_name, first_id, second_id, subject)| {
                 let subject_label =
-                    self.pretty_print_type(&subject.get_type(self), &HashMap::new());
+                    self.pretty_print_type(&subject.get_type(self), &HashMap::default());
                 (member_name, first_id, second_id, subject_label)
             })
             .collect();
@@ -3851,7 +3857,10 @@ impl<'src> Analyzer<'src> {
             .map(|implementation| {
                 (
                     implementation.declared_members.clone(),
-                    self.pretty_print_type(&implementation.subject.get_type(self), &HashMap::new()),
+                    self.pretty_print_type(
+                        &implementation.subject.get_type(self),
+                        &HashMap::default(),
+                    ),
                 )
             })
             .chain(self.traits.values().map(|trait_| {
@@ -3961,7 +3970,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let subject_label =
-                self.pretty_print_type(&second.subject.get_type(self), &HashMap::new());
+                self.pretty_print_type(&second.subject.get_type(self), &HashMap::default());
             // C3, as B57: the first impl is the whole point of the message. The
             // note carries its own source, so it renders across files too.
             //
@@ -4498,12 +4507,12 @@ impl<'src> Analyzer<'src> {
             if !self.compare_type_rigid(
                 &expected_type,
                 &actual_type,
-                &HashMap::new(),
+                &HashMap::default(),
                 &impl_shape.generic_constraint_ids,
             ) {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
-                let expected_label = self.pretty_print_type(&expected_type, &HashMap::new());
-                let actual_label = self.pretty_print_type(&actual_type, &HashMap::new());
+                let expected_label = self.pretty_print_type(&expected_type, &HashMap::default());
+                let actual_label = self.pretty_print_type(&actual_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note,
                     span: anchor,
@@ -4559,12 +4568,12 @@ impl<'src> Analyzer<'src> {
         if !self.compare_type_rigid(
             &expected_return,
             &actual_return,
-            &HashMap::new(),
+            &HashMap::default(),
             &impl_shape.generic_constraint_ids,
         ) {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
-            let expected_label = self.pretty_print_type(&expected_return, &HashMap::new());
-            let actual_label = self.pretty_print_type(&actual_return, &HashMap::new());
+            let expected_label = self.pretty_print_type(&expected_return, &HashMap::default());
+            let actual_label = self.pretty_print_type(&actual_return, &HashMap::default());
             self.diagnostics.push(Error {
                 note,
                 span: impl_shape.name_span,
@@ -4740,9 +4749,9 @@ impl<'src> Analyzer<'src> {
         // owns the persistent memo; R11's per-instantiation variant
         // (`type_is_resource_with`) threads its OWN scratch memo — valid only for
         // its resource-constraint set — through the same recursive core.
-        let empty = HashSet::new();
+        let empty = HashSet::default();
         let mut memo = std::mem::take(&mut self.resource_classification);
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         let result = self
             .classify_resource(type_id, &empty, &mut memo, &mut visiting)
             .0;
@@ -4765,7 +4774,7 @@ impl<'src> Analyzer<'src> {
         resource_constraints: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> bool {
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         self.classify_resource(type_id, resource_constraints, memo, &mut visiting)
             .0
     }
@@ -4856,14 +4865,14 @@ impl<'src> Analyzer<'src> {
             // marks the whole (destruction.md §3, "element type").
             Type::Tuple(elements) => self.any_member_resource(
                 &elements,
-                &SubstitutionContext::new(),
+                &SubstitutionContext::default(),
                 resource_constraints,
                 memo,
                 visiting,
             ),
             Type::Array(element, _length) => self.any_member_resource(
                 &[element],
-                &SubstitutionContext::new(),
+                &SubstitutionContext::default(),
                 resource_constraints,
                 memo,
                 visiting,
@@ -4962,7 +4971,7 @@ impl<'src> Analyzer<'src> {
     /// fingerprint are computed once, while the type tables are live.
     fn compute_hmr_bindings(&mut self, global_scope_id: Id) -> HashMap<Id, HmrBinding> {
         // Scope id -> enclosing `mod`'s name, for scopes that are a module body.
-        let mut module_of_scope: HashMap<Id, &'src str> = HashMap::new();
+        let mut module_of_scope: HashMap<Id, &'src str> = HashMap::default();
         for module in self.modules.values() {
             module_of_scope.insert(module.body.1, module.name);
         }
@@ -5001,7 +5010,7 @@ impl<'src> Analyzer<'src> {
             path.reverse();
             entries.push((binding, path));
         }
-        let mut bindings = HashMap::new();
+        let mut bindings = HashMap::default();
         for (binding_id, module_path) in entries {
             let (type_id, name) = match self.variables.get(&binding_id) {
                 Some(variable) => (variable.type_id, variable.name.to_string()),
@@ -5020,7 +5029,7 @@ impl<'src> Analyzer<'src> {
             key.push_str("::");
             key.push_str(&name);
             let mut rendering = String::new();
-            let mut visiting = HashSet::new();
+            let mut visiting = HashSet::default();
             self.render_type_canonical(type_id, 0, &mut visiting, &mut rendering);
             let fingerprint = djb2_hash(&rendering);
             bindings.insert(
@@ -5073,8 +5082,8 @@ impl<'src> Analyzer<'src> {
     /// view, resource, bare `Shared`/`Signal`, external/opaque struct, or anything
     /// unresolved excludes the whole. Memoized and cycle-guarded.
     fn transferable_as_value(&mut self, type_id: TypeId) -> bool {
-        let mut memo: HashMap<TypeId, bool> = HashMap::new();
-        let mut visiting: HashSet<TypeId> = HashSet::new();
+        let mut memo: HashMap<TypeId, bool> = HashMap::default();
+        let mut visiting: HashSet<TypeId> = HashSet::default();
         self.classify_transferable(type_id, &mut memo, &mut visiting)
             .0
     }
@@ -5145,7 +5154,7 @@ impl<'src> Analyzer<'src> {
                 if name.is_some_and(|name| matches!(name, "List" | "Map" | "Set")) {
                     return self.all_members_transferable(
                         &arguments,
-                        &SubstitutionContext::new(),
+                        &SubstitutionContext::default(),
                         memo,
                         visiting,
                     );
@@ -5186,13 +5195,13 @@ impl<'src> Analyzer<'src> {
             }
             Type::Tuple(elements) => self.all_members_transferable(
                 &elements,
-                &SubstitutionContext::new(),
+                &SubstitutionContext::default(),
                 memo,
                 visiting,
             ),
             Type::Array(element, _length) => self.all_members_transferable(
                 &[element],
-                &SubstitutionContext::new(),
+                &SubstitutionContext::default(),
                 memo,
                 visiting,
             ),
@@ -5418,8 +5427,8 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let containers = self.resource_rejecting_containers();
-        let no_generic_resources = HashSet::new();
-        let mut memo = HashMap::new();
+        let no_generic_resources = HashSet::default();
+        let mut memo = HashMap::default();
         // Two dedup keys, because they answer two different questions. The
         // TypeId is INSTANTIATION identity — the analyzer interns per
         // application, not structurally (B95's doctrine), so two spellings of
@@ -5428,8 +5437,8 @@ impl<'src> Analyzer<'src> {
         // rendering is STRUCTURAL identity, and it is what the inferred tier
         // keys on: an inferred type has no spelling to point at, so it is one
         // fact reported once however many ids carry it.
-        let mut reported_instantiations: HashSet<TypeId> = HashSet::new();
-        let mut reported_structures: HashSet<String> = HashSet::new();
+        let mut reported_instantiations: HashSet<TypeId> = HashSet::default();
+        let mut reported_structures: HashSet<String> = HashSet::default();
         for (type_id, span) in applications {
             let Some(found) =
                 self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
@@ -5450,7 +5459,7 @@ impl<'src> Analyzer<'src> {
         // One descent per distinct site TYPE: the sites are many and the types
         // few (every read of one binding repeats its type), and only the first
         // site of a type could ever be the earliest.
-        let mut examined: HashSet<TypeId> = HashSet::new();
+        let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, span) in sites {
             if !examined.insert(type_id) {
                 continue;
@@ -5543,7 +5552,7 @@ impl<'src> Analyzer<'src> {
     /// same type.
     fn container_structure_key(&self, type_id: TypeId) -> String {
         let mut buf = String::new();
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         self.render_type_canonical(type_id, 0, &mut visiting, &mut buf);
         buf
     }
@@ -5608,7 +5617,7 @@ impl<'src> Analyzer<'src> {
         at_instantiation: Option<(&'src str, Span, Id)>,
     ) {
         let container_name = found.container_name;
-        let rendered = self.pretty_print_type(&found.argument.get_type(self), &HashMap::new());
+        let rendered = self.pretty_print_type(&found.argument.get_type(self), &HashMap::default());
         // The head the type is rooted at, so the path reads as the user sees it.
         let reached = (!found.field_path.is_empty())
             .then(|| {
@@ -5672,7 +5681,7 @@ impl<'src> Analyzer<'src> {
         memo: &mut HashMap<TypeId, bool>,
     ) -> Option<ContainerResource<'src>> {
         let mut path = Vec::new();
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         self.container_resource_in(
             type_id,
             containers,
@@ -5960,14 +5969,14 @@ impl<'src> Analyzer<'src> {
                 sites.push(*value_id);
             }
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         sites.retain(|site| seen.insert(*site));
         for site in sites {
             let Some(type_id) = self.resolved_type_id_of(site) else {
                 continue;
             };
             if self.type_is_resource(type_id) {
-                let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::new());
+                let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
                 let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
                 self.diagnostics.push(Error {
                     note: None,
@@ -5999,7 +6008,7 @@ impl<'src> Analyzer<'src> {
         // value argument (whose type IS `T`); a `take` site carries the call
         // (whose resolved type is `Option<T>`).
         let mut stash_value_ids: Vec<Id> = Vec::new();
-        let mut take_call_ids: HashSet<Id> = HashSet::new();
+        let mut take_call_ids: HashSet<Id> = HashSet::default();
         for expr in self.expr_id_to_expr_map.values() {
             let Expr::Call(call_id) = expr else {
                 continue;
@@ -6024,7 +6033,8 @@ impl<'src> Analyzer<'src> {
         // the generic argument isn't recorded on the call when it was inferred,
         // and a bare closure/call argument carries no stored result type.
         for value_id in stash_value_ids {
-            let inferred = self.infer_type(value_id, &Type::Unknown, &SubstitutionContext::new());
+            let inferred =
+                self.infer_type(value_id, &Type::Unknown, &SubstitutionContext::default());
             if matches!(inferred, Type::Unresolved | Type::Unknown) {
                 continue;
             }
@@ -6080,7 +6090,7 @@ impl<'src> Analyzer<'src> {
     /// (per-instantiation checking is the recorded refinement, hmr.md §11 S2).
     fn report_hmr_transfer(&mut self, site: Id, type_id: TypeId) {
         let resolved = type_id.get_type(self);
-        let rendered = self.pretty_print_type(&resolved, &HashMap::new());
+        let rendered = self.pretty_print_type(&resolved, &HashMap::default());
         let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
         let msg = if matches!(resolved, Type::Generic(_)) {
             format!(
@@ -6154,7 +6164,7 @@ impl<'src> Analyzer<'src> {
     /// per-instantiation classification. `&mut` because `type_is_resource`
     /// memoizes; the scan then runs against the returned (owned) set as `&self`.
     fn collect_resource_bindings(&mut self) -> HashSet<Id> {
-        let mut bindings = HashSet::new();
+        let mut bindings = HashSet::default();
         let variables: Vec<(Id, TypeId)> =
             self.variables.values().map(|v| (v.id, v.type_id)).collect();
         for (id, type_id) in variables {
@@ -6180,7 +6190,7 @@ impl<'src> Analyzer<'src> {
     /// partial move) and — stored on the analyzer — `compute_clone_sites`, which
     /// must never mark a resource place a clone (R1: resources move, not copy).
     fn collect_resource_value_places(&mut self) -> HashSet<Id> {
-        let mut places = HashSet::new();
+        let mut places = HashSet::default();
         let place_ids: Vec<Id> = self
             .expr_id_to_expr_map
             .iter()
@@ -6220,7 +6230,7 @@ impl<'src> Analyzer<'src> {
     /// Consuming such a capture is the capture-position twin of
     /// `binding_is_loaned_parameter`, and is rejected in `scan_move_touch`.
     fn collect_loaned_pattern_captures(&self) -> HashMap<Id, Id> {
-        let mut loaned: HashMap<Id, Id> = HashMap::new();
+        let mut loaned: HashMap<Id, Id> = HashMap::default();
         let mut record = |pattern: &ExprPattern, subject: Id| {
             let mut captures = Vec::new();
             Self::collect_pattern_captures(pattern, &mut captures);
@@ -6267,7 +6277,7 @@ impl<'src> Analyzer<'src> {
                 _ => None,
             })
             .collect();
-        let mut refinements = HashMap::new();
+        let mut refinements = HashMap::default();
         for (test_id, subject_id, pattern) in tests {
             let ExprPattern::Variant(pattern_enum_id, variant_index, _) = pattern else {
                 continue;
@@ -6349,7 +6359,7 @@ impl<'src> Analyzer<'src> {
             if payload.is_empty() {
                 continue;
             }
-            let mut visiting = HashSet::new();
+            let mut visiting = HashSet::default();
             let (found, complete) = self.any_member_resource(
                 payload,
                 context,
@@ -6414,7 +6424,8 @@ impl<'src> Analyzer<'src> {
         let loaned_captures = self.collect_loaned_pattern_captures();
         // The concrete scan knows no generic resources, so the empty constraint
         // set makes `type_is_resource_with` agree with `type_is_resource`.
-        let is_refinements = self.collect_is_refinements(&HashSet::new(), &mut HashMap::new());
+        let is_refinements =
+            self.collect_is_refinements(&HashSet::default(), &mut HashMap::default());
         let scan = MoveScan {
             resource_bindings: &resource_bindings,
             resource_value_places: &resource_value_places,
@@ -6467,10 +6478,10 @@ impl<'src> Analyzer<'src> {
         {
             return;
         }
-        let mut dropped: HashSet<Id> = HashSet::new();
-        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
+        let mut dropped: HashSet<Id> = HashSet::default();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
         // Per scan-root, the resource types it drops (for the §8 coloring edges).
-        let mut owned_by_root: HashMap<Id, HashSet<TypeId>> = HashMap::new();
+        let mut owned_by_root: HashMap<Id, HashSet<TypeId>> = HashMap::default();
         // Function bodies: the tail is the return value, so it is consuming — a
         // resource returned out of the body is moved, not dropped. An `own`
         // resource parameter of CONCRETE type is owned at entry, so one that is
@@ -6506,8 +6517,8 @@ impl<'src> Analyzer<'src> {
             .collect();
         for (root, statements, tail, own_params) in &bodies {
             let mut owned: HashSet<Id> = own_params.iter().copied().collect();
-            let mut root_dropped: HashSet<Id> = HashSet::new();
-            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::new();
+            let mut root_dropped: HashSet<Id> = HashSet::default();
+            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::default();
             self.plan_scope(
                 &[],
                 statements,
@@ -6538,9 +6549,9 @@ impl<'src> Analyzer<'src> {
             .map(|(id, closure)| (*id, closure.return_))
             .collect();
         for (root, return_id) in closures {
-            let mut owned: HashSet<Id> = HashSet::new();
-            let mut root_dropped: HashSet<Id> = HashSet::new();
-            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::new();
+            let mut owned: HashSet<Id> = HashSet::default();
+            let mut root_dropped: HashSet<Id> = HashSet::default();
+            let mut root_overwrites: HashMap<Id, TypeId> = HashMap::default();
             self.plan_expr(
                 return_id,
                 true,
@@ -6630,7 +6641,7 @@ impl<'src> Analyzer<'src> {
             })
             .filter(|(_, target_id)| self.is_place_expr(*target_id))
             .collect();
-        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
         for (assignment_id, target_id) in targets {
             let Some(type_id) = self.place_value_type_id(target_id) else {
                 continue;
@@ -6674,7 +6685,7 @@ impl<'src> Analyzer<'src> {
         overwrites: &HashMap<Id, TypeId>,
         out: &mut HashMap<Id, HashSet<TypeId>>,
     ) {
-        let mut types: HashSet<TypeId> = HashSet::new();
+        let mut types: HashSet<TypeId> = HashSet::default();
         for binding in dropped {
             if let Some(type_id) = self.dropped_binding_type_id(*binding) {
                 types.insert(type_id);
@@ -7261,7 +7272,7 @@ impl<'src> Analyzer<'src> {
             .collect();
         for argument_id in sink_arguments {
             let inferred =
-                self.infer_type(argument_id, &Type::Unknown, &SubstitutionContext::new());
+                self.infer_type(argument_id, &Type::Unknown, &SubstitutionContext::default());
             // An unresolved argument stays unrecorded: the transformer's
             // never-silent guard reports it rather than emitting a quiet leak.
             if matches!(inferred, Type::Unresolved | Type::Unknown) {
@@ -7280,7 +7291,7 @@ impl<'src> Analyzer<'src> {
     /// argument types are harmless here — `build_drop_glue` only builds an edge for
     /// a type that has drop glue. Empty when `std::drop` is not loaded.
     fn drop_sink_types_by_root(&self) -> HashMap<Id, HashSet<TypeId>> {
-        let mut by_root: HashMap<Id, HashSet<TypeId>> = HashMap::new();
+        let mut by_root: HashMap<Id, HashSet<TypeId>> = HashMap::default();
         if self.drop_fn_id.is_none() {
             return by_root;
         }
@@ -7305,7 +7316,7 @@ impl<'src> Analyzer<'src> {
         for (closure_id, return_id) in closures {
             let mut calls = Vec::new();
             let mut nested = Vec::new();
-            let mut visited = HashSet::new();
+            let mut visited = HashSet::default();
             self.r11_collect_calls(return_id, &mut visited, &mut calls, &mut nested);
             let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
@@ -7403,8 +7414,8 @@ impl<'src> Analyzer<'src> {
         for type_id in self.drop_sink_argument_types() {
             worklist.push(type_id);
         }
-        let mut glue: HashMap<TypeId, DropGlue> = HashMap::new();
-        let mut seen: HashSet<TypeId> = HashSet::new();
+        let mut glue: HashMap<TypeId, DropGlue> = HashMap::default();
+        let mut seen: HashSet<TypeId> = HashSet::default();
         while let Some(type_id) = worklist.pop() {
             if !seen.insert(type_id) {
                 continue;
@@ -7433,10 +7444,10 @@ impl<'src> Analyzer<'src> {
         // `@process`-needing drop colors the owning scope. `CallGraph::successors`
         // appends these. Empty on a resource-free program.
         let owned_by_root = std::mem::take(&mut self.drop_owned_types_by_root);
-        let mut edges: HashMap<Id, Vec<Id>> = HashMap::new();
+        let mut edges: HashMap<Id, Vec<Id>> = HashMap::default();
         for (root, types) in owned_by_root {
             let mut methods: Vec<Id> = Vec::new();
-            let mut seen: HashSet<TypeId> = HashSet::new();
+            let mut seen: HashSet<TypeId> = HashSet::default();
             let mut worklist: Vec<TypeId> = types.into_iter().collect();
             while let Some(type_id) = worklist.pop() {
                 if !seen.insert(type_id) {
@@ -8259,7 +8270,7 @@ impl<'src> Analyzer<'src> {
             .enumerate()
             .filter(|(_, arm)| !arm.diverges)
             .collect();
-        let mut candidates: HashSet<Id> = HashSet::new();
+        let mut candidates: HashSet<Id> = HashSet::default();
         for (_, arm) in &live {
             for binding in arm.post.keys() {
                 if outer_bindings.contains(binding) {
@@ -8366,7 +8377,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        let mut merged = HashMap::new();
+        let mut merged = HashMap::default();
         for binding in keys {
             let mut any_moved = false;
             let mut any_absent = false;
@@ -8546,7 +8557,7 @@ impl<'src> Analyzer<'src> {
         let Some(closure) = self.closures.get(&closure_id) else {
             return;
         };
-        let mut declared_inside: HashSet<Id> = HashSet::new();
+        let mut declared_inside: HashSet<Id> = HashSet::default();
         for parameter in closure
             .parameters
             .iter()
@@ -8555,7 +8566,7 @@ impl<'src> Analyzer<'src> {
             declared_inside.insert(*parameter);
         }
         let mut captured: Vec<Id> = Vec::new();
-        let mut visited: HashSet<Id> = HashSet::new();
+        let mut visited: HashSet<Id> = HashSet::default();
         self.scan_capture_body(
             closure.return_,
             resource_bindings,
@@ -8585,7 +8596,7 @@ impl<'src> Analyzer<'src> {
     /// wants the captured resource references and computes this set on the way,
     /// where this wants only the set. One walk, so the two answers cannot drift.
     fn closure_declared_bindings(&self, closure_id: Id) -> HashSet<Id> {
-        let mut declared_inside: HashSet<Id> = HashSet::new();
+        let mut declared_inside: HashSet<Id> = HashSet::default();
         let Some(closure) = self.closures.get(&closure_id) else {
             return declared_inside;
         };
@@ -8598,10 +8609,10 @@ impl<'src> Analyzer<'src> {
         }
         self.scan_capture_body(
             closure.return_,
-            &HashSet::new(),
+            &HashSet::default(),
             &mut declared_inside,
             &mut Vec::new(),
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         );
         declared_inside
     }
@@ -9057,7 +9068,7 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let mut worklist: VecDeque<R11Instance> = VecDeque::new();
-        let mut enqueued: HashSet<(Id, Vec<TypeId>)> = HashSet::new();
+        let mut enqueued: HashSet<(Id, Vec<TypeId>)> = HashSet::default();
         // B65 rides R11 unchanged, like every other rule: a capture's loan-ness
         // is whole-program, so the same set serves every instantiation.
         let loaned_captures = self.collect_loaned_pattern_captures();
@@ -9067,8 +9078,8 @@ impl<'src> Analyzer<'src> {
         // inside a generic whose parameter is bound to that generic's own `T`
         // seeds nothing until the generic is itself known to be instantiated at a
         // resource, which propagation below discovers.)
-        let empty: HashSet<TypeId> = HashSet::new();
-        let mut seed_memo: HashMap<TypeId, bool> = HashMap::new();
+        let empty: HashSet<TypeId> = HashSet::default();
+        let mut seed_memo: HashMap<TypeId, bool> = HashMap::default();
         let all_calls: Vec<Id> = self.function_calls.keys().copied().collect();
         for call_id in all_calls {
             self.r11_discover(
@@ -9088,7 +9099,7 @@ impl<'src> Analyzer<'src> {
             // resource written into the generic body — is chunk 3's, already
             // checked with its own in-body span; re-checking it here would
             // double-report at the instantiation site.
-            let mut memo: HashMap<TypeId, bool> = HashMap::new();
+            let mut memo: HashMap<TypeId, bool> = HashMap::default();
             let resource_bindings = self.collect_instantiation_bindings(&resources, &mut memo);
             let resource_value_places =
                 self.collect_instantiation_value_places(&resources, &mut memo);
@@ -9101,7 +9112,7 @@ impl<'src> Analyzer<'src> {
                 // A generic body's bindings are all in-body (parameters / locals);
                 // module-level resources never enter its delta set, so the loan-only
                 // corollary is inert here.
-                let no_module_level: HashSet<Id> = HashSet::new();
+                let no_module_level: HashSet<Id> = HashSet::default();
                 let scan = MoveScan {
                     resource_bindings: &resource_bindings,
                     resource_value_places: &resource_value_places,
@@ -9125,7 +9136,7 @@ impl<'src> Analyzer<'src> {
             // Propagate: the callee's own calls, now under ITS resource
             // parameters — a call passing `T` on to another generic instantiates
             // that generic at a resource too (the indirect case).
-            let mut propagate_memo: HashMap<TypeId, bool> = HashMap::new();
+            let mut propagate_memo: HashMap<TypeId, bool> = HashMap::default();
             for call_id in calls {
                 self.r11_discover(
                     call_id,
@@ -9201,8 +9212,8 @@ impl<'src> Analyzer<'src> {
         // happens to take no `own T`. `fun clear<T>(slot: &mut Option<T>) { slot
         // = None }` owes R2's drop and declares no `own` parameter at all.
         let mut owned: HashSet<Id> = own_params.iter().copied().collect();
-        let mut dropped: HashSet<Id> = HashSet::new();
-        let mut overwrites: HashMap<Id, TypeId> = HashMap::new();
+        let mut dropped: HashSet<Id> = HashSet::default();
+        let mut overwrites: HashMap<Id, TypeId> = HashMap::default();
         // A loan owns nothing (B94), here as much as in the whole-program plan:
         // a `&mut T` binding in the body is not a value this instantiation would
         // have to destroy — so it is not an owner, and B101's point is that it is
@@ -9412,9 +9423,9 @@ impl<'src> Analyzer<'src> {
             .get(&instance.callee)
             .map(|function| function.name)
             .unwrap_or("this generic");
-        let no_generic_resources = HashSet::new();
-        let mut memo = HashMap::new();
-        let mut examined: HashSet<TypeId> = HashSet::new();
+        let no_generic_resources = HashSet::default();
+        let mut memo = HashMap::default();
+        let mut examined: HashSet<TypeId> = HashSet::default();
         for (_, type_id, body_span) in sites {
             if !examined.insert(type_id) {
                 continue;
@@ -9531,7 +9542,7 @@ impl<'src> Analyzer<'src> {
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
-        let mut bindings = HashSet::new();
+        let mut bindings = HashSet::default();
         let entries: Vec<(Id, TypeId)> = self
             .variables
             .values()
@@ -9562,7 +9573,7 @@ impl<'src> Analyzer<'src> {
         resources: &HashSet<TypeId>,
         memo: &mut HashMap<TypeId, bool>,
     ) -> HashSet<Id> {
-        let mut places = HashSet::new();
+        let mut places = HashSet::default();
         let place_ids: Vec<Id> = self
             .expr_id_to_expr_map
             .iter()
@@ -9764,12 +9775,12 @@ impl<'src> Analyzer<'src> {
     /// which B103's per-instantiation R10 needs to ask its question of.
     fn r11_body_calls_and_closures(&self, function_id: Id) -> (Vec<Id>, Vec<Id>, HashSet<Id>) {
         let Some(function) = self.functions.get(&function_id) else {
-            return (Vec::new(), Vec::new(), HashSet::new());
+            return (Vec::new(), Vec::new(), HashSet::default());
         };
         let (statements, tail, _) = &function.body;
         let mut calls = Vec::new();
         let mut closures = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         for statement in statements {
             self.r11_collect_calls(*statement, &mut visited, &mut calls, &mut closures);
         }
@@ -10315,7 +10326,7 @@ impl<'src> Analyzer<'src> {
                 self.compare_type(
                     subject_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
             })
             .filter_map(|implementation| {
@@ -10415,7 +10426,7 @@ impl<'src> Analyzer<'src> {
                 self.compare_type(
                     subject_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
             })
             .find_map(|implementation| {
@@ -10426,7 +10437,7 @@ impl<'src> Analyzer<'src> {
                     .map(|(_, arguments)| arguments.clone())
             })
             .unwrap_or_default();
-        self.pretty_print_type(&Type::Trait(trait_id, arguments), &HashMap::new())
+        self.pretty_print_type(&Type::Trait(trait_id, arguments), &HashMap::default())
     }
 
     /// The receiver expression as the user wrote it, so a steer can quote it
@@ -10490,7 +10501,7 @@ impl<'src> Analyzer<'src> {
                 self.compare_type(
                     subject_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
             })
             .flat_map(|implementation| implementation.trait_ids.iter())
@@ -10525,7 +10536,7 @@ impl<'src> Analyzer<'src> {
                  looks up methods)"
             )),
             field_type => {
-                let field_label = self.pretty_print_type(&field_type, &HashMap::new());
+                let field_label = self.pretty_print_type(&field_type, &HashMap::default());
                 Some(format!(
                     "; `{member_name}` is a field of type `{field_label}`, which is not \
                      callable: did you mean the plain access `x.{member_name}`?"
@@ -10543,7 +10554,7 @@ impl<'src> Analyzer<'src> {
     /// backing before they reach here (§3.6).
     /// Renders one type id for a declaration label (empty substitution).
     fn declaration_type_label(&self, type_id: TypeId) -> String {
-        self.pretty_print_type(&type_id.get_type(self), &HashMap::new())
+        self.pretty_print_type(&type_id.get_type(self), &HashMap::default())
     }
 
     /// The generic-parameter list of a declaration (`<T: Greeter, U>`), empty
@@ -10841,7 +10852,7 @@ impl<'src> Analyzer<'src> {
                 self.compare_type(
                     subject_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
             })
             .filter(|implementation| {
@@ -10942,7 +10953,7 @@ impl<'src> Analyzer<'src> {
     ) -> SubstitutionContext {
         let impl_subject = impl_subject_id.get_type(self);
         let mut bindings: SubstitutionContext = self
-            .reconcile_type(&impl_subject, subject_type, &HashMap::new())
+            .reconcile_type(&impl_subject, subject_type, &HashMap::default())
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
         let trait_parameter_ids = self
@@ -10972,7 +10983,7 @@ impl<'src> Analyzer<'src> {
             self.compare_type(
                 subject_type,
                 implementation.subject.borrow_type(self),
-                &HashMap::new(),
+                &HashMap::default(),
             )
         }) {
             for trait_id in &implementation.trait_ids {
@@ -11802,7 +11813,7 @@ impl<'src> Analyzer<'src> {
     /// initialization-order check could reject the program.
     fn view_binding_mutability(&self, binding_id: Id) -> Option<bool> {
         let mut current = binding_id;
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         loop {
             if !seen.insert(current) {
                 // A copy cycle never reaches a view; the bindings are broken
@@ -12404,7 +12415,7 @@ impl<'src> Analyzer<'src> {
         };
         let statements = function.body.0.clone();
         let tail = function.body.1;
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         for statement in &statements {
             self.scan_bumps(*statement, function_id, positions, &mut visited);
         }
@@ -12832,7 +12843,7 @@ impl<'src> Analyzer<'src> {
     /// the returned view is sound. A view of a local would dangle, so it isn't.
     fn derives_from_view_param(&self, expr_id: Id) -> bool {
         let mut found = false;
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         self.scan_view_param_ref(expr_id, &mut found, &mut visited);
         found
     }
@@ -12845,7 +12856,7 @@ impl<'src> Analyzer<'src> {
             return false;
         };
         let mut captured = false;
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         self.scan_view_param_ref(closure.return_, &mut captured, &mut visited);
         captured
     }
@@ -13001,7 +13012,7 @@ impl<'src> Analyzer<'src> {
     /// → `{arena}`, via the subject's tail leaves so conditional transients
     /// union their branches).
     fn compute_view_origins(&self) -> HashMap<Id, Vec<Id>> {
-        let mut origins: HashMap<Id, Vec<Id>> = HashMap::new();
+        let mut origins: HashMap<Id, Vec<Id>> = HashMap::default();
         // `for e in &mut c` bindings have no initial — their origin is the
         // iterated container's root.
         for expr in self.expr_id_to_expr_map.values() {
@@ -13166,8 +13177,8 @@ impl<'src> Analyzer<'src> {
     /// scalar-ness (and so whether they are boxed) can only be decided at
     /// monomorphization, by the transformer, against the concrete type.
     fn compute_boxed_locals(&self) -> (HashSet<Id>, HashSet<Id>) {
-        let mut boxed = HashSet::new();
-        let mut generic_referenced_roots = HashSet::new();
+        let mut boxed = HashSet::default();
+        let mut generic_referenced_roots = HashSet::default();
         for expr in self.expr_id_to_expr_map.values() {
             if let Expr::Reference(operand, _) = expr {
                 if let Some(root) = self.place_root(*operand) {
@@ -13369,7 +13380,7 @@ impl<'src> Analyzer<'src> {
     /// must not reject these: the payload is unwrapped in the same expression,
     /// never stored.
     fn transient_wrapped_view_calls(&self) -> HashSet<Id> {
-        let mut calls = HashSet::new();
+        let mut calls = HashSet::default();
         for expr in self.expr_id_to_expr_map.values() {
             let Expr::Match(subject_id, _) = expr else {
                 continue;
@@ -13454,7 +13465,7 @@ impl<'src> Analyzer<'src> {
     /// aggregate's reference), so it is a view binding. Maps each such capture to
     /// the view's `(mutable, scalar)`.
     fn compute_wrapped_view_captures(&self) -> HashMap<Id, (bool, bool)> {
-        let mut captures = HashMap::new();
+        let mut captures = HashMap::default();
         for expr in self.expr_id_to_expr_map.values() {
             let Expr::Match(subject_id, legs) = expr else {
                 continue;
@@ -13523,7 +13534,7 @@ impl<'src> Analyzer<'src> {
     /// field), copied between locals (`let w = v`), or a scalar `&`/`&mut`
     /// parameter (which receives such a pair from its caller).
     fn compute_primitive_views(&self) -> HashSet<Id> {
-        let mut views: HashSet<Id> = HashSet::new();
+        let mut views: HashSet<Id> = HashSet::default();
         // A `Some(let v)` capture over a wrapped-*scalar*-view call binds the
         // `(base, key)` pair directly, so `*v` derefs through it. (An aggregate
         // wrapped-view capture is the reference itself, accessed via `.field` —
@@ -13621,7 +13632,7 @@ impl<'src> Analyzer<'src> {
             .collect();
         let mut violations: Vec<InvalidationViolation<'src>> = Vec::new();
         for (function_id, statements, tail) in &bodies {
-            let mut live = HashSet::new();
+            let mut live = HashSet::default();
             let mut saw_await = false;
             self.scan_invalidation_block(
                 statements,
@@ -13656,7 +13667,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         for return_id in closure_returns {
-            let mut live = HashSet::new();
+            let mut live = HashSet::default();
             let mut saw_await = false;
             self.scan_invalidation_block(
                 &[],
@@ -13747,9 +13758,9 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let mut saw_await = false;
-            let mut declared_inside: HashSet<Id> = HashSet::new();
+            let mut declared_inside: HashSet<Id> = HashSet::default();
             let mut captured: Vec<Id> = Vec::new();
-            let mut visited: HashSet<Id> = HashSet::new();
+            let mut visited: HashSet<Id> = HashSet::default();
             self.scan_closure_view_captures(
                 closure.return_,
                 view_bindings,
@@ -15099,7 +15110,7 @@ impl<'src> Analyzer<'src> {
         // identity on scalars) so that a generic store — `push`'s `own item: T`,
         // which is what `map`/`filter`/`reverse` build their results through —
         // is honest at every instantiation; a resource one MOVES (R1).
-        let mut sites = HashMap::new();
+        let mut sites = HashMap::default();
         for (value_id, type_id) in candidates {
             let value_type = type_id.get_type(self);
             if !(self.is_cloneable_aggregate(&value_type) || matches!(value_type, Type::Generic(_)))
@@ -15217,7 +15228,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        let mut sites = HashMap::new();
+        let mut sites = HashMap::default();
         for (value_id, type_id) in candidates {
             let value_type = type_id.get_type(self);
             if !(self.is_cloneable_aggregate(&value_type) || matches!(value_type, Type::Generic(_)))
@@ -15261,7 +15272,7 @@ impl<'src> Analyzer<'src> {
         // the elision below: the alias would ride the seam out (the
         // `unwrap` leak).
         let mut candidates: Vec<(Id, Id)> = Vec::new();
-        let mut seam_roots: HashSet<Id> = HashSet::new();
+        let mut seam_roots: HashSet<Id> = HashSet::default();
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::Destructure(value_id, pattern) => {
@@ -15324,8 +15335,8 @@ impl<'src> Analyzer<'src> {
         // phase 3 needs it.
         let written_roots = self.collect_written_roots();
         let mut classified: Vec<(Id, Id, CopyDecision)> = Vec::new();
-        let mut shared: HashSet<Id> = HashSet::new();
-        let mut materialized: HashSet<Id> = HashSet::new();
+        let mut shared: HashSet<Id> = HashSet::default();
+        let mut materialized: HashSet<Id> = HashSet::default();
         for (capture_id, subject_id) in candidates {
             let Some((type_id, capture_is_mutable)) = self
                 .variables
@@ -15403,7 +15414,7 @@ impl<'src> Analyzer<'src> {
         // phase 2's set in hand — a SHARED capture, which owns nothing to
         // donate.
         let repeatable = self.collect_repeatable_interiors();
-        let mut sites = HashMap::new();
+        let mut sites = HashMap::default();
         for (capture_id, subject_id, copy) in classified {
             if !self.is_elidable_copy(subject_id, &repeatable, &shared) {
                 sites.insert(capture_id, copy);
@@ -15432,8 +15443,8 @@ impl<'src> Analyzer<'src> {
         constraints
             .into_iter()
             .filter(|constraint_id| {
-                let resources = HashSet::from([*constraint_id]);
-                let mut memo = HashMap::new();
+                let resources = HashSet::from_iter([*constraint_id]);
+                let mut memo = HashMap::default();
                 self.type_is_resource_with(type_id, &resources, &mut memo)
             })
             .collect()
@@ -15513,7 +15524,7 @@ impl<'src> Analyzer<'src> {
     /// through. A resource never clones (R1): a `mut` resource parameter
     /// is rejected, steering to `own` (transfer).
     fn compute_parameter_entry_clones(&mut self) -> HashSet<Id> {
-        let mut sites = HashSet::new();
+        let mut sites = HashSet::default();
         let mut resource_rejections: Vec<(Id, &'src str)> = Vec::new();
         let mutable_parameters: Vec<(Id, &'src str, TypeId)> = self
             .parameters
@@ -15584,8 +15595,8 @@ impl<'src> Analyzer<'src> {
     /// module, and closure body is walked; closures are also roots (at depth 1)
     /// so a copy inside any closure is treated as repeatable.
     fn collect_repeatable_interiors(&self) -> HashSet<Id> {
-        let mut interior = HashSet::new();
-        let mut visited = HashSet::new();
+        let mut interior = HashSet::default();
+        let mut visited = HashSet::default();
         for function in self.functions.values() {
             if function.has_body {
                 for statement in &function.body.0 {
@@ -18794,8 +18805,10 @@ impl<'src> Analyzer<'src> {
                             lookup_scope_id,
                         ) =>
                     {
-                        let parameter = self
-                            .pretty_print_type(&expected_type_id.get_type(self), &HashMap::new());
+                        let parameter = self.pretty_print_type(
+                            &expected_type_id.get_type(self),
+                            &HashMap::default(),
+                        );
                         self.diagnostics.push(Error {
                             note: None,
                             span,
@@ -18820,7 +18833,7 @@ impl<'src> Analyzer<'src> {
                         return None;
                     }
                     other => {
-                        let subject_str = self.pretty_print_type(&other, &HashMap::new());
+                        let subject_str = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
                             note: None,
                             span,
@@ -18931,7 +18944,7 @@ impl<'src> Analyzer<'src> {
                     }
                     Type::Unknown | Type::Unresolved | Type::Any => Type::Unknown.get_type_id(self),
                     other => {
-                        let rendered = self.pretty_print_type(&other, &HashMap::new());
+                        let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
                             note: None,
                             span: *span,
@@ -18956,13 +18969,13 @@ impl<'src> Analyzer<'src> {
             WalkPattern::Literal(literal_id) => {
                 // The literal's type must be compatible with the matched value's.
                 let literal_id = *literal_id;
-                let literal_type = self.infer_type(literal_id, &Type::Unknown, &HashMap::new());
+                let literal_type = self.infer_type(literal_id, &Type::Unknown, &HashMap::default());
                 let subject_type = expected_type_id.get_type(self);
                 if !matches!(subject_type, Type::Unknown | Type::Any | Type::Unresolved)
-                    && !self.compare_type(&subject_type, &literal_type, &HashMap::new())
+                    && !self.compare_type(&subject_type, &literal_type, &HashMap::default())
                 {
-                    let expected = self.pretty_print_type(&subject_type, &HashMap::new());
-                    let got = self.pretty_print_type(&literal_type, &HashMap::new());
+                    let expected = self.pretty_print_type(&subject_type, &HashMap::default());
+                    let got = self.pretty_print_type(&literal_type, &HashMap::default());
                     self.diagnostics.push(Error {
                         note: None,
                         span: **self.span_map.get(&literal_id).unwrap_or(&&EMPTY_SPAN),
@@ -19354,7 +19367,7 @@ impl<'src> Analyzer<'src> {
         iterable_type: &Type,
         next_method: &str,
     ) {
-        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
         self.report_for_each_error(
             for_each_id,
             iterable_id,
@@ -19381,7 +19394,7 @@ impl<'src> Analyzer<'src> {
         iterable_type: &Type,
         next_method: &str,
     ) {
-        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
         let kind = match iterable_type {
             Type::Enum(_, _) => "an enum",
             _ => "a struct",
@@ -19419,8 +19432,8 @@ impl<'src> Analyzer<'src> {
         next_id: Id,
         return_type: &Type,
     ) {
-        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
-        let returned = self.pretty_print_type(return_type, &HashMap::new());
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
+        let returned = self.pretty_print_type(return_type, &HashMap::default());
         let annotated = matches!(
             self.expr_id_to_expr_map.get(&next_id),
             Some(Expr::Function(function_id))
@@ -19466,7 +19479,7 @@ impl<'src> Analyzer<'src> {
         trait_ids: &[Id],
         providers_tier: ForEachNextProviders,
     ) {
-        let rendered = self.pretty_print_type(iterable_type, &HashMap::new());
+        let rendered = self.pretty_print_type(iterable_type, &HashMap::default());
         let providers: Vec<String> = trait_ids
             .iter()
             .map(|trait_id| format!("'{}'", self.trait_label_for(iterable_type, *trait_id)))
@@ -19554,7 +19567,7 @@ impl<'src> Analyzer<'src> {
             // contradict; conformance makes the impl declare it, and that
             // declaration is what the loop resolves to.
             None if !has_body => return None,
-            None => self.infer_type(body_return_id, &Type::Unknown, &HashMap::new()),
+            None => self.infer_type(body_return_id, &Type::Unknown, &HashMap::default()),
         };
         match &return_type {
             Type::Enum(enum_id, _)
@@ -19984,7 +19997,7 @@ impl<'src> Analyzer<'src> {
                     .zip(expected_arguments.iter().copied())
                     .collect()
             }
-            _ => HashMap::new(),
+            _ => HashMap::default(),
         };
         for (data_type_id, argument_id) in data_type_ids.iter().zip(argument_ids.iter()) {
             let data_type = data_type_id.get_type(self);
@@ -20022,7 +20035,7 @@ impl<'src> Analyzer<'src> {
             expr_id,
             constraint,
             substitution_context,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         )
     }
 
@@ -20277,8 +20290,9 @@ impl<'src> Analyzer<'src> {
                             .is_none()
                             && self.reported_literal_errors.insert(*item_id)
                         {
-                            let expected = self.pretty_print_type(&element_type, &HashMap::new());
-                            let got = self.pretty_print_type(&item_type, &HashMap::new());
+                            let expected =
+                                self.pretty_print_type(&element_type, &HashMap::default());
+                            let got = self.pretty_print_type(&item_type, &HashMap::default());
                             self.diagnostics.push(Error { note: None,
                                 span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -20354,8 +20368,8 @@ impl<'src> Analyzer<'src> {
                             });
                             if !absorbed && self.reported_literal_errors.insert(*item_id) {
                                 let expected =
-                                    self.pretty_print_type(&element_type, &HashMap::new());
-                                let got = self.pretty_print_type(&item_type, &HashMap::new());
+                                    self.pretty_print_type(&element_type, &HashMap::default());
+                                let got = self.pretty_print_type(&item_type, &HashMap::default());
                                 self.diagnostics.push(Error { note: None,
                                     span: **self.span_map.get(item_id).unwrap_or(&&EMPTY_SPAN),
                                     msg: format!(
@@ -20749,7 +20763,7 @@ impl<'src> Analyzer<'src> {
                                     &return_type,
                                     self_trait,
                                     subject,
-                                    &SubstitutionContext::new(),
+                                    &SubstitutionContext::default(),
                                 );
                             }
                         }
@@ -21094,7 +21108,7 @@ impl<'src> Analyzer<'src> {
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             if let Some((_, bindings)) =
-                self.reconcile_type(concrete, &subject, &SubstitutionContext::new())
+                self.reconcile_type(concrete, &subject, &SubstitutionContext::default())
             {
                 let context: SubstitutionContext = bindings.into_iter().collect();
                 let resolved = arguments
@@ -21159,7 +21173,7 @@ impl<'src> Analyzer<'src> {
     /// other type, is returned unchanged.
     fn expand_mapped(&mut self, type_: Type) -> Type {
         if matches!(type_, Type::Mapped(..)) {
-            self.substitute_type(&type_, &SubstitutionContext::new())
+            self.substitute_type(&type_, &SubstitutionContext::default())
         } else {
             type_
         }
@@ -21202,7 +21216,7 @@ impl<'src> Analyzer<'src> {
             Some(declared) => declared,
             None => {
                 let body_return_id = self.functions.get(&function_id)?.body.1;
-                let inferred = self.infer_type(body_return_id, &Type::Unknown, &HashMap::new());
+                let inferred = self.infer_type(body_return_id, &Type::Unknown, &HashMap::default());
                 if matches!(inferred, Type::Unresolved) {
                     return None;
                 }
@@ -22449,7 +22463,7 @@ impl<'src> Analyzer<'src> {
     /// fix the docs already promise ("write the small wrapping closure. The
     /// compiler will tell you when you hit one").
     fn not_callable_message(&self, subject_type: &Type) -> String {
-        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         let base = format!("cannot call this as a function: it is {rendered}");
         let Type::Function(function_id) = subject_type else {
             return base;
@@ -22567,7 +22581,7 @@ impl<'src> Analyzer<'src> {
         // No receiver at all: the trait member takes `self`, so the ordinary
         // arity check reports it — and better than a bespoke message would.
         let receiver_id = *argument_ids.first()?;
-        let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::new());
+        let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::default());
         if matches!(receiver_type, Type::Unresolved) {
             return Some(Resolution::Deferred);
         }
@@ -22596,7 +22610,7 @@ impl<'src> Analyzer<'src> {
                 self.compare_type(
                     &receiver_type,
                     implementation.subject.borrow_type(self),
-                    &HashMap::new(),
+                    &HashMap::default(),
                 )
             })
             .filter(|implementation| {
@@ -22623,7 +22637,7 @@ impl<'src> Analyzer<'src> {
                 // method-call path does, so the body monomorphizes.
                 let impl_subject_type = impl_subject.get_type(self);
                 if let Some((_, bindings)) =
-                    self.reconcile_type(&impl_subject_type, &receiver_type, &HashMap::new())
+                    self.reconcile_type(&impl_subject_type, &receiver_type, &HashMap::default())
                     && !bindings.is_empty()
                 {
                     self.static_subject_bindings
@@ -22665,7 +22679,7 @@ impl<'src> Analyzer<'src> {
                 Some(Resolution::Resolved)
             }
             None => {
-                let type_label = self.pretty_print_type(&receiver_type, &HashMap::new());
+                let type_label = self.pretty_print_type(&receiver_type, &HashMap::default());
                 let trait_label = self.trait_label_for(&receiver_type, trait_id);
                 self.diagnostics.push(Error {
                     note: None,
@@ -22707,7 +22721,7 @@ impl<'src> Analyzer<'src> {
         {
             return resolution;
         }
-        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -22735,7 +22749,7 @@ impl<'src> Analyzer<'src> {
                 });
                 return Resolution::Failed;
             }
-            let substitution_context = HashMap::new();
+            let substitution_context = HashMap::default();
             for (index, parameter_type_id) in parameter_type_ids.clone().iter().enumerate() {
                 let parameter_type = parameter_type_id.get_type(self);
                 let argument_id = *argument_ids.get(index).unwrap();
@@ -22828,7 +22842,7 @@ impl<'src> Analyzer<'src> {
                         });
                         return Resolution::Failed;
                     }
-                    let substitution_context = HashMap::new();
+                    let substitution_context = HashMap::default();
                     for (index, data_type_id) in data_type_ids.iter().enumerate() {
                         let data_type = data_type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
@@ -22927,7 +22941,7 @@ impl<'src> Analyzer<'src> {
                         });
                         return Resolution::Failed;
                     }
-                    let mut substitution_context = HashMap::new();
+                    let mut substitution_context = HashMap::default();
                     // A qualified-generic subject (`Boxy<i32>::make(..)`) seeds
                     // THIS call's bindings with the args written in the path, so
                     // the impl's binders monomorphize per call site instead of
@@ -23122,7 +23136,7 @@ impl<'src> Analyzer<'src> {
                     };
                     let non_function_message = {
                         let subject_type =
-                            self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+                            self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                         self.not_callable_message(&subject_type)
                     };
                     self.diagnostics.push(Error { note: None,
@@ -23153,7 +23167,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Resolved
             }
             _ => {
-                let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+                let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                 let msg = self.not_callable_message(&subject_type);
                 self.diagnostics.push(Error {
                     note: None,
@@ -23170,7 +23184,7 @@ impl<'src> Analyzer<'src> {
     /// its element type. Defers while the iterable (or its element slot, which a
     /// later `push` may fill) is unresolved.
     fn resolve_for_each_item(&mut self, item_id: Id, iterable_id: Id) -> Resolution {
-        let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
+        let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
         let next_method = self.for_each_next_method(Some(item_id));
         let element_type = self.iterable_element_type(&iterable_type, next_method);
         if matches!(iterable_type, Type::Unresolved)
@@ -23215,7 +23229,7 @@ impl<'src> Analyzer<'src> {
             // default) — there is no concrete type to dispatch to.
             BareTraitValue(Id),
         }
-        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         // A method on a `List::new()` whose element slot is still unknown but has a
         // pending `push`/`run` to fill it must wait: resolving now would type a
         // closure parameter — and the call's own result element — against the
@@ -23241,7 +23255,7 @@ impl<'src> Analyzer<'src> {
         if let Type::Array(_, length) = &subject_type {
             let length = *length;
             if member_name != "len" {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     // The method NAME identifies the problem (A1/A4), not
@@ -23286,7 +23300,7 @@ impl<'src> Analyzer<'src> {
                         // so the method body monomorphizes.
                         let impl_subject = impl_subject_id.get_type(self);
                         if let Some((_, bindings)) =
-                            self.reconcile_type(&impl_subject, &subject_type, &HashMap::new())
+                            self.reconcile_type(&impl_subject, &subject_type, &HashMap::default())
                             && !bindings.is_empty()
                         {
                             self.method_call_substitution
@@ -23580,7 +23594,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Resolved
             }
             MethodLookup::NoMethod => {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 // If the method exists but is `[trait_only]`, say so — the fix
                 // is to reach it through a bound, not to define the method.
                 let trait_only_note = self
@@ -23620,7 +23634,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Failed
             }
             MethodLookup::AmbiguousTraits(trait_ids) => {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 // B4: the steer is the exact spelling that resolves this call,
                 // built from the call's own receiver so it is copy-pasteable.
                 let receiver = self
@@ -23664,7 +23678,7 @@ impl<'src> Analyzer<'src> {
             }
             MethodLookup::Defer => Resolution::Deferred,
             MethodLookup::NotCallable => {
-                let type_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let type_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: self
@@ -23705,18 +23719,18 @@ impl<'src> Analyzer<'src> {
     /// reconcile binding, so the generic argument check can't catch this one.
     /// Defers while the value is unresolved.
     fn resolve_slot_unification(&mut self, slot: TypeId, argument_id: Id) -> Resolution {
-        let argument_type = self.infer_type(argument_id, &Type::Unknown, &HashMap::new());
+        let argument_type = self.infer_type(argument_id, &Type::Unknown, &HashMap::default());
         if matches!(argument_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
         let slot_type = slot.get_type(self);
         if !matches!(slot_type, Type::Unknown) {
             if self
-                .reconcile_type(&argument_type, &slot_type, &HashMap::new())
+                .reconcile_type(&argument_type, &slot_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&slot_type, &HashMap::new());
-                let got = self.pretty_print_type(&argument_type, &HashMap::new());
+                let expected = self.pretty_print_type(&slot_type, &HashMap::default());
+                let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
@@ -23779,7 +23793,7 @@ impl<'src> Analyzer<'src> {
                 .map(|parameter| parameter.type_id.get_type(self))
                 .map(|parameter| self.substitute_type(&parameter, &substitution))
                 .unwrap_or(Type::Unknown);
-            let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::new());
+            let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
                 return Resolution::Deferred;
             }
@@ -23800,11 +23814,11 @@ impl<'src> Analyzer<'src> {
                 return Resolution::Deferred;
             }
             if self
-                .reconcile_type(&argument_type, &parameter_type, &HashMap::new())
+                .reconcile_type(&argument_type, &parameter_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&parameter_type, &HashMap::new());
-                let got = self.pretty_print_type(&argument_type, &HashMap::new());
+                let expected = self.pretty_print_type(&parameter_type, &HashMap::default());
+                let got = self.pretty_print_type(&argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
@@ -23829,7 +23843,7 @@ impl<'src> Analyzer<'src> {
         source_id: Id,
         body_id: Id,
     ) -> Resolution {
-        let source_type = self.infer_type(source_id, &Type::Unknown, &HashMap::new());
+        let source_type = self.infer_type(source_id, &Type::Unknown, &HashMap::default());
         match self.expand_mapped(source_type) {
             Type::Unresolved | Type::Unknown => Resolution::Deferred,
             Type::Mapped(_, _, element_template) => {
@@ -23844,7 +23858,7 @@ impl<'src> Analyzer<'src> {
             // A concrete tuple source isn't supported yet (heterogeneous elements
             // have no single binder type); only mapped sources, which combine uses.
             other => {
-                let got = self.pretty_print_type(&other, &HashMap::new());
+                let got = self.pretty_print_type(&other, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
@@ -23858,7 +23872,7 @@ impl<'src> Analyzer<'src> {
     }
 
     fn resolve_destructure(&mut self, constraint: &DestructureConstraint<'src>) -> Resolution {
-        let value_type = self.infer_type(constraint.value_id, &Type::Unknown, &HashMap::new());
+        let value_type = self.infer_type(constraint.value_id, &Type::Unknown, &HashMap::default());
         let not_ready = matches!(value_type, Type::Unresolved)
             || (constraint.defer_until_known && matches!(value_type, Type::Unknown));
         if not_ready {
@@ -23896,7 +23910,7 @@ impl<'src> Analyzer<'src> {
             .map(|&value_id| {
                 self.expr_id_to_expr_map.contains_key(&value_id)
                     && !matches!(
-                        self.infer_type(value_id, &Type::Unknown, &HashMap::new()),
+                        self.infer_type(value_id, &Type::Unknown, &HashMap::default()),
                         Type::Unresolved
                     )
             })
@@ -23905,7 +23919,7 @@ impl<'src> Analyzer<'src> {
             return Resolution::Deferred;
         }
 
-        let mut substitution_context = HashMap::new();
+        let mut substitution_context = HashMap::default();
         let mut variable_type = initial_type_id.get_type(self);
 
         // When the type comes from the first VALUE (no annotation), that
@@ -24027,7 +24041,7 @@ impl<'src> Analyzer<'src> {
             return Resolution::Deferred;
         }
         let return_type = return_type_id.get_type(self);
-        let substitution_context = HashMap::new();
+        let substitution_context = HashMap::default();
         let body_type = self.infer_type(body_id, &return_type, &substitution_context);
         if matches!(body_type, Type::Unresolved) {
             return Resolution::Deferred;
@@ -24066,7 +24080,7 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
-        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -24101,7 +24115,8 @@ impl<'src> Analyzer<'src> {
         if self.resolved_types.get(&binder_id) != Some(&element_id) {
             self.resolved_types.insert(binder_id, element_id);
         }
-        let continuation_type = self.infer_type(continuation_id, &Type::Unknown, &HashMap::new());
+        let continuation_type =
+            self.infer_type(continuation_id, &Type::Unknown, &HashMap::default());
         if matches!(continuation_type, Type::Unresolved) {
             // The continuation resolves after the wake; retry then.
             return Resolution::Deferred;
@@ -24122,14 +24137,14 @@ impl<'src> Analyzer<'src> {
                     .reconcile_type(
                         &subject_error_type,
                         &continuation_error_type,
-                        &HashMap::new(),
+                        &HashMap::default(),
                     )
                     .is_none()
                 {
                     let subject_rendered =
-                        self.pretty_print_type(&subject_error_type, &HashMap::new());
+                        self.pretty_print_type(&subject_error_type, &HashMap::default());
                     let continuation_rendered =
-                        self.pretty_print_type(&continuation_error_type, &HashMap::new());
+                        self.pretty_print_type(&continuation_error_type, &HashMap::default());
                     self.diagnostics.push(Error { note: None,
                         span,
                         msg: format!(
@@ -24183,7 +24198,7 @@ impl<'src> Analyzer<'src> {
             if !self.expr_id_to_expr_map.contains_key(step_id) {
                 return Resolution::Deferred;
             }
-            let step_type = self.infer_type(*step_id, &Type::Unknown, &HashMap::new());
+            let step_type = self.infer_type(*step_id, &Type::Unknown, &HashMap::default());
             if matches!(step_type, Type::Unresolved) {
                 return Resolution::Deferred;
             }
@@ -24212,7 +24227,7 @@ impl<'src> Analyzer<'src> {
                         return Resolution::Failed;
                     }
                     let Some((nominal_id, arguments)) = self.lift_element_of(&other) else {
-                        let rendered = self.pretty_print_type(&other, &HashMap::new());
+                        let rendered = self.pretty_print_type(&other, &HashMap::default());
                         self.diagnostics.push(Error {
                             note: None,
                             span: step_span,
@@ -24261,11 +24276,17 @@ impl<'src> Analyzer<'src> {
                         let family_error_type = family_error.get_type(self);
                         let step_error_type = step_error.get_type(self);
                         if self
-                            .reconcile_type(&family_error_type, &step_error_type, &HashMap::new())
+                            .reconcile_type(
+                                &family_error_type,
+                                &step_error_type,
+                                &HashMap::default(),
+                            )
                             .is_none()
                         {
-                            let first = self.pretty_print_type(&family_error_type, &HashMap::new());
-                            let second = self.pretty_print_type(&step_error_type, &HashMap::new());
+                            let first =
+                                self.pretty_print_type(&family_error_type, &HashMap::default());
+                            let second =
+                                self.pretty_print_type(&step_error_type, &HashMap::default());
                             self.diagnostics.push(Error {
                                 note: None,
                                 span: step_span,
@@ -24295,7 +24316,7 @@ impl<'src> Analyzer<'src> {
             // A region without a split cannot be built by the rewrite.
             return Resolution::Failed;
         };
-        let body_type = self.infer_type(body_id, &Type::Unknown, &HashMap::new());
+        let body_type = self.infer_type(body_id, &Type::Unknown, &HashMap::default());
         if matches!(body_type, Type::Unresolved) {
             // The body resolves after the binders' wake; retry then.
             return Resolution::Deferred;
@@ -24316,11 +24337,11 @@ impl<'src> Analyzer<'src> {
                 let region_error_type = region_error.get_type(self);
                 let body_error_type = body_error.get_type(self);
                 if self
-                    .reconcile_type(&region_error_type, &body_error_type, &HashMap::new())
+                    .reconcile_type(&region_error_type, &body_error_type, &HashMap::default())
                     .is_none()
                 {
-                    let first = self.pretty_print_type(&region_error_type, &HashMap::new());
-                    let second = self.pretty_print_type(&body_error_type, &HashMap::new());
+                    let first = self.pretty_print_type(&region_error_type, &HashMap::default());
+                    let second = self.pretty_print_type(&body_error_type, &HashMap::default());
                     self.diagnostics.push(Error {
                         note: None,
                         span,
@@ -24441,10 +24462,10 @@ impl<'src> Analyzer<'src> {
         if self.std_export_index.is_some() {
             return;
         }
-        let mut export_index: HashMap<String, String> = HashMap::new();
-        let mut ambiguous_names: HashSet<String> = HashSet::new();
-        let mut method_index: HashMap<(String, String), (String, String)> = HashMap::new();
-        let mut ambiguous_methods: HashSet<(String, String)> = HashSet::new();
+        let mut export_index: HashMap<String, String> = HashMap::default();
+        let mut ambiguous_names: HashSet<String> = HashSet::default();
+        let mut method_index: HashMap<(String, String), (String, String)> = HashMap::default();
+        let mut ambiguous_methods: HashSet<(String, String)> = HashSet::default();
         let files = self.std_module_files.clone();
         for (module_name, path) in &files {
             let Some(loaded) = load_package_module(path) else {
@@ -24513,7 +24534,7 @@ impl<'src> Analyzer<'src> {
         // A generic parameter, a closure, a tuple — nothing with a nominal head
         // to key on. `pretty_print_type` renders the head first, so a generic
         // subject (`List<i32>`) reduces by dropping its arguments.
-        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         let head = rendered.split('<').next()?.to_string();
         self.build_std_indexes_if_needed();
         let (importable, module_name) = self
@@ -24610,7 +24631,7 @@ impl<'src> Analyzer<'src> {
         for subject in lift_subjects {
             let candidate = subject.get_type(self);
             if self
-                .reconcile_type(subject_type, &candidate, &HashMap::new())
+                .reconcile_type(subject_type, &candidate, &HashMap::default())
                 .is_some()
             {
                 return true;
@@ -24622,7 +24643,7 @@ impl<'src> Analyzer<'src> {
     /// The message both lift operators give a type that never opted in.
     /// `operator` is how the site spells itself (`` `?.` `` / "a bare `?`").
     fn lift_opt_in_error(&mut self, operator: &str, subject_type: &Type, span: Span) {
-        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
             note: None,
             span,
@@ -24648,7 +24669,7 @@ impl<'src> Analyzer<'src> {
         if let Some(found) = self.method_member_impl_subject(subject_type, member_name) {
             return Some(found);
         }
-        let rendered = self.pretty_print_type(subject_type, &HashMap::new());
+        let rendered = self.pretty_print_type(subject_type, &HashMap::default());
         self.diagnostics.push(Error {
             note: None,
             span,
@@ -24686,7 +24707,7 @@ impl<'src> Analyzer<'src> {
         }
         // The element: the container's first type argument.
         let Some((nominal_id, arguments)) = self.lift_element_of(&subject_type) else {
-            let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
+            let rendered = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
                 note: None,
                 span,
@@ -24702,7 +24723,8 @@ impl<'src> Analyzer<'src> {
         if self.resolved_types.get(&binder_id) != Some(&element_id) {
             self.resolved_types.insert(binder_id, element_id);
         }
-        let continuation_type = self.infer_type(continuation_id, &Type::Unknown, &HashMap::new());
+        let continuation_type =
+            self.infer_type(continuation_id, &Type::Unknown, &HashMap::default());
         if matches!(continuation_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -24769,7 +24791,7 @@ impl<'src> Analyzer<'src> {
         tail_id: Id,
         rets: &[(Span, Option<Id>)],
     ) -> Resolution {
-        let tail_type = self.infer_type(tail_id, &Type::Unknown, &HashMap::new());
+        let tail_type = self.infer_type(tail_id, &Type::Unknown, &HashMap::default());
         // `Unknown` means the closure's parameters haven't been typed yet (the
         // call site reconciles them later) — defer; the run-all backstop
         // retries once they land. A closure that never types (unbound, never
@@ -24783,7 +24805,7 @@ impl<'src> Analyzer<'src> {
             match value_id {
                 None => {
                     if !tail_is_void {
-                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::new());
+                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
                         self.diagnostics.push(Error { note: None,
                             span: *span,
                             msg: format!(
@@ -24793,7 +24815,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 Some(value_id) => {
-                    let value_type = self.infer_type(*value_id, &tail_type, &HashMap::new());
+                    let value_type = self.infer_type(*value_id, &tail_type, &HashMap::default());
                     if matches!(value_type, Type::Unresolved) {
                         return Resolution::Deferred;
                     }
@@ -24804,11 +24826,12 @@ impl<'src> Analyzer<'src> {
                                 .to_string(),
                         });
                     } else if self
-                        .reconcile_type(&value_type, &tail_type, &HashMap::new())
+                        .reconcile_type(&value_type, &tail_type, &HashMap::default())
                         .is_none()
                     {
-                        let value_rendered = self.pretty_print_type(&value_type, &HashMap::new());
-                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::new());
+                        let value_rendered =
+                            self.pretty_print_type(&value_type, &HashMap::default());
+                        let tail_rendered = self.pretty_print_type(&tail_type, &HashMap::default());
                         self.diagnostics.push(Error { note: None,
                             span: *span,
                             msg: format!(
@@ -24837,7 +24860,7 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&receiver_id) {
             return Resolution::Deferred;
         }
-        let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::new());
+        let receiver_type = self.infer_type(receiver_id, &Type::Unknown, &HashMap::default());
         if matches!(receiver_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -24864,7 +24887,7 @@ impl<'src> Analyzer<'src> {
                         directed_arguments[0] = expected_good_id;
                     }
                     let directed = Type::Enum(*enum_id, directed_arguments);
-                    self.infer_type(receiver_id, &directed, &HashMap::new())
+                    self.infer_type(receiver_id, &directed, &HashMap::default())
                 } else {
                     receiver_type
                 }
@@ -24886,7 +24909,7 @@ impl<'src> Analyzer<'src> {
             match &return_type {
                 Type::Enum(return_enum, _) if Some(*return_enum) == self.option_enum_id => {}
                 other => {
-                    let rendered = self.pretty_print_type(other, &HashMap::new());
+                    let rendered = self.pretty_print_type(other, &HashMap::default());
                     self.diagnostics.push(Error { note: None,
                         span,
                         msg: format!(
@@ -24918,11 +24941,12 @@ impl<'src> Analyzer<'src> {
                         .map(|type_id| type_id.get_type(self));
                     if let (Some(bad), Some(return_bad)) = (bad, return_bad)
                         && self
-                            .reconcile_type(&bad, &return_bad, &HashMap::new())
+                            .reconcile_type(&bad, &return_bad, &HashMap::default())
                             .is_none()
                     {
-                        let receiver_rendered = self.pretty_print_type(&bad, &HashMap::new());
-                        let return_rendered = self.pretty_print_type(&return_bad, &HashMap::new());
+                        let receiver_rendered = self.pretty_print_type(&bad, &HashMap::default());
+                        let return_rendered =
+                            self.pretty_print_type(&return_bad, &HashMap::default());
                         self.diagnostics.push(Error { note: None,
                             span,
                             msg: format!(
@@ -24932,7 +24956,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 other => {
-                    let rendered = self.pretty_print_type(other, &HashMap::new());
+                    let rendered = self.pretty_print_type(other, &HashMap::default());
                     self.diagnostics.push(Error { note: None,
                         span,
                         msg: format!(
@@ -24963,7 +24987,7 @@ impl<'src> Analyzer<'src> {
         for (index, subject) in candidates {
             let subject_type = subject.get_type(self);
             if self
-                .reconcile_type(&receiver_type, &subject_type, &HashMap::new())
+                .reconcile_type(&receiver_type, &subject_type, &HashMap::default())
                 .is_some()
             {
                 try_impl = Some(index);
@@ -24971,7 +24995,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         let Some(impl_index) = try_impl else {
-            let rendered = self.pretty_print_type(&receiver_type, &HashMap::new());
+            let rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
@@ -25008,7 +25032,7 @@ impl<'src> Analyzer<'src> {
             .reconcile_type(
                 &receiver_type,
                 &impl_subject.get_type(self),
-                &HashMap::new(),
+                &HashMap::default(),
             )
             .map(|(_, bindings)| bindings)
             .unwrap_or_default();
@@ -25023,14 +25047,14 @@ impl<'src> Analyzer<'src> {
         // v1: the enclosing return type must be exactly the receiver's type
         // (`from_bad` returns Self — no higher-kinded re-instantiation).
         if self
-            .reconcile_type(&receiver_type, &return_type, &HashMap::new())
+            .reconcile_type(&receiver_type, &return_type, &HashMap::default())
             .is_none()
             || self
-                .reconcile_type(&return_type, &receiver_type, &HashMap::new())
+                .reconcile_type(&return_type, &receiver_type, &HashMap::default())
                 .is_none()
         {
-            let receiver_rendered = self.pretty_print_type(&receiver_type, &HashMap::new());
-            let return_rendered = self.pretty_print_type(&return_type, &HashMap::new());
+            let receiver_rendered = self.pretty_print_type(&receiver_type, &HashMap::default());
+            let return_rendered = self.pretty_print_type(&return_type, &HashMap::default());
             self.diagnostics.push(Error { note: None,
                 span,
                 msg: format!(
@@ -25057,7 +25081,7 @@ impl<'src> Analyzer<'src> {
     /// match as the unification of its leg bodies. Defers while the subject, a
     /// guard, or a leg body is unresolved.
     fn resolve_match(&mut self, prepped: &PreppedMatch<'src>) -> Resolution {
-        let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -25089,11 +25113,11 @@ impl<'src> Analyzer<'src> {
             }
             if let Some(guard_id) = leg.guard {
                 // A guard must be a resolved `bool`.
-                let guard_type = self.infer_type(guard_id, &Type::Unknown, &HashMap::new());
+                let guard_type = self.infer_type(guard_id, &Type::Unknown, &HashMap::default());
                 if matches!(guard_type, Type::Unresolved) {
                     guard_deferred = true;
-                } else if !self.compare_type(&guard_type, &self.bool_type(), &HashMap::new()) {
-                    let got = self.pretty_print_type(&guard_type, &HashMap::new());
+                } else if !self.compare_type(&guard_type, &self.bool_type(), &HashMap::default()) {
+                    let got = self.pretty_print_type(&guard_type, &HashMap::default());
                     self.diagnostics.push(Error {
                         note: None,
                         span: **self.span_map.get(&guard_id).unwrap_or(&&EMPTY_SPAN),
@@ -25183,34 +25207,36 @@ impl<'src> Analyzer<'src> {
             let leg_constraint = expected
                 .map(|type_id| type_id.get_type(self))
                 .unwrap_or(Type::Unknown);
-            let body_type = self.infer_type(*body_id, &leg_constraint, &HashMap::new());
+            let body_type = self.infer_type(*body_id, &leg_constraint, &HashMap::default());
             if matches!(body_type, Type::Unresolved) {
                 return Resolution::Deferred;
             }
             unified = Some(match unified {
                 None => body_type,
-                Some(current) => match self.reconcile_type(&current, &body_type, &HashMap::new()) {
-                    Some((unified_type, _)) => unified_type,
-                    None => {
-                        let expected = self.pretty_print_type(&current, &HashMap::new());
-                        let got = self.pretty_print_type(&body_type, &HashMap::new());
-                        // Anchor at the OFFENDING leg's body, not the whole
-                        // match (E7 — the pertinent expression).
-                        let leg_span = self
-                            .span_map
-                            .get(body_id)
-                            .map(|span| **span)
-                            .unwrap_or(prepped.span);
-                        self.diagnostics.push(Error { note: None,
+                Some(current) => {
+                    match self.reconcile_type(&current, &body_type, &HashMap::default()) {
+                        Some((unified_type, _)) => unified_type,
+                        None => {
+                            let expected = self.pretty_print_type(&current, &HashMap::default());
+                            let got = self.pretty_print_type(&body_type, &HashMap::default());
+                            // Anchor at the OFFENDING leg's body, not the whole
+                            // match (E7 — the pertinent expression).
+                            let leg_span = self
+                                .span_map
+                                .get(body_id)
+                                .map(|span| **span)
+                                .unwrap_or(prepped.span);
+                            self.diagnostics.push(Error { note: None,
                             span: leg_span,
                             msg: format!(
                                 "match legs have mismatched types: expected {}, but got {} instead.",
                                 expected, got
                             ),
                         });
-                        current
+                            current
+                        }
                     }
-                },
+                }
             });
         }
         let match_type = unified.unwrap_or(Type::Void);
@@ -25307,7 +25333,7 @@ impl<'src> Analyzer<'src> {
         let initializer_id = constraint.initializer_id;
         let struct_name = constraint.struct_name;
         let mut initializer_fields = IndexMap::new();
-        let mut substitution_context = HashMap::new();
+        let mut substitution_context = HashMap::default();
         for (index, generic_argument_id) in constraint.generic_argument_ids.iter().enumerate() {
             if let Some(generic_constraint) = generic_param_ids.get(index) {
                 substitution_context.insert(*generic_constraint, *generic_argument_id);
@@ -25449,7 +25475,7 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
-        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
             // `pair.0`: a tuple's members are its positions (spec §5.9).
@@ -25488,7 +25514,7 @@ impl<'src> Analyzer<'src> {
                     Err(problem) => {
                         let label = self.pretty_print_type(
                             &Type::Tuple(element_type_ids.clone()),
-                            &HashMap::new(),
+                            &HashMap::default(),
                         );
                         self.diagnostics.push(Error {
                             note: None,
@@ -25573,7 +25599,7 @@ impl<'src> Analyzer<'src> {
                 if self.is_unknown_closure_parameter(subject_id) {
                     return Resolution::Deferred;
                 }
-                let subject_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
@@ -25592,7 +25618,7 @@ impl<'src> Analyzer<'src> {
     /// (typing its captures) and record the `Expr::Is`. `None` from the pattern
     /// means a diagnostic was already emitted.
     fn resolve_is(&mut self, prepped: &PreppedIs<'src>) -> Resolution {
-        let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(prepped.subject_id, &Type::Unknown, &HashMap::default());
         if matches!(subject_type, Type::Unresolved) {
             return Resolution::Deferred;
         }
@@ -25613,7 +25639,7 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
-        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+        let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         let list_id = self.primitive_struct_ids.get("List").copied();
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
@@ -25679,7 +25705,7 @@ impl<'src> Analyzer<'src> {
                 Resolution::Resolved
             }
             subject_type => {
-                let subject_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
@@ -26013,7 +26039,8 @@ impl<'src> Analyzer<'src> {
                 .or_else(|| self.try_get_expr_id_by_name(name, scope_id));
             match resolved {
                 Some(subject_id) => {
-                    let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+                    let subject_type =
+                        self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
                     // Attach the written generic arguments to the nominal type
                     // (`Option<i32>` -> `Enum(option_id, [i32])`). A bare name
                     // keeps whatever the reference resolved to.
@@ -26137,7 +26164,7 @@ impl<'src> Analyzer<'src> {
                     match self.member_in_namespace(member_name, module_scope_id) {
                         Some(member_id) => {
                             let member_type =
-                                self.infer_type(member_id, &Type::Unknown, &HashMap::new());
+                                self.infer_type(member_id, &Type::Unknown, &HashMap::default());
                             self.write_type_slot(type_id, member_type);
                         }
                         None => {
@@ -26161,7 +26188,8 @@ impl<'src> Analyzer<'src> {
                 // crash).
                 subject_type => {
                     if !matches!(subject_type, Type::Unknown | Type::Unresolved) {
-                        let subject_str = self.pretty_print_type(&subject_type, &HashMap::new());
+                        let subject_str =
+                            self.pretty_print_type(&subject_type, &HashMap::default());
                         self.diagnostics.push(Error {
                             note: None,
                             span,
@@ -26325,7 +26353,7 @@ impl<'src> Analyzer<'src> {
                                     if let Some((_, bindings)) = self.reconcile_type(
                                         &impl_subject_type,
                                         &subject_type,
-                                        &HashMap::new(),
+                                        &HashMap::default(),
                                     ) {
                                         if !bindings.is_empty() {
                                             self.static_subject_bindings
@@ -26354,7 +26382,7 @@ impl<'src> Analyzer<'src> {
                                 unreachable!("just matched AmbiguousTraits");
                             };
                             let subject_str =
-                                self.pretty_print_type(&subject_type, &HashMap::new());
+                                self.pretty_print_type(&subject_type, &HashMap::default());
                             let providers: Vec<String> = homes
                                 .iter()
                                 .map(|trait_id| {
@@ -26380,7 +26408,7 @@ impl<'src> Analyzer<'src> {
                         // trait at the path head.
                         None if !method_candidates.is_empty() => {
                             let subject_str =
-                                self.pretty_print_type(&subject_type, &HashMap::new());
+                                self.pretty_print_type(&subject_type, &HashMap::default());
                             let mut homes: Vec<Id> = Vec::new();
                             for candidate in &method_candidates {
                                 if let Some(trait_id) = candidate.home_trait
@@ -26420,7 +26448,7 @@ impl<'src> Analyzer<'src> {
                         }
                         None => {
                             let subject_str =
-                                self.pretty_print_type(&subject_type, &HashMap::new());
+                                self.pretty_print_type(&subject_type, &HashMap::default());
                             let trait_only_note = if subject_is_trait {
                                 None
                             } else {
@@ -26644,7 +26672,7 @@ impl<'src> Analyzer<'src> {
                         })
                         .unwrap_or_default()
                 } else {
-                    SubstitutionContext::new()
+                    SubstitutionContext::default()
                 };
                 self.conformance_signature_checks
                     .push(ConformanceSignatureCheck {
@@ -26687,7 +26715,11 @@ impl<'src> Analyzer<'src> {
                             .contains(&declaring_trait_id)
                     }) && {
                         let candidate_subject = subject_id.get_type(self);
-                        self.compare_type(&check_subject_type, &candidate_subject, &HashMap::new())
+                        self.compare_type(
+                            &check_subject_type,
+                            &candidate_subject,
+                            &HashMap::default(),
+                        )
                     }
                 });
                 if provided_elsewhere {
@@ -26850,7 +26882,7 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (item_id, iterable_id) in deferred_for_each {
-            let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
+            let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
             let next_method = self.for_each_next_method(Some(item_id));
             let element_type = self
                 .iterable_element_type(&iterable_type, next_method)
@@ -26868,7 +26900,7 @@ impl<'src> Analyzer<'src> {
         // iterator) iterates by calling `next()` until `None`; anything else
         // (e.g. a `List`) stays a native `for...of`.
         for (for_each_id, iterable_id) in std::mem::take(&mut self.prepped_for_each) {
-            let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::new());
+            let iterable_type = self.infer_type(iterable_id, &Type::Unknown, &HashMap::default());
             // Keep it: emission picks its native lowering by this same type, and
             // it is the only place the type is known. A `for x in <expr>` whose
             // iterable stores no type on its own expr id — a parameter (`self`
@@ -26935,7 +26967,7 @@ impl<'src> Analyzer<'src> {
                         // trait's empty abstract member (B55).
                         let impl_subject = impl_subject_id.get_type(self);
                         if let Some((_, bindings)) =
-                            self.reconcile_type(&impl_subject, &iterable_type, &HashMap::new())
+                            self.reconcile_type(&impl_subject, &iterable_type, &HashMap::default())
                             && !bindings.is_empty()
                         {
                             self.method_call_substitution
@@ -27120,13 +27152,13 @@ impl<'src> Analyzer<'src> {
         {
             let bool_type = self.bool_type();
             for (condition_id, construct) in std::mem::take(&mut self.prepped_conditions) {
-                let condition = self.infer_type(condition_id, &bool_type, &HashMap::new());
+                let condition = self.infer_type(condition_id, &bool_type, &HashMap::default());
                 if !matches!(
                     condition,
                     Type::Unknown | Type::Unresolved | Type::Generic(_)
-                ) && !self.compare_type(&bool_type, &condition, &HashMap::new())
+                ) && !self.compare_type(&bool_type, &condition, &HashMap::default())
                 {
-                    let label = self.pretty_print_type(&condition, &HashMap::new());
+                    let label = self.pretty_print_type(&condition, &HashMap::default());
                     self.diagnostics.push(Error {
                         note: None,
                         span: **self.span_map.get(&condition_id).unwrap_or(&&EMPTY_SPAN),
@@ -27139,7 +27171,7 @@ impl<'src> Analyzer<'src> {
         }
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
-            let lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::new());
+            let lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
             // Record the unsigned-emission verdict for bitwise/shift binaries
             // while the operand's type is in hand: concrete `u32` settles here;
             // a generic operand records its constraint for the transformer to
@@ -27201,11 +27233,11 @@ impl<'src> Analyzer<'src> {
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let bool_type = self.bool_type();
                     for (operand_id, side) in [(lhs_id, "left"), (rhs_id, "right")] {
-                        let operand = self.infer_type(operand_id, &bool_type, &HashMap::new());
+                        let operand = self.infer_type(operand_id, &bool_type, &HashMap::default());
                         if grounded(&operand)
-                            && !self.compare_type(&bool_type, &operand, &HashMap::new())
+                            && !self.compare_type(&bool_type, &operand, &HashMap::default())
                         {
-                            let label = self.pretty_print_type(&operand, &HashMap::new());
+                            let label = self.pretty_print_type(&operand, &HashMap::default());
                             self.diagnostics.push(Error { note: None,
                                 span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
                                 msg: format!(
@@ -27261,12 +27293,12 @@ impl<'src> Analyzer<'src> {
                     && grounded(&lhs_type)
                     && self.is_native_operator_type(&lhs_type)
                 {
-                    let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::new());
+                    let rhs_type = self.infer_type(rhs_id, &lhs_type, &HashMap::default());
                     if grounded(&rhs_type)
-                        && !self.compare_type(&lhs_type, &rhs_type, &HashMap::new())
+                        && !self.compare_type(&lhs_type, &rhs_type, &HashMap::default())
                     {
-                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::new());
-                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::new());
+                        let lhs_label = self.pretty_print_type(&lhs_type, &HashMap::default());
+                        let rhs_label = self.pretty_print_type(&rhs_type, &HashMap::default());
                         self.diagnostics.push(Error {
                             note: None,
                             span: **self.span_map.get(&binary_id).unwrap_or(&&EMPTY_SPAN),
@@ -27315,7 +27347,7 @@ impl<'src> Analyzer<'src> {
                 // `Option<i32>`) the generic emission already lowers `==` to native JS.
                 let impl_subject = impl_subject_id.get_type(self);
                 if let Some((_, bindings)) =
-                    self.reconcile_type(&impl_subject, &lhs_type, &HashMap::new())
+                    self.reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
                 {
                     let needs_specialization = bindings.iter().any(|(_, concrete)| {
                         !self.is_native_operator_type(&concrete.get_type(self))
@@ -27352,7 +27384,7 @@ impl<'src> Analyzer<'src> {
                 );
                 let impl_subject = impl_subject_id.get_type(self);
                 let mut bindings: SubstitutionContext = self
-                    .reconcile_type(&impl_subject, &lhs_type, &HashMap::new())
+                    .reconcile_type(&impl_subject, &lhs_type, &HashMap::default())
                     .map(|(_, bindings)| bindings.into_iter().collect())
                     .unwrap_or_default();
                 let trait_parameter_ids = self
@@ -27502,7 +27534,7 @@ impl<'src> Analyzer<'src> {
             // positive. (Threading constraint expectations into the record is
             // the follow-up.)
             let literal_type = if suffix.is_some() {
-                self.infer_type(literal_id, &Type::Unknown, &HashMap::new())
+                self.infer_type(literal_id, &Type::Unknown, &HashMap::default())
             } else if let Some(type_id) = self
                 .expected_types
                 .get(&literal_id)
@@ -27618,7 +27650,7 @@ impl<'src> Analyzer<'src> {
             })
             .collect();
         for (subscript_id, subject_id) in unresolved_subscripts {
-            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
+            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
             if self.list_element_slot(&subject_type).is_some() {
                 self.diagnostics.push(Error {
                     note: None,
@@ -27641,8 +27673,8 @@ impl<'src> Analyzer<'src> {
                 .collect()
         };
         for (subject_id, span) in unresolved_matches {
-            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::new());
-            let subject_str = self.pretty_print_type(&subject_type, &HashMap::new());
+            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+            let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
             self.diagnostics.push(Error {
                 note: None,
                 span,
@@ -27679,7 +27711,7 @@ impl<'src> Analyzer<'src> {
         // was whichever entity a randomly-seeded `HashMap` iteration reached
         // last, so a user's impl block un-froze std's own `List::map` on
         // roughly half of otherwise identical cold compiles.
-        let mut generic_declaration_sources: HashMap<TypeId, Vec<SourceId>> = HashMap::new();
+        let mut generic_declaration_sources: HashMap<TypeId, Vec<SourceId>> = HashMap::default();
         for (entity_id, expr) in &self.expr_id_to_expr_map {
             if let Expr::Generic(constraint_id) = expr
                 && let Some(source) = self.source_of_id(*entity_id)
@@ -27700,7 +27732,7 @@ impl<'src> Analyzer<'src> {
             if self.reference_count.get(&variable_id).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::new());
+            let variable_type = self.infer_type(variable_id, &Type::Unknown, &HashMap::default());
             // Only STRUCT-headed types (the container shape — `Map<K, V>`)
             // reject. An enum keeping a payload parameter (`Ok("done")` with
             // its `E` never named, `let x = None`) is commonplace and its
@@ -27737,7 +27769,7 @@ impl<'src> Analyzer<'src> {
                     .get(&variable_id)
                     .map(|variable| variable.name)
                     .unwrap_or("unknown");
-                let rendered = self.pretty_print_type(&variable_type, &HashMap::new());
+                let rendered = self.pretty_print_type(&variable_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     note: None,
                     span,
@@ -27821,7 +27853,7 @@ impl<'src> Analyzer<'src> {
             self.collect_generics(return_type, 0, &mut found);
         }
         let mut generics: Vec<(TypeId, bool)> = Vec::new();
-        let mut seen: HashSet<TypeId> = HashSet::new();
+        let mut seen: HashSet<TypeId> = HashSet::default();
         for constraint_id in own {
             if !substitution.contains_key(constraint_id) && seen.insert(*constraint_id) {
                 generics.push((*constraint_id, false));
@@ -28686,7 +28718,7 @@ pub struct Program<'src> {
     /// analysis-reuse.md §6): std modules loaded from disk — never the entry,
     /// never an LSP-overlaid buffer. Post-passes consult this the way the
     /// in-analyze checks consult `Analyzer::frozen_entity`.
-    pub std_sources: std::collections::HashSet<SourceId>,
+    pub std_sources: HashSet<SourceId>,
     /// Where each run of GENERATED entities came from: the entity-id range, the
     /// span of the attribute that generated it, and the file that attribute is
     /// written in. `source_ranges` files those entities under [`DERIVED_SOURCE`]
@@ -29195,7 +29227,7 @@ impl<'src> Program<'src> {
         for module_bindings in by_module {
             bindings.extend(module_bindings);
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         bindings.retain(|id| seen.insert(*id));
         bindings
     }
@@ -29323,7 +29355,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     // analysis. Keeping broken modules in their own cache leaves the shared one
     // holding only clean, reusable trees.
     static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
-    let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::default()));
 
     // `read_source` is now the one overlay-then-disk seam (buffer verbatim, disk
     // BOM-stripped per `windows-support.md` §2), so this reads like any other
@@ -30927,7 +30959,7 @@ fn interned_display_name(name: String) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let names = NAMES.get_or_init(|| Mutex::new(HashMap::default()));
     let mut names = names.lock().unwrap();
     if let Some(existing) = names.get(&name).copied() {
         return existing;
@@ -31042,7 +31074,7 @@ fn workspace_fingerprint(
 /// `None` (a miss, counted). Validation re-reads every recorded source and
 /// compares content hashes; a stale world is evicted, not repaired.
 fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'static>> {
-    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -31097,7 +31129,7 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // (no pkg refs, no services, no macro-DEFINING entry text), so no other
     // entry-derived state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
-    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::default()));
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -31508,7 +31540,7 @@ fn analyze_inner<'src>(
     sources.push(lib_path);
     source_hashes.push(lib_loaded.map_or(0, |loaded| crate::content_hash(loaded.text)));
     let lib_source_id = SourceId((sources.len() - 1) as u32);
-    let mut module_scopes: HashMap<&str, Id> = HashMap::new();
+    let mut module_scopes: HashMap<&str, Id> = HashMap::default();
     // Each loaded module carries the `[derive(..)]` impls synthesized from its own
     // items (or `None`), walked into the module's scope after its body — the general
     // form of the entry's derive expansion, so a derived type imported from another
@@ -31632,7 +31664,7 @@ fn analyze_inner<'src>(
         analyzer.packages.push(LoadedPackage {
             namespace_id: pkg_module_id,
             namespace_scope_id: pkg_scope_id,
-            dependencies: HashMap::new(),
+            dependencies: HashMap::default(),
         });
         analyzer.package_of_source.insert(SourceId(0), 0);
         // One namespace per dependency package, created up front so edges (which
@@ -31663,7 +31695,7 @@ fn analyze_inner<'src>(
             analyzer.packages.push(LoadedPackage {
                 namespace_id,
                 namespace_scope_id,
-                dependencies: HashMap::new(),
+                dependencies: HashMap::default(),
             });
         }
         // Resolve dependency edges to namespace ids now that every namespace
@@ -31797,7 +31829,7 @@ fn analyze_inner<'src>(
     analyzer.packages.push(LoadedPackage {
         namespace_id: std_module_id,
         namespace_scope_id: std_scope_id,
-        dependencies: HashMap::new(),
+        dependencies: HashMap::default(),
     });
     analyzer
         .package_of_source
@@ -31816,13 +31848,13 @@ fn analyze_inner<'src>(
     let mut entry_is_module = false;
     // Dedup is per-package, not by bare name: two packages may each define a
     // module of the same name, and both must load into their own namespace.
-    let mut loaded_keys: HashSet<(Origin, &str)> = HashSet::new();
+    let mut loaded_keys: HashSet<(Origin, &str)> = HashSet::default();
     // Macro expansion state (macro-engine.md Phase 1): the registry is built
     // once every load settles (macro definitions must be reachable WITHOUT
     // expansion); each file's attributes then expand exactly once, and the
     // generated code's imports re-enter the load loop.
     let mut macro_registry: Option<crate::macros::MacroRegistry> = None;
-    let mut expanded_sources: HashSet<SourceId> = HashSet::new();
+    let mut expanded_sources: HashSet<SourceId> = HashSet::default();
     // The derive/macro hoist (§6.13): a cacheable entry expands AFTER the
     // world is constructed (and, on a miss, stored) — through
     // `expand_entry_over_world`, identically on hit and miss — so the stored
@@ -31834,7 +31866,7 @@ fn analyze_inner<'src>(
     // Splice sites are stamped with a per-analysis counter (gensym hygiene, §7).
     let mut macro_site_counter: u32 = 0;
     let mut generated_by_source: HashMap<SourceId, Vec<(Span, &'static NodeList<'static>)>> =
-        HashMap::new();
+        HashMap::default();
     loop {
         // Canonical drain (WO-1b): load the smallest-key module still pending
         // rather than the last one pushed. `to_load.pop()` (LIFO) made the load
@@ -32947,7 +32979,7 @@ fn analyze_over_world<'src>(
     // Capture the external std functions with built-in JS lowerings: `str`'s
     // methods (across every `impl str` block), and the module-level `scan` /
     // `random::range_{i32,u32,f64}` (the `Random` trait impls forward to these).
-    let mut intrinsics: HashMap<Id, Intrinsic> = HashMap::new();
+    let mut intrinsics: HashMap<Id, Intrinsic> = HashMap::default();
     if let Some(str_struct_id) = analyzer.primitive_struct_ids.get("str").copied() {
         for implementation in &analyzer.implementations {
             let subject_is_str = matches!(
@@ -33145,10 +33177,10 @@ fn analyze_over_world<'src>(
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
     // is applied last so it wins over `resolved_types`, matching `type_of_expr`.
-    let empty_substitution = SubstitutionContext::new();
-    let mut expr_types: HashMap<Id, String> = HashMap::new();
+    let empty_substitution = SubstitutionContext::default();
+    let mut expr_types: HashMap<Id, String> = HashMap::default();
     // The same merge, kept as raw type ids for the transformer (tuple layout).
-    let mut expr_type_ids: HashMap<Id, TypeId> = HashMap::new();
+    let mut expr_type_ids: HashMap<Id, TypeId> = HashMap::default();
     for (expr_id, type_id) in analyzer
         .resolved_types
         .iter()
@@ -33203,7 +33235,7 @@ fn analyze_over_world<'src>(
     // Full declaration labels for hover (E9): a function's complete
     // signature, a struct/enum's fields and variants — the language server
     // fences these as code and appends docs and platform lines.
-    let mut declaration_labels: HashMap<Id, String> = HashMap::new();
+    let mut declaration_labels: HashMap<Id, String> = HashMap::default();
     for (function_id, function) in &analyzer.functions {
         declaration_labels.insert(*function_id, analyzer.function_signature_label(function));
     }
@@ -33389,7 +33421,7 @@ fn analyze_over_world<'src>(
         division_generic_lhs: analyzer.division_generic_lhs,
         parameter_contexts: analyzer.parameter_contexts,
         // Filled by `context::thread_contexts` from its `param_nodes`.
-        context_dependent_functions: HashSet::new(),
+        context_dependent_functions: HashSet::default(),
         bitwise_generic_lhs: analyzer.bitwise_generic_lhs,
         method_call_substitution: analyzer.method_call_substitution,
         intrinsics,
@@ -33402,7 +33434,7 @@ fn analyze_over_world<'src>(
         drop_fn_id: analyzer.drop_fn_id,
         asset_emit_fn_id: analyzer.asset_emit_fn_id,
         const_exprs: analyzer.const_exprs.clone(),
-        const_results: HashMap::new(),
+        const_results: HashMap::default(),
         const_assets: Vec::new(),
         context_new_fn_id,
         context_run_fn_id,
@@ -33411,7 +33443,7 @@ fn analyze_over_world<'src>(
         nursery_ambient_id,
         nursery_fn_id,
         owned_nursery_enter_fn_id,
-        spawn_nursery_sources: HashMap::new(),
+        spawn_nursery_sources: HashMap::default(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,
         modules: analyzer.modules,
@@ -33439,14 +33471,14 @@ fn analyze_over_world<'src>(
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         next_entity_id: analyzer.entity_id,
-        async_functions: HashSet::new(),
+        async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
         async_values: analyzer.async_values.clone(),
         sync_values: analyzer.sync_values.clone(),
         async_fields: analyzer.async_fields.clone(),
         async_returning: analyzer.async_returning.clone(),
-        awaited_calls: HashSet::new(),
-        adapted_instances: HashMap::new(),
+        awaited_calls: HashSet::default(),
+        adapted_instances: HashMap::default(),
         return_sites: analyzer.return_sites.clone(),
         clone_sites,
         return_clone_sites,

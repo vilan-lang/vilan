@@ -8,7 +8,7 @@
 //! from two or more arms → shared, which v1 sends eager. Nothing here
 //! changes emission; the plan is a report.
 
-use std::collections::HashSet;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::id::Id;
@@ -68,8 +68,8 @@ pub struct Gate {
 
 impl ChunkPlan {
     /// Each function's chunk index, for the emitter's partition.
-    pub fn members(&self) -> std::collections::HashMap<Id, usize> {
-        let mut members = std::collections::HashMap::new();
+    pub fn members(&self) -> HashMap<Id, usize> {
+        let mut members = HashMap::default();
         for (index, chunk) in self.chunks.iter().enumerate() {
             for id in &chunk.ids {
                 members.insert(*id, index);
@@ -115,7 +115,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
 
     // Eager reach: main + every module binding, with arm-attributed edges
     // held out at each recognized render closure.
-    let mut eager = HashSet::new();
+    let mut eager = HashSet::default();
     let mut queue: Vec<Id> = Vec::new();
     if let Some(main) = program
         .functions
@@ -141,7 +141,7 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     let mut arm_reach: Vec<(String, Option<usize>, HashSet<Id>)> = Vec::new();
     for site in &sites {
         for arm in &site.arms {
-            let mut reach = HashSet::new();
+            let mut reach = HashSet::default();
             let mut queue = arm.seeds(program);
             while let Some(node) = queue.pop() {
                 if !reach.insert(node) {

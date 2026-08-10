@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::fx::FxHashMap as HashMap;
 
 use crate::id::Id;
 

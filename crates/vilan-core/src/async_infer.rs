@@ -24,7 +24,7 @@
 //!
 //! The result is `Program::async_functions`, read by the transformer.
 
-use std::collections::{HashMap, HashSet};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
@@ -38,12 +38,12 @@ use crate::type_::{Type, TypeId};
 /// `adapted_instances` and diagnostics, none of which the graph is derived
 /// from, so its view of the program is bit-for-bit the one it used to build.
 pub fn infer(program: &mut Program, graph: &CallGraph) {
-    let mut async_set: HashSet<Id> = HashSet::new();
+    let mut async_set: HashSet<Id> = HashSet::default();
 
     // Every value each binding ever holds — its initializer plus every
     // reassignment (`mut` rebinds) — for async ADOPTION: a binding holding
     // an async closure through any of them awaits when called.
-    let mut held_values: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut held_values: HashMap<Id, Vec<Id>> = HashMap::default();
     for (variable_id, variable) in &program.variables {
         if let Some(initial) = variable.initial {
             held_values.entry(*variable_id).or_default().push(initial);
@@ -144,7 +144,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // ADAPTS instead of erroring — the worklist above; void-returning
     // parameters stay legal as spawn semantics.)
     let mut divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    let no_flags: HashMap<Id, bool> = HashMap::new();
+    let no_flags: HashMap<Id, bool> = HashMap::default();
     for function_call in program.function_calls.values() {
         let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
             continue;
@@ -338,7 +338,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                             &held_values,
                             &async_set,
                             &initializer_adaptive,
-                            &HashMap::new(),
+                            &HashMap::default(),
                             &[],
                             callee,
                             call.call_id,
@@ -788,9 +788,9 @@ fn compute_adaptation(
         members
     };
 
-    let mut instance_async: HashMap<InstanceKey, bool> = HashMap::new();
-    let mut origins: HashMap<InstanceKey, Id> = HashMap::new();
-    let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::new();
+    let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
+    let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
+    let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::default();
     let mut pending: Vec<InstanceKey> = program
         .functions
         .keys()
@@ -809,7 +809,7 @@ fn compute_adaptation(
                     held_values,
                     async_set,
                     &adaptive,
-                    &HashMap::new(),
+                    &HashMap::default(),
                     &[],
                     callee,
                     call.call_id,
@@ -938,16 +938,16 @@ fn compute_adaptation(
 
     // --- Final pass: with every flag stable, collect each instance's
     // emission decisions and the context-dependent diagnostics.
-    let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::new();
+    let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::default();
     let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    let mut reported: HashSet<(Id, Id)> = HashSet::new();
+    let mut reported: HashSet<(Id, Id)> = HashSet::default();
     // A.4's escape positions, collected once — the same positions the global
     // divergence checks refuse, asked again per instance (`escape_violations_in`).
     // Deduplicated by value expression, so one escaping store reports once
     // however many instances reach it.
     let field_stores = plain_closure_field_stores(program);
     let return_sites = plain_closure_return_sites(program);
-    let mut reported_escapes: HashSet<Id> = HashSet::new();
+    let mut reported_escapes: HashSet<Id> = HashSet::default();
     // C1: this pass is FIRST-WINS across instances — `reported` and
     // `reported_escapes` let one instance claim a violation and silence the
     // others — and each instance anchors its diagnostic at its OWN origin. So a
@@ -1391,7 +1391,7 @@ fn sync_violations_at(
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
     };
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     for (argument, parameter) in function_call.argument_ids.iter().zip(&function.parameters) {
         // B61: the contract, not the adaptation shape — a `sync` marker binds a
         // void-returning callback too.
@@ -1459,7 +1459,7 @@ fn extern_violations_at(
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
     };
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     for (argument, parameter) in function_call.argument_ids.iter().zip(&external.parameters) {
         // The typed channel: a declared `async |…| T` parameter means the
         // host awaits the closure itself (`__nursery_run`'s body parameter).
@@ -1595,7 +1595,7 @@ fn escape_violations_in(
     reported: &mut HashSet<Id>,
     diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     let escapes_here = |value_id: Id| {
         value_async_in(program, held_values, async_set, flags, bits, value_id)
             && !value_async_in(program, held_values, async_set, &empty_flags, &[], value_id)
@@ -1782,7 +1782,7 @@ fn base_fixpoint(
 /// RESOLVED non-void return. `sync`/`async`-marked and void/unresolved ones
 /// never adapt (contract, spawn, or no known lie).
 fn adaptive_params_of(program: &Program) -> HashMap<Id, HashSet<Id>> {
-    let mut adaptive: HashMap<Id, HashSet<Id>> = HashMap::new();
+    let mut adaptive: HashMap<Id, HashSet<Id>> = HashMap::default();
     for (function_id, function) in &program.functions {
         let params: HashSet<Id> = function
             .parameters

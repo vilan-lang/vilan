@@ -19,8 +19,8 @@
 //! interpreter is deterministic by construction. Both caches hold leaked,
 //! process-global data, mirroring `load_package_module`'s parse cache.
 
+use crate::fx::FxHashMap as HashMap;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -135,7 +135,7 @@ pub(crate) fn scope_for<'r>(
     key: &ModuleKey,
     nodes: &NodeList,
 ) -> MacroScope<'r> {
-    let mut names: HashMap<String, &MacroDef> = HashMap::new();
+    let mut names: HashMap<String, &MacroDef> = HashMap::default();
     // 1. The std prelude.
     for (module_key, macros) in &registry.by_module {
         if matches!(module_key, ModuleKey::Std(_)) {
@@ -743,11 +743,11 @@ fn compile_world(
     std: &PackageSpec,
     macro_std: &PackageSpec,
 ) -> Result<Arc<World>, Vec<Error>> {
-    let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(world) = worlds.lock().unwrap().get(&world_key) {
         return Ok(world.clone());
     }
-    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(errors) = failures.lock().unwrap().get(&failure_key) {
         // The cached spans are true for this definition layout; only a span
         // at the END of a since-shortened file could overshoot — clamp it.
@@ -936,7 +936,7 @@ pub(crate) fn expand_source(
         std,
         limits,
         rust_source: String::new(),
-        rust_traits: std::collections::HashSet::new(),
+        rust_traits: std::collections::HashSet::default(),
         rust_any_service: false,
         backed_enums: false,
         bare_lowered_enums: false,
@@ -1620,7 +1620,7 @@ fn cached_run(
         arguments.hash(&mut hasher);
         hasher.finish()
     };
-    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(raw) = expansions.lock().unwrap().get(&key).copied() {
         return Ok(raw);
     }
@@ -1722,7 +1722,7 @@ fn parse_cached(text: &str) -> Result<(&'static NodeList<'static>, &'static str)
     static PARSES: OnceLock<Mutex<HashMap<u64, (&'static NodeList<'static>, &'static str)>>> =
         OnceLock::new();
     let key = content_key(text);
-    let parses = PARSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let parses = PARSES.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(cached) = parses.lock().unwrap().get(&key).copied() {
         return Ok(cached);
     }

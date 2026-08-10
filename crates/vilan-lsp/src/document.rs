@@ -2,12 +2,13 @@
 //! handlers run against it: position→entity lookup, hover, go-to-definition,
 //! find-references, and rename.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Implementation, Parameter, SourceId};
+use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
@@ -1005,7 +1006,7 @@ impl Document {
             entity_spans: Vec::new(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
-            platform_requirements: HashMap::new(),
+            platform_requirements: HashMap::default(),
             manifest_problem: None,
         }
     }

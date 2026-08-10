@@ -85,7 +85,7 @@ fn folded(program: &Program, options: &BuildOptions, name: &str) -> Option<Const
 /// several times.
 fn fold_of<'a>(
     program: &Program,
-    results: &'a std::collections::HashMap<vilan_core::id::Id, ConstValue>,
+    results: &'a vilan_core::fx::FxHashMap<vilan_core::id::Id, ConstValue>,
     name: &str,
 ) -> Option<&'a ConstValue> {
     results.get(&initializer_of(program, name))
@@ -584,7 +584,7 @@ fn folding_is_identical_across_repeated_sweeps() {
     // Compared as sorted text, not as maps: std folds `f64::NAN` among its
     // constants, and `NaN != NaN` would fail a structural comparison of two
     // genuinely identical results.
-    let canonical = |results: std::collections::HashMap<vilan_core::id::Id, ConstValue>| {
+    let canonical = |results: vilan_core::fx::FxHashMap<vilan_core::id::Id, ConstValue>| {
         let mut rendered: Vec<String> = results
             .into_iter()
             .map(|(id, value)| format!("{}={value:?}", id.0))
