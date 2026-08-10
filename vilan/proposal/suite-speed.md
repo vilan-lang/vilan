@@ -1182,6 +1182,19 @@ exactly `RandomState`'s behaviour — is load-bearing, and `diagnostic_determini
 calls it. `VILAN_HASH_SHUFFLE=1` turns it on for a whole suite run, which
 restores the old net on demand over every test rather than just this one.
 
+That whole-suite mode was not just provided, it was run: **`VILAN_HASH_SHUFFLE=1
+cargo nextest run --workspace` is 3339/3339**, every corpus golden and every
+diagnostic byte-identical with each of the ~600 tables per analysis carrying a
+different seed. It is the closest thing available to re-running the entire suite
+under the old `RandomState`, and it says the constant seed is hiding nothing.
+
+The first attempt at that run was 4 red, and all four were `fx.rs`'s own tests
+asserting properties of the *default* seed — which `VILAN_HASH_SHUFFLE=1`
+changes out from under them. No compiler test failed. Those four now name the
+seed they mean instead of taking it from `Default`, and the shuffle test pins
+both directions, so the instruction in `fx.rs`'s header is one a reader can
+actually follow.
+
 ### Before / after
 
 Cold `vilan check` per module, fresh process. Ir is the primary column.

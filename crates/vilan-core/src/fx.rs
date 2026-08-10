@@ -254,8 +254,19 @@ mod tests {
     use super::*;
     use std::hash::Hash;
 
+    /// The unseeded builder, spelled out rather than taken from `Default`.
+    ///
+    /// Every test below pins the ALGORITHM, which is the constant-seed
+    /// behaviour, and `Default` stops producing it under `VILAN_HASH_SHUFFLE=1`
+    /// — a mode the module header tells people to run whole suites in. Naming
+    /// the seed here is what keeps `VILAN_HASH_SHUFFLE=1 cargo nextest run
+    /// --workspace` green, so that instruction stays true.
+    fn unseeded() -> FxBuildHasher {
+        FxBuildHasher { seed: 0 }
+    }
+
     fn hash_of<T: Hash>(value: &T) -> u64 {
-        FxBuildHasher::default().hash_one(value)
+        unseeded().hash_one(value)
     }
 
     /// The claim the missing finalizer rests on: for a power-of-two bucket
@@ -334,12 +345,26 @@ mod tests {
     }
 
     /// A shuffled builder is a different hash function, which is the whole
-    /// point of the escape hatch — and shuffling must not be the default, or
-    /// every measurement in `suite-speed.md` §10 would be noise.
+    /// point of the escape hatch — and shuffling must be OFF unless asked for,
+    /// or every measurement in `suite-speed.md` §10 would be noise.
+    ///
+    /// Both directions are pinned, because `VILAN_HASH_SHUFFLE=1` is a
+    /// supported way to run the suite and "on" has to be as true as "off".
     #[test]
     fn the_shuffle_reseeds_and_is_off_until_asked_for() {
-        let quiet = FxBuildHasher::default();
-        assert_eq!(quiet, FxBuildHasher::default(), "off by default");
+        if shuffling() {
+            assert_ne!(
+                FxBuildHasher::default(),
+                FxBuildHasher::default(),
+                "asked for: every table gets its own seed"
+            );
+        } else {
+            assert_eq!(
+                FxBuildHasher::default(),
+                FxBuildHasher::default(),
+                "off by default: every table gets the constant seed"
+            );
+        }
 
         // Not `enable_seed_shuffle()`: that is process-wide and one-way, and
         // this test shares its process with the ones above.
