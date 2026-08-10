@@ -2469,21 +2469,62 @@ impl<'src> Transformer<'src> {
     /// parameter, or `&place` of a scalar place directly.
     fn derefs_scalar_view(&self, operand: Id) -> bool {
         match self.program.entity_map.get(&operand) {
+            Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
+            _ => self.emits_scalar_view_pair(operand),
+        }
+    }
+
+    /// Whether an expression's own emission IS a scalar `(base, key)` pair — a
+    /// scalar view binding / parameter, or a call returning a scalar view.
+    ///
+    /// Deliberately not the `&place` case, which `derefs_scalar_view` adds for
+    /// its own question: at B108's return seam a `&place` leaf emits the PLACE
+    /// READ, not a pair (the `Expr::Reference` arm decides that with the seam in
+    /// hand), so asking "is this already a pair" must say no about it.
+    fn emits_scalar_view_pair(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
             Some(Expr::Local(binding)) => {
                 self.program.primitive_views.contains(binding)
                     || self.generic_ref_param_is_scalar(*binding)
             }
-            Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
             // `*obj.slot()` — a `borrows` call returning a scalar view. A
             // scalar `Shared::write()` is one too: it lowers to the `(base,
             // key)` pair, and the analyzer cannot classify it (the pointee is
             // generic until this monomorphization).
             Some(Expr::Call(..)) => {
-                self.program.scalar_view_calls.contains(&operand)
-                    || self.call_is_scalar_shared_write(operand)
+                self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
             }
             _ => false,
         }
+    }
+
+    /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
+    /// A view produced by a CALL is bound to a temp first, so the two reads do
+    /// not evaluate it twice; a plain binding or reference is cheap to repeat.
+    fn emit_scalar_view_read(
+        &mut self,
+        view_id: Id,
+        view: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let mut view = view;
+        if matches!(self.program.entity_map.get(&view_id), Some(Expr::Call(..))) {
+            let name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(view),
+            }));
+            view = js::Node::Local(name);
+        }
+        let base = js::Node::PropertyIndex(
+            Box::new(view.clone()),
+            Box::new(js::Node::Number("0".to_string(), None)),
+        );
+        let key = js::Node::PropertyIndex(
+            Box::new(view),
+            Box::new(js::Node::Number("1".to_string(), None)),
+        );
+        js::Node::PropertyIndex(Box::new(base), Box::new(key))
     }
 
     /// Whether a call expression is a `Shared::write()` with a scalar pointee.
@@ -2730,6 +2771,15 @@ impl<'src> Transformer<'src> {
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        // B108: the same seam for a leaf whose runtime representation is a
+        // scalar `(base, key)` view — a `&mut i32` parameter forwarded straight
+        // out, a scalar `borrows` call, a generic `&T` at a scalar
+        // instantiation. `__clone` cannot collapse a pair (and the type filter
+        // rightly kept scalars out of `return_clone_sites`); a scalar's copy IS
+        // its read (B81), so the crossing emits the read.
+        if self.program.return_view_reads.contains(&id) && self.emits_scalar_view_pair(id) {
+            return Some(self.emit_scalar_view_read(id, node, block));
+        }
         // Rule 1's return clause: a tail/`ret` leaf that hands back a place the
         // body does not own copies HERE, where the place itself is emitted, so
         // that a tail `if`/`match` copies only in the arms that owe it. Keyed by
@@ -3701,7 +3751,14 @@ impl<'src> Transformer<'src> {
             // aggregate is the value's own JS reference (an aggregate is its own
             // view), so it passes through unchanged.
             Expr::Reference(operand, _) => {
-                if self.emits_scalar_view_ref(id, *operand) {
+                // B108/B109: at a by-value return seam the reference CROSSES to a
+                // value, so what leaves is the place the reference names — its
+                // read, never the pair. (An aggregate view is the value's own JS
+                // reference, so it takes this path anyway; only a scalar's
+                // representation differs, which is the whole of B108.)
+                if self.emits_scalar_view_ref(id, *operand)
+                    && !self.program.return_view_reads.contains(&id)
+                {
                     let (base, key) = match self.program.entity_map.get(operand) {
                         Some(Expr::Field(subject, _, field_index)) => (
                             self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
@@ -3738,29 +3795,11 @@ impl<'src> Transformer<'src> {
             // Deref of an aggregate view is the operand itself; deref of a scalar
             // `(base, key)` view reads/writes through `operand[0][operand[1]]`.
             Expr::Dereference(operand) => {
-                let value = self.walk_entity(*operand, block);
-                if self.derefs_scalar_view(*operand) {
-                    let mut view = value.unwrap_or(js::Node::Void);
-                    // A view produced by a call (`*obj.slot()`) is bound to a temp
-                    // first, so the `[0]` and `[1]` reads don't evaluate the call
-                    // twice; a plain binding / reference is cheap to repeat.
-                    if matches!(self.program.entity_map.get(operand), Some(Expr::Call(..))) {
-                        let name = self.ng.next_name();
-                        block.push(js::Node::ConstVariable(js::Variable {
-                            name: name.clone(),
-                            value: Box::new(view),
-                        }));
-                        view = js::Node::Local(name);
-                    }
-                    let base = js::Node::PropertyIndex(
-                        Box::new(view.clone()),
-                        Box::new(js::Node::Number("0".to_string(), None)),
-                    );
-                    let key = js::Node::PropertyIndex(
-                        Box::new(view),
-                        Box::new(js::Node::Number("1".to_string(), None)),
-                    );
-                    return Some(js::Node::PropertyIndex(Box::new(base), Box::new(key)));
+                let operand = *operand;
+                let value = self.walk_entity(operand, block);
+                if self.derefs_scalar_view(operand) {
+                    let view = value.unwrap_or(js::Node::Void);
+                    return Some(self.emit_scalar_view_read(operand, view, block));
                 }
                 return value;
             }
