@@ -548,6 +548,28 @@ fn assert_fails_with(source: &str, message_part: &str) {
     }
 }
 
+/// Asserts compilation fails with EXACTLY ONE diagnostic containing
+/// `message_part` — for a rule whose reach is wide enough that the multiplicity
+/// is part of the claim (B103: one inferred `List<Guard>` reaches R10 as the
+/// literal, the binding, every read of it, and the aggregate holding it, and it
+/// is one mistake).
+#[track_caller]
+fn assert_fails_once_with(source: &str, message_part: &str) {
+    match compile(source) {
+        Ok(_) => panic!("expected a compile error, but it compiled cleanly"),
+        Err(errors) => {
+            let matching = errors
+                .iter()
+                .filter(|error| error.contains(message_part))
+                .count();
+            assert_eq!(
+                matching, 1,
+                "expected exactly one diagnostic containing {message_part:?}; got: {errors:#?}"
+            );
+        }
+    }
+}
+
 /// Asserts compilation fails and that NO diagnostic mentions `message_part` —
 /// for a fix whose point is that a misleading message is gone, not merely that
 /// a better one was added beside it.
@@ -31193,6 +31215,302 @@ fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
         fun sink(holder: Holder<Db>) {}
         fun main() {}
         "#,
+    );
+}
+
+// --- B103: R10 is asked of an INFERRED container too — containment decides -----
+// --- whatever the type's provenance (destruction.md §4 R10).
+
+/// A resource whose teardown is observable, for the B103 routes. Each route is
+/// the SAME program in a different spelling: a `List` (or `Shared`, or a tuple)
+/// holding a `Guard`, with nothing written down for the walk to record.
+fn b103_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn r10_refuses_an_inferred_list_of_a_resource() {
+    // The filed repro. `mut arr: List<Guard> = [..]` was rejected as designed and
+    // the same program with the annotation DELETED compiled — and leaked, since a
+    // `List` is not a resource by containment and the binding took no teardown.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr = [Guard { label = "one" }];
+            print("end");
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_grown_from_an_empty_literal() {
+    // The element type arrives at the `push`, not at the literal — an empty
+    // literal mints an inference slot (B16), and the slot grounds to `Guard`.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr = [];
+            arr.push(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_from_an_inferred_return_type() {
+    // No annotation anywhere: the function's return type is inferred from its
+    // tail, and the caller's binding from the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun make() { [Guard { label = "one" }] }
+        fun main() {
+            let xs = make();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_a_generic_hands_back_at_a_resource() {
+    // `List<T>` is written, but it is a container at a RESOURCE only where `T`
+    // binds — and that binding is inferred at the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun wrap<T>(own value: T): List<T> { [value] }
+        fun main() {
+            let xs = wrap(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_a_closure_returns() {
+    // A closure's return type is never written, so the container exists only in
+    // the solver's answer for the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let make = || [Guard { label = "one" }];
+            let xs = make();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_reached_through_an_inferred_aggregate() {
+    // A19's per-instantiation descent, at an instantiation nobody wrote:
+    // `Inner<Guard>` comes from the field initializer's type.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        struct Inner<T> { items: List<T> }
+        fun main() {
+            let holder = Inner { items = [Guard { label = "one" }] };
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`, reached through `Inner.items`",
+    );
+}
+
+#[test]
+fn r10_refuses_an_inferred_shared_of_a_resource() {
+    // Not only `List`: every rejecting head is asked the same question, and
+    // `Shared::new(..)` names none of them.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`Shared` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_nested_inside_an_inferred_list() {
+    // The descent now enters a container's OWN type arguments. `List<List<Guard>>`
+    // holds no resource argument — `List<Guard>` is not a resource — so the outer
+    // head alone answers "no", and the inner spelling that used to carry the
+    // report does not exist here.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut nested = [[Guard { label = "one" }]];
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_inside_an_inferred_tuple() {
+    // A tuple is a value aggregate with no head to ask, and the descent had no
+    // arm for one at all.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let pair = (1, [Guard { label = "one" }]);
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_argument_bound_to_a_generic_parameter() {
+    // The container type exists only as the callee's `List<T>` and the argument's
+    // own (unrecorded) type: R10 asked per instantiation is what sees it.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun consume<T>(own items: List<T>) {}
+        fun main() {
+            consume([Guard { label = "one" }]);
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_a_generic_body_builds() {
+    // The half no whole-program sweep can reach: the `List<Guard>` exists only
+    // INSIDE the instantiated body, and the caller's program never has the type.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun stash<T>(own value: T) { let items = [value]; }
+        fun main() {
+            stash(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_temporary_that_binds_no_name() {
+    // Nothing records this list's type: it is never bound, and `len` is native so
+    // there is no body for the per-instantiation scan. The method call's own
+    // substitution is where the receiver's type is written down.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let count = [Guard { label = "one" }].len();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_reports_an_inferred_container_once_per_container() {
+    // The multiplicity IS the claim (B5). The inferred type reaches the check
+    // from the literal, the binding, both reads, and the `Inner<Guard>` holding
+    // it — and a second binding of the same type is the same fact.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut first = [Guard { label = "one" }];
+            mut second = [Guard { label = "two" }];
+            first.push(Guard { label = "three" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_reports_an_annotated_container_once_even_though_inference_agrees() {
+    // The written spelling keeps its anchor and its single report: the inferred
+    // tier never repeats a container a spelling already named.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr: List<Guard> = [Guard { label = "one" }];
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_leaves_an_inferred_container_of_data_alone() {
+    // The other direction, and the reason the sweep cannot simply reject every
+    // inferred container: a `List` of data is the ordinary case, and the resource
+    // beside it drops on its own.
+    assert_compiles_and_runs(
+        &b103_program(
+            r#"
+        fun main() {
+            mut names = ["a"];
+            names.push("b");
+            let held = Guard { label = "one" };
+            print(i"{names.len()}");
+        }
+        "#,
+        ),
+        "2\ndropped one\n",
+    );
+}
+
+#[test]
+fn r10_leaves_an_inferred_fixed_array_of_resources_alone() {
+    // The pinned control, in the inferred spelling: `[Guard; 2]` is a value
+    // aggregate, a resource BY CONTAINMENT, and it drops in reverse element
+    // order — which is why R10 must not reach it, annotation or none.
+    assert_compiles_and_runs(
+        &b103_program(
+            r#"
+        fun main() {
+            let pair: [Guard; 2] = [Guard { label = "one" }, Guard { label = "two" }];
+            print("end");
+        }
+        "#,
+        ),
+        "end\ndropped two\ndropped one\n",
     );
 }
 

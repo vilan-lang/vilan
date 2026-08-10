@@ -20,6 +20,21 @@ Two smaller things fall out. A backed enum is now accepted as a *field* of a `[d
 
 ---
 
+**Deleting a type annotation no longer lets a resource escape into a `List`.** `mut arr: List<Guard> = [Guard { .. }]` was refused, as designed — a native container's internals are host code the move checker cannot see, so it cannot promise to close what you put in one. Delete the annotation and the identical program compiled. Worse, it ran: the `Guard` was never destroyed, because a `List` is not a resource by containment and so the binding took no scope-end teardown at all. Two rules missed the same program at once, and which one you got came down to whether you had written the type down.
+
+The rule reads the same now whatever the type's provenance, because containment is a question about a type and not about a spelling. `mut arr = [Guard { .. }]`, `mut arr = []` grown by a `push`, a function whose return type is inferred, a closure's result, `Shared::new(Guard { .. })`, a `Guard` list reaching a container through an inferred `Inner { items = .. }`, one nested inside another list or sitting in a tuple, and a list built inside a generic body out of that body's own `T` — every one of them is refused, once, at the earliest place the value appears.
+
+The last of those is the case no whole-program check can see: `fun stash<T>(own value: T) { let items = [value]; }` builds a `List<Guard>` that exists only inside the instantiated body, and the caller writes `stash(Guard { .. })` and never has the type. It is refused at the instantiation site, with a note pointing at the line in the generic body that builds the container.
+
+Two older holes closed with it, both about nesting and both reachable from a written type too. `List<List<Guard>>` holds no resource *argument* — a `List<Guard>` is not itself a resource — so the outer type answered "nothing here", and only the separately-written inner spelling ever reported. A tuple or a fixed array was not descended into at all, so a `Guard` list inside one was invisible.
+
+What is *not* refused is the fixed-array spelling, and that is the point of the boundary: `[Guard; 2]` is a value aggregate, a resource by containment, and its elements drop in reverse order at the end of the scope. `Option<Guard>` is likewise unaffected — it is the sanctioned resource container. If you want several resources, hold them in a fixed array or in a struct of your own.
+
+Nothing in the standard library, the examples, the documentation, or the regression corpus builds a container at a resource, so nothing had to change and no emitted output moved.
+
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
