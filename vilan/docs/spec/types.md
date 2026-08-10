@@ -105,6 +105,28 @@ receiver already *is* that value, so the call lowers to the receiver.
 fallible parse, matching `str::parse_i32`. Declaring your own `value` or
 `parse` on a backed enum is a duplicate-member error.
 
+Every variant takes part, including one that *continued* the sequence
+instead of writing a value. There is one rule about what a variant is
+worth, and the conversions read the same answer the lowering does:
+
+```vilan
+import std::print;
+import std::option::Option::{ self, Some, None };
+
+enum Level { Low = 0, Mid, High }
+
+fun main() {
+	print(Level::Mid.value());  // 1 — continued from Low
+	print(match Level::parse(2) {
+		Some(let level) => level.value(),
+		None => -1,
+	});                         // 2 — High
+}
+```
+
+(A **string** backing is the exception, and not a new one: there is no
+successor of `"start"`, so every variant must write its own.)
+
 A backed enum is also **`Hashable`**, implemented by the compiler on the
 same opt-in and for the same reason `value()` costs nothing: the enum IS
 its backing value, and that value is already a key.

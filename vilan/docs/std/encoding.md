@@ -133,7 +133,9 @@ Align { Start = "flex-start", … }` — encodes as that value rather than as
 its variant name, for both `Json` and `Wire`. `Align::Start` is
 `"flex-start"` on the wire, not `"Start"`, and it decodes through
 `Align::parse`, so a peer sending a value outside the set is a decode
-error rather than a confidently-wrong variant.
+error rather than a confidently-wrong variant. One explicit value backs
+the whole enum, so `enum Level { Low = 0, Mid, High }` puts `1` on the
+wire for `Mid`, not `"Mid"`.
 
 **Adding a backing value to an existing derived enum is a wire-format
 break, and so is removing one.** An enum with no backing value keeps the
