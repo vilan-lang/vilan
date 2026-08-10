@@ -12,6 +12,7 @@ pub mod context;
 pub mod elements;
 pub mod error;
 pub mod formatter;
+pub mod fx;
 pub mod git_dep;
 pub mod id;
 pub mod init_order;
