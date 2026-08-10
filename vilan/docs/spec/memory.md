@@ -544,6 +544,23 @@ changes no ownership and is policed by rule 4.
   — whose storage is a `Shared<T>` — is refused exactly as
   `Shared<Database>` is. Holding the resource in a struct field of your own
   is the sanctioned alternative, and stays legal.
+
+  It is read per instantiation whatever the type's **provenance**: an
+  inferred container is a container. Deleting the annotation changes
+  nothing, and neither does never writing one —
+
+  ```vilan,ignore
+  mut arr: List<Guard> = [Guard { .. }];   // rejected
+  mut arr = [Guard { .. }];                // rejected, identically
+  let cell = Shared::new(Guard { .. });    // and so is this
+  fun stash<T>(own value: T) { let items = [value]; }   // rejected at T := Guard
+  ```
+
+  — because containment is a question about a type, not about a spelling.
+  The nesting is read the same way: a container inside a container, a tuple,
+  or a fixed array is found wherever it sits. A **fixed array** of resources
+  (`[Guard; 2]`) is not a container in this sense: it is a value aggregate,
+  a resource by containment, and it drops its elements in reverse order.
 - **R11: generics must be move-clean per instantiation.** Instantiating a
   type parameter with a resource type re-checks the instantiated body under
   the affine rules (T := the resource): every T-typed value is used at most

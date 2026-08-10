@@ -632,12 +632,17 @@ pub struct Struct<'src> {
     pub resource: bool,
 }
 
-/// A native container holding a resource, found at or beneath a written type
-/// application (R10 / A19): the container's display name, the resource argument
-/// it holds, and the member chain the search took to reach it — empty when the
-/// application IS the container.
+/// A native container holding a resource, found at or beneath a type the
+/// program uses (R10 / A19 / B103): the container's display name, the resource
+/// argument it holds, and the member chain the search took to reach it — empty
+/// when the searched type IS the container.
 struct ContainerResource<'src> {
     container_name: &'static str,
+    /// The container's own instantiation (`List<Guard>`) — the offending type
+    /// itself, as distinct from the type the search started at. B103's dedup
+    /// key: `Inner<Guard>` and the `List<Guard>` its field holds are one
+    /// mistake, and reporting per found container collapses them to one report.
+    container_type: TypeId,
     argument: TypeId,
     field_path: Vec<&'src str>,
     /// The aggregate whose member completes the chain, and that member's name
@@ -1391,6 +1396,11 @@ pub struct Analyzer<'src> {
     /// once types resolve: R10 (destruction.md §4) rejects a resource type
     /// argument to a native container / external generic.
     generic_type_applications: Vec<(TypeId, Span)>,
+    /// The container instantiations R10 has already reported, by structural key
+    /// (`container_structure_key`). R11's per-instantiation half runs after the
+    /// whole-program one and consults it, so a `List<Guard>` the caller was
+    /// already told about is not told again from inside the generic body.
+    reported_container_structures: HashSet<String>,
     /// Every place expression (`Local`, `Field`, `Index`, `TupleIndex`) whose
     /// resolved type is a resource — computed by the affine move checker
     /// (`check_resource_moves`, destruction.md §4). Read afterwards by
@@ -2224,6 +2234,7 @@ impl<'src> Analyzer<'src> {
             partialeq_types_to_check: Vec::new(),
             resource_classification: HashMap::new(),
             generic_type_applications: Vec::new(),
+            reported_container_structures: HashSet::new(),
             resource_value_places: HashSet::new(),
             dropped_bindings: HashSet::new(),
             overwrite_drops: HashMap::new(),
@@ -5329,15 +5340,170 @@ impl<'src> Analyzer<'src> {
     /// written generically and holds nothing yet. `Signal<T>`'s storage is a
     /// `Shared<T>`, so `Shared<Database>` was refused while `Signal<Database>` —
     /// the same container, holding the same resource — compiled clean.
+    ///
+    /// And it is per-instantiation whatever the type's PROVENANCE (B103). The
+    /// written applications were the rule's original reach and they were its
+    /// whole reach: `mut arr: List<Guard> = [..]` was refused while `mut arr =
+    /// [..]` — the same program with the annotation deleted — compiled, and the
+    /// element was never destroyed (a `List` is not a resource by containment,
+    /// so the binding took no scope-end teardown either). Containment is a
+    /// question about a TYPE, so it is asked of every type the program's values
+    /// carry, inferred ones included. Two tiers, because a spelling is a site a
+    /// user can point at and an inferred type is not:
+    ///
+    /// - **Written applications report per site**, exactly as before — two
+    ///   spellings of `List<Db>` are two places to fix and stay two reports.
+    /// - **Inferred types report once per offending CONTAINER instantiation**,
+    ///   anchored at the earliest site carrying it, and never for a container a
+    ///   written application already reported. That is B5 by construction: one
+    ///   inferred `List<Guard>` reaches the check as the list literal, the
+    ///   binding, every read of it, and the `Inner<Guard>` aggregate holding it
+    ///   — one mistake, so one diagnostic.
     fn check_container_resource_arguments(&mut self) {
         let applications = std::mem::take(&mut self.generic_type_applications);
         // Nothing is a resource unless something declares itself one, so the
-        // whole check — the per-instantiation descent included — is dead work
-        // for a program with no `resource` declaration anywhere.
+        // whole check — the per-instantiation descent and the inferred sweep
+        // included — is dead work for a program with no `resource` declaration
+        // anywhere.
         if !self.any_declared_resource() {
             return;
         }
-        // The resource-rejecting heads, by entity id -> display name.
+        let containers = self.resource_rejecting_containers();
+        let no_generic_resources = HashSet::new();
+        let mut memo = HashMap::new();
+        // Two dedup keys, because they answer two different questions. The
+        // TypeId is INSTANTIATION identity — the analyzer interns per
+        // application, not structurally (B95's doctrine), so two spellings of
+        // `List<Db>` are two ids and stay two reports, while `List<List<Db>>`
+        // and its own inner spelling share one id and collapse. The canonical
+        // rendering is STRUCTURAL identity, and it is what the inferred tier
+        // keys on: an inferred type has no spelling to point at, so it is one
+        // fact reported once however many ids carry it.
+        let mut reported_instantiations: HashSet<TypeId> = HashSet::new();
+        let mut reported_structures: HashSet<String> = HashSet::new();
+        for (type_id, span) in applications {
+            let Some(found) =
+                self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
+            else {
+                continue;
+            };
+            reported_structures.insert(self.container_structure_key(found.container_type));
+            if !reported_instantiations.insert(found.container_type) {
+                continue;
+            }
+            self.report_container_resource(&found, type_id, span, None);
+        }
+        // The inferred tier. Sorted by span so "the earliest site" is a real
+        // answer and not a hash order (C1, determinism); the entity id breaks
+        // ties totally.
+        let mut sites = self.inferred_container_sites();
+        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
+        // One descent per distinct site TYPE: the sites are many and the types
+        // few (every read of one binding repeats its type), and only the first
+        // site of a type could ever be the earliest.
+        let mut examined: HashSet<TypeId> = HashSet::new();
+        for (_, type_id, span) in sites {
+            if !examined.insert(type_id) {
+                continue;
+            }
+            let Some(found) =
+                self.container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
+            else {
+                continue;
+            };
+            if !reported_structures.insert(self.container_structure_key(found.container_type)) {
+                continue;
+            }
+            reported_instantiations.insert(found.container_type);
+            self.report_container_resource(&found, type_id, span, None);
+        }
+        // The receiver of a NATIVE method call, whose type nothing else records.
+        // `[Guard { .. }].len()` binds no name, and a list literal carries no
+        // type entry of its own — but the call's method substitution binds
+        // `List`'s own parameter, which IS the receiver's type, spelled by the
+        // solver instead of by the program.
+        for (container_id, arguments, span) in self.container_receiver_sites(&containers) {
+            let container_type = Type::Struct(container_id, arguments).get_type_id(self);
+            let Some(found) = self.container_resource_at(
+                container_type,
+                &containers,
+                &no_generic_resources,
+                &mut memo,
+            ) else {
+                continue;
+            };
+            if !reported_structures.insert(self.container_structure_key(found.container_type)) {
+                continue;
+            }
+            self.report_container_resource(&found, container_type, span, None);
+        }
+        self.reported_container_structures = reported_structures;
+    }
+
+    /// Every method call whose substitution instantiates a REJECTING container's
+    /// own type parameters, as `(container id, its arguments here, the call's
+    /// span)`. The receiver's type by another route: a native method has no body
+    /// for R11 to scan and its receiver expression carries no recorded type, so
+    /// this is the only place `[Guard { .. }].len()`'s `List<Guard>` is written
+    /// down anywhere.
+    fn container_receiver_sites(
+        &self,
+        containers: &[(Id, &'static str)],
+    ) -> Vec<(Id, Vec<TypeId>, Span)> {
+        let mut sites = Vec::new();
+        for (call_id, substitution) in &self.method_call_substitution {
+            let Some(span) = self.span_map.get(call_id) else {
+                continue;
+            };
+            for (container_id, _) in containers.iter().copied() {
+                let constraints = self.declared_parameter_constraint_ids(container_id);
+                if constraints.is_empty()
+                    || !constraints
+                        .iter()
+                        .any(|constraint| substitution.contains_key(constraint))
+                {
+                    continue;
+                }
+                // An unbound parameter stays itself — the container is still
+                // instantiated at whatever the substitution did bind.
+                let arguments: Vec<TypeId> = constraints
+                    .iter()
+                    .map(|constraint| substitution.get(constraint).copied().unwrap_or(*constraint))
+                    .collect();
+                sites.push((container_id, arguments, **span));
+            }
+        }
+        sites.sort_unstable_by_key(|(container_id, arguments, span)| {
+            (
+                span.start,
+                span.end,
+                container_id.0,
+                arguments
+                    .iter()
+                    .map(|argument| argument.0)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        sites
+    }
+
+    /// A container instantiation's STRUCTURAL identity, for a dedup that has to
+    /// see two separately-interned `List<Guard>`s as one fact. `TypeId` cannot
+    /// serve: the analyzer interns per application rather than structurally, so
+    /// a binding's type and its own annotation's type are different ids for the
+    /// same type.
+    fn container_structure_key(&self, type_id: TypeId) -> String {
+        let mut buf = String::new();
+        let mut visiting = HashSet::new();
+        self.render_type_canonical(type_id, 0, &mut visiting, &mut buf);
+        buf
+    }
+
+    /// The heads R10 refuses a resource argument to, by entity id -> display
+    /// name: the native containers and the external generics. `Option` is the
+    /// sanctioned resource container (a vilan enum, checkable under R11), so it
+    /// is deliberately absent.
+    fn resource_rejecting_containers(&self) -> Vec<(Id, &'static str)> {
         let mut containers: Vec<(Id, &'static str)> = Vec::new();
         for name in ["List", "Map", "Set", "Shared", "Context"] {
             if let Some(id) = self.primitive_struct_ids.get(name).copied() {
@@ -5350,27 +5516,74 @@ impl<'src> Analyzer<'src> {
         if let Some(id) = self.task_struct_id {
             containers.push((id, "Task"));
         }
-        for (type_id, span) in applications {
-            let mut path = Vec::new();
-            let mut visiting = HashSet::new();
-            let Some(found) =
-                self.container_resource_in(type_id, &containers, &mut path, &mut visiting)
-            else {
-                continue;
-            };
-            let container_name = found.container_name;
-            let rendered = self.pretty_print_type(&found.argument.get_type(self), &HashMap::new());
-            // The head the user wrote, so the path reads as they see it.
-            let reached = (!found.field_path.is_empty())
-                .then(|| {
-                    let head = self.type_head_name(type_id).unwrap_or("this type");
-                    format!(", reached through `{head}.{}`", found.field_path.join("."))
+        containers
+    }
+
+    /// Every type an INFERRED value in the program carries, with the site that
+    /// carries it: each expression's resolved type, and each binding's — a
+    /// binding's own span is the anchor a user can act on when the initializer
+    /// is a call whose span says nothing about the container. Deliberately
+    /// maximal rather than a curated set of "origins": R10 is a fact about a
+    /// type, so under-collecting is a hole and over-collecting costs nothing
+    /// once the caller dedups per found container.
+    fn inferred_container_sites(&self) -> Vec<(Id, TypeId, Span)> {
+        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
+        for expr_id in self.expr_id_to_expr_map.keys().copied() {
+            if let Some(type_id) = self.resolved_type_id_of(expr_id)
+                && let Some(span) = self.span_map.get(&expr_id)
+            {
+                sites.push((expr_id, type_id, **span));
+            }
+        }
+        for variable in self.variables.values() {
+            sites.push((variable.id, variable.type_id, variable.name_span));
+        }
+        for parameter in self.parameters.values() {
+            if let Some(span) = self.span_map.get(&parameter.id) {
+                sites.push((parameter.id, parameter.type_id, **span));
+            }
+        }
+        sites
+    }
+
+    /// R10's diagnostic. `site_type_id` is the type the search started at (the
+    /// head whose name the reached-through path reads from); `at_instantiation`
+    /// carries R11's extra clause — the generic body's name, the in-body span the
+    /// note anchors at, and that body's entity id (for the note's file) — when
+    /// the container exists only under a generic instantiation.
+    fn report_container_resource(
+        &mut self,
+        found: &ContainerResource<'src>,
+        site_type_id: TypeId,
+        span: Span,
+        at_instantiation: Option<(&'src str, Span, Id)>,
+    ) {
+        let container_name = found.container_name;
+        let rendered = self.pretty_print_type(&found.argument.get_type(self), &HashMap::new());
+        // The head the type is rooted at, so the path reads as the user sees it.
+        let reached = (!found.field_path.is_empty())
+            .then(|| {
+                let head = self.type_head_name(site_type_id).unwrap_or("this type");
+                format!(", reached through `{head}.{}`", found.field_path.join("."))
+            })
+            .unwrap_or_default();
+        // C3: one secondary note. At the instantiated body's own site when the
+        // container is R11's (the primary is the instantiation, in user code),
+        // otherwise at the member that holds the container — which for `Signal`
+        // is in `std`, so the primary stays in user code (A2) and the note names
+        // the file it points into.
+        let note = match at_instantiation {
+            Some((callee, body_span, callee_id)) => {
+                let note_source = self.source_of_id(callee_id);
+                Some(crate::error::Note {
+                    span: body_span,
+                    msg: format!("in `{callee}`, that `{container_name}` is built here"),
+                    source: (note_source != Some(self.current_source_id))
+                        .then_some(note_source)
+                        .flatten(),
                 })
-                .unwrap_or_default();
-            // C3: one secondary note, at the member that holds the container —
-            // which for `Signal` is in `std`, so the primary stays in user code
-            // (A2) and the note names the file it points into.
-            let note = found.declared_at.map(|(owner_id, member_span)| {
+            }
+            None => found.declared_at.map(|(owner_id, member_span)| {
                 let member = found.field_path.last().copied().unwrap_or("it");
                 let note_source = self.source_of_id(owner_id);
                 crate::error::Note {
@@ -5380,53 +5593,129 @@ impl<'src> Analyzer<'src> {
                         .then_some(note_source)
                         .flatten(),
                 }
-            });
-            self.diagnostics.push(Error {
-                note,
-                span,
-                msg: format!(
-                    "`{container_name}` cannot hold the resource `{rendered}`{reached}: a native \
-                     container's internals are host code the move checker cannot see (v1); \
-                     `Option` is the sanctioned resource container, or hold the resource in \
-                     a struct field"
-                ),
-            });
-        }
+            }),
+        };
+        let instantiated = at_instantiation
+            .map(|(callee, _, _)| format!(" this instantiation of `{callee}` builds one, and"))
+            .unwrap_or_default();
+        self.diagnostics.push(Error {
+            note,
+            span,
+            msg: format!(
+                "`{container_name}` cannot hold the resource `{rendered}`{reached}:{instantiated} \
+                 a native container's internals are host code the move checker cannot see (v1); \
+                 `Option` is the sanctioned resource container, or hold the resource in \
+                 a struct field"
+            ),
+        });
+    }
+
+    /// `container_resource_in` at a fresh path and cycle guard — the entry point
+    /// every caller wants. `resource_constraints` is the set of generic
+    /// parameters treated as resources for this query (empty for a concrete
+    /// type; R11's instantiation set otherwise), and `memo` is that set's
+    /// classification cache.
+    fn container_resource_at(
+        &mut self,
+        type_id: TypeId,
+        containers: &[(Id, &'static str)],
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) -> Option<ContainerResource<'src>> {
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        self.container_resource_in(
+            type_id,
+            containers,
+            resource_constraints,
+            memo,
+            &mut path,
+            &mut visiting,
+        )
     }
 
     /// Finds a native container holding a resource at or beneath `type_id`, for
-    /// R10. The written head is asked first — the original question — and then,
-    /// for a GENERIC aggregate, each member as instantiated HERE: `Signal<T>`'s
+    /// R10. The head is asked first — the original question — and then, for a
+    /// GENERIC aggregate, each member as instantiated HERE: `Signal<T>`'s
     /// `value: Shared<T>` is a `Shared<Database>` only at `Signal<Database>`, and
-    /// the written head alone cannot see that (A19). The descent mirrors
-    /// `compute_resource`'s, and skips a member whose substituted type is its
-    /// declared one: a concrete member is a written application in its own right,
-    /// already checked, and reporting it again would be two diagnostics for one
-    /// root cause.
+    /// the head alone cannot see that (A19). The member descent skips a member
+    /// whose substituted type is its declared one: a concrete member is a type in
+    /// its own right, already checked, and reporting it again would be two
+    /// diagnostics for one root cause.
+    ///
+    /// The descent mirrors `compute_resource`'s in full (B103): a tuple's
+    /// elements, a fixed array's element, and a container's OWN type arguments
+    /// are all descended, because the type nests the same way containment does.
+    /// `List<List<Guard>>` holds no resource *argument* — `List<Guard>` is not a
+    /// resource — and the inner container was found only when it had been
+    /// written (the walk records nested applications separately); a `(i32,
+    /// List<Guard>)` inferred from a tuple literal was not reachable at all.
+    /// Those descents push no path segment: the "reached through" clause names
+    /// MEMBERS, and an element or type argument has no member name.
     fn container_resource_in(
         &mut self,
         type_id: TypeId,
         containers: &[(Id, &'static str)],
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
         path: &mut Vec<&'src str>,
         visiting: &mut HashSet<TypeId>,
     ) -> Option<ContainerResource<'src>> {
         let (head_id, arguments) = match type_id.get_type(self) {
             Type::Struct(id, arguments) | Type::Enum(id, arguments) => (id, arguments),
+            // Value aggregates: no head, no members to name, just elements.
+            Type::Tuple(elements) => {
+                return self.container_resource_in_anonymous(
+                    &elements,
+                    type_id,
+                    containers,
+                    resource_constraints,
+                    memo,
+                    path,
+                    visiting,
+                );
+            }
+            Type::Array(element, _length) => {
+                return self.container_resource_in_anonymous(
+                    &[element],
+                    type_id,
+                    containers,
+                    resource_constraints,
+                    memo,
+                    path,
+                    visiting,
+                );
+            }
             _ => return None,
         };
         if let Some((_, container_name)) = containers.iter().copied().find(|(id, _)| *id == head_id)
         {
-            // One diagnostic per application; the first resource argument is
-            // enough to steer.
-            let argument = arguments
-                .into_iter()
-                .find(|argument| self.type_is_resource(*argument))?;
-            return Some(ContainerResource {
-                container_name,
-                argument,
-                field_path: path.clone(),
-                declared_at: None,
-            });
+            // One diagnostic per container instantiation; the first resource
+            // argument is enough to steer.
+            let resource_argument = arguments
+                .iter()
+                .copied()
+                .find(|argument| self.type_is_resource_with(*argument, resource_constraints, memo));
+            if let Some(argument) = resource_argument {
+                return Some(ContainerResource {
+                    container_name,
+                    container_type: type_id,
+                    argument,
+                    field_path: path.clone(),
+                    declared_at: None,
+                });
+            }
+            // This container holds no resource, but one of its arguments may BE
+            // a container that does (`List<List<Guard>>`).
+            return self.container_resource_in_anonymous(
+                &arguments,
+                type_id,
+                containers,
+                resource_constraints,
+                memo,
+                path,
+                visiting,
+            );
         }
         // A member can only hide a container behind a type ARGUMENT, and a
         // recursive type would otherwise descend forever.
@@ -5475,7 +5764,14 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             path.push(name);
-            found = self.container_resource_in(member_type_id, containers, path, visiting);
+            found = self.container_resource_in(
+                member_type_id,
+                containers,
+                resource_constraints,
+                memo,
+                path,
+                visiting,
+            );
             path.pop();
             if let Some(found) = found.as_mut() {
                 // The DEEPEST frame owns the note; this one only fills it in if
@@ -5485,6 +5781,42 @@ impl<'src> Analyzer<'src> {
             }
         }
         visiting.remove(&type_id);
+        found
+    }
+
+    /// `container_resource_in` over members that have no NAME — a tuple's
+    /// elements, a fixed array's element, a container's own type arguments. The
+    /// path is left untouched (there is no member to name), so a container found
+    /// this way reports without a "reached through" clause. `owner` is the type
+    /// whose elements these are, and it carries the cycle guard.
+    fn container_resource_in_anonymous(
+        &mut self,
+        members: &[TypeId],
+        owner: TypeId,
+        containers: &[(Id, &'static str)],
+        resource_constraints: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+        path: &mut Vec<&'src str>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Option<ContainerResource<'src>> {
+        if members.is_empty() || !visiting.insert(owner) {
+            return None;
+        }
+        let mut found = None;
+        for member in members {
+            found = self.container_resource_in(
+                *member,
+                containers,
+                resource_constraints,
+                memo,
+                path,
+                visiting,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+        visiting.remove(&owner);
         found
     }
 
@@ -6910,7 +7242,7 @@ impl<'src> Analyzer<'src> {
             .map(|function| function.id)
             .collect();
         for function_id in function_ids {
-            let (calls, _) = self.r11_body_calls_and_closures(function_id);
+            let (calls, _, _) = self.r11_body_calls_and_closures(function_id);
             let types = self.drop_sink_types_of_calls(&calls);
             if !types.is_empty() {
                 by_root.entry(function_id).or_default().extend(types);
@@ -8715,7 +9047,7 @@ impl<'src> Analyzer<'src> {
             // instantiation, but a variant carrying `T` is a resource only at
             // this one, so the refinement is recomputed under the delta set.
             let is_refinements = self.collect_is_refinements(&resources, &mut memo);
-            let (calls, closures) = self.r11_body_calls_and_closures(instance.callee);
+            let (calls, closures, body_exprs) = self.r11_body_calls_and_closures(instance.callee);
             let violations = {
                 // A generic body's bindings are all in-body (parameters / locals);
                 // module-level resources never enter its delta set, so the loan-only
@@ -8739,6 +9071,7 @@ impl<'src> Analyzer<'src> {
                 body_is_move_clean,
             );
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
+            self.check_instantiation_container_resources(&instance, &body_exprs);
 
             // Propagate: the callee's own calls, now under ITS resource
             // parameters — a call passing `T` on to another generic instantiates
@@ -8977,6 +9310,101 @@ impl<'src> Analyzer<'src> {
     /// with the SAME delta rule as every other R11 place (resource under the
     /// parameter set, not without it) — a concrete resource dropped in the body
     /// (`drop(Db{..})`) is chunk 3's and lowers to its real destructor. Spanned at
+    /// R10 asked per INSTANTIATION (B103), which is the half of B103 no
+    /// whole-program sweep can reach. A generic body can build a native
+    /// container out of its own `T` and never hand it back: `fun stash<T>(own
+    /// value: T) { let xs = [value]; }` binds `List<T>`, which is a container at
+    /// a resource only once `T := Guard`, and the caller — `stash(Guard { .. })`
+    /// — never has that type for the sweep to find. Same rule, same descent,
+    /// over the body's types substituted at THIS instantiation.
+    ///
+    /// Asked of the DELTA, per the pass's standing rule: a type that offends
+    /// without the substitution is a concrete container the whole-program check
+    /// already reported with its own in-body span, and re-asking it here would
+    /// report it once per instantiation site. Deduplicated against the
+    /// whole-program report too (`reported_container_structures`), so the caller
+    /// that binds its own `List<Guard>` and passes it in is told once.
+    fn check_instantiation_container_resources(
+        &mut self,
+        instance: &R11Instance,
+        body_exprs: &HashSet<Id>,
+    ) {
+        let containers = self.resource_rejecting_containers();
+        if containers.is_empty() {
+            return;
+        }
+        let bindings = self.r11_call_type_bindings(instance.call_id, instance.callee);
+        let (constraints, bounds): (Vec<TypeId>, Vec<TypeId>) = bindings.into_iter().unzip();
+        let context = Self::instantiation_context(&constraints, &bounds);
+        // The body's own typed sites: the parameters it declares and the
+        // bindings it introduces. Span-sorted so the earliest in-body site is
+        // the one the note points at (C1, determinism).
+        let mut sites: Vec<(Id, TypeId, Span)> = Vec::new();
+        if let Some(function) = self.functions.get(&instance.callee) {
+            for parameter_id in function.parameters.clone() {
+                if let Some(parameter) = self.parameters.get(&parameter_id)
+                    && let Some(span) = self.span_map.get(&parameter_id)
+                {
+                    sites.push((parameter_id, parameter.type_id, **span));
+                }
+            }
+        }
+        for expr_id in body_exprs {
+            if let Some(Expr::Variable(variable_id)) = self.expr_id_to_expr_map.get(expr_id)
+                && let Some(variable) = self.variables.get(variable_id)
+            {
+                sites.push((variable.id, variable.type_id, variable.name_span));
+            }
+        }
+        sites.sort_unstable_by_key(|(id, _, span)| (span.start, span.end, id.0));
+        let call_span = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        let callee_name = self
+            .functions
+            .get(&instance.callee)
+            .map(|function| function.name)
+            .unwrap_or("this generic");
+        let no_generic_resources = HashSet::new();
+        let mut memo = HashMap::new();
+        let mut examined: HashSet<TypeId> = HashSet::new();
+        for (_, type_id, body_span) in sites {
+            if !examined.insert(type_id) {
+                continue;
+            }
+            let instantiated = self
+                .substitute_type(&type_id.get_type(self), &context)
+                .get_type_id(self);
+            if instantiated == type_id {
+                continue;
+            }
+            let Some(found) = self.container_resource_at(
+                instantiated,
+                &containers,
+                &no_generic_resources,
+                &mut memo,
+            ) else {
+                continue;
+            };
+            // The delta: a container the substitution CAUSED. One that offends
+            // without it belongs to the whole-program check.
+            if self
+                .container_resource_at(type_id, &containers, &no_generic_resources, &mut memo)
+                .is_some()
+            {
+                continue;
+            }
+            let key = self.container_structure_key(found.container_type);
+            if !self.reported_container_structures.insert(key) {
+                continue;
+            }
+            self.report_container_resource(
+                &found,
+                instantiated,
+                call_span,
+                Some((callee_name, body_span, instance.callee)),
+            );
+        }
+    }
+
     /// the instantiation site, like the other R11 diagnostics.
     fn check_generic_drop_forwarding(
         &mut self,
@@ -9283,9 +9711,11 @@ impl<'src> Analyzer<'src> {
     /// the closures feed `scan_instantiated_body` (their internal moves and R9
     /// captures). A closure passed as an argument (`opt.map(|d| ..)`) is defined
     /// in this body, so it is a lexical closure of it.
-    fn r11_body_calls_and_closures(&self, function_id: Id) -> (Vec<Id>, Vec<Id>) {
+    /// `visited` is every expr id the walk reached — the body's own expressions,
+    /// which B103's per-instantiation R10 needs to ask its question of.
+    fn r11_body_calls_and_closures(&self, function_id: Id) -> (Vec<Id>, Vec<Id>, HashSet<Id>) {
         let Some(function) = self.functions.get(&function_id) else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), HashSet::new());
         };
         let (statements, tail, _) = &function.body;
         let mut calls = Vec::new();
@@ -9295,7 +9725,7 @@ impl<'src> Analyzer<'src> {
             self.r11_collect_calls(*statement, &mut visited, &mut calls, &mut closures);
         }
         self.r11_collect_calls(*tail, &mut visited, &mut calls, &mut closures);
-        (calls, closures)
+        (calls, closures, visited)
     }
 
     /// Accumulate the `Expr::Call` ids and lexical closure ids reachable from
