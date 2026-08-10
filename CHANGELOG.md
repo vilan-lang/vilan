@@ -8,6 +8,14 @@ tracks the latest state.
 
 ## Unreleased
 
+**An exhaustive `match` over a backed enum no longer lies about a value it has never seen.** `enum Align { Start = "flex-start", Center = "center", End = "flex-end" }` compiles to those three strings, and a `match` over all three compiled its last arm to a bare `else` — so a value that was none of them, arriving from the host, came back as `Align::End`. Not as an error, not as a wrong-looking answer: as `Align::End`, confidently, exit 0.
+
+The last arm is now tested like every other one, and the `else` panics with the enum's name and the raw value: `Align: "middle" is not one of its values`. Exhaustiveness was always checked over the *variant set*, by name — a proof about the vilan side of the boundary, never about the runtime value, because a backed enum lowers to a bare host string or number and its runtime domain is the host's. The trap is where the compiler stops assuming those two are the same thing.
+
+Only the exhaustive form changes. A `match` you gave a `_` arm keeps it — an out-of-set value takes the arm you wrote, which is what you asked for — and `is` and `==` were never affected, because comparing against a literal already answers `false` for a value outside the set. An enum with no backing value is untouched: it lowers to the tagged array, whose tag the language writes itself.
+
+The cost is one `===` on the last-variant path and about fifty bytes per exhaustive match, plus the panic helper once per file that has one. Across the whole regression corpus that is a single `match`, in a single program.
+
 **`Map<Align, T>` compiles.** A backed enum is now a `Map` key and a `Set` member with nothing to remember — no `[derive(Hashable)]`, no import, no ceremony. This was the first thing anyone was going to try after `enum Align { Start = "flex-start" }` shipped, and it met `Error: 'Align' does not implement trait 'Hashable'`, which is a strange answer when the enum *is* the string `"flex-start"` and the host's own `Map` keys strings by value.
 
 The reason it works is the reason `value()` costs nothing: the enum is not a wrapper around the backing value, it *is* the backing value. Hashing it and hashing that value are the same operation on the same runtime datum, so `Align::Start.hash()` and `Align::Start.value().hash()` are one key. The implementation is written by the compiler beside `value()` and `parse()`, off the same opt-in — writing `= "flex-start"` is what makes the enum that value, so it is also what makes the value its key. Both backings come along, integer and string, and so does the C-style tail: `enum Walked { A = 5, B, C }` is bare-lowered because one explicit value converts the whole declaration, so it keys too.
