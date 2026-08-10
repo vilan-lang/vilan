@@ -872,3 +872,222 @@ looks its member up in the trait, not in the impl's declarations, so the
 name that keys the index is not present on the impl). Fixing it wants a
 second index keyed by trait, for about a point. Filed as a fact, not a
 lever.
+
+## 9. It was never the parsing: macro worlds re-WALKED and re-RESOLVED `macro_std` (cycle 13, 2026-08-10)
+
+§8.2 closed with "`load+walk` is 891 ms of the module's 1190 — the three
+macro worlds' nested analyses, each of which **re-parses and re-walks**
+`macro_std`'s workspace from scratch". Half of that sentence is wrong, and
+the profile says so before any code changes: **no macro world re-parses
+anything.** `parse_clean_cached` has been content-keyed and process-global
+since E12, and the module loader has gone through it since; worlds two and
+three of an `import std::rpc_server` compile perform 29 module loads apiece
+and produce **zero** parse-cache misses. The 179%-inclusive
+`parse_binary_level` §8.2 read as "re-entered per macro world" is a
+recursive-descent parser being counted in its own recursive frames. What a
+macro world genuinely repeats is the WALK and the pre-entry `resolve_world`
+— and those are what the base cache exists to hold.
+
+**The instrument.** One cold `vilan check` per module in a fresh process,
+debug binary, `VILAN_PHASE_TIMING=1` with the macro-world phase line
+temporarily un-suppressed, plus temporary process-wide counters around
+`parsing::parse`, `parse_clean_cached`, `load_package_module`, the module
+walk loop, the registry build and `expand_one`. All instrumentation was
+reverted before the first commit; every figure below that ranks a candidate
+is a **callgrind instruction count** (deterministic; the box ran between
+load 3 and load 22 throughout, so wall and CPU are quoted only as
+interleaved minimum-of-seven).
+
+### The split inside a macro world
+
+`import std::rpc_server`, one cold run — the outer analysis is 1120 ms and
+its three macro worlds are 596 ms of it, all of it inside the outer's
+`load+walk`:
+
+| macro world (rpc_server's three) | load+walk | base  | build | checks | post-passes | total |
+|----------------------------------|-----------|-------|-------|--------|-------------|-------|
+| compare.vl                       |      34.8 |  58.2 |   9.9 |   72.8 |        21.8 | 197.5 |
+| debug.vl                         |      28.9 |  60.1 |  10.4 |   62.0 |        22.5 | 183.9 |
+| json.vl                          |      32.8 |  61.4 |  27.3 |   69.3 |        24.3 | 215.1 |
+| the outer analysis               |     830.7 | 121.8 |   9.6 |  158.0 |           — |1120.1 |
+
+Inside a world's ~32 ms of `load+walk`: **24 ms is the module walk, 0.9 ms
+is the 29 module loads, and the parse is nil.** The process-wide counters,
+printed at each analysis's end (absolute, so worlds difference cleanly):
+
+| after…      | parse calls | parse-cache MISSES | parse-cache hits | module loads | modules walked |
+|-------------|-------------|--------------------|------------------|--------------|----------------|
+| world 1     |          43 |             **40** |               22 |           61 |             27 |
+| world 2     |          46 |             **40** |               51 |           90 |             54 |
+| world 3     |          53 |             **40** |               80 |          119 |             81 |
+| the outer   |          59 |             **40** |               80 |          119 |            112 |
+
+The miss column never moves again after the first world. The walk column
+moves by exactly 27 every time.
+
+### The four reuse levels, and which two were already shipped
+
+| level                                   | shared today? | mechanism / invalidation | worth |
+|-----------------------------------------|---------------|--------------------------|-------|
+| (a) the parsed AST of `macro_std`'s files | **YES** | `parse_clean_cached`, keyed on content, leaked process-global | **0** — zero re-parses measured |
+| (b) the walked module set                | no      | — | ~24 ms per world |
+| (c) the resolved pre-entry world (walk + `resolve_world`) | no | the base cache's own key + a per-hit re-hash of every recorded source (E12) | **~92 ms per world** |
+| (d) the whole analyzed macro world, per defining file | **YES** | `WORLDS`, keyed on the definition segments' content (E23) | **0** — three distinct defining files is three compiles, and that is the floor |
+
+Candidate (a) as filed — "a parsed-file cache keyed on content hash" — is
+the cache the compiler has had since E12; candidate (c) as filed — "caching
+the analyzed macro WORLD per defining-file content" — is `compile_world`'s
+`WORLDS`. Both were already in the tree, which is why neither could be the
+lever. (b) and the base half of (c) are the same thing seen at two depths,
+and the thing that holds them is the §8-recorded direction: **the base
+cache**. So there was one candidate, not three.
+
+### What shipped: the key describes the workspace
+
+`base_cacheable` excluded macro worlds with `workspace.packages.is_empty()`.
+That test was standing in for a KEY that did not describe the workspace, not
+for a hazard: the key was `(platform, the entry's sorted std:: reference
+names)`, so a world built with `macro_std` loaded and one built without were
+indistinguishable in it, and refusing to store either was the only safe
+move. `BaseCacheKey` now carries the workspace — dependency packages by
+identity (roots, surface flag, dependency edges), the entry's dependency
+edges, the entry's references INTO each dependency, and the expansion
+budgets — and the `is_empty()` test goes. What the packages CONTAIN stays
+out of the key and is re-hashed per hit, which is the rule the cache already
+ran on.
+
+All three of `rpc_server`'s macro worlds land in ONE slot, which is the
+measured fact the lever rests on: their entry `std::` seeds are empty and
+their `macro_std::` seeds dedup to the same five (`build`, `fresh`, `meta`,
+`option`, `source`) whether the defining file is compare.vl, debug.vl or
+json.vl.
+
+Two seams the widening required, both recorded here because each was a way
+to get it silently wrong:
+
+- **The entry's `<dep>::module` seeds are entry-text slices.** They reach
+  the world's maps exactly as the `std::` seeds do (`modules[id].name`, the
+  namespace scope), and only the `std::` side was interned. The store's
+  `transmute` claims every surviving reference is `'static` in fact; with a
+  workspace admitted, that claim was one uninterned path short of true. The
+  dep seeds now go through `interned_display_name` at extraction, and the
+  load loop consumes that same interned list.
+- **E23's blanked-source entanglement, met head-on rather than half-solved.**
+  The `!entry_source.contains("macro")` bypass exists because a
+  macro-DEFINING entry registers into the registry the world carries, which
+  would leak one entry's macros into another analysis. A blanked world entry
+  is full of the substring `macro_std`, so the test would have kept every
+  macro world out by accident — and deleting it for macro worlds is only
+  sound because of a fact, not a hope: **inside a macro world the load
+  region registers NOTHING** (`macro_registry`'s `in_macro_world` early
+  return), so a world's entry contributes no registry rows whatever its text
+  reads. The test is now scoped to the analyses that can register at all.
+  `expand_entry_over_world` mirrors that same split instead of returning
+  early: a world's entry still EXPANDS, against the empty registry, which is
+  what the load region did before the hoist took the entry's expansion over.
+  E23's ACTUAL entanglement — the outer analysis whose own buffer defines
+  macros — is untouched and still bypasses.
+
+### Before / after
+
+Cold `vilan check` per module, fresh process. Ir is the primary column
+(deterministic); CPU ms is the interleaved minimum of seven, and its control
+rows show that instrument's noise floor to be about ±4%.
+
+| module                      | before Ir | after Ir | ratio | CPU ms ratio | macro worlds |
+|-----------------------------|-----------|----------|-------|--------------|--------------|
+| `reactive`                  |   9.301e9 |  7.739e9 | 1.202 |        1.205 |            3 |
+| `ui` (node)                 |  10.424e9 |  8.856e9 | 1.177 |        1.174 |            3 |
+| `rpc`                       |  10.934e9 |  9.362e9 | 1.168 |        1.178 |            3 |
+| `rpc_server`                |  11.810e9 | 10.246e9 | 1.153 |        1.136 |            3 |
+| **`[derive(Debug, PartialEq)]`** | 5.882e9 | 5.114e9 | **1.150** |    1.131 |        2 |
+| `time`                      |   6.858e9 |  6.091e9 | 1.126 |        1.100 |            2 |
+| **`[derive(Debug)]`**       |   3.977e9 |  4.012e9 | **0.991** |    0.990 |        1 |
+| `arena`                     |   4.527e9 |  4.558e9 | 0.993 |        0.974 |            1 |
+| `set` (control)             |   2.122e9 |  2.123e9 | 1.000 |        0.962 |            0 |
+| `map` (control)             |   2.117e9 |  2.117e9 | 1.000 |        1.019 |            0 |
+| `io` (control)              |   2.028e9 |  2.028e9 | 1.000 |        1.010 |            0 |
+
+**The single-world row is a loss and it is the honest price of the lever.** A
+cold compile whose only macro world is the first one pays the store — one
+`World` clone, ~35e6 Ir — and never gets a hit back: 0.9% on
+`[derive(Debug)]`, 0.7% on `arena`. It buys 13–20% wherever a second world
+follows, and a second world follows as soon as a program derives from two
+families, which `[derive(Debug, PartialEq)]` is: **1.15x**. That pair is the
+user-facing headline, and quoting only the winning half of it would be
+dishonest.
+
+The mechanism check, inclusive Ir on `rpc_server`, is exact:
+
+| inclusive                | before   | after    | delta     |
+|--------------------------|----------|----------|-----------|
+| `compile_world`          |  6.129e9 |  4.567e9 | **−1.562e9** |
+| — `resolve_world` (all)  |  3.374e9 |  2.136e9 |    −1.238e9 |
+| — `walk_expr_nodes`      |  0.856e9 |  0.494e9 |    −0.362e9 |
+| `parse_binary_level'2`   | 20.0387e9| 20.0383e9|  **−0.0004e9** |
+| PROGRAM TOTAL            | 11.810e9 | 10.246e9 |    −1.564e9 |
+
+The whole program's saving is `compile_world`'s saving, to within 0.1%; and
+parsing moves by one part in sixty thousand, which is the diagnosis at the
+top of this section stated as a measurement.
+
+A long-lived multi-analysis process gains too, but modestly and for a
+different reason: `WORLDS` already bounds macro-world COMPILES to one per
+distinct defining-file content, so a process that analyzes hundreds of
+programs still compiles only a handful of worlds. `check_scope_differential`
+(the whole corpus analyzed twice in-process) is **36.33 → 35.54 CPU s,
+1.022x**, interleaved minimum of seven. The cold single-process case is
+where this lever lives.
+
+### The gates
+
+Four pins in `base_cache.rs`, each plant-proven:
+`macro_worlds_share_one_base_world_and_observe_identically` (deltas of
+exactly two hits and one miss for a two-defining-file entry),
+`a_warm_macro_world_observes_what_a_cold_one_observes`,
+`a_missing_derive_errors_identically_through_a_warm_macro_world` (§6.13's
+sharp edge one level down), and
+`a_macro_world_is_never_served_an_ordinary_world`. The first two go red
+under the restored `workspace.packages.is_empty()` gate. The last exists
+because the other three do NOT: planting `workspace: Vec::new()` into the
+key left all of them green, since a macro world's empty `std::` seeds
+happened to differ from those fixtures' — and an entry that imports no std
+module at all agrees with its own macro world on every field the plant left
+in the key, so the world is served the ordinary base and fails with "cannot
+find module 'macro_std' to import", 44 diagnostics deep. That is the shape
+of the hazard the workspace row removes, and it needed its own fixture to
+show it.
+
+`macro_world_cache_clear` is the surface that makes a warm/cold differential
+over a macro world writable at all: `WORLDS` memoizes by content, so without
+it the first compile in a test process is the only one.
+
+### What the profile says next, recorded and not taken
+
+- **Hashing is now the largest single family in a cold analysis.** SipHash
+  (`d_rounds` + `c_rounds` + `Hasher::write` + `u8to64_le`) is **13.2%** of
+  `rpc_server`'s remaining 10.2e9 Ir, and `__memcpy_avx_unaligned_erms` is
+  another 7.1% (the world clones the cache trades on, plus map growth). The
+  analyzer's ~90 id-keyed tables all run on `std`'s default hasher against
+  4- and 8-byte keys, where SipHash's setup dominates its own work. A
+  hasher swap on the `HashMap<Id, _>` / `HashMap<TypeId, _>` families is
+  contained and measurable, and it is the largest thing left. Note the
+  neighbouring 12.5% of `precondition_check` is a DEBUG-build artifact and
+  will not appear in a release profile — do not count it.
+- **The trait-keyed second index does NOT ride along.** §8.2 filed
+  `inherited_default_candidates` at ~1% and this lane was to take it only if
+  trivially cheap after the main work. Re-measured: 128.66e6 Ir before,
+  128.68e6 after — **unchanged in absolute terms**, because it lives
+  entirely in the outer analysis and no macro world ever reaches it. It is
+  1.26% of the smaller total, it still needs a second index with its own
+  invalidation story and its own pin, and "cheap" it is not. Left recorded,
+  with the number now measured rather than estimated.
+- **The remaining macro-world cost is not redundant.** After the base hit, a
+  macro world still pays its own `build` (~16 ms), `checks` (~68 ms) and
+  post-passes (~23 ms) — ~107 ms of the ~199 ms it cost — and those are the
+  ordinary cost of analyzing a distinct program, not a repetition of
+  anything. Removing them means not analyzing the world at all, i.e.
+  persisting a compiled world across PROCESSES, which is §6.2's rejected
+  disk-serialization with a worse correctness profile (`World.program` is a
+  `JsProgram<'static>` over leaked text, not a string). Recorded as the
+  boundary of this lever, not as a next step.
