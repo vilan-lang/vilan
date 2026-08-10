@@ -40,7 +40,7 @@ path never consulted the clone-site set, so:
 ```vilan
 if pair is (let xs, let n) { pair.0.push(9); print(xs.len()) }   // 3, not 2
 if held is Some(mut v) { v.push(9) }                             // grew the option
-match pair { (mut xs, let n) if n > 0 => … }                     // wrote back
+match pair { (mut xs, let n) if n > 0 => …, _ => … }             // wrote back
 ```
 
 The analyzer had already been collecting these captures — nothing consumed
@@ -213,6 +213,11 @@ copies everything" each turns the golden red.
 > them red against the pre-fix tree; the fifth
 > (`a_guard_that_reads_a_copied_capture_reads_the_copy`) guards the new
 > reads-a-copy condition and is proven by planting it out.
+>
+> **Update 2026-08-10 (B115):** neither shape kept a FINAL leg's guard —
+> the line that runs after the shape is chosen dropped the last leg's
+> test, prelude and guard together, on an exhaustiveness proof a guarded
+> leg never carries. §11 has the record.
 
 - **A moved-from `Option` is still readable, and still destroyed** —
   **CLOSED 2026-08-04 (B60); see `affine-moves.md` for the record.**
@@ -879,3 +884,128 @@ Three findings from the measurement, none fixed in this lane:
   synthesized re-read has existed. Pre-existing, unrelated to resources, and
   the reason B99's drop may re-walk its target place without introducing a new
   class of defect: the emission was already this shape.
+
+## 11. B115 — the final leg's guard, 2026-08-10
+
+§5's B59 update taught `Expr::Match` to compile each leg into its pieces
+(pattern test, prelude, guard test, body) and to pick the emission shape once
+every guard has been walked. What it inherited unexamined is the line that runs
+after that choice: the final leg becomes the bare `else`, "the analyzer verified
+exhaustiveness". `match a { A => .., B if c => .. }` ran B's arm when `!c` —
+the leg's test, its prelude and its **guard** were all dropped together.
+
+### 11.1 The verdict: the checker was right, the lowering contradicted it
+
+Probed before touching anything, because a guarded leg cannot prove
+exhaustiveness and only one of the two halves could be believing that.
+
+The **checker** already believed it, and had all along. `resolve_match`'s
+catch-all walk requires `guard.is_none()`, and its variant-coverage walk
+filters guarded legs out before counting. The filed repro is refused outright:
+`match e { E::A => "a", E::B if c => "b" }` is *"match is not exhaustive:
+missing 'B'"*. The **lowering** was the half asserting the opposite — that the
+final leg is licensed to answer for everything left over — and a guarded leg is
+exactly the leg the checker's proof never used.
+
+So the bug is not that the two disagree about guards. It is that the lowering
+consumed a proof that, in two places, was never made:
+
+- **The subject-type exemptions.** A tuple, generic, `any`, `never` or
+  not-yet-known subject skipped the exhaustiveness question entirely. That
+  exemption answers the DOMAIN question — *which values can the subject take?*
+  — and it never licensed a guard, but it is what let `match p { (1, 2) => "x",
+  (let a, let b) if c => "guarded" }` compile and answer "guarded" for `(7, 8)`
+  with `c` false.
+- **A refutable tuple pattern counted as a catch-all.** `has_catch_all` matched
+  `ExprPattern::Tuple(_)` flat, so `(1, 2)` — a *test* — was read as a
+  destructure that matches everything. Spec §3.10 already said otherwise ("the
+  `let`/parameter binder grammar is the irrefutable subset"), so this was a
+  conformance bug, and it is why even the first mechanism's fix did not by
+  itself refuse the tuple shape: the match appeared to have a catch-all.
+
+### 11.2 The rule shipped
+
+> Exhaustiveness is proven by **unguarded** legs only, whatever the subject's
+> type — a guard tests the value, which the check does not reason about. A
+> `match` whose final leg is guarded must therefore be exhaustive *without* it,
+> and is refused otherwise. At run time the final leg keeps its test, its
+> prelude and its guard; only an unguarded one becomes the bare `else`.
+
+Both halves are load-bearing and both are planted out in the pins. The refusal
+is what removes the shape from the language; keeping the guard is what makes
+the emission right on its own terms rather than downstream of a verdict —
+§11.5's residual is a live case where the verdict is wrong and the emission is
+not.
+
+The refusal is deliberately narrow: it lapses the *exemptions*, and asks
+nothing new of a match whose earlier legs already carry the proof. A fully
+covered enum with a guarded final leg (`E::A => .., E::B => .., E::B if c =>
+..`) still compiles — the leg is dead where it stands, which is precisely why
+its guard must survive: with the guard dropped it became the `else` and
+answered for values the legs above it had already taken. A blanket "the last
+leg may not be guarded" was considered and rejected: it would have to call that
+match non-exhaustive, which is a lie about it.
+
+The diagnostics gained a note at the guard's span — *"this leg is guarded, and
+a guarded leg cannot prove exhaustiveness"*. Without it *"missing 'B'"* is
+close to unreadable, because the author can see `E::B` written in the match.
+
+### 11.3 The trap composes, and its message stays honest
+
+`backed-enums.md` §11.3 recorded the collision and left it: the trap arm keeps
+a backed final leg's variant test "and still drops the guard, deliberately".
+Both now, with neither emitter learning about the other — the leg keeps test
+AND guard, and the trap is still appended as the true `else`:
+
+```js
+if ($a === "s") { .. } else if ($a === "e") { .. }
+else if ($a === "e" && count > 0) { .. }
+else { __enum_trap("Align", $a); }
+```
+
+The message stays honest for the reason the refusal supplies: the legs above a
+surviving guarded leg cover every variant, so an in-set value the guard rejects
+was taken by one of them and only an out-of-set value reaches the trap —
+exactly as when the final leg is unguarded.
+
+### 11.4 The sweep, and what moved
+
+701 match expressions across std, the corpus, examples, benchmarks,
+`macro_std`, every `.vl` under `crates/`, all 497 docs/proposal fences and
+every vilan program embedded in a Rust fixture. **Guarded final legs: one**, and
+it is §2.1's illustrative fragment in this document (a tuple subject, no
+catch-all) — not compiled by any gate, and corrected in place. So the flip list
+is empty: no program in the tree changes verdict or emission, and no golden
+moved. The corpus had no byte-level coverage of the shape at all, which is why
+it now has three (`match-patterns.vl`: the chain, the backed twin with its
+trap, and B59's sequence emitter reached through an `is` guard).
+
+### 11.5 The residual, and two bycatch bugs
+
+The one shape a guarded final leg still survives *reachably*: an enum whose
+coverage comes from a leg with a REFUTABLE payload pattern.
+
+```vilan,fragment
+match p {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(let x) if count > 0 => "guarded",   // reachable: the proof is holed
+}
+```
+
+The coverage walk asks only which VARIANT a pattern names, never whether the
+pattern can fail below the tag, so `Of` counts as covered and the match is
+accepted. Before the fix this answered "guarded" for `Of(End)` whatever the
+guard said; now the guard is tested and the value matches no leg. Pinned both
+ways: a live pin that the guard survives here too, and an `#[ignore]`d pin for
+the verdict the checker owes. Not B115's hole — the same walk accepts `match p
+{ Pair::Of(Align::Start) => "s" }` alone, which answers "s" for `Of(End)` with
+no guard anywhere in sight — and closing it wants real nested-pattern
+usefulness analysis, its own measurement. Filed.
+
+Filed with it, found by the same probes and left where they were found:
+
+- **A tuple subject skips exhaustiveness even unguarded.** `match p { (1, 2) =>
+  "x", (3, 4) => "y" }` compiles and answers "y" for `(7, 8)`. The exemption
+  now lapses only for a guarded final leg; unguarded, the domain question is
+  still never asked. Same family as the residual above — the checker accepting
+  a non-exhaustive match — and the same fix closes both.

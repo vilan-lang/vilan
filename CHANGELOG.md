@@ -36,6 +36,16 @@ Two shapes disappear with the last generated body. The return direction used to 
 
 The generated file is still ordinary source you own. Where you would rather have `None` than a panic for a value the host might legitimately answer with, hand-edit the binding back to the guarded shape — bind the `str`, forward through `parse`. That edit is now yours to make rather than the generator's to assume.
 
+**A guarded last `match` arm no longer runs when its guard is false.** `match a { A => …, B if ready => … }` compiled the last arm to a bare `else` and threw the guard away with the arm's own test, so `B`'s arm answered for every value that reached it — the one the guard rejects included. No error, no wrong-looking output: the arm you guarded, taken anyway, exit 0.
+
+The arm keeps its guard now, and the shape that made the bug reachable is refused before it runs. Exhaustiveness is proven by *unguarded* arms only — a guard tests the value, and the compiler is reasoning about the type, so a guarded arm proves nothing about what a `match` covers — which means a `match` whose last arm is guarded has to be exhaustive without it. Write the arm you meant to fall through to: `B if ready => …, _ => …`.
+
+Two ways in, both closed. A `match` over a tuple or a generic skipped the exhaustiveness question entirely, and that exemption is about which values the subject can take; it never licensed a guard. And a tuple pattern that *tests* — `(1, 2)` — was read as one that *destructures* — `(let a, let b)` — so a `match` could appear to have a catch-all it never wrote.
+
+Where a guarded last arm still means something, because the arms above it already cover the subject, it compiles and its guard is tested where it stands. On a backed enum that composes with the trap arm rather than competing with it: the arm keeps its test and its guard, and the `else` still panics for a value outside the set.
+
+The diagnostics say why: a variant written only on a guarded arm is still reported missing, with a note on the guard — *this leg is guarded, and a guarded leg cannot prove exhaustiveness* — because otherwise "missing 'B'" is unreadable next to a `B` you can see in the match.
+
 ---
 
 **Returning `&self.inner` from a by-value signature now hands back a value.** `fun grab(&self): Inner { &self.inner }` gave the caller the receiver's field itself, so a later write to `h.inner` showed through the result — while `fun grab(&self): Inner { self.inner }`, one character away, copied as the rule says. The copy rule reads the *return*, not the leaf, and the leaf is where it stopped looking: a reference is not a place, so nothing in the return seam ever saw it. The same hole sat one indirection over, behind a `borrows` call: `fun get(h: &Holder): (i32, i32) { peek(h) }` handed back whatever `peek` projected out of `h`.
