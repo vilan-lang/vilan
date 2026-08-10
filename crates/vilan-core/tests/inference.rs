@@ -50451,6 +50451,73 @@ fn b76_the_trap_arm_fires_on_a_host_supplied_value() {
 }
 
 #[test]
+fn b76_the_trap_arm_reaches_the_edge_shapes_of_a_match() {
+    // The forms a one-happy-path pin would miss, all three in one emission.
+    //
+    // A ONE-VARIANT enum: the single arm used to BE the bare `else`, so the
+    // match emitted no test at all — now it tests and traps.
+    //
+    // A GUARDED final leg: the guard is still dropped, as it always was, and
+    // only the pattern test is kept. The trap answers for values outside the
+    // set, not for a guard that rejects an in-set one, so `Center if flag`
+    // followed by a bare `Center` behaves exactly as before.
+    //
+    // The SEQUENCE emission (B59): a guard needing statement slots turns the
+    // whole match into a flat `matched`-flag sequence rather than an else-if
+    // chain, a second emitter that has to grow the arm too. There the trap is
+    // the final `if (!matched)`.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum One { Only = "only" }
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun single(o: One): str { match o { One::Only => "o" } }
+        fun guarded(a: Align, flag: bool): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if flag => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun sequenced(a: Align, o: Option<i32>): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if o is Option::Some(let n) && n > 1 => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun main() {
+            print(single(One::Only));
+            print(guarded(Align::End, false));
+            print(sequenced(Align::End, Option::None));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif ($a === \"only\") {\n\t\t$b = \"o\";\n\t} else {\n\t\t__enum_trap(\"One\", $a);\n\t}"),
+        "a one-variant match should test its single arm and trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else if ($c === \"flex-end\") {\n\t\t$d = \"e\";\n\t} else {\n\t\t__enum_trap(\"Align\", $c);\n\t}"),
+        "a guarded match's final leg should keep only its PATTERN test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif (!($h)) {\n\t\t__enum_trap(\"Align\", $e);\n\t}"),
+        "the sequence emission should trap on the unmatched flag, got:\n{javascript}"
+    );
+    // And it still runs the in-set values the way it always did.
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\ne\ne\n",
+        "the in-set paths must be unchanged"
+    );
+}
+
+#[test]
 #[ignore = "known limit: the trap arm is asked of the match's OWN subject, so a \
             backed enum reached through a payload pattern keeps its bare `else` \
             — see backed-enums.md §11"]
