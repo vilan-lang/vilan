@@ -342,39 +342,73 @@ fn a_string_literal_union_alias_becomes_a_backed_enum_with_no_wrapper() {
 }
 
 #[test]
-fn a_string_literal_union_in_return_position_becomes_a_parse_forwarder() {
-    // §4.1's bigger win, and it is not a deletion: this used to be a TODO —
-    // 375 of them on `lib.dom.d.ts`, construct class "string-literal union
-    // property" — because there was no spelling for string -> variant.
-    //
-    // The extern still binds the raw `str`, and that is §7.2's DEFERRAL rather
-    // than a limitation of the mapping: an `external fun` may not return a
-    // backed enum, because the host may answer outside the set and an
-    // exhaustive `match` has no trap arm. `parse` is where the honest `None`
-    // comes from.
+fn a_string_literal_union_in_return_position_binds_the_enum_directly() {
+    // §4.1's bigger win, arrived at in two steps. It used to be a TODO — 375 of
+    // them on `lib.dom.d.ts` — because there was no spelling for string ->
+    // variant; then it was the raw `str` plus an `Enum::parse` forwarder,
+    // because §7.2's deferral meant an `external fun` could not return a backed
+    // enum. §9's trap arm lifted that, so the return direction is now the enum
+    // itself and bindgen is back to emitting SIGNATURES ONLY — no `_raw`, no
+    // `[doc(hidden)]`, no body, and no `Option` import to explain.
     let output = bind("type Align = \"start\" | \"end\";\ninterface Chart { getAlign(): Align; }");
     assert!(
-        output.contains("external fun get_align_raw(self): str;"),
+        output.contains("external fun get_align(self): Align;"),
         "{output}"
     );
-    assert!(output.contains("[doc(hidden)]"), "{output}");
-    assert!(
-        output.contains("fun get_align(self): Option<Align> {"),
-        "{output}"
-    );
-    assert!(
-        output.contains("Align::parse(self.get_align_raw())"),
-        "{output}"
-    );
-    // The forwarder needs `Option` in scope, and the file says so.
-    assert!(output.contains("import std::option::Option;"), "{output}");
+    assert!(!output.contains("get_align_raw"), "{output}");
+    assert!(!output.contains("[doc(hidden)]"), "{output}");
+    assert!(!output.contains("Align::parse("), "{output}");
+    // Nothing in the file needs `Option` any more — the forwarder was its only
+    // user, and an unused import in generated source is noise.
+    assert!(!output.contains("import std::option::Option;"), "{output}");
     assert!(
         compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
         "{output}"
     );
-    // No file WITHOUT a forwarder carries the import.
-    let plain = bind("interface Chart { width(self): void; }");
-    assert!(!plain.contains("import std::option::Option;"), "{plain}");
+    // Both directions of one PROPERTY bind the same type now, which is what
+    // §8.4's "properties keep their TODO" was waiting on: the getter wanted the
+    // raw `str` and the setter wanted the enum, so no single bound type served
+    // it. They want the same type.
+    let property = bind("type Align = \"start\" | \"end\";\ninterface Chart { align: Align; }");
+    assert!(
+        property.contains("external fun align(self): Align;"),
+        "{property}"
+    );
+    assert!(
+        property.contains("external fun set_align(self, value: Align): void;"),
+        "{property}"
+    );
+    assert!(!property.contains("TODO(bindgen):"), "{property}");
+}
+
+#[test]
+fn a_string_literal_union_nested_in_a_type_binds_the_enum_too() {
+    // The conservative `Nested` case, and it was conservative for the SAME
+    // reason: a closed set inside `List<..>` or a closure parameter has no
+    // forwarder position, so it fell back to the raw `str`. With no forwarder
+    // anywhere, direction stops mattering and one rule covers every position.
+    //
+    // The closure case is B107's shape — the host constructs the value — and it
+    // is the trap that makes binding the enum here honest.
+    let output = bind(
+        "type Align = \"start\" | \"end\";\n\
+         interface Chart {\n\
+         \tallAligns(): Align[];\n\
+         \tonAlign(handler: (value: Align) => void): void;\n\
+         }",
+    );
+    assert!(
+        output.contains("external fun all_aligns(self): List<Align>;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("external fun on_align(self, handler: |Align| void): void;"),
+        "{output}"
+    );
+    assert!(
+        compile(&format!("{output}\nfun main() {{}}\n")).is_empty(),
+        "{output}"
+    );
 }
 
 #[test]
@@ -1485,18 +1519,20 @@ fn a_vilan_enum_carries_a_string_backing_value() {
     );
     // The integer form the language always had, unchanged.
     assert!(compile("enum Ordering { Less = -1, Equal = 0 }\nfun main() {}\n").is_empty());
-    // And the one rule bindgen's RETURN direction depends on: §7.2 is
-    // DEFERRED, so an extern may not return a backed enum. If that ever
-    // changes, the `parse` forwarder becomes optional and this goes red.
+    // The rule bindgen's RETURN direction turns on, and it moved: §7.2 is
+    // LIFTED (§9), so an extern MAY return a backed enum — the trap arm
+    // guarantees a host value outside the set is named rather than silently
+    // becoming a variant. This is what lets the return direction bind the enum
+    // directly instead of forwarding through `parse`.
     assert!(
-        !compile(
+        compile(
             "enum Align { Start = \"start\", End = \"end\" }\n\
              [extern(\"getAlign\")]\n\
              external fun get_align(): Align;\n\
              fun main() {}\n"
         )
         .is_empty(),
-        "an `external fun` returning a backed enum should still be refused (§7.2)"
+        "an `external fun` returning a backed enum should be accepted (§7.2, lifted)"
     );
 }
 

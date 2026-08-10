@@ -155,11 +155,54 @@ lexicographically (`Size::Large < Size::Small` because `"lg" < "sm"`),
 and ordering by declaration index cannot be offered, because bare
 lowering erases the index. Integer backings order as before.
 
-An `external fun` may take a backed enum but may **not return one**: the
-host can answer with a value outside the set, and an exhaustive `match`
-compiles its last arm to a bare `else`, so a bogus value would silently
-become whichever variant happened to be last. Bind the backing type and
-convert with `parse`, which answers `None`.
+### The trap arm
+
+A backed enum lowers to a bare host value, so its runtime domain is the
+*host's* and not the variant set. Exhaustiveness is checked over that
+variant set, by name — which is a proof about the vilan side of the
+boundary and never was one about the value. So an **exhaustive** `match`
+over a backed enum tests every variant, including the last, and its
+`else` traps:
+
+```vilan,fragment
+match align {
+    Align::Start => "s",
+    Align::End   => "e",       // tested, not assumed
+}
+// a value outside the set panics:
+//   Align: "middle" is not one of its values
+```
+
+Only the exhaustive form is affected. A `match` you gave a `_` arm keeps
+it — an out-of-set value takes the arm you wrote, which is the answer you
+asked for — and `is` and `==` compare against a literal, so they answer
+`false` outside the set, as they always did. An enum with no backing
+value keeps the tagged array form and no trap: the language itself writes
+that tag, so there its exhaustiveness proof *is* a proof about the value.
+
+An `external fun` may both **take and return** a backed enum, and so may
+a callback it is handed. Nothing checks the boundary: a host value
+outside the set enters unremarked, exactly as it does for an
+`external fun f(): i32` that answers `"hello"`. What the trap arm buys is
+that such a value can no longer become a *confident* variant — the first
+exhaustive `match` to meet it panics with the raw value.
+
+Which of the two shapes to write is a question about the value, not about
+safety:
+
+```vilan,fragment
+[extern("getAlign")]
+external fun get_align(): Align;              // out of set is a BUG — trap
+
+[extern("getAlign")]
+[doc(hidden)]
+external fun get_align_raw(): str;            // out of set is an INPUT
+fun read_align(): Option<Align> { Align::parse(get_align_raw()) }
+```
+
+Return the enum where the host's set is genuinely closed and a value
+outside it means something is wrong; bind the backing type and `parse`
+where an unrecognized value is one of the answers you expect.
 
 ## 5.4 Impls
 

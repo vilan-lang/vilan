@@ -50340,12 +50340,24 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     // `js::Node::Number` is — which is what makes the feature a widening rather
     // than a new lowering. Compared as WHOLE EMISSIONS, so a divergence
     // anywhere in the shape (a temp, a wrapper, a jump table) fails this.
+    //
+    // THE REFERENCE SHAPE MOVED, and §9.2's slice 2 asks that the weakening be
+    // written on the pin rather than absorbed silently. Under §9's ratified (b)
+    // the backed side's exhaustive match keeps its last variant test and gains a
+    // trap `else`, so the raw side is given the same shape — every value tested,
+    // a `_` arm last — instead of the two-test-plus-bare-`else` chain it used to
+    // be compared against. The claim this protects survives in a marginally
+    // WEAKER form: not "a backed match emits what a raw `str` match emits", but
+    // "a backed match emits what a raw `str` match WITH A TRAP ARM emits". That
+    // is still the whole of §1.4's point — the codegen path is shared, the trap
+    // included; what it no longer says is that a backed match costs a raw one's
+    // exact bytes.
     let backed = compile(
         r#"
         import std::print;
         enum Align { Start = "start", End = "end", Center = "center" }
-        fun classify(a: Align): i32 {
-            match a { Align::Start => 0, Align::End => 1, Align::Center => 2 }
+        fun classify(a: Align): str {
+            match a { Align::Start => "s", Align::End => "e", Align::Center => "c" }
         }
         fun main() { print(classify(Align::End)); }
         "#,
@@ -50354,16 +50366,284 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     let raw = compile(
         r#"
         import std::print;
-        fun classify(a: str): i32 {
-            match a { "start" => 0, "end" => 1, _ => 2 }
+        fun classify(a: str): str {
+            match a { "start" => "s", "end" => "e", "center" => "c", _ => "trap" }
         }
         fun main() { print(classify("end")); }
         "#,
     )
     .expect("a clean compile");
+    // The reference side cannot SPELL the trap — `__enum_trap` is a compiler
+    // helper, not a callable — so the two differences the trap arm makes are
+    // reconciled here, and named rather than hidden: the helper's own
+    // definition (emitted once per file, on demand) and the trap statement
+    // standing where the raw match's `_` arm assigns. Everything the pin is
+    // about — the chain, its temps, the tested constants, the arm the trap
+    // occupies — is still compared byte for byte.
+    let reference = format!(
+        "function __enum_trap(name, value) {{\n\
+         \tthrow name + \": \" + JSON.stringify(value) + \" is not one of its values\";\n\
+         }}\n{}",
+        raw.replace("$b = \"trap\";", "__enum_trap(\"Align\", $a);")
+    );
     assert_eq!(
-        backed, raw,
-        "a backed enum's match should emit exactly what the raw `str` match emits"
+        backed, reference,
+        "a backed enum's match should emit exactly what a raw `str` match with a trap arm emits"
+    );
+}
+
+// --- B76 §9: the trap arm --------------------------------------------------
+//
+// `backed-enums.md` §9, candidate (b) RATIFIED 2026-08-09. A backed enum lowers
+// to a bare host primitive, so §1.5's exhaustiveness proof is over the vilan
+// VARIANT SET and never was a proof about the runtime value's domain — the
+// host's. P12 measured where that gap is observable and it is one construct:
+// `is`, `==` and a `_`-armed match all answer `false`/`_` for a value outside
+// the set (honest), while an exhaustive match's last arm is a bare `else` that
+// answers with a confident wrong variant (P11). So every exhaustive match over
+// a backed enum now tests its last variant too and traps in the `else`.
+
+#[test]
+fn b76_an_exhaustive_string_backed_match_traps_instead_of_falling_through() {
+    // §9.5 slice 1, the `str` backing. Every variant is tested — including the
+    // last, which used to ride the bare `else` — and the `else` names the enum
+    // and the raw value.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() { print(label(Align::Center)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"} else if ($a === "flex-end") {"#),
+        "the LAST variant should get its own test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t__enum_trap(\"Align\", $a);\n\t}"),
+        "the `else` should be the trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("function __enum_trap(name, value) {"),
+        "the trap helper should be emitted on demand, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_an_exhaustive_integer_backed_match_traps_too() {
+    // §9.5 slice 1, the integer backing. §9's ruling is about the host
+    // boundary, not about strings — P14 measured the same delta on `Ordering`,
+    // the one backed enum std already shipped, and `vilan/test/enum-discriminant.mjs`
+    // is the corpus golden that moved for it.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Ordering { Less = -1, Equal = 0, Greater = 1 }
+        fun describe(order: Ordering): str {
+            match order { Ordering::Less => "less", Ordering::Equal => "equal", Ordering::Greater => "greater" }
+        }
+        fun main() { print(describe(Ordering::Greater)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a === 1) {"),
+        "the LAST variant should get its own test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Ordering\", $a);"),
+        "the `else` should be the trap, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_is_the_exhaustive_case_only() {
+    // §9's scope, from the other side. A match the author already gave a
+    // catch-all is not exhaustive-by-variants: its `_` is a real arm the author
+    // wrote and means, an out-of-set value takes it, and P12 calls that answer
+    // honest. Nothing changes — no extra test, no trap, no helper.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun label(align: Align): str {
+            match align { Align::Start => "s", _ => "other" }
+        }
+        fun main() { print(label(Align::End)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "a match with a user `_` arm should keep its bare `else`, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"other\";\n\t}"),
+        "the user's arm should still be the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_reaches_only_backed_enums() {
+    // §3.1(b)'s conjunction decides this, as it decides the lowering: an enum
+    // without a backing value keeps the `[index, ..data]` array form, whose
+    // `[0]` slot the language itself writes, so its exhaustiveness proof IS a
+    // proof about the runtime value and its bare `else` stays honest. `bool`
+    // lowers to a native scalar through its own special case rather than a
+    // backing value (§3.4 rejects a `bool` backing) and is not covered either.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Plain { A, B, C }
+        fun plain(p: Plain): str { match p { Plain::A => "a", Plain::B => "b", Plain::C => "c" } }
+        fun boolean(b: bool): str { match b { true => "t", false => "f" } }
+        fun opt(o: Option<i32>): i32 { match o { Option::Some(let n) => n, Option::None => 0 } }
+        fun main() { print(plain(Plain::C)); print(boolean(false)); print(opt(Option::Some(3))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "only a BACKED enum's match should trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"c\";\n\t}"),
+        "the plain enum's last arm should still be the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_fires_on_a_host_supplied_value() {
+    // The behavioral half, and B107's own repro (§9.2's P16): a function-typed
+    // parameter's parameter is a return position wearing a parameter's clothes
+    // — the HOST constructs the value — and before this the program printed
+    // `e`, `Align::End`, confidently, exit 0. It now trap. `forEach` is the
+    // host helper: it calls the handler with each element, so the second call
+    // hands vilan a value outside `Align`'s set with nothing in between.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("Array.prototype.forEach.call")]
+        external fun for_each_align(values: List<str>, handler: |Align| void): void;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            for_each_align([ "center" ], |a| print(label(a)));
+            for_each_align([ "middle" ], |a| print(label(a)));
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "c\n",
+        "the in-set value should still label normally"
+    );
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "the trap should name the enum and the raw value, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
+#[test]
+fn b76_the_trap_arm_reaches_the_edge_shapes_of_a_match() {
+    // The forms a one-happy-path pin would miss, all three in one emission.
+    //
+    // A ONE-VARIANT enum: the single arm used to BE the bare `else`, so the
+    // match emitted no test at all — now it tests and traps.
+    //
+    // A GUARDED final leg: the guard is still dropped, as it always was, and
+    // only the pattern test is kept. The trap answers for values outside the
+    // set, not for a guard that rejects an in-set one, so `Center if flag`
+    // followed by a bare `Center` behaves exactly as before.
+    //
+    // The SEQUENCE emission (B59): a guard needing statement slots turns the
+    // whole match into a flat `matched`-flag sequence rather than an else-if
+    // chain, a second emitter that has to grow the arm too. There the trap is
+    // the final `if (!matched)`.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum One { Only = "only" }
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun single(o: One): str { match o { One::Only => "o" } }
+        fun guarded(a: Align, flag: bool): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if flag => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun sequenced(a: Align, o: Option<i32>): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if o is Option::Some(let n) && n > 1 => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun main() {
+            print(single(One::Only));
+            print(guarded(Align::End, false));
+            print(sequenced(Align::End, Option::None));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif ($a === \"only\") {\n\t\t$b = \"o\";\n\t} else {\n\t\t__enum_trap(\"One\", $a);\n\t}"),
+        "a one-variant match should test its single arm and trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else if ($c === \"flex-end\") {\n\t\t$d = \"e\";\n\t} else {\n\t\t__enum_trap(\"Align\", $c);\n\t}"),
+        "a guarded match's final leg should keep only its PATTERN test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif (!($h)) {\n\t\t__enum_trap(\"Align\", $e);\n\t}"),
+        "the sequence emission should trap on the unmatched flag, got:\n{javascript}"
+    );
+    // And it still runs the in-set values the way it always did.
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\ne\ne\n",
+        "the in-set paths must be unchanged"
+    );
+}
+
+#[test]
+#[ignore = "known limit: the trap arm is asked of the match's OWN subject, so a \
+            backed enum reached through a payload pattern keeps its bare `else` \
+            — see backed-enums.md §11"]
+fn b76_the_trap_arm_does_not_reach_a_nested_backed_pattern() {
+    // The residual §9 does not cover. `match p { Pair(Align::Start) => .. }`
+    // drops the LAST leg's whole condition, nested variant test included, so an
+    // out-of-set `Align` inside the payload still lands on the last arm
+    // confidently. Closing it wants a trap message design §9 does not have (a
+    // leg's condition can carry more than one backed test, and which one failed
+    // is not knowable at runtime), so it is recorded rather than guessed at.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("__enum_trap"),
+        "a nested backed pattern should trap too, got:\n{javascript}"
     );
 }
 
@@ -50921,125 +51201,275 @@ fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
     );
 }
 
-// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
-// enum ------------------------------------------------------------------------
+// --- B76 §7.2, LIFTED (§9): an extern may RETURN a backed enum ---------------
 //
-// The parameter direction is safe — vilan constructs the value, so it is always
-// in the set. The return direction is not, and what happens then is the reason
-// for the deferral: an exhaustive `match` compiles its last arm to a bare
-// `else` (there is no "impossible" trap arm), so a host value outside the set
-// silently takes whichever arm happens to be last. It is not detectably wrong;
-// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
-// `parse()` path, where an out-of-set value honestly yields `None`, until
-// backed enums grow a trap-arm story.
+// The deferral existed for one behavior — "confidently the wrong variant" — and
+// §9's trap arm removes it rather than re-arguing it. The refusal that stood in
+// the meantime is deleted, along with the hole B107 found in it: it worked by
+// ENUMERATING the positions a host can construct a value from (return type,
+// generic arguments, tuple elements, array elements) and had already missed
+// one, a function-typed parameter's parameters. The trap asks nothing about
+// provenance, so it has nothing to enumerate and nothing to miss.
+//
+// What is NOT claimed: the boundary still does not check. A host value outside
+// the set enters unremarked, exactly as an `external fun f(): i32` answering
+// `"hello"` does. `parse` is the non-panicking alternative and stays the shape
+// to reach for when an out-of-set value is an expected input rather than a bug.
 
 #[test]
-fn b76_an_external_fun_cannot_return_a_backed_enum() {
-    assert_fails_with(
+fn b76_an_external_fun_can_return_a_backed_enum() {
+    // The inversion of the refusal, at every shape it used to refuse: the bare
+    // enum, the integer backing, and the nested forms its walker followed
+    // (`Option<Align>`, `List<Align>`).
+    assert_compiles(
         r#"
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Align;
         fun main() { }
         "#,
-        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
     );
-    // The message names the way out rather than only the prohibition (B6).
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        fun main() { }
-        "#,
-        "convert with `Align::parse`",
-    );
-    // The INTEGER backing is refused for the same reason — §7.2 is about the
-    // host boundary, not about strings.
-    assert_fails_with(
+    assert_compiles(
         r#"
         enum Code { Ok = 200, NotFound = 404 }
         [extern("getCode")]
         external fun get_code(): Code;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Code'",
     );
-}
-
-#[test]
-fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
-    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
-    // exactly the same way, and the wrapper path is what each of them wants.
-    assert_fails_with(
+    assert_compiles(
         r#"
         import std::option::Option;
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Option<Align>;
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
-    );
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        [extern("getAligns")]
         external fun get_aligns(): List<Align>;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Align'",
+    );
+    // A backed enum on an `external struct`'s method, the receiver form the
+    // refusal also caught.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        external struct Widget;
+        impl Widget {
+            [extern(method, "getAlign")]
+            external fun align(self): Align;
+        }
+        fun main() { }
+        "#,
     );
 }
 
 #[test]
-fn b76_the_refusal_is_the_return_direction_only() {
-    // The parameter direction is the whole point of the feature — the extern
-    // takes the enum, because the enum IS the string — and it stays legal, as
-    // does an unbacked enum in either direction.
-    assert_compiles(
+fn b76_an_external_returned_backed_enum_round_trips_and_traps() {
+    // The runtime proof, both directions in one program. `String` is the host
+    // helper: `String(x)` is `x` for a string, so the extern hands vilan
+    // whatever it is given — a legal value on the first call and `"middle"` on
+    // the second, which is exactly what §7.2 said nothing could stop.
+    //
+    // Nothing stops it now either. What changed is what happens next: the value
+    // reaches a `match` and is NAMED rather than becoming `Align::End`.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("setAlign")]
-        external fun set_align(value: Align): void;
-        fun main() { set_align(Align::Start); }
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("String")]
+        external fun host_align(text: str): Align;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            let legal = host_align("flex-end");
+            print(legal == Align::End);
+            print(label(legal));
+            print(label(host_align("middle")));
+        }
         "#,
     );
-    assert_compiles(
-        r#"
-        enum Plain { A, B }
-        [extern("getPlain")]
-        external fun get_plain(): Plain;
-        fun main() { }
-        "#,
+    assert_eq!(
+        stdout, "true\ne\n",
+        "a legal host value should round-trip as its variant"
     );
-    // The refusal does not depend on declaration order.
-    assert_fails_with(
-        r#"
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        enum Align { Start = "start", End = "end" }
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "an out-of-set host value should trap, got:\n{stderr}"
     );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
 }
 
 #[test]
-fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
-    // What §7.2 steers to, compiled: the extern speaks the host's own type and
-    // `parse` is the guard, answering `None` for a value outside the set.
-    assert_compiles(
+fn b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration() {
+    // B107 / §9.2's P16, closed. `external fun on(handler: |Align| void)` is a
+    // return position wearing a parameter's clothes — the HOST constructs the
+    // value — and the refusal, which enumerated positions, compiled it clean
+    // and let a host `handler("middle")` print `e` at exit 0.
+    //
+    // It still compiles clean; the refusal is gone. The value is caught one
+    // step later, by the trap, which is the whole argument for (b) over (a):
+    // the guard is at the `else`, so the position the value came in through
+    // never had to be listed.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("Array.prototype.forEach.call")]
+        external fun on_each_align(values: List<str>, handler: |Align| void): void;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            on_each_align([ "flex-start" ], |a| print(label(a)));
+            on_each_align([ "middle" ], |a| print(label(a)));
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "s\n",
+        "the in-set callback value should label normally"
+    );
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "the callback's out-of-set value should trap, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
+#[test]
+fn b76_the_parse_path_is_the_non_panicking_alternative() {
+    // What the deferral steered to is not retired by the lift — it is now the
+    // CHOICE. Bind the backing type and `parse` when an out-of-set value is an
+    // input you mean to handle; return the enum directly when it would be a
+    // bug. Both compile, and this pins the difference at runtime: `parse`
+    // answers `None` where the direct return would have trapped.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
         import std::option::Option;
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [extern("String")]
         [doc(hidden)]
-        external fun get_align_raw(): str;
-        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
-        fun main() { }
+        external fun host_align_raw(text: str): str;
+        fun host_align(text: str): Option<Align> { Align::parse(host_align_raw(text)) }
+        fun main() {
+            print(match host_align("flex-end") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+            print(match host_align("middle") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+        }
+        "#,
+        "flex-end\nnone\n",
+    );
+}
+
+// --- B76 §4.2/§9.6: `json.vl`'s kind() family ---------------------------------
+//
+// §4.2's contingency, taken now that §7.2 has lifted. `kind()` returns the
+// backed enum `JsonKind` and the four `is_*` predicates delete; §9.6's corrected
+// shape is that the 13 in-file sites are `==` comparisons, NOT a match — so
+// they pay nothing (`$a === "number"` either way), they gain no trap, and
+// §4.2's "covered for free by exhaustiveness" was wrong about them.
+//
+// What the closed type buys is that `Object` and `Null` — the two members of
+// the documented set that never got a predicate — are now as usable as the
+// other four.
+
+#[test]
+fn b76_json_kind_is_a_backed_enum_carrying_the_intrinsic_strings() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let value = parse_json_value("{\"n\":1,\"s\":\"x\",\"b\":true,\"a\":[],\"z\":null}");
+            print(value.kind() == JsonKind::Object);
+            print(value.field("n").kind() == JsonKind::Number);
+            print(value.field("s").kind() == JsonKind::String);
+            print(value.field("b").kind() == JsonKind::Bool);
+            print(value.field("a").kind() == JsonKind::Array);
+            // The two members that never got a predicate, now first-class.
+            print(value.field("z").kind() == JsonKind::Null);
+            print(JsonKind::Number.value());
+        }
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\nnumber\n",
+    );
+}
+
+#[test]
+fn b76_json_kind_comparisons_emit_what_the_predicates_compiled_to() {
+    // §9.6's first claim, checked in bytes: the site is the same `===` against
+    // the same literal `is_number()`'s body used to compile to, and the wrapper
+    // is no longer emitted at all (emission is demand-driven, §8.2(a)). That is
+    // why the rewrite is a net REDUCTION rather than a cost.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() { print(parse_json_value("1").kind() == JsonKind::Number); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"__json_kind("#),
+        "the intrinsic should still be the whole of it, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains(r#" === "number""#),
+        "the comparison should be against the raw string, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function is_number"),
+        "the deleted predicate should emit nothing, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an `==` is not a match, so §9.6 pays no trap cost, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
+    // The honest edge, recorded rather than papered over. A `JsonValue` is
+    // whatever the host handed over, so `field()` on an absent key is
+    // `undefined`, whose kind is none of the six. `==` answers `false` — the
+    // behavior the `is_*` predicates had — and an exhaustive `match` over
+    // `JsonKind` is the construct that says so instead of guessing, which is
+    // exactly what §9's trap is for.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let absent = parse_json_value("{}").field("nope");
+            print(absent.kind() == JsonKind::Null);
+            print(absent.kind() == JsonKind::Object);
+            print(match absent.kind() {
+                JsonKind::Null => "null",
+                JsonKind::Bool => "bool",
+                JsonKind::Number => "number",
+                JsonKind::String => "string",
+                JsonKind::Array => "array",
+                JsonKind::Object => "object",
+            });
+        }
         "#,
     );
+    assert_eq!(
+        stdout, "false\nfalse\n",
+        "`==` should answer false for a kind outside the set"
+    );
+    assert!(
+        stderr.contains(r#"JsonKind: "undefined" is not one of its values"#),
+        "an exhaustive match should trap naming the raw kind, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
 }
 
 // --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------

@@ -341,9 +341,6 @@ pub struct ExternalFunction<'src> {
     /// opaque host call may do anything). A `self`-by-value extern (`Shared::write`)
     /// has no `&mut` parameter and so an empty set.
     pub bumps: BTreeSet<u32>,
-    /// The span of the written return type, for a diagnostic that points at it
-    /// rather than at the name (A1). `None` when the declaration wrote none.
-    pub return_type_span: Option<Span>,
     pub call_count: u32,
     /// Declared `async` — a promise-returning host function. Calls to it are
     /// implicitly awaited.
@@ -11210,84 +11207,6 @@ impl<'src> Analyzer<'src> {
             .filter(|enum_| enum_.backing == Some(Backing::Str))
     }
 
-    /// **§7.2, DEFERRED at ratification: an `external fun` may not return a
-    /// backed enum in v1.** Host boundaries keep the generated-wrapper /
-    /// `parse()` path, where an out-of-set value honestly yields `None`.
-    ///
-    /// The parameter direction is safe and stays legal — vilan constructs the
-    /// value, so it is always in the set. The return direction is not, and what
-    /// happens then is the reason for the deferral rather than an argument
-    /// against the feature: an exhaustive `match` compiles its last arm to a
-    /// bare `else`, there being no "impossible" trap arm, so a host value
-    /// outside the set silently takes whichever arm happens to be last. The
-    /// value is not detectably wrong; it is CONFIDENTLY THE WRONG VARIANT.
-    /// Until backed enums grow a trap-arm story, the boundary keeps the shape
-    /// that reports honestly.
-    ///
-    /// Checked after the walk rather than at the declaration, so it does not
-    /// depend on whether the enum was declared above or below the extern. The
-    /// whole return type is searched, not just its head: `Option<Align>` and
-    /// `List<Align>` carry a host-supplied backing value in exactly the same
-    /// way, and the wrapper path is what each of them wants too. A nominal
-    /// struct is NOT searched through — a struct crossing the boundary is a
-    /// different hazard, and one the language already has.
-    fn check_external_backed_returns(&mut self) {
-        // The declaration's own id rides along: the check runs after `build()`
-        // over every file at once, so it is the only thing that can say which
-        // file the return-type span indexes (B112).
-        let offenders: Vec<(Id, Span, &'src str, &'src str)> = self
-            .external_functions
-            .values()
-            .filter_map(|external| {
-                let span = external.return_type_span?;
-                let enum_name =
-                    self.backed_enum_within(external.return_type_id, &mut Vec::new())?;
-                Some((external.id, span, external.name, enum_name))
-            })
-            .collect();
-        for (declaration_id, span, function_name, enum_name) in offenders {
-            self.push_anchored(
-                Error {
-                    note: None,
-                    span,
-                    msg: format!(
-                        "'{function_name}' is `external`, so it cannot return the backed enum \
-                         '{enum_name}': the host may send a value outside the set, and a backed \
-                         enum has no way to refuse one; return the backing type and convert \
-                         with `{enum_name}::parse`, which answers `None` outside the set"
-                    ),
-                },
-                declaration_id,
-            );
-        }
-    }
-
-    /// The name of the first backed enum anywhere inside `type_id`, following
-    /// generic arguments (`Option<Align>`, `List<Align>`) but not the fields of
-    /// a nominal struct. `seen` guards a recursive type.
-    fn backed_enum_within(&self, type_id: TypeId, seen: &mut Vec<TypeId>) -> Option<&'src str> {
-        if seen.contains(&type_id) {
-            return None;
-        }
-        seen.push(type_id);
-        let type_ = type_id.get_type(self);
-        if let Type::Enum(id, _) = &type_
-            && let Some(enum_) = self.enums.get(id)
-            && enum_.backing.is_some()
-        {
-            return Some(enum_.name);
-        }
-        let arguments = match &type_ {
-            Type::Enum(_, arguments) | Type::Struct(_, arguments) => arguments.clone(),
-            Type::Tuple(elements) => elements.clone(),
-            Type::Array(element, _) => vec![*element],
-            _ => Vec::new(),
-        };
-        arguments
-            .into_iter()
-            .find_map(|argument| self.backed_enum_within(argument, seen))
-    }
-
     fn is_native_operator_type(&self, type_: &Type) -> bool {
         match type_ {
             Type::Struct(id, _) => [
@@ -17449,7 +17368,6 @@ impl<'src> Analyzer<'src> {
                             // Seeded after `build()`: the native-container table, or
                             // the all-`&mut` default (`infer_bumps`). Empty until then.
                             bumps: BTreeSet::new(),
-                            return_type_span: return_type_node.map(|spanned| spanned.1),
                             call_count: 0,
                             is_async: function.is_async,
                         },
@@ -33129,9 +33047,6 @@ fn analyze_over_world<'src>(
     // it runs at the definition site rather than waiting for a call to pick
     // between them. After conformance, so an impl's `with`-clause traits are
     // resolved onto it and a trait's member is not mistaken for the type's own.
-    // §7.2's deferral: the host boundary keeps the wrapper/parse path in v1.
-    // A definition-site rule, so it runs here rather than at a call.
-    analyzer.check_external_backed_returns();
     analyzer.check_duplicate_inherent_members();
     // One block declaring one name twice (B84) — a different rule with a
     // different scope, so a trait-provided name collides here even though it

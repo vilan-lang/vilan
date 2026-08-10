@@ -1004,6 +1004,16 @@ fn helper_source(name: &str) -> &'static str {
         // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // The trap arm of an exhaustive `match` over a BACKED enum
+        // (backed-enums.md §9): the enum lowers to a bare host primitive, so its
+        // runtime domain is the host's, not the variant set the analyzer proved
+        // total over. Reaching this means the subject holds a value outside the
+        // set — a panic naming the enum and the raw value, rather than the
+        // confident wrong variant a bare `else` used to answer. `JSON.stringify`
+        // so a string backing is quoted and a number is not.
+        "__enum_trap" => {
+            "function __enum_trap(name, value) {\n\tthrow name + \": \" + JSON.stringify(value) + \" is not one of its values\";\n}"
+        }
         // The externally-tagged enum discriminator: a bare `"Variant"` is its own
         // tag, a `{"Variant":..}` object's tag is its single key.
         "__json_tag" => {
@@ -4436,13 +4446,53 @@ impl<'src> Transformer<'src> {
                         break;
                     }
                 }
+                // backed-enums.md §9 (candidate (b), ratified): the one match
+                // whose final leg does NOT become a bare `else`. A backed enum
+                // lowers to a bare host primitive (§3.5), so §1.5's
+                // exhaustiveness proof is over the vilan-side VARIANT SET and
+                // never was a proof about the runtime value's domain — the
+                // host's. The final leg keeps its variant test and the `else`
+                // traps, so a value outside the set is named instead of
+                // silently becoming whichever variant the analyzer ordered
+                // last (P11). Asked of the leg's own pattern, never of where
+                // the subject came from — that is the whole point of (b) over
+                // (a).
+                let trap_enum = compiled_legs
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|index| legs.get(index))
+                    .and_then(|leg| match &leg.pattern {
+                        ExprPattern::Variant(enum_id, _, _) => self.backed_enum_name(*enum_id),
+                        _ => None,
+                    });
                 // The analyzer verified exhaustiveness, so the final leg can
                 // always be the `else` branch — its whole test, guard and
                 // guard prelude included, is dropped.
                 if let Some(last_leg) = compiled_legs.last_mut() {
-                    last_leg.pattern_condition = None;
+                    // The GUARD still goes, trap or not: the trap answers for
+                    // values outside the set, not for a guard that rejects an
+                    // in-set one, so a guarded final leg keeps behaving exactly
+                    // as it did.
+                    if trap_enum.is_none() {
+                        last_leg.pattern_condition = None;
+                    }
                     last_leg.guard_condition = None;
                     last_leg.prelude.clear();
+                }
+                if let Some(enum_name) = trap_enum {
+                    self.used_helpers.insert("__enum_trap");
+                    compiled_legs.push(MatchLeg {
+                        pattern_condition: None,
+                        prelude: Vec::new(),
+                        guard_condition: None,
+                        body: vec![js::Node::Call(
+                            Box::new(js::Node::Local("__enum_trap".to_string())),
+                            vec![
+                                js::Node::String(Cow::Borrowed(enum_name)),
+                                js::Node::Local(subject_name.clone()),
+                            ],
+                        )],
+                    });
                 }
                 if compiled_legs.iter().all(|leg| leg.prelude.is_empty()) {
                     self.emit_match_chain(compiled_legs, block);
@@ -4574,6 +4624,19 @@ impl<'src> Transformer<'src> {
                 unescape_string(text).into_owned(),
             ))),
         }
+    }
+
+    /// The name of `enum_id` if it is a BACKED enum, else `None`. `bool` is
+    /// excluded deliberately: it lowers to a native scalar through its own
+    /// special case rather than through a backing value (§3.4 rejects a `bool`
+    /// backing), and a `match` over it is not what §9's trap arm guards.
+    fn backed_enum_name(&self, enum_id: Id) -> Option<&'src str> {
+        if Some(enum_id) == self.program.bool_enum_id {
+            return None;
+        }
+        let enum_ = self.program.enums.get(&enum_id)?;
+        enum_.backing?;
+        Some(enum_.name)
     }
 
     /// For a variant of an enum that lowers to a native scalar — `bool`

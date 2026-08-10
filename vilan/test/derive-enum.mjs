@@ -19,12 +19,9 @@ function __try_parse_json(text) {
 		return [ 1 ];
 	}
 }
-function is_number(self) {
-	return __json_kind(self) === "number";
-}
 function from_json_value(value) {
 	let $m = null;
-	if (is_number(value)) {
+	if (__json_kind(value) === "number") {
 		$m = [ 0, Number(value) ];
 	} else {
 		$m = [ 1, "expected a number" ];

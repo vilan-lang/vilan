@@ -1653,3 +1653,201 @@ written-literal-per-variant rule: six go red, and the seven pinning the
 rules that must *not* move — the walked collision, `§3.1(a)`'s string
 requirement, the payload rejection, the plain-enum conjunction, `Hashable`
 — stay green.
+
+## 11. Implementation notes — the trap arm and the lift (cycle 14)
+
+§9's candidate (b) shipped as ratified, and with it §7.2's deferral, §4.2's
+`json.vl` contingency, and B107. What follows is what the build found: the
+one measurement §9 stated that did not survive contact, the places (b)
+turned out to be wider than the note claimed, and the residual it does not
+cover.
+
+### 11.1 The measured cost — §9.3's "+39" is superseded
+
+P14 measured the delta with a **placeholder** trap statement (`$b = "trap";`,
+13 bytes), and said so in the same breath: "a real helper call lands around
+50–55 bytes". The real numbers, this worktree's binary, whole emissions:
+
+| | §9.3 | shipped |
+|---|---|---|
+| per exhaustive match | ~50–55 (estimated) | **56** (`Ordering`) – **62** (`Align`) |
+| the helper, once per emitting file | not counted | **111** |
+| the corpus | +39 | **+167**, still one program |
+
+The per-match figure is P14's estimate, confirmed. The corpus figure is not
+P14's, because P14's did not include a helper it explicitly declined to
+model. The decomposition is unchanged and holds exactly: one added `===`
+test (12 bytes plus the last variant's literal as written) plus one `else`
+block, and the 7-variant enum is still cheaper than the 3-variant one — the
+cost is per match, per the enum's LAST literal, not per variant.
+
+**On the whole arc the corpus SHRANK: −184 bytes** across 114 goldens. The
+trap costs +167 in `enum-discriminant.mjs` and §11.4's `json.vl` rewrite
+returns −351. §9.3's "not a cost worth an argument" is if anything
+understated.
+
+The helper rather than an inline `throw` was a deliberate trade and it is
+the wrong one at exactly one call site: inline is ~95 bytes per match with
+no fixed cost, so a file with ONE exhaustive match (which is the corpus,
+today) pays 95 where the helper pays 167, and a file with three or more
+pays less. It was chosen for the reason that outlives the byte count —
+the message is defined once, so every trap in every program reads the same
+and `JSON.stringify` quotes a string backing without each site paying for
+the quoting.
+
+### 11.2 The message: `Align: "middle" is not one of its values`
+
+§9.4's illustrative wording is *`Align: host value "middle" is not one of
+its values`*, and the shipped message drops **"host"**. That is not
+tidying: §9.4 wrote it inside candidate (a), where provenance is a tracked
+fact. (b)'s first argument for itself is that it "never asks where the
+value came from" (§9.5.1), so a message asserting the value came from the
+host would be claiming exactly the thing the design declines to know.
+Everything else is as §9.4 specifies — a panic, not an `Option`; the enum
+and the raw value named; emitted through the same `throw`-a-string shape
+`panic()` uses, so the CLI reports it as an ordinary vilan panic.
+
+`__enum_trap` has a macro-time mirror in the interpreter, worded
+identically (`Failure::Thrown`, the `__at` precedent). It is unreachable
+from a const-eval in practice — the folded value is in-set by construction
+— but the emitted-vs-interpreted helper pair is a parity contract in this
+codebase and a one-sided one is how they drift.
+
+### 11.3 Where (b) turned out to be wider than §9 says
+
+- **A ONE-VARIANT backed enum gains a test where it had none.** `match o
+  { One::Only => .. }` compiled to no branch at all — the single arm WAS
+  the bare `else`. §9's framing ("the last arm of an exhaustive match")
+  covers it, but the shape is worth naming because it is the one case
+  where the trap adds a conditional rather than extending a chain.
+- **The B59 SEQUENCE emitter needed the arm too.** A guard needing
+  statement slots turns a match into a flat `matched`-flag sequence rather
+  than an else-if chain. §9.3's P13 measured the chain only. Appending
+  the trap as an ordinary final leg (no pattern, no guard) makes both
+  emitters produce it without either learning anything: the chain renders
+  it as the `else`, the sequence as the closing `if (!matched)`.
+- **A GUARDED final leg keeps only its PATTERN test.** The pre-existing
+  code dropped the last leg's test, guard and guard prelude together. The
+  trap keeps the test and still drops the guard, deliberately: the trap
+  answers for values outside the SET, and a guard that rejects an in-set
+  value must keep falling through exactly as it did. (That fall-through is
+  itself questionable — `match a { A => .., B if c => .. }` runs `B`'s arm
+  when `!c` — but it is pre-existing, orthogonal, and not this lane's.)
+
+### 11.4 §4.2's `json.vl`, per §9.6 — and one thing §9.6 did not know
+
+Taken, in §9.6's corrected shape. §4.2's "13 call sites become `v.kind() ==
+JsonKind::Number`" is exactly right and §9.6's two amendments both hold:
+the sites pay nothing (same `===`, same literal) and get no trap (an `==`
+is not a match). The four predicate wrappers stop being emitted, which is
+where the −351 bytes come from.
+
+§9.6 inherited §8.3's sweep — "no caller outside `json.vl` itself" — and
+that sweep was short by one **class** of caller, not by a site:
+`docs/std/encoding.md` has a **gated fence** (upgraded from a fragment on
+2026-08-08) that calls `kind()` and `is_string()`, so the docs gate is a
+real compile-time caller. Re-verified for `.vl` source, where it holds
+exactly: nothing in `vilan/std/src` outside `json.vl`, `vilan/test`,
+`vilan/examples`, `vilan/benchmarks` or any Rust fixture std calls
+`kind()` or the four predicates.
+
+**The honest edge §2.2 through §9.6 all miss: `kind()`'s set is not closed
+over `JsonValue`.** It is closed over JSON. `__json_kind` is `typeof` with
+arrays and `null` named, and a `JsonValue` is whatever the host handed
+over — so `value.field("absent")` is `undefined` and its kind is
+`"undefined"`, a seventh string. §2.2's diagnosis ("the set is closed in
+prose and open in the type system") was right about the prose being wrong
+in the OTHER direction too.
+
+`JsonKind` ships with the six documented members and not a seventh, for
+two reasons. `undefined` is not a JSON type, so naming it would make the
+type lie about what it is; and it would not close the set anyway — `typeof`
+can also answer `function`, `bigint`, `symbol` for a host value that never
+saw `JSON.parse`. The behavior is therefore: `==` answers `false` for an
+out-of-set kind, exactly as the deleted predicates did (this is what keeps
+the 13 sites byte-equivalent), and an exhaustive `match` over `JsonKind`
+traps and names it — which is the trap doing precisely the job §9 built it
+for, at the first place in std where the boundary is genuinely open.
+Pinned, and documented in `docs/std/encoding.md` beside `has_field`, which
+is the check that keeps a caller out of the case.
+
+### 11.5 bindgen — §9 is silent, and the answer is DELETE, not switch
+
+§9 says nothing about bindgen (§9.5's slices stop at `json.vl`), so this is
+recorded rather than inherited. §4.1's summary was "bindgen goes back to
+emitting signatures only, **plus one one-line `parse` forwarder in return
+position**". The qualifier existed for §7.2's deferral and nothing else, so
+it goes with it, and §4.1's own sentence lands unqualified: bindgen emits
+signatures only. There is no generated body left anywhere in the emitter.
+
+Two consequences neither §4.1 nor §8.4 anticipated, and they are why this
+is a deletion rather than a switch:
+
+- **`Position::Nested` stops being a special case.** It bound the raw
+  `str` "conservatively... the direction it travels is not knowable here"
+  — an argument wholly about needing a forwarder POSITION, which a nested
+  type does not have. With no forwarder anywhere, direction stops
+  mattering: `List<Align>` and a closure's own parameter both bind the
+  enum. The closure case is B107's shape, and it is the trap that makes
+  binding it honest rather than optimistic.
+- **§8.4's "bindgen's PROPERTIES keep their TODO" closes unprompted.** Its
+  stated reason — "a property is both, through separate externs, so one
+  bound type cannot serve it" — was true only while the getter wanted
+  `str` and the setter wanted `Align`. They want the same type now. §8.4
+  proposed "widening the property emitter to a raw pair plus two
+  forwarders"; the property emitter needed a DELETION instead, and the
+  TODO class disappears rather than being served.
+
+Dead with them: `Mapped::string_enum`, `emit_one_binding`'s
+`return_string_enum` and the `_raw`/`[doc(hidden)]` naming it drove, the
+`extra` forwarder channel threaded through four callers, and
+`needs_option`/`header_end` (the `Option` import only the forwarder
+needed). `Enum::parse` survives in the generated file's DOC COMMENT, as
+the shape to hand-edit toward — which is the right place for it, the
+generated file being ordinary source the author owns.
+
+### 11.6 What (b) does NOT cover — one residual, pinned `#[ignore]`d
+
+The trap is asked of the match's own subject: the final leg's pattern must
+be a `Variant` of a backed enum. A backed enum reached through a PAYLOAD
+pattern is not covered —
+
+```vilan
+match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+```
+
+— because the final leg drops its whole condition, the nested `Align` test
+with it, so an out-of-set `Align` inside the payload still lands on the
+last arm confidently. This is the same hazard §9 exists to remove, one
+level down.
+
+It is recorded rather than guessed at because closing it needs a message
+design §9 does not have: a leg's condition can carry more than one backed
+test, and which of them failed is not knowable at runtime, so the trap
+cannot name "the enum and the raw value" the way §9.4 requires. The
+generalization also changes the emission of matches over UNBACKED enums
+(their last leg's condition would have to be kept whenever any nested
+backed test rides in it), which is a corpus-wide byte question §9's
+measurement did not ask. Pinned as `b76_the_trap_arm_does_not_reach_a_nested_backed_pattern`,
+`#[ignore]`d, asserting the desired outcome.
+
+### 11.7 Ledger
+
+- **B107 is MOOT, as §9.5.1 predicted** — the incomplete check deletes with
+  the lift rather than being completed. Its repro is kept as a live
+  regression pin (`b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration`),
+  because what it now asserts is a different claim: not that the shape is
+  refused, but that it runs and traps.
+- **`ExternalFunction::return_type_span`** was added for the refusal's
+  diagnostic and had no other reader; it goes too.
+- **Pins: 13** across the arc (5 trap-arm emission/behavior, 1 edge-shape,
+  4 lift, 3 `JsonKind`), plus the rewritten byte-equality pin, 2 rewritten
+  bindgen pins and 1 new one. Every load-bearing pin proven non-vacuous by
+  plant: the trap disabled (4 red), the trap widened to every enum (1 red),
+  the leg read from the wrong end (1 red), the refusal restored (2 red).
+- **Goldens moved: 6.** `enum-discriminant.mjs` (+167, the trap);
+  `derive-enum.mjs`/`derive-json.mjs`/`json-roundtrip.mjs` (−351 together,
+  the predicate wrappers no longer emitted); `bindgen/unions.vl` and
+  `bindgen/only_closure.vl` (the direct return, the property, the doc
+  comment). Each verified by reading the diff.
+

@@ -13,11 +13,11 @@
 // `undefined` binds as the BARE type, and the absence is yours to guard.
 // Each such binding carries a `///` note saying so.
 
-import std::option::Option;
-
 /// `Align` — the closed string set `"start" | "end" | "center"`.
 /// A backed enum: each variant IS the host string it names, so it crosses
-/// the boundary unchanged. `parse` guards the return direction.
+/// the boundary unchanged, in both directions. A host value outside the set
+/// panics at the first `match`; bind `str` and use `parse` instead where
+/// such a value is expected rather than a bug.
 enum Align {
 	Start = "start",
 	End = "end",
@@ -38,16 +38,13 @@ impl Chart {
 	[extern("Object")]
 	external fun new(): Chart;
 
-	// TODO(bindgen): property `align` is the closed string set `Align` — the
-	// raw `str` is bound; read it with `Align::parse(..)`, and write
-	// `Align::Variant.value()`
 	[extern(get, "align")]
 	[platform("node")]
-	external fun align(self): str;
+	external fun align(self): Align;
 
 	[extern(set, "align")]
 	[platform("node")]
-	external fun set_align(self, value: str): void;
+	external fun set_align(self, value: Align): void;
 
 	[extern(method, "setAlign")]
 	[platform("node")]
@@ -108,13 +105,6 @@ impl Chart {
 	external fun maybe_align_with_align(self, align: Align): void;
 
 	[extern(method, "getAlign")]
-	[doc(hidden)]
 	[platform("node")]
-	external fun get_align_raw(self): str;
-
-	/// `get_align` — `get_align_raw` guarded by `Align::parse`: the host may answer
-	/// outside the set, which is `None`.
-	fun get_align(self): Option<Align> {
-		Align::parse(self.get_align_raw())
-	}
+	external fun get_align(self): Align;
 }

@@ -274,7 +274,9 @@ impl ReachedCycleRight {
 
 /// `ReachedAlign` — the closed string set `"start" | "end"`.
 /// A backed enum: each variant IS the host string it names, so it crosses
-/// the boundary unchanged. `parse` guards the return direction.
+/// the boundary unchanged, in both directions. A host value outside the set
+/// panics at the first `match`; bind `str` and use `parse` instead where
+/// such a value is expected rather than a bug.
 enum ReachedAlign {
 	Start = "start",
 	End = "end",

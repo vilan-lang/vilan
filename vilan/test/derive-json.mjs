@@ -16,21 +16,12 @@ function __try_parse_json(text) {
 		return [ 1 ];
 	}
 }
-function is_number(self) {
-	return __json_kind(self) === "number";
-}
-function is_string(self) {
-	return __json_kind(self) === "string";
-}
-function is_bool(self) {
-	return __json_kind(self) === "boolean";
-}
 function has_field(self, name) {
 	return Object.hasOwn(self, name);
 }
 function from_json_value(value) {
 	let $i = null;
-	if (is_string(value)) {
+	if (__json_kind(value) === "string") {
 		$i = [ 0, String(value) ];
 	} else {
 		$i = [ 1, "expected a string" ];
@@ -39,7 +30,7 @@ function from_json_value(value) {
 }
 function from_json_value2(value) {
 	let $k = null;
-	if (is_number(value)) {
+	if (__json_kind(value) === "number") {
 		$k = [ 0, Number(value) ];
 	} else {
 		$k = [ 1, "expected a number" ];
@@ -48,7 +39,7 @@ function from_json_value2(value) {
 }
 function from_json_value3(value) {
 	let $m = null;
-	if (is_bool(value)) {
+	if (__json_kind(value) === "boolean") {
 		$m = [ 0, Boolean(value) ];
 	} else {
 		$m = [ 1, "expected a boolean" ];
