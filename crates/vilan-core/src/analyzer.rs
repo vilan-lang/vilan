@@ -241,6 +241,22 @@ pub enum ExprPattern {
     Literal(Id),
 }
 
+/// Whether a pattern matches every value of its type — the grammar's
+/// "irrefutable subset" (spec §3.10: the `let`/parameter binder forms). A tuple
+/// destructure qualifies only when every element does, so `(let a, let b)` is a
+/// catch-all and `(1, 2)` is a test. Variant, literal and array patterns are
+/// refutable: they can fail, so they prove nothing about the values a match
+/// covers.
+fn is_irrefutable_pattern(pattern: &ExprPattern) -> bool {
+    match pattern {
+        ExprPattern::Wildcard | ExprPattern::Binding(_) => true,
+        ExprPattern::Tuple(elements) => elements
+            .iter()
+            .all(|(element, _)| is_irrefutable_pattern(element)),
+        ExprPattern::Variant(_, _, _) | ExprPattern::Array(_) | ExprPattern::Literal(_) => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Function<'src> {
     pub id: Id,
@@ -25501,16 +25517,38 @@ impl<'src> Analyzer<'src> {
         }
 
         // Exhaustiveness: a leg is an irrefutable catch-all when it is unguarded
-        // and a pattern matches anything (`_`, a binding, or a tuple destructure).
+        // and a pattern matches anything (`_`, a binding, or a tuple destructure
+        // whose elements are themselves irrefutable — `(1, 2)` is a TEST, not a
+        // destructure, and counting it as one is what let B115's tuple shape
+        // through this check).
         let has_catch_all = resolved_legs.iter().any(|(patterns, guard, _)| {
-            guard.is_none()
-                && patterns.iter().any(|pattern| {
-                    matches!(
-                        pattern,
-                        ExprPattern::Wildcard | ExprPattern::Binding(_) | ExprPattern::Tuple(_)
-                    )
-                })
+            guard.is_none() && patterns.iter().any(is_irrefutable_pattern)
         });
+        // B115: a guard tests the VALUE, which this check does not reason about,
+        // so a guarded leg proves nothing — which is why both walks below count
+        // unguarded legs only. The lowering makes the FINAL leg the bare `else`
+        // on the strength of whatever proof this check accepts (transformer,
+        // `Expr::Match`), so a match whose last leg is guarded must be proven
+        // exhaustive WITHOUT that leg. A catch-all leg is unguarded by
+        // definition and every leg after one is unreachable, so a match that has
+        // one is never in this case.
+        let guarded_final_leg = !has_catch_all
+            && resolved_legs
+                .last()
+                .is_some_and(|(_, guard, _)| guard.is_some());
+        // The note that makes the message legible when the leg the author
+        // believes covers the case is the guarded one: it points at the guard.
+        // The LAST such leg, which is the final leg whenever that one is
+        // guarded — the case the note exists for.
+        let guarded_leg_note = |analyzer: &Self, guard_ids: &[Id]| {
+            guard_ids.last().map(|guard_id| {
+                Note::here(
+                    **analyzer.span_map.get(guard_id).unwrap_or(&&EMPTY_SPAN),
+                    "this leg is guarded, and a guarded leg cannot prove exhaustiveness"
+                        .to_string(),
+                )
+            })
+        };
         match &subject_type {
             Type::Enum(enum_id, _) if !has_catch_all => {
                 // Each unguarded variant pattern (in any leg) covers its variant.
@@ -25523,6 +25561,25 @@ impl<'src> Analyzer<'src> {
                         _ => None,
                     })
                     .collect::<HashSet<_>>();
+                // A variant written only on a GUARDED leg is still missing, and
+                // that is the confusing case — the author sees the variant's
+                // name in the match. Collect those guards so the note can point
+                // at one.
+                let guards_over_missing_variants = resolved_legs
+                    .iter()
+                    .filter_map(|(patterns, guard, _)| {
+                        let guard_id = (*guard)?;
+                        patterns
+                            .iter()
+                            .any(|pattern| match pattern {
+                                ExprPattern::Variant(_, variant_index, _) => {
+                                    !covered.contains(variant_index)
+                                }
+                                _ => false,
+                            })
+                            .then_some(guard_id)
+                    })
+                    .collect::<Vec<_>>();
                 let missing = self
                     .enums
                     .get(enum_id)
@@ -25535,7 +25592,7 @@ impl<'src> Analyzer<'src> {
                     .collect::<Vec<_>>();
                 if !missing.is_empty() {
                     self.diagnostics.push(Error {
-                        note: None,
+                        note: guarded_leg_note(self, &guards_over_missing_variants),
                         span: prepped.span,
                         msg: format!("match is not exhaustive: missing {}", missing.join(", ")),
                     });
@@ -25543,11 +25600,20 @@ impl<'src> Analyzer<'src> {
             }
             // A non-enum subject (e.g. a `str` matched with literals) has an
             // unbounded domain, so it needs an explicit catch-all. Tuples and
-            // not-yet-known types are exempt.
-            Type::Tuple(_) | Type::Unknown | Type::Any | Type::Never | Type::Generic(_) => {}
+            // not-yet-known types are exempt — but that exemption answers the
+            // DOMAIN question ("which values can the subject take?"), and it
+            // never licensed a guard (B115): it lapses when the final leg is
+            // guarded, because then there is nothing behind it to fall through
+            // to whatever the subject's type.
+            Type::Tuple(_) | Type::Unknown | Type::Any | Type::Never | Type::Generic(_)
+                if !guarded_final_leg => {}
             _ if !has_catch_all => {
+                let guards = resolved_legs
+                    .iter()
+                    .filter_map(|(_, guard, _)| *guard)
+                    .collect::<Vec<_>>();
                 self.diagnostics.push(Error {
-                    note: None,
+                    note: guarded_leg_note(self, &guards),
                     span: prepped.span,
                     msg: "match is not exhaustive: add a catch-all `_` leg".to_string(),
                 });

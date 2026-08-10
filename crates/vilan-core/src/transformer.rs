@@ -4505,19 +4505,28 @@ impl<'src> Transformer<'src> {
                         ExprPattern::Variant(enum_id, _, _) => self.backed_enum_name(*enum_id),
                         _ => None,
                     });
-                // The analyzer verified exhaustiveness, so the final leg can
-                // always be the `else` branch — its whole test, guard and
-                // guard prelude included, is dropped.
-                if let Some(last_leg) = compiled_legs.last_mut() {
-                    // The GUARD still goes, trap or not: the trap answers for
-                    // values outside the set, not for a guard that rejects an
-                    // in-set one, so a guarded final leg keeps behaving exactly
-                    // as it did.
-                    if trap_enum.is_none() {
-                        last_leg.pattern_condition = None;
-                    }
-                    last_leg.guard_condition = None;
-                    last_leg.prelude.clear();
+                // The analyzer verified exhaustiveness, so an UNGUARDED final
+                // leg can always be the `else` branch — its whole test is
+                // dropped. The trap case above is the one exception: it keeps
+                // the test and traps in the `else` instead.
+                //
+                // B115: a GUARDED final leg never carries that proof. The
+                // analyzer's walk counts unguarded legs only — a guard tests the
+                // VALUE, which it does not reason about — so the legs BEFORE
+                // this one are what make the match exhaustive, and this one
+                // keeps its test, its prelude and its guard. Dropping them made
+                // the leg the catch-all it is not: `match a { A => .., B if c =>
+                // .. }` ran B's arm when `!c`. A guarded final leg therefore
+                // survives only where the earlier legs already cover the
+                // subject, which is what keeps the trap's message honest when
+                // the two compose — an in-set value this guard rejects was
+                // taken by one of them, so only an out-of-set value reaches the
+                // trap, exactly as when the final leg is unguarded.
+                if let Some(last_leg) = compiled_legs.last_mut()
+                    && trap_enum.is_none()
+                    && last_leg.guard_condition.is_none()
+                {
+                    last_leg.pattern_condition = None;
                 }
                 if let Some(enum_name) = trap_enum {
                     self.used_helpers.insert("__enum_trap");
@@ -4764,7 +4773,9 @@ impl<'src> Transformer<'src> {
         let leg_count = legs.len();
         for (index, leg) in legs.into_iter().enumerate() {
             let mut body = leg.body;
-            // The final leg is the `else`: nothing follows it to fall through to.
+            // Nothing follows the final leg to fall through to, so it has no
+            // flag to set — whether it is the `else` (unguarded) or keeps a test
+            // of its own (a guarded final leg, B115).
             if index + 1 < leg_count {
                 // Record the match BEFORE the body runs, so a body that returns,
                 // breaks, or continues cannot leave the flag behind.
