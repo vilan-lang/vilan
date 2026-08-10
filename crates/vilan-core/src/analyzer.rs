@@ -1373,23 +1373,29 @@ pub struct Scope<'src> {
     pub declaration_order: Vec<(&'src str, Id)>,
 }
 
-/// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, plus each
+/// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
+/// DECLARATION's entity id — the file every member span indexes into, which the
+/// check cannot ask for later because it runs after `build()` (B112) — plus each
 /// member as `(label, type node, resolved field TypeId, span)` (see
 /// `check_wire_boundary`). The resolved `TypeId` lets the same member be tested
 /// for resource-ness (destruction.md §8 — a resource field is rejected with a
 /// resource-specific steer, taking precedence over the not-Wire message) without
 /// re-walking the syntactic node.
-type WireTypeCheck<'src> = (&'src str, Vec<(String, &'src Node<'src>, TypeId, Span)>);
+type WireTypeCheck<'src> = (&'src str, Id, Vec<(String, &'src Node<'src>, TypeId, Span)>);
 
-/// An `[rpc]` method awaiting its Wire-signature check: its name, plus each
-/// parameter and the return as `(label, declared type node, span)` — `None` for
-/// a parameter that declares no type (see `check_rpc_signatures`).
-type RpcSignatureCheck<'src> = (&'src str, Vec<(String, Option<&'src Node<'src>>, Span)>);
+/// An `[rpc]` method awaiting its Wire-signature check: its name, its own entity
+/// id — the file every span below indexes into, which the check cannot ask for
+/// later because it runs after `build()` (B112) — plus each parameter and the
+/// return as `(label, declared type node, span)`, `None` for a parameter that
+/// declares no type (see `check_rpc_signatures`).
+type RpcSignatureCheck<'src> = (&'src str, Id, Vec<(String, Option<&'src Node<'src>>, Span)>);
 
 /// An `[expose]`d struct field awaiting its `Signal`-of-Wire check: a label
-/// naming the struct + field, its declared type node (`None` if missing), and
-/// the span to report at (see `check_expose_fields`).
-type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, Span);
+/// naming the struct + field, its declared type node (`None` if missing), the
+/// span to report at, and the STRUCT's entity id — the file that span indexes
+/// into, which the check cannot ask for later because it runs after `build()`
+/// (B112). See `check_expose_fields`.
+type ExposeFieldCheck<'src> = (String, Option<&'src Node<'src>>, Span, Id);
 
 #[derive(Clone, Debug)]
 pub struct Analyzer<'src> {
@@ -1461,9 +1467,12 @@ pub struct Analyzer<'src> {
     /// `impl Subject with Drop` sites (destruction.md §5), recorded during the
     /// conformance check (where the std `Drop` trait id resolves) and validated
     /// post-build, once resource classification is complete: `(subject TypeId,
-    /// the `with Drop` span, the impl's `drop` method id)`. `Drop` is
-    /// implementable only for a resource, and `drop` must be synchronous.
-    drop_impls_to_check: Vec<(TypeId, Span, Option<Id>)>,
+    /// the `with Drop` span, the IMPL's own entity id, the impl's `drop` method
+    /// id)`. `Drop` is implementable only for a resource, and `drop` must be
+    /// synchronous. The impl id is what places the diagnostic in the file the
+    /// span indexes into — the check runs after `build()`, where nothing else
+    /// can say (B112).
+    drop_impls_to_check: Vec<(TypeId, Span, Id, Option<Id>)>,
     /// A resource type's own `drop(&mut self)` method (destruction.md §5), keyed
     /// on the subject's NOMINAL id (struct/enum id, not `TypeId` — the same
     /// nominal type interns to several `TypeId`s, and generics share one `drop`
@@ -2668,7 +2677,9 @@ impl<'src> Analyzer<'src> {
 
         let mut marked: Vec<Id> = self.spread_elements.iter().copied().collect();
         marked.sort_by_key(|id| id.0);
-        let mut errors: Vec<(Span, String)> = Vec::new();
+        // Each error carries the entity its span came from: the check runs
+        // after `build()`, so nothing else can say which file that is (B112).
+        let mut errors: Vec<(Id, Span, String)> = Vec::new();
         for id in marked {
             let span = self
                 .spread_spans
@@ -2677,6 +2688,7 @@ impl<'src> Analyzer<'src> {
                 .unwrap_or_else(|| **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN));
             if !in_a_construction.contains(&id) {
                 errors.push((
+                    id,
                     span,
                     "`..` splices a tuple's elements into a tuple construction, so it \
                      belongs inside `(…)` — or at a call to a spread parameter, which \
@@ -2701,7 +2713,7 @@ impl<'src> Analyzer<'src> {
             if let Type::Generic(constraint_id) = operand_type {
                 if !self.tuple_bounds.contains_key(&constraint_id) {
                     let label = self.pretty_print_type(&operand_type, &HashMap::new());
-                    errors.push((span, Self::not_a_tuple_message(&label)));
+                    errors.push((id, span, Self::not_a_tuple_message(&label)));
                     continue;
                 }
                 // An abstract pack: a tuple whose elements are not yet a
@@ -2715,6 +2727,7 @@ impl<'src> Analyzer<'src> {
                 if !alone {
                     let label = self.pretty_print_type(&operand_type, &HashMap::new());
                     errors.push((
+                        id,
                         span,
                         format!(
                             "'{label}' is a tuple of unknown arity here, so its elements \
@@ -2728,15 +2741,18 @@ impl<'src> Analyzer<'src> {
             }
             if !matches!(operand_type, Type::Tuple(_)) {
                 let label = self.pretty_print_type(&operand_type, &HashMap::new());
-                errors.push((span, Self::not_a_tuple_message(&label)));
+                errors.push((id, span, Self::not_a_tuple_message(&label)));
             }
         }
-        for (span, msg) in errors {
-            self.diagnostics.push(Error {
-                note: None,
-                span,
-                msg,
-            });
+        for (id, span, msg) in errors {
+            self.push_anchored(
+                Error {
+                    note: None,
+                    span,
+                    msg,
+                },
+                id,
+            );
         }
     }
 
@@ -2760,7 +2776,10 @@ impl<'src> Analyzer<'src> {
     /// explicit `f<Cat>()` arguments, method own-generics, impl-subject and
     /// trait-parameter bindings).
     fn check_generic_bound_satisfaction(&mut self) {
-        let mut errors: Vec<(Span, String, TypeId)> = Vec::new();
+        // Each entry carries the entity its span came from: the check runs over
+        // every file at once, after `build()`, so nothing else can say which file
+        // the span indexes (B112) — and the sort below needs the file to lead.
+        let mut errors: Vec<(Id, Span, String, TypeId)> = Vec::new();
         let recorded: Vec<(Id, SubstitutionContext)> = self
             .method_call_substitution
             .iter()
@@ -2787,6 +2806,7 @@ impl<'src> Analyzer<'src> {
                     for msg in self.tuple_bound_violations(&requirement, &value_type, &substitution)
                     {
                         errors.push((
+                            call_id,
                             **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                             msg,
                             constraint_id,
@@ -2834,6 +2854,7 @@ impl<'src> Analyzer<'src> {
                         )
                     };
                     errors.push((
+                        call_id,
                         **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                         msg,
                         constraint_id,
@@ -2882,6 +2903,7 @@ impl<'src> Analyzer<'src> {
                     })
                     .collect();
                 errors.push((
+                    call_id,
                     **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
                     format!(
                         "cannot infer '{generic_label}' for this call; its bound ': {}' \
@@ -3020,6 +3042,7 @@ impl<'src> Analyzer<'src> {
                         &declared_bindings,
                     ) {
                         errors.push((
+                            site_id,
                             **self.span_map.get(&site_id).unwrap_or(&&EMPTY_SPAN),
                             msg,
                             *constraint_id,
@@ -3061,6 +3084,7 @@ impl<'src> Analyzer<'src> {
                         )
                     };
                     errors.push((
+                        site_id,
                         **self.span_map.get(&site_id).unwrap_or(&&EMPTY_SPAN),
                         msg,
                         *constraint_id,
@@ -3081,11 +3105,27 @@ impl<'src> Analyzer<'src> {
         // at, so without the constraint in the key that was a hash-order pick
         // between `A` and `B` (16/14 over 30 cold analyses). Least id wins,
         // which is the first-declared parameter.
-        errors.sort_by_key(|(span, msg, constraint_id)| {
-            (span.start, span.end, msg.clone(), constraint_id.0)
+        //
+        // The FILE leads both keys. A span is a byte offset into its own file, so
+        // ordering by offset alone is not an answer across files — and the dedup
+        // is worse than unordered there: two violations in two files can share a
+        // span range and a message word for word, and collapsing them would drop
+        // one file's diagnostic outright (E38's C1 rule, B112's multi-file half).
+        let mut errors: Vec<(SourceId, Id, Span, String, TypeId)> = errors
+            .into_iter()
+            .map(|(anchor, span, msg, constraint_id)| {
+                let source = self.source_of_id(anchor).unwrap_or(SourceId(0));
+                (source, anchor, span, msg, constraint_id)
+            })
+            .collect();
+        errors.sort_by_key(|(source, _, span, msg, constraint_id)| {
+            (source.0, span.start, span.end, msg.clone(), constraint_id.0)
         });
-        errors
-            .dedup_by(|(a_span, a_msg, _), (b_span, b_msg, _)| a_span == b_span && a_msg == b_msg);
+        errors.dedup_by(
+            |(a_source, _, a_span, a_msg, _), (b_source, _, b_span, b_msg, _)| {
+                a_source == b_source && a_span == b_span && a_msg == b_msg
+            },
+        );
         // Note WHERE the failing bound is declared (`T: Feed` in the
         // callee's signature — cross-file when the callee is std's): the
         // generic's registration entity carries the declaration's name span.
@@ -3100,9 +3140,9 @@ impl<'src> Analyzer<'src> {
         // in walk order, so that is the earliest declaration — which is the one
         // that actually WRITES the bound, the inheriting binders having only
         // adopted it.
-        let bound_declarations: Vec<(Span, String, Option<crate::error::Note>)> = errors
+        let bound_declarations: Vec<(Id, Span, String, Option<crate::error::Note>)> = errors
             .into_iter()
-            .map(|(span, msg, constraint_id)| {
+            .map(|(_, anchor, span, msg, constraint_id)| {
                 let declaration = self
                     .expr_id_to_expr_map
                     .iter()
@@ -3123,11 +3163,11 @@ impl<'src> Analyzer<'src> {
                     msg: "the bound is declared here".to_string(),
                     source: self.source_of_id(entity_id),
                 });
-                (span, msg, note)
+                (anchor, span, msg, note)
             })
             .collect();
-        for (span, msg, note) in bound_declarations {
-            self.diagnostics.push(Error { note, span, msg });
+        for (anchor, span, msg, note) in bound_declarations {
+            self.push_anchored(Error { note, span, msg }, anchor);
         }
     }
 
@@ -3400,7 +3440,8 @@ impl<'src> Analyzer<'src> {
         };
         self.wire_names.insert(name);
         let members = self.collect_derived_members(item, declaration_id);
-        self.wire_types_to_check.push((name, members));
+        self.wire_types_to_check
+            .push((name, declaration_id, members));
     }
 
     /// A field type is Wire iff it is a Wire scalar
@@ -3441,36 +3482,42 @@ impl<'src> Analyzer<'src> {
     /// after all modules are walked, so `wire_names` sees cross-module Wire types.
     fn check_wire_boundary(&mut self) {
         let checks = std::mem::take(&mut self.wire_types_to_check);
-        for (type_name, members) in &checks {
+        for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Wire message: a resource is not
                 // plain data, so it cannot cross the wire (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span: *span,
-                        msg: format!(
-                            "{label} of `[derive(Wire)]` type `{type_name}` is the resource \
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span: *span,
+                            msg: format!(
+                                "{label} of `[derive(Wire)]` type `{type_name}` is the resource \
                              `{rendered}`: a resource is not plain data and cannot be sent over \
                              the wire; carry a plain-data handle (an id, a key) instead"
-                        ),
-                    });
+                            ),
+                        },
+                        *declaration_id,
+                    );
                     continue;
                 }
                 if !self.is_wire_type(type_node) {
                     let rendered = render_type(type_node);
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span: *span,
-                        msg: format!(
-                            "{label} of `[derive(Wire)]` type `{type_name}` is `{rendered}`, \
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span: *span,
+                            msg: format!(
+                                "{label} of `[derive(Wire)]` type `{type_name}` is `{rendered}`, \
                              which is not Wire: every field of a Wire type must itself be Wire \
                              (a scalar, `str`, `bool`, `List`/`Option` of Wire, or another \
                              `[derive(Wire)]` type)"
-                        ),
-                    });
+                            ),
+                        },
+                        *declaration_id,
+                    );
                 }
             }
         }
@@ -3484,7 +3531,8 @@ impl<'src> Analyzer<'src> {
         };
         self.hashable_names.insert(name);
         let members = self.collect_derived_members(item, declaration_id);
-        self.hashable_types_to_check.push((name, members));
+        self.hashable_types_to_check
+            .push((name, declaration_id, members));
     }
 
     /// Record a `[derive(PartialEq)]` struct/enum for the resource-field reject
@@ -3496,7 +3544,8 @@ impl<'src> Analyzer<'src> {
             return;
         };
         let members = self.collect_derived_members(item, declaration_id);
-        self.partialeq_types_to_check.push((name, members));
+        self.partialeq_types_to_check
+            .push((name, declaration_id, members));
     }
 
     /// A field type is Hashable iff it is a scalar (any numeric, `str`, `bool`), a
@@ -3535,14 +3584,14 @@ impl<'src> Analyzer<'src> {
     /// silently produce a broken key. Runs after all modules are walked.
     fn check_hashable_boundary(&mut self) {
         let checks = std::mem::take(&mut self.hashable_types_to_check);
-        for (type_name, members) in &checks {
+        for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
                 // A resource field is rejected with a resource-specific steer,
                 // taking precedence over the not-Hashable message: a resource
                 // cannot be hashed by value (destruction.md §8).
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.diagnostics.push(Error {
+                    self.push_anchored(Error {
                         note: None,
                         span: *span,
                         msg: format!(
@@ -3550,12 +3599,12 @@ impl<'src> Analyzer<'src> {
                              `{rendered}`: a resource cannot be hashed by value; hash a plain-data \
                              projection (an id, a key) instead"
                         ),
-                    });
+                    }, *declaration_id);
                     continue;
                 }
                 if !self.is_hashable_type(type_node) {
                     let rendered = render_type(type_node);
-                    self.diagnostics.push(Error {
+                    self.push_anchored(Error {
                         note: None,
                         span: *span,
                         msg: format!(
@@ -3564,7 +3613,7 @@ impl<'src> Analyzer<'src> {
                              `bool`, `List`/`Option` of `Hashable`, a backed enum, or another \
                              `[derive(Hashable)]` type)"
                         ),
-                    });
+                    }, *declaration_id);
                 }
             }
         }
@@ -3576,11 +3625,11 @@ impl<'src> Analyzer<'src> {
     /// after all modules are walked (so resource-ness is fully known).
     fn check_partialeq_boundary(&mut self) {
         let checks = std::mem::take(&mut self.partialeq_types_to_check);
-        for (type_name, members) in &checks {
+        for (type_name, declaration_id, members) in &checks {
             for (label, type_node, field_type_id, span) in members {
                 if self.type_is_resource(*field_type_id) {
                     let rendered = render_type(type_node);
-                    self.diagnostics.push(Error {
+                    self.push_anchored(Error {
                         note: None,
                         span: *span,
                         msg: format!(
@@ -3588,7 +3637,7 @@ impl<'src> Analyzer<'src> {
                              `{rendered}`: a resource cannot be compared by value (equality would \
                              copy it); compare a plain-data projection instead"
                         ),
-                    });
+                    }, *declaration_id);
                 }
             }
         }
@@ -3604,20 +3653,23 @@ impl<'src> Analyzer<'src> {
     /// (a different id) never reaches here.
     fn check_drop_impls(&mut self) {
         let checks = std::mem::take(&mut self.drop_impls_to_check);
-        for (subject_type_id, span, drop_method_id) in checks {
+        for (subject_type_id, span, impl_id, drop_method_id) in checks {
             let subject_type = subject_type_id.get_type(self);
             let rendered = self.pretty_print_type(&subject_type, &HashMap::new());
             // `Drop` is implementable only for a resource.
             if !self.type_is_resource(subject_type_id) {
-                self.diagnostics.push(Error {
-                    note: None,
-                    span,
-                    msg: format!(
-                        "`{rendered}` implements `Drop` but is not a resource: \
-                         destruction without move discipline is exactly the double-close \
-                         bug; declare it a `resource` so it moves instead of being copied"
-                    ),
-                });
+                self.push_anchored(
+                    Error {
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`{rendered}` implements `Drop` but is not a resource: \
+                             destruction without move discipline is exactly the double-close \
+                             bug; declare it a `resource` so it moves instead of being copied"
+                        ),
+                    },
+                    impl_id,
+                );
             }
             // Record the `drop` method for the synchronous-teardown check
             // (`check_async_drops`). It runs after `async_infer`, because a body
@@ -4010,18 +4062,17 @@ impl<'src> Analyzer<'src> {
                 },
             });
             let elsewhere = self.other_module_clause(first.impl_id, second.impl_id);
-            let diagnostics_before = self.diagnostics.len();
-            self.diagnostics.push(Error {
-                note,
-                span: second.span,
-                msg: format!(
-                    "'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; \
-                     remove or merge this impl"
-                ),
-            });
-            if let Some(source) = self.source_of_id(second.impl_id) {
-                self.attribute_new_diagnostics(diagnostics_before, source);
-            }
+            self.push_anchored(
+                Error {
+                    note,
+                    span: second.span,
+                    msg: format!(
+                        "'{trait_name}' is already implemented for '{subject_label}'{elsewhere}; \
+                         remove or merge this impl"
+                    ),
+                },
+                second.impl_id,
+            );
         }
     }
 
@@ -4253,18 +4304,17 @@ impl<'src> Analyzer<'src> {
             // fixes — and which one is right is the author's call, not ours.
             let elsewhere = self.other_module_clause(first_id, second_id);
             let span = self.declaration_name_span(second_id);
-            let diagnostics_before = self.diagnostics.len();
-            self.diagnostics.push(Error {
-                note,
-                span,
-                msg: format!(
-                    "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
-                     remove or rename this one"
-                ),
-            });
-            if let Some(source) = self.source_of_id(second_id) {
-                self.attribute_new_diagnostics(diagnostics_before, source);
-            }
+            self.push_anchored(
+                Error {
+                    note,
+                    span,
+                    msg: format!(
+                        "'{member_name}' is already defined for '{subject_label}'{elsewhere}; \
+                         remove or rename this one"
+                    ),
+                },
+                second_id,
+            );
         }
     }
 
@@ -4354,19 +4404,22 @@ impl<'src> Analyzer<'src> {
         let member_generics_align = trait_shape.generic_count == impl_shape.generic_count;
         if !member_generics_align {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
-            self.diagnostics.push(Error {
-                note,
-                span: impl_shape.name_span,
-                msg: format!(
-                    "`{}`'s `{}` declares {} type parameter(s), but `{}` declares {}; \
+            self.push_anchored(
+                Error {
+                    note,
+                    span: impl_shape.name_span,
+                    msg: format!(
+                        "`{}`'s `{}` declares {} type parameter(s), but `{}` declares {}; \
                      match the trait's type-parameter list",
-                    check.subject_name,
-                    check.member_name,
-                    impl_shape.generic_count,
-                    check.trait_name,
-                    trait_shape.generic_count
-                ),
-            });
+                        check.subject_name,
+                        check.member_name,
+                        impl_shape.generic_count,
+                        check.trait_name,
+                        trait_shape.generic_count
+                    ),
+                },
+                check.impl_function_id,
+            );
         }
         let mut context = check.generic_context.clone();
         if member_generics_align {
@@ -4414,19 +4467,22 @@ impl<'src> Analyzer<'src> {
         // meaningful.
         if trait_shape.conventions.len() != impl_shape.conventions.len() {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
-            self.diagnostics.push(Error {
-                note,
-                span: impl_shape.name_span,
-                msg: format!(
-                    "`{}`'s `{}` takes {} parameter(s), but `{}` declares {}; \
+            self.push_anchored(
+                Error {
+                    note,
+                    span: impl_shape.name_span,
+                    msg: format!(
+                        "`{}`'s `{}` takes {} parameter(s), but `{}` declares {}; \
                      match the declared parameter list",
-                    check.subject_name,
-                    check.member_name,
-                    impl_shape.conventions.len(),
-                    check.trait_name,
-                    trait_shape.conventions.len()
-                ),
-            });
+                        check.subject_name,
+                        check.member_name,
+                        impl_shape.conventions.len(),
+                        check.trait_name,
+                        trait_shape.conventions.len()
+                    ),
+                },
+                check.impl_function_id,
+            );
             return;
         }
 
@@ -4441,29 +4497,32 @@ impl<'src> Analyzer<'src> {
             // contract (the compiler loans it per convention).
             if position == 0 && trait_shape.is_self[0] != impl_shape.is_self[0] {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
-                self.diagnostics.push(Error {
-                    note,
-                    span: anchor,
-                    msg: if trait_shape.is_self[0] {
-                        format!(
-                            "`{}`'s `{}` takes no receiver, but `{}` declares `{}`; \
+                self.push_anchored(
+                    Error {
+                        note,
+                        span: anchor,
+                        msg: if trait_shape.is_self[0] {
+                            format!(
+                                "`{}`'s `{}` takes no receiver, but `{}` declares `{}`; \
                              give it the declared receiver",
-                            check.subject_name,
-                            check.member_name,
-                            check.trait_name,
-                            Self::receiver_form(trait_convention)
-                        )
-                    } else {
-                        format!(
-                            "`{}`'s `{}` takes a `{}` receiver, but `{}` declares it \
+                                check.subject_name,
+                                check.member_name,
+                                check.trait_name,
+                                Self::receiver_form(trait_convention)
+                            )
+                        } else {
+                            format!(
+                                "`{}`'s `{}` takes a `{}` receiver, but `{}` declares it \
                              without one",
-                            check.subject_name,
-                            check.member_name,
-                            Self::receiver_form(impl_convention),
-                            check.trait_name
-                        )
+                                check.subject_name,
+                                check.member_name,
+                                Self::receiver_form(impl_convention),
+                                check.trait_name
+                            )
+                        },
                     },
-                });
+                    check.impl_function_id,
+                );
                 continue;
             }
 
@@ -4491,11 +4550,14 @@ impl<'src> Analyzer<'src> {
                         Self::convention_form(trait_convention)
                     )
                 };
-                self.diagnostics.push(Error {
-                    note,
-                    span: anchor,
-                    msg,
-                });
+                self.push_anchored(
+                    Error {
+                        note,
+                        span: anchor,
+                        msg,
+                    },
+                    check.impl_function_id,
+                );
             }
 
             // The receiver's type is always `Self` on both sides (it interns to
@@ -4528,15 +4590,18 @@ impl<'src> Analyzer<'src> {
                 let note = self.conformance_note(check.trait_function_id, &check.member_name);
                 let expected_label = self.pretty_print_type(&expected_type, &HashMap::new());
                 let actual_label = self.pretty_print_type(&actual_type, &HashMap::new());
-                self.diagnostics.push(Error {
-                    note,
-                    span: anchor,
-                    msg: format!(
-                        "parameter {position} of `{}`'s `{}` is `{actual_label}`, but `{}` \
+                self.push_anchored(
+                    Error {
+                        note,
+                        span: anchor,
+                        msg: format!(
+                            "parameter {position} of `{}`'s `{}` is `{actual_label}`, but `{}` \
                          declares `{expected_label}`; match the declared type",
-                        check.subject_name, check.member_name, check.trait_name
-                    ),
-                });
+                            check.subject_name, check.member_name, check.trait_name
+                        ),
+                    },
+                    check.impl_function_id,
+                );
             }
         }
 
@@ -4589,7 +4654,7 @@ impl<'src> Analyzer<'src> {
             let note = self.conformance_note(check.trait_function_id, &check.member_name);
             let expected_label = self.pretty_print_type(&expected_return, &HashMap::new());
             let actual_label = self.pretty_print_type(&actual_return, &HashMap::new());
-            self.diagnostics.push(Error {
+            self.push_anchored(Error {
                 note,
                 span: impl_shape.name_span,
                 msg: format!(
@@ -4597,7 +4662,7 @@ impl<'src> Analyzer<'src> {
                      match the declared return type",
                     check.subject_name, check.member_name, check.trait_name
                 ),
-            });
+            }, check.impl_function_id);
         }
     }
 
@@ -6016,7 +6081,7 @@ impl<'src> Analyzer<'src> {
             if self.type_is_resource(type_id) {
                 let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::new());
                 let span = **self.span_map.get(&site).unwrap_or(&&EMPTY_SPAN);
-                self.diagnostics.push(Error {
+                self.push_anchored(Error {
                     note: None,
                     span,
                     msg: format!(
@@ -6024,7 +6089,7 @@ impl<'src> Analyzer<'src> {
                          is a data sink, and a resource must keep its single owner (it cannot be \
                          copied into one); debug-print its fields instead"
                     ),
-                });
+                }, site);
             }
         }
     }
@@ -6143,16 +6208,19 @@ impl<'src> Analyzer<'src> {
                  cannot adopt; stash only plain data"
             )
         };
-        self.diagnostics.push(Error {
-            note: Some(crate::error::Note::here(
-                span,
-                "only plain data transfers: scalars, `str`, lists, options, and \
+        self.push_anchored(
+            Error {
+                note: Some(crate::error::Note::here(
+                    span,
+                    "only plain data transfers: scalars, `str`, lists, options, and \
                  structs/enums built from them"
-                    .to_string(),
-            )),
-            span,
-            msg,
-        });
+                        .to_string(),
+                )),
+                span,
+                msg,
+            },
+            site,
+        );
     }
 
     /// Whether a parameter's declared type is exactly `any` (R12's target slot).
@@ -10144,7 +10212,7 @@ impl<'src> Analyzer<'src> {
     /// Record an `[rpc]` method's declared signature for the Wire-signature
     /// check: each non-`self` parameter's type node and the return type node,
     /// validated once `wire_names` is complete (`check_rpc_signatures`).
-    fn collect_rpc_signature(&mut self, function: &'src Func<'src>) {
+    fn collect_rpc_signature(&mut self, function: &'src Func<'src>, function_id: Id) {
         let mut members = Vec::new();
         for parameter in &function.parameters.0 {
             let parameter_name = match &parameter.pattern {
@@ -10178,7 +10246,7 @@ impl<'src> Analyzer<'src> {
             None => members.push(("return type".to_string(), None, function.name.1)),
         }
         self.rpc_signatures_to_check
-            .push((function.name.0, members));
+            .push((function.name.0, function_id, members));
     }
 
     /// Enforce the `[rpc]` Wire-signature rule (`proposal/transport-rpc.md`
@@ -10187,33 +10255,39 @@ impl<'src> Analyzer<'src> {
     /// crosses the wire. Runs after all modules are walked.
     fn check_rpc_signatures(&mut self) {
         let checks = std::mem::take(&mut self.rpc_signatures_to_check);
-        for (method_name, members) in checks {
+        for (method_name, method_id, members) in checks {
             for (label, type_node, span) in members {
                 match type_node {
                     Some(type_node) if self.is_wire_type(type_node) => {}
                     Some(type_node) => {
                         let rendered = render_type(type_node);
-                        self.diagnostics.push(Error {
-                            note: None,
-                            span,
-                            msg: format!(
-                                "{label} of `[rpc]` method `{method_name}` is `{rendered}`, \
+                        self.push_anchored(
+                            Error {
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "{label} of `[rpc]` method `{method_name}` is `{rendered}`, \
                                  which is not Wire: every `[rpc]` parameter and return must be \
                                  Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
                                  `[derive(Wire)]` type)"
-                            ),
-                        });
+                                ),
+                            },
+                            method_id,
+                        );
                     }
                     None => {
-                        self.diagnostics.push(Error {
-                            note: None,
-                            span,
-                            msg: format!(
-                                "{label} of `[rpc]` method `{method_name}` must declare a Wire \
+                        self.push_anchored(
+                            Error {
+                                note: None,
+                                span,
+                                msg: format!(
+                                    "{label} of `[rpc]` method `{method_name}` must declare a Wire \
                                  type: arguments are decoded, and the reply encoded, at their \
                                  declared types"
-                            ),
-                        });
+                                ),
+                            },
+                            method_id,
+                        );
                     }
                 }
             }
@@ -10226,7 +10300,7 @@ impl<'src> Analyzer<'src> {
     /// modules are walked.
     fn check_expose_fields(&mut self) {
         let checks = std::mem::take(&mut self.expose_fields_to_check);
-        for (label, type_node, span) in checks {
+        for (label, type_node, span, declaration_id) in checks {
             let signal_element = match type_node {
                 Some(Node::AccessorWithGenerics("Signal", arguments)) if arguments.0.len() == 1 => {
                     Some(&arguments.0[0].0)
@@ -10237,30 +10311,36 @@ impl<'src> Analyzer<'src> {
                 Some(element) if self.is_wire_type(element) => {}
                 Some(element) => {
                     let rendered = render_type(element);
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span,
-                        msg: format!(
-                            "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} is `[expose]`d, but its element `{rendered}` is not Wire: \
                              an exposed signal's values cross the wire, so the element must be \
                              Wire (a scalar, `str`, `bool`, `List`/`Option` of Wire, or a \
                              `[derive(Wire)]` type)"
-                        ),
-                    });
+                            ),
+                        },
+                        declaration_id,
+                    );
                 }
                 None => {
                     let rendered = type_node
                         .map(render_type)
                         .unwrap_or_else(|| "_".to_string());
-                    self.diagnostics.push(Error {
-                        note: None,
-                        span,
-                        msg: format!(
-                            "{label} is `[expose]`d, but its type `{rendered}` is not a \
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span,
+                            msg: format!(
+                                "{label} is `[expose]`d, but its type `{rendered}` is not a \
                              `Signal`: only observable state (`Signal<T>` with a Wire `T`) can \
                              be exposed; a plain value has nothing to subscribe to"
-                        ),
-                    });
+                            ),
+                        },
+                        declaration_id,
+                    );
                 }
             }
         }
@@ -10792,27 +10872,33 @@ impl<'src> Analyzer<'src> {
     /// struct is NOT searched through — a struct crossing the boundary is a
     /// different hazard, and one the language already has.
     fn check_external_backed_returns(&mut self) {
-        let offenders: Vec<(Span, &'src str, &'src str)> = self
+        // The declaration's own id rides along: the check runs after `build()`
+        // over every file at once, so it is the only thing that can say which
+        // file the return-type span indexes (B112).
+        let offenders: Vec<(Id, Span, &'src str, &'src str)> = self
             .external_functions
             .values()
             .filter_map(|external| {
                 let span = external.return_type_span?;
                 let enum_name =
                     self.backed_enum_within(external.return_type_id, &mut Vec::new())?;
-                Some((span, external.name, enum_name))
+                Some((external.id, span, external.name, enum_name))
             })
             .collect();
-        for (span, function_name, enum_name) in offenders {
-            self.diagnostics.push(Error {
-                note: None,
-                span,
-                msg: format!(
-                    "'{function_name}' is `external`, so it cannot return the backed enum \
-                     '{enum_name}': the host may send a value outside the set, and a backed \
-                     enum has no way to refuse one; return the backing type and convert with \
-                     `{enum_name}::parse`, which answers `None` outside the set"
-                ),
-            });
+        for (declaration_id, span, function_name, enum_name) in offenders {
+            self.push_anchored(
+                Error {
+                    note: None,
+                    span,
+                    msg: format!(
+                        "'{function_name}' is `external`, so it cannot return the backed enum \
+                         '{enum_name}': the host may send a value outside the set, and a backed \
+                         enum has no way to refuse one; return the backing type and convert \
+                         with `{enum_name}::parse`, which answers `None` outside the set"
+                    ),
+                },
+                declaration_id,
+            );
         }
     }
 
@@ -12818,10 +12904,10 @@ impl<'src> Analyzer<'src> {
             }
         }
         for expr_id in escapes {
-            self.diagnostics.push(Error { note: None,
+            self.push_anchored(Error { note: None,
                 span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
                 msg: "a view cannot escape its scope: it may not be returned, stored in a field, placed in a collection, or carried in an enum payload. Return an owned value or a handle instead.".to_string(),
-            });
+            }, expr_id);
         }
     }
 
@@ -13671,24 +13757,33 @@ impl<'src> Analyzer<'src> {
             // parameters — the caller's view would be held across the
             // suspension one frame down. Sync functions (no await) pass
             // views freely; that is what keeps the analysis local.
+            // Collected first, reported after: placing a diagnostic reads the
+            // whole analyzer (it resolves the anchor's file), so it cannot run
+            // while `functions` is borrowed.
+            let mut view_parameters: Vec<(Id, &'static str)> = Vec::new();
             if saw_await && let Some(function) = self.functions.get(function_id) {
                 for parameter_id in &function.parameters {
                     let Some(parameter) = self.parameters.get(parameter_id) else {
                         continue;
                     };
-                    if matches!(parameter.convention, Convention::Ref | Convention::RefMut) {
-                        let form = match parameter.convention {
-                            Convention::RefMut => "'&mut'",
-                            _ => "'&'",
-                        };
-                        self.diagnostics.push(Error { note: None,
-                            span: **self.span_map.get(parameter_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!(
-                                "an async function cannot take {form} parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle."
-                            ),
-                        });
+                    match parameter.convention {
+                        Convention::RefMut => view_parameters.push((*parameter_id, "'&mut'")),
+                        Convention::Ref => view_parameters.push((*parameter_id, "'&'")),
+                        Convention::Bare | Convention::Own => {}
                     }
                 }
+            }
+            for (parameter_id, form) in view_parameters {
+                self.push_anchored(
+                    Error {
+                        note: None,
+                        span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "an async function cannot take {form} parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle."
+                        ),
+                    },
+                    parameter_id,
+                );
             }
         }
         for return_id in closure_returns {
@@ -13756,11 +13851,14 @@ impl<'src> Analyzer<'src> {
                     (anchor, msg)
                 }
             };
-            self.diagnostics.push(Error {
-                note: None,
-                span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
-                msg,
-            });
+            self.push_anchored(
+                Error {
+                    note: None,
+                    span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
+                    msg,
+                },
+                anchor,
+            );
         }
     }
 
@@ -13814,12 +13912,12 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (reference_id, name) in errors {
-            self.diagnostics.push(Error { note: None,
+            self.push_anchored(Error { note: None,
                 span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
                 msg: format!(
                     "an async closure cannot capture the view '{name}': the capture would be held across the closure's suspension points. Re-acquire the view inside, or pass a value/handle."
                 ),
-            });
+            }, reference_id);
         }
     }
 
@@ -14240,12 +14338,12 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (reseat_id, name) in violations {
-            self.diagnostics.push(Error { note: None,
+            self.push_anchored(Error { note: None,
                 span: **self.span_map.get(&reseat_id).unwrap_or(&&EMPTY_SPAN),
                 msg: format!(
                     "cannot reseat a view to '{name}', which goes out of scope before the view; the view would dangle. Reseat to a place that outlives the view, or use a handle."
                 ),
-            });
+            }, reseat_id);
         }
     }
 
@@ -14534,11 +14632,14 @@ impl<'src> Analyzer<'src> {
         for target_id in assignment_targets {
             if let Some((name, fix)) = self.readonly_root(target_id) {
                 let advice = Self::immutability_advice(name, fix);
-                self.diagnostics.push(Error {
-                    note: None,
-                    span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot mutate immutable '{name}'; {advice}."),
-                });
+                self.push_anchored(
+                    Error {
+                        note: None,
+                        span: **self.span_map.get(&target_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!("cannot mutate immutable '{name}'; {advice}."),
+                    },
+                    target_id,
+                );
             }
         }
     }
@@ -14591,11 +14692,14 @@ impl<'src> Analyzer<'src> {
                 if writable {
                     if let Some((name, fix)) = self.readonly_root(*argument_id) {
                         let advice = Self::immutability_advice(name, fix);
-                        self.diagnostics.push(Error {
-                            note: None,
-                            span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
-                            msg: format!("cannot mutate immutable '{name}'; {advice}."),
-                        });
+                        self.push_anchored(
+                            Error {
+                                note: None,
+                                span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!("cannot mutate immutable '{name}'; {advice}."),
+                            },
+                            *argument_id,
+                        );
                     }
                 }
             }
@@ -14701,12 +14805,12 @@ impl<'src> Analyzer<'src> {
         }
         for leak in leaks {
             let span = **self.span_map.get(&leak).unwrap_or(&&EMPTY_SPAN);
-            self.diagnostics.push(Error { note: None,
+            self.push_anchored(Error { note: None,
                 span,
                 msg: "a view can't be read as a value here; write `*` to copy the value out \
                       (a view's value is explicit: `*v` is the only way to cross from view to value)"
                     .to_string(),
-            });
+            }, leak);
         }
     }
 
@@ -14729,11 +14833,16 @@ impl<'src> Analyzer<'src> {
         for (reference_id, operand_id) in references {
             if let Some((name, fix)) = self.readonly_root(operand_id) {
                 let advice = Self::immutability_advice(name, fix);
-                self.diagnostics.push(Error {
-                    note: None,
-                    span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("cannot take a writable view of immutable '{name}'; {advice}."),
-                });
+                self.push_anchored(
+                    Error {
+                        note: None,
+                        span: **self.span_map.get(&reference_id).unwrap_or(&&EMPTY_SPAN),
+                        msg: format!(
+                            "cannot take a writable view of immutable '{name}'; {advice}."
+                        ),
+                    },
+                    reference_id,
+                );
             }
         }
     }
@@ -14775,12 +14884,12 @@ impl<'src> Analyzer<'src> {
                 initial.is_some_and(|initial_id| self.assignment_target_is_view(initial_id));
             // R7: a view binding may not be `mut`.
             if mutable && holds_view {
-                self.diagnostics.push(Error { note: None,
+                self.push_anchored(Error { note: None,
                     span: name_span,
                     msg: format!(
                         "view binding '{name}' cannot be `mut`: a view cannot be rebound. Declare it `let`, and mutate the referent by assigning through it (`{name} = …`)."
                     ),
-                });
+                }, binding_id);
             }
             // R1: an annotation's view-ness must match its initializer's.
             if let Some(annotation_is_view) = annotation_is_view
@@ -14795,11 +14904,14 @@ impl<'src> Analyzer<'src> {
                         "'{name}' is annotated as a value but its initializer is a view; write `*` to copy the value out, or annotate `&[mut] T` to alias it."
                     )
                 };
-                self.diagnostics.push(Error {
-                    note: None,
-                    span: name_span,
-                    msg,
-                });
+                self.push_anchored(
+                    Error {
+                        note: None,
+                        span: name_span,
+                        msg,
+                    },
+                    binding_id,
+                );
             }
         }
     }
@@ -14859,12 +14971,12 @@ impl<'src> Analyzer<'src> {
                     None => continue,
                 };
                 if !self.assignment_target_is_view(*argument_id) {
-                    self.diagnostics.push(Error { note: None,
+                    self.push_anchored(Error { note: None,
                         span: **self.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
                         msg: format!(
                             "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
                         ),
-                    });
+                    }, *argument_id);
                 }
             }
         }
@@ -15567,14 +15679,17 @@ impl<'src> Analyzer<'src> {
             }
         }
         for (parameter_id, name) in resource_rejections {
-            self.diagnostics.push(Error {
-                note: None,
-                span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
-                msg: format!(
-                    "a resource never copies, so `mut {name}` cannot take one; \
+            self.push_anchored(
+                Error {
+                    note: None,
+                    span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "a resource never copies, so `mut {name}` cannot take one; \
                      declare it `own {name}` to transfer it in"
-                ),
-            });
+                    ),
+                },
+                parameter_id,
+            );
         }
         sites
     }
@@ -17198,7 +17313,7 @@ impl<'src> Analyzer<'src> {
                     // An `[rpc]` method's declared signature must be Wire —
                     // recorded now, checked once `wire_names` is complete.
                     if function.rpc {
-                        self.collect_rpc_signature(function);
+                        self.collect_rpc_signature(function, id);
                     }
                     Some(Expr::Function(id))
                 }
@@ -17656,6 +17771,7 @@ impl<'src> Analyzer<'src> {
                                 .as_ref()
                                 .map(|type_node| type_node.1)
                                 .unwrap_or(child.1),
+                            id,
                         ));
                     }
                     // An `async || T` field peels its marker (J2): calls
@@ -26670,6 +26786,7 @@ impl<'src> Analyzer<'src> {
                 self.drop_impls_to_check.push((
                     check.subject_type_id,
                     check.span,
+                    check.impl_id,
                     check.declarations.get("drop").copied(),
                 ));
             }
