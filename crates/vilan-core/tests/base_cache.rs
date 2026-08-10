@@ -3,6 +3,13 @@
 //! should, and revalidate by CONTENT (the E12 rule — a std edit evicts).
 //! Stats are process-global, so every test serializes on one lock and
 //! asserts deltas.
+//!
+//! One instrument note since macro worlds joined the cache (cycle 13,
+//! §9): the counters see NESTED analyses too. A program whose std closure
+//! dispatches a derive compiles macro worlds, and those worlds look the
+//! cache up on their own account — so a fixture chosen to exercise the
+//! OUTER analysis must not smuggle macro worlds in, or its hit delta counts
+//! two things at once.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -64,8 +71,11 @@ fn stats() -> (u64, u64) {
 
 const PROGRAM_A: &str = "import std::print;\nfun main() { print(1); }\n";
 const PROGRAM_B: &str = "import std::print;\nfun main() { print(2 + 3); }\n";
-const PROGRAM_C: &str =
-    "import std::print;\nimport std::time::sleep;\nfun main() { sleep(1); print(9); }\n";
+/// A DISTINCT import set from A/B — and deliberately one that reaches no
+/// macro-defining std module, so this fixture's hit deltas belong to the
+/// outer analysis alone (`std::time`, the previous choice, drags two macro
+/// worlds along and each of those now consults the cache itself).
+const PROGRAM_C: &str = "import std::print;\nimport std::math::PI;\nfun main() { print(PI); }\n";
 
 /// Same import set: the second program hits, and its observations are
 /// byte-identical to a fresh (cache-cleared) build of the same program.
@@ -331,6 +341,166 @@ fn derive_entries_cache_and_derived_impls_survive_the_hit() {
         "the missing-derive error must be identical through a hit"
     );
     assert_ne!(cached_error.0, "[]", "and it must actually error");
+}
+
+/// Macro worlds are analyses too, and they all analyze the same `macro_std`
+/// (cycle 13, §9). Two derives resolving to two DIFFERENT defining files
+/// compile two worlds; the second must be served from the base world the
+/// first stored, and — the bar that matters — a macro world served warm must
+/// observe exactly what a cold one observes.
+///
+/// The differential is only writable because both caches can be dropped:
+/// `WORLDS` memoizes a compiled world by content, so without
+/// `macro_world_cache_clear` the first compile in a process is the only one
+/// and the cold leg is unreachable a second time.
+#[test]
+fn macro_worlds_share_one_base_world_and_observe_identically() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Two defining files: `PartialEq` lives in compare.vl, `Debug` in
+    // debug.vl — so this entry compiles two macro worlds, not one.
+    const TWO_WORLDS: &str = "import std::print;\n[derive(PartialEq, Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
+
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    // Prime the ordinary (dependency-free) base so the OUTER analysis below
+    // is a hit and every remaining delta belongs to the macro worlds.
+    // `import std::print` dispatches no macro of its own.
+    let _ = observe(PROGRAM_A);
+    let (hits_before, misses_before) = stats();
+    let two_worlds = observe(TWO_WORLDS);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(two_worlds.0, "[]", "the two-world entry compiles");
+    // Outer: hit. First macro world: miss (nothing is stored under a
+    // macro_std workspace yet), and it stores. Second macro world: hit.
+    assert_eq!(
+        (hits_after, misses_after),
+        (hits_before + 2, misses_before + 1),
+        "the second macro world must be served from the first's base"
+    );
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+}
+
+/// The key must describe the WORKSPACE, not only the platform and the entry's
+/// `std::` seeds. A macro world's workspace is `[macro_std]`; an ordinary
+/// program's is empty — and when the entry imports no std module at all the
+/// two agree on every other field. A key that forgot the workspace would
+/// therefore serve the macro world the ordinary world it stored a moment
+/// earlier (the store happens before the entry's derives expand), a world with
+/// no `macro_std` in it at all, and the derive would fail to expand.
+#[test]
+fn a_macro_world_is_never_served_an_ordinary_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // No `import std::..` anywhere: the entry's std seeds are empty, exactly
+    // like the blanked entry of the macro world its derive compiles.
+    const NO_STD_IMPORT_DERIVE: &str =
+        "[derive(Debug)]\nstruct P {\n\tx: i32,\n}\n\nfun main() {}\n";
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    let observed = observe(NO_STD_IMPORT_DERIVE);
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    assert_eq!(
+        observed.0, "[]",
+        "a derive whose entry imports no std module must still expand"
+    );
+    assert!(observed.2.is_some(), "and it must actually have emitted");
+}
+
+/// The bar that matters for the above: a macro world analyzed over a CACHED
+/// base must observe exactly what one built from scratch observes. Both legs
+/// analyze the same derive-bearing program with the same outer world already
+/// stored; they differ only in whether a macro-world base is available.
+#[test]
+fn a_warm_macro_world_observes_what_a_cold_one_observes() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const DERIVE_DEBUG: &str = "import std::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print(P { x = 1 }.debug()); }\n";
+    const DERIVE_PARTIAL_EQ: &str = "import std::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+
+    // Cold leg: the outer world is stored, no macro-world base is.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    let _ = observe(PROGRAM_A);
+    let (_, misses_before) = stats();
+    let cold = observe(DERIVE_DEBUG);
+    let (_, misses_after) = stats();
+    assert_eq!(
+        misses_after,
+        misses_before + 1,
+        "the cold leg's macro world must build its own base"
+    );
+
+    // Warm leg: a DIFFERENT defining file's world runs first and stores a
+    // macro-world base; debug.vl's world is then analyzed over it. Only the
+    // compiled-world memo is dropped in between, so the base survives.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    let _ = observe(PROGRAM_A);
+    let _ = observe(DERIVE_PARTIAL_EQ);
+    vilan_core::macro_world_cache_clear();
+    let (hits_before, _) = stats();
+    let warm = observe(DERIVE_DEBUG);
+    let (hits_after, _) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 2,
+        "the warm leg's macro world must be served from the stored base"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    assert_eq!(cold.0, warm.0, "diagnostics differ warm vs cold");
+    assert_eq!(cold.1, warm.1, "warnings differ warm vs cold");
+    assert_eq!(cold.2, warm.2, "emitted JS differs warm vs cold");
+    assert!(cold.2.is_some(), "and it must actually have emitted");
+}
+
+/// §6.13's sharp edge, now through a macro world served from a base-cache
+/// hit: a `[derive]`-less struct compared with `==` must produce the SAME
+/// diagnostic whether the derive macro's world was analyzed over a cached
+/// base or built from scratch. A macro world that quietly resolved a
+/// different `macro_std` would show up here first.
+#[test]
+fn a_missing_derive_errors_identically_through_a_warm_macro_world() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The entry derives Debug (compiling debug.vl's world) and then asks for
+    // an `==` its struct never derived: the error must be identical whichever
+    // way the world beneath the derive was analyzed.
+    const MISSING_DERIVE: &str = "import std::print;\n[derive(Debug)]\nstruct P { x: i32 }\nfun main() { print((P { x = 1 } == P { x = 1 }).debug()); }\n";
+
+    const DERIVE_PARTIAL_EQ: &str = "import std::print;\n[derive(PartialEq)]\nstruct Q { x: i32 }\nfun main() { print(Q { x = 1 } == Q { x = 1 }); }\n";
+
+    // Cold: nothing is stored under a macro_std workspace, so debug.vl's
+    // world builds its own base.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    let _ = observe(PROGRAM_A);
+    let cold = observe(MISSING_DERIVE);
+
+    // Warm: compare.vl's world stores a macro-world base first.
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    let _ = observe(PROGRAM_A);
+    let _ = observe(DERIVE_PARTIAL_EQ);
+    vilan_core::macro_world_cache_clear();
+    let warm = observe(MISSING_DERIVE);
+
+    vilan_core::analyzer::base_cache_clear();
+    vilan_core::macro_world_cache_clear();
+    assert_ne!(warm.0, "[]", "the missing derive must actually error");
+    assert_eq!(
+        warm.0, cold.0,
+        "the missing-derive error must be identical through a warm macro world"
+    );
+    assert_eq!(warm.1, cold.1, "warnings differ warm vs cold");
 }
 
 /// The member-name index (E46 lever 1) rides the world's lifecycle. Member
