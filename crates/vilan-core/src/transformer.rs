@@ -1366,6 +1366,15 @@ struct MatchLeg<'src> {
     body: Vec<js::Node<'src>>,
 }
 
+/// One BACKED-enum test inside a match leg's pattern, and where the value it
+/// tests is read from (`backed_enum_name`'s enum, `compile_pattern`'s accessor).
+/// The trap arm names both (backed-enums.md §9.4, §11.6).
+struct BackedTest<'src> {
+    enum_name: &'src str,
+    enum_id: Id,
+    value: js::Node<'src>,
+}
+
 struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
@@ -4497,50 +4506,85 @@ impl<'src> Transformer<'src> {
                 // last (P11). Asked of the leg's own pattern, never of where
                 // the subject came from — that is the whole point of (b) over
                 // (a).
-                let trap_enum = compiled_legs
+                //
+                // §11.6 / B114: asked of the whole pattern, not of its root. A
+                // backed test nested in a payload (`Pair::Of(Align::Start)`) is
+                // the same hazard, and dropping the leg's condition drops that
+                // `===` with the rest. The trap keys on backed tests ONLY, so a
+                // match carrying none emits exactly as it always did.
+                let mut trap_tests = Vec::new();
+                if let Some(final_leg) = compiled_legs
                     .len()
                     .checked_sub(1)
                     .and_then(|index| legs.get(index))
-                    .and_then(|leg| match &leg.pattern {
-                        ExprPattern::Variant(enum_id, _, _) => self.backed_enum_name(*enum_id),
-                        _ => None,
-                    });
+                {
+                    self.backed_pattern_tests(
+                        &final_leg.pattern,
+                        js::Node::Local(subject_name.clone()),
+                        &mut trap_tests,
+                    );
+                }
                 // The analyzer verified exhaustiveness, so an UNGUARDED final
                 // leg can always be the `else` branch — its whole test is
-                // dropped. The trap case above is the one exception: it keeps
-                // the test and traps in the `else` instead.
+                // dropped. Backed tests are the exception (§9/§11.6): the leg
+                // keeps its condition and the `else` traps.
                 //
-                // B115: a GUARDED final leg never carries that proof. The
-                // analyzer's walk counts unguarded legs only — a guard tests the
-                // VALUE, which it does not reason about — so the legs BEFORE
-                // this one are what make the match exhaustive, and this one
-                // keeps its test, its prelude and its guard. Dropping them made
-                // the leg the catch-all it is not: `match a { A => .., B if c =>
-                // .. }` ran B's arm when `!c`. A guarded final leg therefore
-                // survives only where the earlier legs already cover the
-                // subject, which is what keeps the trap's message honest when
-                // the two compose — an in-set value this guard rejects was
-                // taken by one of them, so only an out-of-set value reaches the
-                // trap, exactly as when the final leg is unguarded.
+                // B115: a GUARDED final leg never carries that proof — the
+                // analyzer's walk counts unguarded legs only, so the legs
+                // BEFORE this one are what make the match exhaustive, and this
+                // one keeps its test, its prelude and its guard. The trap
+                // composes cleanly: an in-set value this guard rejects was
+                // taken by an earlier leg, so only an out-of-set value reaches
+                // the trap, exactly as when the final leg is unguarded.
                 if let Some(last_leg) = compiled_legs.last_mut()
-                    && trap_enum.is_none()
                     && last_leg.guard_condition.is_none()
                 {
-                    last_leg.pattern_condition = None;
+                    if trap_tests.is_empty() {
+                        last_leg.pattern_condition = None;
+                    }
+                    last_leg.prelude.clear();
                 }
-                if let Some(enum_name) = trap_enum {
+                if !trap_tests.is_empty() {
                     self.used_helpers.insert("__enum_trap");
+                    // ONE backed test is the whole story: reaching the trap
+                    // proves that value left its set, so it is named
+                    // unconditionally — which is the shipped §9 emission when
+                    // the test is the pattern's root (the accessor is the
+                    // subject itself), byte for byte.
+                    //
+                    // SEVERAL backed tests in one leg (`Two::Of(Align::End,
+                    // Display::Inline)`) is the case §11.6 said needed a message
+                    // design §9 does not have, and it needs none: which value
+                    // failed is not knowable from the leg's condition, but it IS
+                    // knowable by asking each value whether it is in its enum's
+                    // set at all. The first that is not is named; the last is
+                    // what is left when none of the others answered.
+                    let final_test = trap_tests.len() - 1;
+                    let mut trap_body = Vec::new();
+                    for (index, test) in trap_tests.into_iter().enumerate() {
+                        let trap = js::Node::Call(
+                            Box::new(js::Node::Local("__enum_trap".to_string())),
+                            vec![
+                                js::Node::String(Cow::Borrowed(test.enum_name)),
+                                test.value.clone(),
+                            ],
+                        );
+                        match self.backed_value_membership(test.enum_id, &test.value) {
+                            Some(membership) if index < final_test => {
+                                trap_body.push(js::Node::If(js::IfBranch::If(
+                                    Box::new(js::Node::Unary('!', Box::new(membership))),
+                                    vec![trap],
+                                    None,
+                                )))
+                            }
+                            _ => trap_body.push(trap),
+                        }
+                    }
                     compiled_legs.push(MatchLeg {
                         pattern_condition: None,
                         prelude: Vec::new(),
                         guard_condition: None,
-                        body: vec![js::Node::Call(
-                            Box::new(js::Node::Local("__enum_trap".to_string())),
-                            vec![
-                                js::Node::String(Cow::Borrowed(enum_name)),
-                                js::Node::Local(subject_name.clone()),
-                            ],
-                        )],
+                        body: trap_body,
                     });
                 }
                 if compiled_legs.iter().all(|leg| leg.prelude.is_empty()) {
@@ -4711,6 +4755,87 @@ impl<'src> Transformer<'src> {
             Box::new(subject.clone()),
             Box::new(value),
         ))
+    }
+
+    /// Every BACKED-enum test `pattern` carries, in source order, each paired
+    /// with the accessor that reads the value it tests.
+    ///
+    /// This is §9's trap question asked of the pattern TREE rather than of its
+    /// root (§11.6, B114). A backed enum reached through a payload —
+    /// `Pair::Of(Align::Start)` — is the same hazard one level down: its `===`
+    /// rides in the leg's condition, and the final leg drops that condition
+    /// whole. The walk mirrors `compile_pattern`'s accessors exactly, so the
+    /// value named at the trap is the value the dropped test compared.
+    ///
+    /// A backed enum has no payload variants (§3.3), so a backed test is always
+    /// a LEAF — the walk never recurses through one, and a variant's payload is
+    /// only descended for the array-form enums that have one.
+    fn backed_pattern_tests(
+        &self,
+        pattern: &ExprPattern,
+        subject: js::Node<'src>,
+        out: &mut Vec<BackedTest<'src>>,
+    ) {
+        match pattern {
+            // Irrefutable, or refutable against something that is not an enum
+            // value: a literal pattern's domain is the primitive's own, which no
+            // host value can leave.
+            ExprPattern::Wildcard | ExprPattern::Binding(_) | ExprPattern::Literal(_) => {}
+            ExprPattern::Variant(enum_id, _, payload) => {
+                if let Some(enum_name) = self.backed_enum_name(*enum_id) {
+                    out.push(BackedTest {
+                        enum_name,
+                        enum_id: *enum_id,
+                        value: subject,
+                    });
+                    return;
+                }
+                // `bool` lowers to a native scalar too (and carries no payload),
+                // but its two values ARE its domain — nothing to trap.
+                if Some(*enum_id) == self.program.bool_enum_id {
+                    return;
+                }
+                for (data_index, sub_pattern) in payload.iter().enumerate() {
+                    let element = js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number((data_index + 1).to_string(), None)),
+                    );
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+            ExprPattern::Tuple(elements) => {
+                let mut leaves = Vec::new();
+                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                for (sub_pattern, element) in leaves {
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+            ExprPattern::Array(elements) => {
+                for (index, sub_pattern) in elements.iter().enumerate() {
+                    let element = js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number(index.to_string(), None)),
+                    );
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+        }
+    }
+
+    /// `value === v1 || value === v2 || …` over every variant of a backed enum:
+    /// the runtime question "is this one of its values AT ALL", which is a
+    /// different question from "did this leg's test match". Only the trap block
+    /// asks it, and only when one leg carries more than one backed test — see
+    /// `Expr::Match`.
+    fn backed_value_membership(
+        &self,
+        enum_id: Id,
+        value: &js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let enum_ = self.program.enums.get(&enum_id)?;
+        (0..enum_.variants.len())
+            .filter_map(|variant_index| self.scalar_variant_test(enum_id, variant_index, value))
+            .reduce(|a, b| js::Node::Binary(BinaryOp::Or, Box::new(a), Box::new(b)))
     }
 
     /// B53 (rule 1): whether this capture's slot read copies AT THIS EMISSION.

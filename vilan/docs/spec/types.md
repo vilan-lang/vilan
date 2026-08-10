@@ -173,12 +173,30 @@ match align {
 //   Align: "middle" is not one of its values
 ```
 
+The trap follows the backed enum **wherever the pattern tests it**, not
+only when it is the subject. A backed enum reached through a payload is
+the same value on the same boundary:
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // tested, not assumed
+}
+// an out-of-set payload panics, naming the payload's own value:
+//   Align: "middle" is not one of its values
+```
+
+If one arm tests **more than one** backed enum, the panic names whichever
+value actually left its set.
+
 Only the exhaustive form is affected. A `match` you gave a `_` arm keeps
 it — an out-of-set value takes the arm you wrote, which is the answer you
 asked for — and `is` and `==` compare against a literal, so they answer
 `false` outside the set, as they always did. An enum with no backing
 value keeps the tagged array form and no trap: the language itself writes
 that tag, so there its exhaustiveness proof *is* a proof about the value.
+That holds nested too — a `match` whose arms test only unbacked enums
+emits exactly what it always did, at any depth.
 
 An `external fun` may both **take and return** a backed enum, and so may
 a callback it is handed. Nothing checks the boundary: a host value

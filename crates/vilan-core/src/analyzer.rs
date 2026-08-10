@@ -6949,12 +6949,29 @@ impl<'src> Analyzer<'src> {
     /// reference stays a reference and nothing crosses.
     fn compute_return_value_crossings(&self) -> HashSet<Id> {
         let mut crossings = HashSet::default();
-        for function in self.functions.values() {
+        // Every return position of every by-value function: the tail, and (B116)
+        // each `ret`. `return_sites` carries both but only for a function with a
+        // DECLARED return type, so the tails are taken from the functions
+        // themselves and the rets joined on top — the overlap is a set, and
+        // re-scanning one seam names the same places twice.
+        let mut seams: Vec<(&Function, Id)> = self
+            .functions
+            .values()
+            .map(|function| (function, function.body.1))
+            .collect();
+        seams.extend(
+            self.return_sites
+                .iter()
+                .filter_map(|(function_id, value_id)| {
+                    Some((self.functions.get(function_id)?, *value_id))
+                }),
+        );
+        for (function, seam) in seams {
             if !function.has_body || function.returns_view {
                 continue;
             }
             let mut leaves = Vec::new();
-            self.collect_tail_leaves(function.body.1, &mut leaves);
+            self.collect_tail_leaves(seam, &mut leaves);
             for leaf in leaves {
                 // Only the view leaves cross. A place leaf is already scanned as
                 // a returned place, and re-marking it would say nothing new.
@@ -13288,6 +13305,17 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
+        // B116: which function each `ret` returns from. `return_sites` indexes
+        // every return position of every declared-return function — the tail and
+        // each `ret` — which is exactly the pairing this loop needs to ask a
+        // `ret` the question the tail is asked below. A `ret` with no entry is
+        // one inside a CLOSURE (its rets check against the inferred tail type,
+        // `ret-checking.md`), and a closure may not hand back a view at all.
+        let return_site_functions: HashMap<Id, Id> = self
+            .return_sites
+            .iter()
+            .map(|(function_id, value_id)| (*value_id, *function_id))
+            .collect();
         let mut escapes: Vec<Id> = Vec::new();
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // S1: every escape this loop finds anchors inside the iterated
@@ -13297,7 +13325,13 @@ impl<'src> Analyzer<'src> {
             }
             match expr {
                 Expr::FunctionReturn(Some(value_id))
-                    if self.escapes_as_view(*value_id, &view_bindings, &capturing) =>
+                    if self.escapes_as_view(*value_id, &view_bindings, &capturing)
+                        && !return_site_functions
+                            .get(value_id)
+                            .and_then(|function_id| self.functions.get(function_id))
+                            .is_some_and(|function| {
+                                self.return_position_hands_back_no_view(function, *value_id)
+                            }) =>
                 {
                     escapes.push(*value_id);
                 }
@@ -13344,8 +13378,7 @@ impl<'src> Analyzer<'src> {
             }
             if function.has_body
                 && self.escapes_as_view(function.body.1, &view_bindings, &capturing)
-                && !self.by_value_return_copies_the_view(function)
-                && (function.borrows.is_empty() || !self.derives_from_view_param(function.body.1))
+                && !self.return_position_hands_back_no_view(function, function.body.1)
             {
                 escapes.push(function.body.1);
             }
@@ -13389,6 +13422,22 @@ impl<'src> Analyzer<'src> {
         )
     }
 
+    /// Whether a RETURN POSITION of `function` hands the caller back no view
+    /// after all — the two ways rule 3 has nothing to reject. Asked of the tail
+    /// and, since B116, of each `ret` with the same argument: a `ret` is a
+    /// return position exactly like the tail (`ret-checking.md`), the value
+    /// crossing at it is the same crossing, and the two spellings of one
+    /// expression must not disagree.
+    ///
+    /// Either the by-value return copies the view into a value (B104,
+    /// `element-clones.md` §9.3), or the signature declares the projection —
+    /// a `borrows` function may return a view, but only of a (view) parameter,
+    /// whose target the caller keeps alive.
+    fn return_position_hands_back_no_view(&self, function: &Function, value_id: Id) -> bool {
+        self.by_value_return_copies_the_view(function, value_id)
+            || (!function.borrows.is_empty() && self.derives_from_view_param(value_id))
+    }
+
     /// Whether a by-value return turns the view the body hands back into a
     /// value, so rule 3 has nothing to reject (B104, `element-clones.md` §9.3) —
     /// the escape check's half of [`Self::by_value_return_copies_the_place`],
@@ -13400,13 +13449,13 @@ impl<'src> Analyzer<'src> {
     /// really does leave: a view of a LOCAL (rule 1 leaves it alone — the frame
     /// is a dead owner donating its storage, so the view dangles), and a
     /// `&place` leaf, which is not a place at all and never reaches the seam.
-    fn by_value_return_copies_the_view(&self, function: &Function) -> bool {
-        let roots_at_a_loan = self.place_root(function.body.1).is_some_and(|root| {
+    fn by_value_return_copies_the_view(&self, function: &Function, value_id: Id) -> bool {
+        let roots_at_a_loan = self.place_root(value_id).is_some_and(|root| {
             self.parameters.get(&root).is_some_and(|parameter| {
                 matches!(parameter.convention, Convention::Ref | Convention::RefMut)
             })
         });
-        roots_at_a_loan && self.by_value_return_copies_the_place(function.id, function.body.1)
+        roots_at_a_loan && self.by_value_return_copies_the_place(function.id, value_id)
     }
 
     /// Whether an expression (a `borrows` function's returned view) projects a
