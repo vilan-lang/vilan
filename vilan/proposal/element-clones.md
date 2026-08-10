@@ -668,3 +668,144 @@ B100's own §9.2 table returned `ret self.pair` because a bare place is not a
 view expression at all. Rule 1 copies both; only one of them is allowed to say
 it. Filed rather than fixed here: it is the same escape-check widening (d)
 wants, and it belongs to that measurement.
+
+> **CLOSED by B116 (cycle 15) — see §12.** It was NOT (d)'s widening in the
+> end: `return_sites` already indexed the `ret` as a return position, so the
+> tail's own condition applies to it unchanged. (d)'s measurement is still
+> owed, by the two shapes §12.3 files.
+
+## 12. B116 — the `ret` spelling gets the tail's analysis, 2026-08-10
+
+§11.6's bycatch, closed. `check_view_escape` read `Expr::FunctionReturn` as
+an unconditional escape and exempted only `function.body.1`, so
+`ret &self.inner;` was refused with *"a view cannot escape its scope"*
+while the tail spelling one line away compiled. Rule 1 copies both; only
+one of them was allowed to say so.
+
+### 12.1 The filed repro could not be the probe
+
+The lane was warned before designing, and the warning holds: **`ret` is
+early-return-only**, so §11.6's `fun grab(&self): Inner { ret &self.inner; }`
+is doubly invalid — a body ending in `ret x;` with no tail also draws
+*"Expected Inner, but got void"*, regardless of the view question. Both
+errors are reported on that program, so the escape refusal was real, but
+the repro proved nothing on its own.
+
+The probe that isolates it is a **conditional early `ret` with a legal
+tail**, which is the idiom `base64.vl`'s `digit` is written in:
+
+```vilan
+fun grab(&self, flag: bool): Inner {
+    if flag { ret &self.inner; }   // refused
+    &self.inner                    // compiles
+}
+```
+
+One error, at the `ret`, on the same expression the next line accepts.
+Every pin in this section is that shape, and the asymmetry is real.
+
+### 12.2 One index already had the answer
+
+A `ret` is a return position exactly like the tail (`ret-checking.md`), and
+`return_sites` — *(function id, value id)* for the tail **and each `ret`* —
+already says so. `compute_return_clone_sites` reads it, which is why rule 1's
+return clause reached the `ret` spelling all along: the copy was planned and
+then the escape check refused the program that would have used it.
+
+So the fix is to ask the same question at the same index, not to invent one.
+`return_position_hands_back_no_view(function, value_id)` is the tail loop's
+own condition with the seam as a parameter — the by-value copy (B104/B109)
+or the `borrows` projection — and both callers now pass their own seam.
+
+Two seams were **not** joined, and the second is the half that had teeth:
+
+- `compute_return_clone_sites` — already `return_sites`. Unchanged.
+- `compute_return_value_crossings` (§11.4's resource crossing) — walked
+  `function.body.1` alone. Lifting the escape check without this one would
+  have compiled a resource out of a loan through the `ret` door, uncopied
+  and undestroyed: precisely the bug §11.4 shipped to close. The return
+  positions are joined onto the per-function tails (the tails are kept
+  separately because `return_sites` holds only functions with a DECLARED
+  return type).
+
+The two spellings emit identically, which is the claim: `__clone(self[0])` in
+both branches for an aggregate, `v[0][v[1]]` in both for B108's scalar,
+`h2[0]` in both for a sanctioned `borrows` projection.
+
+### 12.3 What the lift does NOT reach, and why it is not the `ret`'s fault
+
+Probing the fix turned up a second asymmetry with the same symptom and a
+different cause, filed rather than fixed (it is §11.3 candidate (d)'s
+measurement, which this lane is not):
+
+```vilan
+fun early(&self, flag: bool): Inner { if flag { ret &self.inner; } Inner { n = 0 } }   // refused
+fun conditional(&self, flag: bool): Inner { if flag { Inner { n = 0 } } else { &self.inner } }   // compiles
+```
+
+Here the two spellings are examined by **different questions**. The tail
+loop asks `escapes_as_view(function.body.1)` of the whole body, and an `if`
+with one owned arm is not a view expression — so it is never asked at all.
+The `ret` arm asks the leaf, which is. Neither exemption reaches it: the
+function's `borrows` set is inferred from the tail and is empty here, and
+`by_value_return_copies_the_view` roots at `place_root`, which is `None` for
+a `&place` — §11.1's whole finding, in the one place rule 3 still reads it.
+
+The same leaf-blindness runs the other way, and that direction matters more:
+
+```vilan
+fun grab(flag: bool): Inner {
+    let local = Inner { n = 3 };
+    if flag { Inner { n = 0 } } else { &local }   // compiles — a view of a LOCAL
+}
+```
+
+Rule 3 exists to refuse exactly that, and a second owned arm hides it. The
+`ret` spelling **is** refused. Benign as emitted (the frame is dead and
+nothing else holds the storage, which is B100's dead-owner elision), but it
+is the rule not being applied rather than the rule deciding — so it is
+recorded as a limit, not as a design.
+
+Both pinned `#[ignore]`d:
+`b116_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail` and
+`b116_a_conditional_tail_arm_may_not_escape_a_view_of_a_local`. Closing them
+is one change — the escape check asking its question of a return's LEAVES,
+which is what §11.3 measured (d) against and deferred.
+
+### 12.4 The `Expr::FunctionReturn` sweep
+
+Every other reader in the analyzer was checked, and `check_view_escape` was
+the only special case. The rest are transparent recursions into the operand
+— `plan_expr`, `scan_move` (R4's terminal move), `scan_bumps`,
+`scan_view_param_ref`, `scan_closure_view_captures`, `scan_invalidation`,
+`mark_repeatable`, `r11_collect_calls` — or leaves that are about
+divergence, not about returning: `expr_diverges` and `Type::Never`. The one
+real disagreement found is the one §12.2 fixed: two seam computations that
+both mean "return position" and walked different sets.
+
+### 12.5 Coverage
+
+Eight live pins and two `#[ignore]`d, in `crates/vilan-core/tests/inference.rs`,
+every live one the same program in both spellings: the aggregate `&place`
+leaf, B108's scalar read, the `borrows`-call leaf, the sanctioned `borrows`
+projection, the two resource refusals (R1's and R3's, word for word the bare
+twins'), the ret-only resource crossing, and the view of a LOCAL — which
+stays refused in both spellings, because agreement means agreeing on the
+refusals too. Plus the boundary: a CLOSURE's `ret` still cannot hand back a
+view, because a closure's rets never enter `return_sites` and a closure may
+not project at all.
+
+Two plants, each red on what it should be:
+
+| plant | red |
+|---|---|
+| the `ret` an unconditional escape again | 3 (the aggregate leaf, the scalar read, the sanctioned projection) |
+| the return positions unjoined from the crossing | 1 (`b116_a_ret_only_resource_crossing_is_named_by_the_move_scan`) |
+
+The `borrows`-call pins are green under both plants and say so on purpose:
+a call leaf is not a view *expression*, so the escape check never examined
+either spelling — what those pins hold is the emission agreeing, which is
+rule 1's half.
+
+**No corpus golden moved**, and no docs page changed: the fix removes a
+false positive, and nothing documented ever claimed the tail-only rule.

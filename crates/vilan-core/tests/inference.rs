@@ -6309,6 +6309,352 @@ fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
     );
 }
 
+// B116 — the `ret` spelling of a return position gets the tail's analysis.
+//
+// `check_view_escape` read `Expr::FunctionReturn` as an unconditional escape and
+// exempted only `function.body.1`, so `ret &self.inner;` was refused while the
+// tail spelling one line away compiled (element-clones.md §11.6). A `ret` is a
+// return position exactly like the tail (`ret-checking.md`) and rule 1's return
+// clause already treated it as one — `return_sites` carries both — so the two
+// spellings disagreed about a value the compiler had already decided to copy.
+//
+// Every pin below is the SAME program in both spellings: a conditional early
+// `ret` whose fall-through tail is the same expression. That shape is what
+// isolates the escape question from `ret`'s own early-return-only rule — a body
+// that ENDS in `ret x;` is separately a type error ("Expected Inner, but got
+// void"), which is why B116's filed repro could not be the probe.
+
+#[test]
+fn b116_the_ret_spelling_of_a_reference_leaf_agrees_with_the_tail() {
+    // B109's first shape, both spellings in one function. The `ret` was refused;
+    // the tail compiled and copied. Both now emit the copy, and the same one.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self, flag: bool): Inner {
+                if flag { ret &self.inner; }
+                &self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.grab(true);
+            let tail = h.grab(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function grab(self, flag) {\n\
+             \tif (flag) {\n\t\treturn __clone(self[0]);\n\t}\n\
+             \treturn __clone(self[0]);\n}"
+        ),
+        "both spellings should emit the same copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n3\n",
+        "neither spelling may hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_scalar_view_reads_the_place() {
+    // B108's shape: a scalar has no aggregate to clone, so its copy is its READ
+    // (`v[0][v[1]]`). The `ret` gets the same read, not a refusal and not the
+    // runtime pair.
+    let javascript = compile(
+        r#"
+        import std::print;
+        fun same(v: &mut i32, flag: bool): i32 {
+            if flag { ret v; }
+            v
+        }
+        fun main() { mut n = 5; print(same(&mut n, true)); print(same(&mut n, false)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function same(v, flag) {\n\
+             \tif (flag) {\n\t\treturn v[0][v[1]];\n\t}\n\
+             \treturn v[0][v[1]];\n}"
+        ),
+        "both spellings should read the scalar place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "5\n5\n",
+        "neither spelling may hand back the view pair"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_borrows_call_leaf_copies() {
+    // B109's second shape: the leaf is a CALL, so the places it hands back are
+    // read from the callee's `borrows` clause. Same answer at the `ret`.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder, flag: bool): (i32, i32) {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let early = get(&h, true);
+            h.pair.1 = 99;
+            print(early.1);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\tif (flag) {\n\t\treturn __clone(peek(h2));\n\t}\n\treturn __clone(peek(h2));"
+        ),
+        "both spellings should copy the call's projection, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "neither spelling may hand back the callee's alias"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused() {
+    // A resource cannot copy (R1), so the crossing is a MOVE and the move scan
+    // refuses it — and it must refuse the `ret` for the SAME reason and with the
+    // same words, not because the escape check happened to reject the spelling.
+    // Lifting the escape check without telling the crossing about `ret` would
+    // have compiled this and leaked the guard uncopied AND undestroyed, which is
+    // exactly the bug B109 shipped to close.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool): Guard {
+                if flag { ret &self.g; }
+                &self.g
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_resource_borrows_call_is_refused() {
+    // The call spelling of the same crossing, where the place named is the
+    // loaned parameter itself — R3's diagnostic, at the `ret` as at the tail.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        fun peek(h: &Holder): &Guard borrows h { &h.g }
+        fun take(h: &Holder, flag: bool): Guard {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(take(&h, true).tag);
+        }
+        "#,
+        "cannot move the resource `h` out of this function",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
+    // The half that must NOT move. Rule 1's return clause leaves a LOCAL alone —
+    // the frame is a dead owner donating its storage — so no copy happens and
+    // the view really would dangle. Agreement means agreeing on the refusals
+    // too: this is refused in both spellings, as the tail always was.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { ret &local; }
+            &local
+        }
+        fun main() { print(grab(true).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_borrows_projection_is_sanctioned() {
+    // The escape check's OTHER exemption, which the `ret` also never got: a
+    // `borrows` function may hand back a view of a view parameter, because the
+    // caller's argument outlives the call. Rule 3's sanctioned case, now
+    // reachable through either spelling — and it emits the projection, not a
+    // copy, in both.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun view_of(h: &Holder, flag: bool): &Inner borrows h {
+            if flag { ret &h.inner; }
+            &h.inner
+        }
+        fun main() { let h = Holder { inner = Inner { n = 3 } }; print(view_of(&h, true).n); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif (flag) {\n\t\treturn h2[0];\n\t}\n\treturn h2[0];"),
+        "a sanctioned projection must not gain a copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "the projection should reach the field"
+    );
+}
+
+#[test]
+fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
+    // The crossing half of B116, isolated: the resource leaves through the
+    // `ret` and the TAIL hands back an owned value, so the tail's own crossing
+    // says nothing about it. `compute_return_value_crossings` walked
+    // `function.body.1` alone, so the `ret`'s `&self.g` named no place and R1
+    // never saw the move. It is joined to the return positions now, and the
+    // move scan answers with the bare twin's diagnostic.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool): Guard {
+                if flag { ret &self.g; }
+                Guard { tag = "fresh" }
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+#[ignore = "known limit: rule 3's escape check asks its question of the whole \
+            body rather than of its return LEAVES, so a conditional tail with \
+            one owned arm is never examined while the `ret` spelling of the same \
+            program is — see element-clones.md §12.3"]
+fn b116_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
+    // Found closing B116, and it is NOT the `ret` special case: the two
+    // spellings here are examined by different questions. The tail loop asks
+    // `escapes_as_view(function.body.1)` of the WHOLE body, and an `if` with one
+    // owned arm is not a view expression, so it is never asked at all; the `ret`
+    // arm asks the leaf, which is. The function's `borrows` set is empty (it is
+    // inferred from the tail, which projects nothing), so neither exemption
+    // reaches the `ret` — and rule 1's return clause copies it regardless, which
+    // is what makes the refusal a false positive rather than a disagreement
+    // about the rule. Widening the escape check to its return leaves is
+    // `element-clones.md` §11.3 candidate (d)'s measurement, not this lane's.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun early(&self, flag: bool): Inner {
+                if flag { ret &self.inner; }
+                Inner { n = 0 }
+            }
+            fun conditional(&self, flag: bool): Inner {
+                if flag { Inner { n = 0 } } else { &self.inner }
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.early(true);
+            let tail = h.conditional(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+#[ignore = "known limit: a view of a LOCAL escapes through one arm of a \
+            conditional tail, which the whole-body question never examines — \
+            the same leaf-blindness, opposite polarity; see element-clones.md \
+            §12.3"]
+fn b116_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
+    // The other side of the same hole, and the one that matters: rule 3 exists
+    // to refuse exactly this, and a second owned arm hides it. The `ret`
+    // spelling IS refused, so today the two disagree in the direction that lets
+    // code through. (Benign as emitted — the frame is dead and nothing else
+    // holds the storage — but it is the rule not being applied, not the rule
+    // deciding.)
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { Inner { n = 0 } } else { &local }
+        }
+        fun main() { print(grab(false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_closures_ret_still_cannot_hand_back_a_view() {
+    // The boundary of B116's lift. A closure's rets check against its INFERRED
+    // tail type and never enter `return_sites`, so they get no exemption — which
+    // is right, because a closure may not declare `borrows` and cannot return a
+    // view at all (`compute_return_clone_sites` relies on exactly that).
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun main() {
+            let h = Holder { inner = Inner { n = 3 } };
+            let f = |flag: bool| { if flag { ret &h.inner; } &h.inner };
+            print(f(true).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
 #[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
