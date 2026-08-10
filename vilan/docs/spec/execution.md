@@ -91,7 +91,9 @@ Short-circuit: `&&` and `||` evaluate
 the right operand only when needed. `if`/`match` evaluate exactly the
 taken branch; a `match` evaluates its subject once, then tests legs top
 to bottom (first matching leg wins; its guard is evaluated only when the
-pattern matches).
+pattern matches). Every guard is tested where its leg stands, the last
+leg's included — exhaustiveness never rests on a guard (§3.10 of the
+grammar chapter), so no leg is treated as a catch-all it did not spell.
 
 ## 7.2a Integer overflow
 

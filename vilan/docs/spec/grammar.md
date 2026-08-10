@@ -430,3 +430,19 @@ classic mistyped-variant trap is a resolution error instead of a silent
 catch-all. `bool` and `null` literals match as variants of their enums.
 The `let`/parameter binder grammar (names and tuples, §3.3) is the
 irrefutable subset; refutable forms (literals, variants) are match-only.
+A tuple pattern is irrefutable only when its elements are: `(let a, let b)`
+is a destructure and matches everything, `(1, 2)` is a test.
+
+A `match` must be **exhaustive**, and exhaustiveness is proven by
+**unguarded** legs only — a guard tests the value, which the check does
+not reason about, so a guarded leg proves nothing about what the match
+covers. Over an enum the unguarded legs must name every variant; over any
+other subject one of them must be an irrefutable catch-all. The
+consequence lands on the **last** leg, the one that answers for whatever
+the legs above it did not take: a `match` whose final leg is guarded must
+be exhaustive without it, so `match a { A => …, B if c => … }` is refused
+whatever the subject's type ("match is not exhaustive"). Write the guard
+with a catch-all after it — `B if c => …, _ => …` — and the value the
+guard rejects has somewhere to go. A guard is tested wherever its leg
+stands, the last one included; no leg is silently promoted to a
+catch-all.
