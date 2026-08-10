@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 
 /// The scalar primitive type names — each backed by a JS value (a number or a

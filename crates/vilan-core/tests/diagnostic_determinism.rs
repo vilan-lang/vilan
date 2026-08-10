@@ -116,6 +116,15 @@ fn render_all(source: &'static str, platform: Platform) -> Vec<String> {
 /// Analyze `source` cold [`ATTEMPTS`] times and hand back the distinct
 /// renderings with their counts. One entry means deterministic.
 fn cold_renderings(source: &'static str, platform: Platform) -> BTreeMap<Vec<String>, usize> {
+    // The repetition above only proves anything if the attempts can DISAGREE.
+    // `std`'s `RandomState` reseeded every table, so it supplied that on its
+    // own; E48 put the analyzer's id-keyed tables on a constant-seeded hasher
+    // (`fx.rs`), under which an order-dependent answer would be stably wrong and
+    // thirty attempts would agree on it. This puts the variation back — one seed
+    // per table, from a process counter — so these pins keep the power they were
+    // written with. Without it they still pass, and mean nothing.
+    vilan_core::fx::enable_seed_shuffle();
+
     let source = source.to_string();
     let source: &'static str = Box::leak(source.into_boxed_str());
     // The 256 MB worker every other compiler-behavior harness uses: a deep

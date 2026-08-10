@@ -27,11 +27,10 @@
 //! The pass is a no-op for programs that never create a `Context`, so it can't
 //! change the output of any existing program.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
 
@@ -244,7 +243,7 @@ fn analyze(
         .filter(|id| program.functions.contains_key(id));
 
     // call id -> the function/closure it sits in.
-    let mut owner_of: HashMap<Id, Node> = HashMap::new();
+    let mut owner_of: HashMap<Id, Node> = HashMap::default();
     for node in graph.nodes() {
         for call in graph.calls_of(node.id()) {
             owner_of.insert(call.call_id, *node);
@@ -255,7 +254,7 @@ fn analyze(
     let mut gets: Vec<GetSite> = Vec::new();
     let mut runs: Vec<RunSite> = Vec::new();
     let mut news: Vec<Id> = Vec::new();
-    let mut contexts: HashSet<Id> = HashSet::new();
+    let mut contexts: HashSet<Id> = HashSet::default();
 
     for (&call_id, function_call) in &program.function_calls {
         let Some(target) = call_target(program, call_id) else {
@@ -386,7 +385,7 @@ fn analyze(
     // The body closure of every `run`, mapped to the context it binds (the
     // run's receiver). A closure passed to `run` receives the value as a
     // parameter rather than capturing it.
-    let mut run_closures: HashMap<Id, Id> = HashMap::new();
+    let mut run_closures: HashMap<Id, Id> = HashMap::default();
     for site in &runs {
         if let (Some(closure_id), Some(context)) = (
             site.closure_id,
@@ -462,7 +461,7 @@ fn analyze(
     // (caller node, call id, candidate callees) per dispatch site.
     let mut dispatch_sites: Vec<(Id, Id, Vec<Id>)> = Vec::new();
     // callee -> the nodes that may reach it through dispatch.
-    let mut dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     for node in graph.nodes() {
         for call in graph.calls_of(node.id()) {
             if !matches!(
@@ -627,7 +626,7 @@ fn analyze(
         }
     };
     // Incoming direct calls per function, and top-level incoming calls.
-    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::new();
+    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
     for node in graph.nodes() {
         for call in graph.calls_of(node.id()) {
             if let CallTarget::Function(target) = call.target {
@@ -638,7 +637,7 @@ fn analyze(
             }
         }
     }
-    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
     for (call_id, call) in &program.function_calls {
         if owned_call_ids.contains(call_id) {
             continue;
@@ -647,8 +646,8 @@ fn analyze(
             top_level_incoming.entry(target).or_default().push(*call_id);
         }
     }
-    let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::new();
-    let mut coverage_outside: HashSet<Id> = HashSet::new();
+    let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
+    let mut coverage_outside: HashSet<Id> = HashSet::default();
     for (owner, site_call, candidates) in &dispatch_sites {
         let union_fallback = |map: &mut HashMap<Id, Vec<Id>>| {
             for &candidate in candidates {
@@ -720,7 +719,7 @@ fn analyze(
             union_fallback(&mut coverage_dispatch_callers);
             continue;
         };
-        let mut visited: HashSet<(Id, crate::type_::TypeId)> = HashSet::new();
+        let mut visited: HashSet<(Id, crate::type_::TypeId)> = HashSet::default();
         let mut walk: Vec<(Id, crate::type_::TypeId)> = vec![(root, constraint)];
         while let Some((function, constraint)) = walk.pop() {
             if !visited.insert((function, constraint)) {
@@ -773,8 +772,8 @@ fn analyze(
     // read-like demand on the caller (and a threading site), and the value
     // may only flow where the threading can follow it — a call, a forward to
     // a parameter with the SAME clause, or `run`'s body position.
-    let mut deferred: HashMap<Id, HashSet<Id>> = HashMap::new(); // ctx -> closures
-    let mut injected_calls: HashMap<Id, Vec<(Node, Id)>> = HashMap::new(); // ctx -> (caller, call)
+    let mut deferred: HashMap<Id, HashSet<Id>> = HashMap::default(); // ctx -> closures
+    let mut injected_calls: HashMap<Id, Vec<(Node, Id)>> = HashMap::default(); // ctx -> (caller, call)
     // The working clause map: declared clauses (parameters AND `let`
     // annotations) plus ADOPTED ones — an unannotated closure-literal binding
     // passed into a clause position adopts that clause (`let add = || ..;`
@@ -815,7 +814,7 @@ fn analyze(
 
         // Closure literals landing in annotated positions defer; annotated
         // values may forward to a parameter with the SAME clause.
-        let mut allowed_forwards: HashSet<Id> = HashSet::new();
+        let mut allowed_forwards: HashSet<Id> = HashSet::default();
 
         // Clause-typed LET bindings (the ui-boundary follow-up): the
         // binding is a NAMED injected closure. Its initializer literal
@@ -949,7 +948,7 @@ fn analyze(
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
         // Seed with the nodes that directly read this context.
-        let mut needs: HashSet<Id> = HashSet::new();
+        let mut needs: HashSet<Id> = HashSet::default();
         let mut worklist: Vec<Id> = Vec::new();
         for get in gets.iter().filter(|get| get.context == context) {
             if needs.insert(get.owner.id()) {
@@ -1014,7 +1013,7 @@ fn analyze(
         // SAFE — it holds `Option<T>` and never fences. Strictness propagates
         // backward exactly like `needs` (a caller of a strict node must
         // supply the bare value), so strict ⊆ needs.
-        let mut strict: HashSet<Id> = HashSet::new();
+        let mut strict: HashSet<Id> = HashSet::default();
         let mut strict_worklist: Vec<Id> = Vec::new();
         for get in gets
             .iter()
@@ -1222,11 +1221,11 @@ fn analyze(
         let mut param_nodes: HashSet<Id> = run_closure_ids.clone();
         // node -> the node whose parameter it reads (itself, or the capture
         // provider) — the parameter's FLAVOR is the provider's.
-        let mut provider_of: HashMap<Id, Id> = HashMap::new();
+        let mut provider_of: HashMap<Id, Id> = HashMap::default();
         // Nodes with no value source: the inlined entry `main` (it can carry
         // no hidden parameter), and any closure whose provider chain roots at
         // it — their safe reads and threads become literal `None`s.
-        let mut none_rooted: HashSet<Id> = HashSet::new();
+        let mut none_rooted: HashSet<Id> = HashSet::default();
         if let Some(main) = entry_main {
             if needs.contains(&main) {
                 none_rooted.insert(main);
@@ -1462,7 +1461,7 @@ fn apply(program: &mut Program, plan: Plan) {
     };
 
     // (context, node) -> the parameter id that holds the value inside that node.
-    let mut source: HashMap<(Id, Id), Id> = HashMap::new();
+    let mut source: HashMap<(Id, Id), Id> = HashMap::default();
 
     // Give each function and `run` closure its own hidden parameter.
     for &(context, node) in &plan.param_nodes {

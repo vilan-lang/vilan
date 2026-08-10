@@ -3,6 +3,7 @@ use crate::analyzer::{
     Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
@@ -11,7 +12,7 @@ use crate::span::Span;
 use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
@@ -60,7 +61,7 @@ pub fn transform_functions<'src>(
     let global_variables = crate::init_order::initialization_order(program, program.call_graph());
     let t_global_variables = transformer.walk_list(&global_variables);
 
-    let mut names = HashMap::new();
+    let mut names = HashMap::default();
     for root in roots {
         transformer.ensure_function_emitted(*root);
         names.insert(*root, transformer.ng.name_for(*root));
@@ -1533,7 +1534,7 @@ impl<'src> Transformer<'src> {
         // names identifiers after and `Annotated` annotates them with. `Plain`
         // needs none.
         let source_names = if matches!(style, NameStyle::Plain) {
-            HashMap::new()
+            HashMap::default()
         } else {
             program
                 .variables
@@ -1583,26 +1584,26 @@ impl<'src> Transformer<'src> {
             drop_fn_id: program.drop_fn_id,
             program,
             required_functions: IndexMap::new(),
-            emitting: HashSet::new(),
-            current_substitution: HashMap::new(),
+            emitting: HashSet::default(),
+            current_substitution: HashMap::default(),
             current_adapted: Vec::new(),
             current_instance: None,
             current_origin: None,
-            referenced_globals: HashSet::new(),
-            instances: HashMap::new(),
+            referenced_globals: HashSet::default(),
+            instances: HashMap::default(),
             current_self_type: None,
-            default_instances: HashMap::new(),
-            drop_helpers: HashMap::new(),
+            default_instances: HashMap::default(),
+            drop_helpers: HashMap::default(),
             monomorphized: Vec::new(),
-            is_bindings: HashMap::new(),
-            hoisted_values: HashMap::new(),
+            is_bindings: HashMap::default(),
+            hoisted_values: HashMap::default(),
             is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
             unresolved_drop_sinks: Vec::new(),
-            chunk_members: HashMap::new(),
+            chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
             gate_call_names: BTreeMap::new(),
@@ -4404,7 +4405,7 @@ impl<'src> Transformer<'src> {
                             let mut copies = Vec::new();
                             self.materialize_captures(&leg.pattern, &mut copies);
                             let mut guard_prelude = Vec::new();
-                            let outer_reads = self.is_binding_reads.replace(HashSet::new());
+                            let outer_reads = self.is_binding_reads.replace(HashSet::default());
                             guard_condition = self.walk_entity(guard_id, &mut guard_prelude);
                             let guard_reads =
                                 std::mem::replace(&mut self.is_binding_reads, outer_reads)
@@ -5630,7 +5631,7 @@ impl<'src> Transformer<'src> {
             self.program.functions.get(&from),
             self.program.functions.get(&to),
         ) else {
-            return HashMap::new();
+            return HashMap::default();
         };
         from.generic_parameter_constraint_ids
             .iter()
@@ -5759,7 +5760,7 @@ impl<'src> Transformer<'src> {
         {
             return Dispatch::Extern(member_id, binding);
         }
-        let mut substitution = HashMap::new();
+        let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
         if !own_generic_values.is_empty() {
             if let Some(function) = self.program.functions.get(&member_id) {
@@ -5880,7 +5881,7 @@ impl<'src> Transformer<'src> {
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        let mut substitution = HashMap::new();
+        let mut substitution = HashMap::default();
         let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
             return substitution;
         };
@@ -6291,7 +6292,7 @@ impl<'src> Transformer<'src> {
     /// Searches a trait and its supertraits for a default (bodied) member.
     fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
         let mut stack = vec![trait_id];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
@@ -6469,10 +6470,10 @@ impl<'src> Transformer<'src> {
     /// caller falls back to a plain (generic) emission.
     fn inherited_substitution(&self, target_id: Id) -> HashMap<TypeId, TypeId> {
         if self.current_substitution.is_empty() {
-            return HashMap::new();
+            return HashMap::default();
         }
         let Some(function) = self.program.functions.get(&target_id) else {
-            return HashMap::new();
+            return HashMap::default();
         };
         let mut generics = Vec::new();
         for parameter_id in &function.parameters {
@@ -7330,7 +7331,7 @@ pub fn transform_const_program<'src>(
 
     // Emitting a binding's initializer can reference more bindings (and
     // require more functions) — iterate to a fixpoint.
-    let mut declared: HashSet<Id> = HashSet::new();
+    let mut declared: HashSet<Id> = HashSet::default();
     let mut unresolved: Vec<Id> = Vec::new();
     let mut prelude: Vec<js::Node<'src>> = Vec::new();
     loop {
@@ -7709,11 +7710,11 @@ impl NameGenerator {
                 .chars()
                 .collect(),
             counter: 0,
-            names: HashMap::new(),
+            names: HashMap::default(),
             source_names,
             style,
             taken: reserved,
-            minted: HashSet::new(),
+            minted: HashSet::default(),
         }
     }
 
@@ -8172,7 +8173,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         NameStyle::Plain => true,
     };
     // Each renameable binding's current (unique) name -> its source name.
-    let mut source_of: HashMap<String, String> = HashMap::new();
+    let mut source_of: HashMap<String, String> = HashMap::default();
     for (id, name) in &ng.names {
         if let Some(source) = ng.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
@@ -8207,7 +8208,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     // the name the generator minted, which is a name this pass can otherwise
     // mint again. Reserving the unreached names makes the allocator's output
     // disjoint from the kept names whatever the walk did or did not see.
-    let mut reached = HashSet::new();
+    let mut reached = HashSet::default();
     collect_reached_names(&global, &mut reached);
     reserved.extend(
         renameable
@@ -8215,11 +8216,11 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
             .filter(|name| !reached.contains(*name))
             .cloned(),
     );
-    let mut rename = HashMap::new();
+    let mut rename = HashMap::default();
     allocate_scope(
         &global,
         &reserved,
-        &HashMap::new(),
+        &HashMap::default(),
         release,
         &source_of,
         &mut rename,
