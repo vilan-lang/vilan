@@ -15745,6 +15745,87 @@ fn an_async_function_with_a_view_parameter_is_rejected() {
     assert_fails_spanning(source, "value", "cannot take '&mut' parameters");
 }
 
+// The `&` half of the same signature rule (`view-invalidation.md` §3: "an `async
+// fun` may not declare `&`/`&mut` parameters"). Only the `&mut` spelling above
+// was ever pinned — B112's survey found the gap. A SHARED view is no safer than
+// a mutable one here: the hazard is the caller's claim outliving its epoch while
+// the callee sits suspended, and reading through a stale view is the read half
+// of exactly that. The message names the form it saw, so the two spellings are
+// separately observable.
+
+#[test]
+fn an_async_function_with_a_shared_view_parameter_is_rejected() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        async fun peek(viewed: &Point) {
+            await tick();
+            let _seen = viewed.x;
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            peek(&point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&' parameters");
+}
+
+#[test]
+fn an_async_method_with_a_shared_view_receiver_is_rejected() {
+    // A receiver is an ordinary parameter with a `&` convention, so `&self`
+    // meets the same rule and anchors on the `self` token.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        impl Point {
+            async fun peek(&self) {
+                await tick();
+                let _seen = self.x;
+            }
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            point.peek();
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "self", "cannot take '&' parameters");
+}
+
+// KNOWN BUG (found 2026-08-10 probing the `&` form; pre-existing, and it is the
+// GATE's, not the form's — both spellings escape). The signature rule fires only
+// when the body contains an explicit `await` token, so the IMPLICIT-await
+// spelling (`spec/execution.md` §7: calling an async function without `await`,
+// the sanctioned form) bypasses it entirely. The emission proves the suspension
+// is real — `const t = await (tick());` — with the caller's view live across it.
+// Tightening the gate to declared-asyncness is not a one-liner: it would also
+// reject `async fun m(&self)` bodies that never suspend, which
+// `a_declared_async_impl_of_a_sync_trait_method_is_permitted` pins as legal
+// (B29's declared-async impl of a sync trait). Its own measurement.
+#[test]
+#[ignore]
+fn an_implicit_await_does_not_lift_the_async_view_parameter_rule() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun stash(viewed: &mut Point) {
+            let beat = tick();
+            viewed.x = beat;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
 #[test]
 fn a_sync_function_with_view_parameters_called_from_async_compiles() {
     // Sync callees cannot suspend — views pass freely.
