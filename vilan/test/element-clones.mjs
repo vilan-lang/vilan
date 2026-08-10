@@ -64,6 +64,24 @@ function viewed_of(holder) {
 function viewed_projection(holder) {
 	return holder;
 }
+function items_view(holder) {
+	return holder[0];
+}
+function reference_of(holder) {
+	return __clone(holder[0]);
+}
+function called_of(holder) {
+	return __clone(items_view(holder));
+}
+function scalar_of(cell2) {
+	return cell2[0];
+}
+function scalar_projection(cell2) {
+	return [ cell2, 0 ];
+}
+function scalar_forward(value) {
+	return value[0][value[1]];
+}
 function elements_are_independent() {
 	let rows = [  ];
 	rows.push([ 1, 2 ]);
@@ -148,4 +166,15 @@ lifted.push(9);
 console.log(viewer[0].length);
 viewed_projection(viewer)[0].push(9);
 console.log(viewer[0].length);
+const referenced = reference_of(viewer);
+console.log(referenced.length);
+const called = called_of(viewer);
+console.log(called.length);
+let cell = [ 5 ];
+console.log(scalar_of(cell));
+const slot = scalar_projection(cell);
+slot[0][slot[1]] = 7;
+console.log(cell[0]);
+let counter = [ 3 ];
+console.log(scalar_forward([ counter, 0 ]));
 elements_are_independent();
