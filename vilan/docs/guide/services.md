@@ -138,6 +138,13 @@ That triple is the standard shape for payload types: `Wire` to travel,
 hiding inside a payload type is a compile error at the derive, which is
 exactly where you want to find out.
 
+A `resource` never travels, in either position: not as a field, and not as
+the derived type itself — `derive(Wire)` and `derive(Json)` are both refused
+for a `resource` struct or enum. A resource is an owned handle, and the
+receiving side would rebuild one out of bytes: a second handle to the same
+thing, owned by nobody. Send a name for it instead, which is what the next
+section is about.
+
 The codec is chosen at connect time: `json_codec()` for a readable wire,
 `binary_codec()` for a compact one. Client and server must use the same
 one.
