@@ -79,6 +79,12 @@ values must be unique across the enum, counting the values implicitly
 continued from the previous variant; see the grammar chapter for the full
 rule.
 
+An **integer** backing value must lie in `-9007199254740991 ..=
+9007199254740991` (`i53`), because that is the widest integer a runtime
+number holds exactly and the variant *is* that number: a discriminant
+past the bound would cross a host boundary as a different value than the
+source wrote. The continuation stops at the same edge.
+
 ### Backed-enum conversions
 
 Every backed enum gets two members, synthesized by the compiler — no

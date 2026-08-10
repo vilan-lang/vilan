@@ -1100,14 +1100,36 @@ rather than fixed here.
 
 ### 8.4 Two limits found, both pre-existing
 
-- **A discriminant past 2^53 is not representable.** `enum E { A =
-  9007199254740993 }` emits the JS number literal
-  `9007199254740993`, which JavaScript reads as `9007199254740992`. The
-  emission is self-consistent (the `match` compares the same literal), so
-  nothing in-tree miscompiles — but a value crossing a host boundary
-  would. This predates backed enums and is untouched by them; the arc's
-  only concession is that `value()`/`parse()` are not synthesized there,
-  rather than being synthesized with a return type that lies.
+- **A discriminant past 2^53 is not representable — CLOSED as B106,
+  2026-08-10.** `enum E { A = 9007199254740993 }` emitted the JS number
+  literal `9007199254740993`, which JavaScript reads as
+  `9007199254740992`. The emission was self-consistent (the `match`
+  compared the same literal), so nothing in-tree miscompiled — but a value
+  crossing a host boundary would. This predated backed enums and was
+  untouched by them; the arc's only concession was that `value()`/`parse()`
+  are not synthesized there, rather than being synthesized with a return
+  type that lies.
+
+  The fix is a range check in B79's validation family (`backing_value`),
+  at **i53's edge** rather than `i64`'s: the bound belongs to the
+  *emission*, not to the compiler's storage type, and the diagnostic says
+  so ("a backed enum is a JS number at runtime, and an integer past
+  2^53 - 1 has no exact double, so the emitted literal would be a
+  different value"). Two consequences worth naming:
+
+  - The bound is now **symmetric**. B79's reached one further on the
+    negative side because two's complement does — a fact about `i64`, not
+    about a JS number, and the old pin asserting `Min =
+    -9223372036854775808` legal was pinning the bug's own shape.
+  - The **implicit continuation** stops at the same edge, because a
+    continued value is emitted as the same bare literal. One rule, not two.
+
+  A value in `(i53, i64]` is now a compile error rather than a silently
+  wrong literal, and `integer_backing_type`'s `None` arm — §3.8's "no
+  conversions where the type would lie" — is reachable only for a
+  discriminant the check has already rejected. Zero in-tree flips: the
+  sweep finds no `.vl` anywhere with a discriminant past i53. Pins: the
+  `b106_*` family plus B79's two rewritten bound pins.
 - **bindgen's PROPERTIES keep their TODO.** §4.1 specifies the parameter
   and return directions; a property is both, through separate externs, so
   one bound type cannot serve it. The TODO now names the spellings that

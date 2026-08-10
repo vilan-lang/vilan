@@ -48822,14 +48822,15 @@ fn b79_an_overflowing_discriminant_is_rejected_rather_than_zeroed() {
 }
 
 #[test]
-fn b79_the_i64_bounds_themselves_are_legal() {
-    // The negative bound is one PAST the positive one, because the minus
-    // applies to the magnitude rather than being parsed into it — the same
-    // rule `-128i8` follows. Off-by-one here would reject a legal program.
+fn b79_the_bounds_themselves_are_legal() {
+    // Off-by-one here would reject a legal program. (B106 moved the bound from
+    // `i64` to `i53` and made it SYMMETRIC: `i64`'s negative end reaches one
+    // further only because two's complement does, and a JS number has no such
+    // asymmetry.)
     assert_compiles_and_runs(
         r#"
         import std::print;
-        enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }
+        enum Edge { Min = -9007199254740991, Max = 9007199254740991 }
         fun main() {
             print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
         }
@@ -48844,10 +48845,10 @@ fn b79_a_discriminant_sequence_cannot_run_past_the_bound() {
     // debug compiler here and wrapped the release one.
     assert_fails_with(
         r#"
-        enum Edge { A = 9223372036854775807, B }
+        enum Edge { A = 9007199254740991, B }
         fun main() { }
         "#,
-        "variant 'B' continues the discriminant sequence past 9223372036854775807",
+        "variant 'B' continues the discriminant sequence past 9007199254740991",
     );
 }
 
@@ -50859,5 +50860,122 @@ fn two_hand_written_subscripts_are_not_collapsed_into_one() {
         }
         "#,
         "first\nsecond\n21\n20\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B106 (a discriminant past 2^53 is unrepresentable in the emission). A backed
+// enum IS its backing value at runtime, emitted as a bare JS numeric literal —
+// and a double holds integers exactly only to 2^53 - 1, so
+// `= 9007199254740993` emitted a literal the host reads back as `…992`.
+// Self-consistent in-tree (every site emitted the same wrong number) and wrong
+// across a host boundary. The range check lands in B79's validation family, at
+// i53's edge, and the diagnostic names the emission target as the reason.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b106_the_i53_edge_is_a_legal_discriminant() {
+    // 2^53 - 1: the largest integer a JS number holds exactly, and the last one
+    // that round-trips through the emitted literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Max = 9007199254740991 }
+        fun main() {
+            print(match Edge::Max { Edge::Zero => "zero", Edge::Max => "max" });
+        }
+        "#,
+        "max\n",
+    );
+}
+
+#[test]
+fn b106_one_past_the_i53_edge_is_refused() {
+    // One more, and the emitted literal is a different number than the source
+    // wrote. The diagnostic states the bound AND why it is that bound.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Over = 9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9007199254740992` is out of range \
+         (-9007199254740991 ..= 9007199254740991): a backed enum is a JS number \
+         at runtime, and an integer past 2^53 - 1 has no exact double, so the \
+         emitted literal would be a different value",
+    );
+}
+
+#[test]
+fn b106_the_negative_i53_edge_is_legal_and_one_past_it_is_refused() {
+    // The negative twin, and the change B106 makes to B79's shape: the bound is
+    // SYMMETRIC. `i64`'s negative end reached one further because two's
+    // complement does; a JS number has no such asymmetry, so `-9007199254740991`
+    // is the last legal value in that direction too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Min = -9007199254740991 }
+        fun main() {
+            print(match Edge::Min { Edge::Zero => "zero", Edge::Min => "min" });
+        }
+        "#,
+        "min\n",
+    );
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Under = -9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `-9007199254740992` is out of range",
+    );
+}
+
+#[test]
+fn b106_the_old_i64_bound_is_now_refused() {
+    // The value B79 accepted and this fix does not — the one that made the
+    // range a lie: `i64::MAX` cannot be an emitted JS literal at all.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Max = 9223372036854775807 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9223372036854775807` is out of range",
+    );
+}
+
+#[test]
+fn b106_a_continued_discriminant_stops_at_the_same_edge() {
+    // A continued value is emitted as the same bare literal, so the sequence
+    // must stop where an explicit discriminant does — one rule, not two.
+    assert_fails_with(
+        r#"
+        enum Walk { A = 9007199254740990, B, C }
+        fun main() { }
+        "#,
+        "variant 'C' continues the discriminant sequence past 9007199254740991, \
+         the largest integer a JS number holds exactly",
+    );
+}
+
+#[test]
+fn b106_a_hex_discriminant_is_range_checked_too() {
+    // The range check always spoke radix 16 (B79's fix); the narrower bound
+    // inherits that, so hex cannot smuggle a value past it.
+    assert_fails_with(
+        r#"
+        enum Mask { Zero = 0, Wide = 0x20000000000000 }
+        fun main() { }
+        "#,
+        "the enum discriminant `0x20000000000000` is out of range",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Mask { Zero = 0, Edge = 0x1FFFFFFFFFFFFF }
+        fun main() {
+            print(match Mask::Edge { Mask::Zero => "zero", Mask::Edge => "edge" });
+        }
+        "#,
+        "edge\n",
     );
 }

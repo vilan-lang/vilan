@@ -137,9 +137,13 @@ An integer backing value is an **integer**, not a general `NUMBER`: a
 fractional part (`= 1.5`) and a type suffix (`= 1u32`, and `= 1_000`,
 which lexes as `1` with the trailer `_000`) are both errors rather than
 being silently discarded. Hex is read as hex (`= 0xFF` is 255). The value
-must fit a signed 64-bit integer, and so must the implicit continuation:
-a variant with no backing value takes the previous variant's plus one,
-starting at 0, and running past the bound is an error rather than a wrap.
+must lie in **`-9007199254740991 ..= 9007199254740991`** — `i53`, the
+widest integer a runtime number holds exactly — because a backed enum *is*
+that number at runtime, and a discriminant past the bound would reach the
+host as a different value than the source wrote. The bound is symmetric.
+The implicit continuation obeys it too: a variant with no backing value
+takes the previous variant's plus one, starting at 0, and running past the
+bound is an error rather than a wrap.
 
 **A string backing must be written on every variant.** There is no
 successor of `"start"` for the continuation rule to hand out, and the

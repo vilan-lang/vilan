@@ -20,6 +20,16 @@ use crate::util::{join_with, plural};
 const CYCLE_SUBSTITUTE: u8 = 0;
 const CYCLE_RECONCILE: u8 = 1;
 
+/// `i53`'s edge — the largest integer a JS number (an IEEE-754 double) holds
+/// exactly, and therefore the largest **enum discriminant** the emission can
+/// carry (B106). A backed enum IS its backing value at runtime
+/// (`backed-enums.md` §3.4), so a discriminant is emitted as a bare JS numeric
+/// literal: past this bound the literal the host reads back is a *different*
+/// number (`= 9007199254740993` reads as `…992`). The range is symmetric,
+/// because JS's safe integers are — unlike `i64`'s, whose negative end reaches
+/// one further because two's complement does.
+const I53_MAX: i64 = (1 << 53) - 1;
+
 thread_local! {
     /// The `(operation, generic constraint id)` pairs currently being resolved on
     /// the active recursion path, so a cyclic mapping terminates.
@@ -15822,22 +15832,22 @@ impl<'src> Analyzer<'src> {
             Some(hex) => u128::from_str_radix(hex, 16),
             None => whole.parse::<u128>(),
         };
-        // A negative discriminant reaches one past the positive bound, exactly
-        // as the literal `-9223372036854775808` does elsewhere: the minus is
-        // applied to the magnitude, not parsed into it.
-        let bound = if negative {
-            1u128 << 63
-        } else {
-            (1u128 << 63) - 1
-        };
+        // B106: the bound is the EMISSION's, not `i64`'s. It is symmetric —
+        // `i64`'s negative end reaches one further only because two's
+        // complement does, and a JS number has no such asymmetry — so the minus
+        // buys nothing here.
         match magnitude {
-            Ok(magnitude) if magnitude <= bound => Some(BackingValue::Int(match negative {
-                true => (magnitude as i64).wrapping_neg(),
-                false => magnitude as i64,
-            })),
+            Ok(magnitude) if magnitude <= I53_MAX as u128 => {
+                Some(BackingValue::Int(match negative {
+                    true => -(magnitude as i64),
+                    false => magnitude as i64,
+                }))
+            }
             _ => reject(format!(
                 "the enum discriminant `{written}` is out of range \
-                 (-9223372036854775808 ..= 9223372036854775807)"
+                 (-{I53_MAX} ..= {I53_MAX}): a backed enum is a JS number at \
+                 runtime, and an integer past 2^53 - 1 has no exact double, so \
+                 the emitted literal would be a different value"
             )),
         }
     }
@@ -17324,8 +17334,9 @@ impl<'src> Analyzer<'src> {
                                         span: variant.1,
                                         msg: format!(
                                             "variant '{variant_name}' continues the discriminant \
-                                             sequence past 9223372036854775807; give it an \
-                                             explicit discriminant"
+                                             sequence past {I53_MAX}, the largest integer a JS \
+                                             number holds exactly; give it an explicit \
+                                             discriminant"
                                         ),
                                     });
                                 }
@@ -17335,7 +17346,11 @@ impl<'src> Analyzer<'src> {
                     };
                     if let Some(backing_value) = &backing_value {
                         if let BackingValue::Int(discriminant) = backing_value {
-                            next_discriminant = discriminant.checked_add(1);
+                            // The continuation stops at the same edge an explicit
+                            // discriminant does (B106): a continued value is emitted
+                            // as the same bare JS literal.
+                            next_discriminant =
+                                discriminant.checked_add(1).filter(|next| *next <= I53_MAX);
                         }
                         let (key, rendered) = match backing_value {
                             BackingValue::Int(value) => {
@@ -29623,10 +29638,12 @@ pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
 /// it is what `Ordering::Greater.value() == 1` compares against without
 /// friction; `i53` is the widest integer a JS number represents exactly, and a
 /// backed enum IS a JS number. `None` — no conversions at all — when a
-/// discriminant is outside `i53`, because the bare lowering already cannot
-/// represent it and `value()` would be a lie.
+/// discriminant is outside `i53`; since B106 that is only ever a discriminant
+/// the range check has already REJECTED (this runs on the written literals, at
+/// derive-expansion time, so it still meets one), and generating nothing keeps
+/// a rejected enum to its one error.
 fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<String> {
-    const I53_MAX: i128 = (1 << 53) - 1;
+    let bound = i128::from(I53_MAX);
     let mut lowest: i128 = 0;
     let mut highest: i128 = 0;
     for (_, backing) in written {
@@ -29656,7 +29673,7 @@ fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<Strin
     if lowest >= i32::MIN as i128 && highest <= i32::MAX as i128 {
         return Some("i32".to_string());
     }
-    if lowest >= -I53_MAX && highest <= I53_MAX {
+    if lowest >= -bound && highest <= bound {
         return Some("i53".to_string());
     }
     None
