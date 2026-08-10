@@ -30938,17 +30938,42 @@ fn interned_display_name(name: String) -> &'static str {
     leaked
 }
 
+/// What a resolved pre-entry world is a function of, apart from the loaded
+/// files' CONTENT — which the per-hit re-hash validates instead of keying on
+/// (the E12 rule). Two analyses agreeing on every field here discover, load,
+/// expand and resolve the same module set, so they may share a world.
+///
+/// The `workspace` row is what admits MACRO WORLDS (cycle 13): a macro world's
+/// workspace is `[macro_std]`, which the cache's original
+/// `workspace.packages.is_empty()` gate could never satisfy even though every
+/// macro world in a process shares one `macro_std` — the gate was standing in
+/// for a key that did not describe the workspace, not for a real hazard.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct BaseCacheKey {
+    platform: Platform,
+    /// The entry's sorted, deduped `std::` reference names.
+    std_seeds: Vec<String>,
+    /// The workspace, rendered: one row per dependency package (its roots,
+    /// surface flag and dependency edges), one per entry dependency edge, and
+    /// one per entry reference INTO a dependency (those seed the load too).
+    /// Empty for a dependency-free program — which every world stored before
+    /// this key existed was.
+    workspace: Vec<String>,
+    /// The expansion budgets. Module-file expansions run inside the world, so
+    /// two budgets can resolve two different worlds from identical sources.
+    macro_limits: (u64, u32),
+}
+
 /// The base cache (S3c, analysis-reuse.md §6.10): resolved pre-entry worlds
-/// keyed by (platform, the entry's sorted `std::` reference names), each hit
-/// re-validated against the loaded files' CONTENT hashes (the E12 rule) and
-/// then cloned with the three entry slots patched. Worlds are stored
-/// SCRUBBED — entry path, hash, and text emptied — and every reference a
-/// stored world still holds is 'static in fact: std/dep texts live in
-/// `parse_clean_cached`'s leaked cache, and the one entry-derived string
-/// that reaches the world's maps (a seeded module name) is interned above.
-static BASE_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(Platform, Vec<String>), World<'static>>>,
-> = std::sync::OnceLock::new();
+/// keyed by [`BaseCacheKey`], each hit re-validated against the loaded files'
+/// CONTENT hashes (the E12 rule) and then cloned with the three entry slots
+/// patched. Worlds are stored SCRUBBED — entry path, hash, and text emptied —
+/// and every reference a stored world still holds is 'static in fact: std/dep
+/// texts live in `parse_clean_cached`'s leaked cache, and the entry-derived
+/// strings that reach the world's maps (seeded module names, dependency
+/// display names) are interned above.
+static BASE_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<BaseCacheKey, World<'static>>>> =
+    std::sync::OnceLock::new();
 static BASE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BASE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -30971,20 +30996,57 @@ pub fn base_cache_clear() {
     }
 }
 
+/// The workspace half of a [`BaseCacheKey`], rendered as sorted rows: the
+/// dependency packages by IDENTITY (roots, surface flag, dependency edges),
+/// the entry's own dependency edges, and the entry's references into each
+/// dependency. Everything the load loop consults about the workspace is here;
+/// what the packages CONTAIN is validated per hit by content hash instead,
+/// which is the E12 rule and the reason the roots alone suffice.
+///
+/// A dependency-free program renders the empty vector — the shape every world
+/// stored before this key existed had.
+fn workspace_fingerprint(
+    workspace: &Workspace,
+    entry_dependency_seeds: &[(usize, &str)],
+) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for (name, index) in &workspace.entry_dependencies {
+        rows.push(format!("edge {name} -> {index}"));
+    }
+    for (index, spec) in workspace.packages.iter().enumerate() {
+        let layers: Vec<String> = spec
+            .layers
+            .iter()
+            .map(|layer| format!("{}@{}", layer.name, layer.root.display()))
+            .collect();
+        let dependencies: Vec<String> = spec
+            .dependencies
+            .iter()
+            .map(|(name, dependency_index)| format!("{name}->{dependency_index}"))
+            .collect();
+        rows.push(format!(
+            "package {index} root={} surface={} layers=[{}] deps=[{}]",
+            spec.base_root.display(),
+            spec.surface,
+            layers.join(","),
+            dependencies.join(","),
+        ));
+    }
+    for (index, module) in entry_dependency_seeds {
+        rows.push(format!("seed {index}::{module}"));
+    }
+    rows
+}
+
 /// A validated, entry-patched clone of the cached world for this key, or
 /// `None` (a miss, counted). Validation re-reads every recorded source and
 /// compares content hashes; a stale world is evicted, not repaired.
-fn base_cache_lookup(
-    platform: Platform,
-    seed_names: &[String],
-    entry_path: &Path,
-) -> Option<World<'static>> {
+fn base_cache_lookup(key: &BaseCacheKey, entry_path: &Path) -> Option<World<'static>> {
     let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (platform, seed_names.to_vec());
-    let stale = if let Some(world) = cache.get(&key) {
+    let stale = if let Some(world) = cache.get(key) {
         let entry_canonical = crate::util::canonical_path(entry_path);
         let entry_is_a_loaded_module = world
             .sources
@@ -31010,14 +31072,14 @@ fn base_cache_lookup(
         false
     };
     if stale {
-        cache.remove(&key);
+        cache.remove(key);
     }
     BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     None
 }
 
-/// Stores a scrubbed clone of `world` under (platform, seeds).
-fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'_>) {
+/// Stores a scrubbed clone of `world` under its key.
+fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     let mut scrubbed = world.clone();
     scrubbed.sources[0] = PathBuf::new();
     scrubbed.source_hashes[0] = 0;
@@ -31026,18 +31088,20 @@ fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'
     // SAFETY: lifetime-only transmute. After the scrub, every reference the
     // world holds is 'static in fact: module/dep texts and ASTs live in
     // `parse_clean_cached`'s leaked cache (`analyze` loads every non-entry
-    // file through it), seeded module names go through
-    // `interned_display_name`, and the three entry slots — the only places
-    // entry-borrowed data ever lands before the entry walk — were just
+    // file through it), the entry-derived strings that reach the world's maps
+    // — a seeded module name, whether it seeded `std` or a DEPENDENCY — go
+    // through `interned_display_name`, dependency namespace display names go
+    // through it too, and the three entry slots (the only places
+    // entry-borrowed data ever lands before the entry walk) were just
     // emptied. The store path is additionally gated on `base_cacheable`
-    // (no pkg refs, no services, no macro/derive text, no overlays, no
-    // dependencies), so no other entry-derived state exists in the world.
+    // (no pkg refs, no services, no macro-DEFINING entry text), so no other
+    // entry-derived state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
     let cache = BASE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert((platform, seed_names), static_world);
+        .insert(key, static_world);
 }
 
 /// Expands the ENTRY over a constructed [`World`] — the derive/macro hoist
@@ -31049,6 +31113,14 @@ fn base_cache_store(platform: Platform, seed_names: Vec<String>, world: &World<'
 /// counter — the value the load-region path gives the entry, which always
 /// expanded first. Returns `true` when generated code demands a module the
 /// world never loaded (or any `pkg::` sibling): the caller rebuilds fresh.
+///
+/// Inside a macro WORLD the registration step is skipped, exactly as the
+/// load region skips it (`macro_registry`'s `in_macro_world` early return):
+/// a world's registry is empty by construction, so a blanked entry
+/// contributes no rows however its text reads. The EXPANSION still runs —
+/// with that empty registry, which is how std's own derives inside a world
+/// reach the Rust fallback, and how an unknown attribute in there still
+/// errors instead of silently vanishing.
 fn expand_entry_over_world<'src>(
     world: &mut World<'src>,
     nodes: &'src Spanned<NodeList<'src>>,
@@ -31057,23 +31129,22 @@ fn expand_entry_over_world<'src>(
     std: &PackageSpec,
     workspace: &Workspace,
 ) -> bool {
-    if crate::macros::in_macro_world() {
-        return false;
+    if !crate::macros::in_macro_world() {
+        let before = world.analyzer.diagnostics.len();
+        crate::macros::register_file(
+            &mut world.macro_registry,
+            crate::macros::ModuleKey::Entry,
+            &nodes.0,
+            entry_source,
+            entry_path,
+            SourceId(0),
+            std,
+            &mut world.analyzer.diagnostics,
+        );
+        world
+            .analyzer
+            .attribute_new_diagnostics(before, SourceId(0));
     }
-    let before = world.analyzer.diagnostics.len();
-    crate::macros::register_file(
-        &mut world.macro_registry,
-        crate::macros::ModuleKey::Entry,
-        &nodes.0,
-        entry_source,
-        entry_path,
-        SourceId(0),
-        std,
-        &mut world.analyzer.diagnostics,
-    );
-    world
-        .analyzer
-        .attribute_new_diagnostics(before, SourceId(0));
     let scope = crate::macros::scope_for(
         &world.macro_registry,
         workspace,
@@ -31239,13 +31310,14 @@ fn analyze_inner<'src>(
     // `Instant::now()` calls are noise next to an analysis.
     let phase_analyze_start = crate::PhaseClock::now();
     // The base cache (S3c): a WORLD — everything up to and including the
-    // pre-entry `resolve_world` — is a pure function of (std content,
-    // platform, the entry's std:: reference names) whenever the entry brings
+    // pre-entry `resolve_world` — is a pure function of the loaded files'
+    // content plus [`BaseCacheKey`] (platform, the entry's std:: reference
+    // names, the workspace, the expansion budgets) whenever the entry brings
     // no world-entangling features. The bypass list is conservative and
-    // syntactic where it must be: workspace dependencies, `pkg::` siblings,
-    // `[service]` blocks, and macro/derive text all expand or load inside
-    // the world-building loop, so such entries build fresh and are never
-    // stored. Overlays bypass wholesale: loaded content may not match disk.
+    // syntactic where it must be: `pkg::` siblings, `[service]` blocks, and
+    // macro-DEFINING text all expand or load inside the world-building loop,
+    // so such entries build fresh and are never stored. Overlays need no
+    // bypass — see below.
     let entry_seed_names: Vec<String> = {
         let mut names: Vec<String> = collect_module_refs(&nodes.0, "std")
             .into_iter()
@@ -31255,21 +31327,51 @@ fn analyze_inner<'src>(
         names.dedup();
         names
     };
+    // The entry's references INTO each dependency package. These seed the load
+    // exactly as the `std::` names do, so they belong to the key — and they
+    // are entry-text slices, so they are interned before they can reach the
+    // world's maps (the same rule the `std::` seeds follow).
+    let entry_dependency_seeds: Vec<(usize, &'static str)> = {
+        let mut seeds: Vec<(usize, &'static str)> = workspace
+            .entry_dependencies
+            .iter()
+            .flat_map(|(name, index)| {
+                collect_module_refs(&nodes.0, name)
+                    .into_iter()
+                    .map(move |(module, _)| (*index, interned_display_name(module.to_string())))
+            })
+            .collect();
+        seeds.sort();
+        seeds.dedup();
+        seeds
+    };
     let entry_is_inside_std = {
         let pkg_root_canonical = crate::util::canonical_path(pkg_root);
         std::iter::once(&std.base_root)
             .chain(std.layers.iter().map(|layer| &layer.root))
             .any(|root| crate::util::canonical_path(root) == pkg_root_canonical)
     };
+    let base_cache_key = BaseCacheKey {
+        platform,
+        std_seeds: entry_seed_names,
+        workspace: workspace_fingerprint(workspace, &entry_dependency_seeds),
+        macro_limits: (workspace.macro_limits.fuel, workspace.macro_limits.depth),
+    };
     let base_cacheable = allow_cache
-        && workspace.packages.is_empty()
         && !entry_is_inside_std
         && collect_module_refs(&nodes.0, "pkg").is_empty()
         && !contains_service(&nodes.0)
-        // Macro-DEFINING entries stay bypassed (their world compile is
-        // entry-entangled, E23); derive USERS cache — the ambient derive
-        // vocabulary lives in the registry the world carries (§6.13).
-        && !entry_source.contains("macro");
+        // Macro-DEFINING entries stay bypassed: their definitions register
+        // into the registry the world carries, which would leak one entry's
+        // macros into another's analysis (E23's blanked-source entanglement).
+        // Derive USERS cache — the ambient derive vocabulary lives in the
+        // registry the world carries (§6.13). The test is scoped to the
+        // analyses that can register at all: inside a macro WORLD the load
+        // region registers NOTHING (`macro_registry`'s `in_macro_world` early
+        // return), so a world's blanked entry — whose surviving macro bodies
+        // are full of the substring `macro_std` — contributes no rows, and
+        // the syntactic test would only be reading its own tail.
+        && (crate::macros::in_macro_world() || !entry_source.contains("macro"));
     // Overlays need no bypass (S3d): every load AND every per-hit validation
     // reads through `read_source`, which consults the overlay first — so a
     // world built from overlay-served std (the wasm playground's boot) hits
@@ -31278,9 +31380,7 @@ fn analyze_inner<'src>(
     // does not cover is an overlay MINTING a std module that exists nowhere
     // else mid-process after a world was stored — not a flow any front-end
     // has; boot registers before the first analysis.
-    if base_cacheable
-        && let Some(mut world) = base_cache_lookup(platform, &entry_seed_names, entry_path)
-    {
+    if base_cacheable && let Some(mut world) = base_cache_lookup(&base_cache_key, entry_path) {
         world.sources[0] = entry_path.to_path_buf();
         world.source_hashes[0] = crate::content_hash(entry_source);
         world.analyzer.source_texts[0] = (SourceId(0), entry_source);
@@ -31586,13 +31686,15 @@ fn analyze_inner<'src>(
         // module not available for the build target (it's in another target's
         // layer) is reported here (once, at its import) but still loaded, so its
         // items resolve and the file doesn't cascade (L1).
-        for (name, index) in &workspace.entry_dependencies {
-            let refs = collect_module_refs(&nodes.0, name);
-            to_load.extend(
-                refs.into_iter()
-                    .map(|(module, _)| (Origin::Dep(*index), module)),
-            );
-        }
+        // Interned at extraction (the `entry_dependency_seeds` above), for the
+        // reason the `std::` seeds are: a stored base world must hold no
+        // entry-text slices, and a seeded module NAME is the one entry-derived
+        // string that reaches the world's maps.
+        to_load.extend(
+            entry_dependency_seeds
+                .iter()
+                .map(|(index, module)| (Origin::Dep(*index), *module)),
+        );
         // Load each dependency's `lib.vl` (its public surface) and seed the modules
         // reachable from it — its own `pkg::` submodules, `std::` imports, and
         // `<subdep>::` references — mirroring the `std` package load above.
@@ -32512,7 +32614,7 @@ fn analyze_inner<'src>(
         },
     };
     if base_cacheable && !entry_is_module {
-        base_cache_store(platform, entry_seed_names, &world);
+        base_cache_store(base_cache_key, &world);
     }
     // The suppressed entry expansion runs here, symmetric with the hit path
     // (§6.13); a generated demand for an unloaded module rebuilds fresh.

@@ -704,6 +704,37 @@ pub(crate) fn world_prelude_nodes(
     Some(root)
 }
 
+/// Compiled worlds by `world_key` (the definition segments' content).
+static WORLDS: OnceLock<Mutex<HashMap<u64, Arc<World>>>> = OnceLock::new();
+/// Failed compiles, by `failure_key`. A failure inserts nothing into
+/// [`WORLDS`], so without this a buffer holding a BROKEN macro definition
+/// would recompile the world — and re-leak its text — on every analysis,
+/// edited or not (backlog E23).
+static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new();
+
+/// Drops every compiled macro world, so the next dispatch analyzes one afresh.
+/// The test surface that makes a macro world's COLD path reachable twice in a
+/// process — without it, the first compile in a test binary is the only one,
+/// and a warm-vs-cold differential over a macro world cannot be written.
+/// Sibling of `analyzer::base_cache_clear` — and to be used WITH it: a stored
+/// base world carries a macro registry whose `MacroDef`s memoize their own
+/// compiled world, so clearing this map alone leaves those reachable.
+#[doc(hidden)]
+pub fn macro_world_cache_clear() {
+    if let Some(worlds) = WORLDS.get() {
+        worlds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    if let Some(failures) = FAILURES.get() {
+        failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 fn compile_world(
     blanked: String,
     world_key: u64,
@@ -712,12 +743,6 @@ fn compile_world(
     std: &PackageSpec,
     macro_std: &PackageSpec,
 ) -> Result<Arc<World>, Vec<Error>> {
-    static WORLDS: OnceLock<Mutex<HashMap<u64, Arc<World>>>> = OnceLock::new();
-    // Failed compiles, by `failure_key`. A failure inserts nothing into
-    // `WORLDS`, so without this a buffer holding a BROKEN macro definition
-    // would recompile the world — and re-leak its text — on every analysis,
-    // edited or not (backlog E23).
-    static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new();
     let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(world) = worlds.lock().unwrap().get(&world_key) {
         return Ok(world.clone());

@@ -36,6 +36,8 @@ pub mod util;
 pub use analyzer::{Layer, PackageSpec, Program, Workspace, analyze};
 pub use error::Error;
 pub use macros::MacroLimits;
+#[doc(hidden)]
+pub use macros::macro_world_cache_clear;
 pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
 pub use span::{Span, Spanned};
