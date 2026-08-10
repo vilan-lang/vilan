@@ -174,7 +174,26 @@ impl Map<type K: Hashable, type V: PartialEq> {
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
 ```
 
-Keys compare **by value**. Scalars work directly; a struct, enum, tuple, or
+Keys compare **by value**. Scalars work directly, and so does a **backed enum**
+— one with explicit backing values, which *is* that value at runtime, so the
+backing value is the key and no derive is needed:
+
+```vilan
+import std::print;
+import std::map::Map;
+
+enum Align { Start = "flex-start", End = "flex-end" }
+
+fun main() {
+	mut widths: Map<Align, i32> = Map::new();
+	widths.insert(Align::Start, 1);
+	print(widths.get(Align::Start).unwrap_or(0)); // 1
+}
+```
+
+An **unbacked** enum (`enum Plain { A, B }`) is not a key on its own: without a
+backing value it lowers to an array, like a struct, so it needs the derive along
+with every other aggregate. A struct, an unbacked or payload-carrying enum, or a
 `List` key works as long as it is `Hashable`. Derive it:
 
 ```vilan
@@ -271,11 +290,24 @@ fun main() {
 
 ## `Hashable`
 
-A key's value is turned into a `Hash` (a canonical key) by `key.hash()`.
-`[derive(Hashable)]` implements it for a struct/enum whose fields are all
-`Hashable` (scalars, `str`, `bool`, `List`/`Option` of `Hashable`, or another
-derived type); a closure, `Set`, `Map`, or `Shared` field is rejected. You can
-also hand-write `impl Hashable` to key by a subset of fields, and build your own
+A key's value is turned into a `Hash` (a canonical key) by `key.hash()`. Three
+routes reach it:
+
+- **Scalars** (`str`, `bool`, every sized numeric) and `List`/`Option` of a
+  `Hashable` — implemented by std.
+- **A backed enum** — implemented by the compiler beside its `value()`/`parse()`
+  (see the types chapter), off the same opt-in: writing `= "flex-start"` is what
+  makes the enum that value, and the value is the key. So `Align::Start.hash()`
+  and `Align::Start.value().hash()` are the same key, and a backed enum is
+  accepted as a *field* of a derived type too. A `resource` enum is excluded — a
+  resource cannot be hashed by value.
+- **`[derive(Hashable)]`** — for a struct or an enum whose fields are all
+  `Hashable` (scalars, `str`, `bool`, `List`/`Option` of `Hashable`, a backed
+  enum, or another derived type); a closure, `Set`, `Map`, or `Shared` field is
+  rejected. Writing it on a backed enum is harmless and does nothing.
+
+You can also hand-write `impl Hashable` to key by a subset of fields — except on
+a backed enum, whose impl the compiler already provides — and build your own
 container by bounding on `K: Hashable` and keying a `Map<Hash, …>` yourself.
 
 One corner: a float *inside* an aggregate key canonicalizes through JSON, where

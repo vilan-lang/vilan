@@ -50369,3 +50369,404 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
         "sfatq7m s1g8z7cm\nclosest-corner\n",
     );
 }
+
+// A RESOURCE backed enum: the conversions used to be synthesized for it, and
+// `fun value(self)` reads a resource out of a loan — so the declaration itself
+// failed, with an error about a body the author never wrote. A resource's
+// identity is not its copyable backing value (the rule `check_hashable_boundary`
+// already states for a resource field), so it is offered neither conversions nor
+// `Hashable`.
+
+#[test]
+fn a_resource_backed_enum_declares_without_synthesized_conversions() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {
+            let handle = Handle::Open;
+            print(handle == Handle::Open);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn a_resource_backed_enum_has_no_value_member() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() { print(Handle::Open.value()); }
+        "#,
+        "no method 'value'",
+    );
+}
+
+#[test]
+fn a_resource_backed_enum_is_not_hashable() {
+    // The resource rule wins over the bare-lowering one: a resource cannot be
+    // hashed by value, so it is not a key however it lowers.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {
+            mut seen: Set<Handle> = Set::new();
+            seen.insert(Handle::Open);
+            print(seen.len());
+        }
+        "#,
+        "does not implement trait 'Hashable'",
+    );
+}
+
+// §7.1/§8.5: a bare-lowered enum IS its backing value at runtime — a plain JS
+// number or string, which `canonical_hash` returns unchanged — so the backing
+// value is the key and `Map<Align, V>` / `Set<Align>` work without a derive.
+// The impl is synthesized beside `value()`/`parse()`, off the same opt-in.
+
+#[test]
+fn b76_a_string_backed_enum_keys_a_map() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut widths: Map<Align, i32> = Map::new();
+            widths.insert(Align::Start, 1);
+            widths.insert(Align::End, 2);
+            print(widths.get(Align::Start).unwrap_or(0));
+            print(widths.get(Align::End).unwrap_or(0));
+            print(widths.contains_key(Align::Start));
+            print(widths.len());
+            widths.remove(Align::Start);
+            print(widths.contains_key(Align::Start));
+        }
+        "#,
+        "1\n2\ntrue\n2\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_an_integer_backed_enum_keys_a_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Level { Low = 0, High = 1 }
+        fun main() {
+            mut seen: Set<Level> = Set::new();
+            seen.insert(Level::High);
+            print(seen.contains(Level::High));
+            print(seen.contains(Level::Low));
+            // A second insert of the same variant is the same key.
+            seen.insert(Level::High);
+            print(seen.len());
+        }
+        "#,
+        "true\nfalse\n1\n",
+    );
+}
+
+#[test]
+fn b76_an_auto_incremented_backing_keys_a_set() {
+    // `Hashable` keys off the LOWERING rule (payload-free plus one explicit
+    // value), not off the stricter "every variant carries a written literal"
+    // rule `value()`/`parse()` need — so the C-style tail comes along.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Walked { A = 5, B, C }
+        fun main() {
+            mut seen: Set<Walked> = Set::new();
+            seen.insert(Walked::B);
+            print(seen.contains(Walked::B));
+            print(seen.contains(Walked::C));
+            print(seen.len());
+        }
+        "#,
+        "true\nfalse\n1\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enums_hash_is_its_backing_values_hash() {
+    // Coherence, observed the way a user-built container observes it (a
+    // `Map<Hash, ..>`, which is what `collections.md` documents): one variant is
+    // one key however the hash is re-derived, two variants are two keys, and the
+    // enum's key is its BACKING VALUE's key — the identity the whole design
+    // rests on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::{ Hash, Hashable };
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut by_hash: Map<Hash, i32> = Map::new();
+            by_hash.insert(Align::Start.hash(), 10);
+            by_hash.insert(Align::End.hash(), 20);
+            print(by_hash.len());
+            print(by_hash.get(Align::Start.hash()).unwrap_or(0));
+            // Re-derived from a second mention of the same variant: same key.
+            by_hash.insert(Align::Start.hash(), 11);
+            print(by_hash.len());
+            // The backing value, and the raw string it is, hash to that key too.
+            print(by_hash.get(Align::Start.value().hash()).unwrap_or(0));
+            print(by_hash.get("flex-start".hash()).unwrap_or(0));
+        }
+        "#,
+        "2\n10\n2\n11\n11\n",
+    );
+}
+
+#[test]
+fn b76_an_integer_backed_enums_hash_is_its_numbers_hash() {
+    // The other backing, same identity — and the cross-check that a backed
+    // enum does NOT collide with an unrelated key of the other shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::{ Hash, Hashable };
+        enum Level { Low = 0, High = 1 }
+        fun main() {
+            mut by_hash: Map<Hash, str> = Map::new();
+            by_hash.insert(Level::High.hash(), "high");
+            print(by_hash.get(1.hash()).unwrap_or("miss"));
+            print(by_hash.get("1".hash()).unwrap_or("miss"));
+        }
+        "#,
+        "high\nmiss\n",
+    );
+}
+
+#[test]
+fn b76_std_ordering_keys_a_map() {
+    // The backed enum std already shipped, now a key without ceremony.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::compare::Ordering;
+        fun main() {
+            mut labels: Map<Ordering, str> = Map::new();
+            labels.insert(Ordering::Less, "lt");
+            labels.insert(Ordering::Greater, "gt");
+            print(labels.get(Ordering::Less).unwrap_or("?"));
+            print(labels.len());
+        }
+        "#,
+        "lt\n2\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_key_emits_its_bare_value() {
+    // Nothing wraps the key on the way into the map: the emitted program hands
+    // the native string straight to `insert`, exactly as §1.3's host-boundary
+    // probe found for a call.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::map::Map;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut widths: Map<Align, i32> = Map::new();
+            widths.insert(Align::Start, 1);
+            print(widths.len());
+        }
+        "#,
+    )
+    .expect("expected a clean compile");
+    assert!(javascript.contains(r#""flex-start""#), "{javascript}");
+    assert!(!javascript.contains("[ 0 ]"), "{javascript}");
+}
+
+#[test]
+fn b76_a_plain_enum_is_still_not_hashable() {
+    // The §3.1(b) conjunction decides this too: `enum Plain { A, B }` keeps its
+    // `[0]`/`[1]` ARRAY form, so it is an aggregate with no bare value to key
+    // by — exactly the reference-identity footgun `Hashable` exists to stop.
+    // It needs `[derive(Hashable)]` like any other aggregate.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Plain { A, B, C }
+        fun main() {
+            mut seen: Set<Plain> = Set::new();
+            seen.insert(Plain::B);
+            print(seen.len());
+        }
+        "#,
+        "'Plain' does not implement trait 'Hashable'",
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_keys_a_set_with_the_derive() {
+    // The escape hatch the previous pin points at, and it works by value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Plain { A, B, C }
+        fun main() {
+            mut seen: Set<Plain> = Set::new();
+            seen.insert(Plain::B);
+            print(seen.contains(Plain::B));
+            print(seen.contains(Plain::C));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_payload_enum_is_still_not_hashable() {
+    // The tagged-array lowering is out of scope: a payload enum gets no
+    // synthesized `Hashable` and is refused at the key, with the ordinary bound
+    // diagnostic rather than a runtime surprise.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Payload { Num(i32), Text(str) }
+        fun main() {
+            mut seen: Set<Payload> = Set::new();
+            seen.insert(Payload::Num(3));
+            print(seen.len());
+        }
+        "#,
+        "'Payload' does not implement trait 'Hashable'",
+    );
+}
+
+#[test]
+fn b76_a_payload_enum_keys_a_set_with_the_derive() {
+    // Its route is unchanged by this arc: the derive, with its all-fields gate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Payload { Num(i32), Text(str) }
+        fun main() {
+            mut seen: Set<Payload> = Set::new();
+            seen.insert(Payload::Num(3));
+            print(seen.contains(Payload::Num(3)));
+            print(seen.contains(Payload::Num(4)));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_field_of_a_derived_hashable_type_is_accepted() {
+    // The two oracles have to agree: the impl table says `Align` is a key, so
+    // the derive's syntactic all-fields check must not reject it as a FIELD.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Hashable)]
+        struct Slot { align: Align, index: i32 }
+        fun main() {
+            mut seen: Set<Slot> = Set::new();
+            seen.insert(Slot { align = Align::Start, index = 1 });
+            print(seen.contains(Slot { align = Align::Start, index = 1 }));
+            print(seen.contains(Slot { align = Align::End, index = 1 }));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_field_of_a_derived_hashable_type_still_needs_its_own_derive() {
+    // The contrast that keeps the previous pin honest: the field rule tracks
+    // the lowering, not "is an enum".
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+        enum Plain { A, B }
+        [derive(Hashable)]
+        struct Slot { plain: Plain }
+        fun main() { print(1); }
+        "#,
+        "field `plain` of `[derive(Hashable)]` type `Slot` is `Plain`",
+    );
+}
+
+#[test]
+fn b76_a_redundant_hashable_derive_on_a_backed_enum_is_a_no_op() {
+    // The derive and the synthesis emit the identical `canonical_hash(self)`
+    // body, so there is nothing for a duplicate-impl error to protect — and a
+    // program written before the impl was synthesized keeps compiling.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut seen: Set<Align> = Set::new();
+            seen.insert(Align::Start);
+            print(seen.contains(Align::Start));
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b76_a_hand_written_hashable_impl_on_a_backed_enum_collides() {
+    // A hand-written impl may mean something else, and which one wins is B73's
+    // open specificity question — so it stays a duplicate, reported AT the
+    // author's impl with a note saying the other one is the compiler's.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::{ Hashable, Hash, canonical_hash };
+        enum Align { Start = "flex-start", End = "flex-end" }
+        impl Align with Hashable {
+            fun hash(self): Hash { canonical_hash(self) }
+        }
+        fun main() { print(1); }
+        "#,
+        "'Hashable' is already implemented for 'Align'",
+    );
+}
+
+#[test]
+fn b76_a_generic_backed_enum_gets_no_hashable() {
+    // §8.2(d)'s rule, unchanged: a generic enum gets no synthesized members at
+    // all, `Hashable` included.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Phantom<T> { A = 1, B = 2 }
+        fun main() {
+            mut seen: Set<Phantom<i32>> = Set::new();
+            seen.insert(Phantom::A);
+            print(seen.len());
+        }
+        "#,
+        "does not implement trait 'Hashable'",
+    );
+}
