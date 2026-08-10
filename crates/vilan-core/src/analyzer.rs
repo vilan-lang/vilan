@@ -11658,21 +11658,28 @@ impl<'src> Analyzer<'src> {
                     positions.insert(position);
                 }
             }
-            // A `&`/`&mut` parameter forwarded straight out (`same(x) = x`).
+            // A `&`/`&mut` parameter forwarded straight out (`same(x) = x`) —
+            // unless the return copies it out of the loan.
             //
-            // Deliberately NOT gated on `Function::returns_view`, though B100
-            // makes that gate tempting: `fun copy(&self): Holder { self }` now
-            // returns a COPY, so calling it a borrow leaves its result
-            // classified as a view at every call site (it cannot be `mut`, and
-            // a write to it lowers as a write-through). Narrowing the arm was
-            // measured and refused — with `borrows` empty, `check_view_escape`
-            // rejects the body outright ("a view cannot escape its scope"),
-            // which answers a *rule 3* question this arc did not ask and breaks
-            // programs that compile today. The stale classification is
-            // conservative (a view binding is the more restricted one) and
-            // unchanged from before B100; filed rather than ridden in.
+            // B104: this arm is the one whose leaf is a PLACE, so it is the one
+            // rule 1's return clause reaches, and the two passes must give the
+            // same answer about the same seam. Where rule 1 copies, what leaves
+            // `fun copy(&self): Holder { self }` is a `Holder` and the function
+            // projects nothing; recording it as a borrow classified the result
+            // as a view at every call site — it could not be `mut`, and a write
+            // to it lowered as a write-through into the receiver it no longer
+            // aliases.
+            //
+            // The other arms are deliberately NOT gated, because rule 1 does
+            // not reach their leaves: a `&place` leaf and a wrapped/chained
+            // call leaf are not places, no copy is inserted for them, and the
+            // result really does alias whatever the signature says. Calling
+            // those borrows is what keeps the call site's classification honest
+            // about the alias (`element-clones.md` §9.3).
             Some(Expr::Local(_)) => {
-                if let Some(position) = self.projected_parameter_position(function_id, leaf_id) {
+                if !self.by_value_return_copies_the_place(function_id, leaf_id)
+                    && let Some(position) = self.projected_parameter_position(function_id, leaf_id)
+                {
                     positions.insert(position);
                 }
             }
@@ -11710,6 +11717,36 @@ impl<'src> Analyzer<'src> {
             .iter()
             .position(|parameter_id| *parameter_id == root)
             .map(|index| index as u32)
+    }
+
+    /// Whether rule 1's return clause copies a returned place OUT of the loan it
+    /// was read from, so that what leaves the function is a value and the
+    /// function projects nothing (B104, `element-clones.md` §9.3). Asked by
+    /// rule 3's two passes — the `borrows` root-set here and
+    /// [`Self::check_view_escape`] — so both agree with
+    /// `compute_return_clone_sites` about the same seam: a copied place left the
+    /// loan; an uncopied one did not.
+    ///
+    /// Three halves, all of them that seam's own conditions. The signature must
+    /// return by VALUE — a view return is rule 3's sanctioned projection, an
+    /// alias on purpose. The place must not be a resource one, which MOVES
+    /// rather than copies (R1 refuses moving a resource out of a loan outright,
+    /// so this half is a guard, not a live case). And its value type must be a
+    /// **cloneable aggregate**: a scalar has no aggregate storage to copy, and a
+    /// *generic* `&T` is worse than uncopied — it lowers as a `(base, key)` pair
+    /// at a scalar instantiation, which `__clone` cannot collapse. Both keep the
+    /// alias, so both keep the (conservative) borrow classification they had
+    /// before this fix.
+    fn by_value_return_copies_the_place(&self, function_id: Id, leaf_id: Id) -> bool {
+        let returns_view = self
+            .functions
+            .get(&function_id)
+            .is_some_and(|function| function.returns_view);
+        if returns_view || self.resource_value_places.contains(&leaf_id) {
+            return false;
+        }
+        self.place_value_type(leaf_id)
+            .is_some_and(|value_type| self.is_cloneable_aggregate(&value_type))
     }
 
     /// If `call_id` is a wrapped-view constructor `Some(&place)` whose payload
@@ -12238,13 +12275,15 @@ impl<'src> Analyzer<'src> {
         // A function or closure body whose trailing expression escapes a view
         // returns it implicitly. A `borrows` function may return one — but only a
         // projection of a (view) parameter, whose target the caller keeps alive;
-        // a view of a local still dangles and is rejected.
+        // a view of a local still dangles and is rejected. A by-value return
+        // hands back no view at all (B104), so it is never an escape.
         for function in self.functions.values() {
             if self.frozen_entity(function.id) {
                 continue;
             }
             if function.has_body
                 && self.escapes_as_view(function.body.1, &view_bindings, &capturing)
+                && !self.by_value_return_copies_the_view(function)
                 && (function.borrows.is_empty() || !self.derives_from_view_param(function.body.1))
             {
                 escapes.push(function.body.1);
@@ -12287,6 +12326,26 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
                 if capturing.contains(closure_id)
         )
+    }
+
+    /// Whether a by-value return turns the view the body hands back into a
+    /// value, so rule 3 has nothing to reject (B104, `element-clones.md` §9.3) —
+    /// the escape check's half of [`Self::by_value_return_copies_the_place`],
+    /// which is also what emptied this function's root-set.
+    ///
+    /// The place must root at a LOANED parameter, which is storage the frame
+    /// does not own and so exactly what rule 1's return clause copies. The two
+    /// shapes rule 1 does *not* reach stay rejected, because for them the alias
+    /// really does leave: a view of a LOCAL (rule 1 leaves it alone — the frame
+    /// is a dead owner donating its storage, so the view dangles), and a
+    /// `&place` leaf, which is not a place at all and never reaches the seam.
+    fn by_value_return_copies_the_view(&self, function: &Function) -> bool {
+        let roots_at_a_loan = self.place_root(function.body.1).is_some_and(|root| {
+            self.parameters.get(&root).is_some_and(|parameter| {
+                matches!(parameter.convention, Convention::Ref | Convention::RefMut)
+            })
+        });
+        roots_at_a_loan && self.by_value_return_copies_the_place(function.id, function.body.1)
     }
 
     /// Whether an expression (a `borrows` function's returned view) projects a

@@ -300,6 +300,12 @@ fun write(self): &mut T borrows self;   // Shared::write — explicit
 fun get(&mut self, i: i32): &mut T      // inferred: borrows self
 ```
 
+What is inferred is a *projection*, so the **return type decides**, exactly as
+it does for the copy in §6.1: `fun copy(&self): Holder { self }` hands back a
+value — the return copies it out of the loan — and projects nothing, so its
+result is an ordinary owned binding (`mut c = h.copy()` is legal). Change the
+return type to `&mut Holder` and the same body is a projection.
+
 At the call site the returned view obeys the same second-class rules,
 with the borrow anchored to the projected argument: the argument's place
 is treated as viewed while the result is live (rule 4 applies to it).

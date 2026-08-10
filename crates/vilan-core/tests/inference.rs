@@ -5609,6 +5609,309 @@ fn a_closure_returning_its_own_view_parameters_field_copies() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B104 (the classification residual B100 filed). `infer_borrows` recorded `fun
+// copy(&self): Holder { self }` as borrowing its receiver — so its result bound
+// as a VIEW at every call site — although B100 made that return a COPY. The
+// root-set arm whose leaf is a PLACE is the one rule 1's return clause reaches,
+// so the two passes now answer the same way about the same seam: where the
+// return copies, the place LEFT the loan and the function projects nothing.
+// `check_view_escape` still accepts the forwarder, for the same reason (nothing
+// escapes when nothing aliased leaves). See proposal/element-clones.md §9.3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_by_value_forwarders_result_binds_mut() {
+    // The filed repro. Both halves in one program: the result is `mut`-bindable
+    // (it is a value, not a view), and writing it leaves the receiver alone
+    // (B100's copy is what makes the first half true).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = h.copy();
+            c.pair.1 = 42;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n3\n",
+    );
+}
+
+#[test]
+fn a_free_by_value_forwarders_result_binds_mut() {
+    // The free-function spelling: nothing here is special to a receiver, and
+    // the caller's own value is untouched by the write to the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun copy_of(h: &Holder): Holder { h }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut c = copy_of(&h);
+            c.pair.1 = 42;
+            h.pair.1 = 99;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n99\n",
+    );
+}
+
+#[test]
+fn a_by_value_forwarder_still_passes_the_escape_check() {
+    // The hazard B100 recorded when it refused candidate (c): emptying the
+    // root-set makes `check_view_escape` reject the body outright, turning a
+    // program that compiles into an error. It must not, and the reason is rule
+    // 3's own: the return hands back a value, so no view escapes.
+    assert_compiles(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.copy().pair.1);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_view_returning_forwarders_result_is_still_a_view() {
+    // The other direction, one word apart: the same body under a `&mut Holder`
+    // return is a projection, its result is a view, and a view cannot be `mut`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut w = h.me();
+            print(w.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_view_of_a_local_still_cannot_escape_a_by_value_return() {
+    // The escape the new clause must not swallow: rule 1 leaves a place rooted
+    // at a LOCAL alone (the frame is a dead owner donating its storage), so no
+    // copy converts this one and the view still dangles.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun bad(&self): (i32, i32) { let v = &self.pair; v }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.bad().1);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_scalar_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // A scalar has no aggregate storage for rule 1 to copy, so the alias
+    // survives the return and the (conservative) borrow classification must
+    // survive with it — rule 4 still sees a live view into `n`. Pins the gate
+    // as CLONEABLE-AGGREGATE-only rather than by-value-only.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            n = 9;
+            print(m);
+        }
+        "#,
+        "rule 4",
+    );
+}
+
+#[test]
+fn a_generic_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // The generic twin, and why `Type::Generic` is excluded even though rule 1
+    // admits it: a `&T` parameter lowers as a `(base, key)` pair at a scalar
+    // instantiation, which `__clone` cannot collapse. The alias survives, so
+    // the view classification does too.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same<T>(v: &T): T { v }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = same(&h);
+            print(c.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_borrows_call_chain_into_a_by_value_return_keeps_its_borrow() {
+    // The Call arm is deliberately ungated: rule 1 never reaches a call leaf
+    // (it is not a place), so no copy is inserted and the result really does
+    // alias whatever the signature says. Calling it a borrow is what keeps the
+    // call site honest about that.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut p = get(&h);
+            print(p.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_wrapped_view_return_is_still_a_borrow() {
+    // The wrapped arm is ungated for the same reason, and its signature could
+    // not carry the gate anyway: `Option<&mut Inner>` is not a view return by
+    // `returns_view`, which reads the TOP-LEVEL type node.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun inner_mut(&mut self): Option<&mut Inner> { Some(&mut self.inner) }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 1 } };
+            match h.inner_mut() {
+                Some(let v) => { v.n = 77; }
+                None => {}
+            }
+            print(h.inner.n);
+        }
+        "#,
+        "77\n",
+    );
+}
+
+#[test]
+fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
+    // The resource half of the gate is a guard, not a live case: R1 refuses
+    // moving a resource out of a loan before the classification is ever
+    // consulted. Pinned so the guard's unreachability is a fact, not a hope.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard {
+            fun drop(own self) { print("drop " + self.tag); }
+            fun take(&self): Guard { self }
+        }
+        fun main() {
+            let g = Guard { tag = "a" };
+            print(g.take().tag);
+        }
+        "#,
+        "cannot move the resource",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a scalar `&mut` forwarded into a by-value return hands back the (base, key) pair"]
+fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
+    // Found measuring B104, pre-existing: `same(&mut n)` prints `[ [ 5 ], 0 ]`
+    // — the view's runtime pair, not the i32 the signature promises. Rule 1's
+    // copy does not reach a scalar, and nothing else reads through it at the
+    // return seam.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            print(m);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a `&place` leaf in a by-value return is not a place, so rule 1 never copies it"]
+fn a_reference_leaf_in_a_by_value_return_copies() {
+    // Found measuring B104, pre-existing (a residual of B100 rather than of the
+    // classification): `&self.inner` is not a place, so `compute_return_clone_sites`
+    // never sees it and the caller's result IS the receiver's field. Prints 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self): Inner { &self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a borrows-call leaf in a by-value return is not a place either"]
+fn a_borrows_call_leaf_in_a_by_value_return_copies() {
+    // The same hole one indirection over: the tail is a call, so rule 1 has no
+    // place to copy and the by-value signature hands back the callee's alias.
+    // Prints 99. The classification stays a view, which is what keeps this
+    // merely wrong rather than unsound.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = get(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
 #[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
