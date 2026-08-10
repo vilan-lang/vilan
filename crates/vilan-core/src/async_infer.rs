@@ -24,10 +24,9 @@
 //!
 //! The result is `Program::async_functions`, read by the transformer.
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
 

@@ -17,9 +17,8 @@
 //! of a particular type substitution, so every instance inherits whatever the
 //! pass decides for the single node.
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{Expr, ExprIfBranch, ExprPattern, GenericDispatch, Program};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
 /// What a single call site resolves to.

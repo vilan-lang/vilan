@@ -19,7 +19,6 @@
 //! interpreter is deterministic by construction. Both caches hold leaked,
 //! process-global data, mirroring `load_package_module`'s parse cache.
 
-use crate::fx::FxHashMap as HashMap;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -28,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::analyzer::SourceId;
 use crate::error::Error;
+use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::interpreter::{self, Limits};
 use crate::node::{Func, ImportBranch, Node, NodeList, Pattern};

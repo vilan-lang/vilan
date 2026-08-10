@@ -34,11 +34,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::span::Span;
 use crate::target::Platform;

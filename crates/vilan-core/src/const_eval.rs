@@ -8,11 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget, Node};
 use crate::error::{Error, Note};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::interpreter::{self, ConstValue, FailureKind, Limits};
 use crate::options::BuildOptions;

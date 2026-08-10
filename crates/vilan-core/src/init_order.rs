@@ -62,13 +62,12 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use indexmap::IndexMap;
 
 use crate::analyzer::{Expr, ExprIfBranch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::error::{Error, Note};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::span::Span;
 

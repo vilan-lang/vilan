@@ -8,9 +8,8 @@
 //! from two or more arms → shared, which v1 sends eager. Nothing here
 //! changes emission; the plan is a report.
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{Expr, Program, SourceId};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
 /// One splittable arm's would-be chunk.

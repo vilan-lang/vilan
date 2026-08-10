@@ -1,11 +1,10 @@
 use std::collections::{BTreeSet, VecDeque};
-
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
 use crate::error::{Error, Note};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::node::{
     BackingLiteral, BinaryOp, Convention, EnumVariant, ExternBinding, Func, GenericParameters,

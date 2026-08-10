@@ -27,11 +27,10 @@
 //! The pass is a no-op for programs that never create a `Context`, so it can't
 //! change the output of any existing program.
 
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
-
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason, Node};
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::Type;
 

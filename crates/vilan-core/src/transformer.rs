@@ -3,6 +3,7 @@ use crate::analyzer::{
     Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
@@ -12,8 +13,6 @@ use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-
-use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
