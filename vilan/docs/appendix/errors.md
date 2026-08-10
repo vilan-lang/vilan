@@ -176,7 +176,12 @@ so callers await it regardless).
 
 **"match is not exhaustive: missing …"** · **"match is not exhaustive: add a catch-all `_` leg"**
 Some variants have no arm. Handle them or add `_ => …`. This error is
-the feature: it's what fires everywhere when you add a variant.
+the feature: it's what fires everywhere when you add a variant. A
+**guarded** leg does not count towards it — a guard tests the value, and
+the check reasons about the type — so `B if ready => …` leaves `B`
+missing, and a note points at the guard to say so. That also means the
+last leg may not be guarded: give it a `_ => …` after it, so the value
+the guard rejects has somewhere to go.
 → [Control flow](../tour/control-flow.md)
 
 **"struct '…' has no field '…'"** · **"variant '…' does not belong to the matched enum"**

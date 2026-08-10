@@ -1,8 +1,11 @@
 import std::print;
 
 // String-literal patterns, or-patterns (`"y", ""`), qualified variant patterns
-// (`Signal::Quit`), and `let NAME if CONDITION` match guards.
+// (`Signal::Quit`), `let NAME if CONDITION` match guards, and a guarded FINAL
+// leg — the one leg that may not become the bare `else` (B115).
 enum Signal { Quit, Finished }
+enum Align { Start = "start", End = "end" }
+enum Wrap { One(i32), Two }
 
 fun classify(s: str): str {
 	match s {
@@ -27,6 +30,40 @@ fun temperature(distance: i32): str {
 	}
 }
 
+// B115: a guarded FINAL leg keeps its test AND its guard. Exhaustiveness is
+// proven by unguarded legs only, so it is the two legs above that make this
+// match exhaustive — the guarded one is dead where it stands, and dropping its
+// guard turned it into the catch-all it is not.
+fun ranked(signal: Signal, count: i32): str {
+	match signal {
+		Signal::Quit => "quit",
+		Signal::Finished => "finished",
+		Signal::Finished if count > 0 => "counted",
+	}
+}
+
+// The same leg on a BACKED enum, where the trap arm is the real `else`: the two
+// compose, the leg keeping test and guard while an out-of-set host value still
+// trips `__enum_trap`.
+fun aligned(align: Align, count: i32): str {
+	match align {
+		Align::Start => "start",
+		Align::End => "end",
+		Align::End if count > 0 => "counted",
+	}
+}
+
+// A guard needing a statement slot (an `is` test) emits the match as B59's flat
+// sequence rather than an else-if chain; the final leg's guard and the prelude
+// its temporary lives in survive there too.
+fun wrapped(signal: Signal, wrap: Wrap): str {
+	match signal {
+		Signal::Quit => "quit",
+		Signal::Finished => "finished",
+		Signal::Finished if wrap is Wrap::One(let n) && n > 0 => "counted",
+	}
+}
+
 fun main() {
 	print(classify("quit"));
 	print(classify("y"));
@@ -37,4 +74,10 @@ fun main() {
 	print(temperature(1));
 	print(temperature(7));
 	print(temperature(40));
+	print(ranked(Signal::Finished, 0));
+	print(ranked(Signal::Finished, 5));
+	print(aligned(Align::End, 0));
+	print(aligned(Align::End, 5));
+	print(wrapped(Signal::Finished, Wrap::Two));
+	print(wrapped(Signal::Finished, Wrap::One(3)));
 }

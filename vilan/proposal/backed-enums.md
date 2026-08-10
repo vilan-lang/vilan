@@ -1807,6 +1807,16 @@ codebase and a one-sided one is how they drift.
   itself questionable — `match a { A => .., B if c => .. }` runs `B`'s arm
   when `!c` — but it is pre-existing, orthogonal, and not this lane's.)
 
+  **Superseded 2026-08-10 (B115).** The parenthesis was the bug, and it is
+  fixed: a guarded final leg now keeps its guard as well as its test, and
+  the shape the parenthesis describes is refused outright — exhaustiveness
+  is proven by unguarded legs only, so a match whose last leg is guarded
+  must be exhaustive without it. The two compose with neither emitter
+  learning about the other: the leg keeps test AND guard, the trap is
+  still the `else`, and the message stays honest because the legs above a
+  surviving guarded leg cover every variant, so only an out-of-set value
+  reaches the trap. Record: `capture-clones.md` §11.
+
 ### 11.4 §4.2's `json.vl`, per §9.6 — and one thing §9.6 did not know
 
 Taken, in §9.6's corrected shape. §4.2's "13 call sites become `v.kind() ==

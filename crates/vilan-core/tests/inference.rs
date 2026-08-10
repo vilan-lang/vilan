@@ -53393,3 +53393,430 @@ fn b111_a_payload_variant_still_blocks_the_conversions() {
          data-less, and 'B' carries a payload",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B115 — a guarded FINAL match leg drops its guard.
+//
+// The lowering made the final leg the bare `else` on the strength of the
+// analyzer's exhaustiveness proof — but that proof counts UNGUARDED legs only
+// (a guard tests the value, which the checker does not reason about), so a
+// guarded final leg never carried it. Two halves, and the checker's was right:
+// it refuses `match a { A => .., B if c => .. }` outright ("missing 'B'"). What
+// let the shape through was the checker's *exemptions* — a tuple/generic
+// subject skipped the question entirely, and a REFUTABLE tuple pattern counted
+// as an irrefutable catch-all. The rule shipped: exhaustiveness is proven by
+// unguarded legs only, whatever the subject's type, so a match whose last leg
+// is guarded must be exhaustive WITHOUT it; and the lowering keeps that leg's
+// test, prelude and guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b115_a_guarded_final_leg_on_an_enum_is_not_exhaustive() {
+    // The checker's half, and it was already right: the coverage walk counts
+    // unguarded legs, so 'B' is missing even though the author wrote its name.
+    // The note is what makes that legible — it points at the guard.
+    assert_fails_noting(
+        r#"
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B if count > 0 => "b",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'B'",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_backed_enum_is_not_exhaustive() {
+    // Same walk, backed subject: the trap arm answers for values outside the
+    // SET and never for a guard that rejects an in-set one, so it does not
+    // excuse the missing variant.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "s", End = "e" }
+        fun f(a: Align, count: i32): str {
+            match a {
+                Align::Start => "start",
+                Align::End if count > 0 => "end",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'End'",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_tuple_subject_is_refused() {
+    // A tuple subject is exempt from the DOMAIN question ("which values can the
+    // subject take?"), and that exemption is what B115 rode in on: it never
+    // licensed a guard. This program ran the guarded arm when the guard was
+    // false.
+    assert_fails_noting(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (let a, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_generic_subject_is_refused() {
+    // The same exemption, reached through a generic parameter rather than a
+    // tuple — one rule, not two.
+    assert_fails_with(
+        r#"
+        fun f<T>(v: T, count: i32): str {
+            match v {
+                let x if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_lone_guarded_leg_is_refused() {
+    // The single-leg shape: nothing precedes the guard, so nothing can carry
+    // the proof. It is the smallest program in the family.
+    assert_fails_with(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (let a, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_an_int_subject_is_refused() {
+    // An unbounded scalar domain always needed a catch-all, and a guarded leg
+    // is not one — this direction already held, and it is pinned so the shape
+    // has a test of its own rather than being inferred from the tuple's.
+    assert_fails_with(
+        r#"
+        fun f(n: i32, count: i32): str {
+            match n {
+                1 => "one",
+                _ if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_str_subject_is_refused() {
+    assert_fails_with(
+        r#"
+        fun f(s: str, count: i32): str {
+            match s {
+                "quit" => "leaving",
+                let other if count > 0 => other,
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_refutable_tuple_pattern_is_not_a_catch_all() {
+    // The second half of what let the tuple shape compile: `(1, 2)` is a TEST,
+    // and the catch-all walk counted every `ExprPattern::Tuple` as a
+    // destructure. With it miscounted, the match above had a "catch-all" and
+    // the guarded-final question was never asked.
+    assert_fails_with(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (3, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_tuple_of_binders_is_still_a_catch_all() {
+    // The other direction of the same walk, so the narrowing cannot silently
+    // become "a tuple pattern is never a catch-all": every element is a binder,
+    // so the leg matches every value. The guarded leg AFTER it is what makes
+    // this non-vacuous — a real catch-all is what licenses one, and the leg is
+    // dead where it stands (the lowering stops at the catch-all), so it is the
+    // catch-all that is emitted as the `else`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (let a, let b) => "rest",
+                (3, 4) if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f((7, 8), 5)); print(f((3, 4), 5)); }
+        "#,
+        "rest\nrest\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_leg_before_a_catch_all_runs_both_ways() {
+    // The shape the author should write, pinned at RUN time in both
+    // directions — the guard is honoured when it holds and the catch-all takes
+    // the value when it does not. This is what B115 silently broke when the
+    // guarded leg was last instead.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B if count > 0 => "guarded",
+                _ => "fallback",
+            }
+        }
+        fun main() {
+            print(f(E::B, 5));
+            print(f(E::B, 0));
+            print(f(E::A, 0));
+        }
+        "#,
+        "guarded\nfallback\na\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard() {
+    // The lowering's half. The legs before it cover every variant, so the match
+    // is exhaustive without the guarded leg and the checker accepts it — and
+    // the leg is unreachable, which is exactly why the guard must survive: drop
+    // it and the leg becomes the `else` it is not, answering for values the
+    // legs above it already took.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, 0)); print(f(E::B, 5)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a[0] === 1 && count > 0) {"),
+        "the final leg should keep its test AND its guard, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("} else {\n\t\t$b = \"guarded\";"),
+        "the final leg must not become the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_runs_the_leg_the_earlier_legs_cover() {
+    // The same program, run. It pins the ANSWER, not the guard: an accepted
+    // match's guarded final leg is unreachable by construction (the legs that
+    // carry the proof take every value first), so dropping the guard is
+    // invisible here — measured, by planting the drop and watching this stay
+    // green. The emission pins above and below are where the drop shows.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, 0)); print(f(E::B, 5)); print(f(E::A, 5)); }
+        "#,
+        "b\nb\na\n",
+    );
+}
+
+#[test]
+fn b115_the_trap_composes_with_a_guarded_final_leg() {
+    // backed-enums.md §11.3 recorded the collision and left it: "the trap keeps
+    // the test and still drops the guard". Both now, and they compose without
+    // either learning about the other — the leg keeps test AND guard, and the
+    // trap is still the `else`. The message stays honest because an in-set
+    // value this guard rejects was taken by one of the legs above.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "s", End = "e" }
+        fun f(a: Align, count: i32): str {
+            match a {
+                Align::Start => "start",
+                Align::End => "end",
+                Align::End if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(Align::End, 0)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a === \"e\" && count > 0) {"),
+        "the backed final leg should keep its test AND its guard, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $a);"),
+        "the trap should still be the `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard_in_the_sequence_emitter() {
+    // B59's other emitter (capture-clones.md §5): a guard needing a statement
+    // slot — here an `is` test — turns the match into a flat `matched`-flag
+    // sequence rather than an else-if chain. The final leg's guard was dropped
+    // there too, and with it the prelude the guard's temporary lives in.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum E { A, B }
+        enum Wrap { One(i32), Two }
+        fun f(e: E, w: Wrap): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if w is Wrap::One(let n) && n > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, Wrap::Two)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("$d = false;"),
+        "a guard needing a slot should pick the sequence emitter, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("if ($c[0] === 0 && $c[1] > 0) {"),
+        "the final leg's guard should survive into its slot, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_in_the_sequence_emitter_runs_the_covering_leg() {
+    // The same program, run: `w` is `Two`, so the guard rejects and the leg
+    // above must be the answer. Like its chain twin, this pins the answer
+    // rather than the guard — the guarded leg is unreachable in an accepted
+    // match.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        enum Wrap { One(i32), Two }
+        fun f(e: E, w: Wrap): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if w is Wrap::One(let n) && n > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, Wrap::Two)); print(f(E::B, Wrap::One(3))); }
+        "#,
+        "b\nb\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
+    // Why the lowering's half is load-bearing and not merely belt-and-braces.
+    // `Pair::Of(Align::Start)` is counted as covering the variant `Of`, so the
+    // checker calls this match exhaustive on a proof that does not hold, and
+    // the guarded final leg is REACHABLE. With the guard dropped it answered
+    // "guarded" for `Of(End)` whatever the guard said — the emission was wrong
+    // on its own terms, not merely downstream of a bad verdict. The leg keeps
+    // its guard here exactly as anywhere else.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(let x) if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(Pair::Of(Align::End), 0)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("count > 0"),
+        "the final leg's guard should survive, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("} else {\n\t\t$b = \"guarded\";"),
+        "the final leg must not become the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+#[ignore = "the coverage walk counts a leg whose payload pattern is REFUTABLE \
+            as covering its variant; a separate, pre-existing hole whose \
+            unguarded form is equally wrong"]
+fn b115_a_refutable_payload_pattern_should_not_prove_coverage() {
+    // The one residual, stated as what it is: the match above is NOT
+    // exhaustive — `Of(End)` with a false guard matches no leg — and the
+    // checker should say so. It does not, because the coverage walk asks only
+    // which VARIANT a pattern names and never whether the pattern can fail
+    // below the tag. Not B115's hole: the same walk accepts
+    // `match p { Pair::Of(Align::Start) => "s" }` alone, which answers "s" for
+    // `Of(End)` with no guard anywhere in sight. Closing it wants real
+    // nested-pattern usefulness analysis, which is its own measurement.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(let x) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive",
+    );
+}
