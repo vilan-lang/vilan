@@ -405,12 +405,12 @@ JS array too.
 
 A named union of string literals becomes a **backed enum** — each variant
 carries the host string it stands for, so the enum *is* that string at
-runtime and crosses the boundary unchanged. A parameter takes the enum
-directly, with no wrapper:
+runtime and crosses the boundary unchanged. Every position takes it
+directly, with no wrapper and no forwarder: a parameter, a return, a
+property's getter and setter, a `List<Align>`, a callback's own parameter.
+bindgen emits signatures only; there is never a generated body.
 
 ```vilan,norun
-import std::option::Option;
-
 enum Align {
 	Start = "start",
 	End = "end",
@@ -423,20 +423,26 @@ impl Chart {
 	[platform("node")]
 	external fun set_align(self, value: Align): void;
 
-	// The read direction keeps a guard: the host may answer outside the
-	// set, so the raw `str` is bound and `parse` returns `Option`.
 	[extern(get, "align")]
-	[doc(hidden)]
 	[platform("node")]
-	external fun align_raw(self): str;
+	external fun align(self): Align;
 
-	fun align(self): Option<Align> {
-		Align::parse(self.align_raw())
-	}
+	[extern(method, "onAlign")]
+	[platform("node")]
+	external fun on_align(self, handler: |Align| void): void;
 }
 
 fun main() { }
 ```
+
+Nothing checks the read direction at the boundary — the host can answer
+with a string that is none of the variants — but nothing has to: an
+exhaustive `match` on a backed enum traps and names the value rather than
+returning a confident wrong variant. Where an unrecognized value is an
+answer you expect rather than a bug, hand-edit the binding to the guarded
+shape: bind the raw `str` under a `[doc(hidden)]` name and forward through
+`Align::parse`, which returns `Option<Align>`. The generated file is
+ordinary source, and that edit is one of the reasons it is yours to keep.
 
 An *inline* `"left" | "right"` is widened to `str` instead — safe and
 exact, since that is what the host takes; only a union the library
