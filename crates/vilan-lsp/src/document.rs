@@ -3340,6 +3340,46 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── B112: a post-`build()` check publishes on the file its span indexes ──
+    //
+    // The editor half of the bug. R10 runs after `build()`, where the analyzer's
+    // "current file" is the entry, so a written `List<Guard>` in an imported
+    // module published against THIS document at the module's offsets — a
+    // squiggle over unrelated text in the file the user has open, and nothing at
+    // all in the file that has the mistake.
+    #[test]
+    fn a_container_resource_in_a_module_publishes_on_the_module() {
+        let module = "import std::print;\nimport std::drop::Drop;\n\
+                      resource struct Guard { label: str }\n\
+                      impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
+                      fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::store::keep;\nfun main() { keep(); }\n",
+            ),
+            ("store.vl", module),
+        ]);
+        let published = document.published_diagnostics();
+        let item = published
+            .iter()
+            .find(|item| item.message.contains("cannot hold the resource `Guard`"))
+            .unwrap_or_else(|| panic!("R10 should publish: {:?}", messages(&published)));
+        let path = item.path.as_ref().expect("attributed to a file");
+        assert!(path.ends_with("store.vl"), "{path:?}");
+        // And the span is an offset into store.vl's own text — the half that
+        // makes the path worth having.
+        let annotation = module
+            .find("List<Guard>")
+            .expect("the annotation is in store.vl");
+        assert_eq!(
+            item.span.into_range(),
+            annotation..annotation + "List<Guard>".len(),
+            "spanned at the annotation, in store.vl's own text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The same-file half: a cycle in the open document publishes on the entry
     // (no path), so the squiggle lands under the read the user is looking at.
     #[test]
