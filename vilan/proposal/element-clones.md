@@ -513,3 +513,158 @@ The last two are B100's residual, not B104's: the return rule reaches PLACES,
 and both of those tails are expressions that produce an alias without being
 one. Closing them wants the return seam to read through a returned view, which
 is a rule 1 question and wants its own measurement.
+
+## 11. B108 / B109 — the seam reads through a view, 2026-08-10
+
+> **Status: SHIPPED.** §10.4's three `#[ignore]`d pins, closed together because
+> they are one sentence: rule 1's return clause reached only leaves that were
+> PLACES. Two leaf shapes name storage without being one — `&self.inner` (a
+> `&place`, `place_root` = `None`) and `peek(h)` (a `borrows` call, likewise) —
+> so `fun grab(&self): Inner { &self.inner }` handed the caller the receiver's
+> field (99, want 3). A third leaf *did* reach the seam and fell out of the
+> copy's TYPE filter: a scalar view, whose "copy" `__clone` cannot express.
+
+### 11.1 One question, asked of the value rather than the leaf
+
+§9 put the exemption in the SIGNATURE and §10 made the classification agree.
+What neither moved is the seam's first step, which asked `place_root(leaf)` and
+gave up on anything that was not a place. That question is about the leaf's
+*syntax*; the rule is about the storage the return hands back.
+
+> **A by-value return copies the storage its value NAMES**, whether or not the
+> expression naming it is a place. A `&place` names its operand; a `borrows`
+> call names the arguments the callee projects.
+
+That is B97's `capture_subject_places` (`capture-clones.md` §9.3) asked at a
+return instead of at a pattern subject, and it is answerable for the same
+reason: *the receiver is right there in the call*. `returned_value_places`
+recurses, so a chain (`o.mid_mut().slot()`) reaches the parameter at its root;
+an OWNED call projects nothing and so names nothing, which is "a call owns its
+result" falling out rather than being special-cased.
+
+### 11.2 A scalar's copy is its READ
+
+B108 is the same seam at a leaf rule 1 already reached. `fun same(v: &mut i32):
+i32 { v }` printed `[ [ 5 ], 0 ]` — the view's runtime pair — because the copy
+machinery is aggregate-shaped: `is_cloneable_aggregate` said no, the leaf left
+the candidate list, and nothing else materialized a value there. §10.3 had
+already found the shape and drawn the right conclusion for *its* question (the
+gate is cloneable-aggregate, not by-value), which is why the leak was recorded
+rather than fixed.
+
+B81's doctrine is the answer: **a scalar read IS the copy**. So the seam is not
+"which leaves clone" but "which leaves materialize a value", and the
+representation decides how:
+
+| the leaf emits | the crossing emits |
+|---|---|
+| an aggregate place or aggregate view (`self[0]`) | `__clone(self[0])` |
+| a scalar place (`self[0]`) | itself — the read already happened |
+| a scalar `(base, key)` pair (`v`, `peek(h)`) | `v[0][v[1]]` |
+| `&`*scalar place* (`[self, 0]`) | `self[0]` — the pair is never built |
+
+The last row is why the decision cannot live entirely in the analyzer: a
+generic `&T` is a pair at exactly its scalar instantiations, and the pointee is
+abstract until monomorphization. `return_view_reads` carries every leaf that
+owes a copy; `emits_scalar_view_pair` resolves the representation under the
+active substitution, exactly as `generic_ref_param_is_scalar` already did for
+every other view question.
+
+### 11.3 The candidates, measured before choosing
+
+Each was implemented far enough to rebuild the whole corpus and run the
+analyzer gate. "Shapes" counts 24 pinned answers over the probe set below.
+
+| | goldens moved | analyzer gate | shapes correct |
+|---|---|---|---|
+| **(a)** read through `&place` leaves only | 0 | 2077 pass | 16 / 24 |
+| **(b)** (a), plus `borrows`-call leaves (recursive) | 0 | 2077 pass | 20 / 24 |
+| **(c)** (b), plus the scalar READ at the crossing | **0** | 2077 pass | **24 / 24** |
+| **(d)** (c), plus: the borrow classification gated to match | 0 | **1 FAIL** | 24 / 24 |
+
+**(a) and (b) are the same fix arriving in instalments**, and what they leave is
+the leak §10.3 named: four of the eight shapes (a) misses are scalars, and they
+stay wrong under (b) too. There is no reading of B109 that closes the `&place`
+hole and leaves `&self.n` handing back a pair — it is the same leaf.
+
+**(d) is the root-cause tidy, and it is refused with evidence.** §10.1's
+sentence — *a place the return COPIES has left the loan* — now applies to two
+more arms, so gating them looks like finishing the job. Gating them makes
+`check_view_escape` reject **seven** shapes that compile today ("a view cannot
+escape its scope"), including every aggregate `&place` probe and the resource
+one, whose precise diagnostic it replaces with a worse one; and it reddens
+B104's own `a_borrows_call_chain_into_a_by_value_return_keeps_its_borrow`. This
+is §9.3's candidate (c) one level down, with the same shape of answer: rule 3's
+escape check reads `place_root(function.body.1)`, which is `None` for exactly
+the leaves B109 added, so the fact rule 1 now has does not reach it. Widening
+it is rule 3's call and wants its own measurement. **The classification left
+standing is conservative** — a value treated as a view, so `mut` is refused and
+rule 4 counts it live — and unchanged from before this fix.
+
+**(c) ships.**
+
+### 11.4 The resource crossing, twinned
+
+A resource cannot copy (R1), so the seam has no copy to offer it — and doing
+nothing was not neutral. `fun take(&self): Guard { &self.g }` compiled, printed
+the tag, and ran **no destructor at all**: the resource left the loan uncopied
+*and* undestroyed. Its bare twin `fun take(&self): Guard { self.g }` is refused
+("cannot move a resource field out of a live aggregate"), and the two differ by
+one character.
+
+So the crossing is told to the move scan rather than re-decided: a place a
+by-value return hands back through a view leaf is **consumed there**
+(`value_crossings`, whole-program like `loaned_captures`). The scan's own rules
+then answer, and the answers are the bare twins' by construction — R1's partial
+move for `&self.g`, R3's move-out-of-a-loan for a `borrows` call naming the
+parameter (`cannot move the resource 'h' out of this function: it is declared
+'&h', a loan`). Under a VIEW return nothing crosses and the same `&self.g` is
+still rule 3's projection, pinned. R11 shares the set for the reason B65 does:
+whether a leaf crosses is a property of its own signature.
+
+### 11.5 Coverage
+
+Twenty-one pins in `crates/vilan-core/tests/inference.rs` (three of them the
+`#[ignore]`d bycatch, un-ignored), six plants:
+
+| plant | red |
+|---|---|
+| the `&place` arm removed | 7 |
+| the `borrows`-call arm removed | 5 |
+| the chain recursion removed | 1 (`a_borrows_call_chain_leaf_in_a_by_value_return_copies`) |
+| the scalar read removed | 3 (both B108 shapes + the scalar `borrows` call) |
+| the `&place` crossing suppression removed | 1 (`a_scalar_reference_leaf_in_a_by_value_return_reads_the_place`) |
+| the resource crossings emptied | 2 (both refusals) |
+
+The pins green under every plant are exactly the ones that pin UNCHANGED
+behavior: the OWNED call result, the `borrows` call on a LOCAL (a dead owner
+donates — B100's elision, which the new arms must not eat), the view return,
+the resource under a view return, and all of B100's and B104's.
+
+**No corpus golden moved**, and the sweep says why rather than luck: an
+instrumented binary reports **zero** new-arm return sites across `vilan/test`,
+`vilan/examples`, `vilan/benchmarks`, `vilan/std` and `vilan/macro_std` — and
+zero scalar-view return crossings — while firing on every probe. The same
+answer B100 and B104 got, for the third time; `&`-of-field is the more natural
+spelling of the two, and the tree still does not contain it.
+
+`element-clones.vl` gains `reference_of`, `called_of`, `scalar_of`,
+`scalar_projection` and `scalar_forward`. `reference_of` emits `return
+__clone(holder[0])` — `viewed_of`'s body, byte for byte, which IS the claim
+that the three spellings are indistinguishable — and `called_of` emits `return
+__clone(items_view(holder))`. `scalar_of` against `scalar_projection` is the
+crossing pair: `return cell2[0]` against `return [ cell2, 0 ]`, the same leaf
+under the two return types. The golden moved **additively** — every pre-existing
+byte unchanged, temp names included.
+
+### 11.6 Bycatch, verified and filed
+
+`ret &self.inner` — the explicit-`ret` spelling of B109's first shape — is
+still refused with *"a view cannot escape its scope"*, while the tail spelling
+one line away compiles. `check_view_escape` treats `Expr::FunctionReturn`
+unconditionally as an escape and exempts only the tail (via `borrows` +
+`derives_from_view_param`), so the asymmetry is rule 3's and pre-existing —
+B100's own §9.2 table returned `ret self.pair` because a bare place is not a
+view expression at all. Rule 1 copies both; only one of them is allowed to say
+it. Filed rather than fixed here: it is the same escape-check widening (d)
+wants, and it belongs to that measurement.
