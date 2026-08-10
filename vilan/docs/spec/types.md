@@ -99,6 +99,25 @@ receiver already *is* that value, so the call lowers to the receiver.
 fallible parse, matching `str::parse_i32`. Declaring your own `value` or
 `parse` on a backed enum is a duplicate-member error.
 
+A backed enum is also **`Hashable`**, implemented by the compiler on the
+same opt-in and for the same reason `value()` costs nothing: the enum IS
+its backing value, and that value is already a key.
+
+```vilan,fragment
+mut widths: Map<Align, i32> = Map::new();
+widths.insert(Align::Start, 1);          // keyed by "flex-start"
+```
+
+So `Map<Align, V>` and `Set<Align>` need no `[derive(Hashable)]`, and
+`Align::Start.hash()` is `Align::Start.value().hash()`. Writing the derive
+anyway is harmless and does nothing; a hand-written `impl Align with
+Hashable` is a duplicate-impl error, because the compiler's is already
+there. An **unbacked** enum is unaffected — it lowers to the tagged array,
+so it is an aggregate and needs the derive like a struct.
+
+A `resource` enum gets none of the three — no `value()`, no `parse`, no
+`Hashable`. Its identity is not its copyable backing value.
+
 Two rules follow from the backing value being a *representation* rather
 than a second name for the variant. A `match` still matches variants, not
 values — `match align { "flex-start" => … }` is an error, exactly as

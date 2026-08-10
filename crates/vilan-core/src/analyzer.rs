@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 use crate::error::{Error, Note};
 use crate::id::Id;
 use crate::node::{
-    BackingLiteral, BinaryOp, Convention, ExternBinding, Func, GenericParameters, ImportBranch,
-    Node, NodeIfBranch, NodeList, Pattern,
+    BackingLiteral, BinaryOp, Convention, EnumVariant, ExternBinding, Func, GenericParameters,
+    ImportBranch, Node, NodeIfBranch, NodeList, Pattern,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -1367,10 +1367,13 @@ pub struct Analyzer<'src> {
     /// walked, validated once `wire_names` is complete: `(type name, [(member
     /// label, member type node, span)])`.
     wire_types_to_check: Vec<WireTypeCheck<'src>>,
-    /// Names of `[derive(Hashable)]` structs/enums, and the ones awaiting the
-    /// all-fields-Hashable check (I1) — same shape as the Wire pair. A field of a
-    /// derived Hashable type must itself be Hashable, or `canonical_hash`
-    /// (JSON.stringify) would silently mangle it into a broken key.
+    /// Names of the types known to be Hashable syntactically — every
+    /// `[derive(Hashable)]` struct/enum, plus every bare-lowered enum, whose
+    /// impl is synthesized from its backing value instead of derived — and the
+    /// derived ones awaiting the all-fields-Hashable check (I1), same shape as
+    /// the Wire pair. A field of a derived Hashable type must itself be
+    /// Hashable, or `canonical_hash` (JSON.stringify) would silently mangle it
+    /// into a broken key.
     hashable_names: HashSet<&'src str>,
     hashable_types_to_check: Vec<WireTypeCheck<'src>>,
     /// `[derive(PartialEq)]` types awaiting the resource-field reject
@@ -3450,10 +3453,16 @@ impl<'src> Analyzer<'src> {
     }
 
     /// A field type is Hashable iff it is a scalar (any numeric, `str`, `bool`), a
-    /// `List`/`Option` of Hashable (recursing into the element), or a named
-    /// `[derive(Hashable)]` type. A closure, `Set`/`Map`/`Shared`, or a view is
-    /// not — `canonical_hash` would mangle it. (Tuple *fields* are deferred, like
-    /// `Wire`.)
+    /// `List`/`Option` of Hashable (recursing into the element), a bare-lowered
+    /// enum (its backing value is its key), or a named `[derive(Hashable)]` type.
+    /// A closure, `Set`/`Map`/`Shared`, or a view is not — `canonical_hash` would
+    /// mangle it. (Tuple *fields* are deferred, like `Wire`.)
+    ///
+    /// The bare-lowered enums reach this through `hashable_names`, recorded by the
+    /// enum walk off the authoritative `Enum::backing` rather than re-derived here:
+    /// this predicate is syntactic (it runs on `&Node`, pre-resolution) and the two
+    /// oracles for "is this Hashable?" — this one and `satisfies_trait_bound` over
+    /// the impl table — have to agree or a field the key check accepts is rejected.
     fn is_hashable_type(&self, node: &Node) -> bool {
         const HASHABLE_SCALARS: &[&str] = &[
             "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
@@ -3505,7 +3514,7 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "{label} of `[derive(Hashable)]` type `{type_name}` is `{rendered}`, \
                              which is not `Hashable`: every field must be (a scalar, `str`, \
-                             `bool`, `List`/`Option` of `Hashable`, or another \
+                             `bool`, `List`/`Option` of `Hashable`, a backed enum, or another \
                              `[derive(Hashable)]` type)"
                         ),
                     });
@@ -3895,8 +3904,20 @@ impl<'src> Analyzer<'src> {
         // Declaration order is the entity id (§9(1)): textual order within a
         // file, canonical module order across them, so the same program always
         // reports the same one of a pair as the second.
+        //
+        // A COMPILER-SYNTHESIZED impl always ranks first, whatever its entity id
+        // — the same rule the duplicate-member check uses, for the same reason:
+        // it is the impl the author cannot edit, so it must be the one the
+        // message points at rather than the one it blames. Today that is a
+        // bare-lowered enum's `Hashable` (backed-enums.md §7.1).
         let mut sites = std::mem::take(&mut self.trait_impl_sites);
-        sites.sort_by_key(|site| (site.impl_id.0, site.span.start));
+        sites.sort_by_key(|site| {
+            (
+                self.source_of_id(site.impl_id) != Some(DERIVED_SOURCE),
+                site.impl_id.0,
+                site.span.start,
+            )
+        });
         let mut duplicates: Vec<(&'src str, TraitImplSite, TraitImplSite)> = Vec::new();
         for (position, site) in sites.iter().enumerate() {
             // Each later impl is reported against the FIRST one it repeats, so
@@ -3920,10 +3941,26 @@ impl<'src> Analyzer<'src> {
                 self.pretty_print_type(&second.subject.get_type(self), &HashMap::new());
             // C3, as B57: the first impl is the whole point of the message. The
             // note carries its own source, so it renders across files too.
-            let note = Some(crate::error::Note {
-                span: first.span,
-                msg: format!("'{trait_name}' is already implemented here"),
-                source: self.source_of_id(first.impl_id),
+            //
+            // A COMPILER-SYNTHESIZED first impl has no file to point at (its
+            // span indexes a generated template), so the note says what it is —
+            // otherwise it points the author's own impl back at itself, which
+            // reads as if the impl duplicated nothing. Today that is a
+            // bare-lowered enum's `Hashable` (backed-enums.md §7.1): the backing
+            // value IS the key, so the impl comes with the declaration.
+            let note = Some(match self.source_of_id(first.impl_id) {
+                Some(DERIVED_SOURCE) => crate::error::Note {
+                    span: second.span,
+                    msg: format!(
+                        "'{trait_name}' is synthesized for '{subject_label}' by the compiler"
+                    ),
+                    source: None,
+                },
+                first_source => crate::error::Note {
+                    span: first.span,
+                    msg: format!("'{trait_name}' is already implemented here"),
+                    source: first_source,
+                },
             });
             let elsewhere = self.other_module_clause(first.impl_id, second.impl_id);
             let diagnostics_before = self.diagnostics.len();
@@ -17334,6 +17371,16 @@ impl<'src> Analyzer<'src> {
                         .map(|(kind, _, _)| kind)
                         .unwrap_or(Backing::Int)
                 });
+                // A bare-lowered enum IS a `str`/number at runtime and carries a
+                // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
+                // so it counts as Hashable for the derive's all-fields check too —
+                // otherwise the impl table and `is_hashable_type` would disagree and
+                // `[derive(Hashable)] struct Key { align: Align }` would be rejected
+                // for a field the key check accepts. A resource is excluded on both
+                // sides for the same reason it is excluded there.
+                if backing.is_some() && !resource {
+                    self.hashable_names.insert(name);
+                }
                 self.enums.insert(
                     id,
                     Enum {
@@ -29447,6 +29494,62 @@ pub(crate) fn service_impl_source(
     out
 }
 
+/// Whether an enum is BARE-LOWERED, read syntactically: every variant is
+/// payload-free and at least one carries an explicit backing value. This is the
+/// same conjunction the walker folds into [`Enum::backing`]
+/// (`proposal/backed-enums.md` §3.1(b)) — `enum Plain { A, B }` keeps its
+/// `[0]`/`[1]` array form, and `enum Level { Low = 0, Mid, High }` does not,
+/// because one explicit value converts the whole declaration.
+///
+/// Deliberately WEAKER than the "every variant carries a written literal" rule
+/// [`backed_enum_impl_source`] uses for `value()`/`parse()`: those two must
+/// reprint each backing literal, so they need one per variant, while the
+/// runtime representation only needs the conjunction. Keying `Hashable` off the
+/// representation rather than off the printable literals is what keeps
+/// "the enum IS the key" true for `enum Level { Low = 0, Mid, High }` too.
+fn enum_is_bare_lowered(variants: &[Spanned<EnumVariant<'_>>]) -> bool {
+    // A variant-less `enum E {}` falls out false: `any` over nothing is false.
+    variants.iter().all(|variant| variant.0.1.is_empty())
+        && variants.iter().any(|variant| variant.0.2.is_some())
+}
+
+/// `Hashable` for a bare-lowered enum, synthesized as vilan source
+/// (`proposal/backed-enums.md` §7.1/§8.5, `proposal/hashable-keys.md`).
+///
+/// The impl is the primitive one-liner because the enum IS the primitive: a
+/// backed enum lowers to a bare JS number or string, and `canonical_hash`
+/// returns a non-object unchanged, so `Align::Start.hash()` and
+/// `"flex-start".hash()` produce the identical key. Nothing here is a new
+/// semantics — it is the same identity `value()` already is, stated as a trait
+/// impl so `Map<Align, V>` and `Set<Align>` can find it.
+///
+/// Synthesized rather than derived for §7.3's reason, unchanged: writing
+/// `= "flex-start"` is already the opt-in, so `[derive(Hashable)]` would be a
+/// second switch for one decision. A user who writes it anyway, or hand-writes
+/// `impl Align with Hashable`, meets the ordinary duplicate-impl error.
+pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
+    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+        return String::new();
+    };
+    // A generic enum gets no synthesized members at all (§8.2(d)), and a
+    // RESOURCE cannot be hashed by value — `check_hashable_boundary` says so of
+    // a resource field, and a resource enum is the same value under the same
+    // rule: hash a plain-data projection instead.
+    if generic_parameters.is_some() || *resource || !enum_is_bare_lowered(&variants.0) {
+        return String::new();
+    }
+    let enum_name = name.0;
+    format!(
+        "impl {enum_name} with Hashable {{\n\
+         \t/// `{enum_name}` IS its backing value at runtime, so the backing value is\n\
+         \t/// the key: hashing the enum and hashing that value agree.\n\
+         \tfun hash(self): Hash {{\n\
+         \t\tcanonical_hash(self)\n\
+         \t}}\n\
+         }}\n\n"
+    )
+}
+
 /// The two conversions every backed enum gets, synthesized as vilan source
 /// (`proposal/backed-enums.md` §3.8): an inherent `value()` out and a static
 /// `parse()` back. Empty for every other item — a plain enum, a payload enum,
@@ -29473,11 +29576,20 @@ pub(crate) fn service_impl_source(
 /// A GENERIC enum gets nothing: its parameter can only be phantom (a payload
 /// is rejected by §3.3), and `Enum::parse` on one would have no way to bind it.
 /// The `[derive(..)]` generators skip generic enums for the same reason.
+///
+/// A RESOURCE enum gets nothing either, and that one is a fix rather than a
+/// rule: `fun value(self)` reads a resource out of a loan, so `resource enum
+/// Handle { Open = 1 }` used to fail AT ITS DECLARATION with "cannot move the
+/// resource `self` out of this function" — an error about a body the author
+/// never wrote, on a declaration that is otherwise legal. A resource's identity
+/// is not its copyable backing value (the rule `check_hashable_boundary`
+/// already states for a resource field), so the conversions are simply not
+/// offered.
 pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
-    let Node::Enum(name, generic_parameters, _resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return String::new();
     };
-    if generic_parameters.is_some() {
+    if generic_parameters.is_some() || *resource {
         return String::new();
     }
     // (variant name, the backing literal as written). Every variant must carry

@@ -6,6 +6,20 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## Unreleased
+
+**`Map<Align, T>` compiles.** A backed enum is now a `Map` key and a `Set` member with nothing to remember — no `[derive(Hashable)]`, no import, no ceremony. This was the first thing anyone was going to try after `enum Align { Start = "flex-start" }` shipped, and it met `Error: 'Align' does not implement trait 'Hashable'`, which is a strange answer when the enum *is* the string `"flex-start"` and the host's own `Map` keys strings by value.
+
+The reason it works is the reason `value()` costs nothing: the enum is not a wrapper around the backing value, it *is* the backing value. Hashing it and hashing that value are the same operation on the same runtime datum, so `Align::Start.hash()` and `Align::Start.value().hash()` are one key. The implementation is written by the compiler beside `value()` and `parse()`, off the same opt-in — writing `= "flex-start"` is what makes the enum that value, so it is also what makes the value its key. Both backings come along, integer and string, and so does the C-style tail: `enum Walked { A = 5, B, C }` is bare-lowered because one explicit value converts the whole declaration, so it keys too.
+
+An **unbacked** enum is deliberately left where it was. `enum Plain { A, B }` has no backing value, so it lowers to the tagged array `[0]`/`[1]` — a fresh array per mention, which is exactly the by-reference footgun value keys exist to prevent. It is an aggregate, and like every other aggregate it needs `[derive(Hashable)]`, which works as it always did. A payload-carrying enum is the same story: refused at the key with the ordinary bound diagnostic rather than a surprise at runtime, and admitted by the derive, whose all-fields check still names a payload it cannot hash.
+
+Two smaller things fall out. A backed enum is now accepted as a *field* of a `[derive(Hashable)]` struct — the derive's field check and the key check had two separate answers for "is this hashable", and they now agree. And writing `[derive(Hashable)]` on a backed enum anyway keeps compiling and does nothing: the derive and the compiler emit the identical body, so there is nothing to disagree about. A *hand-written* `impl Align with Hashable` is still a duplicate-impl error — it might mean something else — and that error now lands on your impl with a note saying the other one is the compiler's, rather than pointing your own declaration back at itself.
+
+**A `resource` enum with backing values can be declared again.** `resource enum Handle { Open = 1 }` failed at its own declaration with "cannot move the resource `self` out of this function" — an error about a body nobody wrote, because `value()` was being synthesized for it and `fun value(self)` reads a resource out of a loan. A resource's identity is not its copyable backing value, so it is offered no `value()`, no `parse`, and no `Hashable`, and the declaration simply compiles.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.

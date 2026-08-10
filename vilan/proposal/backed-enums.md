@@ -1408,3 +1408,134 @@ anyone implements it:
 So the winner's worked example costs `json.vl` nothing and returns 15 lines
 and four functions — which is what §4.2 promised, arrived at for a slightly
 different reason than §4.2 gave.
+
+## 10. §7.1 resolved (cycle 13) — `Hashable` for bare-lowered enums
+
+§8.5's "still open, and now stronger" is closed. §7.1's recommendation was
+to leave the question to `hashable-keys.md`, on the ground that solving it
+"for bare-lowered enums only would create a rule that half the enums in a
+program satisfy for reasons invisible at their declaration". The survey
+that opened this arc found that objection does not hold, for a reason the
+paper could not have known: the reason is **not** invisible at the
+declaration. It is the `= "flex-start"` — the same mark that makes the
+enum bare-lowered, gives it `value()`/`parse()`, changes what `Wire` puts
+on the wire, and decides how it crosses a host boundary. A backed enum's
+declaration already announces four consequences; this is the fifth, and it
+is announced by the same character.
+
+### 10.1 The mechanism, and the two it was chosen over
+
+**Synthesized beside `value()`/`parse()`** — `backed_enum_hashable_source`,
+emitted from `collect_backed_enum_impls_in` alongside §8.2(a)'s generator,
+as the ordinary vilan source `impl E with Hashable { fun hash(self): Hash {
+canonical_hash(self) } }`.
+
+The body is the primitive one-liner because the enum IS the primitive.
+`canonical_hash` returns a non-object unchanged, so hashing `Align::Start`
+and hashing `"flex-start"` are the same operation on the same runtime
+datum. Nothing new is defined; the identity `value()` already is, is
+stated as a trait impl so bound resolution can find it.
+
+Two alternatives were surveyed and rejected on evidence:
+
+- **A blanket impl over bare-lowered enums.** Not expressible: the
+  language's blanket impls (`impl type T: Display`) are bounded by a
+  TRAIT, and "bare-lowered" is a representation property with no trait to
+  name. A compiler-side blanket would have been the first special case in
+  `satisfies_trait_bound`, which has none, and it would have satisfied only
+  one of the two Hashable oracles (§10.3).
+- **A derive.** `[derive(Hashable)]` already worked on a backed enum
+  before this arc — that is precisely the problem. It is opt-in, and §7.3's
+  argument against `[derive(Backed)]` applies verbatim: the backing value
+  is already the opt-in, so a derive is a second switch for one decision.
+  A rule half the enums satisfy is bad; a rule the author must remember
+  twice is worse.
+
+### 10.2 The unbacked C-like enum does NOT come along
+
+Asked directly, and the answer is no, on the lowering. `enum Plain { A, B }`
+is **not** bare-lowered — §3.1(b)'s conjunction requires an explicit
+backing value, and without one the enum keeps the tagged `[0]`/`[1]` array
+form (P1, re-verified against the worktree binary: `show([ 1 ])`). So it is
+an aggregate, a fresh array per mention, which is exactly the
+by-reference key hazard `hashable-keys.md` §1 exists to prevent. The
+"the lowering IS the key" argument does not reach it, and it keeps needing
+`[derive(Hashable)]` like every other aggregate. Pinned both ways: the
+refusal, and the derive still working.
+
+The verdict generalizes: `Hashable` tracks the LOWERING, not "is an enum".
+That is also why it keys off §3.1(b)'s conjunction rather than off §3.8's
+stricter "every variant carries a written literal" — `enum Walked { A = 5,
+B, C }` is bare-lowered and hashes, though §8.4's sibling limit (below)
+means it gets no `value()`.
+
+### 10.3 The two Hashable oracles had to be made to agree
+
+The language holds two independent answers to "is this Hashable?": the
+impl table, through `satisfies_trait_bound`, which decides a KEY; and the
+syntactic `is_hashable_type`, which decides a FIELD of a
+`[derive(Hashable)]` type. Synthesizing the impl moved only the first, and
+the disagreement was immediately visible — `[derive(Hashable)] struct Slot
+{ align: Align }` was rejected for a field the key check accepts. The enum
+walk now records a bare-lowered enum's name in `hashable_names` off the
+authoritative `Enum::backing`, so both answer the same. Pinned as a pair,
+with the unbacked contrast beside it so the field rule cannot drift back
+to "is an enum".
+
+### 10.4 Collisions: the derive stands down, a hand-written impl does not
+
+A backed enum carrying `[derive(Hashable)]` would have been a duplicate
+impl — and, because both impls are synthesized, a duplicate reported with
+no span to point at. It is made a **no-op** instead: the synthesis stands
+down when the derive is present, so exactly one impl exists either way.
+This is not leniency, it is that there is nothing to protect — the two
+generators emit the identical `canonical_hash(self)` — and it keeps a
+program written before this arc compiling.
+
+A HAND-WRITTEN `impl Align with Hashable` stays a duplicate error. It may
+mean something else (§4 of `hashable-keys.md` is explicit that a custom
+impl is the feature), and which of two applicable impls wins is B73's open
+specificity question, not this pass's to answer.
+
+That error needed §8.2(a)'s treatment, extended from members to trait
+impls: a compiler-synthesized impl now sorts FIRST whatever its entity id,
+so the error lands on the declaration the author can edit, and the note
+says "'Hashable' is synthesized for 'Align' by the compiler" rather than
+pointing the author's own impl back at itself.
+
+### 10.5 A resource enum: a bug found, and fixed
+
+`resource enum Handle { Open = 1 }` did not compile — at its DECLARATION,
+with "cannot move the resource `self` out of this function". `value()` was
+being synthesized for it, and `fun value(self)` reads a resource out of a
+loan, so the author met an error about a body they never wrote. Nothing in
+the tree had a resource backed enum, so it had never been seen.
+
+A resource's identity is not its copyable backing value — the rule
+`check_hashable_boundary` already states for a resource FIELD — so a
+resource enum is offered no `value()`, no `parse`, and no `Hashable`, on
+the §8.2(d) precedent ("a generic enum gets no conversions"), and the
+declaration compiles. Three pins.
+
+### 10.6 Two limits, both left where they were found
+
+- **`enum Walked { A = 5, B, C }` gets no `value()`/`parse()`.** §3.8's
+  generator requires a written literal per variant because it reprints
+  each one; the walker's rule only requires the conjunction. So the
+  C-style auto-incremented tail is bare-lowered, hashes, matches and
+  crosses a host boundary as its number, but has no conversions —
+  `Level::High.value()` is "no method 'value'" on a declaration
+  `docs/spec/types.md` presents as backed. Pre-existing, untouched here.
+  Closing it means computing the implied discriminants syntactically,
+  which is the walker's `next_discriminant` (with B79's overflow rule)
+  duplicated into the macro-expansion reader — a refactor that wants the
+  two readers unified, not a third copy.
+- **`Hash` is not `PartialEq`.** `hashable-keys.md` §3.2 specifies
+  "`==`-comparable — native `===` on the underlying value (`impl Hash with
+  PartialEq`)" and it did not ship: `k.hash() == k.hash()` is "type 'Hash'
+  does not implement the `PartialEq` operator". §8's own test plan asks
+  for that pin, so the gap is in `hashable-keys.md`'s ledger, not this
+  paper's. Coherence is pinned here through a `Map<Hash, V>` instead,
+  which is the capability `docs/std/collections.md` documents and a
+  stronger observation anyway: it tests the keying, not an operator.
+

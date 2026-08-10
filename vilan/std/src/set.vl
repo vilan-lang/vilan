@@ -1,5 +1,6 @@
 // `Set<T>` is the built-in hash set. It holds unique values compared **by
-// value** — a struct/enum/tuple element works as long as it derives `Hashable`
+// value** — a scalar or a backed enum works directly (the enum IS its backing
+// value), and a struct or unbacked/payload enum works once it derives `Hashable`
 // (I1). Each element is turned into a canonical `Hash` via `value.hash()`, which
 // keys the underlying native map; the original value is stored alongside so
 // `for x in set` yields real `T`s in insertion order.

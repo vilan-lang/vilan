@@ -872,9 +872,18 @@ struct Expander<'r, 'd> {
     rust_source: String,
     rust_traits: std::collections::HashSet<&'static str>,
     rust_any_service: bool,
-    /// Whether this module declared a backed enum, so the generated block gets
-    /// `Option` in scope for its `parse` (backed-enums.md §3.8).
+    /// Whether this module declared a backed enum whose `value()`/`parse()` were
+    /// generated, so the generated block gets `Option` in scope for its `parse`
+    /// (backed-enums.md §3.8).
     backed_enums: bool,
+    /// Whether this module declared a bare-lowered enum, so the generated block
+    /// gets `Hashable`/`Hash`/`canonical_hash` in scope for its synthesized
+    /// `impl .. with Hashable` (backed-enums.md §7.1). Tracked apart from
+    /// `backed_enums` because the two are not the same set: `enum Level { Low =
+    /// 0, Mid, High }` is bare-lowered — one explicit value converts the whole
+    /// declaration — but has no written literal for `Mid`/`High` to reprint, so
+    /// it gets the Hashable impl and no conversions.
+    bare_lowered_enums: bool,
     diagnostics: &'d mut Vec<Error>,
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
@@ -905,6 +914,7 @@ pub(crate) fn expand_source(
         rust_traits: std::collections::HashSet::new(),
         rust_any_service: false,
         backed_enums: false,
+        bare_lowered_enums: false,
         diagnostics,
         site_counter,
         output: ExpansionOutput::default(),
@@ -916,9 +926,10 @@ pub(crate) fn expand_source(
 }
 
 impl Expander<'_, '_> {
-    /// The synthesized `value()` / `parse()` members of every backed enum this
-    /// module declares (backed-enums.md §3.8), collected in ONE pass over the
-    /// item tree rather than inside the macro dispatch below.
+    /// The synthesized members of every backed enum this module declares —
+    /// `value()` / `parse()` (backed-enums.md §3.8) and `impl .. with Hashable`
+    /// (§7.1) — collected in ONE pass over the item tree rather than inside the
+    /// macro dispatch below.
     ///
     /// Separate because it is not a macro: a backing value is not a `[derive]`
     /// and does not depend on one, so the generation must reach an enum however
@@ -927,18 +938,40 @@ impl Expander<'_, '_> {
     /// whose arm does not recurse.
     fn collect_backed_enum_impls(&mut self, nodes: &NodeList) {
         for node in nodes {
-            self.collect_backed_enum_impls_in(node);
+            self.collect_backed_enum_impls_in(node, false);
         }
     }
 
-    fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>) {
+    /// `derived_hashable` is set once a `[derive(Hashable)]` has been passed on
+    /// the way down to the enum. The synthesized `Hashable` then STANDS DOWN, so
+    /// exactly one impl exists either way: the derive's generator and this one
+    /// emit the identical `canonical_hash(self)` body, so there is nothing for a
+    /// duplicate-impl error to protect — and a program that wrote the derive
+    /// before the impl was synthesized keeps compiling. (A HAND-WRITTEN `impl
+    /// Align with Hashable` is a different case and stays a duplicate error: it
+    /// may mean something else, and which impl wins is B73's open specificity
+    /// question, not this pass's to answer.)
+    fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>, derived_hashable: bool) {
         match &node.0 {
             Node::Export(inner)
-            | Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) => self.collect_backed_enum_impls_in(inner),
+            | Node::MacroAttribute(_, _, _, inner) => {
+                self.collect_backed_enum_impls_in(inner, derived_hashable)
+            }
+            Node::Derive(names, inner) => {
+                let derived_hashable =
+                    derived_hashable || names.iter().any(|(name, _)| *name == "Hashable");
+                self.collect_backed_enum_impls_in(inner, derived_hashable)
+            }
             Node::Module(_, body) => self.collect_backed_enum_impls(&body.0),
             Node::Enum(..) => {
+                if !derived_hashable {
+                    let hashable = crate::analyzer::backed_enum_hashable_source(node);
+                    if !hashable.is_empty() {
+                        self.bare_lowered_enums = true;
+                        self.rust_source.push_str(&hashable);
+                    }
+                }
                 let source = crate::analyzer::backed_enum_impl_source(node);
                 if !source.is_empty() {
                     self.backed_enums = true;
@@ -1192,7 +1225,10 @@ impl Expander<'_, '_> {
         if self.rust_traits.contains("Debug") {
             prelude.push_str("import std::debug::Debug;\n");
         }
-        if self.rust_traits.contains("Hashable") {
+        // One import line serves both producers of an `impl .. with Hashable`:
+        // the `[derive(Hashable)]` fallback generator and a bare-lowered enum's
+        // synthesized impl. A module with both must not import it twice.
+        if self.rust_traits.contains("Hashable") || self.bare_lowered_enums {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
         if self.backed_enums {

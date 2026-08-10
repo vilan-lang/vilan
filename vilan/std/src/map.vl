@@ -1,5 +1,6 @@
 // `Map<K, V>` is the built-in hash map. Keys are compared **by value** — a
-// struct/enum/tuple key works as long as it derives `Hashable` (I1). Each key
+// scalar or a backed enum keys directly (the enum IS its backing value), and a
+// struct or unbacked/payload enum keys once it derives `Hashable` (I1). Each key
 // is turned into a canonical `Hash` via `key.hash()`, which keys the underlying
 // native map; the original key is stored alongside the value so `keys()`
 // returns real `K`s, and mutating the original afterward can't desync the map
