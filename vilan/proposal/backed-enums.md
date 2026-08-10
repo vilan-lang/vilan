@@ -1125,3 +1125,286 @@ is now the shipped pitch — so `Map<Align, T>` failing on a missing
 `Hashable` is the first thing a user will hit. The case for a
 compiler-derived `Hashable` on bare-lowered enums is stronger than the
 paper could state it.
+
+## 9. The trap arm — a design note for lifting §7.2 (cycle 13)
+
+> **DESIGN NOTE, not a ratification and not an implementation.** §7.2 is
+> DEFERRED "until backed enums grow a trap-arm story for the bare-`else`
+> hazard". This is that story, written for the owner's queue. Nothing here
+> is built; §9.5 is a recommendation to accept or reject, and §9.6 is the
+> worked example of what accepting buys.
+>
+> Probes P11–P16 ran against `target/debug/vilan` built in the
+> `docs-trap-note` worktree from `next @92db7d2` — the shipped v0.35.0
+> backed-enum implementation, not the paper's model of it. P16 found a live
+> hole in the refusal §8.2(f) describes, which changes the weighing.
+
+### 9.1 The hazard, re-measured — and it is narrower than §7.2 states
+
+> **P11.** The shipped emission for an exhaustive three-variant string-backed
+> `match`:
+>
+> ```vilan
+> enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+> fun label(align: Align): str {
+>     match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+> }
+> ```
+> ```js
+> if ($a === "flex-start")   { $b = "s"; }
+> else if ($a === "center")  { $b = "c"; }
+> else                       { $b = "e"; }
+> ```
+>
+> Driving the emitted function directly: `label("middle") === "e"`. §7.2's
+> "confidently the wrong variant" is exact, and still true of the build.
+
+> **P12.** The other three ways a backed enum can be tested, same enum, one
+> program:
+>
+> | source | emitted | on an out-of-set value |
+> |---|---|---|
+> | `a is Align::End` | `$a === "flex-end"` | `false` — honest |
+> | `a == Align::End` | `a === "flex-end"` | `false` — honest |
+> | `match a { Align::Start => .., _ => .. }` | `if ($a === "flex-start") .. else ..` | takes `_` — honest |
+
+P12 is the useful narrowing and the paper does not currently say it: **the
+hazard is confined to the last arm of an exhaustive `match`.** Everywhere
+else the feature emits a `===` against a literal, and a `===` against a
+literal answers `false` for a value outside the set, which is the correct
+answer. There is exactly one construct in the language that converts an
+out-of-set value into a confident lie, and it converts it into precisely one
+variant: whichever the analyzer ordered last.
+
+That matters for scope. A trap-arm design does not have to guard the
+boundary, or the type, or the value. It has to guard one `else`.
+
+### 9.2 A hole in the refusal itself (P16) — and why it re-ranks the candidates
+
+> **P16.** §8.2(f) says the refusal "searches the whole return type". It does
+> not search a function-typed **parameter's** parameters, where the host is
+> the one constructing the value:
+>
+> ```vilan
+> [extern("onAlignChange")]
+> external fun on_align_change(handler: |Align| void): void;
+> ```
+>
+> This compiles clean today — `vilan check` reports no errors — while
+> `external fun host_align(): Align` and `external fun align(self): Align` on
+> an `external struct` are both correctly refused. Run against a host that
+> calls `handler("middle")`, the program prints `e`: `Align::End`,
+> confidently, exit 0.
+
+§7.2's premise for allowing the parameter direction is "vilan constructs the
+value, so it is always in the set". That premise fails for a **callback**
+parameter, which is a return position wearing a parameter's clothes. The
+refusal inherited the premise rather than the position, so it enumerates
+host-constructing positions and has already missed one.
+
+This should be filed as a bug against the shipped refusal regardless of what
+happens to §7.2 — it is a live instance of the exact hazard the deferral
+exists to prevent. But it also carries a design argument: **any answer built
+on "find the places the host supplies a value" has to be exhaustive over the
+language's positions to be worth anything, and one attempt already was
+not.** An answer built on "guard the one `else`" does not have to enumerate
+anything.
+
+### 9.3 The trap arm already exists in the emission (P13, P14)
+
+> **P13.** A `_` arm on an ALREADY-EXHAUSTIVE backed-enum match is accepted
+> today — no unreachable-arm diagnostic — and emits exactly the trap shape:
+> every variant gets its own `===` and the `_` becomes the bare `else`.
+>
+> ```js
+> if ($a === "flex-start")    { $b = "s"; }
+> else if ($a === "center")   { $b = "c"; }
+> else if ($a === "flex-end") { $b = "e"; }   // the last arm, now tested
+> else                        { $b = "trap"; } // the trap
+> ```
+
+So no candidate below needs a new codegen path. `scalar_variant_test` already
+produces both shapes; what a trap arm changes is only whether the compiler
+emits the second shape when the author wrote the first. The difference
+between the three candidates is **who writes the arm and when** — not what
+it compiles to.
+
+> **P14.** The byte delta, measured on three enums (whole emissions, this
+> worktree's binary):
+>
+> | enum | backing | variants | today | with a trap arm | delta |
+> |---|---|---|---|---|---|
+> | `Align` | `str` | 3 | 211 | 259 | **+48** |
+> | `Display` | `str` | 7 | 353 | 392 | **+39** |
+> | `Ordering` (`vilan/test/enum-discriminant.vl:15`) | `i32` | 3 | 329 | 368 | **+39** |
+>
+> The delta is **per match, not per variant** — the 7-variant enum is the
+> cheapest of the three. It decomposes as one added `===` test (12 bytes plus
+> the last variant's literal as written) plus one `else` block (13 bytes plus
+> the trap statement), so a real helper call lands around 50–55 bytes.
+
+The runtime cost is the mirror image and just as small: matching the *last*
+variant goes from N−1 comparisons to N. The trap branch itself runs never.
+
+**Corpus-wide, "always trap" costs 39 bytes.** The tree contains exactly ONE
+exhaustive match over a backed enum — `vilan/test/enum-discriminant.vl:15` —
+across 112 corpus programs totalling 213,335 bytes of goldens, i.e. **0.018%**
+of the corpus, in one file. `style.vl` contributes nothing, because §8.1's
+rewrite collapsed all eleven wrappers to `.value()`; there is no `match` left
+there to pay for. That is the measurement §6's slice 3 would need, and it is
+not a cost worth an argument.
+
+### 9.4 The three candidates
+
+**(a) A trap arm at host-tainted values only.**
+
+The value carries a provenance bit from an `external fun`'s return, and a
+`match` on a tainted subject gains the arm; everything else emits as today.
+
+On the sub-question of what the arm *does*: **panic, naming the enum and the
+raw value** — not an `Option`-shaped result. An `Option`-shaped result would
+make a `match` expression's type depend on where its subject came from: the
+same three arms are `str` for one caller and `Option<str>` for another. That
+is not a trap-arm design, it is an effect system, and it is a much larger
+paper than this one. A panic reading `Align: host value "middle" is not one
+of its values` is the honest report, and it should emit through the same
+`throw` shape `panic()` already uses rather than inventing a second failure
+path.
+
+Costs: a taint analysis through the analyzer that survives assignment, field
+reads, list elements, closure capture and calls — new machinery in exactly
+the two places §1.4 and §1.5 were pleased to leave untouched. Its emitted
+size today is **zero**, but only because the refusal makes the taint set
+empty; zero is the cost of doing nothing. And per P16 it inherits the
+liability that sank the refusal: it must be right about every position from
+which a host value can enter, and it makes one `match`'s emission a function
+of a fact established elsewhere in the program — the property that produces
+bugs reproducing in one program and not another.
+
+**(b) Exhaustive matches on backed enums always emit a trap `else`.**
+
+Costs, all measured above: +39 bytes on the whole corpus; ~50 bytes per match
+in user code; one extra comparison when the last variant matches.
+
+What it breaks, concretely: `b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets`
+(`crates/vilan-core/tests/inference.rs:49612`) asserts **byte equality** of
+two whole emissions — a backed-enum match against a raw-`str` match with a
+`_` arm. Under (b) the backed side gains an arm the raw side does not, and
+the pin fails by construction. It **rewrites rather than retires**: give the
+raw side its own trap-shaped `_` arm and the equality holds again, since P13
+shows the two are the same emission. The claim it protects — §1.4/P2's "a
+string backing needs no new codegen path" — survives in a marginally weaker
+form (the reference shape becomes "a raw `str` match with a trap arm"), and
+that weakening should be written on the pin rather than absorbed silently.
+
+The real objection is philosophical: the compiler proves the match total in
+§1.5 and then emits code for the impossible case. The answer is that §1.5's
+proof is over the vilan-side *variant set*, and was never a proof about the
+runtime *value* — a backed enum lowers to a bare host primitive (§3.5), so
+its runtime domain is the host's, not the language's. Rust faces the same
+gap on a `repr` enum built from a transmuted byte and answers with `unsafe`;
+vilan has no `unsafe`, so a trap is how it pays.
+
+**(c) The boundary stays where §7.2 put it; `json.vl` uses `parse()` at its
+own boundary.**
+
+Two readings, and they measure differently.
+
+*As status quo* — leave `json.vl` alone — this is §8.3, already taken.
+Re-verified here rather than inherited: `kind()` and its four predicates have
+**13 call sites, all inside `json.vl`, and zero callers anywhere in
+`vilan/std/src`, `vilan/test`, `vilan/examples` or `vilan/docs`.** The
+standing cost is §4.2's 15 lines and 4 functions, plus the two members of the
+documented set that never got a predicate (`"object"`, `"null"`) staying
+uncovered — `is_null()` does not close that gap, being a separate intrinsic
+that tests the value against `null` rather than reading `kind()`.
+
+*As written* — `kind()` actually routing through `parse()` — it is **worse
+than doing nothing**:
+
+> **P15.** `fun kind_of(value: JsonValue): Option<JsonKind> {
+> JsonKind::parse(value.kind()) }` over the six-member set emits a **425-byte**
+> six-arm `===` chain, and every call allocates an `Option` (`[ 0, "number" ]`)
+> that each predicate must then unwrap — replacing today's single
+> `__json_kind(value) === "number"`.
+
+And neither reading closes P16, which is a hole in the language, not in
+`json.vl`.
+
+### 9.5 Recommendation: (b), always trap
+
+**Recommend (b).** Three reasons, in the order they should be weighed:
+
+1. **It is the only candidate that does not have to enumerate anything.** P16
+   is the argument: the refusal already tried to name every host-constructing
+   position and missed callback parameters. A trap arm asserts what §1.5
+   already proved, at the one place P12 shows the proof can be violated — it
+   never asks where the value came from. Adopting (b) also makes P16 *moot
+   rather than fixed*, because lifting the refusal removes the incomplete
+   check along with its hole.
+2. **The measured cost does not support the argument against it.** +39 bytes
+   on a 213 KB corpus, ~50 per match in user code, one extra `===` on the
+   last-variant path, and no new analysis in the analyzer or the transformer
+   — P13 shows the emission already exists.
+3. **It changes §7.2's answer from "allow it and hope" to "allow it and
+   find out".** §7.2 recommended allowing the return direction on consistency
+   grounds — `external fun f(): i32` returning `"hello"` is equally unchecked
+   — and the deferral was the owner declining that trade. (b) does not
+   re-argue it; it removes it. Under (b) a bogus host value is not detected
+   at the boundary (nothing is), but it can no longer become a *confident*
+   variant: the first `match` that meets it says so, loudly, with the raw
+   value in the message. Backed enums end up better checked than `i32`, which
+   is an asymmetry worth naming out loud rather than discovering later.
+
+Rejecting (a) is chiefly about the analyzer: it buys a strictly smaller
+guarantee than (b) for a strictly larger implementation, and it makes the
+emission of a `match` depend on a caller. Rejecting (c) is not a criticism of
+§8.3 — leaving it was right while the deferral stood — but (c) is a decision
+not to have a trap-arm story, and this note exists because one was asked for.
+
+Slices, if (b) is accepted:
+
+1. The trap arm in `scalar_variant_test`'s exhaustive path, plus the helper.
+   One pin per backing (`str`, integer), each proven non-vacuous.
+2. Rewrite `b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets`
+   to compare against a raw-`str` match with a trap arm, and record on the
+   pin why the reference shape moved.
+3. Lift §7.2's refusal — which deletes the check P16 found the hole in. A pin
+   that the callback shape now traps rather than lying is the regression test
+   for P16.
+4. §4.2's `json.vl` deletion (§9.6), and `docs/std/encoding.md` in the same
+   commit per the house rule.
+
+Steps 1 and 2 are independent of 3 and 4 and ship on their own; the trap arm
+is worth having whether or not the boundary ever opens.
+
+### 9.6 Worked example — `json.vl`'s fifteen lines, and what they actually cost
+
+§4.2's contingency is the right test of the winner because §8.3 already
+established it has no external callers, so the whole change is one file.
+
+Under (b), `external fun kind(self): JsonKind` becomes legal, the four
+predicates delete, and the 13 in-file call sites become
+`value.kind() == JsonKind::Number`. The result is better than §4.2 predicted
+in one way and worse in another, and both are worth writing down before
+anyone implements it:
+
+- **The 13 sites pay nothing.** P12 measured `==` on a backed enum as
+  `$a === "number"` — the same comparison against the same literal
+  `is_number()`'s body compiles to today. The four predicate wrappers stop
+  being emitted (emission is demand-driven, §8.2(a)), so the rewrite is a
+  net *reduction* in emitted bytes as well as the promised −15 source lines.
+- **The rewrite pays no trap cost either**, because `==` is not a `match`:
+  there is no exhaustive match over `JsonKind` in the rewritten file, so (b)'s
+  ~50-byte-per-match cost applies at zero sites in the worked example.
+- **§4.2's claim that `"object"` and `"null"` are "covered for free by
+  exhaustiveness" does not survive contact with this shape.** Exhaustiveness
+  covers a `match`; the 13 sites are `==` comparisons and get no coverage
+  from it. Buying that coverage means writing the decode checks *as* a match
+  over `JsonKind` — which is a better file, and which is then exactly the
+  site that pays (b)'s one added `===` and gains the trap. That is the trade
+  §4.2 should have stated, and it is small in both directions.
+
+So the winner's worked example costs `json.vl` nothing and returns 15 lines
+and four functions — which is what §4.2 promised, arrived at for a slightly
+different reason than §4.2 gave.
