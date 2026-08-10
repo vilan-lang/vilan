@@ -6933,7 +6933,7 @@ impl<'src> Analyzer<'src> {
     /// A view RETURN is excluded — rule 3's sanctioned projection, where the
     /// reference stays a reference and nothing crosses.
     fn compute_return_value_crossings(&self) -> HashSet<Id> {
-        let mut crossings = HashSet::new();
+        let mut crossings = HashSet::default();
         for function in self.functions.values() {
             if !function.has_body || function.returns_view {
                 continue;
@@ -15769,7 +15769,7 @@ impl<'src> Analyzer<'src> {
             )
         }));
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
-        let mut view_reads: HashSet<Id> = HashSet::new();
+        let mut view_reads: HashSet<Id> = HashSet::default();
         for (seam, closure_id, returns_view) in seams {
             let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
