@@ -50994,16 +50994,13 @@ fn b76_the_trap_arm_reaches_the_edge_shapes_of_a_match() {
 }
 
 #[test]
-#[ignore = "known limit: the trap arm is asked of the match's OWN subject, so a \
-            backed enum reached through a payload pattern keeps its bare `else` \
-            — see backed-enums.md §11"]
-fn b76_the_trap_arm_does_not_reach_a_nested_backed_pattern() {
-    // The residual §9 does not cover. `match p { Pair(Align::Start) => .. }`
-    // drops the LAST leg's whole condition, nested variant test included, so an
-    // out-of-set `Align` inside the payload still lands on the last arm
-    // confidently. Closing it wants a trap message design §9 does not have (a
-    // leg's condition can carry more than one backed test, and which one failed
-    // is not knowable at runtime), so it is recorded rather than guessed at.
+fn b114_the_trap_arm_reaches_a_nested_backed_pattern() {
+    // §11.6's residual, closed. `match p { Pair::Of(Align::Start) => .. }`
+    // dropped the LAST leg's whole condition, nested variant test included, so
+    // an out-of-set `Align` inside the payload landed on the last arm
+    // confidently. The trap question is now asked of the pattern TREE, and the
+    // value it names is the one the dropped test compared — the payload slot,
+    // not the subject.
     let javascript = compile(
         r#"
         import std::print;
@@ -51017,8 +51014,285 @@ fn b76_the_trap_arm_does_not_reach_a_nested_backed_pattern() {
     )
     .expect("a clean compile");
     assert!(
+        javascript.contains(
+            "\t} else if ($a[0] === 0 && $a[1] === \"flex-end\") {\n\t\t$b = \"e\";\n\
+             \t} else {\n\t\t__enum_trap(\"Align\", $a[1]);\n\t}"
+        ),
+        "the final leg should keep its nested test and trap at the PAYLOAD slot, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\n",
+        "the in-set path must be unchanged"
+    );
+}
+
+#[test]
+fn b114_a_nested_trap_names_the_out_of_set_payload() {
+    // The behavior the emission buys: driven with a payload the host invented,
+    // the match says so instead of answering `Align::End`. `__enum_trap` throws
+    // a bare string, which is `panic()`'s shape.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::Start))); }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "s\nAlign: \"middle\" is not one of its values\n",
+        "the nested trap should name the enum and the raw payload value"
+    );
+}
+
+#[test]
+fn b114_a_trap_reads_through_every_payload_it_is_nested_under() {
+    // Two levels of payload, and a TUPLE subject — the two other ways a backed
+    // test rides in a condition. The accessor the trap names is
+    // `compile_pattern`'s own, so it tracks the nesting exactly.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun deep(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s", Outer::Of(Mid::Of(Align::End)) => "e" }
+        }
+        fun paired(a: Align, flag: bool): str {
+            match (a, flag) {
+                (Align::Start, true) => "st",
+                (Align::Start, false) => "sf",
+                (Align::End, true) => "et",
+                (Align::End, false) => "ef",
+            }
+        }
+        fun main() {
+            print(deep(Outer::Of(Mid::Of(Align::End))));
+            print(paired(Align::End, false));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $a[1][1]);"),
+        "a twice-nested payload should trap at the inner slot, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $c[0]);"),
+        "a tuple subject should trap at the tuple's own element, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\nef\n",
+        "the in-set paths must be unchanged"
+    );
+}
+
+#[test]
+fn b114_several_backed_tests_in_one_leg_name_the_one_that_left_its_set() {
+    // The question §11.6 filed as needing a message design §9 does not have:
+    // `Two::Of(Align::End, Display::Inline)` carries TWO backed tests, and which
+    // of them failed is not knowable from the leg's condition. It IS knowable by
+    // asking each value whether it is in its enum's set AT ALL, which is a
+    // different question from "did this leg match" — so §9's message stands and
+    // the trap block orders the tests instead. The last needs no membership
+    // check: it is what is left when none of the others answered.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Display { Block = "block", Inline = "inline" }
+        enum Two { Of(Align, Display) }
+        fun label(t: Two): str {
+            match t {
+                Two::Of(Align::Start, Display::Block) => "sb",
+                Two::Of(Align::Start, Display::Inline) => "si",
+                Two::Of(Align::End, Display::Block) => "eb",
+                Two::Of(Align::End, Display::Inline) => "ei",
+            }
+        }
+        fun main() { print(label(Two::Of(Align::End, Display::Inline))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif (!($a[1] === \"flex-start\" || $a[1] === \"flex-end\")) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t}\n\
+             \t\t__enum_trap(\"Display\", $a[2]);\n\t}"
+        ),
+        "the trap should ask each backed test for SET MEMBERSHIP in order, got:\n{javascript}"
+    );
+    let driven = format!(
+        "{javascript}\n\
+         try {{ label([ 0, \"middle\", \"inline\" ]); }} catch (error) {{ console.log(error); }}\n\
+         try {{ label([ 0, \"flex-end\", \"grid\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "ei\n\
+         Align: \"middle\" is not one of its values\n\
+         Display: \"grid\" is not one of its values\n",
+        "each direction should name the value that actually left its set"
+    );
+}
+
+#[test]
+fn b114_a_nested_backed_test_reaches_the_sequence_emitter_too() {
+    // B59's flat `matched`-flag emission is the second shape a match takes, and
+    // §11.3 had to teach the top-level trap about it. The nested trap arrives
+    // through the same appended leg, so it needs to learn nothing.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair, o: Option<i32>): str {
+            match p {
+                Pair::Of(Align::Start) if o is Option::Some(let n) && n > 1 => "s!",
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+            }
+        }
+        fun main() { print(label(Pair::Of(Align::End), Option::None)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif (!($d)) {\n\t\t__enum_trap(\"Align\", $a[1]);\n\t}"),
+        "the sequence emission should trap at the nested slot, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\n",
+        "the in-set path must be unchanged"
+    );
+}
+
+#[test]
+fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
+    // The NARROW rule, which is the true one. §11.6 warned the generalization
+    // "changes the emission of matches over UNBACKED enums", and it does not:
+    // the trap keys on a BACKED test, and an unbacked enum's discriminant is the
+    // compiler's own — its runtime domain IS its variant set, so there is
+    // nothing outside it to name. A nested LITERAL is the same argument for a
+    // primitive. Both keep the bare `else` they have always had, which is why
+    // the whole corpus moved zero bytes.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner) }
+        enum Wrapped { Of(i32) }
+        fun nested(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b" }
+        }
+        fun literal(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
+        }
+        fun main() { print(nested(Pair::Of(Inner::B))); print(literal(Wrapped::Of(2))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an unbacked nested test must not grow a trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif ($a[0] === 0 && $a[1][0] === 0) {\n\t\t$b = \"a\";\n\t} else {"),
+        "the unbacked final leg should still drop its condition, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif ($c[0] === 0 && $c[1] === 1) {\n\t\t$d = \"one\";\n\t} else {"),
+        "the literal final leg should still drop its condition, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b114_a_written_catch_all_is_still_the_authors_own_arm() {
+    // P13's rule, unchanged one level down: a `_` the author wrote IS the trap
+    // arm, and the compiler must not add a second one behind it.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", _ => "other" }
+        }
+        fun main() { print(label(Pair::Of(Align::Start))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "a written catch-all needs no trap behind it, got:\n{javascript}"
+    );
+}
+
+#[test]
+#[ignore = "known limit: a backed test in an EARLIER leg still reaches the final \
+            leg's bare `else` — a distinct shape from B114's, needing a message \
+            the trap point cannot compute; see backed-enums.md §12.4"]
+fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
+    // Found probing B114. The final leg carries no backed test, so it drops its
+    // condition as it always did — but an EARLIER leg's nested `Align` test can
+    // fail for an out-of-set value, and the fall-through then answers
+    // `Pair::Other` confidently. The trap point cannot name the offending value
+    // in general: which payload slot holds it depends on which variant the
+    // subject is, and the final leg's arm is reached from all of them.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
         javascript.contains("__enum_trap"),
-        "a nested backed pattern should trap too, got:\n{javascript}"
+        "an out-of-set payload must not become `Pair::Other`, got:\n{javascript}"
+    );
+}
+
+#[test]
+#[ignore = "known bug: exhaustiveness is checked on the TOP-LEVEL variant set \
+            only, so a refutable nested pattern is accepted as total — see \
+            backed-enums.md §12.4"]
+fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
+    // Found probing B114, and it is the analyzer's, not the trap's: `Pair` has
+    // one variant, so §1.5's by-name check calls this total and the single leg
+    // becomes the bare `else`. `Pair::Of(Inner::B)` then runs the `Inner::A`
+    // arm. The right answer is a compile error naming the missing case — a trap
+    // would paper over a missing check with a runtime throw.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a" }
+        }
+        fun main() { print(label(Pair::Of(Inner::B))); }
+        "#,
+        "match is not exhaustive",
     );
 }
 

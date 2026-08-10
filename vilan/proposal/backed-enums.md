@@ -1831,6 +1831,11 @@ backed test rides in it), which is a corpus-wide byte question §9's
 measurement did not ask. Pinned as `b76_the_trap_arm_does_not_reach_a_nested_backed_pattern`,
 `#[ignore]`d, asserting the desired outcome.
 
+> **CLOSED by B114 (cycle 15) — see §12.** Both worries turned out to be
+> answerable: the message needs no redesign, and the unbacked emission does
+> not move at all. The pin is live, renamed
+> `b114_the_trap_arm_reaches_a_nested_backed_pattern`.
+
 ### 11.7 Ledger
 
 - **B107 is MOOT, as §9.5.1 predicted** — the incomplete check deletes with
@@ -1851,3 +1856,150 @@ measurement did not ask. Pinned as `b76_the_trap_arm_does_not_reach_a_nested_bac
   `bindgen/only_closure.vl` (the direct return, the property, the doc
   comment). Each verified by reading the diff.
 
+## 12. B114 — the trap follows the pattern, not the subject (cycle 15)
+
+§11.6's residual, closed. The trap arm's question was asked of the final
+leg's pattern *root* — `ExprPattern::Variant` of a backed enum — so a
+backed enum reached through a payload (`Pair::Of(Align::Start)`) kept the
+bare `else` §9 exists to remove. It is now asked of the pattern **tree**:
+every backed test the leg carries, at the accessor `compile_pattern` reads
+it from.
+
+§11.6 filed two reasons for recording it rather than guessing, and the
+build answered both — one of them by measurement, the other by asking a
+different question. Neither answer is the one §11.6 expected.
+
+### 12.1 The message needs no redesign — a second question does
+
+§11.6: *"a leg's condition can carry more than one backed test, and which
+of them failed is not knowable at runtime, so the trap cannot name 'the
+enum and the raw value' the way §9.4 requires."*
+
+The premise is exact and the conclusion does not follow. **Which test
+failed is not knowable; which VALUE left its set is.** They are different
+questions and only the second one matters:
+
+| the leg's own test | the trap's question |
+|---|---|
+| `$a[1] === "flex-end"` — did this arm match | `$a[1] === "flex-start" \|\| $a[1] === "flex-end"` — is it an `Align` at all |
+
+The first is false for `Align::Start`, which is a perfectly good `Align`.
+The second is false only for a value that was never one. So a leg carrying
+K backed tests emits K−1 membership-guarded traps and one bare one:
+
+```js
+} else {
+    if (!($a[1] === "flex-start" || $a[1] === "flex-end")) {
+        __enum_trap("Align", $a[1]);
+    }
+    __enum_trap("Display", $a[2]);
+}
+```
+
+The last needs no guard: it is what is left when none of the others
+answered. Driven both ways, an out-of-set `Align` names `Align` and an
+out-of-set `Display` names `Display` — pinned. §9.4's message, the
+`__enum_trap` helper and its interpreter twin are all untouched, and
+**K = 1 emits exactly what shipped in cycle 14**, byte for byte, because
+the sole test is unconditional and its accessor is the subject itself when
+the pattern's root is the backed test. That is what keeps §11's whole pin
+set green without a line of rewriting.
+
+The membership chain costs bytes only inside a trap block, which runs
+never, and only when a single leg tests two or more backed enums — a shape
+that does not occur anywhere in the tree (§12.2).
+
+### 12.2 The unbacked emission does not move — the narrow rule is the true one
+
+§11.6: *"the generalization also changes the emission of matches over
+UNBACKED enums … which is a corpus-wide byte question §9's measurement did
+not ask."*
+
+Asked, both ways, and the answer is **zero** — because the generalization
+does not have to touch them. The trap keys on a **backed test**, not on a
+refutable one:
+
+- an unbacked enum's discriminant is written by the language itself
+  (§1.2's tagged array), so its runtime domain **is** its variant set and
+  §1.5's proof *is* a proof about the value — exactly the argument §9.5
+  makes for why a backed enum is different, applied one level down;
+- a nested LITERAL pattern (`Wrapped::Of(1)`) is the same argument for a
+  primitive.
+
+So `match p { Pair::Of(Inner::A) => .., Pair::Of(Inner::B) => .. }` keeps
+the bare `else` it always had, at any depth. Measured rather than
+asserted: **0 goldens moved** across the 114-program corpus gate, and an
+instrumented binary reports **0** sites even for the WIDER rule — no final
+leg anywhere in `vilan/test`, `vilan/examples`, `vilan/benchmarks` or the
+`docs` fences carries a refutable nested pattern at all, backed or not.
+The fourth time this family has measured a return of zero (§11.5 of
+`element-clones.md` counts three).
+
+The narrow rule is also the *true* one, which is the reason to prefer it
+over the cheap one: widening the trap to unbacked nested tests would
+convert a missing compile-time check into a runtime throw. §12.4 files
+that check.
+
+### 12.3 The shapes, probed before choosing
+
+Every one built and driven with this worktree's binary.
+
+| shape | source | trap |
+|---|---|---|
+| payload, one level | `Pair::Of(Align::End)` | `__enum_trap("Align", $a[1])` |
+| payload, two levels | `Outer::Of(Mid::Of(Align::End))` | `__enum_trap("Align", $a[1][1])` |
+| tuple subject | `(Align::End, false)` | `__enum_trap("Align", $c[0])` |
+| two backed tests in one leg | `Two::Of(Align::End, Display::Inline)` | §12.1's ordered pair |
+| mixed backed / unbacked | `Pair::Of(Align::End)` under an unbacked `Pair` | the payload only — `Pair`'s own tag is not asked |
+| B59 SEQUENCE emitter | a guard needing statement slots | `if (!($d)) __enum_trap("Align", $a[1])` |
+| a WRITTEN `_` arm | `Pair::Of(Align::Start) => .., _ => ..` | none — P13's rule, unchanged |
+| unbacked nested / nested literal | `Pair::Of(Inner::A)`, `Wrapped::Of(1)` | none — §12.2 |
+
+The backed test is always a LEAF, which is what makes the walk total: a
+backed enum may not have payload variants (§3.3), so nothing is ever
+reached *through* one.
+
+### 12.4 Two shapes found probing, both filed rather than guessed at
+
+- **A backed test in an EARLIER leg still reaches the bare `else`.**
+  `match p { Pair::Of(Align::Start) => .., Pair::Of(Align::End) => ..,
+  Pair::Other => .. }` — the final leg carries no backed test, so it drops
+  its condition as it always did, and an out-of-set payload falls through
+  to answer `Pair::Other` confidently. This is B114's hazard reached by a
+  different route, and the message §12.1 solves does not solve it: which
+  payload slot holds the offending value depends on which variant the
+  subject is, and the final arm is reached from all of them. Naming it
+  wants either a per-variant re-dispatch in the trap block or a different
+  design entirely. Pinned `#[ignore]`d as
+  `b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`.
+- **Exhaustiveness is checked on the top-level variant set only**, so a
+  refutable NESTED pattern is accepted as total: `match p {
+  Pair::Of(Inner::A) => "a" }` compiles clean and answers `"a"` for
+  `Pair::Of(Inner::B)` — silent wrong code for a perfectly in-set value,
+  and nothing to do with the host boundary. `Wrapped::Of(1)` over `i32` is
+  the same shape with an infinite domain. This is the analyzer's, not the
+  trap's: the right answer is the compile error §1.5 already knows how to
+  write, and a trap here would paper over a missing check. Pinned
+  `#[ignore]`d as `b114_a_refutable_nested_pattern_is_not_exhaustive`,
+  asserting the refusal.
+
+  The two interact at exactly one point, and it is worth stating so the
+  message is not read as more than it claims: under this hole a match can
+  reach the trap with every value **in** set, and the trap then names an
+  in-set value as out-of-set. It is still strictly better than the silent
+  wrong answer it replaces, it points at the right enum and the right
+  value, and it stops being reachable the moment the exhaustiveness check
+  is fixed.
+
+### 12.5 Ledger
+
+- **Pins: 9** (7 live, 2 `#[ignore]`d), all in `crates/vilan-core/tests/inference.rs`.
+  §11.6's `#[ignore]`d pin is live and renamed.
+- **Plants: 3**, each red on the pins it should be:
+  the walk stopped at the pattern root (5 red — the shipped §11.6 behavior
+  restored), the membership question dropped (1 red), the trap widened to
+  every nested variant test (6 red, `b114_a_match_carrying_no_backed_test_keeps_its_bare_else`
+  among them).
+- **Goldens moved: 0.**
+- `docs/spec/types.md`'s trap-arm section gains the nested form and the
+  unbacked non-form, in the same commit.
