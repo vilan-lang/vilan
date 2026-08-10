@@ -1,0 +1,44 @@
+// B105: a compound assignment desugars to `x = x op v`, so the target place is
+// walked twice — and every effectful subscript in it used to RUN twice
+// (`ys[bump()] += 1` emitted `__at_put(ys, bump(), __at(ys, bump()) + 1)`).
+// Each one is now evaluated once, into a temp both walks name.
+//
+// The byte diff between the two halves below IS the rule: an effectful
+// subscript gets a temp, a pure one is left exactly as it was.
+import std::print;
+
+struct Cell { n: i32 }
+
+mut calls = 0;
+
+fun bump(): i32 {
+	calls += 1;
+	0
+}
+
+fun main() {
+	// The filed repro: one call, one increment.
+	mut ys = [10, 20];
+	ys[bump()] += 1;
+	print(ys[0]);
+	print(calls);
+
+	// Through a FIELD of the indexed element — the effectful subscript is in
+	// the target's subject, not at its top.
+	mut cells = [Cell { n = 10 }, Cell { n = 20 }];
+	cells[bump()].n += 1;
+	print(cells[0].n);
+	print(calls);
+
+	// Two subscripts, both effectful: each is hoisted, in source order.
+	mut grid = [[1, 2], [3, 4]];
+	grid[bump()][bump()] += 100;
+	print(grid[0][0]);
+	print(calls);
+
+	// A PURE subscript keeps the plain emission — no temp is minted for it.
+	let index = 1;
+	ys[index] += 5;
+	print(ys[1]);
+	print(calls);
+}

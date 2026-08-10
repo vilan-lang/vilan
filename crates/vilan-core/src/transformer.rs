@@ -1406,6 +1406,10 @@ struct Transformer<'src> {
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
     is_bindings: HashMap<Id, js::Node<'src>>,
+    // Expressions already evaluated into a temp, which every occurrence names
+    // instead of re-evaluating: a compound assignment's INDEXED target subscript,
+    // walked once for the write and once for the synthesized re-read (B105).
+    hoisted_values: HashMap<Id, js::Node<'src>>,
     // While `Some`, every `is_bindings` lookup records the capture it resolved.
     // A match guard is walked with this on, so the leg's lowering can tell
     // whether the guard READS a capture whose copy has to be declared ahead of
@@ -1581,6 +1585,7 @@ impl<'src> Transformer<'src> {
             drop_helpers: HashMap::new(),
             monomorphized: Vec::new(),
             is_bindings: HashMap::new(),
+            hoisted_values: HashMap::new(),
             is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
@@ -2314,6 +2319,106 @@ impl<'src> Transformer<'src> {
         )));
     }
 
+    /// The compound-assignment subscript hoist (B105). `x[i] op= v` desugars to
+    /// `x[i] = x[i] op v`, and the two `x[i]`s are two independent walks of the
+    /// same source place — so every effectful subscript in the target ran TWICE
+    /// (`ys[bump()] += 1` emitted `__at_put(ys, bump(), __at(ys, bump()) + 1)`).
+    /// Each is evaluated ONCE into a temp declared ahead of the statement, and
+    /// both occurrences name the temp.
+    ///
+    /// The compound-ness comes from the analyzer's own record rather than from
+    /// the shape: `ys[f()] = ys[g()] + 1` has the same shape and two genuinely
+    /// different subscripts.
+    fn hoist_compound_target(
+        &mut self,
+        target_id: Id,
+        value_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        // The re-read is the synthesized left operand of the desugared binary. An
+        // OVERLOADED operator keeps this shape — its dispatch is a side map
+        // (`binary_op_dispatch`), not a different expression — and a VIEW target
+        // wraps both halves alike in R5's synthetic `Dereference`, under which the
+        // analyzer's mark sits.
+        let Some(&Expr::Binary(_, left_id, _)) = self.program.entity_map.get(&value_id) else {
+            return;
+        };
+        let reread_id = match self.program.entity_map.get(&left_id) {
+            Some(&Expr::Dereference(operand)) => operand,
+            _ => left_id,
+        };
+        if !self.program.compound_rereads.contains(&reread_id) {
+            return;
+        }
+        self.hoist_compound_place(target_id, reread_id, block);
+    }
+
+    /// The two place spines in lockstep — they are the same source place walked
+    /// twice, so they match node for node, and pairing them is what lets the
+    /// re-read name the write's temp.
+    ///
+    /// Descends to the ROOT first, so the temps land in source order (`grid[f()][g()]`
+    /// evaluates `f()` before `g()`), which is also the order the un-hoisted
+    /// emission ran them in — a JS call evaluates its arguments left to right, and
+    /// the subscript is `__at_put`'s second argument while the read is its third.
+    /// Nothing but the duplication changes.
+    ///
+    /// A **pure** subscript is deliberately left alone: evaluating `i` twice is
+    /// not an observable difference, and a temp for it would churn goldens with
+    /// nothing to show for it.
+    fn hoist_compound_place(
+        &mut self,
+        target_id: Id,
+        reread_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        let matched = match (
+            self.program.entity_map.get(&target_id),
+            self.program.entity_map.get(&reread_id),
+        ) {
+            (
+                Some(&Expr::Index(target_subject, target_index)),
+                Some(&Expr::Index(reread_subject, reread_index)),
+            ) => Some((
+                target_subject,
+                reread_subject,
+                Some((target_index, reread_index)),
+            )),
+            (
+                Some(&Expr::Field(target_subject, _, _)),
+                Some(&Expr::Field(reread_subject, _, _)),
+            )
+            | (
+                Some(&Expr::TupleIndex(target_subject, _, _)),
+                Some(&Expr::TupleIndex(reread_subject, _, _)),
+            )
+            | (
+                Some(&Expr::Dereference(target_subject)),
+                Some(&Expr::Dereference(reread_subject)),
+            ) => Some((target_subject, reread_subject, None)),
+            _ => None,
+        };
+        let Some((target_subject, reread_subject, index)) = matched else {
+            return;
+        };
+        self.hoist_compound_place(target_subject, reread_subject, block);
+        if let Some((target_index, reread_index)) = index
+            && self.expr_has_side_effects(target_index)
+        {
+            let value = self
+                .walk_entity(target_index, block)
+                .unwrap_or(js::Node::Void);
+            let name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(value),
+            }));
+            let temp = js::Node::Local(name);
+            self.hoisted_values.insert(target_index, temp.clone());
+            self.hoisted_values.insert(reread_index, temp);
+        }
+    }
+
     /// Whether an expression may have a side effect — a call, an `await`, or an
     /// assignment, or anything containing one. An unused `let` binding can be
     /// dropped only if its initializer is side-effect-free; a side-effecting one
@@ -2653,6 +2758,11 @@ impl<'src> Transformer<'src> {
         // never short-circuits an evaluation.
         if let Some(value) = self.program.const_results.get(&id) {
             return Some(const_value_to_js(value));
+        }
+        // An expression already evaluated into a temp (B105) names the temp: the
+        // whole point is that the second occurrence does not run it again.
+        if let Some(hoisted) = self.hoisted_values.get(&id) {
+            return Some(hoisted.clone());
         }
         let entity = self.program.entity_map.get(&id).unwrap();
 
@@ -3770,6 +3880,12 @@ impl<'src> Transformer<'src> {
                 }
             }
             Expr::Assignment(target_id, value_id) => {
+                // B105: a compound assignment desugars to `x = x op v`, which walks
+                // the target place TWICE — so an effectful subscript in it ran
+                // twice. Evaluate each one here, first, into a temp both walks
+                // name; source order puts the subscript ahead of everything the
+                // write does, the drop below included.
+                self.hoist_compound_target(*target_id, *value_id, block);
                 // R2 (destruction.md §5): assigning onto a place that still holds
                 // a resource drops the OLD value first, then moves the new one in.
                 // The analyzer flagged the assignment and resolved the overwritten

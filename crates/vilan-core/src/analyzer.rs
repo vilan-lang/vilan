@@ -20,6 +20,16 @@ use crate::util::{join_with, plural};
 const CYCLE_SUBSTITUTE: u8 = 0;
 const CYCLE_RECONCILE: u8 = 1;
 
+/// `i53`'s edge — the largest integer a JS number (an IEEE-754 double) holds
+/// exactly, and therefore the largest **enum discriminant** the emission can
+/// carry (B106). A backed enum IS its backing value at runtime
+/// (`backed-enums.md` §3.4), so a discriminant is emitted as a bare JS numeric
+/// literal: past this bound the literal the host reads back is a *different*
+/// number (`= 9007199254740993` reads as `…992`). The range is symmetric,
+/// because JS's safe integers are — unlike `i64`'s, whose negative end reaches
+/// one further because two's complement does.
+const I53_MAX: i64 = (1 << 53) - 1;
+
 thread_local! {
     /// The `(operation, generic constraint id)` pairs currently being resolved on
     /// the active recursion path, so a cyclic mapping terminates.
@@ -1621,7 +1631,9 @@ pub struct Analyzer<'src> {
     // (`x += v` desugars to `x = x + v`). When the target is a view, this re-read
     // must also read *through* it (transparent references R5), so it is tracked
     // to be deref-wrapped alongside the target — distinct from a user-written
-    // value-position read, which keeps its explicit `*` (R6).
+    // value-position read, which keeps its explicit `*` (R6). Published on
+    // `Program`, because the re-read is also a second walk of the target's
+    // SUBSCRIPT and the emission has to evaluate that only once (B105).
     compound_reread_ids: HashSet<Id>,
     // Literal-element diagnostics already emitted (keyed by the offending item's
     // expr id, or the literal's own id for a count mismatch). These checks run
@@ -12125,21 +12137,28 @@ impl<'src> Analyzer<'src> {
                     positions.insert(position);
                 }
             }
-            // A `&`/`&mut` parameter forwarded straight out (`same(x) = x`).
+            // A `&`/`&mut` parameter forwarded straight out (`same(x) = x`) —
+            // unless the return copies it out of the loan.
             //
-            // Deliberately NOT gated on `Function::returns_view`, though B100
-            // makes that gate tempting: `fun copy(&self): Holder { self }` now
-            // returns a COPY, so calling it a borrow leaves its result
-            // classified as a view at every call site (it cannot be `mut`, and
-            // a write to it lowers as a write-through). Narrowing the arm was
-            // measured and refused — with `borrows` empty, `check_view_escape`
-            // rejects the body outright ("a view cannot escape its scope"),
-            // which answers a *rule 3* question this arc did not ask and breaks
-            // programs that compile today. The stale classification is
-            // conservative (a view binding is the more restricted one) and
-            // unchanged from before B100; filed rather than ridden in.
+            // B104: this arm is the one whose leaf is a PLACE, so it is the one
+            // rule 1's return clause reaches, and the two passes must give the
+            // same answer about the same seam. Where rule 1 copies, what leaves
+            // `fun copy(&self): Holder { self }` is a `Holder` and the function
+            // projects nothing; recording it as a borrow classified the result
+            // as a view at every call site — it could not be `mut`, and a write
+            // to it lowered as a write-through into the receiver it no longer
+            // aliases.
+            //
+            // The other arms are deliberately NOT gated, because rule 1 does
+            // not reach their leaves: a `&place` leaf and a wrapped/chained
+            // call leaf are not places, no copy is inserted for them, and the
+            // result really does alias whatever the signature says. Calling
+            // those borrows is what keeps the call site's classification honest
+            // about the alias (`element-clones.md` §9.3).
             Some(Expr::Local(_)) => {
-                if let Some(position) = self.projected_parameter_position(function_id, leaf_id) {
+                if !self.by_value_return_copies_the_place(function_id, leaf_id)
+                    && let Some(position) = self.projected_parameter_position(function_id, leaf_id)
+                {
                     positions.insert(position);
                 }
             }
@@ -12177,6 +12196,36 @@ impl<'src> Analyzer<'src> {
             .iter()
             .position(|parameter_id| *parameter_id == root)
             .map(|index| index as u32)
+    }
+
+    /// Whether rule 1's return clause copies a returned place OUT of the loan it
+    /// was read from, so that what leaves the function is a value and the
+    /// function projects nothing (B104, `element-clones.md` §9.3). Asked by
+    /// rule 3's two passes — the `borrows` root-set here and
+    /// [`Self::check_view_escape`] — so both agree with
+    /// `compute_return_clone_sites` about the same seam: a copied place left the
+    /// loan; an uncopied one did not.
+    ///
+    /// Three halves, all of them that seam's own conditions. The signature must
+    /// return by VALUE — a view return is rule 3's sanctioned projection, an
+    /// alias on purpose. The place must not be a resource one, which MOVES
+    /// rather than copies (R1 refuses moving a resource out of a loan outright,
+    /// so this half is a guard, not a live case). And its value type must be a
+    /// **cloneable aggregate**: a scalar has no aggregate storage to copy, and a
+    /// *generic* `&T` is worse than uncopied — it lowers as a `(base, key)` pair
+    /// at a scalar instantiation, which `__clone` cannot collapse. Both keep the
+    /// alias, so both keep the (conservative) borrow classification they had
+    /// before this fix.
+    fn by_value_return_copies_the_place(&self, function_id: Id, leaf_id: Id) -> bool {
+        let returns_view = self
+            .functions
+            .get(&function_id)
+            .is_some_and(|function| function.returns_view);
+        if returns_view || self.resource_value_places.contains(&leaf_id) {
+            return false;
+        }
+        self.place_value_type(leaf_id)
+            .is_some_and(|value_type| self.is_cloneable_aggregate(&value_type))
     }
 
     /// If `call_id` is a wrapped-view constructor `Some(&place)` whose payload
@@ -12705,13 +12754,15 @@ impl<'src> Analyzer<'src> {
         // A function or closure body whose trailing expression escapes a view
         // returns it implicitly. A `borrows` function may return one — but only a
         // projection of a (view) parameter, whose target the caller keeps alive;
-        // a view of a local still dangles and is rejected.
+        // a view of a local still dangles and is rejected. A by-value return
+        // hands back no view at all (B104), so it is never an escape.
         for function in self.functions.values() {
             if self.frozen_entity(function.id) {
                 continue;
             }
             if function.has_body
                 && self.escapes_as_view(function.body.1, &view_bindings, &capturing)
+                && !self.by_value_return_copies_the_view(function)
                 && (function.borrows.is_empty() || !self.derives_from_view_param(function.body.1))
             {
                 escapes.push(function.body.1);
@@ -12754,6 +12805,26 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
                 if capturing.contains(closure_id)
         )
+    }
+
+    /// Whether a by-value return turns the view the body hands back into a
+    /// value, so rule 3 has nothing to reject (B104, `element-clones.md` §9.3) —
+    /// the escape check's half of [`Self::by_value_return_copies_the_place`],
+    /// which is also what emptied this function's root-set.
+    ///
+    /// The place must root at a LOANED parameter, which is storage the frame
+    /// does not own and so exactly what rule 1's return clause copies. The two
+    /// shapes rule 1 does *not* reach stay rejected, because for them the alias
+    /// really does leave: a view of a LOCAL (rule 1 leaves it alone — the frame
+    /// is a dead owner donating its storage, so the view dangles), and a
+    /// `&place` leaf, which is not a place at all and never reaches the seam.
+    fn by_value_return_copies_the_view(&self, function: &Function) -> bool {
+        let roots_at_a_loan = self.place_root(function.body.1).is_some_and(|root| {
+            self.parameters.get(&root).is_some_and(|parameter| {
+                matches!(parameter.convention, Convention::Ref | Convention::RefMut)
+            })
+        });
+        roots_at_a_loan && self.by_value_return_copies_the_place(function.id, function.body.1)
     }
 
     /// Whether an expression (a `borrows` function's returned view) projects a
@@ -16228,22 +16299,22 @@ impl<'src> Analyzer<'src> {
             Some(hex) => u128::from_str_radix(hex, 16),
             None => whole.parse::<u128>(),
         };
-        // A negative discriminant reaches one past the positive bound, exactly
-        // as the literal `-9223372036854775808` does elsewhere: the minus is
-        // applied to the magnitude, not parsed into it.
-        let bound = if negative {
-            1u128 << 63
-        } else {
-            (1u128 << 63) - 1
-        };
+        // B106: the bound is the EMISSION's, not `i64`'s. It is symmetric —
+        // `i64`'s negative end reaches one further only because two's
+        // complement does, and a JS number has no such asymmetry — so the minus
+        // buys nothing here.
         match magnitude {
-            Ok(magnitude) if magnitude <= bound => Some(BackingValue::Int(match negative {
-                true => (magnitude as i64).wrapping_neg(),
-                false => magnitude as i64,
-            })),
+            Ok(magnitude) if magnitude <= I53_MAX as u128 => {
+                Some(BackingValue::Int(match negative {
+                    true => -(magnitude as i64),
+                    false => magnitude as i64,
+                }))
+            }
             _ => reject(format!(
                 "the enum discriminant `{written}` is out of range \
-                 (-9223372036854775808 ..= 9223372036854775807)"
+                 (-{I53_MAX} ..= {I53_MAX}): a backed enum is a JS number at \
+                 runtime, and an integer past 2^53 - 1 has no exact double, so \
+                 the emitted literal would be a different value"
             )),
         }
     }
@@ -17730,8 +17801,9 @@ impl<'src> Analyzer<'src> {
                                         span: variant.1,
                                         msg: format!(
                                             "variant '{variant_name}' continues the discriminant \
-                                             sequence past 9223372036854775807; give it an \
-                                             explicit discriminant"
+                                             sequence past {I53_MAX}, the largest integer a JS \
+                                             number holds exactly; give it an explicit \
+                                             discriminant"
                                         ),
                                     });
                                 }
@@ -17741,7 +17813,11 @@ impl<'src> Analyzer<'src> {
                     };
                     if let Some(backing_value) = &backing_value {
                         if let BackingValue::Int(discriminant) = backing_value {
-                            next_discriminant = discriminant.checked_add(1);
+                            // The continuation stops at the same edge an explicit
+                            // discriminant does (B106): a continued value is emitted
+                            // as the same bare JS literal.
+                            next_discriminant =
+                                discriminant.checked_add(1).filter(|next| *next <= I53_MAX);
                         }
                         let (key, rendered) = match backing_value {
                             BackingValue::Int(value) => {
@@ -28498,6 +28574,11 @@ pub struct Program<'src> {
     pub try_dispatch: HashMap<Id, TryDispatch>,
     /// Per `?.` site: the lowering (proposal/try-and-lift.md §3–4).
     pub lift_dispatch: HashMap<Id, LiftDispatch>,
+    /// The compiler-synthesized target re-reads of compound assignments (`x op= v`
+    /// desugars to `x = x op v`, walking the target twice). The transformer reads
+    /// it to recognize a compound write and evaluate an INDEXED target's subscript
+    /// exactly once (B105) — `ys[bump()] += 1` ran `bump()` twice.
+    pub compound_rereads: HashSet<Id>,
     pub bitwise_u32: HashSet<Id>,
     pub bitwise_generic_lhs: HashMap<Id, TypeId>,
     pub integer_division: HashSet<Id>,
@@ -30099,10 +30180,12 @@ pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
 /// it is what `Ordering::Greater.value() == 1` compares against without
 /// friction; `i53` is the widest integer a JS number represents exactly, and a
 /// backed enum IS a JS number. `None` — no conversions at all — when a
-/// discriminant is outside `i53`, because the bare lowering already cannot
-/// represent it and `value()` would be a lie.
+/// discriminant is outside `i53`; since B106 that is only ever a discriminant
+/// the range check has already REJECTED (this runs on the written literals, at
+/// derive-expansion time, so it still meets one), and generating nothing keeps
+/// a rejected enum to its one error.
 fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<String> {
-    const I53_MAX: i128 = (1 << 53) - 1;
+    let bound = i128::from(I53_MAX);
     let mut lowest: i128 = 0;
     let mut highest: i128 = 0;
     for (_, backing) in written {
@@ -30132,7 +30215,7 @@ fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<Strin
     if lowest >= i32::MIN as i128 && highest <= i32::MAX as i128 {
         return Some("i32".to_string());
     }
-    if lowest >= -I53_MAX && highest <= I53_MAX {
+    if lowest >= -bound && highest <= bound {
         return Some("i53".to_string());
     }
     None
@@ -33198,6 +33281,7 @@ fn analyze_over_world<'src>(
         bound_dispatch_traits: analyzer.bound_dispatch_traits,
         try_dispatch: analyzer.try_dispatch,
         lift_dispatch: analyzer.lift_dispatch,
+        compound_rereads: analyzer.compound_reread_ids,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,

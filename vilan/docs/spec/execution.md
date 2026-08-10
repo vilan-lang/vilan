@@ -85,7 +85,9 @@ host's own reporting.
 Within an expression, evaluation is **left-to-right**: operands before
 operators apply, the callee before its arguments, arguments in source
 order, the receiver before method arguments. A compound assignment
-evaluates its target place once. Short-circuit: `&&` and `||` evaluate
+evaluates its target place once — **subscripts included**, so
+`ys[bump()] += 1` calls `bump()` exactly once, before the read.
+Short-circuit: `&&` and `||` evaluate
 the right operand only when needed. `if`/`match` evaluate exactly the
 taken branch; a `match` evaluates its subject once, then tests legs top
 to bottom (first matching leg wins; its guard is evaluated only when the

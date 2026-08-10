@@ -376,7 +376,9 @@ error. That is rule 3's call, not rule 1's, and it wants its own measurement.
 The residual left standing is conservative (a view binding is the more
 restricted one) and unchanged from before this fix. Filed.
 
-**(b) ships.**
+**(b) ships.** (The residual closed as B104 — §10. Candidate (c) was right
+about *where*, and its failure was a missing half rather than a wrong idea:
+rule 3's escape check needed the same signature fact rule 1 already had.)
 
 ### 9.4 Coverage
 
@@ -413,3 +415,101 @@ nothing about the caller's later writes, so a `&self` receiver earns no
 exemption. The elision that *would* apply is §7's first open item — an escape
 summary consulted at the CALL site, where deadness is visible — and B100's
 copies join that item rather than motivating a new one.
+
+## 10. B104 — the classification catches up, 2026-08-10
+
+> **Status: SHIPPED.** §9.3's refused candidate (c), taken on its own terms.
+> `infer_borrows` still recorded `fun copy(&self): Holder { self }` as
+> borrowing its receiver, so the result bound as a VIEW at every call site
+> (`mut c = h.copy()` was rejected, and a write to `c` lowered as a
+> write-through) although B100 had made the return a copy.
+
+### 10.1 One seam, one answer
+
+B100 put the exemption in the signature: at a return seam,
+`compute_return_clone_sites` reads `Function::returns_view`. Rule 3's root-set
+was still reading the LEAF, so the two passes described the same seam
+differently — and rule 1's was the true one, because it is the pass that emits.
+
+> **A place the return COPIES has left the loan.** The function projects
+> nothing through it, so it contributes no `borrows` position.
+
+That is a statement about *one arm*. `collect_leaf_borrows_position` has four,
+and the gate belongs only to the one whose leaf is a PLACE — the forwarded
+`&`/`&mut` parameter — because that is the only leaf rule 1 reaches:
+
+| arm | leaf | rule 1 copies it? | gated |
+|---|---|---|---|
+| forwarded parameter (`self`) | a place | yes | **yes** |
+| `&self.x` | not a place (`place_root` = `None`) | no | no |
+| `Some(&mut self.x)` | a call | no | no |
+| a borrows-call chain | a call | no | no |
+
+The three ungated arms hand back an alias whatever the signature says, and the
+borrow classification is what keeps their call sites honest about it. Two of
+them are latent wrongness on rule 1's side, not this one's — §10.4.
+
+### 10.2 The escape check still accepts the forwarder
+
+This is the hazard §9.3 recorded, and it is real: with the root-set empty,
+`check_view_escape` reported *"a view cannot escape its scope"* against a body
+that compiles today. The answer is not to loosen rule 3 but to give it the same
+fact rule 1 has — **a by-value return hands back no view at all**, so there is
+nothing to escape. The clause is deliberately narrow, and the two shapes rule 1
+does not reach stay rejected exactly as before:
+
+- a view of a **local** — rule 1 leaves it alone (the frame is a dead owner
+  donating its storage), so nothing converts it and it still dangles;
+- a **`&place`** leaf — not a place, never reaches the seam.
+
+`by_value_return_copies_the_view` is `by_value_return_copies_the_place` plus
+"and it roots at a loaned parameter", so the pass that empties the set and the
+pass that tolerates the emptying cannot drift apart.
+
+### 10.3 The gate is CLONEABLE-AGGREGATE, not by-value
+
+Measured, not assumed. Gating on `returns_view` alone regressed two shapes,
+because rule 1's copy does not reach them:
+
+| forwarded parameter | rule 1 | by-value-only gate | shipped gate |
+|---|---|---|---|
+| `&Holder` (a struct, list, tuple, array) | `__clone` | correct | correct |
+| `&mut i32` (a scalar) | nothing to clone | **leaks the `(base, key)` pair** | keeps the borrow |
+| `&T` (generic) | `__clone`, identity on scalars | **leaks the pair at `T = i32`** | keeps the borrow |
+
+A scalar view IS a `(base, key)` pair at runtime; `__clone` cannot collapse one,
+and a generic `&T` is boxed for exactly that reason. So the gate asks rule 1's
+own admission test — cloneable aggregate, non-resource — and where no copy is
+inserted the conservative view classification stays, unchanged from before this
+fix. The resource half is a guard rather than a live case: R1 refuses moving a
+resource out of a loan before any of this is consulted (pinned, both the
+declared and the by-containment spelling).
+
+### 10.4 Coverage, and what stayed wrong
+
+Ten pins in `crates/vilan-core/tests/inference.rs`, three plants:
+
+| plant | red |
+|---|---|
+| the arm ungated — the B104 bug restored | 2 (both `binds_mut` pins) |
+| the escape-check clause removed | 4, including **B100's own** `a_view_receiver_forwarded_whole_into_a_by_value_return_copies` |
+| the gate reads by-value only | 2 (the scalar and generic `keeps_its_borrow` pins) |
+
+**No corpus golden moved** — the same measurement as B100's, for the same
+reason: nothing in `vilan/test` or `vilan/std/src` forwards a loaned parameter
+whole into a by-value return.
+
+Three `#[ignore]`d pins record bycatch found while measuring, all pre-existing
+and all on rule 1's side of the seam:
+
+- `fun same(v: &mut i32): i32 { v }` returns the view's `(base, key)` pair,
+  not the `i32` the signature promises;
+- `fun grab(&self): Inner { &self.inner }` — a `&place` leaf is not a place, so
+  no copy is inserted and the caller's result IS the receiver's field;
+- `fun get(h: &Holder): (i32, i32) { peek(h) }` — the same hole one indirection
+  over, through a borrows-call leaf.
+
+The last two are B100's residual, not B104's: the return rule reaches PLACES,
+and both of those tails are expressions that produce an alias without being
+one. Closing them wants the return seam to read through a returned view, which
+is a rule 1 question and wants its own measurement.

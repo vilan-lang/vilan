@@ -5631,6 +5631,309 @@ fn a_closure_returning_its_own_view_parameters_field_copies() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B104 (the classification residual B100 filed). `infer_borrows` recorded `fun
+// copy(&self): Holder { self }` as borrowing its receiver — so its result bound
+// as a VIEW at every call site — although B100 made that return a COPY. The
+// root-set arm whose leaf is a PLACE is the one rule 1's return clause reaches,
+// so the two passes now answer the same way about the same seam: where the
+// return copies, the place LEFT the loan and the function projects nothing.
+// `check_view_escape` still accepts the forwarder, for the same reason (nothing
+// escapes when nothing aliased leaves). See proposal/element-clones.md §9.3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_by_value_forwarders_result_binds_mut() {
+    // The filed repro. Both halves in one program: the result is `mut`-bindable
+    // (it is a value, not a view), and writing it leaves the receiver alone
+    // (B100's copy is what makes the first half true).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = h.copy();
+            c.pair.1 = 42;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n3\n",
+    );
+}
+
+#[test]
+fn a_free_by_value_forwarders_result_binds_mut() {
+    // The free-function spelling: nothing here is special to a receiver, and
+    // the caller's own value is untouched by the write to the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun copy_of(h: &Holder): Holder { h }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut c = copy_of(&h);
+            c.pair.1 = 42;
+            h.pair.1 = 99;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n99\n",
+    );
+}
+
+#[test]
+fn a_by_value_forwarder_still_passes_the_escape_check() {
+    // The hazard B100 recorded when it refused candidate (c): emptying the
+    // root-set makes `check_view_escape` reject the body outright, turning a
+    // program that compiles into an error. It must not, and the reason is rule
+    // 3's own: the return hands back a value, so no view escapes.
+    assert_compiles(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.copy().pair.1);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_view_returning_forwarders_result_is_still_a_view() {
+    // The other direction, one word apart: the same body under a `&mut Holder`
+    // return is a projection, its result is a view, and a view cannot be `mut`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut w = h.me();
+            print(w.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_view_of_a_local_still_cannot_escape_a_by_value_return() {
+    // The escape the new clause must not swallow: rule 1 leaves a place rooted
+    // at a LOCAL alone (the frame is a dead owner donating its storage), so no
+    // copy converts this one and the view still dangles.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun bad(&self): (i32, i32) { let v = &self.pair; v }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.bad().1);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_scalar_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // A scalar has no aggregate storage for rule 1 to copy, so the alias
+    // survives the return and the (conservative) borrow classification must
+    // survive with it — rule 4 still sees a live view into `n`. Pins the gate
+    // as CLONEABLE-AGGREGATE-only rather than by-value-only.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            n = 9;
+            print(m);
+        }
+        "#,
+        "rule 4",
+    );
+}
+
+#[test]
+fn a_generic_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // The generic twin, and why `Type::Generic` is excluded even though rule 1
+    // admits it: a `&T` parameter lowers as a `(base, key)` pair at a scalar
+    // instantiation, which `__clone` cannot collapse. The alias survives, so
+    // the view classification does too.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same<T>(v: &T): T { v }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = same(&h);
+            print(c.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_borrows_call_chain_into_a_by_value_return_keeps_its_borrow() {
+    // The Call arm is deliberately ungated: rule 1 never reaches a call leaf
+    // (it is not a place), so no copy is inserted and the result really does
+    // alias whatever the signature says. Calling it a borrow is what keeps the
+    // call site honest about that.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut p = get(&h);
+            print(p.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_wrapped_view_return_is_still_a_borrow() {
+    // The wrapped arm is ungated for the same reason, and its signature could
+    // not carry the gate anyway: `Option<&mut Inner>` is not a view return by
+    // `returns_view`, which reads the TOP-LEVEL type node.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun inner_mut(&mut self): Option<&mut Inner> { Some(&mut self.inner) }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 1 } };
+            match h.inner_mut() {
+                Some(let v) => { v.n = 77; }
+                None => {}
+            }
+            print(h.inner.n);
+        }
+        "#,
+        "77\n",
+    );
+}
+
+#[test]
+fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
+    // The resource half of the gate is a guard, not a live case: R1 refuses
+    // moving a resource out of a loan before the classification is ever
+    // consulted. Pinned so the guard's unreachability is a fact, not a hope.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard {
+            fun drop(own self) { print("drop " + self.tag); }
+            fun take(&self): Guard { self }
+        }
+        fun main() {
+            let g = Guard { tag = "a" };
+            print(g.take().tag);
+        }
+        "#,
+        "cannot move the resource",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a scalar `&mut` forwarded into a by-value return hands back the (base, key) pair"]
+fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
+    // Found measuring B104, pre-existing: `same(&mut n)` prints `[ [ 5 ], 0 ]`
+    // — the view's runtime pair, not the i32 the signature promises. Rule 1's
+    // copy does not reach a scalar, and nothing else reads through it at the
+    // return seam.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            print(m);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a `&place` leaf in a by-value return is not a place, so rule 1 never copies it"]
+fn a_reference_leaf_in_a_by_value_return_copies() {
+    // Found measuring B104, pre-existing (a residual of B100 rather than of the
+    // classification): `&self.inner` is not a place, so `compute_return_clone_sites`
+    // never sees it and the caller's result IS the receiver's field. Prints 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self): Inner { &self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+#[ignore = "B104 bycatch: a borrows-call leaf in a by-value return is not a place either"]
+fn a_borrows_call_leaf_in_a_by_value_return_copies() {
+    // The same hole one indirection over: the tail is a call, so rule 1 has no
+    // place to copy and the by-value signature hands back the callee's alias.
+    // Prints 99. The classification stays a view, which is what keeps this
+    // merely wrong rather than unsound.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = get(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
 #[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
@@ -48837,14 +49140,15 @@ fn b79_an_overflowing_discriminant_is_rejected_rather_than_zeroed() {
 }
 
 #[test]
-fn b79_the_i64_bounds_themselves_are_legal() {
-    // The negative bound is one PAST the positive one, because the minus
-    // applies to the magnitude rather than being parsed into it — the same
-    // rule `-128i8` follows. Off-by-one here would reject a legal program.
+fn b79_the_bounds_themselves_are_legal() {
+    // Off-by-one here would reject a legal program. (B106 moved the bound from
+    // `i64` to `i53` and made it SYMMETRIC: `i64`'s negative end reaches one
+    // further only because two's complement does, and a JS number has no such
+    // asymmetry.)
     assert_compiles_and_runs(
         r#"
         import std::print;
-        enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }
+        enum Edge { Min = -9007199254740991, Max = 9007199254740991 }
         fun main() {
             print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
         }
@@ -48859,10 +49163,10 @@ fn b79_a_discriminant_sequence_cannot_run_past_the_bound() {
     // debug compiler here and wrapped the release one.
     assert_fails_with(
         r#"
-        enum Edge { A = 9223372036854775807, B }
+        enum Edge { A = 9007199254740991, B }
         fun main() { }
         "#,
-        "variant 'B' continues the discriminant sequence past 9223372036854775807",
+        "variant 'B' continues the discriminant sequence past 9007199254740991",
     );
 }
 
@@ -51086,5 +51390,310 @@ fn b76_a_generic_backed_enum_gets_no_hashable() {
         }
         "#,
         "does not implement trait 'Hashable'",
+    );
+}
+
+// B105 (a compound assignment evaluated an impure subscript twice). `x op= v`
+// desugars to `x = x op v`, which walks the TARGET PLACE twice — so every
+// effectful subscript in it ran twice: `ys[bump()] += 1` emitted
+// `__at_put(ys, bump(), __at(ys, bump()) + 1)`. Each is now evaluated once,
+// into a temp both walks name. A PURE subscript is left alone.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_compound_assignment_evaluates_an_impure_index_once() {
+    // The filed repro, counted: one call, and the increment lands once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] += 1;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_evaluates_the_index_before_the_value() {
+    // Source order: the subscript, then the read, then the right-hand side.
+    // The un-hoisted emission ran them in that order too (a JS call evaluates
+    // its arguments left to right), so the temp must not reorder anything.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun index(): i32 { print("index"); 0 }
+        fun amount(): i32 { print("amount"); 5 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[index()] += amount();
+            print(ys[0]);
+        }
+        "#,
+        "index\namount\n15\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_with_a_pure_index_mints_no_temp() {
+    // The other direction, in bytes: evaluating `index` twice is not an
+    // observable difference, so the emission is exactly what it was. Hoisting
+    // unconditionally is *correct* and was measured — it moves this shape's
+    // golden and buys nothing (proposal/transparent-references.md).
+    let source = r#"
+        import std::print;
+        fun main() {
+            mut ys = [10, 20];
+            let index = 1;
+            ys[index] += 5;
+            print(ys[1]);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__at_put(ys, index, __at(ys, index) + 5)"),
+            "a pure subscript was hoisted into a temp:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "25\n");
+}
+
+#[test]
+fn a_compound_assignment_hoists_an_index_in_the_targets_subject() {
+    // The subscript is not at the top of the target place — `cells[bump()].n`
+    // is a FIELD of an indexed element — so the hoist walks the whole spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Cell { n: i32 }
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut cells = [Cell { n = 10 }, Cell { n = 20 }];
+            cells[bump()].n += 1;
+            print(cells[0].n);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_hoists_every_index_of_a_nested_target() {
+    // Two subscripts, each effectful and each its own temp, minted root-first
+    // so the calls run in source order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun row(): i32 { print("row"); 0 }
+        fun column(): i32 { print("column"); 1 }
+        fun main() {
+            mut grid = [[1, 2], [3, 4]];
+            grid[row()][column()] += 100;
+            print(grid[0][1]);
+        }
+        "#,
+        "row\ncolumn\n102\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_through_a_view_hoists_its_index() {
+    // R5 wraps a view target and its synthesized re-read alike in a `Dereference`,
+    // so the analyzer's compound mark sits one node down. The hoist looks under it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun add(v: &mut List<i32>) {
+            v[bump()] += 1;
+        }
+        fun main() {
+            mut ys = [10, 20];
+            add(&mut ys);
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_plain_indexed_assignment_still_evaluates_its_index_once() {
+    // The neighbour that was always right: a non-compound write walks the
+    // target once, and the hoist must not touch it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] = 99;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "99\n1\n",
+    );
+}
+
+#[test]
+fn two_hand_written_subscripts_are_not_collapsed_into_one() {
+    // Why the compound-ness comes from the analyzer's record and not from the
+    // shape: `ys[first()] = ys[second()] + 1` looks exactly like the desugared
+    // form and means something else entirely. Both calls run, at their own
+    // indices.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun first(): i32 { print("first"); 0 }
+        fun second(): i32 { print("second"); 1 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[first()] = ys[second()] + 1;
+            print(ys[0]);
+            print(ys[1]);
+        }
+        "#,
+        "first\nsecond\n21\n20\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B106 (a discriminant past 2^53 is unrepresentable in the emission). A backed
+// enum IS its backing value at runtime, emitted as a bare JS numeric literal —
+// and a double holds integers exactly only to 2^53 - 1, so
+// `= 9007199254740993` emitted a literal the host reads back as `…992`.
+// Self-consistent in-tree (every site emitted the same wrong number) and wrong
+// across a host boundary. The range check lands in B79's validation family, at
+// i53's edge, and the diagnostic names the emission target as the reason.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b106_the_i53_edge_is_a_legal_discriminant() {
+    // 2^53 - 1: the largest integer a JS number holds exactly, and the last one
+    // that round-trips through the emitted literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Max = 9007199254740991 }
+        fun main() {
+            print(match Edge::Max { Edge::Zero => "zero", Edge::Max => "max" });
+        }
+        "#,
+        "max\n",
+    );
+}
+
+#[test]
+fn b106_one_past_the_i53_edge_is_refused() {
+    // One more, and the emitted literal is a different number than the source
+    // wrote. The diagnostic states the bound AND why it is that bound.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Over = 9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9007199254740992` is out of range \
+         (-9007199254740991 ..= 9007199254740991): a backed enum is a JS number \
+         at runtime, and an integer past 2^53 - 1 has no exact double, so the \
+         emitted literal would be a different value",
+    );
+}
+
+#[test]
+fn b106_the_negative_i53_edge_is_legal_and_one_past_it_is_refused() {
+    // The negative twin, and the change B106 makes to B79's shape: the bound is
+    // SYMMETRIC. `i64`'s negative end reached one further because two's
+    // complement does; a JS number has no such asymmetry, so `-9007199254740991`
+    // is the last legal value in that direction too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Min = -9007199254740991 }
+        fun main() {
+            print(match Edge::Min { Edge::Zero => "zero", Edge::Min => "min" });
+        }
+        "#,
+        "min\n",
+    );
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Under = -9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `-9007199254740992` is out of range",
+    );
+}
+
+#[test]
+fn b106_the_old_i64_bound_is_now_refused() {
+    // The value B79 accepted and this fix does not — the one that made the
+    // range a lie: `i64::MAX` cannot be an emitted JS literal at all.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Max = 9223372036854775807 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9223372036854775807` is out of range",
+    );
+}
+
+#[test]
+fn b106_a_continued_discriminant_stops_at_the_same_edge() {
+    // A continued value is emitted as the same bare literal, so the sequence
+    // must stop where an explicit discriminant does — one rule, not two.
+    assert_fails_with(
+        r#"
+        enum Walk { A = 9007199254740990, B, C }
+        fun main() { }
+        "#,
+        "variant 'C' continues the discriminant sequence past 9007199254740991, \
+         the largest integer a JS number holds exactly",
+    );
+}
+
+#[test]
+fn b106_a_hex_discriminant_is_range_checked_too() {
+    // The range check always spoke radix 16 (B79's fix); the narrower bound
+    // inherits that, so hex cannot smuggle a value past it.
+    assert_fails_with(
+        r#"
+        enum Mask { Zero = 0, Wide = 0x20000000000000 }
+        fun main() { }
+        "#,
+        "the enum discriminant `0x20000000000000` is out of range",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Mask { Zero = 0, Edge = 0x1FFFFFFFFFFFFF }
+        fun main() {
+            print(match Mask::Edge { Mask::Zero => "zero", Mask::Edge => "edge" });
+        }
+        "#,
+        "edge\n",
     );
 }
