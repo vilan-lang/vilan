@@ -4970,7 +4970,6 @@ impl<'src> Analyzer<'src> {
                         span: anchor,
                         msg: format!(
                             "parameter {position} of `{}`'s `{}` is `{actual_label}`, but `{}` \
-
                          declares `{expected_label}`; match the declared type",
                             check.subject_name, check.member_name, check.trait_name
                         ),
