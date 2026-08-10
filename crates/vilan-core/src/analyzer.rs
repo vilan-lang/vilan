@@ -1608,7 +1608,9 @@ pub struct Analyzer<'src> {
     // (`x += v` desugars to `x = x + v`). When the target is a view, this re-read
     // must also read *through* it (transparent references R5), so it is tracked
     // to be deref-wrapped alongside the target — distinct from a user-written
-    // value-position read, which keeps its explicit `*` (R6).
+    // value-position read, which keeps its explicit `*` (R6). Published on
+    // `Program`, because the re-read is also a second walk of the target's
+    // SUBSCRIPT and the emission has to evaluate that only once (B105).
     compound_reread_ids: HashSet<Id>,
     // Literal-element diagnostics already emitted (keyed by the offending item's
     // expr id, or the literal's own id for a count mismatch). These checks run
@@ -28080,6 +28082,11 @@ pub struct Program<'src> {
     pub try_dispatch: HashMap<Id, TryDispatch>,
     /// Per `?.` site: the lowering (proposal/try-and-lift.md §3–4).
     pub lift_dispatch: HashMap<Id, LiftDispatch>,
+    /// The compiler-synthesized target re-reads of compound assignments (`x op= v`
+    /// desugars to `x = x op v`, walking the target twice). The transformer reads
+    /// it to recognize a compound write and evaluate an INDEXED target's subscript
+    /// exactly once (B105) — `ys[bump()] += 1` ran `bump()` twice.
+    pub compound_rereads: HashSet<Id>,
     pub bitwise_u32: HashSet<Id>,
     pub bitwise_generic_lhs: HashMap<Id, TypeId>,
     pub integer_division: HashSet<Id>,
@@ -32715,6 +32722,7 @@ fn analyze_over_world<'src>(
         bound_dispatch_traits: analyzer.bound_dispatch_traits,
         try_dispatch: analyzer.try_dispatch,
         lift_dispatch: analyzer.lift_dispatch,
+        compound_rereads: analyzer.compound_reread_ids,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,

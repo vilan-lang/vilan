@@ -141,6 +141,18 @@ reference (aggregate), exactly as today. Only where `*` sits in the AST moves.
   `cell.v.push(z)` (the `SharedValue` intrinsic already yields `cell.v`).
 - A view-returning **call** used as an assignment target or `op=` target is bound to a temp once, so
   `g(c) /= 10` evaluates `g(c)` a single time (the transformer already does this for `*call`).
+- A **subscript** in an `op=` target is bound to a temp once too — the same rule one seam over, and
+  the one the implementation was breaking. **B105 (2026-08-10):** `x[i] op= v` desugars to
+  `x[i] = x[i] op v`, which walks the target *place* twice, so every effectful subscript in it ran
+  twice: `ys[bump()] += 1` emitted `__at_put(ys, bump(), __at(ys, bump()) + 1)`. The spec already
+  said otherwise (`docs/spec/execution.md` §7.2, `types.md` §A.4: "with `x`'s place evaluated once"),
+  so this was a conformance bug, not a design gap. The transformer now hoists each effectful
+  subscript along the target's spine into a temp both walks name, minted ROOT-FIRST so the calls run
+  in source order (`grid[row()][column()] += 1`); the re-read is identified by the analyzer's own
+  `compound_rereads` record, never by shape, so a hand-written `ys[f()] = ys[g()] + 1` keeps its two
+  genuinely different subscripts. A **pure** subscript is left alone: hoisting unconditionally is
+  equally correct and was measured — it moves `vilan/test/compound-index.mjs` and buys nothing but a
+  `const` per `ys[i] += 1`.
 
 ## Resolved `Shared::write` (A1) — done
 

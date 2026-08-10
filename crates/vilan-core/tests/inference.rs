@@ -50672,3 +50672,192 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
         "sfatq7m s1g8z7cm\nclosest-corner\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B105 (a compound assignment evaluated an impure subscript twice). `x op= v`
+// desugars to `x = x op v`, which walks the TARGET PLACE twice — so every
+// effectful subscript in it ran twice: `ys[bump()] += 1` emitted
+// `__at_put(ys, bump(), __at(ys, bump()) + 1)`. Each is now evaluated once,
+// into a temp both walks name. A PURE subscript is left alone.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_compound_assignment_evaluates_an_impure_index_once() {
+    // The filed repro, counted: one call, and the increment lands once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] += 1;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_evaluates_the_index_before_the_value() {
+    // Source order: the subscript, then the read, then the right-hand side.
+    // The un-hoisted emission ran them in that order too (a JS call evaluates
+    // its arguments left to right), so the temp must not reorder anything.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun index(): i32 { print("index"); 0 }
+        fun amount(): i32 { print("amount"); 5 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[index()] += amount();
+            print(ys[0]);
+        }
+        "#,
+        "index\namount\n15\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_with_a_pure_index_mints_no_temp() {
+    // The other direction, in bytes: evaluating `index` twice is not an
+    // observable difference, so the emission is exactly what it was. Hoisting
+    // unconditionally is *correct* and was measured — it moves this shape's
+    // golden and buys nothing (proposal/transparent-references.md).
+    let source = r#"
+        import std::print;
+        fun main() {
+            mut ys = [10, 20];
+            let index = 1;
+            ys[index] += 5;
+            print(ys[1]);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__at_put(ys, index, __at(ys, index) + 5)"),
+            "a pure subscript was hoisted into a temp:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "25\n");
+}
+
+#[test]
+fn a_compound_assignment_hoists_an_index_in_the_targets_subject() {
+    // The subscript is not at the top of the target place — `cells[bump()].n`
+    // is a FIELD of an indexed element — so the hoist walks the whole spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Cell { n: i32 }
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut cells = [Cell { n = 10 }, Cell { n = 20 }];
+            cells[bump()].n += 1;
+            print(cells[0].n);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_hoists_every_index_of_a_nested_target() {
+    // Two subscripts, each effectful and each its own temp, minted root-first
+    // so the calls run in source order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun row(): i32 { print("row"); 0 }
+        fun column(): i32 { print("column"); 1 }
+        fun main() {
+            mut grid = [[1, 2], [3, 4]];
+            grid[row()][column()] += 100;
+            print(grid[0][1]);
+        }
+        "#,
+        "row\ncolumn\n102\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_through_a_view_hoists_its_index() {
+    // R5 wraps a view target and its synthesized re-read alike in a `Dereference`,
+    // so the analyzer's compound mark sits one node down. The hoist looks under it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun add(v: &mut List<i32>) {
+            v[bump()] += 1;
+        }
+        fun main() {
+            mut ys = [10, 20];
+            add(&mut ys);
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_plain_indexed_assignment_still_evaluates_its_index_once() {
+    // The neighbour that was always right: a non-compound write walks the
+    // target once, and the hoist must not touch it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] = 99;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "99\n1\n",
+    );
+}
+
+#[test]
+fn two_hand_written_subscripts_are_not_collapsed_into_one() {
+    // Why the compound-ness comes from the analyzer's record and not from the
+    // shape: `ys[first()] = ys[second()] + 1` looks exactly like the desugared
+    // form and means something else entirely. Both calls run, at their own
+    // indices.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun first(): i32 { print("first"); 0 }
+        fun second(): i32 { print("second"); 1 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[first()] = ys[second()] + 1;
+            print(ys[0]);
+            print(ys[1]);
+        }
+        "#,
+        "first\nsecond\n21\n20\n",
+    );
+}
