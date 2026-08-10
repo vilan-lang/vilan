@@ -65,6 +65,19 @@ Keeping `Hash` opaque (not a plain `struct Hash { key: str }`) seals the
 representation: callers can't peek at or depend on the internal string, so it
 stays the swap seam (§5).
 
+**How the `PartialEq` impl is written (cycle 14).** The bullet shipped as a
+paper claim: `impl Hash with PartialEq` did not exist, and `==` on a `Hash`
+reported "type 'Hash' does not implement the `PartialEq` operator". Writing the
+obvious body is a trap — `self == b` on a non-native type dispatches back into
+the very impl being defined, and the emitted `function eq(self, b) { return
+eq(self, b); }` compiles clean and blows the stack at runtime. The body calls a
+`hashes_equal` intrinsic (`a === b`, no helper) instead. `Hash` is deliberately
+NOT added to the compiler's native-operator list, which is the other way to
+break the recursion: that predicate governs *every* operator, so an opaque key
+would silently accept `<` and `-` — emitting a lexicographic compare of the
+canonical JSON, or `NaN` — where it reports a missing `PartialOrd` today.
+Equality is the whole of a `Hash`'s operator surface, per §9's "no ordering".
+
 ### 3.3 The uniform hasher
 
 One builtin does the work for every stock impl:

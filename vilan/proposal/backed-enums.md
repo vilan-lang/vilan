@@ -1544,7 +1544,12 @@ resource enum is offered no `value()`, no `parse`, and no `Hashable`, on
 the §8.2(d) precedent ("a generic enum gets no conversions"), and the
 declaration compiles. Three pins.
 
-### 10.6 Two limits, both left where they were found
+### 10.6 Two limits, both left where they were found — BOTH CLOSED (cycle 14)
+
+> Both bullets below are the record as written in cycle 13. The first is
+> closed by §10.7, the second by `hashable-keys.md` §3.2's implementation
+> note (`impl Hash with PartialEq`, over a `hashes_equal` intrinsic — the
+> obvious body recurses).
 
 - **`enum Walked { A = 5, B, C }` gets no `value()`/`parse()`.** §3.8's
   generator requires a written literal per variant because it reprints
@@ -1566,3 +1571,85 @@ declaration compiles. Three pins.
   which is the capability `docs/std/collections.md` documents and a
   stronger observation anyway: it tests the keying, not an operator.
 
+
+### 10.7 The readers unified (cycle 14) — one answer to "what is this variant worth"
+
+§10.6's first bullet named the shape of the fix and it is the shape taken:
+the two readers are unified, not copied a third time.
+
+**What was actually wrong.** Nothing in this paper ever said a walked
+variant is worth less than a written one. The divergence was structural —
+two pieces of code read the same declaration at two different times and
+answered differently:
+
+| | the lowering walk | the `value()`/`parse()` generator |
+|---|---|---|
+| when | the semantic walk | derive-expansion, *before* the walk |
+| a variant with no literal | continues the C-style sequence | **bails on the whole enum** |
+| what a value is | `BackingValue::Int(i64)` / `Str` | the literal's own text, reprinted |
+| how a number is read | `u128` magnitude + sign | a second `i128` re-parse |
+
+So `enum Walked { A = 5, B, C }` lowered to the bare numbers 5/6/7 —
+matched as them, hashed as them, crossed a host boundary as them — while
+having no `value()`, no `parse()`, and the name-tagged JSON shape of an
+**unbacked** enum. `Walked::B` was the number 6 and went out on the wire
+as `"B"`.
+
+**The shape.** One function, `read_enum_backing(name, variants)`, walks the
+declaration once and returns, per variant, its effective `BackingValue`,
+the literal it wrote (if any), and what is wrong with it — plus the
+§3.1(b) conjunction for the enum. It is **pure**: it builds `Error`s and
+hands them back rather than pushing them, because its two callers want
+opposite things from a broken declaration. The walk pushes them at the
+point it always did. The generators, which run earlier and have no
+diagnostic sink at all, read them only as "this declaration is broken,
+emit nothing" — so one mistake stays one message.
+
+Four readings collapsed into it: the walk's inline loop, the
+`value()`/`parse()` generator, `backed_enum_backing_type` (the `Json`/`Wire`
+derives'), and `enum_is_bare_lowered` (the `Hashable` gate). `next_discriminant`
+still exists exactly once.
+
+**§3.7's validation is the same reading.** It always counted walked values
+— `enum E { A = 1, B = 0, C }` collided on C — and it still does, now from
+inside the shared reader, so `enum Walked { A = 5, B, C = 6 }` is rejected
+naming `B`. That was not a change; the point is that it can no longer
+*become* one, because the validation and the generators no longer have
+separate opinions about what `B` is worth.
+
+**What a generated body prints.** The resolved value and the written
+spelling are kept side by side, and the generator prefers the spelling: hex
+stays hex in `parse`'s `===` chain, exactly as §8.2 decided. Only a walked
+variant, which wrote nothing, is rendered from its resolved value.
+
+**Consequences taken deliberately.**
+
+- **The derived `Json`/`Wire` shape follows the lowering.** A walked enum
+  now serializes as its backing value, like every other backed enum. This
+  is the same wire-format sentence §3.9 already carries, applied to the
+  enums it was silently skipping — and it is the *correction* of a
+  disagreement between an enum's runtime representation and its own
+  encoding, not a new divergence.
+- **`Hashable` is deliberately NOT gated on cleanliness.** The two kinds of
+  member want opposite answers on a broken enum: a source generator must
+  stay silent, while `Hashable` must track the runtime representation,
+  which a broken enum still has. The walk keys `hashable_names` off exactly
+  the conjunction, and §10.3's two oracles have to keep agreeing.
+- **`resource` is now one rule.** `backed_enum_backing_type_of` was the
+  reader that omitted §10.5's resource exclusion, so a `[derive(Wire)]`
+  `resource enum Handle { Open = 1 }` generated impls calling a `value()`
+  no resource enum has — four errors inside code the author never wrote.
+  It now lands on the plain path and gets the same diagnostic a plain
+  resource enum gets. (`Wire`/`Json` on a resource enum is unsupported
+  either way; only the message changes.)
+- **`integer_backing_type` became total.** It used to re-parse the written
+  literals in `i128` and return `Option`, `None` for a value outside `i53`.
+  Every value it sees now came through the one literal reader, which
+  rejects those (B106) and whose rejection makes the enum unclean — so the
+  out-of-range arm had no reachable input left.
+
+Thirteen pins (`b111_*`), proven non-vacuous by restoring the
+written-literal-per-variant rule: six go red, and the seven pinning the
+rules that must *not* move — the walked collision, `§3.1(a)`'s string
+requirement, the payload rejection, the plain-enum conjunction, `Hashable`
+— stay green.

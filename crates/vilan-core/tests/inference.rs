@@ -27057,6 +27057,107 @@ fn hashable_builds_a_reusable_container() {
     );
 }
 
+#[test]
+fn b110_two_hashes_compare_with_partial_eq() {
+    // hashable-keys.md §3.2/§8: `Hash` is `==`-comparable, so equal values hash
+    // equal and different values do not — over a primitive, a string, and a
+    // derived aggregate. The impl existed only on paper: `==` on a `Hash`
+    // reported "type 'Hash' does not implement the `PartialEq` operator".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        [derive(Hashable)]
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let k = 7;
+            print(k.hash() == k.hash());        // true
+            print(k.hash() == 8.hash());        // false
+            print("a".hash() == "a".hash());    // true
+            print("a".hash() == "b".hash());    // false
+            let p = Point { x = 1, y = 2 };
+            print(p.hash() == Point { x = 1, y = 2 }.hash());  // true
+            print(p.hash() == Point { x = 9, y = 2 }.hash());  // false
+            print(p.hash() != Point { x = 9, y = 2 }.hash());  // true
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_equality_does_not_recurse_into_its_own_impl() {
+    // The reason `eq`'s body is `hashes_equal` and not `self == b`: `Hash` is
+    // opaque and NOT a native-operator type, so a `==` in the body dispatches
+    // back into this same impl — `function eq(self, b) { return eq(self, b); }`,
+    // which stack-overflowed at runtime while compiling clean. The `.eq()` call
+    // reaches the body directly, so it is the arm the operator lowering skips.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash().eq(1.hash()));  // true
+            print(1.hash().eq(2.hash()));  // false
+            print(1.hash().ne(2.hash()));  // true — the inherited default
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_satisfies_a_partial_eq_bound() {
+    // What the impl buys beyond the operator: `Hash` now grounds a
+    // `T: PartialEq` bound, so it nests in the conditional impls and in generic
+    // user code. `Option<Hash>` is the conditional impl; `same` is the bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::{ Hashable, Hash };
+        import std::option::Option::{ self, Some, None };
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun main() {
+            print(same(1.hash(), 1.hash()));  // true
+            print(same(1.hash(), 2.hash()));  // false
+            let here: Option<Hash> = Some(1.hash());
+            print(here == Some(1.hash()));    // true
+            print(here == Some(2.hash()));    // false
+            print(here == None);              // false
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn b110_hash_is_still_not_ordered_or_arithmetic() {
+    // `Hash` gained equality, not the rest of the operator surface. It is
+    // deliberately absent from `is_native_operator_type` for exactly this: an
+    // opaque key has no order, and `<` on one would compare canonical JSON
+    // strings lexicographically.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash() < 2.hash());
+        }
+        "#,
+        "does not implement the `PartialOrd` operator",
+    );
+}
+
 // --- C5.1: a scalar view read as a value requires `*` -----------------------------
 // `transparent-references.md`: `*v` is the only way to cross from view to value —
 // the language never silently converts. A bare scalar view (whose runtime form is
@@ -51695,5 +51796,307 @@ fn b106_a_hex_discriminant_is_range_checked_too() {
         }
         "#,
         "edge\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B111 (a walked discriminant gets `value()`/`parse()`). `enum Walked { A = 5,
+// B, C }` lowers to the bare numbers 5/6/7 — the walk resolves every variant by
+// continuing the C-style sequence — but the generators read the declaration
+// separately and bailed on the first variant with no WRITTEN literal, so the
+// enum got no `value()`, no `parse()`, and the name-tagged JSON shape of an
+// unbacked enum. The fix is one reader (`read_enum_backing`, backed-enums.md
+// §10) shared by the walk, the generators, and §3.7's duplicate check, so a
+// variant's effective backing is computed once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b111_a_walked_discriminant_gets_value_and_parse() {
+    // The headline: `B` wrote nothing, is 6 at runtime, and now says so. The
+    // round trip goes out through `value()` and back through `parse()`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            print(Walked::A.value());  // 5
+            print(Walked::B.value());  // 6 — the walked one
+            print(Walked::C.value());  // 7
+            print(match Walked::parse(6) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                        // 6
+            print(match Walked::parse(99) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                        // -1
+        }
+        "#,
+        "5\n6\n7\n6\n-1\n",
+    );
+}
+
+#[test]
+fn b111_a_walk_from_the_implicit_zero_gets_them_too() {
+    // The `enum Level { Low = 0, Mid, High }` shape §3.1(b) names: one explicit
+    // value converts the whole declaration, so the other two walk from it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Level { Low = 0, Mid, High }
+
+        fun main() {
+            print(Level::High.value());  // 2
+            print(match Level::parse(1) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                          // 1
+        }
+        "#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn b111_a_negative_walk_gets_them_too() {
+    // The sequence continues from a negative value the same way, and `parse`'s
+    // `if`/`else if` chain (not a `match`) is what lets a negative literal be
+    // compared at all — the reason §3.8 chose that shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Signed { Less = -1, Equal, Greater }
+
+        fun main() {
+            print(Signed::Less.value());     // -1
+            print(Signed::Equal.value());    // 0
+            print(Signed::Greater.value());  // 1
+            print(match Signed::parse(0) {
+                Some(let variant) => variant.value(),
+                None => -99,
+            });                              // 0
+        }
+        "#,
+        "-1\n0\n1\n0\n",
+    );
+}
+
+#[test]
+fn b111_a_written_literal_keeps_its_own_spelling() {
+    // The unified reader resolves values, but the generator still reprints the
+    // literal the author WROTE where there is one: hex stays hex in the
+    // generated `parse` chain. Only the walked variant, which wrote nothing, is
+    // rendered from the resolved value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Hexed { A = 0x10, B, C = 0x20 }
+
+        fun main() {
+            print(Hexed::A.value());  // 16
+            print(Hexed::B.value());  // 17
+            print(Hexed::C.value());  // 32
+            print(match Hexed::parse(17) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                       // 17
+        }
+        "#,
+        "16\n17\n32\n17\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_collision_is_still_rejected() {
+    // §3.7's uniqueness rule already counted walked values, and it still does:
+    // `B` walks onto 6 and `C` writes 6. Unifying the readers must not make the
+    // generator's view of the enum the one validation trusts.
+    assert_fails_with(
+        r#"
+        enum Walked { A = 5, B, C = 6 }
+        fun main() { }
+        "#,
+        "variant 'C' has discriminant 6, which 'B' already uses; two variants of \
+         'Walked' cannot share one",
+    );
+}
+
+#[test]
+fn b111_a_broken_walk_generates_no_conversions() {
+    // The other half of the collision rule. A generator emits vilan SOURCE, so
+    // it stays silent on a declaration the walk already rejects — otherwise the
+    // generated `parse` chain would compare against a value the compiler does
+    // not believe in and report the enum a second time, from inside code the
+    // author never wrote. The cost is the `has no method` at the call site,
+    // which is what a broken enum has always produced.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Walked { A = 5, B, C = 6 }
+        fun main() { print(Walked::A.value()); }
+        "#,
+        "Walked has no method 'value'",
+    );
+}
+
+#[test]
+fn b111_a_string_backing_still_needs_a_literal_per_variant() {
+    // §3.1(a) is untouched by the unification: there is no successor of
+    // `"start"`, so the walk has nothing to continue and the missing value is a
+    // hard error rather than a silently synthesized one.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "flex-start", End }
+        fun main() { }
+        "#,
+        "variant 'End' has no backing value, and a string backing has no successor \
+         to continue from; give every variant of 'Align' its own string",
+    );
+}
+
+#[test]
+fn b111_a_fully_written_string_enum_is_unchanged() {
+    // The other half of the same claim: a string-backed enum still gets its
+    // conversions, and they still carry the author's own text.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Align { Start = "flex-start", End = "flex-end" }
+
+        fun main() {
+            print(Align::Start.value());  // flex-start
+            print(match Align::parse("flex-end") {
+                Some(let variant) => variant.value(),
+                None => "miss",
+            });                           // flex-end
+            print(match Align::parse("center") {
+                Some(let variant) => variant.value(),
+                None => "miss",
+            });                           // miss
+        }
+        "#,
+        "flex-start\nflex-end\nmiss\n",
+    );
+}
+
+#[test]
+fn b111_the_i53_continuation_edge_still_holds_through_the_unified_reader() {
+    // B106's edge is enforced inside the one reader now, so it has to hold for
+    // every consumer at once: the sequence stops where an explicit discriminant
+    // does, and a walk that runs off the end is refused rather than generating
+    // conversions over a value the emission cannot carry.
+    assert_fails_with(
+        r#"
+        enum Walk { A = 9007199254740990, B, C }
+        fun main() { }
+        "#,
+        "variant 'C' continues the discriminant sequence past 9007199254740991, \
+         the largest integer a JS number holds exactly",
+    );
+    // The last legal walk, and the `i53` backing type it forces: a value past
+    // `i32` cannot narrow to the default integer.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Walk { A = 9007199254740990, B }
+        fun main() {
+            let widest: i53 = Walk::B.value();
+            print(widest);
+        }
+        "#,
+        "9007199254740991\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_enum_serializes_as_its_backing_value() {
+    // §3.9 over the same reading: the derived `Json` shape follows the RUNTIME
+    // representation. A walked enum lowered to bare numbers while encoding the
+    // variant NAME — `Walked::B` was the number 6 and went out as `"B"`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result::{ self, Ok, Err };
+
+        [derive(Json)]
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            print(Walked::B.to_json());  // 6
+            print(match Walked::from_json("6") {
+                Ok(let back) => back.value(),
+                Err(_) => -1,
+            });                          // 6
+            print(match Walked::from_json("99") {
+                Ok(let back) => back.value(),
+                Err(_) => -1,
+            });                          // -1
+        }
+        "#,
+        "6\n6\n-1\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_enum_is_hashable_and_keys_by_its_value() {
+    // The `Hashable` synthesis always keyed off the runtime representation, so
+    // a walked enum already had it. The unification must not narrow that to the
+    // generators' stricter rule — this is the pin that would catch it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::Hashable;
+
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            mut widths: Map<Walked, i32> = Map::new();
+            widths.insert(Walked::B, 42);
+            print(widths.contains_key(Walked::B));  // true
+            print(Walked::B.hash() == 6.hash());    // true — the enum IS 6
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+#[test]
+fn b111_a_plain_enum_is_still_not_backed() {
+    // §3.1(b)'s conjunction is untouched: with no explicit value anywhere the
+    // enum keeps its `[index, ..data]` array form and gets no conversions.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Plain { A, B }
+        fun main() { print(Plain::A.value()); }
+        "#,
+        "Plain has no method 'value'",
+    );
+}
+
+#[test]
+fn b111_a_payload_variant_still_blocks_the_conversions() {
+    // §3.3: a payload anywhere flips the enum to the tagged form, so no backing
+    // value in it reaches the runtime and no conversion may claim otherwise.
+    assert_fails_with(
+        r#"
+        enum Mixed { A = 1, B(i32) }
+        fun main() { }
+        "#,
+        "an explicit backing value is only meaningful when every variant is \
+         data-less, and 'B' carries a payload",
     );
 }

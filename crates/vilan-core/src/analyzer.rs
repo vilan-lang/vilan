@@ -764,6 +764,366 @@ pub struct EnumVariantDeclaration<'src> {
     pub backing_value: BackingValue,
 }
 
+/// One variant as [`read_enum_backing`] resolved it (`backed-enums.md` §10).
+#[derive(Debug)]
+pub(crate) struct VariantBacking<'a> {
+    pub name: &'a str,
+    /// The value this variant IS at runtime. `None` when it has none to be:
+    /// the literal it wrote was rejected, it disagreed with the enum's backing,
+    /// or the C-style sequence it continued ran out. Each case is in
+    /// `diagnostics`, and a valueless variant takes no part in the uniqueness
+    /// check — one bad literal must not also read as a duplicate.
+    pub value: Option<BackingValue>,
+    /// The literal as WRITTEN, when the variant wrote one. Kept beside the
+    /// resolved value so a generator reprints the author's own spelling (hex
+    /// stays hex) rather than the decimal it resolves to.
+    pub written: Option<&'a BackingLiteral<'a>>,
+    /// What is wrong with this variant, in the order the walk reports it.
+    pub diagnostics: Vec<Error>,
+}
+
+/// An enum's discriminants, read once (`backed-enums.md` §10).
+#[derive(Debug)]
+pub(crate) struct EnumBacking<'a> {
+    /// One entry per variant, in declaration order.
+    pub variants: Vec<VariantBacking<'a>>,
+    /// §3.1(b)'s conjunction: `Some` exactly when the enum lowers to its bare
+    /// backing values rather than the `[index, ..data]` array form.
+    pub backing: Option<Backing>,
+}
+
+impl EnumBacking<'_> {
+    /// Whether the declaration is clean enough for a generator to emit against.
+    /// A broken enum is already reported by the walk, and every generator stays
+    /// silent there rather than piling a second report on top of the first.
+    fn is_clean(&self) -> bool {
+        self.variants
+            .iter()
+            .all(|variant| variant.diagnostics.is_empty())
+    }
+}
+
+/// **The** reader of an enum's discriminants (`backed-enums.md` §10), shared by
+/// the lowering walk, the `value()`/`parse()` generator, the `Json`/`Wire`
+/// derives, and §3.7's duplicate check.
+///
+/// It exists because those consumers used to read the same declaration
+/// separately and disagree about it. The walk resolves every variant, walking
+/// the C-style sequence through the ones that wrote no literal; the generators
+/// re-read the raw literals and bailed on the first variant that had none. So
+/// `enum Walked { A = 5, B, C }` lowered to the bare numbers 5/6/7 — the walk's
+/// answer — while getting no `value()`, no `parse()`, and the name-tagged JSON
+/// shape of an unbacked enum. One reading removes the disagreement by
+/// construction: a variant's effective backing is computed once, here.
+///
+/// Pure and diagnostic-free by design — it BUILDS [`Error`]s and hands them
+/// back per variant rather than pushing them. The walk pushes them at the point
+/// it always did; the generators, which run earlier at derive-expansion time
+/// and have no diagnostic sink at all, read them only as "this declaration is
+/// broken, emit nothing".
+pub(crate) fn read_enum_backing<'a>(
+    enum_name: &str,
+    variants: &'a [Spanned<EnumVariant<'a>>],
+) -> EnumBacking<'a> {
+    // C-style discriminants: each unspecified variant continues from the
+    // previous value plus one, starting at 0. `None` once the sequence has run
+    // past the emission's bound and there is no next value to hand out — a
+    // plain `+ 1` panicked the debug compiler there and wrapped the release one.
+    let mut next_discriminant: Option<i64> = Some(0);
+    let mut all_data_less = true;
+    let mut any_explicit_backing = false;
+    // §3.2: the backing type is fixed by the FIRST explicit value in
+    // declaration order, and every later value must agree — an enum has one
+    // runtime representation, and a value that is sometimes a number and
+    // sometimes a string is not a vilan type.
+    let mut enum_backing: Option<(Backing, &'a str, Span)> = None;
+    // §3.3's payload rule: a backing value only reaches the runtime when EVERY
+    // variant is data-less, so the first payload variant is what a stray one
+    // must be reported against.
+    let first_payload_variant = variants
+        .iter()
+        .find(|variant| !variant.0.1.is_empty())
+        .map(|variant| (variant.0.0, variant.1));
+    // §3.7's uniqueness rule, over both backings: value -> the variant that
+    // took it first. Implicit values count — `enum E { A = 1, B = 0, C }` walks
+    // C onto 1 and collides just as loudly. Two variants sharing a value ARE
+    // one runtime value: the second `match` arm is unreachable and an
+    // exhaustive match returns the wrong answer with exit 0.
+    let mut backing_owners: IndexMap<String, (&'a str, Span)> = IndexMap::new();
+    let mut read: Vec<VariantBacking<'a>> = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let (variant_name, payload, explicit_backing) = &variant.0;
+        let variant_name = *variant_name;
+        let has_payload = !payload.is_empty();
+        let explicit_backing = explicit_backing.as_ref();
+        all_data_less &= !has_payload;
+        any_explicit_backing |= explicit_backing.is_some();
+        let mut diagnostics = Vec::new();
+        if let Some(written) = explicit_backing {
+            diagnostics.extend(backing_placement_error(
+                variant_name,
+                written,
+                has_payload,
+                first_payload_variant,
+            ));
+        }
+        // §3.2: one backing per enum. Reported against the second spelling,
+        // with a note at the first — both variants and both literals, because
+        // either one could be the typo.
+        let mut backing_disagrees = false;
+        if let Some(written) = explicit_backing {
+            let kind = match written {
+                BackingLiteral::Int { .. } => Backing::Int,
+                BackingLiteral::Str { .. } => Backing::Str,
+            };
+            match enum_backing {
+                Some((established, owner, owner_span)) if established != kind => {
+                    backing_disagrees = true;
+                    diagnostics.push(Error {
+                        note: Some(Note {
+                            span: owner_span,
+                            msg: format!("'{owner}' backs '{enum_name}' with {}", established.label()),
+                            source: None,
+                        }),
+                        span: written.span(),
+                        msg: format!(
+                            "variant '{variant_name}' is backed by {} (`{written}`) where '{owner}' \
+                             is backed by {}; every variant of '{enum_name}' must share one \
+                             backing type",
+                            kind.label(),
+                            established.label()
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => enum_backing = Some((kind, variant_name, written.span())),
+            }
+        }
+        let value = match explicit_backing {
+            Some(_) if backing_disagrees => None,
+            Some(written) => match backing_literal_value(written) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    diagnostics.push(error);
+                    None
+                }
+            },
+            None => {
+                // §3.1(a): C-style auto-increment is meaningful for integers and
+                // there is no successor of `"start"`, so a string backing must
+                // be written on EVERY variant. Deriving it from the variant name
+                // is rejected on §2.1's evidence: five of std's eleven CSS enums
+                // have names no case convention produces (`AlignItems::Start` is
+                // `"flex-start"`, `Display::Hidden` is `"none"`), and a rule that
+                // is right for six and silently wrong for five is worse than no
+                // rule.
+                // A payload anywhere in the enum already broke the placement
+                // rule and was reported there; the missing-string rule has
+                // nothing to add on top of it (one mistake, one message).
+                if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
+                    && first_payload_variant.is_none()
+                {
+                    let (owner, owner_span) = enum_backing
+                        .map(|(_, owner, span)| (owner, span))
+                        .expect("a string backing was established");
+                    diagnostics.push(Error {
+                        note: Some(Note {
+                            span: owner_span,
+                            msg: format!("'{owner}' backs '{enum_name}' with a string here"),
+                            source: None,
+                        }),
+                        span: variant.1,
+                        msg: format!(
+                            "variant '{variant_name}' has no backing value, and a string backing \
+                             has no successor to continue from; give every variant of \
+                             '{enum_name}' its own string"
+                        ),
+                    });
+                    None
+                } else {
+                    if next_discriminant.is_none() {
+                        diagnostics.push(Error {
+                            note: None,
+                            span: variant.1,
+                            msg: format!(
+                                "variant '{variant_name}' continues the discriminant sequence past \
+                                 {I53_MAX}, the largest integer a JS number holds exactly; give it \
+                                 an explicit discriminant"
+                            ),
+                        });
+                    }
+                    next_discriminant.map(BackingValue::Int)
+                }
+            }
+        };
+        if let Some(value) = &value {
+            if let BackingValue::Int(discriminant) = value {
+                // The continuation stops at the same edge an explicit
+                // discriminant does (B106): a continued value is emitted as the
+                // same bare JS literal.
+                next_discriminant = discriminant.checked_add(1).filter(|next| *next <= I53_MAX);
+            }
+            let (key, rendered) = match value {
+                BackingValue::Int(value) => (format!("i{value}"), format!("discriminant {value}")),
+                BackingValue::Str(text) => {
+                    (format!("s{text}"), format!("backing value \"{text}\""))
+                }
+            };
+            match backing_owners.get(&key) {
+                Some((owner, owner_span)) => diagnostics.push(Error {
+                    // Both variants are in the one declaration, so the note
+                    // needs no source of its own.
+                    note: Some(Note {
+                        span: *owner_span,
+                        msg: format!("'{owner}' has {rendered}"),
+                        source: None,
+                    }),
+                    span: variant.1,
+                    msg: format!(
+                        "variant '{variant_name}' has {rendered}, which '{owner}' already uses; \
+                         two variants of '{enum_name}' cannot share one"
+                    ),
+                }),
+                None => {
+                    backing_owners.insert(key, (variant_name, variant.1));
+                }
+            }
+        }
+        read.push(VariantBacking {
+            name: variant_name,
+            value,
+            written: explicit_backing,
+            diagnostics,
+        });
+    }
+    // §3.1(b): the conjunction stays. An enum is bare-lowered iff it is
+    // payload-free AND at least one variant is explicit, so `enum Plain { A, B }`
+    // keeps its `[0]`/`[1]` array form — changing that would change the runtime
+    // representation of every payload-free enum in every existing program.
+    let backing = (all_data_less && any_explicit_backing).then(|| {
+        enum_backing
+            .map(|(kind, _, _)| kind)
+            .unwrap_or(Backing::Int)
+    });
+    EnumBacking {
+        variants: read,
+        backing,
+    }
+}
+
+/// One written literal as a value, or the diagnostic rejecting it (B79, widened
+/// by backed-enums.md §3.1).
+///
+/// A string arm needs no validation beyond the lexer's: any text is a legal
+/// backing value. The integer arm is B79's, unchanged. The parser used to
+/// reduce it itself, with `.parse::<i64>().unwrap_or(0)` over the number token's
+/// WHOLE part alone — which quietly accepted three spellings it does not mean: a
+/// fraction (`= 1.5` became `1`), a type suffix (`= 1u32` became `1`, and
+/// `= 1_000` lexes as `1` with the suffix `_000`), and a magnitude past `i64`
+/// (which became `0`, a perfectly ordinary discriminant a sibling may
+/// legitimately hold — routing an overflow straight into the duplicate hole).
+/// Hex is read the way every other integer literal in the language is read
+/// (`0x` + radix 16), not left to fail `parse` into `0`.
+///
+/// §3.4's type set is enforced here by omission: `str` and the integers are the
+/// whole of it. A float is the fraction rejection (its `===` lowering and
+/// `NaN !== NaN` would break both the duplicate check and every variant test); a
+/// `bool` never reaches the production at all, `bool` being itself an enum that
+/// already lowers to native `true`/`false`.
+fn backing_literal_value(written: &BackingLiteral<'_>) -> Result<BackingValue, Error> {
+    let (negative, whole, fraction, suffix) = match written {
+        BackingLiteral::Str { text, .. } => {
+            return Ok(BackingValue::Str((*text).to_string()));
+        }
+        BackingLiteral::Int {
+            negative,
+            whole,
+            fraction,
+            suffix,
+            ..
+        } => (*negative, *whole, *fraction, *suffix),
+    };
+    let reject = |msg: String| {
+        Err(Error {
+            note: None,
+            span: written.span(),
+            msg,
+        })
+    };
+    if fraction.is_some() {
+        return reject(format!(
+            "an enum backing value must be an integer or a string, and `{written}` is neither"
+        ));
+    }
+    if let Some(suffix) = suffix {
+        return reject(format!(
+            "an enum backing value must be an integer or a string, and `{written}` carries the \
+             trailer `{suffix}`; write the bare number"
+        ));
+    }
+    let magnitude = match whole.strip_prefix("0x") {
+        Some(hex) => u128::from_str_radix(hex, 16),
+        None => whole.parse::<u128>(),
+    };
+    // B106: the bound is the EMISSION's, not `i64`'s. It is symmetric — `i64`'s
+    // negative end reaches one further only because two's complement does, and
+    // a JS number has no such asymmetry — so the minus buys nothing here.
+    match magnitude {
+        Ok(magnitude) if magnitude <= I53_MAX as u128 => Ok(BackingValue::Int(match negative {
+            true => -(magnitude as i64),
+            false => magnitude as i64,
+        })),
+        _ => reject(format!(
+            "the enum discriminant `{written}` is out of range \
+             (-{I53_MAX} ..= {I53_MAX}): a backed enum is a JS number at \
+             runtime, and an integer past 2^53 - 1 has no exact double, so \
+             the emitted literal would be a different value"
+        )),
+    }
+}
+
+/// §3.3's placement rule: a backing value only means anything when EVERY
+/// variant is data-less. `backing` is a conjunction — all-data-less AND
+/// any-explicit-value — so one payload variant flips the whole enum to the
+/// tagged `[index, ..data]` form and every backing value in it becomes inert. It
+/// parsed, it was stored, and nothing will ever read it. A bare backing value
+/// has nowhere to put a payload, which is why §3.3 rejects the hybrid outright
+/// rather than inventing a lowering for it.
+///
+/// Two shapes, two messages: the value sits on the payload variant itself, or on
+/// a data-less sibling of one. One rule over both backings — the string case
+/// reaches exactly this check.
+fn backing_placement_error(
+    variant_name: &str,
+    written: &BackingLiteral<'_>,
+    has_payload: bool,
+    first_payload_variant: Option<(&str, Span)>,
+) -> Option<Error> {
+    if has_payload {
+        return Some(Error {
+            note: None,
+            span: written.span(),
+            msg: format!(
+                "variant '{variant_name}' carries a payload, so it cannot have an explicit \
+                 backing value"
+            ),
+        });
+    }
+    let (payload_variant, payload_span) = first_payload_variant?;
+    Some(Error {
+        note: Some(Note {
+            span: payload_span,
+            msg: format!("'{payload_variant}' carries a payload here"),
+            source: None,
+        }),
+        span: written.span(),
+        msg: format!(
+            "an explicit backing value is only meaningful when every variant is data-less, and \
+             '{payload_variant}' carries a payload; remove the backing value, or the payload"
+        ),
+    })
+}
+
 // A match pattern as walked, with variant names not yet resolved.
 #[derive(Debug, Clone)]
 enum WalkPattern<'src> {
@@ -16393,129 +16753,6 @@ impl<'src> Analyzer<'src> {
         0
     }
 
-    /// The value of an explicit enum backing value, or `None` with a diagnostic
-    /// when the literal is not one of the two the grammar means (B79, widened
-    /// by backed-enums.md §3.1).
-    ///
-    /// A string arm needs no validation beyond the lexer's: any text is a legal
-    /// backing value. The integer arm is B79's, unchanged. The parser used to
-    /// reduce it itself, with `.parse::<i64>().unwrap_or(0)` over the number
-    /// token's WHOLE part alone — which quietly accepted three spellings it
-    /// does not mean: a fraction (`= 1.5` became `1`), a type suffix (`= 1u32`
-    /// became `1`, and `= 1_000` lexes as `1` with the suffix `_000`), and a
-    /// magnitude past `i64` (which became `0`, a perfectly ordinary
-    /// discriminant a sibling may legitimately hold — routing an overflow
-    /// straight into the duplicate hole). Hex is read the way every other
-    /// integer literal in the language is read (`0x` + radix 16), not left to
-    /// fail `parse` into `0`.
-    ///
-    /// §3.4's type set is enforced here by omission: `str` and the integers are
-    /// the whole of it. A float is the fraction rejection (its `===` lowering
-    /// and `NaN !== NaN` would break both the duplicate check and every variant
-    /// test); a `bool` never reaches the production at all, `bool` being itself
-    /// an enum that already lowers to native `true`/`false`.
-    fn backing_value(&mut self, written: &BackingLiteral<'src>) -> Option<BackingValue> {
-        let (negative, whole, fraction, suffix) = match written {
-            BackingLiteral::Str { text, .. } => {
-                return Some(BackingValue::Str((*text).to_string()));
-            }
-            BackingLiteral::Int {
-                negative,
-                whole,
-                fraction,
-                suffix,
-                ..
-            } => (*negative, *whole, *fraction, *suffix),
-        };
-        let mut reject = |msg: String| {
-            self.diagnostics.push(Error {
-                note: None,
-                span: written.span(),
-                msg,
-            });
-            None::<BackingValue>
-        };
-        if fraction.is_some() {
-            return reject(format!(
-                "an enum backing value must be an integer or a string, and `{written}` is neither"
-            ));
-        }
-        if let Some(suffix) = suffix {
-            return reject(format!(
-                "an enum backing value must be an integer or a string, and `{written}` carries the \
-                 trailer `{suffix}`; write the bare number"
-            ));
-        }
-        let magnitude = match whole.strip_prefix("0x") {
-            Some(hex) => u128::from_str_radix(hex, 16),
-            None => whole.parse::<u128>(),
-        };
-        // B106: the bound is the EMISSION's, not `i64`'s. It is symmetric —
-        // `i64`'s negative end reaches one further only because two's
-        // complement does, and a JS number has no such asymmetry — so the minus
-        // buys nothing here.
-        match magnitude {
-            Ok(magnitude) if magnitude <= I53_MAX as u128 => {
-                Some(BackingValue::Int(match negative {
-                    true => -(magnitude as i64),
-                    false => magnitude as i64,
-                }))
-            }
-            _ => reject(format!(
-                "the enum discriminant `{written}` is out of range \
-                 (-{I53_MAX} ..= {I53_MAX}): a backed enum is a JS number at \
-                 runtime, and an integer past 2^53 - 1 has no exact double, so \
-                 the emitted literal would be a different value"
-            )),
-        }
-    }
-
-    /// B79's placement rule, now §3.3's: a backing value only means anything
-    /// when EVERY variant is data-less. `backing` is a conjunction —
-    /// all-data-less AND any-explicit-value — so one payload variant flips the
-    /// whole enum to the tagged `[index, ..data]` form and every backing value
-    /// in it becomes inert. It parsed, it was stored, and nothing will ever
-    /// read it. A bare backing value has nowhere to put a payload, which is why
-    /// §3.3 rejects the hybrid outright rather than inventing a lowering for it.
-    ///
-    /// Two shapes, two messages: the value sits on the payload variant itself,
-    /// or on a data-less sibling of one. One rule over both backings — the
-    /// string case reaches exactly this check.
-    fn check_backing_placement(
-        &mut self,
-        variant_name: &'src str,
-        written: &BackingLiteral<'src>,
-        has_payload: bool,
-        first_payload_variant: Option<(&'src str, Span)>,
-    ) {
-        if has_payload {
-            self.diagnostics.push(Error {
-                note: None,
-                span: written.span(),
-                msg: format!(
-                    "variant '{variant_name}' carries a payload, so it cannot have an explicit \
-                     backing value"
-                ),
-            });
-            return;
-        }
-        let Some((payload_variant, payload_span)) = first_payload_variant else {
-            return;
-        };
-        self.diagnostics.push(Error {
-            note: Some(crate::error::Note {
-                span: payload_span,
-                msg: format!("'{payload_variant}' carries a payload here"),
-                source: None,
-            }),
-            span: written.span(),
-            msg: format!(
-                "an explicit backing value is only meaningful when every variant is data-less, and \
-                 '{payload_variant}' carries a payload; remove the backing value, or the payload"
-            ),
-        });
-    }
-
     fn walk_expr_nodes(&mut self, list: &'src NodeList<'src>, scope_id: Id) -> Vec<Id> {
         list.iter()
             .map(|child| self.walk_expr_node(child, scope_id))
@@ -17818,191 +18055,29 @@ impl<'src> Analyzer<'src> {
                 // `use Enum::{ ... }` or `Enum::Variant` — not the outer scope.
                 let variants_scope = self.create_scope(None);
                 let variants_scope_id = self.push_scope(variants_scope);
+                // ONE reading of the discriminants (§10): the walk resolves
+                // every variant here, and the generators that run earlier at
+                // derive-expansion time resolve them with the same call, so a
+                // walked variant cannot lower to a value the generators do not
+                // know about.
+                let read = read_enum_backing(name, &variants.0);
+                let backing = read.backing;
                 let mut variant_declarations = Vec::new();
-                // C-style discriminants: each unspecified variant continues from
-                // the previous value plus one, starting at 0. The enum is backed
-                // only if every variant is data-less and one is explicit.
-                // `None` once the sequence has run past `i64::MAX` and there is
-                // no next value to hand out — a plain `+ 1` panicked the debug
-                // compiler there and wrapped the release one.
-                let mut next_discriminant: Option<i64> = Some(0);
-                let mut all_data_less = true;
-                let mut any_explicit_backing = false;
-                // §3.2: the backing type is fixed by the FIRST explicit value in
-                // declaration order, and every later value must agree — an enum
-                // has one runtime representation, and a value that is sometimes
-                // a number and sometimes a string is not a vilan type.
-                let mut enum_backing: Option<(Backing, &'src str, Span)> = None;
-                // B79's payload rule, now §3.3's: a backing value only reaches
-                // the runtime when EVERY variant is data-less, so the first
-                // payload variant is what a stray one must be reported against.
-                let first_payload_variant = variants
-                    .0
-                    .iter()
-                    .find(|variant| !variant.0.1.is_empty())
-                    .map(|variant| (variant.0.0, variant.1));
-                // B79's uniqueness rule, widened to strings by §3.7: value ->
-                // the variant that took it first. Implicit values count —
-                // `enum E { A = 1, B = 0, C }` walks C onto 1 and collides just
-                // as loudly. Two variants sharing a value ARE one runtime value:
-                // the second `match` arm is unreachable and an exhaustive match
-                // returns the wrong answer with exit 0.
-                let mut backing_owners: IndexMap<String, (&'src str, Span)> = IndexMap::new();
-                for (variant_index, variant) in variants.0.iter().enumerate() {
-                    let variant_name = variant.0.0;
+                for (variant_index, (variant, variant_backing)) in
+                    variants.0.iter().zip(read.variants).enumerate()
+                {
+                    let variant_name = variant_backing.name;
                     let data_type_ids: Vec<TypeId> = variant
                         .0
                         .1
                         .iter()
                         .map(|data_type| self.walk_type_node(data_type, body_scope_id))
                         .collect();
-                    all_data_less &= data_type_ids.is_empty();
-                    let explicit_backing = variant.0.2.as_ref();
-                    any_explicit_backing |= explicit_backing.is_some();
-                    if let Some(written) = explicit_backing {
-                        self.check_backing_placement(
-                            variant_name,
-                            written,
-                            !data_type_ids.is_empty(),
-                            first_payload_variant,
-                        );
-                    }
-                    // §3.2: one backing per enum. Reported against the second
-                    // spelling, with a note at the first — both variants and
-                    // both literals, because either one could be the typo.
-                    let written_backing = explicit_backing.map(|written| match written {
-                        BackingLiteral::Int { .. } => Backing::Int,
-                        BackingLiteral::Str { .. } => Backing::Str,
-                    });
-                    let mut backing_disagrees = false;
-                    if let (Some(written), Some(kind)) = (explicit_backing, written_backing) {
-                        match enum_backing {
-                            Some((established, owner, owner_span)) if established != kind => {
-                                backing_disagrees = true;
-                                self.diagnostics.push(Error {
-                                    note: Some(crate::error::Note {
-                                        span: owner_span,
-                                        msg: format!(
-                                            "'{owner}' backs '{name}' with {}",
-                                            established.label()
-                                        ),
-                                        source: None,
-                                    }),
-                                    span: written.span(),
-                                    msg: format!(
-                                        "variant '{variant_name}' is backed by {} (`{written}`) \
-                                         where '{owner}' is backed by {}; every variant of \
-                                         '{name}' must share one backing type",
-                                        kind.label(),
-                                        established.label()
-                                    ),
-                                });
-                            }
-                            Some(_) => {}
-                            None => enum_backing = Some((kind, variant_name, written.span())),
-                        }
-                    }
-                    // `None` when this variant has no usable value: the literal
-                    // it wrote was rejected above, it disagreed with the enum's
-                    // backing, or the C-style sequence it was continuing has no
-                    // next value. Either way it is already diagnosed, and it
-                    // takes no part in the uniqueness check — one bad literal
-                    // must not also read as a duplicate.
-                    let backing_value = match explicit_backing {
-                        Some(_) if backing_disagrees => None,
-                        Some(written) => self.backing_value(written),
-                        None => {
-                            // §3.1(a): C-style auto-increment is meaningful for
-                            // integers and there is no successor of `"start"`,
-                            // so a string backing must be written on EVERY
-                            // variant. Deriving it from the variant name is
-                            // rejected on §2.1's evidence: five of std's eleven
-                            // CSS enums have names no case convention produces
-                            // (`AlignItems::Start` is `"flex-start"`,
-                            // `Display::Hidden` is `"none"`), and a rule that is
-                            // right for six and silently wrong for five is worse
-                            // than no rule.
-                            // A payload anywhere in the enum already broke the
-                            // placement rule and was reported there; the
-                            // missing-string rule has nothing to add on top of
-                            // it (one mistake, one message).
-                            if enum_backing.map(|(kind, _, _)| kind) == Some(Backing::Str)
-                                && first_payload_variant.is_none()
-                            {
-                                let (owner, owner_span) = enum_backing
-                                    .map(|(_, owner, span)| (owner, span))
-                                    .expect("a string backing was established");
-                                self.diagnostics.push(Error {
-                                    note: Some(crate::error::Note {
-                                        span: owner_span,
-                                        msg: format!("'{owner}' backs '{name}' with a string here"),
-                                        source: None,
-                                    }),
-                                    span: variant.1,
-                                    msg: format!(
-                                        "variant '{variant_name}' has no backing value, and a \
-                                         string backing has no successor to continue from; give \
-                                         every variant of '{name}' its own string"
-                                    ),
-                                });
-                                None
-                            } else {
-                                if next_discriminant.is_none() {
-                                    self.diagnostics.push(Error {
-                                        note: None,
-                                        span: variant.1,
-                                        msg: format!(
-                                            "variant '{variant_name}' continues the discriminant \
-                                             sequence past {I53_MAX}, the largest integer a JS \
-                                             number holds exactly; give it an explicit \
-                                             discriminant"
-                                        ),
-                                    });
-                                }
-                                next_discriminant.map(BackingValue::Int)
-                            }
-                        }
-                    };
-                    if let Some(backing_value) = &backing_value {
-                        if let BackingValue::Int(discriminant) = backing_value {
-                            // The continuation stops at the same edge an explicit
-                            // discriminant does (B106): a continued value is emitted
-                            // as the same bare JS literal.
-                            next_discriminant =
-                                discriminant.checked_add(1).filter(|next| *next <= I53_MAX);
-                        }
-                        let (key, rendered) = match backing_value {
-                            BackingValue::Int(value) => {
-                                (format!("i{value}"), format!("discriminant {value}"))
-                            }
-                            BackingValue::Str(text) => {
-                                (format!("s{text}"), format!("backing value \"{text}\""))
-                            }
-                        };
-                        match backing_owners.get(&key) {
-                            Some((owner, owner_span)) => self.diagnostics.push(Error {
-                                // Both variants are in the one declaration, so
-                                // the note needs no source of its own.
-                                note: Some(crate::error::Note {
-                                    span: *owner_span,
-                                    msg: format!("'{owner}' has {rendered}"),
-                                    source: None,
-                                }),
-                                span: variant.1,
-                                msg: format!(
-                                    "variant '{variant_name}' has {rendered}, which '{owner}' \
-                                     already uses; two variants of '{name}' cannot share one"
-                                ),
-                            }),
-                            None => {
-                                backing_owners.insert(key, (variant_name, variant.1));
-                            }
-                        }
-                    }
+                    self.diagnostics.extend(variant_backing.diagnostics);
                     // A rejected literal still needs a value to carry; `0` is
                     // the same placeholder B79 used, and the enum is already
                     // diagnosed, so nothing reads it.
-                    let backing_value = backing_value.unwrap_or(BackingValue::Int(0));
+                    let backing_value = variant_backing.value.unwrap_or(BackingValue::Int(0));
                     let variant_id = self.new_entity_id();
                     self.expr_id_to_expr_map
                         .insert(variant_id, Expr::EnumVariant(id, variant_index));
@@ -18019,16 +18094,6 @@ impl<'src> Analyzer<'src> {
                         backing_value,
                     });
                 }
-                // §3.1(b): the conjunction stays. An enum is bare-lowered iff
-                // it is payload-free AND at least one variant is explicit, so
-                // `enum Plain { A, B }` keeps its `[0]`/`[1]` array form —
-                // changing that would change the runtime representation of
-                // every payload-free enum in every existing program.
-                let backing = (all_data_less && any_explicit_backing).then(|| {
-                    enum_backing
-                        .map(|(kind, _, _)| kind)
-                        .unwrap_or(Backing::Int)
-                });
                 // A bare-lowered enum IS a `str`/number at runtime and carries a
                 // synthesized `impl .. with Hashable` (`backed_enum_hashable_source`),
                 // so it counts as Hashable for the derive's all-fields check too —
@@ -28520,6 +28585,19 @@ pub enum Intrinsic {
     // `JSON.stringify` string. The basis of `Hashable` / value-keyed `Map`/`Set`
     // (proposal/hashable-keys.md, I1).
     CanonicalHash,
+    // `hash::hashes_equal(a, b): bool` -> `a === b`, the native comparison
+    // hashable-keys.md §3.2 promises of `Hash`. It exists because `Hash` is
+    // OPAQUE: `impl Hash with PartialEq` cannot reach a comparable projection,
+    // and writing `self == b` in the body dispatches back into that same impl
+    // and recurses forever. `===` is right because a `Hash` is always a JS
+    // primitive — `__hash` returns a primitive as-is and stringifies everything
+    // else — so there is no reference identity to fall into.
+    //
+    // `Hash` is deliberately NOT added to `is_native_operator_type` instead:
+    // that predicate governs every operator, so an opaque key would silently
+    // accept `<` and `-` (emitting a lexicographic compare, or `NaN`) where it
+    // reports "does not implement the `PartialOrd` operator" today.
+    HashEq,
     // `dom::query_selector_all(selector): List<Element>` -> the matches as a real
     // array, `Array.from(document.querySelectorAll(selector))` (querySelectorAll
     // yields a NodeList, which a `List` would otherwise mishandle).
@@ -29701,6 +29779,7 @@ fn derive_enum_impls(
     derives: &[&str],
     enum_name: &str,
     variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
+    backing_type: Option<&'static str>,
 ) -> String {
     // §3.9: a BACKED enum serializes AS ITS BACKING VALUE, for both `Json` and
     // `Wire`. `Align::Start` encodes as `"start"`, not `"Start"`.
@@ -29715,7 +29794,6 @@ fn derive_enum_impls(
     // first user ships a format. Adding or removing a backing value on a
     // derived enum is a wire-format break; that is a sentence in
     // `docs/std/encoding.md`, not a compiler mechanism.
-    let backing_type = backed_enum_backing_type(variants);
     // (variant name, payload type names — its arity is the length).
     let variants: Vec<(&str, Vec<String>)> = variants
         .0
@@ -29816,7 +29894,7 @@ fn derive_enum_impls(
                 // Both directions delegate — `value()` folds to the identity
                 // and `<backing>::to_json` already escapes correctly — so
                 // neither direction re-implements JSON quoting here.
-                if let Some(backing_type) = &backing_type {
+                if let Some(backing_type) = backing_type {
                     out.push_str(&format!(
                         "impl {enum_name} with Json {{\n\
                          \tfun to_json(self): str {{\n\
@@ -29824,7 +29902,7 @@ fn derive_enum_impls(
                          \t}}\n\
                          }}\n"
                     ));
-                    let coerce = match backing_type.as_str() {
+                    let coerce = match backing_type {
                         "str" => "coerce_str",
                         "i53" => "coerce_i53",
                         _ => "coerce_i32",
@@ -30224,23 +30302,49 @@ pub(crate) fn service_impl_source(
     out
 }
 
-/// Whether an enum is BARE-LOWERED, read syntactically: every variant is
-/// payload-free and at least one carries an explicit backing value. This is the
-/// same conjunction the walker folds into [`Enum::backing`]
-/// (`proposal/backed-enums.md` §3.1(b)) — `enum Plain { A, B }` keeps its
-/// `[0]`/`[1]` array form, and `enum Level { Low = 0, Mid, High }` does not,
-/// because one explicit value converts the whole declaration.
+/// The enum a member may be synthesized onto: BARE-LOWERED, and eligible for
+/// synthesis at all (`proposal/backed-enums.md` §10). `None` for every other
+/// item — a plain enum, a payload enum, a generic or `resource` enum.
 ///
-/// Deliberately WEAKER than the "every variant carries a written literal" rule
-/// [`backed_enum_impl_source`] uses for `value()`/`parse()`: those two must
-/// reprint each backing literal, so they need one per variant, while the
-/// runtime representation only needs the conjunction. Keying `Hashable` off the
-/// representation rather than off the printable literals is what keeps
-/// "the enum IS the key" true for `enum Level { Low = 0, Mid, High }` too.
-fn enum_is_bare_lowered(variants: &[Spanned<EnumVariant<'_>>]) -> bool {
-    // A variant-less `enum E {}` falls out false: `any` over nothing is false.
-    variants.iter().all(|variant| variant.0.1.is_empty())
-        && variants.iter().any(|variant| variant.0.2.is_some())
+/// Every synthesized member — `value()`/`parse()`, the `Hashable` one-liner, the
+/// `Json`/`Wire` backed shape — goes through this one gate, over the one
+/// reading. Before §10 each read the declaration for itself, and the readings
+/// disagreed: `enum Walked { A = 5, B, C }` lowered to the bare numbers 5/6/7
+/// while getting none of the members, because the generators needed a written
+/// literal per variant where the lowering needed only the conjunction. Only the
+/// conjunction is needed here too: a walked variant's value is
+/// [`read_enum_backing`]'s answer, the same one the lowering emits.
+///
+/// The exclusions are here rather than at each caller because they are one rule,
+/// not three. A GENERIC enum's parameter can only be phantom (a payload is
+/// rejected by §3.3) and `Enum::parse` on one would have no way to bind it
+/// (§8.2(d)). A RESOURCE enum's identity is not its copyable backing value — the
+/// rule `check_hashable_boundary` already states for a resource field — and
+/// `fun value(self)` on one reads a resource out of a loan, so `resource enum
+/// Handle { Open = 1 }` used to fail AT ITS DECLARATION with an error about a
+/// body the author never wrote. `backed_enum_backing_type_of` was the reader
+/// that omitted the resource half, and generated `Json`/`Wire` impls calling a
+/// `value()` no resource enum has.
+///
+/// Cleanliness is NOT part of this gate, because the two kinds of member want
+/// opposite answers on a broken declaration: a generator that emits vilan source
+/// must stay silent ([`EnumBacking::is_clean`], so one mistake stays one
+/// message), while `Hashable` must track the RUNTIME representation, which a
+/// broken enum still has — the walk keys `hashable_names` off exactly this
+/// conjunction, and the impl table has to agree with it.
+fn bare_lowered_enum<'a>(
+    name: &str,
+    generic_parameters: &Option<GenericParameters<'a>>,
+    resource: bool,
+    variants: &'a [Spanned<EnumVariant<'a>>],
+) -> Option<EnumBacking<'a>> {
+    if generic_parameters.is_some() || resource {
+        return None;
+    }
+    // A variant-less `enum E {}` falls out: the conjunction's `any` over
+    // nothing is false, so `backing` is `None`.
+    let read = read_enum_backing(name, variants);
+    read.backing.is_some().then_some(read)
 }
 
 /// `Hashable` for a bare-lowered enum, synthesized as vilan source
@@ -30257,15 +30361,15 @@ fn enum_is_bare_lowered(variants: &[Spanned<EnumVariant<'_>>]) -> bool {
 /// `= "flex-start"` is already the opt-in, so `[derive(Hashable)]` would be a
 /// second switch for one decision. A user who writes it anyway, or hand-writes
 /// `impl Align with Hashable`, meets the ordinary duplicate-impl error.
+///
+/// Keyed off the runtime representation and nothing else — deliberately not off
+/// `is_clean`, so the impl table and the walk's `hashable_names` cannot
+/// disagree; see [`bare_lowered_enum`].
 pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
     let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return String::new();
     };
-    // A generic enum gets no synthesized members at all (§8.2(d)), and a
-    // RESOURCE cannot be hashed by value — `check_hashable_boundary` says so of
-    // a resource field, and a resource enum is the same value under the same
-    // rule: hash a plain-data projection instead.
-    if generic_parameters.is_some() || *resource || !enum_is_bare_lowered(&variants.0) {
+    if bare_lowered_enum(name.0, generic_parameters, *resource, &variants.0).is_none() {
         return String::new();
     }
     let enum_name = name.0;
@@ -30303,63 +30407,27 @@ pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
 /// nothing. The body is the SEMANTICS the fold has to agree with, and it is
 /// what runs if the call is ever reached another way.
 ///
-/// A GENERIC enum gets nothing: its parameter can only be phantom (a payload
-/// is rejected by §3.3), and `Enum::parse` on one would have no way to bind it.
-/// The `[derive(..)]` generators skip generic enums for the same reason.
+/// A generic or `resource` enum gets nothing; [`bare_lowered_enum`] carries
+/// both exclusions and the reasons.
 ///
-/// A RESOURCE enum gets nothing either, and that one is a fix rather than a
-/// rule: `fun value(self)` reads a resource out of a loan, so `resource enum
-/// Handle { Open = 1 }` used to fail AT ITS DECLARATION with "cannot move the
-/// resource `self` out of this function" — an error about a body the author
-/// never wrote, on a declaration that is otherwise legal. A resource's identity
-/// is not its copyable backing value (the rule `check_hashable_boundary`
-/// already states for a resource field), so the conversions are simply not
-/// offered.
+/// A WALKED variant — `enum Walked { A = 5, B, C }`'s `B` — is included, and
+/// that is §10's whole point: it has an effective backing value (6), the
+/// lowering emits it, and the conversions now say so. Its literal is rendered
+/// from the resolved value, since there is no written spelling to reprint.
 pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
     let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return String::new();
     };
-    if generic_parameters.is_some() || *resource {
-        return String::new();
-    }
-    // (variant name, the backing literal as written). Every variant must carry
-    // one and they must agree — a disagreement, a payload, or a missing string
-    // is a hard error the walk reports, and this generator stays silent there
-    // rather than emitting source that would report it a second time.
-    let mut written: Vec<(&str, &BackingLiteral<'_>)> = Vec::new();
-    for variant in &variants.0 {
-        let (variant_name, payload, backing) = &variant.0;
-        match backing {
-            Some(backing) if payload.is_empty() => written.push((variant_name, backing)),
-            _ => return String::new(),
-        }
-    }
-    if written.is_empty() {
-        return String::new();
-    }
-    // §3.2's one-backing rule, read here as a precondition: a mixture is
-    // already diagnosed, so generating nothing keeps the errors to one.
-    let all_strings = written
-        .iter()
-        .all(|(_, backing)| matches!(backing, BackingLiteral::Str { .. }));
-    let all_integers = written
-        .iter()
-        .all(|(_, backing)| matches!(backing, BackingLiteral::Int { .. }));
-    let backing_type = if all_strings {
-        "str".to_string()
-    } else if all_integers {
-        match integer_backing_type(&written) {
-            Some(backing_type) => backing_type,
-            None => return String::new(),
-        }
-    } else {
+    // A broken declaration is a hard error the walk reports, and this generator
+    // stays silent there rather than emitting source that would report it a
+    // second time.
+    let Some(read) = bare_lowered_enum(name.0, generic_parameters, *resource, &variants.0)
+        .filter(EnumBacking::is_clean)
+    else {
         return String::new();
     };
+    let backing_type = backing_type_name(&read);
     let enum_name = name.0;
-    // The literal exactly as written — `Display` quotes a string and reprints
-    // an integer's own spelling (hex stays hex), so the generated source says
-    // what the declaration says.
-    let literal = |backing: &BackingLiteral<'_>| backing.to_string();
 
     let mut out = format!("impl {enum_name} {{\n");
     out.push_str(&format!(
@@ -30368,10 +30436,11 @@ pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
          \tfun value(self): {backing_type} {{\n\
          \t\tmatch self {{\n"
     ));
-    for (variant_name, backing) in &written {
+    for variant in &read.variants {
         out.push_str(&format!(
-            "\t\t\t{enum_name}::{variant_name} => {},\n",
-            literal(backing)
+            "\t\t\t{enum_name}::{} => {},\n",
+            variant.name,
+            backing_literal_source(variant)
         ));
     }
     out.push_str("\t\t}\n\t}\n\n");
@@ -30383,66 +30452,68 @@ pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
         "\t/// The variant backed by `value`, or `None` when it is outside the set.\n\
          \tfun parse(value: {backing_type}): Option<{enum_name}> {{\n"
     ));
-    for (index, (variant_name, backing)) in written.iter().enumerate() {
+    for (index, variant) in read.variants.iter().enumerate() {
         let lead = if index == 0 { "\t\tif" } else { " else if" };
         out.push_str(&format!(
-            "{lead} value == {} {{\n\t\t\tOption::Some({enum_name}::{variant_name})\n\t\t}}",
-            literal(backing)
+            "{lead} value == {} {{\n\t\t\tOption::Some({enum_name}::{})\n\t\t}}",
+            backing_literal_source(variant),
+            variant.name
         ));
     }
     out.push_str(" else {\n\t\t\tOption::None\n\t\t}\n\t}\n}\n\n");
     out
 }
 
+/// One variant's backing value as vilan source, for the generated bodies.
+///
+/// The literal exactly as WRITTEN when there is one — `Display` quotes a string
+/// and reprints an integer's own spelling (hex stays hex), so the generated
+/// source says what the declaration says. A walked variant wrote nothing, so its
+/// resolved value is rendered instead: the decimal the lowering emits for it.
+fn backing_literal_source(variant: &VariantBacking<'_>) -> String {
+    if let Some(written) = variant.written {
+        return written.to_string();
+    }
+    match &variant.value {
+        Some(BackingValue::Int(value)) => value.to_string(),
+        // Unreachable on a clean enum: a string backing has no successor, so
+        // every string-backed variant carries a written literal (§3.1(a)), and
+        // a variant with no value at all was diagnosed.
+        Some(BackingValue::Str(text)) => format!("\"{text}\""),
+        None => "0".to_string(),
+    }
+}
+
 /// The vilan type of an integer backing: the narrowest plain-JS-number integer
 /// that holds every discriminant. `i32` is the language's default integer, so
 /// it is what `Ordering::Greater.value() == 1` compares against without
 /// friction; `i53` is the widest integer a JS number represents exactly, and a
-/// backed enum IS a JS number. `None` — no conversions at all — when a
-/// discriminant is outside `i53`; since B106 that is only ever a discriminant
-/// the range check has already REJECTED (this runs on the written literals, at
-/// derive-expansion time, so it still meets one), and generating nothing keeps
-/// a rejected enum to its one error.
-fn integer_backing_type(written: &[(&str, &BackingLiteral<'_>)]) -> Option<String> {
-    let bound = i128::from(I53_MAX);
-    let mut lowest: i128 = 0;
-    let mut highest: i128 = 0;
-    for (_, backing) in written {
-        let BackingLiteral::Int {
-            negative,
-            whole,
-            fraction,
-            suffix,
-            ..
-        } = backing
-        else {
-            return None;
-        };
-        // A rejected spelling is already diagnosed; generating nothing keeps
-        // the errors to one.
-        if fraction.is_some() || suffix.is_some() {
-            return None;
-        }
-        let magnitude: i128 = match whole.strip_prefix("0x") {
-            Some(hex) => i128::from_str_radix(hex, 16).ok()?,
-            None => whole.parse::<i128>().ok()?,
-        };
-        let value = if *negative { -magnitude } else { magnitude };
-        lowest = lowest.min(value);
-        highest = highest.max(value);
+/// backed enum IS a JS number.
+///
+/// Total since §10 unified the readers, where it used to return `Option` and
+/// re-parse the written literals in `i128` to do it: every value it sees now
+/// came through [`backing_literal_value`], which rejects anything outside
+/// `-I53_MAX ..= I53_MAX` (B106) and whose rejection makes the enum unclean, so
+/// the out-of-range arm had no reachable input left. The range is seeded at 0,
+/// so the chosen type spans zero even when no variant is 0.
+fn integer_backing_type(variants: &[VariantBacking<'_>]) -> &'static str {
+    let discriminants = variants.iter().filter_map(|variant| match variant.value {
+        Some(BackingValue::Int(value)) => Some(value),
+        _ => None,
+    });
+    let (lowest, highest) = discriminants.fold((0i64, 0i64), |(lowest, highest), value| {
+        (lowest.min(value), highest.max(value))
+    });
+    match lowest >= i32::MIN as i64 && highest <= i32::MAX as i64 {
+        true => "i32",
+        false => "i53",
     }
-    if lowest >= i32::MIN as i128 && highest <= i32::MAX as i128 {
-        return Some("i32".to_string());
-    }
-    if lowest >= -bound && highest <= bound {
-        return Some("i53".to_string());
-    }
-    None
 }
 
 pub(crate) fn derive_impl_source(derives: &[&str], item: &Spanned<Node<'_>>) -> String {
-    if let Node::Enum(name, _generics, _resource, variants) = &item.0 {
-        return derive_enum_impls(derives, name.0, variants);
+    if let Node::Enum(name, generic_parameters, resource, variants) = &item.0 {
+        let backing_type = enum_backing_type(name.0, generic_parameters, *resource, &variants.0);
+        return derive_enum_impls(derives, name.0, variants, backing_type);
     }
     let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
         return String::new();
@@ -30629,48 +30700,38 @@ fn struct_wire_visitor_impls(struct_name: &str, fields: &[(&str, String)]) -> St
 }
 
 /// The backing type of a `[derive(..)]` enum's variants, or `None` when the
-/// enum is not backed (backed-enums.md §3.9). Mirrors
-/// [`backed_enum_impl_source`]'s reading of the same declaration: every variant
-/// payload-free and carrying a literal, all of one kind — anything else is
-/// already a hard error at the declaration, and the generators stay silent
-/// there rather than piling a second report on top.
-pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<String> {
-    let Node::Enum(_, generic_parameters, _resource, variants) = &item.0 else {
+/// enum is not backed (backed-enums.md §3.9). The same §10 reading every other
+/// synthesized member goes through, so the wire shape and the runtime
+/// representation cannot disagree: `enum Walked { A = 5, B, C }` used to lower
+/// to the bare numbers while its derived `Json` encoded the variant NAME.
+pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<&'static str> {
+    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
         return None;
     };
-    if generic_parameters.is_some() {
-        return None;
-    }
-    backed_enum_backing_type(variants)
+    enum_backing_type(name.0, generic_parameters, *resource, &variants.0)
 }
 
-fn backed_enum_backing_type(
-    variants: &Spanned<Vec<Spanned<crate::node::EnumVariant<'_>>>>,
-) -> Option<String> {
-    let mut written: Vec<(&str, &BackingLiteral<'_>)> = Vec::new();
-    for variant in &variants.0 {
-        let (variant_name, payload, backing) = &variant.0;
-        match backing {
-            Some(backing) if payload.is_empty() => written.push((variant_name, backing)),
-            _ => return None,
-        }
+/// The vilan type name of a bare-lowered enum's backing, or `None` when the enum
+/// is not one a member may be synthesized onto.
+fn enum_backing_type<'a>(
+    name: &str,
+    generic_parameters: &Option<GenericParameters<'a>>,
+    resource: bool,
+    variants: &'a [Spanned<EnumVariant<'a>>],
+) -> Option<&'static str> {
+    bare_lowered_enum(name, generic_parameters, resource, variants)
+        .filter(EnumBacking::is_clean)
+        .map(|read| backing_type_name(&read))
+}
+
+/// The vilan type name of a read enum's backing.
+fn backing_type_name(read: &EnumBacking<'_>) -> &'static str {
+    match read.backing {
+        Some(Backing::Str) => "str",
+        // Every value is an `Int` here: a mixture is diagnosed, and a clean
+        // integer-backed enum resolves every variant.
+        _ => integer_backing_type(&read.variants),
     }
-    if written.is_empty() {
-        return None;
-    }
-    if written
-        .iter()
-        .all(|(_, backing)| matches!(backing, BackingLiteral::Str { .. }))
-    {
-        return Some("str".to_string());
-    }
-    if written
-        .iter()
-        .all(|(_, backing)| matches!(backing, BackingLiteral::Int { .. }))
-    {
-        return integer_backing_type(&written);
-    }
-    None
 }
 
 /// The §6.1 visitor impls for a BACKED `[derive(Wire)]` enum (§3.9): the
@@ -33319,6 +33380,9 @@ fn analyze_over_world<'src>(
     }
     if let Some(hash_id) = module_member("hash", "canonical_hash") {
         intrinsics.insert(hash_id, Intrinsic::CanonicalHash);
+    }
+    if let Some(hashes_equal_id) = module_member("hash", "hashes_equal") {
+        intrinsics.insert(hashes_equal_id, Intrinsic::HashEq);
     }
     for (name, intrinsic) in [
         ("range_i32", Intrinsic::RandomInt),
