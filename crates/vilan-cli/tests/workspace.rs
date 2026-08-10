@@ -672,6 +672,51 @@ fn a_duplicate_static_across_modules_names_the_other_module() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// B112: a check that runs after `build()` renders in the file its span indexes
+// into. R10 collects its candidates during the walk and reports them long after,
+// where the analyzer's "current file" is the entry — so a written `List<Guard>`
+// in an imported module was rendered against `main.vl`, drawing its label over
+// whatever the entry happened to hold at the module's offsets. The terminal
+// rendering is the half only a real two-file build can show (the file name comes
+// out of `Program::diagnostic_source`), so it lives here beside B74's.
+#[test]
+fn a_post_build_violation_in_a_module_renders_in_that_module() {
+    let dir = temp_project("post-build-attribution");
+    write(dir.as_path(), "vilan.toml", "[package]\nname = \"app\"\n");
+    write(
+        dir.as_path(),
+        "src/store.vl",
+        "import std::print;\nimport std::drop::Drop;\n\
+         resource struct Guard { label: str }\n\
+         impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\n\
+         fun keep() {\n\tmut arr: List<Guard> = [];\n}\n",
+    );
+    write(
+        dir.as_path(),
+        "src/main.vl",
+        "import pkg::store::keep;\n\nfun main() { keep(); }\n",
+    );
+    let build = vilan(&["build", dir.to_str().unwrap()]);
+    assert!(
+        !build.status.success(),
+        "a `List` of a resource must not build"
+    );
+    let output = combined(&build);
+    assert!(
+        output.contains("cannot hold the resource `Guard`"),
+        "R10 should be reported: {output}"
+    );
+    assert!(
+        output.contains("store.vl"),
+        "the diagnostic should render in the module that wrote it: {output}"
+    );
+    assert!(
+        !output.contains("main.vl"),
+        "and not in the entry, which has nothing wrong with it: {output}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Block-scoped imports (backlog H2), the multi-package path: a dependency and a
 // `pkg::` sibling referenced ONLY inside function bodies must still seed the
 // loader's reachable set — `collect_module_refs` finds references at any depth.
