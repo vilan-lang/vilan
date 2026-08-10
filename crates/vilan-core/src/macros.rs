@@ -1050,6 +1050,19 @@ impl Expander<'_, '_> {
             // missing impl surfaces at the use site).
             Node::Derive(names, item) => {
                 for (name, name_span) in names.iter() {
+                    // `Wire`/`Json` on a `resource` type is refused HERE, above
+                    // the backend split, so the vilan macros and the Rust
+                    // generators cannot disagree — and so nothing is generated
+                    // to fail later inside a body the author never wrote (B117;
+                    // `analyzer::resource_derive_refusal` carries the rule).
+                    if let Some(refusal) = crate::analyzer::resource_derive_refusal(name, item) {
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span: *name_span,
+                            msg: refusal,
+                        });
+                        continue;
+                    }
                     if self.scope.get(name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
                     } else if let Some(known) =

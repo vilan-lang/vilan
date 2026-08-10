@@ -202,9 +202,28 @@ Anchored at the `await` (the event), naming the live view(s):
 
 > `cannot hold a view across 'await': 'b' (a view into 'a') is still live here. Re-acquire the view after the await — the awaited turn may change what it points at.`
 
-Signature rule, anchored at the parameter:
+Signature rule, anchored at the parameter, naming the form it saw:
 
 > `an async function cannot take '&mut' parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle.`
+> `an async function cannot take '&' parameters: the view would be held across its suspension points. Pass a value, or a Shared/handle.`
+
+Both spellings were always implemented — the `Ref` and `RefMut` arms sit
+side by side — but only the `&mut` one was pinned, and only it was quoted
+here. B112's survey found the gap; cycle 15 pinned the `&` form (a free
+parameter and an `&self` receiver, which is an ordinary `Ref` parameter and
+anchors on the `self` token).
+
+**A gap the pins found, still open.** The signature rule fires only when the
+body contains an EXPLICIT `await` token (`saw_await`), so the implicit-await
+spelling — calling an async function without the keyword, which
+`spec/execution.md` §7 sanctions — bypasses it for both forms: `async fun
+stash(viewed: &mut Point) { let beat = tick(); viewed.x = beat; }` compiles,
+and emits `const beat = await (tick());` with the caller's view live across
+it. Tightening the gate to *declared* asyncness is not a one-liner: it would
+also reject an `async fun m(&self)` whose body never suspends, which B29's
+declared-async impl of a sync trait method relies on. Pinned `#[ignore]`d
+(`an_implicit_await_does_not_lift_the_async_view_parameter_rule`) as the
+desired outcome.
 
 ### Relation to A6
 

@@ -15745,6 +15745,87 @@ fn an_async_function_with_a_view_parameter_is_rejected() {
     assert_fails_spanning(source, "value", "cannot take '&mut' parameters");
 }
 
+// The `&` half of the same signature rule (`view-invalidation.md` §3: "an `async
+// fun` may not declare `&`/`&mut` parameters"). Only the `&mut` spelling above
+// was ever pinned — B112's survey found the gap. A SHARED view is no safer than
+// a mutable one here: the hazard is the caller's claim outliving its epoch while
+// the callee sits suspended, and reading through a stale view is the read half
+// of exactly that. The message names the form it saw, so the two spellings are
+// separately observable.
+
+#[test]
+fn an_async_function_with_a_shared_view_parameter_is_rejected() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        async fun peek(viewed: &Point) {
+            await tick();
+            let _seen = viewed.x;
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            peek(&point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&' parameters");
+}
+
+#[test]
+fn an_async_method_with_a_shared_view_receiver_is_rejected() {
+    // A receiver is an ordinary parameter with a `&` convention, so `&self`
+    // meets the same rule and anchors on the `self` token.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        impl Point {
+            async fun peek(&self) {
+                await tick();
+                let _seen = self.x;
+            }
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            point.peek();
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "self", "cannot take '&' parameters");
+}
+
+// KNOWN BUG (found 2026-08-10 probing the `&` form; pre-existing, and it is the
+// GATE's, not the form's — both spellings escape). The signature rule fires only
+// when the body contains an explicit `await` token, so the IMPLICIT-await
+// spelling (`spec/execution.md` §7: calling an async function without `await`,
+// the sanctioned form) bypasses it entirely. The emission proves the suspension
+// is real — `const t = await (tick());` — with the caller's view live across it.
+// Tightening the gate to declared-asyncness is not a one-liner: it would also
+// reject `async fun m(&self)` bodies that never suspend, which
+// `a_declared_async_impl_of_a_sync_trait_method_is_permitted` pins as legal
+// (B29's declared-async impl of a sync trait). Its own measurement.
+#[test]
+#[ignore]
+fn an_implicit_await_does_not_lift_the_async_view_parameter_rule() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun stash(viewed: &mut Point) {
+            let beat = tick();
+            viewed.x = beat;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
 #[test]
 fn a_sync_function_with_view_parameters_called_from_async_compiles() {
     // Sync callees cannot suspend — views pass freely.
@@ -52162,6 +52243,199 @@ fn a_resource_backed_enum_is_not_hashable() {
         }
         "#,
         "does not implement trait 'Hashable'",
+    );
+}
+
+// B117 — §10.5's rule at the DERIVE. A resource is an owned handle, not plain
+// data: `Wire::rebuild` and `FromJson::from_json` both MINT a `Self` out of
+// bytes, which for a resource is a twin nothing owns. The subject of the derive
+// was the one position nothing tested — `check_wire_boundary` had covered the
+// resource FIELD since destruction.md §8 — so all four shapes (backed/plain enum
+// × `Wire`/`Json`, and the struct twin) reached the generators. The enum shapes
+// then failed inside `match self` with "cannot move the resource `self` out of
+// this function", an error about a body the author never wrote; the STRUCT
+// shapes were worse, compiling clean and giving a resource a serialized form.
+
+#[test]
+fn b117_wire_is_refused_for_a_backed_resource_enum() {
+    assert_fails_spanning(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "Wire",
+        "`Wire` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_wire_is_refused_for_a_plain_resource_enum() {
+    // The plain shape reaches a different generator (externally tagged, no
+    // `value()`), and the refusal is above both.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open, Closed }
+        fun main() {}
+        "#,
+        "`Wire` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_backed_resource_enum() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_plain_resource_enum() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource enum Handle { Open, Closed }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_wire_is_refused_for_a_resource_struct() {
+    // The struct twin USED TO COMPILE: a struct's `describe` reads its fields
+    // through the loan, so nothing moved and nothing complained — the derive
+    // silently handed a resource a wire format.
+    assert_fails_spanning(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "Wire",
+        "`Wire` cannot be derived for the resource struct `Conn`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_resource_struct() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource struct `Conn`",
+    );
+}
+
+#[test]
+fn b117_the_refusal_replaces_the_generated_code_error() {
+    // The point of refusing at the derive rather than after expansion: nothing
+    // is generated, so the author never meets a diagnostic about a body they
+    // did not write.
+    assert_fails_without(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "in code generated by this attribute",
+    );
+}
+
+#[test]
+fn b117_a_refused_wire_derive_leaves_the_resource_not_wire() {
+    // A refused derive must not register the name as Wire. `[rpc]`'s signature
+    // check reads `wire_names` and has no resource guard of its own — the
+    // resource-FIELD rejects do, which is why this is the shape that shows it —
+    // so a refused `Conn` left in the set would still cross the wire, and the
+    // refusal would be advice rather than a rule.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        struct Pool {}
+        impl Pool {
+            [rpc] fun adopt(self, conn: Conn): i32 { 0 }
+        }
+        fun main() {}
+        "#,
+        "of `[rpc]` method `adopt` is `Conn`, which is not Wire",
+    );
+}
+
+#[test]
+fn b117_a_refused_wire_derive_still_meets_the_resource_field_reject() {
+    // The other reader of `wire_names`: a plain-data type holding the refused
+    // resource is rejected at the field, by the resource arm that precedes the
+    // not-Wire one.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        [derive(Wire)]
+        struct Envelope { conn: Conn }
+        fun main() {}
+        "#,
+        "field `conn` of `[derive(Wire)]` type `Envelope` is the resource `Conn`",
+    );
+}
+
+#[test]
+fn b117_the_other_derives_on_a_resource_survive_the_refusal() {
+    // Only `Wire`/`Json` are refused, and per derive NAME: `PartialEq`/`Debug`
+    // on a resource struct read their fields through the loan and stay legal
+    // (`resource_struct_carries_a_derive_through_expansion`).
+    assert_fails_once_with(
+        r#"
+        import std::print;
+        [derive(PartialEq, Wire, Debug)]
+        resource struct Session { id: i32, name: str }
+        fun main() {
+            let session = Session { id = 1, name = "a" };
+            print(session.debug());
+        }
+        "#,
+        "cannot be derived for the resource struct `Session`",
+    );
+}
+
+#[test]
+fn b117_a_resource_by_containment_still_names_its_field() {
+    // Keyed on the DECLARED `resource` modifier: a type that is a resource by
+    // containment has its root cause in the field, which `check_wire_boundary`
+    // already names — one mistake, one message, not two.
+    assert_fails_without(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Wire)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "cannot be derived for the resource",
+    );
+}
+
+#[test]
+fn b117_a_plain_data_wire_derive_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::encode_json;
+        [derive(Wire)]
+        struct Note { id: i32, text: str }
+        fun main() {
+            print(encode_json(Note { id = 7, text = "hi" }));
+        }
+        "#,
+        "{\"id\":7,\"text\":\"hi\"}\n",
     );
 }
 

@@ -17401,7 +17401,15 @@ impl<'src> Analyzer<'src> {
                 // test it for resource-ness). `walk_expr_node` returns the
                 // struct/enum entity id.
                 let declaration_id = self.walk_expr_node(inner, scope_id);
-                if derives.iter().any(|(name, _)| *name == "Wire") {
+                // A `Wire` derive REFUSED for a resource subject (B117) records
+                // nothing: the name must not enter `wire_names`, or a refused
+                // `resource struct Conn` would still satisfy `is_wire_type` and
+                // sail through the `[rpc]` signature check. The refusal is the
+                // expander's (`macros.rs`'s `Node::Derive` arm) — the boundary
+                // check would only add a second message for one mistake.
+                if derives.iter().any(|(name, _)| *name == "Wire")
+                    && resource_derive_refusal("Wire", inner).is_none()
+                {
                     self.collect_wire_type(&inner.0, declaration_id);
                 }
                 if derives.iter().any(|(name, _)| *name == "Hashable") {
@@ -30466,6 +30474,55 @@ fn bare_lowered_enum<'a>(
     // nothing is false, so `backing` is `None`.
     let read = read_enum_backing(name, variants);
     read.backing.is_some().then_some(read)
+}
+
+/// The refusal for `[derive(Wire)]` / `[derive(Json)]` on a type DECLARED
+/// `resource` — `Some(message)` to refuse, `None` for every other derive and
+/// every plain-data subject (B117).
+///
+/// The rule is §10.5's, applied to the derive rather than to the synthesized
+/// conversions: a resource is an OWNED HANDLE, not plain data. Serializing one
+/// copies it out of its owner, and the deserializing half is worse — `Wire`'s
+/// `rebuild` and `FromJson`'s `from_json` both MINT a `Self` out of bytes, an
+/// unowned twin of a handle whose whole point is a single owner. That is the
+/// same sentence `check_wire_boundary` already states for a resource FIELD; the
+/// subject of the derive was the one position nothing tested.
+///
+/// It is answered here, at the ONE seam both derive backends pass through
+/// (`macros::Expander`'s `Node::Derive` arm), rather than in a post-walk
+/// boundary check: expanding the impls and then complaining is what produced
+/// B117's symptom — a `match self` over a loaned resource receiver failing with
+/// "cannot move the resource `self` out of this function", an error about a body
+/// the author never wrote, exactly §10.5's class. A refused derive generates
+/// nothing, so one mistake stays one message.
+///
+/// Keyed on the DECLARED `resource` modifier, not on classified resource-ness:
+/// a type that is a resource by CONTAINMENT has its root cause in the field, and
+/// `check_wire_boundary` names that field precisely. Two diagnostics for one
+/// mistake is what this gate exists to avoid.
+pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
+    let (kind, name) = match &item.0 {
+        Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),
+        Node::Enum(name, _generics, true, _variants) => ("enum", name.0),
+        _ => return None,
+    };
+    let (what_it_would_do, steer) = match derive {
+        "Wire" => (
+            "sending it would copy it out of its owner, and rebuilding it on the far side \
+             would mint a twin nothing owns",
+            "send a plain-data name for it (an id, a key) instead",
+        ),
+        "Json" => (
+            "serializing it would copy it out of its owner, and parsing one back \
+             would mint a twin nothing owns",
+            "serialize a plain-data projection (an id, a key) instead",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "`{derive}` cannot be derived for the resource {kind} `{name}`: a resource is an owned \
+         handle, not plain data — {what_it_would_do}; {steer}"
+    ))
 }
 
 /// `Hashable` for a bare-lowered enum, synthesized as vilan source

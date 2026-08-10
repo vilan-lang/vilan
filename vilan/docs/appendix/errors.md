@@ -366,6 +366,17 @@ value, or compared by copy. Drop it from the derived type, or carry a
 plain-data handle (an id, a key) in its place.
 → [Resources](../tour/resources.md)
 
+**"`Wire` / `Json` cannot be derived for the resource struct / enum `…`: …"**
+The same rule with the resource in the other position — the derived type
+*is* the resource. Serializing it copies a handle out of its owner, and the
+reading half is worse: `Wire`'s `rebuild` and `Json`'s `from_json` build a
+value out of bytes, which for a resource is a second handle nothing owns
+and nothing will close. Send a plain-data name for the resource instead
+(an id, an `Arena` handle) and keep the resource on the side that owns it.
+The other derives are unaffected: `PartialEq` and `Debug` read a resource's
+fields through the loan and stay available.
+→ [Resources](../tour/resources.md), [Services](../guide/services.md)
+
 **"`…` implements `Drop` but is not a resource: … declare it a `resource` …"**
 `Drop` (the destruction hook) may be implemented only for a `resource`
 type. A destructor without move discipline is the double-close bug:
