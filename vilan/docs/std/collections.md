@@ -310,6 +310,32 @@ You can also hand-write `impl Hashable` to key by a subset of fields — except 
 a backed enum, whose impl the compiler already provides — and build your own
 container by bounding on `K: Hashable` and keying a `Map<Hash, …>` yourself.
 
+A `Hash` is opaque: you can hold it, compare two with `==`, hash it again (it is
+itself `Hashable`, being already a canonical key), and use it as a key. You
+cannot read the value inside, which is what keeps the representation free to
+change. Equal values hash equal, so `==` on two hashes answers "same key?":
+
+```vilan
+import std::print;
+import std::hash::Hashable;
+
+[derive(Hashable)]
+struct Point {
+	x: i32,
+	y: i32,
+}
+
+fun main() {
+	let here = Point { x = 1, y = 2 };
+	print(here.hash() == Point { x = 1, y = 2 }.hash()); // true
+	print(here.hash() == Point { x = 9, y = 2 }.hash()); // false
+}
+```
+
+Equality is the whole of a `Hash`'s operator surface — there is no order on a
+canonical key, so `<` is a compile error rather than a lexicographic compare of
+the underlying JSON.
+
 One corner: a float *inside* an aggregate key canonicalizes through JSON, where
 `NaN` becomes `null` and `-0`/`+0` collapse to `0`, so those collide. Bare
 numeric keys don't have this (they key by JS value directly).

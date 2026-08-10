@@ -5205,6 +5205,14 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            // `a === b` — the body of `impl Hash with PartialEq`. A `Hash` is
+            // always a JS primitive, so native equality IS its equality
+            // (hashable-keys.md §3.2); no helper, the comparison is the node.
+            Intrinsic::HashEq => js::Node::Binary(
+                BinaryOp::Eq,
+                Box::new(args.next().unwrap_or(js::Node::Void)),
+                Box::new(args.next().unwrap_or(js::Node::Void)),
+            ),
             // `Array.from(document.querySelectorAll(selector))` — the NodeList as a
             // real array, so `List` operations (`map`/`push`/…) behave.
             Intrinsic::QuerySelectorAll => {

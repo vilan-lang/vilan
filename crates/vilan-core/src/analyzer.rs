@@ -28301,6 +28301,19 @@ pub enum Intrinsic {
     // `JSON.stringify` string. The basis of `Hashable` / value-keyed `Map`/`Set`
     // (proposal/hashable-keys.md, I1).
     CanonicalHash,
+    // `hash::hashes_equal(a, b): bool` -> `a === b`, the native comparison
+    // hashable-keys.md §3.2 promises of `Hash`. It exists because `Hash` is
+    // OPAQUE: `impl Hash with PartialEq` cannot reach a comparable projection,
+    // and writing `self == b` in the body dispatches back into that same impl
+    // and recurses forever. `===` is right because a `Hash` is always a JS
+    // primitive — `__hash` returns a primitive as-is and stringifies everything
+    // else — so there is no reference identity to fall into.
+    //
+    // `Hash` is deliberately NOT added to `is_native_operator_type` instead:
+    // that predicate governs every operator, so an opaque key would silently
+    // accept `<` and `-` (emitting a lexicographic compare, or `NaN`) where it
+    // reports "does not implement the `PartialOrd` operator" today.
+    HashEq,
     // `dom::query_selector_all(selector): List<Element>` -> the matches as a real
     // array, `Array.from(document.querySelectorAll(selector))` (querySelectorAll
     // yields a NodeList, which a `List` would otherwise mishandle).
@@ -33100,6 +33113,9 @@ fn analyze_over_world<'src>(
     }
     if let Some(hash_id) = module_member("hash", "canonical_hash") {
         intrinsics.insert(hash_id, Intrinsic::CanonicalHash);
+    }
+    if let Some(hashes_equal_id) = module_member("hash", "hashes_equal") {
+        intrinsics.insert(hashes_equal_id, Intrinsic::HashEq);
     }
     for (name, intrinsic) in [
         ("range_i32", Intrinsic::RandomInt),

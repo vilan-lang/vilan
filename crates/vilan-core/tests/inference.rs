@@ -27057,6 +27057,107 @@ fn hashable_builds_a_reusable_container() {
     );
 }
 
+#[test]
+fn b110_two_hashes_compare_with_partial_eq() {
+    // hashable-keys.md §3.2/§8: `Hash` is `==`-comparable, so equal values hash
+    // equal and different values do not — over a primitive, a string, and a
+    // derived aggregate. The impl existed only on paper: `==` on a `Hash`
+    // reported "type 'Hash' does not implement the `PartialEq` operator".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        [derive(Hashable)]
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let k = 7;
+            print(k.hash() == k.hash());        // true
+            print(k.hash() == 8.hash());        // false
+            print("a".hash() == "a".hash());    // true
+            print("a".hash() == "b".hash());    // false
+            let p = Point { x = 1, y = 2 };
+            print(p.hash() == Point { x = 1, y = 2 }.hash());  // true
+            print(p.hash() == Point { x = 9, y = 2 }.hash());  // false
+            print(p.hash() != Point { x = 9, y = 2 }.hash());  // true
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_equality_does_not_recurse_into_its_own_impl() {
+    // The reason `eq`'s body is `hashes_equal` and not `self == b`: `Hash` is
+    // opaque and NOT a native-operator type, so a `==` in the body dispatches
+    // back into this same impl — `function eq(self, b) { return eq(self, b); }`,
+    // which stack-overflowed at runtime while compiling clean. The `.eq()` call
+    // reaches the body directly, so it is the arm the operator lowering skips.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash().eq(1.hash()));  // true
+            print(1.hash().eq(2.hash()));  // false
+            print(1.hash().ne(2.hash()));  // true — the inherited default
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_satisfies_a_partial_eq_bound() {
+    // What the impl buys beyond the operator: `Hash` now grounds a
+    // `T: PartialEq` bound, so it nests in the conditional impls and in generic
+    // user code. `Option<Hash>` is the conditional impl; `same` is the bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::{ Hashable, Hash };
+        import std::option::Option::{ self, Some, None };
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun main() {
+            print(same(1.hash(), 1.hash()));  // true
+            print(same(1.hash(), 2.hash()));  // false
+            let here: Option<Hash> = Some(1.hash());
+            print(here == Some(1.hash()));    // true
+            print(here == Some(2.hash()));    // false
+            print(here == None);              // false
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn b110_hash_is_still_not_ordered_or_arithmetic() {
+    // `Hash` gained equality, not the rest of the operator surface. It is
+    // deliberately absent from `is_native_operator_type` for exactly this: an
+    // opaque key has no order, and `<` on one would compare canonical JSON
+    // strings lexicographically.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash() < 2.hash());
+        }
+        "#,
+        "does not implement the `PartialOrd` operator",
+    );
+}
+
 // --- C5.1: a scalar view read as a value requires `*` -----------------------------
 // `transparent-references.md`: `*v` is the only way to cross from view to value —
 // the language never silently converts. A bare scalar view (whose runtime form is
