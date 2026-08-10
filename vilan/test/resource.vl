@@ -111,6 +111,11 @@ fun component_view(slot: &mut Slot) {
 // The data twin, which is where the ABSENCE lives: `count` is not a resource,
 // so its write is the bare slot assignment it always was even though the
 // aggregate around it holds one.
+//
+// `Counted` carries a second claim (B113, verified 2026-08-10): it is the only
+// aggregate here with NO `resource` modifier, so its `try`/`finally` and the
+// trailing "counted" are the byte-level witness that a PLAIN struct holding a
+// resource field is a resource by containment and runs the scope-end teardown.
 struct Counted { held: Res, count: i32 }
 
 fun component_data() {

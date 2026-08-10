@@ -81,6 +81,38 @@ Nothing in Tier 1 forecloses Tier 2.
   `Session` above needs no modifier; writing it is legal and checked (declaring
   `resource` on a type is always allowed — intent: "will gain teardown / must not be
   copied" — but omitting it never hides resource-ness).
+  *(Verified 2026-08-10 — B113, the containment-verify lane. No change: the rule
+  holds as written.)* B109's arc observed a plain struct with a resource field
+  running **no** scope-end destructor, and corrected a draft pin to match. The
+  observation was **probe idiom**, and the probe's own words are the diagnosis:
+  it wrote `impl Res { fun drop(own self) { .. } }` — an *inherent method* whose
+  name happens to be `drop` — where the language hook is the trait impl `impl
+  Res with Drop { fun drop(&mut self) }` (§5; a by-value receiver on the trait
+  is itself rejected). No destructor was ever registered, so none could run.
+  - **The control that clears containment** is the same idiom with the
+    containing struct *deleted*: a bare `resource` local with an inherent
+    `drop` method is equally silent. The silence is identical with and without
+    containment, so containment was never the variable — pinned as
+    `b113_an_inherent_method_named_drop_never_runs`.
+  - **Every shape tears down, and inference buys the WHOLE R-rule surface, not
+    teardown alone.** Measured across the matrix: a plain struct's field, two
+    fields (reverse declaration order), a plain struct nested in a plain struct
+    (recursive, one order rule per level), a tuple local, a move into an `own`
+    parameter (the callee's scope end owns it), an R2 overwrite (old at the
+    write, new at the scope end), and an R4 return (the callee must *not* drop
+    what it moved out). The same struct is also move-only under R1, fenced out
+    of `List` by R10, and refused by R12 — so there is no "teardown without
+    affinity" tier here and none was designed: §3 makes containment decide
+    resource-*ness*, and every R-rule then reads off that one answer. Nine pins
+    (`b113_*` in `crates/vilan-core/tests/inference.rs`).
+  - **Three independent witnesses, and a counterfactual.** The corpus has been
+    byte-pinning this all along without saying so: `resource.vl`'s `Counted` is
+    the file's only unmodified struct, and its golden emits the `try`/`finally`
+    and prints `counted`. Planting the deletion — `compute_resource`'s
+    `Type::Struct` arm returning "not a resource" instead of descending its
+    fields — turns seven of the nine pins red and reproduces the arc's exact
+    output (`body`, no leaf), which is the world the observation was read as
+    describing.
 - **The modifier is required at leaves**: an `external struct` is opaque, so host-object
   resources (`Database`) must say so themselves.
 - **`Drop` may be implemented only for resource types** — an impl on a data type errors,
