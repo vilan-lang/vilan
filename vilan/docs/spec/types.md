@@ -158,10 +158,29 @@ asked for — and `is` and `==` compare against a literal, so they answer
 value keeps the tagged array form and no trap: the language itself writes
 that tag, so there its exhaustiveness proof *is* a proof about the value.
 
-An `external fun` may take a backed enum but may **not return one**: a
-host value outside the set is not detected at the boundary, and the trap
-arm reports it only once a `match` meets it. Bind the backing type and
-convert with `parse`, which answers `None`.
+An `external fun` may both **take and return** a backed enum, and so may
+a callback it is handed. Nothing checks the boundary: a host value
+outside the set enters unremarked, exactly as it does for an
+`external fun f(): i32` that answers `"hello"`. What the trap arm buys is
+that such a value can no longer become a *confident* variant — the first
+exhaustive `match` to meet it panics with the raw value.
+
+Which of the two shapes to write is a question about the value, not about
+safety:
+
+```vilan,fragment
+[extern("getAlign")]
+external fun get_align(): Align;              // out of set is a BUG — trap
+
+[extern("getAlign")]
+[doc(hidden)]
+external fun get_align_raw(): str;            // out of set is an INPUT
+fun read_align(): Option<Align> { Align::parse(get_align_raw()) }
+```
+
+Return the enum where the host's set is genuinely closed and a value
+outside it means something is wrong; bind the backing type and `parse`
+where an unrecognized value is one of the answers you expect.
 
 ## 5.4 Impls
 

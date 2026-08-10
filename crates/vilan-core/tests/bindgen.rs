@@ -1485,18 +1485,20 @@ fn a_vilan_enum_carries_a_string_backing_value() {
     );
     // The integer form the language always had, unchanged.
     assert!(compile("enum Ordering { Less = -1, Equal = 0 }\nfun main() {}\n").is_empty());
-    // And the one rule bindgen's RETURN direction depends on: §7.2 is
-    // DEFERRED, so an extern may not return a backed enum. If that ever
-    // changes, the `parse` forwarder becomes optional and this goes red.
+    // The rule bindgen's RETURN direction turns on, and it moved: §7.2 is
+    // LIFTED (§9), so an extern MAY return a backed enum — the trap arm
+    // guarantees a host value outside the set is named rather than silently
+    // becoming a variant. This is what lets the return direction bind the enum
+    // directly instead of forwarding through `parse`.
     assert!(
-        !compile(
+        compile(
             "enum Align { Start = \"start\", End = \"end\" }\n\
              [extern(\"getAlign\")]\n\
              external fun get_align(): Align;\n\
              fun main() {}\n"
         )
         .is_empty(),
-        "an `external fun` returning a backed enum should still be refused (§7.2)"
+        "an `external fun` returning a backed enum should be accepted (§7.2, lifted)"
     );
 }
 

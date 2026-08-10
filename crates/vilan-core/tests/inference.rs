@@ -51033,124 +51033,170 @@ fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
     );
 }
 
-// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
-// enum ------------------------------------------------------------------------
+// --- B76 §7.2, LIFTED (§9): an extern may RETURN a backed enum ---------------
 //
-// The parameter direction is safe — vilan constructs the value, so it is always
-// in the set. The return direction is not, and what happens then is the reason
-// for the deferral: an exhaustive `match` compiles its last arm to a bare
-// `else` (there is no "impossible" trap arm), so a host value outside the set
-// silently takes whichever arm happens to be last. It is not detectably wrong;
-// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
-// `parse()` path, where an out-of-set value honestly yields `None`, until
-// backed enums grow a trap-arm story.
+// The deferral existed for one behavior — "confidently the wrong variant" — and
+// §9's trap arm removes it rather than re-arguing it. The refusal that stood in
+// the meantime is deleted, along with the hole B107 found in it: it worked by
+// ENUMERATING the positions a host can construct a value from (return type,
+// generic arguments, tuple elements, array elements) and had already missed
+// one, a function-typed parameter's parameters. The trap asks nothing about
+// provenance, so it has nothing to enumerate and nothing to miss.
+//
+// What is NOT claimed: the boundary still does not check. A host value outside
+// the set enters unremarked, exactly as an `external fun f(): i32` answering
+// `"hello"` does. `parse` is the non-panicking alternative and stays the shape
+// to reach for when an out-of-set value is an expected input rather than a bug.
 
 #[test]
-fn b76_an_external_fun_cannot_return_a_backed_enum() {
-    assert_fails_with(
+fn b76_an_external_fun_can_return_a_backed_enum() {
+    // The inversion of the refusal, at every shape it used to refuse: the bare
+    // enum, the integer backing, and the nested forms its walker followed
+    // (`Option<Align>`, `List<Align>`).
+    assert_compiles(
         r#"
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Align;
         fun main() { }
         "#,
-        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
     );
-    // The message names the way out rather than only the prohibition (B6).
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        fun main() { }
-        "#,
-        "convert with `Align::parse`",
-    );
-    // The INTEGER backing is refused for the same reason — §7.2 is about the
-    // host boundary, not about strings.
-    assert_fails_with(
+    assert_compiles(
         r#"
         enum Code { Ok = 200, NotFound = 404 }
         [extern("getCode")]
         external fun get_code(): Code;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Code'",
     );
-}
-
-#[test]
-fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
-    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
-    // exactly the same way, and the wrapper path is what each of them wants.
-    assert_fails_with(
+    assert_compiles(
         r#"
         import std::option::Option;
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Option<Align>;
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
-    );
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        [extern("getAligns")]
         external fun get_aligns(): List<Align>;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Align'",
+    );
+    // A backed enum on an `external struct`'s method, the receiver form the
+    // refusal also caught.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        external struct Widget;
+        impl Widget {
+            [extern(method, "getAlign")]
+            external fun align(self): Align;
+        }
+        fun main() { }
+        "#,
     );
 }
 
 #[test]
-fn b76_the_refusal_is_the_return_direction_only() {
-    // The parameter direction is the whole point of the feature — the extern
-    // takes the enum, because the enum IS the string — and it stays legal, as
-    // does an unbacked enum in either direction.
-    assert_compiles(
+fn b76_an_external_returned_backed_enum_round_trips_and_traps() {
+    // The runtime proof, both directions in one program. `String` is the host
+    // helper: `String(x)` is `x` for a string, so the extern hands vilan
+    // whatever it is given — a legal value on the first call and `"middle"` on
+    // the second, which is exactly what §7.2 said nothing could stop.
+    //
+    // Nothing stops it now either. What changed is what happens next: the value
+    // reaches a `match` and is NAMED rather than becoming `Align::End`.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("setAlign")]
-        external fun set_align(value: Align): void;
-        fun main() { set_align(Align::Start); }
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("String")]
+        external fun host_align(text: str): Align;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            let legal = host_align("flex-end");
+            print(legal == Align::End);
+            print(label(legal));
+            print(label(host_align("middle")));
+        }
         "#,
     );
-    assert_compiles(
-        r#"
-        enum Plain { A, B }
-        [extern("getPlain")]
-        external fun get_plain(): Plain;
-        fun main() { }
-        "#,
+    assert_eq!(
+        stdout, "true\ne\n",
+        "a legal host value should round-trip as its variant"
     );
-    // The refusal does not depend on declaration order.
-    assert_fails_with(
-        r#"
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        enum Align { Start = "start", End = "end" }
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "an out-of-set host value should trap, got:\n{stderr}"
     );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
 }
 
 #[test]
-fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
-    // What §7.2 steers to, compiled: the extern speaks the host's own type and
-    // `parse` is the guard, answering `None` for a value outside the set.
-    assert_compiles(
+fn b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration() {
+    // B107 / §9.2's P16, closed. `external fun on(handler: |Align| void)` is a
+    // return position wearing a parameter's clothes — the HOST constructs the
+    // value — and the refusal, which enumerated positions, compiled it clean
+    // and let a host `handler("middle")` print `e` at exit 0.
+    //
+    // It still compiles clean; the refusal is gone. The value is caught one
+    // step later, by the trap, which is the whole argument for (b) over (a):
+    // the guard is at the `else`, so the position the value came in through
+    // never had to be listed.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("Array.prototype.forEach.call")]
+        external fun on_each_align(values: List<str>, handler: |Align| void): void;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            on_each_align([ "flex-start" ], |a| print(label(a)));
+            on_each_align([ "middle" ], |a| print(label(a)));
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "s\n",
+        "the in-set callback value should label normally"
+    );
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "the callback's out-of-set value should trap, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
+#[test]
+fn b76_the_parse_path_is_the_non_panicking_alternative() {
+    // What the deferral steered to is not retired by the lift — it is now the
+    // CHOICE. Bind the backing type and `parse` when an out-of-set value is an
+    // input you mean to handle; return the enum directly when it would be a
+    // bug. Both compile, and this pins the difference at runtime: `parse`
+    // answers `None` where the direct return would have trapped.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
         import std::option::Option;
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [extern("String")]
         [doc(hidden)]
-        external fun get_align_raw(): str;
-        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
-        fun main() { }
+        external fun host_align_raw(text: str): str;
+        fun host_align(text: str): Option<Align> { Align::parse(host_align_raw(text)) }
+        fun main() {
+            print(match host_align("flex-end") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+            print(match host_align("middle") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+        }
         "#,
+        "flex-end\nnone\n",
     );
 }
 
