@@ -61,12 +61,50 @@ Untyped inspection, when the shape isn't known up front:
 
 ```vilan,fragment
 external struct JsonValue;
-fun parse_json_value(text: str): JsonValue    // panics on bad JSON
-str.try_parse_json(): Option<JsonValue>       // the safe form
-value.field(name: str): JsonValue
-value.tag(): str                              // "object" | "array" | "string" | …
-value.elements(): List<JsonValue>
+fun parse_json_value(text: str): JsonValue  // throws on malformed text
+str.try_parse_json(): Option<JsonValue>     // the safe form
+
+value.kind(): str        // "object"|"array"|"string"|"number"|"boolean"|"null"
+value.is_number(): bool  // and is_string / is_bool / is_array, off kind()
 value.is_null(): bool
+value.field(name: str): JsonValue
+value.has_field(name: str): bool
+value.elements(): List<JsonValue>
+value.tag(): str         // an enum discriminator, NOT a type — see below
+```
+
+`kind()` is the value's JSON type, normalized: the host's `typeof` calls
+both an array and `null` an `"object"`, so the four `is_*` predicates read
+`kind()` instead. `is_null()` is the exception — it tests the value against
+`null` directly.
+
+`tag()` answers a different question and is not a spelling of `kind()`: it
+reads an **externally-tagged enum's discriminator** — the string itself for a
+bare `"Variant"`, the single key for a `{"Variant":…}` object. That is what a
+derived decoder calls to pick a variant, so it only means anything on those
+two shapes: on a number or a bool it yields `"undefined"`, and on `null` it
+throws. Reach for `kind()` unless you are decoding an enum by hand.
+
+```vilan
+import std::print;
+import std::json::parse_json_value;
+
+fun main() {
+	let value = parse_json_value("{\"name\":\"ada\",\"tags\":[\"x\",\"y\"]}");
+	print(value.kind());               // object
+	print(value.field("name").kind()); // string
+	print(value.has_field("age"));     // false
+
+	for element in value.field("tags").elements() {
+		if element.is_string() {
+			print(element.kind()); // string, twice
+		}
+	}
+
+	// `tag()` is the other question: an externally-tagged enum's discriminator.
+	print(parse_json_value("\"Start\"").tag());         // Start
+	print(parse_json_value("{\"Text\":\"hi\"}").tag()); // Text
+}
 ```
 
 `json_codec(): Codec` is the JSON wire codec for rpc (see below).
