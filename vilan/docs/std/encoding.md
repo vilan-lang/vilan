@@ -12,10 +12,10 @@ parsers.
 ## JSON
 
 ```vilan,fragment
-trait Json { fun to_json(self): str; }        // encode
-trait FromJson {                              // decode
-	fun from_json(text: str): FromJson;
-	fun from_json_value(value: JsonValue): FromJson;
+trait Json { fun to_json(self): str; }                     // encode
+trait FromJson {                                           // decode
+	fun from_json(text: str): Result<Self, str>;
+	fun from_json_value(value: JsonValue): Result<Self, str>;
 }
 ```
 
@@ -26,11 +26,17 @@ Encoding (`to_json`) is total, but **decoding is fallible**: the input is
 untrusted, so a missing field, a wrong-shaped value, or text that isn't
 JSON is a decode error rather than silent garbage or a crash. Both
 `from_json(text)` and `from_json_value(value)` return `Result<Self, str>`;
-handle it with `!`, `match`, or `is Ok(..)`:
+handle it with `!`, `match`, or `is Ok(..)`.
+
+The two decode methods differ in what they take, not in what they answer:
+`from_json` parses the text (non-crashing) and hands off to
+`from_json_value`, which validates an already-parsed value's shape. That
+is the one to call when a value is nested inside another decode, and the
+one to write when implementing the trait by hand.
 
 ```vilan
 import std::print;
-import std::json::{ Json, FromJson };
+import std::json::{ Json, FromJson, JsonValue, parse_json_value };
 import std::result::Result::{ self, Ok, Err };
 
 [derive(Json)]
@@ -49,10 +55,59 @@ fun main() {
 		Err(let reason) => print(reason),
 	}
 
+	// The already-parsed form, same `Result`.
+	match Point::from_json_value(parse_json_value("{\"x\":3,\"y\":4}")) {
+		Ok(let back) => print(back.y), // 4
+		Err(let reason) => print(reason),
+	}
+
 	// A missing field is a decode error naming the field.
 	match Point::from_json("{\"x\":1}") {
 		Ok(_) => print("decoded"),
 		Err(let reason) => print(reason), // missing field y
+	}
+
+	// So is text that isn't JSON at all.
+	match Point::from_json("not json") {
+		Ok(_) => print("decoded"),
+		Err(let reason) => print(reason), // not valid JSON
+	}
+}
+```
+
+Written by hand — for a type whose encoding isn't its shape — the
+signatures are the trait's, `Self` included:
+
+```vilan
+import std::print;
+import std::json::{ Json, FromJson, JsonValue };
+import std::result::Result::{ self, Ok, Err };
+
+// A newtype that encodes as the bare string it wraps, not as an object.
+struct Tag {
+	name: str,
+}
+
+impl Tag with Json {
+	fun to_json(self): str {
+		self.name.to_json()
+	}
+}
+
+impl Tag with FromJson {
+	fun from_json(text: str): Result<Self, str> {
+		Tag::from_json_value(text.try_parse_json().ok_or("not valid JSON")!)
+	}
+	fun from_json_value(value: JsonValue): Result<Self, str> {
+		Ok(Tag { name = str::from_json_value(value)! })
+	}
+}
+
+fun main() {
+	print(Tag { name = "ada" }.to_json()); // "ada"
+	match Tag::from_json("\"ada\"") {
+		Ok(let tag) => print(tag.name),    // ada
+		Err(let reason) => print(reason),
 	}
 }
 ```
