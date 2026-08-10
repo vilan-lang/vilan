@@ -7,6 +7,11 @@
 > until backed enums grow a trap-arm story for the bare-`else` hazard
 > §7.2 records. Implementation is the v0.35.0 backed-enums lane.
 >
+> §9 RATIFIED 2026-08-09 (owner): trap-arm candidate (b) — every
+> exhaustive backed-enum match emits the trap `else`; §7.2's deferral
+> LIFTS, its refusal (and B107's hole with it) deletes, json.vl's
+> kind() family deletes. The cycle-14 trap-arm lane implements.
+>
 > Prior status: DRAFT (awaiting owner review)
 >
 > Origin: OWNER NOTE 1 on `bindgen.md` (§9.4), recorded 2026-08-06 during the
