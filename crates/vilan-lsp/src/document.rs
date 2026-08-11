@@ -1324,6 +1324,22 @@ impl Document {
         self.analyzed_index.offset(position)
     }
 
+    /// The ANALYZED-space offset a LIVE-space offset names: through the live
+    /// index's line/character coordinates, then `analyzed_offset` — the same
+    /// conversion every other query performs starting straight from the LSP
+    /// `Position` (S1). `completion` is the one query whose dispatch is
+    /// computed from the live text (the `.`/`?.`/`::` trigger scan legitimately
+    /// reads it — the prefix being typed is live by nature), so its derived
+    /// offsets (the dot, the receiver's end) still need translating before
+    /// they touch `program` data: `scope_at`, `entity_at`, and anything built
+    /// on them would otherwise resolve the wrong scope or entity the moment
+    /// the two snapshots diverge (E52). Both indices clamp out-of-range input
+    /// rather than panicking, so this is safe on any offset the live-text scan
+    /// produces — including one past the end of a shorter analyzed text.
+    fn to_analyzed_offset(&self, live_offset: usize) -> usize {
+        self.analyzed_offset(self.line_index.position(live_offset))
+    }
+
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
     /// analysis is pending and program answers describe an older text.
     ///
@@ -2638,9 +2654,22 @@ impl Document {
         symbols
     }
 
-    /// Completion candidates at `offset`, dispatched by the syntax just before the
-    /// cursor: members after `.`, path items after `::`, else names in scope plus
-    /// keywords. The editor filters the list by whatever prefix is being typed.
+    /// Completion candidates at `offset` — a LIVE-space offset (the caller
+    /// converts an LSP `Position` through `line_index`, never `analyzed_offset`:
+    /// completion's dispatch reads the buffer the user is mid-keystroke in).
+    /// Dispatched by the syntax just before the cursor: members after `.`, path
+    /// items after `::`, else names in scope plus keywords. The editor filters
+    /// the list by whatever prefix is being typed.
+    ///
+    /// The trigger scan below (`start`, the `.`/`?.`/`::` check, the
+    /// open-paren/import sniffs) legitimately stays in LIVE space throughout —
+    /// it is reading the character the user just typed. But every candidate
+    /// gatherer that walks `program` data (`scope_completions`, and
+    /// `member_completions`/`lifted_member_completions` by way of
+    /// `receiver_nominal_id`) must resolve its scope/entity in ANALYZED space,
+    /// via `to_analyzed_offset` — or a scope or receiver resolved from the live
+    /// offset against a stale program answers the wrong question the moment the
+    /// two snapshots diverge (E52).
     pub fn completion(&self, offset: usize) -> Vec<Completion> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
@@ -2677,7 +2706,11 @@ impl Document {
         } else if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
             self.path_completions(program, text, start - 2)
         } else {
-            self.scope_completions(program, offset)
+            // No member/path trigger: the cursor's own scope, resolved in
+            // ANALYZED space (E52) — `path_completions` needs no such
+            // conversion, since it answers by NAME across the whole program
+            // rather than by scope containment.
+            self.scope_completions(program, self.to_analyzed_offset(offset))
         };
         // A call-shaped insertion is wrong when the callee is already
         // parenthesized — the char right after the cursor is `(`, so the user
@@ -2720,7 +2753,7 @@ impl Document {
     }
 
     /// Fields and methods of the receiver value ending just before the `.` at
-    /// `dot_offset`.
+    /// `dot_offset` (LIVE space — see `completion`).
     fn member_completions(&self, program: &Program, dot_offset: usize) -> Vec<Completion> {
         let Some(type_id) = self.receiver_nominal_id(program, dot_offset) else {
             return Vec::new();
@@ -2745,18 +2778,21 @@ impl Document {
 
     /// Members of the ELEMENT under a lifted chain (`a?.` on an
     /// `Option<Profile>` offers Profile's members): the receiver ends just
-    /// before the `?` at `question_offset`; its container's first type
-    /// argument is the element.
+    /// before the `?` at `question_offset` (LIVE space — see `completion`);
+    /// its container's first type argument is the element.
     fn lifted_member_completions(
         &self,
         program: &Program,
         question_offset: usize,
     ) -> Vec<Completion> {
-        // A bare name (`p?.`): the binding's declared container type.
+        // A bare name (`p?.`): the binding's declared container type. The NAME
+        // comes off the live text, but resolving it is a `program` lookup, so
+        // it converts to ANALYZED space first (E52).
         if let Some(name) = identifier_ending_at(self.line_index.text(), question_offset) {
+            let analyzed_offset = self.to_analyzed_offset(question_offset);
             let binding = self
-                .binding_in_scope(program, name, question_offset)
-                .or_else(|| self.same_file_variable(program, name, question_offset));
+                .binding_in_scope(program, name, analyzed_offset)
+                .or_else(|| self.same_file_variable(program, name, analyzed_offset));
             let element = binding
                 .and_then(|id| {
                     program
@@ -2787,9 +2823,11 @@ impl Document {
             }
         }
         // A complex receiver (`find(x)?.`): its rendered type's first generic
-        // argument names the element.
+        // argument names the element — another `program` lookup, so `entity_at`
+        // also takes the ANALYZED offset (E52).
         question_offset
             .checked_sub(1)
+            .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| self.hover_label(program, receiver))
             .and_then(|label| first_generic_argument(&label).map(str::to_string))
@@ -2799,23 +2837,30 @@ impl Document {
     }
 
     /// The nominal struct/enum id of the receiver value ending just before the `.`
-    /// at `dot_offset`.
+    /// at `dot_offset` (LIVE space — see `completion`).
     fn receiver_nominal_id(&self, program: &Program, dot_offset: usize) -> Option<Id> {
         // A bare name (`p.`): resolve through scope, or — when the cursor's own
         // statement failed to parse and dropped its local scope — the nearest
         // same-file binding of that name, then read its declared type. Robust while
-        // the buffer is mid-edit, which is exactly when completion fires.
+        // the buffer is mid-edit, which is exactly when completion fires. The
+        // NAME comes off the live text (`dot_offset` is where it is), but
+        // resolving that name against a scope is a `program` lookup, so it
+        // converts to ANALYZED space first (E52).
         if let Some(name) = identifier_ending_at(self.line_index.text(), dot_offset) {
+            let analyzed_offset = self.to_analyzed_offset(dot_offset);
             let binding = self
-                .binding_in_scope(program, name, dot_offset)
-                .or_else(|| self.same_file_variable(program, name, dot_offset));
+                .binding_in_scope(program, name, analyzed_offset)
+                .or_else(|| self.same_file_variable(program, name, analyzed_offset));
             if let Some(nominal) = binding.and_then(|id| self.binding_nominal_id(program, id)) {
                 return Some(nominal);
             }
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered type.
+        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered
+        // type — another `program` lookup, so `entity_at` also takes the
+        // ANALYZED offset (E52).
         dot_offset
             .checked_sub(1)
+            .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| self.hover_label(program, receiver))
             .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
@@ -2840,14 +2885,20 @@ impl Document {
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
-    /// `offset` — a fallback for when the cursor's statement failed to parse and so
-    /// dropped its enclosing scope from the analysis.
-    fn same_file_variable(&self, program: &Program, name: &str, offset: usize) -> Option<Id> {
+    /// `analyzed_offset` (ANALYZED space — `variable.name_span` is a program
+    /// span) — a fallback for when the cursor's statement failed to parse and
+    /// so dropped its enclosing scope from the analysis.
+    fn same_file_variable(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
         let mut best: Option<(usize, Id)> = None;
         for (id, variable) in &program.variables {
             let start = variable.name_span.into_range().start;
             if variable.name == name
-                && start < offset
+                && start < analyzed_offset
                 && program.source_of(*id) == Some(SourceId(0))
                 && best.is_none_or(|(best_start, _)| start > best_start)
             {
@@ -2899,12 +2950,12 @@ impl Document {
         items
     }
 
-    /// Names visible at `offset` (the cursor's scope, then each enclosing scope up
-    /// to global) plus the language keywords.
-    fn scope_completions(&self, program: &Program, offset: usize) -> Vec<Completion> {
+    /// Names visible at `analyzed_offset` (ANALYZED space — the cursor's scope,
+    /// then each enclosing scope up to global) plus the language keywords.
+    fn scope_completions(&self, program: &Program, analyzed_offset: usize) -> Vec<Completion> {
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        let mut scope_id = self.scope_at(program, offset);
+        let mut scope_id = self.scope_at(program, analyzed_offset);
         while let Some(id) = scope_id {
             let Some(scope) = program.scopes.get(&id) else {
                 break;
@@ -2937,23 +2988,30 @@ impl Document {
         items
     }
 
-    /// The scope of the entity at — or nearest before — the cursor, so the current
-    /// function's locals are in scope even when the cursor sits in fresh text.
-    fn scope_at(&self, program: &Program, offset: usize) -> Option<Id> {
-        let entity = self.entity_at(offset).or_else(|| {
+    /// The scope of the entity at — or nearest before — `analyzed_offset`
+    /// (ANALYZED space), so the current function's locals are in scope even
+    /// when the cursor sits in fresh text.
+    fn scope_at(&self, program: &Program, analyzed_offset: usize) -> Option<Id> {
+        let entity = self.entity_at(analyzed_offset).or_else(|| {
             self.entity_spans
                 .iter()
-                .filter(|(_, end, _)| *end <= offset)
+                .filter(|(_, end, _)| *end <= analyzed_offset)
                 .max_by_key(|(_, end, _)| *end)
                 .map(|(_, _, id)| *id)
         })?;
         program.entity_scope_map.get(&entity).copied()
     }
 
-    /// The binding `name` resolves to in the scope at `offset` (searching the
-    /// enclosing scopes up to global) — a local, parameter, or top-level item.
-    fn binding_in_scope(&self, program: &Program, name: &str, offset: usize) -> Option<Id> {
-        let mut scope_id = self.scope_at(program, offset);
+    /// The binding `name` resolves to in the scope at `analyzed_offset`
+    /// (ANALYZED space, searching the enclosing scopes up to global) — a
+    /// local, parameter, or top-level item.
+    fn binding_in_scope(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
+        let mut scope_id = self.scope_at(program, analyzed_offset);
         while let Some(id) = scope_id {
             let scope = program.scopes.get(&id)?;
             if let Some(binding) = scope.name_to_id_map.get(name) {
