@@ -138,6 +138,7 @@ fn to_completion_item(
     completion: Completion,
     mode: CompletionFunctionCall,
     snippet_support: bool,
+    line_index: &LineIndex,
 ) -> CompletionItem {
     let kind = match completion.kind {
         // The LSP kind set has no macro entry; functions render closest.
@@ -193,6 +194,22 @@ fn to_completion_item(
         item.insert_text = Some(insert_text);
         item.insert_text_format = Some(format);
         item.sort_text = Some(format!("~{}", snippet.fallback));
+    }
+    // An auto-import candidate (E54c): LABEL it with the module it comes
+    // from (overriding any signature/type `detail` — the point here is
+    // making the import visible, not the candidate's shape) and carry the
+    // edit that adds it, so accepting the completion adds the import in the
+    // same keystroke. Ranked below every in-scope candidate (which sorts by
+    // its bare label, `sort_text: None` falling back to it per the LSP spec)
+    // and above a construct snippet (`~`-prefixed, above): `|` (0x7C) sits
+    // between every label's leading alphanumeric and `~` (0x7E) in ASCII.
+    if let Some(auto_import) = completion.needs_import {
+        item.detail = Some(auto_import.module_path.join("::"));
+        item.additional_text_edits = Some(vec![TextEdit {
+            range: line_index.range(&auto_import.edit_span),
+            new_text: auto_import.edit_replacement,
+        }]);
+        item.sort_text = Some(format!("|{}", item.label));
     }
     item
 }
@@ -677,8 +694,15 @@ mod manifest_routing_tests {
 #[cfg(test)]
 mod completion_item_tests {
     use super::{CompletionFunctionCall, to_completion_item};
-    use crate::document::{Completion, CompletionKind, SnippetInsertion};
+    use crate::document::{AutoImport, Completion, CompletionKind, SnippetInsertion};
+    use crate::line_index::LineIndex;
     use tower_lsp::lsp_types::{CompletionItemKind, Documentation, InsertTextFormat};
+
+    /// An empty-buffer index — every fixture below whose `needs_import` is
+    /// `None` never consults it, so its content doesn't matter.
+    fn blank_index() -> LineIndex {
+        LineIndex::new("")
+    }
 
     /// A function candidate as `Document` would hand it over: a full signature,
     /// a doc, and `call_parameters` naming the arguments (`None` = a bare name).
@@ -691,6 +715,7 @@ mod completion_item_tests {
             call_parameters: call_parameters
                 .map(|names| names.into_iter().map(str::to_string).collect()),
             snippet: None,
+            needs_import: None,
         }
     }
 
@@ -702,6 +727,7 @@ mod completion_item_tests {
             function(Some(vec!["host", "port"])),
             CompletionFunctionCall::Full,
             true,
+            &blank_index(),
         );
         assert_eq!(
             item.insert_text.as_deref(),
@@ -725,6 +751,7 @@ mod completion_item_tests {
             function(Some(vec!["host", "port"])),
             CompletionFunctionCall::ParensOnly,
             true,
+            &blank_index(),
         );
         assert_eq!(item.insert_text.as_deref(), Some("connect($0)"));
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
@@ -739,6 +766,7 @@ mod completion_item_tests {
             function(Some(vec!["host"])),
             CompletionFunctionCall::None,
             true,
+            &blank_index(),
         );
         assert!(item.insert_text.is_none(), "the bare label is inserted");
         assert!(item.insert_text_format.is_none());
@@ -753,7 +781,7 @@ mod completion_item_tests {
             CompletionFunctionCall::Full,
             CompletionFunctionCall::ParensOnly,
         ] {
-            let item = to_completion_item(function(Some(vec![])), mode, true);
+            let item = to_completion_item(function(Some(vec![])), mode, true, &blank_index());
             assert_eq!(item.insert_text.as_deref(), Some("connect()$0"), "{mode:?}");
             assert_eq!(item.insert_text_format, Some(InsertTextFormat::SNIPPET));
             assert!(item.command.is_none(), "no parameters ⇒ no hints: {mode:?}");
@@ -768,6 +796,7 @@ mod completion_item_tests {
             function(Some(vec!["host", "port"])),
             CompletionFunctionCall::Full,
             false,
+            &blank_index(),
         );
         assert_eq!(item.insert_text.as_deref(), Some("connect()"));
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
@@ -779,7 +808,12 @@ mod completion_item_tests {
     fn non_callable_stays_bare_in_full_mode() {
         let mut candidate = function(None);
         candidate.kind = CompletionKind::Struct;
-        let item = to_completion_item(candidate, CompletionFunctionCall::Full, true);
+        let item = to_completion_item(
+            candidate,
+            CompletionFunctionCall::Full,
+            true,
+            &blank_index(),
+        );
         assert!(item.insert_text.is_none());
         assert!(item.command.is_none());
     }
@@ -792,6 +826,7 @@ mod completion_item_tests {
             function(Some(vec!["host"])),
             CompletionFunctionCall::Full,
             true,
+            &blank_index(),
         );
         assert_eq!(
             item.detail.as_deref(),
@@ -817,6 +852,26 @@ mod completion_item_tests {
                 body: "for ${1:item} in ${2:items} {\n\t$0\n}".to_string(),
                 fallback: "for".to_string(),
             }),
+            needs_import: None,
+        }
+    }
+
+    /// An auto-import candidate as `Document::auto_import_completions` hands
+    /// it over (E54c): labeled with its module and carrying the edit that
+    /// adds it.
+    fn auto_import_candidate() -> Completion {
+        Completion {
+            label: "Json".to_string(),
+            kind: CompletionKind::Struct,
+            detail: None,
+            documentation: None,
+            call_parameters: None,
+            snippet: None,
+            needs_import: Some(AutoImport {
+                module_path: vec!["std".to_string(), "json".to_string()],
+                edit_span: vilan_core::Span { start: 0, end: 0 },
+                edit_replacement: "import std::json::Json;\n".to_string(),
+            }),
         }
     }
 
@@ -825,7 +880,12 @@ mod completion_item_tests {
     // prefix), and no parameter-hints command.
     #[test]
     fn construct_snippet_renders_as_a_snippet_item() {
-        let item = to_completion_item(construct_snippet(), CompletionFunctionCall::Full, true);
+        let item = to_completion_item(
+            construct_snippet(),
+            CompletionFunctionCall::Full,
+            true,
+            &blank_index(),
+        );
         assert_eq!(item.kind, Some(CompletionItemKind::SNIPPET));
         assert_eq!(
             item.insert_text.as_deref(),
@@ -850,7 +910,12 @@ mod completion_item_tests {
     // text — still iconed as a snippet.
     #[test]
     fn construct_snippet_without_snippet_support_falls_back_to_bare_keyword() {
-        let item = to_completion_item(construct_snippet(), CompletionFunctionCall::Full, false);
+        let item = to_completion_item(
+            construct_snippet(),
+            CompletionFunctionCall::Full,
+            false,
+            &blank_index(),
+        );
         assert_eq!(
             item.insert_text.as_deref(),
             Some("for"),
@@ -869,7 +934,7 @@ mod completion_item_tests {
             CompletionFunctionCall::ParensOnly,
             CompletionFunctionCall::Full,
         ] {
-            let item = to_completion_item(construct_snippet(), mode, true);
+            let item = to_completion_item(construct_snippet(), mode, true, &blank_index());
             assert_eq!(
                 item.insert_text.as_deref(),
                 Some("for ${1:item} in ${2:items} {\n\t$0\n}"),
@@ -881,6 +946,44 @@ mod completion_item_tests {
                 "{mode:?}"
             );
         }
+    }
+
+    // E54c: an auto-import candidate is labeled with its module, carries the
+    // additional text edit that adds the import, and ranks below a plain
+    // in-scope candidate (no `sort_text`, so the client falls back to its
+    // label) — but above a construct snippet (`~`-prefixed).
+    #[test]
+    fn auto_import_candidate_is_labeled_and_carries_its_edit() {
+        let index = LineIndex::new("fun main() {}\n");
+        let item = to_completion_item(
+            auto_import_candidate(),
+            CompletionFunctionCall::Full,
+            true,
+            &index,
+        );
+        assert_eq!(item.detail.as_deref(), Some("std::json"));
+        let edits = item
+            .additional_text_edits
+            .expect("an auto-import candidate carries its edit");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "import std::json::Json;\n");
+        assert_eq!(edits[0].range.start, edits[0].range.end, "a pure insertion");
+        let sort_text = item.sort_text.expect("ranked below in-scope candidates");
+        assert!(
+            sort_text.starts_with('|'),
+            "expected a `|`-prefixed sort_text, got {sort_text:?}"
+        );
+        // `|` (0x7C) sorts after any bare label (which has no `sort_text` and
+        // so compares by its own alphanumeric-leading label) and before a
+        // snippet's `~`-prefixed one (0x7E).
+        assert!(
+            sort_text.as_str() < "~",
+            "{sort_text:?} must sort before snippets"
+        );
+        assert!(
+            "connect" < sort_text.as_str(),
+            "{sort_text:?} must sort after a bare in-scope label"
+        );
     }
 }
 
@@ -1550,9 +1653,15 @@ impl LanguageServer for Backend {
                         ),
                     ),
                     // WO-2: the "Organize Imports" source action (sort + prune).
+                    // E54: QUICKFIX (add-import, and E58's field-name rename) and
+                    // the "add all missing imports" source action.
                     code_action_provider: Some(CodeActionProviderCapability::Options(
                         CodeActionOptions {
-                            code_action_kinds: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                            code_action_kinds: Some(vec![
+                                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                                CodeActionKind::QUICKFIX,
+                                fix_all_imports_kind(),
+                            ]),
                             ..Default::default()
                         },
                     )),
@@ -2003,7 +2112,9 @@ impl LanguageServer for Backend {
             let items = document
                 .completion(offset)
                 .into_iter()
-                .map(|completion| to_completion_item(completion, mode, snippet_support))
+                .map(|completion| {
+                    to_completion_item(completion, mode, snippet_support, &document.line_index)
+                })
                 .collect();
             Ok(Some(CompletionResponse::Array(items)))
         })
@@ -2126,71 +2237,156 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         self.fenced("code_action", Ok(None), || {
-            // The only source action we offer is Organize Imports; skip the work
-            // entirely when the client asked for a different kind (e.g. quickfix).
-            if !organize_imports_requested(&params.context.only) {
+            let wants_organize = organize_imports_requested(&params.context.only);
+            let wants_quickfix =
+                action_kind_requested(&params.context.only, &CodeActionKind::QUICKFIX);
+            let wants_fix_all_imports =
+                action_kind_requested(&params.context.only, &fix_all_imports_kind());
+            // Skip the work entirely when the client asked for a kind none of
+            // these three answer.
+            if !wants_organize && !wants_quickfix && !wants_fix_all_imports {
                 return Ok(None);
             }
             let uri = params.text_document.uri;
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
-            // S3, as for rename: the action returns text edits, and its prune half
-            // is computed from program data. Refuse while the snapshots diverge
-            // rather than hand back a half-informed edit set — with the SILENT
-            // spelling: code actions fire automatically (menu population, the
-            // on-save hooks), so this refusal must not toast.
+            // S3, quickfix home (E54/E58): every action below returns edits
+            // computed from `program` data — Organize Imports' prune half,
+            // the add-import quickfix's candidate scan, the field-rename
+            // quickfix's diagnostic note, "add all missing imports". Refuse
+            // ALL of them the same way while the snapshots diverge, rather
+            // than hand back a half-informed edit set — the SILENT spelling:
+            // code actions fire automatically (menu population, the on-save
+            // hooks), so this refusal must not toast.
             if document.is_stale() {
                 return Err(content_modified());
             }
-            let edits = document.organize_import_edits();
-            // No edits = already organized (or nothing to do): offer no action, so
-            // `codeActionsOnSave` is a clean no-op.
-            if edits.is_empty() {
-                return Ok(None);
+            let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+            if wants_organize {
+                let edits = document.organize_import_edits();
+                // No edits = already organized (or nothing to do): offer no
+                // action, so `codeActionsOnSave` is a clean no-op.
+                if !edits.is_empty() {
+                    let text_edits: Vec<TextEdit> = edits
+                        .into_iter()
+                        .map(|(span, new_text)| TextEdit {
+                            // Live-space: these spans come from the formatter's own
+                            // parse of the live text, not from the program (S2). The
+                            // staleness refusal above means the two texts are equal
+                            // here anyway.
+                            range: document.line_index.range(&span),
+                            new_text,
+                        })
+                        .collect();
+                    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                    changes.insert(uri.clone(), text_edits);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "Organize Imports".to_string(),
+                        kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
             }
-            let text_edits: Vec<TextEdit> = edits
-                .into_iter()
-                .map(|(span, new_text)| TextEdit {
-                    // Live-space: these spans come from the formatter's own parse
-                    // of the live text, not from the program (S2). The staleness
-                    // refusal above means the two texts are equal here anyway.
-                    range: document.line_index.range(&span),
-                    new_text,
-                })
-                .collect();
-            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-            changes.insert(uri, text_edits);
-            let action = CodeAction {
-                title: "Organize Imports".to_string(),
-                kind: Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            Ok(Some(vec![CodeActionOrCommand::CodeAction(action)]))
+            if let Some(program) = document.program.as_ref() {
+                if wants_quickfix {
+                    let range = live_span(&document, params.range);
+                    for fix in document.quickfixes(program, range) {
+                        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                        changes.insert(
+                            uri.clone(),
+                            vec![TextEdit {
+                                range: document.line_index.range(&fix.span),
+                                new_text: fix.replacement,
+                            }],
+                        );
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: fix.title,
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }));
+                    }
+                }
+                if wants_fix_all_imports {
+                    if let Some((span, new_text)) = document.add_all_missing_imports_edit(program) {
+                        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                        changes.insert(
+                            uri.clone(),
+                            vec![TextEdit {
+                                range: document.line_index.range(&span),
+                                new_text,
+                            }],
+                        );
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: "Add All Missing Imports".to_string(),
+                            kind: Some(fix_all_imports_kind()),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+            if actions.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(actions))
+            }
         })
     }
 }
 
-/// Whether a code-action request wants the Organize Imports source action: an
-/// unfiltered request (no `only`) does, and a filtered one does when it lists
-/// `source.organizeImports` or an ancestor kind (`source`). The `.`-delimited
-/// kind hierarchy means a requested `source` matches `source.organizeImports`.
-fn organize_imports_requested(only: &Option<Vec<CodeActionKind>>) -> bool {
+/// The LIVE-space `Span` a code-action request's `range` covers — the same
+/// conversion `Document::completion`'s trigger scan uses, just for a `Range`
+/// instead of one `Position`.
+fn live_span(document: &Document, range: Range) -> Span {
+    Span {
+        start: document.line_index.offset(range.start),
+        end: document.line_index.offset(range.end),
+    }
+}
+
+/// The "add all missing imports" source action's kind (E54d): a `source.fixAll`
+/// sub-kind, following the convention `source.organizeImports` already sets
+/// (a specific source action names itself under the general one it refines) —
+/// there is no `executeCommand` infrastructure at all, and a source-action
+/// kind is what avoids ever needing one.
+fn fix_all_imports_kind() -> CodeActionKind {
+    CodeActionKind::new("source.fixAll.imports")
+}
+
+/// Whether a code-action request wants `kind` — an unfiltered request (no
+/// `only`) always does, and a filtered one does when it lists `kind` itself
+/// or an ANCESTOR of it, per the LSP `.`-delimited kind hierarchy (a
+/// requested `source` matches `source.organizeImports`; a requested
+/// `quickfix` matches a hypothetical `quickfix.something`).
+fn action_kind_requested(only: &Option<Vec<CodeActionKind>>, kind: &CodeActionKind) -> bool {
     let Some(kinds) = only else {
         return true;
     };
-    let organize = CodeActionKind::SOURCE_ORGANIZE_IMPORTS;
     kinds.iter().any(|requested| {
-        organize == *requested
-            || organize
+        kind == requested
+            || kind
                 .as_str()
                 .strip_prefix(requested.as_str())
                 .is_some_and(|rest| rest.starts_with('.'))
     })
+}
+
+/// Whether a code-action request wants the Organize Imports source action:
+/// `source.organizeImports` or an ancestor kind (`source`).
+fn organize_imports_requested(only: &Option<Vec<CodeActionKind>>) -> bool {
+    action_kind_requested(only, &CodeActionKind::SOURCE_ORGANIZE_IMPORTS)
 }
 
 /// B40: request handlers are panic-fenced. A panic used to unwind through
@@ -2419,16 +2615,16 @@ mod snapshot_consistency_tests {
         );
     }
 
-    // A code-action request for a kind we don't offer is answered before the
-    // staleness gate: refusing there would make every unrelated quickfix
+    // A code-action request for a kind we don't offer AT ALL is answered
+    // before the staleness gate: refusing there would make every unrelated
     // request fail mid-typing.
     #[tokio::test]
-    async fn a_stale_document_still_answers_an_unrelated_code_action_kind() {
+    async fn a_stale_document_still_answers_an_unoffered_code_action_kind() {
         let (service, _socket) = backend();
         let backend = service.inner();
         let uri = open_with_live_edit(backend, EDITED);
         let mut params = code_action_params(&uri);
-        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        params.context.only = Some(vec![CodeActionKind::REFACTOR]);
         assert!(
             backend
                 .code_action(params)
@@ -2436,6 +2632,167 @@ mod snapshot_consistency_tests {
                 .expect("not a refusal")
                 .is_none(),
         );
+    }
+
+    // E54/E58 (quickfix home, part a): QUICKFIX and "add all missing
+    // imports" are OFFERED kinds now, so — unlike a kind we never answer at
+    // all — they refuse the SAME way Organize Imports does while the buffer
+    // is ahead of the analysis: their edits are computed from `program` data
+    // too (the diagnostic scan, the candidate search), so a half-informed
+    // edit set is exactly as unsafe here.
+    #[tokio::test]
+    async fn a_stale_document_refuses_a_quickfix_request() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, EDITED);
+        let mut params = code_action_params(&uri);
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let error = backend
+            .code_action(params)
+            .await
+            .expect_err("a stale quickfix request refuses");
+        assert_eq!(error.code, ErrorCode::ContentModified);
+    }
+
+    #[tokio::test]
+    async fn a_stale_document_refuses_an_add_all_missing_imports_request() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open_with_live_edit(backend, EDITED);
+        let mut params = code_action_params(&uri);
+        params.context.only = Some(vec![super::fix_all_imports_kind()]);
+        let error = backend
+            .code_action(params)
+            .await
+            .expect_err("a stale fix-all request refuses");
+        assert_eq!(error.code, ErrorCode::ContentModified);
+    }
+
+    /// Inserts an already-analyzed multi-file `Document` (built with real
+    /// `pkg` siblings on disk, via `document::tests::analyze_workspace`) and
+    /// returns its uri plus the full-file `Range` — the coordinates a
+    /// `CodeActionParams.range` needs to overlap every diagnostic in it.
+    fn open_analyzed(backend: &Backend, document: Document) -> (Url, Range) {
+        let uri = Url::parse("file:///quickfix-home/main.vl").expect("a url");
+        let range = Range::new(
+            document.line_index.position(0),
+            document
+                .line_index
+                .position(document.line_index.text().len()),
+        );
+        backend.documents.insert(uri.clone(), document);
+        (uri, range)
+    }
+
+    // E54(a)/(b), end to end: the QUICKFIX kind is registered, routed, and
+    // answers a real unresolved-name diagnostic with the add-import fix —
+    // through `Backend::code_action` itself, not just the data layer.
+    #[tokio::test]
+    async fn quickfix_add_import_is_offered_and_carries_its_edit_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("a quickfix is offered");
+        assert_eq!(response.len(), 1, "{response:#?}");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert!(action.title.contains("help_topic"), "{}", action.title);
+        assert!(action.title.contains("pkg::topic"), "{}", action.title);
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "import pkg::topic::help_topic;\n");
+    }
+
+    // E54(d), end to end: "Add All Missing Imports" is registered under its
+    // own `source.fixAll.imports` kind and returns one edit fixing every
+    // unambiguous name.
+    #[tokio::test]
+    async fn add_all_missing_imports_is_offered_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![super::fix_all_imports_kind()]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("an action is offered");
+        assert_eq!(response.len(), 1, "{response:#?}");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(super::fix_all_imports_kind()));
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.contains("import pkg::topic::help_topic;"),
+            "{}",
+            edits[0].new_text
+        );
+    }
+
+    // E58(c), end to end: a misspelled initializer field's closest-name note
+    // becomes a QUICKFIX that rewrites exactly the field-name span.
+    #[tokio::test]
+    async fn quickfix_rewrites_a_misspelled_field_through_the_real_handler() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let (_dir, document) = crate::document::tests::analyze_workspace(&[(
+            "main.vl",
+            "struct Config {\n\tentries: i32,\n}\n\nfun main() {\n\tlet _ = Config { entires = 5 };\n}\n",
+        )]);
+        let (uri, range) = open_analyzed(backend, document);
+        let mut params = code_action_params(&uri);
+        params.range = range;
+        params.context.only = Some(vec![CodeActionKind::QUICKFIX]);
+        let response = backend
+            .code_action(params)
+            .await
+            .expect("not stale")
+            .expect("a quickfix is offered");
+        assert_eq!(response.len(), 1, "{response:#?}");
+        let CodeActionOrCommand::CodeAction(action) = &response[0] else {
+            panic!("expected a CodeAction, got {:?}", response[0]);
+        };
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(action.title, "Change to `entries`");
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("an edit for this file");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "entries");
     }
 
     // S1/S3: read-only queries never refuse — they answer
