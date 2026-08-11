@@ -12772,8 +12772,24 @@ impl<'src> Analyzer<'src> {
     /// terminates. Runs before `check_view_escape` and the scalar-view-call
     /// analysis so the root-set is visible to every consumer, each of which reads
     /// *non-empty* where it once read the `true` bool.
+    ///
+    /// B122: a `ret` is a return position exactly like the tail
+    /// (`ret-checking.md`), and the root-set is asked per POSITION, joined —
+    /// `return_sites` carries both for a function with a declared return type
+    /// (B116's join, `element-clones.md` §12.2). Without it, a view handed
+    /// back only through an early `ret` (an owned tail beside it) never
+    /// contributed its parameter, so `check_view_escape`'s own leaf question
+    /// found `borrows` empty and refused a program its conditional-tail twin
+    /// compiles (`element-clones.md` §13).
     fn infer_borrows(&mut self) {
         let function_ids: Vec<Id> = self.functions.keys().copied().collect();
+        let mut return_sites_by_function: HashMap<Id, Vec<Id>> = HashMap::default();
+        for (function_id, value_id) in &self.return_sites {
+            return_sites_by_function
+                .entry(*function_id)
+                .or_default()
+                .push(*value_id);
+        }
         loop {
             let mut updates: Vec<(Id, BTreeSet<u32>)> = Vec::new();
             for function_id in &function_ids {
@@ -12788,6 +12804,11 @@ impl<'src> Analyzer<'src> {
                 }
                 let mut positions = current.clone();
                 self.collect_borrows_positions(*function_id, body_tail, &mut positions);
+                if let Some(ret_value_ids) = return_sites_by_function.get(function_id) {
+                    for ret_value_id in ret_value_ids {
+                        self.collect_borrows_positions(*function_id, *ret_value_id, &mut positions);
+                    }
+                }
                 if positions != current {
                     updates.push((*function_id, positions));
                 }
@@ -13405,16 +13426,18 @@ impl<'src> Analyzer<'src> {
             .flat_map(|function_id| self.wrapped_view_return_calls(function_id))
             .chain(self.transient_wrapped_view_calls())
             .collect();
-        // B116: which function each `ret` returns from. `return_sites` indexes
-        // every return position of every declared-return function — the tail and
-        // each `ret` — which is exactly the pairing this loop needs to ask a
-        // `ret` the question the tail is asked below. A `ret` with no entry is
-        // one inside a CLOSURE (its rets check against the inferred tail type,
-        // `ret-checking.md`), and a closure may not hand back a view at all.
-        let return_site_functions: HashMap<Id, Id> = self
+        // A CLOSURE's `ret` never enters `return_sites` (its rets check against
+        // the inferred tail type instead, `ret-checking.md`) and gets no
+        // exemption at all — a closure may not declare `borrows`, so nothing
+        // sanctions a view leaving through one, by-value copy included (P4c:
+        // second-class all the way). The function-ret positions below get the
+        // leaf-wise seam walk with its exemption; this set is how the loop
+        // tells the two apart without re-deriving return_site_functions per
+        // leaf.
+        let function_return_value_ids: HashSet<Id> = self
             .return_sites
             .iter()
-            .map(|(function_id, value_id)| (*value_id, *function_id))
+            .map(|(_, value_id)| *value_id)
             .collect();
         let mut escapes: Vec<Id> = Vec::new();
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
@@ -13425,13 +13448,8 @@ impl<'src> Analyzer<'src> {
             }
             match expr {
                 Expr::FunctionReturn(Some(value_id))
-                    if self.escapes_as_view(*value_id, &view_bindings, &capturing)
-                        && !return_site_functions
-                            .get(value_id)
-                            .and_then(|function_id| self.functions.get(function_id))
-                            .is_some_and(|function| {
-                                self.return_position_hands_back_no_view(function, *value_id)
-                            }) =>
+                    if !function_return_value_ids.contains(value_id)
+                        && self.escapes_as_view(*value_id, &view_bindings, &capturing) =>
                 {
                     escapes.push(*value_id);
                 }
@@ -13467,20 +13485,49 @@ impl<'src> Analyzer<'src> {
                 _ => {}
             }
         }
-        // A function or closure body whose trailing expression escapes a view
-        // returns it implicitly. A `borrows` function may return one — but only a
-        // projection of a (view) parameter, whose target the caller keeps alive;
-        // a view of a local still dangles and is rejected. A by-value return
-        // hands back no view at all (B104), so it is never an escape.
-        for function in self.functions.values() {
-            if self.frozen_entity(function.id) {
+        // A function body whose return LEAVES escape a view returns it. A
+        // `borrows` function may return one — but only a projection of a (view)
+        // parameter, whose target the caller keeps alive; a view of a local
+        // still dangles and is rejected. A by-value return hands back no view
+        // at all (B104), so it is never an escape.
+        //
+        // B122: asked per LEAF, not of the return position as a whole — an
+        // `if`/`match` tail (or a `ret`'s own value) with one owned arm and one
+        // view arm is not itself a view expression, so asking the WHOLE
+        // position missed both directions: a sound view of a parameter refused
+        // beside an owned twin because the other arm hid it from the question
+        // (the false positive rule 1 already saw through `ret`, B116), and an
+        // unsound view of a LOCAL let through beside an owned arm because the
+        // same averaging hid the arm that mattered (`element-clones.md` §13).
+        // `return_sites` indexes every return position of a declared-return
+        // function — the tail and each `ret` (B116) — and `collect_tail_leaves`
+        // is the same walk rule 1's return clause and the crossing scan already
+        // use for the identical seams, so all three agree about what a return
+        // position hands back. A HashSet dedupes: `return_sites` already
+        // carries the tail for a function with a declared return type, so
+        // adding every function's tail again would ask the same seam twice.
+        let mut function_seams: HashSet<(Id, Id)> = self
+            .functions
+            .values()
+            .filter(|function| function.has_body)
+            .map(|function| (function.id, function.body.1))
+            .collect();
+        function_seams.extend(self.return_sites.iter().copied());
+        for (function_id, seam) in function_seams {
+            if self.frozen_entity(function_id) {
                 continue;
             }
-            if function.has_body
-                && self.escapes_as_view(function.body.1, &view_bindings, &capturing)
-                && !self.return_position_hands_back_no_view(function, function.body.1)
-            {
-                escapes.push(function.body.1);
+            let Some(function) = self.functions.get(&function_id) else {
+                continue;
+            };
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(seam, &mut leaves);
+            for leaf in leaves {
+                if self.escapes_as_view(leaf, &view_bindings, &capturing)
+                    && !self.return_position_hands_back_no_view(function, leaf)
+                {
+                    escapes.push(leaf);
+                }
             }
         }
         let closure_returns: Vec<Id> = self
@@ -13522,12 +13569,15 @@ impl<'src> Analyzer<'src> {
         )
     }
 
-    /// Whether a RETURN POSITION of `function` hands the caller back no view
-    /// after all — the two ways rule 3 has nothing to reject. Asked of the tail
-    /// and, since B116, of each `ret` with the same argument: a `ret` is a
-    /// return position exactly like the tail (`ret-checking.md`), the value
-    /// crossing at it is the same crossing, and the two spellings of one
-    /// expression must not disagree.
+    /// Whether a return LEAF of `function` hands the caller back no view after
+    /// all — the two ways rule 3 has nothing to reject. Asked of the tail and,
+    /// since B116, of each `ret` with the same argument: a `ret` is a return
+    /// position exactly like the tail (`ret-checking.md`), the value crossing
+    /// at it is the same crossing, and the two spellings of one expression must
+    /// not disagree. Since B122, asked of each of a position's LEAVES
+    /// (`collect_tail_leaves`) rather than the position as a whole, so an
+    /// `if`/`match` with one owned arm no longer hides the arm that projects a
+    /// parameter (or the arm that doesn't) behind the arm that does.
     ///
     /// Either the by-value return copies the view into a value (B104,
     /// `element-clones.md` §9.3), or the signature declares the projection —

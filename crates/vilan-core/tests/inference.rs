@@ -6566,21 +6566,17 @@ fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
 }
 
 #[test]
-#[ignore = "known limit: rule 3's escape check asks its question of the whole \
-            body rather than of its return LEAVES, so a conditional tail with \
-            one owned arm is never examined while the `ret` spelling of the same \
-            program is — see element-clones.md §12.3"]
-fn b116_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
-    // Found closing B116, and it is NOT the `ret` special case: the two
-    // spellings here are examined by different questions. The tail loop asks
-    // `escapes_as_view(function.body.1)` of the WHOLE body, and an `if` with one
-    // owned arm is not a view expression, so it is never asked at all; the `ret`
-    // arm asks the leaf, which is. The function's `borrows` set is empty (it is
-    // inferred from the tail, which projects nothing), so neither exemption
-    // reaches the `ret` — and rule 1's return clause copies it regardless, which
-    // is what makes the refusal a false positive rather than a disagreement
-    // about the rule. Widening the escape check to its return leaves is
-    // `element-clones.md` §11.3 candidate (d)'s measurement, not this lane's.
+fn b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
+    // Found closing B116 and closed by B122: the two spellings here were
+    // examined by different questions. The tail loop asked
+    // `escapes_as_view(function.body.1)` of the WHOLE body, and an `if` with
+    // one owned arm is not a view expression, so it was never asked at all;
+    // the `ret` arm asked the leaf, which is. `infer_borrows` walked only the
+    // tail, so the function's root-set stayed empty when a view reached the
+    // caller only through a `ret` — and rule 1's return clause copied it
+    // regardless, which is what made the refusal a false positive rather than
+    // a disagreement about the rule. `element-clones.md` §13 closes the
+    // measurement §11.3 candidate (d) deferred.
     assert_compiles_and_runs(
         r#"
         import std::print;
@@ -6609,17 +6605,16 @@ fn b116_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
 }
 
 #[test]
-#[ignore = "known limit: a view of a LOCAL escapes through one arm of a \
-            conditional tail, which the whole-body question never examines — \
-            the same leaf-blindness, opposite polarity; see element-clones.md \
-            §12.3"]
-fn b116_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
-    // The other side of the same hole, and the one that matters: rule 3 exists
-    // to refuse exactly this, and a second owned arm hides it. The `ret`
-    // spelling IS refused, so today the two disagree in the direction that lets
-    // code through. (Benign as emitted — the frame is dead and nothing else
-    // holds the storage — but it is the rule not being applied, not the rule
-    // deciding.)
+fn b122_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
+    // The other side of the same hole, and the one that mattered more: rule 3
+    // exists to refuse exactly this, and a second owned arm hid it — the whole
+    // body's "is this a view expression" question is `false` for an `if` with
+    // one owned arm, so the view arm was never asked at all. The `ret`
+    // spelling was already refused, so the two spellings used to disagree in
+    // the direction that let code through. (Benign as emitted — the frame is
+    // dead and nothing else holds the storage — but it was the rule not being
+    // applied, not the rule deciding.) `check_view_escape` now asks each
+    // return LEAF (`collect_tail_leaves`), so this arm is examined on its own.
     assert_fails_with(
         r#"
         import std::print;
@@ -6632,6 +6627,98 @@ fn b116_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
         "#,
         "a view cannot escape its scope",
     );
+}
+
+#[test]
+fn b122_a_conditional_tail_arm_order_does_not_matter() {
+    // The mirror of the previous pin: the view-of-a-local arm FIRST, the owned
+    // arm second. `collect_tail_leaves` walks both arms of an `if`/`else`
+    // regardless of order, so which side hides which is not the question —
+    // every leaf gets asked.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { &local } else { Inner { n = 0 } }
+        }
+        fun main() { print(grab(false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_nested_conditional_arm_may_not_escape_a_view_of_a_local() {
+    // `collect_tail_leaves` recurses into a nested `if`'s own branches
+    // (`collect_tail_leaves_if`), so a view of a local buried two levels deep
+    // is still a leaf the walk reaches, not just the immediate arms of the
+    // outermost `if`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool, other: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag {
+                if other { Inner { n = 1 } } else { Inner { n = 2 } }
+            } else {
+                &local
+            }
+        }
+        fun main() { print(grab(false, false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_match_leg_may_not_escape_a_view_of_a_local() {
+    // The same walk over a `match` tail (`collect_tail_leaves`'s other arm):
+    // one leg owned, one leg a view of a local, and the local leg is still
+    // examined on its own regardless of which leg the whole match's TYPE
+    // would suggest is representative.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Choice { A, B }
+        struct Inner { n: i32 }
+        fun grab(choice: Choice): Inner {
+            let local = Inner { n = 3 };
+            match choice {
+                Choice::A => Inner { n = 0 },
+                Choice::B => &local,
+            }
+        }
+        fun main() { print(grab(Choice::A).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf() {
+    // The multi-leaf mix the leaf-wise walk exists to get right: one arm
+    // projects a PARAMETER (sound — the caller's argument outlives the call)
+    // and the other a LOCAL (unsound). Leaf-wise, the two are asked
+    // separately and answered separately — exactly one diagnostic, and its
+    // span is the local arm, not the parameter arm and not the whole `if`.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun grab(h: &Holder, flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { &h.inner } else { &local }
+        }
+        fun main() {
+            let h = Holder { inner = Inner { n = 9 } };
+            print(grab(&h, true).n);
+        }
+        "#;
+    assert_fails_once_with(source, "a view cannot escape its scope");
+    assert_fails_spanning(source, "&local", "a view cannot escape its scope");
 }
 
 #[test]
