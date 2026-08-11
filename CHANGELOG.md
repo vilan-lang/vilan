@@ -8,6 +8,10 @@ tracks the latest state.
 
 ## Unreleased
 
+**Organize Imports no longer prunes a module import used only through `::`.** `import std::math;` referenced only as `math::min(1, 2)` — never by its bare name — was reported unused and removed on save. A static accessor's subject resolves through the same type-position lookup as a struct, an enum, a trait, or a generic, and the definition it records feeds every "is this import used" check in the editor; a module was the one namespace kind that lookup forgot, so `math`'s use site recorded no definition at all and looked referenced nowhere. It now resolves like the others — a module reached only through `::` keeps its import, in a single import or shrunk out of a brace set, exactly like a struct or function would. Hover and go-to-definition on a module name at a `::` use site pick up the same fix; they already worked inside the `import` statement itself.
+
+---
+
 **An exhaustive `match` over a backed enum no longer lies about a value it has never seen.** `enum Align { Start = "flex-start", Center = "center", End = "flex-end" }` compiles to those three strings, and a `match` over all three compiled its last arm to a bare `else` — so a value that was none of them, arriving from the host, came back as `Align::End`. Not as an error, not as a wrong-looking answer: as `Align::End`, confidently, exit 0.
 
 The last arm is now tested like every other one, and the `else` panics with the enum's name and the raw value: `Align: "middle" is not one of its values`. Exhaustiveness was always checked over the *variant set*, by name — a proof about the vilan side of the boundary, never about the runtime value, because a backed enum lowers to a bare host string or number and its runtime domain is the host's. The trap is where the compiler stops assuming those two are the same thing.
