@@ -11339,6 +11339,118 @@ fn unknown_struct_spans_the_initializer() {
     );
 }
 
+// --- E58: closest-name suggestion on an invalid initializer field --------------
+// The scan (vilan_core::closest_name) runs ONLY once a field name has already
+// failed to resolve — the calls below all live inside the "no such field" arm,
+// so a struct initializer that resolves cleanly never reaches it at all.
+
+// An unknown initializer field now anchors on the NAME, not the value it was
+// given — the span the E58 rename quickfix rewrites (main.rs/document.rs).
+// This also proves the count-mismatch shape untouched by the same edit: it
+// returns before this per-field loop even runs.
+#[test]
+fn unknown_initializer_field_spans_the_name_not_the_value() {
+    assert_fails_spanning(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entires = 5 };
+        }
+        "#,
+        "entires",
+        "struct 'Config' has no field 'entires'",
+    );
+}
+
+// A clear typo of a real field gets a "did you mean" note, anchored at the
+// misspelled name — the threshold's suggest side (a single transposed pair).
+#[test]
+fn unknown_initializer_field_notes_a_close_typo() {
+    assert_fails_noting(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entires = 5 };
+        }
+        "#,
+        "struct 'Config' has no field 'entires'",
+        "entires",
+        "did you mean `entries`?",
+    );
+}
+
+// The threshold's refuse side: a name with almost nothing in common with the
+// real field gets no note at all — the diagnostic still fires, bare.
+#[test]
+fn unknown_initializer_field_far_from_every_real_field_gets_no_note() {
+    let source = r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { x = 5 };
+        }
+        "#;
+    let diagnostics = failure_diagnostics_with_notes(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains("struct 'Config' has no field 'x'"))
+        .collect();
+    assert_eq!(matching.len(), 1, "got: {diagnostics:#?}");
+    assert!(
+        matching[0].2.is_none(),
+        "expected no note on a far-off field name; got: {:#?}",
+        matching[0]
+    );
+}
+
+// Structural non-vacuity for the "runs only on the invalid-name path" rule
+// (CLAUDE.md: "assert the diagnostic path, not performance" — the scan call
+// sits textually inside the `None` arm of the field lookup, so a program that
+// never reaches that arm never reaches the scan): a correctly-named
+// initializer produces no diagnostic at all, note included.
+#[test]
+fn a_correctly_named_initializer_field_gets_no_diagnostic() {
+    assert_compiles(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entries = 5 };
+        }
+        "#,
+    );
+}
+
+// The field-COUNT mismatch is a different diagnostic entirely (it returns
+// before the per-field, closest-name-scanning loop even runs) — pinned
+// unaffected by the E58 edit.
+#[test]
+fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
+    assert_fails_with(
+        r#"
+        struct Config {
+        	entries: i32,
+        	limit: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entries = 5 };
+        }
+        "#,
+        "Expected 2 fields, but got 1 instead.",
+    );
+}
+
 // A missing import segment points at that segment, not the whole statement.
 #[test]
 fn import_segment_error_spans_the_segment() {
