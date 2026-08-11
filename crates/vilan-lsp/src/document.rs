@@ -6005,6 +6005,138 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- E51: a module import used only through `::` static access ---------
+    //
+    // A static accessor's SUBJECT (`math` in `math::min(..)`) resolves through
+    // the TYPE-position walk (`walk_type_node`'s `Node::Accessor` arm feeding
+    // `prepped_type_locals`), whose `definition_id` match used to omit
+    // `Type::Module` — so the use site recorded `definition: None` in
+    // `type_references` and, since the accessor's own resolution binds only the
+    // MEMBER (`min`) into `entity_map`, `import_leaf_is_used` found the module
+    // referenced nowhere and pruned it.
+
+    // The reported shape: a module import referenced only via `::`, never as a
+    // bare name, stays.
+    #[test]
+    fn organize_keeps_a_module_import_used_only_via_static_access() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "a module import used only via `::` was pruned",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The brace-set variant: a set with one module leaf used only via `::` and
+    // one dead sibling shrinks to the live branch, keeping the module leaf.
+    #[test]
+    fn organize_shrinks_a_brace_set_keeping_a_module_leaf_used_via_static_access() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::{ io, math };\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let result = organized(&document).expect("a dead branch offers a shrink edit");
+        assert_eq!(
+            result,
+            "import std::{ math };\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The element-syntax companion (backlog's "companion pin owed"): markup
+    // desugars to a bare `view` accessor in VALUE position, which the entity-map
+    // check ((B) in `import_leaf_is_used`) already detects — this should already
+    // pass; the pin guards it from regressing alongside the module fix above.
+    #[test]
+    fn organize_keeps_a_view_import_used_only_by_markup() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::ui::view;\nfun page() {\n\t<div>\"hi\"</div>\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "an import used only through markup's desugared `view` accessor was pruned",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The negative: a module import referenced nowhere — not as a bare name, not
+    // through `::` — is still pruned. The fix must not turn every module import
+    // into a permanent keeper.
+    #[test]
+    fn organize_prunes_a_genuinely_unused_module_import() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "import std::math;\nfun main() {}\n")]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let result = organized(&document).expect("a wholly unused module import offers a prune");
+        assert_eq!(result, "fun main() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The analyzer-level statement, pinned directly (`inference.rs`'s harness
+    // exposes only compile success/failure, not `type_references` — this is the
+    // LSP-layer pin the task calls for instead): a static accessor's module
+    // SUBJECT records the SAME definition id in `type_references` as the
+    // import's own leaf reference, rather than `None`. Plant the bug (drop the
+    // `Type::Module` arm from the `definition_id` match in analyzer.rs) and
+    // `use_definition` goes from `Some(..)` to `None`.
+    #[test]
+    fn a_module_static_accessors_subject_shares_the_imports_definition_id() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        let program = document.program.as_ref().expect("the program analyzes");
+        let text = document.text.clone();
+        let leaf_offset = text.find("math").expect("the import leaf");
+        let use_offset = text.rfind("math::min").expect("the use site");
+        let find_definition = |offset: usize| {
+            program
+                .type_references
+                .iter()
+                .find(|(source, span, _, _)| {
+                    *source == SourceId(0) && span.into_range().start == offset
+                })
+                .and_then(|(_, _, definition, _)| *definition)
+        };
+        let leaf_definition =
+            find_definition(leaf_offset).expect("the import's own leaf records a definition");
+        let use_definition = find_definition(use_offset).expect(
+            "the use site's module SUBJECT must record a definition id (E51's root cause: the \
+             definition_id match omitted Type::Module, so this was None and Organize Imports \
+             saw the module referenced nowhere)",
+        );
+        assert_eq!(
+            leaf_definition, use_definition,
+            "the use site resolved to a different entity than the import's own leaf",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- WO-5: LSP features survive recoverable errors ---------------------
     //
     // Since the handwritten frontend cut over (H6 S5), `parsing::parse` salvages
