@@ -513,6 +513,245 @@ pub fn organize_import_runs(
     Some(printer.organize_runs(&items, keep))
 }
 
+// --- Insert an import (the add-import quickfix and auto-import completion) --
+//
+// E54's second formatter entry point: not reorganizing the imports that are
+// already there, but growing them by one leaf. `insert_import` extends an
+// existing statement that already reaches the target module when one exists
+// among the file's top-level imports, and otherwise inserts a brand new,
+// canonically-positioned statement — both as ONE minimal [`ImportInsertEdit`],
+// never a full reprint of the run (the LSP applies this from a live buffer,
+// where a surgical edit is what keeps the cursor and the rest of the file
+// untouched).
+
+/// One insertion edit adding a leaf to `source`'s imports — a `TextEdit`
+/// shape, like [`ImportRunEdit`] but for growing a file's imports rather than
+/// reorganizing the ones already there.
+pub struct ImportInsertEdit {
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// A parsed import path's trailing shape, past the segments leading to it —
+/// what [`decompose_import_branch`] splits a branch into.
+enum ImportLeafShape<'ast, 'src> {
+    /// A single trailing name with its own span (`import std::json::Json`).
+    Single(&'src str, Span),
+    /// A brace-set of trailing names (`import std::json::{ A, B }`).
+    Set(&'ast [ImportBranch<'src>]),
+}
+
+/// Splits a parsed import path into the segments leading to its terminal
+/// leaf(ves) and the leaf shape itself: `std::json::Json` decomposes to
+/// (`["std", "json"]`, `Single("Json", ..)`); `std::json::{ A, B }` to
+/// (`["std", "json"]`, `Set([A, B])`); a rare root-level brace set
+/// (`import { a, b }`, no leading namespace) to (`[]`, `Set([a, b])`).
+fn decompose_import_branch<'ast, 'src>(
+    branch: &'ast ImportBranch<'src>,
+) -> (Vec<&'src str>, ImportLeafShape<'ast, 'src>) {
+    match branch {
+        ImportBranch::Path(name, span, None) => (Vec::new(), ImportLeafShape::Single(name, *span)),
+        ImportBranch::Path(name, _, Some(child)) => match child.as_ref() {
+            ImportBranch::Set(branches) => (vec![*name], ImportLeafShape::Set(branches)),
+            ImportBranch::Path(..) => {
+                let (mut prefix, shape) = decompose_import_branch(child);
+                prefix.insert(0, name);
+                (prefix, shape)
+            }
+        },
+        ImportBranch::Set(branches) => (Vec::new(), ImportLeafShape::Set(branches)),
+    }
+}
+
+/// The result of [`try_extend_import`]'s probe of ONE existing `import`
+/// statement.
+enum ExtendOutcome {
+    /// This statement doesn't import from the target module at all.
+    NoMatch,
+    /// It does, and the leaf is already among its names — nothing to do.
+    AlreadyImported,
+    /// It does, and doesn't have the leaf yet: the edit that adds it.
+    Edit(Span, String),
+}
+
+/// Tries to extend `branch` — one plain `import` statement's path — with
+/// `leaf`, when `branch` already reaches `module_path`: a brace set gains a
+/// member inserted at its alphabetically-sorted position (`{ Decode }` ->
+/// `{ Decode, Encode }`), and a bare single leaf becomes a two-member set
+/// (`Json` -> `{ Encode, Json }`) — both computed from the AST's own leaf
+/// spans, never a reprint of the whole statement. A brace set holding a
+/// non-flat member (a further `::` continuation inside the set — not a shape
+/// a plain leaf list ever takes in practice) is left alone: [`insert_import`]
+/// falls back to a new import line rather than guess at reordering it.
+fn try_extend_import<'src>(
+    branch: &ImportBranch<'src>,
+    module_path: &[&str],
+    leaf: &str,
+) -> ExtendOutcome {
+    let (prefix, shape) = decompose_import_branch(branch);
+    if prefix != module_path {
+        return ExtendOutcome::NoMatch;
+    }
+    match shape {
+        ImportLeafShape::Single(name, span) => {
+            if name == leaf {
+                return ExtendOutcome::AlreadyImported;
+            }
+            let (first, second) = if name < leaf {
+                (name, leaf)
+            } else {
+                (leaf, name)
+            };
+            ExtendOutcome::Edit(span, format!("{{ {first}, {second} }}"))
+        }
+        ImportLeafShape::Set(branches) => {
+            let mut members: Vec<(&str, Span)> = Vec::with_capacity(branches.len());
+            for member in branches {
+                match member {
+                    ImportBranch::Path(name, span, None) => {
+                        if *name == leaf {
+                            return ExtendOutcome::AlreadyImported;
+                        }
+                        members.push((name, *span));
+                    }
+                    // A non-flat member: don't guess at reordering the set.
+                    _ => return ExtendOutcome::NoMatch,
+                }
+            }
+            match members.iter().find(|(name, _)| *name > leaf) {
+                Some((_, span)) => ExtendOutcome::Edit(
+                    Span {
+                        start: span.start,
+                        end: span.start,
+                    },
+                    format!("{leaf}, "),
+                ),
+                None => {
+                    // The grammar guarantees a brace set has at least one member.
+                    let end = members
+                        .last()
+                        .expect("a parsed brace set has at least one member")
+                        .1
+                        .end;
+                    ExtendOutcome::Edit(Span { start: end, end }, format!(", {leaf}"))
+                }
+            }
+        }
+    }
+}
+
+/// Only a PLAIN `import` — never a `use` (a different binding form) and never
+/// an `export import` (extending someone's re-export with a plain leaf would
+/// silently make the new name part of the module's public surface too,
+/// which is not what an add-import quickfix asked for).
+fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node ImportBranch<'src>> {
+    match node {
+        Node::Import(branch) => Some(branch),
+        _ => None,
+    }
+}
+
+/// Builds the sort key a fresh `import <module_path>::<leaf>;` statement
+/// would have, for finding where it belongs among a run's existing entries —
+/// without constructing a throwaway AST node to feed [`node_import_key`].
+fn fresh_import_sort_key(module_path: &[&str], leaf: &str) -> ImportSortKey {
+    let mut branch = TokenBranch::Path(leaf, None);
+    for segment in module_path.iter().rev() {
+        branch = TokenBranch::Path(segment, Some(Box::new(branch)));
+    }
+    import_sort_key(ImportKind::Import, &branch)
+}
+
+/// The contiguous run of top-level import-like items starting at the FIRST
+/// one found — `(start, end)` index bounds into `items` (`end` exclusive).
+/// `None` when `items` has no top-level import at all. Mirrors
+/// [`Printer::organize_runs`]'s own run predicate
+/// ([`import_kind_and_branch`]), so "the file's first import run" means the
+/// same thing here as it does to Organize Imports.
+fn first_import_run(items: &[Spanned<Node<'_>>]) -> Option<(usize, usize)> {
+    let start = items
+        .iter()
+        .position(|item| import_kind_and_branch(&item.0).is_some())?;
+    let mut end = start;
+    while end < items.len() && import_kind_and_branch(&items[end].0).is_some() {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// The byte offset just past a statement's terminating `;`, scanning forward
+/// from `from` — an import node's own span ends at its path, before the `;`
+/// (see [`Printer::organize_run`]'s note on the same gap).
+fn statement_end(source: &str, from: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = from;
+    while index < bytes.len() && bytes[index] != b';' {
+        index += 1;
+    }
+    if index < bytes.len() {
+        index += 1;
+    }
+    index
+}
+
+/// Computes the edit that adds `import <module_path>::<leaf>;` to `source` —
+/// the LSP add-import quickfix's insert half, and the edit an auto-import
+/// completion candidate carries (E54). Extends an existing PLAIN `import`
+/// that already reaches `module_path`, when one exists anywhere among the
+/// file's top-level statements (see [`try_extend_import`]); otherwise inserts
+/// a new statement, in its canonically sorted position, into the file's FIRST
+/// top-level import run — or, when the file has no import at all, as a new
+/// first line.
+///
+/// `None` when `source` doesn't parse cleanly (the formatter's usual safety
+/// rule: no edit would be safe) or the leaf is already imported from
+/// `module_path` (nothing to do — the caller asked to add something that's
+/// already there).
+pub fn insert_import(source: &str, module_path: &[&str], leaf: &str) -> Option<ImportInsertEdit> {
+    let items = parse(source)?;
+    for item in &items {
+        let Some(branch) = plain_import_branch(&item.0) else {
+            continue;
+        };
+        match try_extend_import(branch, module_path, leaf) {
+            ExtendOutcome::NoMatch => continue,
+            ExtendOutcome::AlreadyImported => return None,
+            ExtendOutcome::Edit(span, replacement) => {
+                return Some(ImportInsertEdit { span, replacement });
+            }
+        }
+    }
+    let new_line = format!("import {}::{leaf};", module_path.join("::"));
+    let Some((start, end)) = first_import_run(&items) else {
+        // No import anywhere in the file: a new first line.
+        return Some(ImportInsertEdit {
+            span: Span { start: 0, end: 0 },
+            replacement: format!("{new_line}\n"),
+        });
+    };
+    let new_key = fresh_import_sort_key(module_path, leaf);
+    let insert_before = items[start..end]
+        .iter()
+        .find(|item| node_import_key(&item.0) > new_key);
+    match insert_before {
+        Some(item) => {
+            let at = item.1.into_range().start;
+            Some(ImportInsertEdit {
+                span: Span { start: at, end: at },
+                replacement: format!("{new_line}\n"),
+            })
+        }
+        None => {
+            let last = &items[end - 1];
+            let at = statement_end(source, last.1.into_range().end);
+            Some(ImportInsertEdit {
+                span: Span { start: at, end: at },
+                replacement: format!("\n{new_line}"),
+            })
+        }
+    }
+}
+
 /// Parses `source` into its top-level item list, or `None` if it doesn't parse
 /// perfectly cleanly — the formatter reprints only sources it fully understands.
 ///
@@ -6918,6 +7157,169 @@ mod organize {
         assert!(
             !organized.starts_with('\r'),
             "a stray CR is left behind: {organized:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod insert {
+    //! `insert_import` backs the LSP's add-import quickfix and its auto-import
+    //! completion edit (E54): given a module path and a leaf name, the edit
+    //! that adds `import <path>::<leaf>;` to the file — extending an existing
+    //! import that already reaches the module, or inserting a new, sorted
+    //! line when none does.
+    use super::insert_import;
+
+    /// Applies `insert_import`'s edit to `source`, or `None` when it offers
+    /// none (the leaf is already imported).
+    fn apply(source: &str, module_path: &[&str], leaf: &str) -> Option<String> {
+        let edit = insert_import(source, module_path, leaf)?;
+        let mut result = source.to_string();
+        result.replace_range(edit.span.into_range(), &edit.replacement);
+        Some(result)
+    }
+
+    // --- Brace-set extension ---------------------------------------------------
+
+    // A new leaf lands at its alphabetically-sorted position inside an
+    // existing brace set — in the middle...
+    #[test]
+    fn a_new_leaf_inserts_into_the_middle_of_an_existing_set() {
+        assert_eq!(
+            apply(
+                "import std::json::{ Alpha, Zeta };\n",
+                &["std", "json"],
+                "Mid"
+            )
+            .unwrap(),
+            "import std::json::{ Alpha, Mid, Zeta };\n",
+        );
+    }
+
+    // ...and at the end, when it sorts after every existing member.
+    #[test]
+    fn a_new_leaf_appends_to_the_end_of_an_existing_set() {
+        assert_eq!(
+            apply(
+                "import std::json::{ Alpha, Mid };\n",
+                &["std", "json"],
+                "Zeta"
+            )
+            .unwrap(),
+            "import std::json::{ Alpha, Mid, Zeta };\n",
+        );
+    }
+
+    // A bare single leaf (no braces yet) becomes a two-member set, sorted —
+    // from both directions.
+    #[test]
+    fn a_bare_leaf_becomes_a_sorted_two_member_set() {
+        assert_eq!(
+            apply("import std::json::Json;\n", &["std", "json"], "Apple").unwrap(),
+            "import std::json::{ Apple, Json };\n",
+        );
+        assert_eq!(
+            apply("import std::json::Json;\n", &["std", "json"], "Zebra").unwrap(),
+            "import std::json::{ Json, Zebra };\n",
+        );
+    }
+
+    // The one-segment (package-surface) form extends the same way — the
+    // module path is just `["std"]`, not `["std", <module>]`.
+    #[test]
+    fn a_surface_level_bare_leaf_becomes_a_set() {
+        assert_eq!(
+            apply("import std::print;\n", &["std"], "read").unwrap(),
+            "import std::{ print, read };\n",
+        );
+    }
+
+    // Extension finds a matching import ANYWHERE in the file, not only the
+    // first one — and skips a RE-EXPORT of the same module entirely (adding a
+    // plain leaf to someone's `export import` would silently publish it too),
+    // reaching past it to the plain import that follows.
+    #[test]
+    fn extension_skips_a_reexport_and_reaches_the_plain_import_after_it() {
+        assert_eq!(
+            apply(
+                "export import std::json::{ Decode };\nimport std::json::Json;\n",
+                &["std", "json"],
+                "Encode",
+            )
+            .unwrap(),
+            "export import std::json::{ Decode };\nimport std::json::{ Encode, Json };\n",
+        );
+    }
+
+    // Already imported (bare or in a set): no edit — there's nothing to add.
+    #[test]
+    fn an_already_imported_bare_leaf_yields_no_edit() {
+        assert!(apply("import std::json::Json;\n", &["std", "json"], "Json").is_none());
+    }
+
+    #[test]
+    fn an_already_imported_set_member_yields_no_edit() {
+        assert!(
+            apply(
+                "import std::json::{ Alpha, Json };\n",
+                &["std", "json"],
+                "Json",
+            )
+            .is_none()
+        );
+    }
+
+    // --- New sorted import line -------------------------------------------------
+
+    // No existing import reaches the module: a new statement lands at its
+    // sorted position inside the file's existing run — in the middle... (each
+    // existing import is from a DIFFERENT module, `["std", "alpha"]` /
+    // `["std", "zeta"]`, so neither is a candidate to extend — this is purely
+    // the new-line path.)
+    #[test]
+    fn a_new_import_line_inserts_into_the_middle_of_the_run() {
+        assert_eq!(
+            apply(
+                "import std::alpha::A;\nimport std::zeta::Z;\n",
+                &["std", "middle"],
+                "M",
+            )
+            .unwrap(),
+            "import std::alpha::A;\nimport std::middle::M;\nimport std::zeta::Z;\n",
+        );
+    }
+
+    // ...and appended after the run, when it sorts last.
+    #[test]
+    fn a_new_import_line_appends_after_the_run() {
+        assert_eq!(
+            apply(
+                "import std::alpha::A;\nimport std::middle::M;\n",
+                &["std", "zeta"],
+                "Z",
+            )
+            .unwrap(),
+            "import std::alpha::A;\nimport std::middle::M;\nimport std::zeta::Z;\n",
+        );
+    }
+
+    // No import anywhere in the file: the new line becomes the file's first.
+    #[test]
+    fn a_new_import_becomes_the_files_first_line_when_there_is_no_run() {
+        assert_eq!(
+            apply("fun main() {}\n", &["std", "json"], "Json").unwrap(),
+            "import std::json::Json;\nfun main() {}\n",
+        );
+    }
+
+    // A `use` statement reaching the same names is not a `import` and is
+    // never extended — a fresh `import` line is inserted instead, sorted
+    // alongside it (kind sorts before `use` — `import_sort_key`).
+    #[test]
+    fn a_use_statement_is_never_extended() {
+        assert_eq!(
+            apply("use std::json::{ Decode };\n", &["std", "json"], "Json").unwrap(),
+            "import std::json::Json;\nuse std::json::{ Decode };\n",
         );
     }
 }
