@@ -26542,10 +26542,19 @@ impl<'src> Analyzer<'src> {
                     // Record the reference for the language server: the type name
                     // span, the definition it points at, and a hover label. A
                     // generic resolves to its binder entity (`subject_id`), which
-                    // carries the `<T>` name span.
+                    // carries the `<T>` name span. A module (the SUBJECT of a
+                    // static accessor, e.g. `math` in `math::min(..)`, walked in
+                    // type position — `walk_type_node`'s `StaticAccessor` arm)
+                    // resolves to the module's own entity id, same as any other
+                    // namespace `record_reference` records: without this arm the
+                    // use site carried `definition: None` and Organize Imports,
+                    // which asks `type_references` whether an import's leaf is
+                    // referenced anywhere else, saw nothing and pruned a module
+                    // import used only through `::` (backlog E51).
                     let definition_id = match &subject_type {
                         Type::Struct(id, _) | Type::Enum(id, _) | Type::Trait(id, _) => Some(*id),
                         Type::Generic(_) => Some(subject_id),
+                        Type::Module(id) => Some(*id),
                         _ => None,
                     };
                     // Store the type id; its label is rendered after `build`,
