@@ -6137,6 +6137,34 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A survey side effect of the fix, pinned deliberately (not a regression
+    // guard for E51 itself): go-to-definition on the module SUBJECT of a `::`
+    // use site now jumps to the module, same as it already did for the module
+    // name written inside the `import` statement itself (`resolve_import`
+    // records a reference on every segment, including the root). Before the
+    // fix, `definition()`'s `let definition = definition?;` short-circuited on
+    // the `None` this use site recorded and answered nothing at all — not a
+    // wrong jump, no jump. The landing spot is the module's registered location
+    // ("its file, at the top", analyzer.rs) rather than a name span, because a
+    // module has no name token of its own to land on.
+    #[test]
+    fn goto_definition_on_a_modules_static_access_subject_jumps_to_the_module() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        let use_offset = document.text.rfind("math::min").expect("the use site") + 1;
+        let (source, _span) = document
+            .definition(use_offset)
+            .expect("go-to-definition on the module subject of a `::` use site");
+        assert_ne!(
+            source,
+            SourceId(0),
+            "the module's definition should live in std's math.vl, not the entry",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- WO-5: LSP features survive recoverable errors ---------------------
     //
     // Since the handwritten frontend cut over (H6 S5), `parsing::parse` salvages
