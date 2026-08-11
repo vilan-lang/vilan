@@ -2191,3 +2191,183 @@ reached *through* one.
 - **Goldens moved: 0.**
 - `docs/spec/types.md`'s trap-arm section gains the nested form and the
   unbacked non-form, in the same commit.
+
+## 13. B121 — the trap follows the VARIANT too, not just the pattern (cycle 17)
+
+§12.4's first filed shape, closed: a backed test living in an EARLIER leg
+than the one that becomes the bare `else`.
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // together, `Of`'s only handler
+    Pair::Other            => "o",
+}
+```
+
+`Other`'s own leg carries no backed test, so `backed_pattern_tests(final_leg.pattern,
+..)` (§12.1's whole mechanism) returns empty and its condition is still
+dropped, exactly as an ordinary bare `else` always was. But the two `Of` legs
+above, TOGETHER, are `Of`'s only handler, and each tests one specific
+`Align` literal. An out-of-set `Align` payload fails BOTH — not because it
+left `Pair::Of`, but because it left `Align` — and falls through to answer
+`Pair::Other`, confidently and wrongly. §12.4 filed the shape and pinned it
+`#[ignore]`d (`b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`)
+because §12.1's message does not transfer: it asks the FINAL leg's own
+pattern, which is not where the hazard lives here, and — as §12.4 put it —
+"which payload slot holds it depends on which variant the subject is, and
+the final leg's arm is reached from all of them."
+
+### 13.1 The design: a per-variant re-dispatch, gated on the tag
+
+§12.4 floated two directions: "a per-variant re-dispatch in the trap block,
+or a different design entirely." The re-dispatch is what shipped, and once
+stated precisely it needs no new machinery — only a new REASON to reach the
+existing one.
+
+**Where it fires.** Not at the final leg's pattern — there is nothing there
+to ask — but at the exact point where the exhaustiveness-over-tags proof is
+CONSUMED: the moment the compiler decides an unguarded final leg's own
+condition may be dropped because every earlier leg's tag test failing
+already proves it. That proof is true about `Pair`'s tag; it says nothing
+about `Align`'s runtime domain, and the dropped-condition final leg's BODY
+is where the trap now lives, wrapped around the leg's own — untouched —
+body:
+
+```js
+if ($a[0] === 0 && $a[1] === "flex-start") {
+    $b = "s";
+} else if ($a[0] === 0 && $a[1] === "flex-end") {
+    $b = "e";
+} else {
+    if ($a[0] === 0) {
+        __enum_trap("Align", $a[1]);
+    } else {
+        $b = "o";
+    }
+}
+```
+
+The `else` block's OWN new test (`$a[0] === 0`, i.e. "is the tag actually
+`Of`") is not a new discriminant invented for the trap — it is
+`compile_pattern`'s own tag-test shape (factored out as `variant_tag_test`
+so the two constructions cannot drift apart), asked of a variant the FINAL
+leg never mentions. Reaching the `else` with that tag can only mean every
+`Of` leg's literal failed, which — since those legs are `Of`'s only
+handler — can only mean the payload left `Align`'s set. The tag that
+DOESN'T match any partitioned variant is what is left over: `Pair::Other`,
+whose own body runs completely unchanged underneath.
+
+**What it says.** `__enum_trap("Align", $a[1])` — the SAME call, the SAME
+message (`Align: "middle" is not one of its values`), §12.1's `trap_body`
+helper reused verbatim (factored out of the final-leg case for exactly this
+reuse). The filing worried the message could not "name the value in
+general" because the slot depends on the variant; the resolution is that it
+never has to CHOOSE a slot at the message level — the re-dispatch chooses
+the slot by choosing the BRANCH first (tag `Of` reads `$a[1]` as `Align`;
+a second partitioned tag `Alt` would read its OWN slot as its OWN enum, in
+its OWN branch — see §13.3). Each branch asks its own, unambiguous question;
+none of them ever had to ask "which slot, in general."
+
+### 13.2 Grouping, and the K → K−1 shape reused
+
+An earlier leg contributes to the re-dispatch only if, walked with
+§12.1's own `backed_pattern_tests`, it yields at least one `BackedTest` —
+so a leg over an UNBACKED nested enum (`Pair::Of(Inner::A)`) contributes
+nothing, and a match built entirely of such legs gets no trap of any kind,
+§12.2's narrow rule unchanged
+(`b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else`).
+Legs are grouped by their OUTER variant (the tag `Pair::Of` names), not by
+enum: two `Of` legs testing the SAME `Align` slot (the pinned shape)
+contribute the identical accessor twice, deduplicated (`same_trap_accessor`,
+a narrow structural equality over the `Local`/`PropertyIndex`/`Number` chain
+`backed_pattern_tests` ever builds — nothing else needs comparing, and
+comparing wrongly only costs a redundant, harmless test) down to ONE
+`BackedTest`, so the K=1 case emits the unconditional, unguarded
+`__enum_trap` call directly — no membership check, because there is nothing
+to disambiguate among. A variant whose several backed slots are tested
+independently across its legs keeps them separate BY ENUM (`Two::Of(Align,
+Display)` legs contribute both), which feeds the SAME K → K−1
+membership-guarded shape §12.1 already defined for a single leg's multiple
+tests — reused by construction, since `trap_body` is one function now, not
+two independent copies of the same logic.
+
+### 13.3 Several partitioned variants chain, in declaration order
+
+Nothing in the mechanism assumes exactly one non-final variant is
+partitioned. Two backed-tested variants (`Of`/`Align`, `Alt`/`Display`)
+sharing one true bare leg (`Other`) chain as `if (tag===Of) {trap Align}
+else if (tag===Alt) {trap Display} else {original body}`, each testing its
+own enum in its own branch, in the order the tags first appear among the
+legs (`b121_two_partitioned_variants_each_trap_their_own_enum`).
+
+### 13.4 The mechanism's own boundary — dead code, not a wrong trap
+
+A variant with an IRREFUTABLE payload leg of its own
+(`Pair::Of(let _) => ..`, added after the two literal legs, say for
+clarity) already matches THAT leg — an unconditional pattern test at its
+own position in the else-if chain — before the dropped final leg is ever
+reached. The re-dispatch still contains an `if ($a[0] === 0) { trap }`
+branch for `Of` (nothing here tries to detect that it is unreachable), but
+it never runs: control never falls that far for tag `Of` once a leg of its
+own already claims it, in-set or not
+(`b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap`).
+This is deliberately left as harmless dead code rather than pruned —
+detecting "is this tag ALSO fully covered by an earlier irrefutable-payload
+leg" is a second, independent analysis with its own edge cases, and the
+cost of not doing it is a few unreachable bytes, never a wrong answer.
+
+### 13.5 Composition with §12.1, and the zero-movement guarantee
+
+The two mechanisms are mutually exclusive by construction, not by
+convention: §13's re-dispatch is gated on `trap_tests.is_empty()` — the
+EXACT condition under which §12.1's own mechanism today does nothing at
+all (drops the final leg's condition, appends no trap). So every shape
+§12.1 already had bytes for (the final leg itself carrying one or more
+backed tests, at any nesting) is completely untouched — `earlier_variant_traps`
+is not even computed when `trap_tests` is non-empty — and every shape
+neither mechanism has anything to say about (an all-unbacked match, a
+written `_` final leg) is equally untouched, since an empty
+`earlier_variant_traps` changes nothing. New bytes appear ONLY for the
+genuinely new shape this section adds a trap for. Measured, not assumed:
+`cargo test -p vilan-cli --test corpus` (rebuilt binary) moved **0**
+goldens — no program in `vilan/test`, `vilan/examples`, `vilan/benchmarks`
+or the docs fences carries this shape either, the same "zero" §12.2
+measured for the unbacked case, a fifth instance of the family.
+
+### 13.6 Ledger
+
+- **Pins: 6**, all in `crates/vilan-core/tests/inference.rs`, all live (the
+  filed `#[ignore]`d pin — renamed `b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`
+  — is un-ignored): the anchor (JS shape + the legitimate `Other` path), a
+  driven-both-ways run naming the out-of-set value instead of misfiling it,
+  two partitioned variants chaining and each trapping its own enum, the
+  written-catch-all boundary (dead code, never taken), and the unbacked
+  control (no trap of any kind, bare `else` byte-identical).
+- **Plant: 1** (the re-dispatch's whole condition short-circuited to
+  `false`): 3 of the 6 pins go red — the three that assert the trap
+  actually fires — while the two controls (no-resource-shape and
+  written-catch-all) correctly stay green, since neither depends on the
+  disabled mechanism.
+- **Goldens moved: 0** (§13.5).
+- `docs/spec/types.md`'s trap-arm section gains the multi-leg form, in the
+  same commit.
+- **B118 interaction, noted for the merge, not acted on here.** The
+  coverage-walk lane is concurrently teaching the CHECKER to refuse a
+  refutable nested payload pattern (§12.4's SECOND filed shape,
+  `b114_a_refutable_nested_pattern_is_not_exhaustive`, untouched by this
+  section). §13's re-dispatch groups EARLIER legs by variant without asking
+  whether those legs are themselves guarded or jointly exhaustive over
+  their OWN payload — it only asks "does this leg's pattern carry a backed
+  test", the same question §12.1 already asks of the final leg. So a GUARDED
+  earlier leg (`Pair::Of(Align::Start) if cond => ..`) is grouped exactly
+  like an unguarded one today: an in-set `Align::Start` value that the guard
+  rejects falls through to the SAME re-dispatch and traps as if it were
+  out-of-set — a false positive, the identical trade §12.4's ledger already
+  accepted for the final leg's own guard composition ("under this hole a
+  match can reach the trap with every value IN set... strictly better than
+  the silent wrong answer it replaces... stops being reachable the moment
+  the exhaustiveness check is fixed"). Nothing here extends or narrows what
+  the checker accepts; when B118 refuses a shape outright, that shape simply
+  stops reaching this trap at all, and the trade above becomes moot for it
+  the same way.

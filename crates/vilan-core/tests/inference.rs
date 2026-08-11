@@ -51889,16 +51889,16 @@ fn b114_a_written_catch_all_is_still_the_authors_own_arm() {
 }
 
 #[test]
-#[ignore = "known limit: a backed test in an EARLIER leg still reaches the final \
-            leg's bare `else` — a distinct shape from B114's, needing a message \
-            the trap point cannot compute; see backed-enums.md §12.4"]
-fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
-    // Found probing B114. The final leg carries no backed test, so it drops its
-    // condition as it always did — but an EARLIER leg's nested `Align` test can
-    // fail for an out-of-set value, and the fall-through then answers
-    // `Pair::Other` confidently. The trap point cannot name the offending value
-    // in general: which payload slot holds it depends on which variant the
-    // subject is, and the final leg's arm is reached from all of them.
+fn b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
+    // §12.4's filed hazard, closed (backed-enums.md §13). The final leg
+    // carries no backed test, so `trap_tests` (the §12.1 mechanism) is empty
+    // and the leg's own condition is still dropped — but `Of`'s two legs,
+    // together, are its ONLY handler, both testing a specific `Align`
+    // literal. Reaching this point with the subject's tag actually `Of`
+    // means neither literal matched, which is possible only when the payload
+    // left `Align`'s set. The fix re-dispatches on the tag INSIDE the dropped
+    // leg's body: `Of` traps, and only the tag that owns the leg (`Other`)
+    // still runs the author's own arm.
     let javascript = compile(
         r#"
         import std::print;
@@ -51912,8 +51912,171 @@ fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
     )
     .expect("a clean compile");
     assert!(
-        javascript.contains("__enum_trap"),
-        "an out-of-set payload must not become `Pair::Other`, got:\n{javascript}"
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "the bare `else` should re-dispatch on the tag, trapping `Of` and \
+         keeping `Other`'s own arm underneath, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\n",
+        "the legitimate `Pair::Other` path must be unchanged"
+    );
+}
+
+#[test]
+fn b121_an_out_of_set_payload_in_an_earlier_leg_traps_instead_of_misfiling() {
+    // The behavior the emission buys: a host-invented `Of` payload traps
+    // instead of silently answering `Other`. Driven both ways, alongside the
+    // in-set control the analyzer itself cannot construct as `Pair::Of` with
+    // a bad `Align` — only `[0, "middle"]`, built by hand, can.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::Start)));
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "s\ne\no\nAlign: \"middle\" is not one of its values\n",
+        "every in-set path stays unchanged and the out-of-set `Of` payload \
+         names the enum and the raw value, not `Pair::Other`"
+    );
+}
+
+#[test]
+fn b121_two_partitioned_variants_each_trap_their_own_enum() {
+    // Generalizes the anchor to TWO tags each exhausted by backed literals
+    // (`Of`/`Align`, `Alt`/`Display`), with `Other` the true bare leg. The
+    // re-dispatch chains in the order the tags first appear, and each traps
+    // only its own enum — the K=1 shape per tag, §12.1's format unchanged.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Display { Block = "block", Inline = "inline" }
+        enum Pair { Of(Align), Alt(Display), Other }
+        fun label(p: Pair): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+                Pair::Alt(Display::Block) => "b",
+                Pair::Alt(Display::Inline) => "i",
+                Pair::Other => "o",
+            }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else if ($a[0] === 1) {\n\
+             \t\t\t__enum_trap(\"Display\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "both partitioned tags should chain, in declaration order, each \
+         trapping its own enum, got:\n{javascript}"
+    );
+    let driven = format!(
+        "{javascript}\n\
+         try {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n\
+         try {{ label([ 1, \"grid\" ]); }} catch (error) {{ console.log(error); }}\n\
+         console.log(label([ 2 ]));\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "o\n\
+         Align: \"middle\" is not one of its values\n\
+         Display: \"grid\" is not one of its values\n\
+         o\n",
+        "each tag should trap its own enum, and the true bare leg is unaffected"
+    );
+}
+
+#[test]
+fn b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap() {
+    // The mechanism's own boundary: a tag covered by an IRREFUTABLE payload
+    // leg of its own (`Pair::Of(let _)`) already matches THAT leg earlier in
+    // the else-if chain, so the re-dispatch's `Of` branch is unreachable —
+    // present in the source (harmless dead code) but never the path taken.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(let _) => "x", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!("{javascript}\nconsole.log(label([ 0, \"middle\" ]));\n");
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "x\no\nx\n",
+        "an out-of-set `Align` under a leg that already covers `Of` unconditionally \
+         takes that leg, same as any other value — it never reaches the trap"
+    );
+}
+
+#[test]
+fn b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else() {
+    // §12.2's narrow rule extended to the new mechanism: an UNBACKED nested
+    // enum's runtime domain IS its variant set (the language wrote the
+    // discriminant), so `Of`'s two legs testing `Inner::A`/`Inner::B` carry
+    // no `BackedTest` at all — `earlier_variant_traps` never gets an entry
+    // for `Of`, and the final leg's bare `else` is exactly what it always
+    // was, byte for byte.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b", Pair::Other => "o" }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an all-unbacked match needs no trap of any kind, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"o\";\n\t}"),
+        "the final leg's bare `else` should be untouched, got:\n{javascript}"
     );
 }
 

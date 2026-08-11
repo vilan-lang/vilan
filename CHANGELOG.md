@@ -12,6 +12,10 @@ tracks the latest state.
 
 ---
 
+**An out-of-set value inside an earlier `match` arm's payload no longer gets silently filed under a different variant.** `match pair { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }` — a `Pair::Of` value whose `Align` payload was neither `Start` nor `End` (invented by a host caller, not something the language itself can construct) failed both `Of` arms and fell through to `Pair::Other`'s, answering `"o"` for a value that was never a `Pair::Other` at all. The exhaustive-`match` trap already catches this when the mismatched test is in the *last* arm; here it was in two *earlier* ones, and the last arm — carrying no backed test of its own — still dropped its condition and became a bare, unquestioning `else`. It now re-checks the subject's own variant before running that arm's body: reaching `Pair::Other` this way is only legitimate if the value's tag genuinely is `Other`; a value tagged `Of` traps instead, naming the enum and the value it actually got (`Align: "middle" is not one of its values`), and a real `Pair::Other` runs exactly as before.
+
+---
+
 **Organize Imports no longer prunes a module import used only through `::`.** `import std::math;` referenced only as `math::min(1, 2)` — never by its bare name — was reported unused and removed on save. A static accessor's subject resolves through the same type-position lookup as a struct, an enum, a trait, or a generic, and the definition it records feeds every "is this import used" check in the editor; a module was the one namespace kind that lookup forgot, so `math`'s use site recorded no definition at all and looked referenced nowhere. It now resolves like the others — a module reached only through `::` keeps its import, in a single import or shrunk out of a brace set, exactly like a struct or function would. Go-to-definition on a module name at a `::` use site picks up the same fix and now jumps to the module; it already worked on the module name written inside the `import` statement itself.
 
 ---
