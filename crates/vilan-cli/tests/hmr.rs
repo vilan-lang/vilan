@@ -1240,6 +1240,10 @@ check(head.children.length === 1, "a repeated css event updates the existing <st
 check(head.children[0] === style, "the same <style> element is reused across swaps");
 check(!globalThis.__reloaded, "a css hot-swap never reloads the page");
 
+// The verdict travels on stdout, not only the exit code: node's Windows
+// shutdown race (see the tolerance at the call site) can abort the process
+// AFTER this line runs, corrupting the status of a fully-passed run.
+console.log(failures === 0 ? "css harness verdict: PASS" : "css harness verdict: FAIL");
 process.exit(failures === 0 ? 0 : 1);
 "#;
 
@@ -1348,11 +1352,22 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
             .current_dir(&dir)
             .output()
             .expect("run node harness");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        // Windows only: node's own shutdown race, not a harness failure.
+        // `uv_async_send` aborts on a closing handle during exit teardown
+        // (nodejs/node#56645 / #58091 — rpc_http.rs documents the same
+        // tolerance), and the abort lands strictly AFTER the harness's
+        // complete stdout, corrupting the exit code of a fully-passed run.
+        // The stdout verdict sentinel is the truth on that path: a failed
+        // check prints FAIL and stays red regardless of this tolerance.
+        let windows_teardown_abort = cfg!(windows)
+            && stdout.contains("css harness verdict: PASS")
+            && stderr.contains("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)")
+            && stderr.contains("async.c");
         assert!(
-            run.status.success(),
-            "css harness failed:\n{}\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
+            run.status.success() || windows_teardown_abort,
+            "css harness failed:\n{stdout}\n{stderr}"
         );
     }));
 
