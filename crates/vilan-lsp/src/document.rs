@@ -4087,6 +4087,56 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The ratified first target (E54): element syntax with no `view` in
+    // scope. `<div/>` desugars to an unresolved `view` accessor, which
+    // already carries the "element syntax lowers to std::ui::view" note
+    // (element-syntax S4) — the quickfix comes from the SAME general
+    // unresolved-name path as any other name, reaching `view` in real std
+    // via `import_candidates`' disk scan, not from the note's text.
+    #[test]
+    fn quickfix_offers_the_add_import_fix_for_an_unresolved_element_view() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x = <div/>;\n}\n")]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let view_fixes: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title.contains("`view`"))
+            .collect();
+        assert_eq!(
+            view_fixes.len(),
+            1,
+            "expected exactly one unambiguous `view` fix: {:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(
+            view_fixes[0].title.contains("std::ui"),
+            "{}",
+            view_fixes[0].title
+        );
+        assert_eq!(view_fixes[0].replacement, "import std::ui::view;\n");
+        // Applied and re-analyzed: the element head resolves.
+        let mut applied = text.to_string();
+        applied.replace_range(view_fixes[0].span.into_range(), &view_fixes[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed
+                .diagnostics
+                .iter()
+                .all(|error| !error.msg.contains("cannot find 'view'")),
+            "applying the fix should resolve the element head: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // An AMBIGUOUS name — two sibling modules each declare it — offers one
     // quickfix PER CANDIDATE, never a guess.
     #[test]
