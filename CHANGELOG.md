@@ -8,6 +8,16 @@ tracks the latest state.
 
 ## Unreleased
 
+**The editor now offers to add a missing import — on its own, or in one sweep.** An unresolved name that's importable now gets a QUICKFIX: hover the "cannot find `X`" diagnostic and the editor offers "Import `X` from std::json" (one action per module, when more than one exports the name — never a guess between them). A "Add All Missing Imports" source action fixes every unambiguous name in the file in one edit, skipping any that are ambiguous. And completing a name you haven't imported yet now offers it directly — labeled with the module it comes from (`std::json`), ranked below the names already in scope, and carrying the import as part of accepting it, so typing the name and imports it in the same keystroke.
+
+The edit itself reuses the formatter's understanding of import structure rather than splicing text by hand: adding a name to a module already imported nearby extends its brace set (or turns a bare `import std::json::Json;` into `import std::json::{ Encode, Json };`); reaching a module for the first time inserts a new `import` line in its canonically sorted position. The element-syntax note — "element syntax lowers to `std::ui::view`; add `import std::ui::{ view, View };`" — is the first diagnostic this reaches: the fix for its "cannot find `view`" is now one click away instead of a comment to copy by hand.
+
+---
+
+**A misspelled field in a struct initializer now gets a suggestion — and a fix.** `Config { entires = 5 }` against a struct with an `entries` field used to answer with a bare "struct 'Config' has no field 'entires'". It now adds a note, "did you mean `entries`?", when a real field is a close-enough edit distance away — close enough that `"entires"` suggests `"entries"` but `"x"` never suggests anything at all, however similar `entries` may look to a human skimming the diagnostics list. The scan runs only once the plain name lookup has already failed, so correctly-spelled code pays nothing for it. The editor turns the suggestion into a quickfix, "Change to `entries`", that rewrites exactly the misspelled name — and the diagnostic's own span moved to match, from the field's value to the field's name, which is what a rename needs to replace.
+
+---
+
 **Organize Imports no longer prunes a module import used only through `::`.** `import std::math;` referenced only as `math::min(1, 2)` — never by its bare name — was reported unused and removed on save. A static accessor's subject resolves through the same type-position lookup as a struct, an enum, a trait, or a generic, and the definition it records feeds every "is this import used" check in the editor; a module was the one namespace kind that lookup forgot, so `math`'s use site recorded no definition at all and looked referenced nowhere. It now resolves like the others — a module reached only through `::` keeps its import, in a single import or shrunk out of a brace set, exactly like a struct or function would. Go-to-definition on a module name at a `::` use site picks up the same fix and now jumps to the module; it already worked on the module name written inside the `import` statement itself.
 
 ---
