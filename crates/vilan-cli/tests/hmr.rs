@@ -1117,7 +1117,7 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
 /// fall into — proving the fix needs a server that behaves exactly like the
 /// real-world idiom it's fixing, not a stand-in.
 fn boot_time_css_server_source() -> String {
-    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\n\n\
+    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
      fun main() {\n\
      \tlet client_css = fs::read_file_to_str(\"dist/client.css\");\n\
      \tServer::builder()\n\
@@ -1125,6 +1125,10 @@ fn boot_time_css_server_source() -> String {
      \t\t.on_request(|request| {\n\
      \t\t\tmatch request.path() {\n\
      \t\t\t\t\"/client.css\" => Response::builder().set_header(\"Content-Type\", \"text/css\").body(client_css).build(),\n\
+     \t\t\t\t\"/shutdown\" => {\n\
+     \t\t\t\t\tprocess::exit(0);\n\
+     \t\t\t\t\tResponse::builder().body(\"\").build()\n\
+     \t\t\t\t}\n\
      \t\t\t\t_ => Response::builder().code(404).body(\"\").build(),\n\
      \t\t\t}\n\
      \t\t})\n\
@@ -1282,6 +1286,12 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
         watcher.stderr.take().unwrap(),
     );
 
+    // E60: the server leg deliberately breaks the house quick-exit rule (the
+    // whole point is a server that OUTLIVES rounds), so it must die by the
+    // harness's hand — killing the watcher only orphans its node grandchild.
+    // The port escapes the assertion closure so cleanup runs red or green.
+    let css_server_port = std::cell::Cell::new(None::<u16>);
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let deadline = support::WATCH_LIVENESS;
         let dev_port = wait_for_port(&lines, deadline)
@@ -1292,6 +1302,7 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
         );
         let server_port = wait_for_css_server_port(&lines, deadline)
             .expect("the boot-time-stale server should announce `css-server-up <port>`");
+        css_server_port.set(Some(server_port));
 
         // Round 1's boot-time snapshot — what the server read once, at start,
         // and will keep serving verbatim through a css-only round.
@@ -1372,6 +1383,37 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
     }));
 
     support::kill_watcher(&mut watcher);
+    // The server survives the watcher by design, so ask it to exit and — on
+    // the green path only, so a red run's own panic is never masked — assert
+    // it actually died. Each poll RE-SENDS /shutdown: a request that lands
+    // exits the process within milliseconds, and a connect that refuses is
+    // the death witness. This assert is the pin that E60's leak cannot
+    // silently return.
+    if let Some(port) = css_server_port.get() {
+        let start = Instant::now();
+        let dead = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => break true,
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = stream.write_all(
+                        b"GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    if start.elapsed() > support::WATCH_LIVENESS {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if outcome.is_ok() {
+            assert!(
+                dead,
+                "the boot-time-stale server must exit on /shutdown — \
+                 an orphan here is E60's leak returning"
+            );
+        }
+    }
     if outcome.is_ok() {
         let _ = std::fs::remove_dir_all(&dir);
     }
