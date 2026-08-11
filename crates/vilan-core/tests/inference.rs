@@ -51832,6 +51832,13 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
     // nothing outside it to name. A nested LITERAL is the same argument for a
     // primitive. Both keep the bare `else` they have always had, which is why
     // the whole corpus moved zero bytes.
+    //
+    // B118 edited the literal half's program, not its claim. `Wrapped::Of(1),
+    // Wrapped::Of(2)` was accepted as total over an `i32` payload — shape (c)
+    // of the coverage walk's holes — so the leg carrying the literal is now a
+    // leg BEFORE an irrefutable one. It keeps its test either way, and the
+    // final leg still drops its condition with no trap behind it, which is all
+    // the narrow rule ever claimed here.
     let javascript = compile(
         r#"
         import std::print;
@@ -51842,7 +51849,7 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
             match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b" }
         }
         fun literal(w: Wrapped): str {
-            match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
         }
         fun main() { print(nested(Pair::Of(Inner::B))); print(literal(Wrapped::Of(2))); }
         "#,
@@ -51858,7 +51865,7 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
     );
     assert!(
         javascript.contains("\tif ($c[0] === 0 && $c[1] === 1) {\n\t\t$d = \"one\";\n\t} else {"),
-        "the literal final leg should still drop its condition, got:\n{javascript}"
+        "the literal leg should keep its nested test, got:\n{javascript}"
     );
 }
 
@@ -51914,15 +51921,13 @@ fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
 }
 
 #[test]
-#[ignore = "known bug: exhaustiveness is checked on the TOP-LEVEL variant set \
-            only, so a refutable nested pattern is accepted as total — see \
-            backed-enums.md §12.4"]
 fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
     // Found probing B114, and it is the analyzer's, not the trap's: `Pair` has
-    // one variant, so §1.5's by-name check calls this total and the single leg
-    // becomes the bare `else`. `Pair::Of(Inner::B)` then runs the `Inner::A`
-    // arm. The right answer is a compile error naming the missing case — a trap
-    // would paper over a missing check with a runtime throw.
+    // one variant, so §1.5's by-name check called this total and the single leg
+    // became the bare `else`. `Pair::Of(Inner::B)` then ran the `Inner::A` arm.
+    // The right answer is a compile error naming the missing case — a trap
+    // would paper over a missing check with a runtime throw. Closed by B118's
+    // coverage walk, which asks the pattern TREE rather than its root.
     assert_fails_with(
         r#"
         import std::print;
@@ -51933,7 +51938,7 @@ fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
         }
         fun main() { print(label(Pair::Of(Inner::B))); }
         "#,
-        "match is not exhaustive",
+        "match is not exhaustive: missing Pair::Of(Inner::B)",
     );
 }
 
@@ -54379,14 +54384,20 @@ fn b115_a_guarded_final_leg_in_the_sequence_emitter_runs_the_covering_leg() {
 }
 
 #[test]
-fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
-    // Why the lowering's half is load-bearing and not merely belt-and-braces.
-    // `Pair::Of(Align::Start)` is counted as covering the variant `Of`, so the
-    // checker calls this match exhaustive on a proof that does not hold, and
-    // the guarded final leg is REACHABLE. With the guard dropped it answered
-    // "guarded" for `Of(End)` whatever the guard said — the emission was wrong
-    // on its own terms, not merely downstream of a bad verdict. The leg keeps
-    // its guard here exactly as anywhere else.
+fn b115_a_guarded_final_leg_keeps_its_guard_behind_a_nested_proof() {
+    // The lowering's half, over a NESTED proof: the coverage that licenses the
+    // bare `else` comes from two legs testing below the tag, and the guarded
+    // final leg behind them keeps its test, its prelude and its guard exactly
+    // as it does behind a flat one.
+    //
+    // B118 retired this pin's original program. It was written when
+    // `Pair::Of(Align::Start)` alone counted as covering the variant `Of`, so
+    // the checker accepted a proof that did not hold and the guarded final leg
+    // was REACHABLE — the point being that the emission was wrong on its own
+    // terms, not merely downstream of a bad verdict. The coverage walk now
+    // descends, so that program is refused outright
+    // (`b118_a_refutable_payload_pattern_does_not_prove_coverage`) and the
+    // shape it demonstrated no longer exists to test.
     let javascript = compile(
         r#"
         import std::print;
@@ -54395,6 +54406,7 @@ fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
         fun f(p: Pair, count: i32): str {
             match p {
                 Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
                 Pair::Of(let x) if count > 0 => "guarded",
             }
         }
@@ -54413,19 +54425,14 @@ fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
 }
 
 #[test]
-#[ignore = "the coverage walk counts a leg whose payload pattern is REFUTABLE \
-            as covering its variant; a separate, pre-existing hole whose \
-            unguarded form is equally wrong"]
-fn b115_a_refutable_payload_pattern_should_not_prove_coverage() {
-    // The one residual, stated as what it is: the match above is NOT
-    // exhaustive — `Of(End)` with a false guard matches no leg — and the
-    // checker should say so. It does not, because the coverage walk asks only
-    // which VARIANT a pattern names and never whether the pattern can fail
-    // below the tag. Not B115's hole: the same walk accepts
-    // `match p { Pair::Of(Align::Start) => "s" }` alone, which answers "s" for
-    // `Of(End)` with no guard anywhere in sight. Closing it wants real
-    // nested-pattern usefulness analysis, which is its own measurement.
-    assert_fails_with(
+fn b118_a_refutable_payload_pattern_does_not_prove_coverage() {
+    // B115's residual, closed. The match is NOT exhaustive — `Of(End)` with a
+    // false guard matches no leg — and the checker now says so. It did not,
+    // because the coverage walk asked only which VARIANT a pattern names and
+    // never whether the pattern can fail below the tag. The note is what makes
+    // the message legible when the leg the author believes covers the case is
+    // the guarded one.
+    assert_fails_noting(
         r#"
         enum Align { Start, End }
         enum Pair { Of(Align) }
@@ -54437,6 +54444,8 @@ fn b115_a_refutable_payload_pattern_should_not_prove_coverage() {
         }
         fun main() { }
         "#,
-        "match is not exhaustive",
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
     );
 }
