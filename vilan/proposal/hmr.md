@@ -510,3 +510,44 @@ three most-worn paths in the industry ended up.
    verification gap is a live-browser session (blob import, EventSource,
    scroll/focus restore run under the node stub only — first real-browser
    use is the confirmation).**
+
+## Appendix: implementation record — css hot-swap via the dev channel (2026-08-10)
+
+**Backlog E55, css half.** S1's `css` handler (§2, `bumpStylesheets`) cache-
+busted the existing `<link>`'s own `href` — which is the **user's own server
+route** (`/client.css` in the todo shape), whose handler `fs::read`s it once at
+boot (`examples/todo/src/server.vl`) and never again. A css-only round never
+restarts that server (§6 — only a bundle change does), so the "refresh" landed
+right back on the same stale bytes: exactly the hazard `fetchAndSwap` (§2's
+amendment) already closed for JS, just not yet for CSS.
+
+**Fix**: a `css` event now fetches the changed sidecar from the dev channel's
+`/asset/<name>` route — which S1 already served, current every round, with
+`Cache-Control: no-cache` — and applies the text as an injected `<style>` that
+supersedes the matching `<link>` (`link.disabled = true`; the href itself is
+never touched). A `<style>` was chosen over a `blob:` URL (the JS swap's
+mechanism, §3): it updates the CSSOM synchronously with no second pass through
+the browser's stylesheet loader, updates in place on a later `css` event with
+no object URL to revoke, and — since the original `<link>` is only disabled,
+never replaced — a plain page reload starts clean from a freshly parsed
+`app.html` rather than carrying a swap artifact forward. Preserved unchanged:
+the asset-matching semantics (an `asset`-named event touches only the `<link>`
+ending in that filename; no name touches every stylesheet `<link>`, each
+fetched by its own basename) and the never-reload discipline (a 404 or network
+failure warns and leaves the current stylesheet exactly as it was — the same
+reasoning `fetchAndSwap` states for a failed bundle fetch: reloading would only
+re-request the user's own stale route).
+
+No server-side change was needed — `hmr.rs`'s `/asset/<leg>.css` route and the
+`css` event's `asset` field already existed (S1/§11's S3 amendment); the gap
+was entirely that the shim never used them. Pinned end to end in
+`crates/vilan-cli/tests/hmr.rs`
+(`a_css_push_heals_a_boot_time_stale_server_route`): a server shaped exactly
+like `examples/todo` (boot-time `fs::read` of `dist/client.css`) proves it is
+never restarted by a css-only round and so stays observably stale, while a node
+harness drives the REAL shim served by the dev channel (Node's own global
+`fetch`, unstubbed, against the real running dev channel) and asserts the
+applied `<style>` carries the fresh bytes — not the stale ones the server's own
+route still serves. Reverting the shim change alone turns the pin red (no
+`<style>` is ever produced, no request ever reaches the dev channel), so the
+fix, not the harness, is what the test is anchored to.
