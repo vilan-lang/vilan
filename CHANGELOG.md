@@ -8,6 +8,10 @@ tracks the latest state.
 
 ## Unreleased
 
+**A css-only edit under `run --watch` no longer round-trips a stale server.** The `css` hot-swap used to "refresh" a stylesheet by cache-busting the `<link>`'s own href — which is the app's own server route (`/client.css` in the common shape), and the common idiom (`examples/todo`) reads that file once at server boot and serves the same bytes for the rest of the process. A css-only round never restarts that server (only a bundle change does), so the cache-bust landed right back on the boot-time snapshot: a style edit that visibly did nothing.
+
+A `css` event now fetches the changed sidecar from the CLI's own dev channel — which already served current `dist/*.css` bytes every round — and applies them as an injected `<style>` that supersedes the stale `<link>` (disabled, its href left untouched). Asset-matching and the never-reload-on-failure behavior are unchanged: a named sidecar updates only its matching `<link>`, and a fetch that fails warns and leaves the current stylesheet exactly as it was.
+
 **An exhaustive `match` over a backed enum no longer lies about a value it has never seen.** `enum Align { Start = "flex-start", Center = "center", End = "flex-end" }` compiles to those three strings, and a `match` over all three compiled its last arm to a bare `else` — so a value that was none of them, arriving from the host, came back as `Align::End`. Not as an error, not as a wrong-looking answer: as `Align::End`, confidently, exit 0.
 
 The last arm is now tested like every other one, and the `else` panics with the enum's name and the raw value: `Align: "middle" is not one of its values`. Exhaustiveness was always checked over the *variant set*, by name — a proof about the vilan side of the boundary, never about the runtime value, because a backed enum lowers to a bare host string or number and its runtime domain is the host's. The trap is where the compiler stops assuming those two are the same thing.
