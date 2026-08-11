@@ -129,6 +129,153 @@ server that reads only `dist/` artifacts is ceremony; `import
 std::json::json_codec` is intent (the codec is a deployment choice,
 `transport-rpc.md` §6.2 Q6).
 
+## 2. The inventory
+
+### 2.1 The owner's todo app — the charter's own evidence
+
+Six files, 122 non-blank lines, written 2026-08-10.
+
+| File | lines | ceremony | intent |
+|---|---:|---:|---:|
+| `src/store.vl` — the `[service]` struct and its one method | 25 | 0 | 25 |
+| `src/client.vl` — connect, subscribe, mount | 27 | 0 | 27 |
+| `src/routes.vl` — the route enum and `Routable` | 33 | 0 | 33 |
+| `src/server.vl` — **the boot function** | 19 | **10** | 9 |
+| `src/app.html` — **the shell** | 13 | **12** | 1 |
+| `vilan.toml` | 5 | *(declaration)* | |
+
+`server.vl`'s ten ceremony lines are three boot reads (`:9-11`), the five-line
+content-type table (`:16-20`), and the two imports that exist only to serve
+them (`import std::fs`, `import std::http::Response`). Its nine intent lines
+are four imports, `async fun main() {`, `let notes = Notes::new();`, the
+`serve_service` call's head and tail, and the closing brace. `app.html`'s one
+intent line is `<title>Todo</title>`.
+
+**The headline: the service is 25 lines, the UI is 27, and joining them cost 32
+lines of which 22 never mention a note.** 69% of the code between a working
+service and a working page is setup.
+
+One further fact about those 32 lines, and it is the strongest evidence in the
+survey for the counting rule's *copy-verbatim* test:
+`vilan-playground/todo/src/server.vl` is
+`vilan/examples/walkthrough/src/server.vl` with two identifiers changed. The
+three reads are identical, the five match arms are identical character for
+character, the port is the same, and even the `on_start` message is the same
+string ("notes server listening on"). The only differences are `boot()` →
+`Notes::new()` and `import std::print` → `import std::io::print`. The owner did
+not write this ceremony; the owner *transcribed* it, because it is not
+derivable from anything they knew about their own app.
+
+### 2.2 The corpus
+
+Four projects and two templates, same rule. Server entries only — see §2.3 for
+why that is the whole story.
+
+| Server entry | lines | ceremony | intent | boot shape |
+|---|---:|---:|---:|---|
+| `examples/fullstack/server/src/main.vl` | 56 | **52** | 4 | `Server::builder()` |
+| `crates/vilan-cli/templates/fullstack/src/server.vl` | 25 | **22** | 3 | `Server::builder()` |
+| `examples/ssr/src/server.vl` | 20 | **15** | 5 | `Server::builder()` |
+| `examples/todo/src/server.vl` | 19 | **10** | 9 | `serve_service` |
+| `examples/walkthrough/src/server.vl` | 19 | **10** | 9 | `serve_service` |
+| *(the owner's)* `todo/src/server.vl` | 19 | **10** | 9 | `serve_service` |
+| `examples/rpc/src/main.vl` — **in-process, no browser** | 198 | **0** | 198 | none (`local_rpc`) |
+
+And the shells:
+
+| Shell | lines | links a stylesheet | mount id | script |
+|---|---:|---|---|---|
+| `templates/fullstack/src/app.html` | 16 | yes, `/client.css` | `app` | `type="module"`, `/client.js` |
+| `templates/browser/index.html` | 16 | yes, `app.css` *(relative)* | `app` | `type="module"`, `app.js` |
+| `examples/todo/src/app.html` | 12 | yes, `/client.css` | `app` | `type="module"`, `/client.js` |
+| `examples/walkthrough/src/app.html` | 12 | yes, `/client.css` | `app` | `type="module"`, `/client.js` |
+| `examples/ssr/src/app.html` | 11 | **no** | `app` (+ `<!--ssr-->`) | `type="module"`, `/client.js` |
+| `examples/fullstack/server/src/main.vl:82` | 1 *(inline string)* | **no** | `app` | `type="module"`, `/client.js` |
+| *(the owner's)* `todo/src/app.html` | 13 | yes, `/client.css` | `app` | `type="module"`, `/client.js` |
+
+Four observations, each of which the design in §5 is answerable to:
+
+1. **The two worst ratios are the two files a new user meets first.** The
+   `vilan init` scaffold's server is 22 ceremony lines and *one* line of
+   intent — and that one line is an `import`. `examples/fullstack`'s server, the
+   one the chunk-splitting docs point at, is 52 of 56. A reader learning the
+   language from either file learns the ceremony as if it were the subject.
+2. **Every shell agrees on everything, and nothing made them agree.** Seven
+   shells, seven `id="app"`, seven `type="module"`. That unanimity is not a
+   convention the tree enforces anywhere (§3.5 shows what it cost); it is seven
+   authors copying the sixth.
+3. **Two of the seven link no stylesheet.** `examples/ssr` and
+   `examples/fullstack` do not, and for both it is currently correct — neither
+   emits one. But "currently correct" is the entire hazard: add one `const
+   style()` to either and the build starts emitting `dist/<leg>.css`, the shell
+   keeps not linking it, and nothing anywhere says a word. That is the owner's
+   bug, latent, in two examples in this repository.
+4. **`examples/rpc` is the control, and it is clean.** 198 lines, zero
+   ceremony: no `std::fs`, no `request.path()`, no `.html` file, no server boot
+   at all. It wires client to server with `local_rpc` in-process. The tax is
+   therefore not a property of rpc, or of `[service]`, or of the language —
+   **it is precisely the price of having a browser**, and it is paid at exactly
+   one seam.
+
+### 2.3 The ratio, collected
+
+Across the six browser-serving projects surveyed (the owner's app, `todo`,
+`walkthrough`, `ssr`, `fullstack`, and the `init` template):
+
+- **Client-leg files: 0% ceremony.** Every one, in every project. The client
+  leg's only coupling to the setup is the string `"app"` inside
+  `mount_root("app", …)`, which is one argument, not a line.
+- **Store / service / view / route files: 0% ceremony.** Every one.
+- **Server entries: 53%–93% ceremony**, and the two extremes are the two files
+  most likely to be read as a model.
+- **Shells: 92%–100% ceremony**, where the intent is a `<title>` and, in one
+  case, a paragraph of prose (`examples/todo/src/app.html:9`).
+
+So the tax is not diffuse and it is not proportional to app size — it is a
+**fixed toll charged at the leg boundary**, roughly 30 lines and two file
+formats, paid identically by a 122-line app and a 500-line one. That is why the
+ratio looks mild in a big app and brutal in a small one, and it is why the
+`vilan init` scaffold — the smallest app anyone ever sees — shows it at its
+worst.
+
+### 2.4 What does not exist, verified
+
+Three negative findings, each checked by exhaustive grep, because the design
+depends on them:
+
+- **There is no document abstraction anywhere.** `doctype`, `<html`,
+  `render_document`, `html_shell`, `render_to_string` occur in exactly ten
+  places in the tree: eight hand-written `.html` files, one escaped string
+  literal (`examples/fullstack/server/src/main.vl:82`), and zero occurrences in
+  `vilan/std/`. The nearest surface is `std::ui::render(view: View): str`
+  (`vilan/std/src/process/ui.vl:367-370`), whose own header says the caller
+  "splices it into its HTML shell" — a **fragment** serializer by design
+  (`ssr.md` §2, §6a: `mount`/`mount_root` are omitted from the process layer).
+- **There is no manifest surface for assets.** No `[assets]`, `[static]`,
+  `[public]`, `[shell]` or `[html]` section exists or is parsed; the manifest's
+  known-key list (`crates/vilan-core/src/manifest.rs:56`) has no room for one
+  today. No `vilan.toml` in the tree names `app.html`, `index.html`,
+  `dist/client.js` or `dist/client.css`. Those paths live only in `.vl` string
+  literals and `.html` attributes.
+- **The docs teach the ceremony rather than abstracting it.**
+  `docs/guide/walkthrough.md:174` and `docs/guide/ssr.md:70` carry the same
+  `fs::read_file_to_str("src/app.html")` line as the examples; `docs/guide/
+  walkthrough.md:52` documents `app.html` as "the shell the server serves".
+  That is honest documentation of what exists, and it is also the mechanism by
+  which every new project inherits it.
+
+One more, which is a finding about the *gate* rather than the code: the closest
+thing in this repository to a specification of the HTML shell is a filename in
+a Rust test array. `crates/vilan-cli/tests/init.rs:335` asserts that
+`src/app.html` exists in the scaffold and in each blessed example; the browser
+template's coupling is checked by substring match on the HTML text
+(`tests/init.rs:141-162` — `page.contains("src=\"app.js\"")`,
+`page.contains("id=\"app\"")`, `page.contains("href=\"app.css\"")`), with the
+stated rationale "Scaffolding a page that never loads the CSS the build writes
+is the failure mode this asserts against". Someone already identified the
+owner's bug, and the only instrument available to them was `str::contains` in a
+test that guards two templates and nobody's project.
+
 ## 3. What the ceremony is made of — seven mechanisms
 
 The inventory is a list of files. This section is the list of *mechanisms* they
