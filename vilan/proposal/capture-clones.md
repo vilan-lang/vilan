@@ -992,6 +992,9 @@ match p {
 }
 ```
 
+*(Closed by §12: the fragment above is refused now, and this section is the
+record of what B115 found, not of what the checker does today.)*
+
 The coverage walk asks only which VARIANT a pattern names, never whether the
 pattern can fail below the tag, so `Of` counts as covered and the match is
 accepted. Before the fix this answered "guarded" for `Of(End)` whatever the
@@ -1009,3 +1012,194 @@ Filed with it, found by the same probes and left where they were found:
   now lapses only for a guarded final leg; unguarded, the domain question is
   still never asked. Same family as the residual above — the checker accepting
   a non-exhaustive match — and the same fix closes both.
+
+## 12. B118 — the coverage walk's nested and refutable holes, 2026-08-10
+
+§11.5's residual, and the two shapes filed beside it. The coverage walk asked
+which VARIANT a pattern named and stopped there, so a `match` was judged on its
+patterns' ROOTS and everything refutable below them was invisible. `enum Pair {
+Of(Align) }` has one variant, so `match p { Pair::Of(Align::Start) => "s" }`
+was total — and answered "s" for `Of(End)`. No guard, no host, no boundary: an
+ordinary value built by vilan, given another arm's answer, exit 0.
+
+### 12.1 Three shapes, one question asked of the wrong thing
+
+Filed as three, and they are three, but the check has only one place to be
+wrong and it was wrong there once:
+
+- **(a) a refutable payload proves coverage.** The walk collected
+  `ExprPattern::Variant(_, variant_index, _)` and discarded the payload, so
+  `Of(Align::Start)` and `Of(let x)` counted the same.
+- **(b) a tuple subject skips the question even unguarded.** §11.2 lapsed the
+  exemption for a guarded final leg only; unguarded, `(1, 2) => .., (3, 4) =>
+  ..` was never asked anything and answered "y" for `(7, 8)`.
+- **(c) the payload's own domain is never consulted.** `Wrapped::Of(1),
+  Wrapped::Of(2)` over an `i32` is (a) with an OPEN payload instead of a closed
+  one — the same discarded sub-pattern, a domain no set of literals exhausts.
+
+(b) reads as the odd one out because its exemption lived in a different arm of
+the same `match &subject_type`, but the exemption answers *"which values can
+the subject take?"* and a tuple is the one type in that list with an answer:
+the product of its elements'. It was in the list because the check had no way
+to ask a compound type anything. Now it has, and the tuple leaves.
+
+### 12.2 The rule shipped
+
+> An unguarded leg proves coverage only for the value-space its whole pattern
+> **tree** covers, not its root. An **enum** position is covered when every
+> variant is named and each named variant's payload positions are covered in
+> turn; a **tuple** position when its elements are, as a product; an **open**
+> position — `i32`, `str`, a struct, a fixed array, a still-abstract parameter
+> — only by a binder or `_`, because no finite set of tests exhausts one.
+
+It extends §11.2 downward and changes nothing about it: guards are filtered out
+before the walk begins, exactly as before, so the two rules compose by
+construction rather than by agreement.
+
+The exemption list keeps `Unknown`, `any`, `never` and a generic parameter, and
+keeps §11.2's lapse for a guarded final leg. Those are the subjects with no
+domain to ask about, and treating an unknown position as OPEN instead was
+considered and rejected: it would refuse matches that are correct for every
+instantiation, which is the direction with no recovery.
+
+### 12.3 The walk, and why it is a matrix
+
+`uncovered_shape` is the usefulness question asked of the all-wildcard row, in
+the standard matrix form: rows are the unguarded patterns (an or-pattern
+contributes one row per alternative), columns are types, and the whole of it is
+three cases applied to the first column.
+
+- The column's space is CLOSED and every constructor appears: descend into each
+  one, splicing its field columns in where the head column was. This is what
+  makes the rule descend — `Pair::Of(Align::Start)` reaches the case where
+  `Align`'s own space is asked the same question, and answers `End`.
+- The space is closed with constructors left over: those are the hole, and the
+  columns behind it are asked of the rows that match anything here.
+- The space is OPEN: same default step, and the witness is `_`.
+
+A per-leg predicate — "is this leg irrefutable?" — cannot express the rule at
+all, and the shape that proves it is
+`match p { (Align::Start, let b) => .., (let a, Align::End) => .. }`: neither
+leg covers anything on its own and together they leave exactly one value,
+`(End, Start)`. Coverage is a property of the SET of legs, which is what a
+matrix is for.
+
+Two mechanisms are borrowed rather than rebuilt, and both matter. `default_rows`
+filters on `is_irrefutable_pattern` — §11's own conformance fix — so "matches
+everything at this column" means one thing in the catch-all walk and in the
+descent. And a variant's payload columns are typed through
+`enum_type_substitution` / `impl_subject_substitution`, the same substitution
+`resolve_pattern` applies when it binds a capture; without it `Option<Align>`'s
+payload column would be the abstract `T` and the hole invisible.
+
+Termination is the matrix's, not the type's: a self-referential payload
+(`enum Tree { Leaf, Node(Tree, Tree) }`) unfolds only as far as the patterns
+do, because a column of binders is DROPPED rather than descended into. A step
+budget stands behind that as a bound on the usefulness algorithm's worst case,
+and it can only ever lose a diagnostic, never invent one — exhausting it
+answers "covered", which is what the check said before.
+
+### 12.4 The message names a pattern, not a paraphrase
+
+Three renderings, in order of how much the walk learned:
+
+| the hole | message | example |
+| --- | --- | --- |
+| a set of the SUBJECT's own variants | `missing 'A', 'B'` | unchanged since §1.5 |
+| rules nothing out | ``add a catch-all `_` leg`` | every unbounded scalar, and `(_, _)` |
+| anything below the top level | `missing <one value>` | `missing Pair::Of(Align::End)` |
+
+The middle row is why a tuple subject of literals says *"add a catch-all"*
+rather than *"missing `(_, _)`"*: the two witnesses are the same witness, and
+the catch-all is the actionable spelling of it. The bottom row names ONE
+uncovered value rather than a set, because a set below the top level has no
+readable spelling — vilan's or-pattern is a comma between legs, not a `|`
+inside a pattern.
+
+The contract is that the witness is a pattern the author can paste, and it is
+pinned by pasting it (`b118_the_witness_is_a_pattern_that_closes_the_hole`).
+That pin is what caught the two places the rendering was merely *recognisable*:
+a whole-variant witness dropped its payload arity (`Tree::Node`, which does not
+parse where `Tree::Node(_, _)` does), and `bool`'s variants were qualified —
+`true` and `false` are literals the parser takes, and `bool::true` is not a
+pattern at all. Both are spelling rules of the language, so the renderer keeps
+them rather than the walk.
+
+### 12.5 The sweep, the cost, and what moved
+
+619 fenced blocks across `docs/` and `proposal/` (500 vilan, 55 carrying a real
+match expression), every `.vl` file in the tree, all 21 `vilan.toml` projects,
+the 114-program corpus and the whole inference binary.
+
+**The flip list is three, and every one of them was a program relying on the
+hole:**
+
+| site | shape | triage |
+| --- | --- | --- |
+| `inference.rs` `b114_a_match_carrying_no_backed_test_keeps_its_bare_else` | (c) — `Wrapped::Of(1), Wrapped::Of(2)` over `i32` | real hole. The literal moves off the final leg; the claim (an unbacked nested test grows no trap) is unchanged and still pinned. |
+| `inference.rs` `b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed` | (a) — the pin whose premise WAS the hole | retired premise. Its program is now refused; the pin guards the same lowering claim behind a sound nested proof, renamed `..._behind_a_nested_proof`. |
+| `capture-clones.md` §11.5's fragment | (a) — the residual, illustrated | the document's own exhibit of the bug. Left in place with a forward pointer: rewriting it would erase what B115 found. |
+
+Zero sites in std, the examples, the benchmarks, `macro_std`, the templates,
+the corpus or the compiled docs. **Goldens moved: 0** — the check only ever
+became stricter, so an accepted match lowers exactly as it did, and a refused
+one has no lowering to move. The three CLI templates fail to check for a
+pre-existing and unrelated reason (`{{name}}` is not an identifier until `vilan
+init` substitutes it).
+
+**Cost, measured**: over the 23 478 coverage walks the tree's own sources
+provoke, the most expensive match costs EIGHT steps. The budget is 200 000.
+
+**Pins: 28** under `b118_`, plus two `#[ignore]`d pins un-ignored where they
+stood (`b114_a_refutable_nested_pattern_is_not_exhaustive`, and B115's residual
+renamed `b118_a_refutable_payload_pattern_does_not_prove_coverage`). The
+matrix is the edge cases, not the happy path: two levels of nesting, a tuple
+inside a variant payload, a multi-payload variant, a recursive enum in both
+directions, a generic payload that only holes once substituted, an or-pattern,
+leg order, and each of `_` / binder / guard proving what it always did.
+
+**Plants: 6**, each red on the pins it should be and only those — the walk
+stopping at the top level (14 red), the tuple exemption restored (3), an open
+position covered by anything (22, and B115's own pins are among them, which is
+the two rules composing), guarded legs counted again (9), a whole-variant
+witness forgetting its payload arity (1), `bool` spelled as a path (1).
+
+### 12.6 The trap composes, and one of its cases retires
+
+`backed-enums.md` §12.4 named the one point where the membership trap and this
+hole interact: under (a) a match could reach the trap with every value IN set,
+and the trap would then name an in-set value as out-of-set. That case is gone,
+because the match that produced it is refused — the trap is now reachable only
+by the value it was designed for, one the HOST invented.
+
+Nothing in the trap changed, and nothing needed to: the walk asks the VARIANT
+SET, which is the same set whatever the variants lower to, so shape (a) is
+refused identically for a backed payload and an unbacked one. All 9 of §12's
+pins are green, the 56 b76 pins are green, and the corpus's byte-level trap
+coverage did not move.
+
+One consequence for the emission worth recording, because it narrows what can
+reach the lowering rather than changing it: **a nested test over an OPEN domain
+can no longer be the final leg of an accepted match.** `Wrapped::Of(1),
+Wrapped::Of(2)` was the only way to write one, and it is not exhaustive. A
+nested test over a closed domain still can be, which is where the trap lives.
+
+### 12.7 What did not change, and what is filed
+
+`_` and a binder still prove everything, at every depth. A guard still proves
+nothing. The `is` operator is unaffected — it asks a refutable question and
+answers `false`, which is what it always did. The subject-type exemptions are
+unchanged except for the tuple's departure.
+
+Filed, found by the same probes and left where they were found:
+
+- **A fixed-array pattern is refutable even where the type makes it total.**
+  `is_irrefutable_pattern` says `ExprPattern::Array(_)` is refutable, and over
+  `[i32; 2]` the pattern `[let a, let b]` cannot fail — the length is in the
+  type and resolution already checks it. Unreachable from a `match` today (the
+  pattern parser takes `[..]` in a `let` binder, not in a match leg), so it
+  costs nothing and is not in this arc's rule. It is the one place the walk's
+  OPEN case is conservative rather than correct.
+- **`proposal/router.md`'s route fragment omits a variant.** `Route::Login` has
+  no arm in the fence at line 109. Non-exhaustive under the OLD rule too, so it
+  is not a flip — a pre-existing inaccuracy in an ungated fence.

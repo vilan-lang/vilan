@@ -6,6 +6,8 @@ import std::print;
 enum Signal { Quit, Finished }
 enum Align { Start = "start", End = "end" }
 enum Wrap { One(i32), Two }
+enum Pair { Of(Align) }
+enum Boxed { Of(i32) }
 
 fun classify(s: str): str {
 	match s {
@@ -64,6 +66,33 @@ fun wrapped(signal: Signal, wrap: Wrap): str {
 	}
 }
 
+// B118: coverage descends. Each of these is exhaustive only because the walk
+// looked BELOW the top-level pattern and found the payload — or the tuple
+// element — covered. `Pair` has one variant, so the nested legs are the whole
+// proof; `Boxed`'s payload is an `i32`, which no list of literals exhausts, so
+// the binder leg is; and the tuple's two elements are covered as a product.
+fun labelled(pair: Pair): str {
+	match pair {
+		Pair::Of(Align::Start) => "start",
+		Pair::Of(Align::End) => "end",
+	}
+}
+
+fun counted(boxed: Boxed): str {
+	match boxed {
+		Boxed::Of(1) => "one",
+		Boxed::Of(let n) => "many",
+	}
+}
+
+fun paired(pair: (Align, bool)): str {
+	match pair {
+		(Align::Start, true) => "start!",
+		(Align::Start, false) => "start",
+		(Align::End, let flag) => "end",
+	}
+}
+
 fun main() {
 	print(classify("quit"));
 	print(classify("y"));
@@ -80,4 +109,9 @@ fun main() {
 	print(aligned(Align::End, 5));
 	print(wrapped(Signal::Finished, Wrap::Two));
 	print(wrapped(Signal::Finished, Wrap::One(3)));
+	print(labelled(Pair::Of(Align::End)));
+	print(counted(Boxed::Of(1)));
+	print(counted(Boxed::Of(9)));
+	print(paired((Align::Start, true)));
+	print(paired((Align::End, false)));
 }

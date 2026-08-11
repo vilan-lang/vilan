@@ -436,8 +436,24 @@ is a destructure and matches everything, `(1, 2)` is a test.
 A `match` must be **exhaustive**, and exhaustiveness is proven by
 **unguarded** legs only — a guard tests the value, which the check does
 not reason about, so a guarded leg proves nothing about what the match
-covers. Over an enum the unguarded legs must name every variant; over any
-other subject one of them must be an irrefutable catch-all. The
+covers. What an unguarded leg proves is the value-space its whole pattern
+**tree** covers, not its root, and the check descends accordingly:
+
+- an **enum** position needs every variant named, and each named
+  variant's payload positions covered in turn, so
+  `Pair::Of(Align::Start)` alone leaves `Pair::Of(Align::End)` missing
+  however few variants `Pair` has;
+- a **tuple** position needs its elements covered — as a product, so
+  `(1, 2)` and `(3, 4)` leave every other pair missing;
+- an **open** position (`i32`, `str`, a struct, a still-abstract type
+  parameter) is covered only by a binder or `_`. No number of literals
+  exhausts it: `Wrapped::Of(1)`, `Wrapped::Of(2)`, … is never total.
+
+A subject whose type is not yet known, or is `any`, `never`, or a generic
+parameter, is exempt: the question is which values the subject can take,
+and there is no answer to give. The diagnostic names one uncovered value
+as a pattern that would cover it — *"missing `Pair::Of(Align::End)`"* —
+or asks for a catch-all where the hole is the whole domain. The
 consequence lands on the **last** leg, the one that answers for whatever
 the legs above it did not take: a `match` whose final leg is guarded must
 be exhaustive without it, so `match a { A => …, B if c => … }` is refused

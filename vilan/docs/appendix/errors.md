@@ -175,13 +175,23 @@ so callers await it regardless).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"match is not exhaustive: missing …"** · **"match is not exhaustive: add a catch-all `_` leg"**
-Some variants have no arm. Handle them or add `_ => …`. This error is
+Some values have no arm. Handle them or add `_ => …`. This error is
 the feature: it's what fires everywhere when you add a variant. A
 **guarded** leg does not count towards it — a guard tests the value, and
 the check reasons about the type — so `B if ready => …` leaves `B`
 missing, and a note points at the guard to say so. That also means the
 last leg may not be guarded: give it a `_ => …` after it, so the value
 the guard rejects has somewhere to go.
+
+The hole may be **below** the top level, and then the message names one
+uncovered value as a pattern that would cover it —
+*"missing `Pair::Of(Align::End)`"*, *"missing `Wrapped::Of(_)`"*,
+*"missing `(Align::End, Align::Start)`"*. Coverage is judged over the
+whole pattern tree: a payload or tuple element tested with a literal
+proves nothing about the values it does not equal, and only a binder or
+`_` covers an unbounded one. Where the hole is the subject's whole
+domain the message asks for a catch-all instead, since naming a value
+there would say nothing the `_` does not.
 → [Control flow](../tour/control-flow.md)
 
 **"struct '…' has no field '…'"** · **"variant '…' does not belong to the matched enum"**

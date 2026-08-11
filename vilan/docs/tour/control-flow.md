@@ -45,6 +45,21 @@ fun main() {
 If you forget a variant, the compiler tells you. That's most of the
 reason enums plus `match` replace flag fields and `null` checks.
 
+Completeness is judged over the whole pattern, not just its outermost
+name, so a payload you narrow has to be handled too:
+
+```vilan,fragment
+match slot {
+	Some(0) => "zero",          // an i32 payload: no list of numbers covers it
+	Some(let value) => "some",  // this is what covers it
+	None => "empty",
+}
+```
+
+Drop the middle arm and the compiler says *"match is not exhaustive:
+missing `Option::Some(_)`"* — it names a value that has nowhere to go,
+spelled as the arm that would take it.
+
 When you only need a yes/no answer instead of a full match, `is` tests a
 pattern as a boolean:
 
