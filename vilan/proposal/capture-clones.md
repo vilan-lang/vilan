@@ -1174,9 +1174,12 @@ by the value it was designed for, one the HOST invented.
 
 Nothing in the trap changed, and nothing needed to: the walk asks the VARIANT
 SET, which is the same set whatever the variants lower to, so shape (a) is
-refused identically for a backed payload and an unbacked one. All 9 of §12's
-pins are green, the 56 b76 pins are green, and the corpus's byte-level trap
-coverage did not move.
+refused identically for a backed payload and an unbacked one. Eight of §12's
+nine pins are green and the ninth is B121's, still `#[ignore]`d and untouched;
+all 56 b76 pins are green; and the corpus's byte-level trap coverage did not
+move — `match-patterns.vl`'s new `labelled` traps at the payload slot and its
+new `paired` at the tuple element, both of which are §12.3's shapes reached
+through a match the walk now has to approve first.
 
 One consequence for the emission worth recording, because it narrows what can
 reach the lowering rather than changing it: **a nested test over an OPEN domain
