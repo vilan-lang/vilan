@@ -132,6 +132,16 @@ The standard library (every module, both platform layers), the regression corpus
 
 ---
 
+**A `match` that narrows a payload no longer claims to cover the values it left out.** `enum Pair { Of(Align) }` has one variant, so `match p { Pair::Of(Align::Start) => "s" }` was accepted as complete — and answered `"s"` for `Pair::Of(Align::End)`. Not a host value, not a boundary: an ordinary vilan value, built by vilan, silently given the wrong arm's answer, exit 0. The same hole had two other doors. A tuple subject skipped the completeness question altogether, so `match p { (1, 2) => "x", (3, 4) => "y" }` compiled and answered `"y"` for `(7, 8)`. And any payload with an unbounded type behaved the same way: `match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }` over an `i32` was "complete" and answered `"two"` for `9`.
+
+All three were one mistake. Completeness was decided from the outermost name a pattern wrote — which variant, and nothing below it — so any test *inside* the pattern was invisible to the check and free to fail at run time with nowhere left to go. It is now decided from the whole pattern, all the way down: an enum position needs every variant named and each of those variants' payloads covered in turn; a tuple position needs its elements covered as a product; and a position with an unbounded type (`i32`, `str`, a struct) is covered only by a binder or `_`, because no list of literals exhausts one.
+
+The error names a value that has nowhere to go, spelled as the arm that would take it — *"missing `Pair::Of(Align::End)`"*, *"missing `Wrapped::Of(_)`"*, *"missing `(Align::End, Align::Start)`"*, *"missing `Outer::Of(Mid::Of(Align::End))`"* — so the fix is to paste it. Where the gap is the subject's whole domain the message asks for a catch-all instead, since naming a value there would tell you nothing that `_` does not.
+
+Nothing that was already complete changes: `_` and a binder still cover everything at every depth, a guarded arm still proves nothing (it tests the value, which the check does not reason about), and a subject whose type is not yet known, or is `any`, `never`, or a generic parameter, is still exempt. Nothing in the standard library, the examples, the documentation, or the regression corpus was relying on the hole, so no emitted output moved. If one of your own matches goes red, it was answering the wrong arm for some value before it stopped compiling.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.

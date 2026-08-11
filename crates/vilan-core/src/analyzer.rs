@@ -257,6 +257,127 @@ fn is_irrefutable_pattern(pattern: &ExprPattern) -> bool {
     }
 }
 
+/// A value shape no unguarded leg of a `match` covers — what the
+/// non-exhaustive diagnostic names (`capture-clones.md` §12). One witness per
+/// column of the coverage walk's matrix; the walk over a `match` starts with a
+/// single column (the subject) and so answers with a single witness.
+#[derive(Clone, Debug, PartialEq)]
+enum Witness {
+    /// Any value of this position's type — the position rules nothing out.
+    Anything,
+    /// Whole variants of an enum, their payloads unconstrained. The shape the
+    /// message has named by variant name since §1.5 ("missing 'A', 'B'").
+    Variants(Id, Vec<usize>),
+    /// One variant whose PAYLOAD is holed — the hole is below the tag, which
+    /// is the case the top-level variant walk could not see.
+    Variant(Id, usize, Vec<Witness>),
+    Tuple(Vec<Witness>),
+}
+
+impl Witness {
+    /// Whether this witness rules nothing out — `_`, or a tuple of such. The
+    /// hole is then the subject's whole domain and the fix is a catch-all, so
+    /// `(_, _)` steers the author the same way `_` does.
+    fn is_unconstrained(&self) -> bool {
+        match self {
+            Witness::Anything => true,
+            Witness::Tuple(elements) => elements.iter().all(Witness::is_unconstrained),
+            Witness::Variants(_, _) | Witness::Variant(_, _, _) => false,
+        }
+    }
+}
+
+/// How a position's type decomposes for the coverage walk: the constructors a
+/// value there can be built from.
+enum ValueSpace {
+    /// A nominal enum — a CLOSED set of constructors, one per variant, so
+    /// naming them all covers the position.
+    Enum(Id, usize),
+    /// A tuple — exactly ONE constructor, of these element types. Coverage is
+    /// therefore decided entirely by the elements.
+    Tuple(Vec<TypeId>),
+    /// An OPEN domain no finite set of tests exhausts (`i32`, `str`, a struct,
+    /// a fixed array, a still-abstract parameter): only an irrefutable pattern
+    /// covers it.
+    Open,
+}
+
+/// The rows a value built from `variant_index` can still match, with that
+/// variant's payload columns spliced in where the head column was. A row whose
+/// head names a different variant is dropped — such a value never reaches it —
+/// and an irrefutable head matches every payload, so it widens to wildcards.
+fn specialize_rows_by_variant(
+    rows: &[Vec<ExprPattern>],
+    enum_id: Id,
+    variant_index: usize,
+    arity: usize,
+) -> Vec<Vec<ExprPattern>> {
+    rows.iter()
+        .filter_map(|row| {
+            let (head, rest) = row.split_first()?;
+            let mut specialized = match head {
+                ExprPattern::Variant(head_enum_id, head_variant_index, payload)
+                    if *head_enum_id == enum_id && *head_variant_index == variant_index =>
+                {
+                    let mut payload = payload.clone();
+                    // Resolution already checked the arity; resizing keeps the
+                    // matrix rectangular whatever a malformed pattern carries.
+                    payload.resize(arity, ExprPattern::Wildcard);
+                    payload
+                }
+                _ if is_irrefutable_pattern(head) => vec![ExprPattern::Wildcard; arity],
+                _ => return None,
+            };
+            specialized.extend_from_slice(rest);
+            Some(specialized)
+        })
+        .collect()
+}
+
+/// [`specialize_rows_by_variant`] for a tuple's single constructor.
+fn specialize_rows_by_tuple(rows: &[Vec<ExprPattern>], arity: usize) -> Vec<Vec<ExprPattern>> {
+    rows.iter()
+        .filter_map(|row| {
+            let (head, rest) = row.split_first()?;
+            let mut specialized = match head {
+                ExprPattern::Tuple(elements) => {
+                    let mut elements = elements
+                        .iter()
+                        .map(|(element, _)| element.clone())
+                        .collect::<Vec<_>>();
+                    elements.resize(arity, ExprPattern::Wildcard);
+                    elements
+                }
+                ExprPattern::Wildcard | ExprPattern::Binding(_) => {
+                    vec![ExprPattern::Wildcard; arity]
+                }
+                _ => return None,
+            };
+            specialized.extend_from_slice(rest);
+            Some(specialized)
+        })
+        .collect()
+}
+
+/// The rows that still say something once the head column is dropped: only a
+/// pattern matching every value THERE constrains the columns behind it.
+fn default_rows(rows: &[Vec<ExprPattern>]) -> Vec<Vec<ExprPattern>> {
+    rows.iter()
+        .filter_map(|row| {
+            let (head, rest) = row.split_first()?;
+            is_irrefutable_pattern(head).then(|| rest.to_vec())
+        })
+        .collect()
+}
+
+/// The coverage walk's step budget. The walk is a usefulness analysis, whose
+/// worst case is exponential in the pattern depth; a program that reaches this
+/// is treated as covered, so the budget can only ever LOSE a diagnostic, never
+/// invent one. It is set five orders of magnitude above the measured need: over
+/// the 23 478 walks the tree's own sources provoke, the most expensive match
+/// costs EIGHT steps (`capture-clones.md` §12.5).
+const COVERAGE_WALK_STEP_BUDGET: u32 = 200_000;
+
 #[derive(Debug, Clone)]
 pub struct Function<'src> {
     pub id: Id,
@@ -25727,6 +25848,250 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// How a position of this type decomposes for the coverage walk. A mapped
+    /// tuple is expanded first, so `(U in T: F<U>)` decides coverage as the
+    /// tuple it became — the same expansion `resolve_pattern` applies when it
+    /// types the elements.
+    fn coverage_value_space(&mut self, type_id: TypeId) -> ValueSpace {
+        match self.expand_mapped(type_id.get_type(self)) {
+            Type::Enum(enum_id, _) => match self.enums.get(&enum_id) {
+                Some(declaration) => ValueSpace::Enum(enum_id, declaration.variants.len()),
+                None => ValueSpace::Open,
+            },
+            Type::Tuple(element_type_ids) => ValueSpace::Tuple(element_type_ids),
+            _ => ValueSpace::Open,
+        }
+    }
+
+    /// The payload types of one variant AT a position of type `subject_type_id`
+    /// — the declared types with the matched value's type arguments
+    /// substituted, exactly as `resolve_pattern` binds them (`Some(let x)` on
+    /// `Option<Car>` is a `Car` slot, not the abstract `T`).
+    fn coverage_payload_types(
+        &mut self,
+        enum_id: Id,
+        variant_index: usize,
+        subject_type_id: TypeId,
+        scope_id: Id,
+    ) -> Vec<TypeId> {
+        let Some(declaration) = self.enums.get(&enum_id) else {
+            return Vec::new();
+        };
+        let Some(variant) = declaration.variants.get(variant_index) else {
+            return Vec::new();
+        };
+        let mut data_type_ids = variant.data_type_ids.clone();
+        let substitution = self
+            .enum_type_substitution(enum_id, subject_type_id)
+            .or_else(|| self.impl_subject_substitution(scope_id, enum_id));
+        if let Some(substitution) = substitution {
+            data_type_ids = data_type_ids
+                .iter()
+                .map(|data_type_id| {
+                    let substituted =
+                        self.substitute_type(&data_type_id.get_type(self), &substitution);
+                    substituted.get_type_id(self)
+                })
+                .collect();
+        }
+        data_type_ids
+    }
+
+    /// The coverage walk (`capture-clones.md` §12): does `rows` — one row per
+    /// unguarded pattern — cover every value the `column_type_ids` can take?
+    /// `None` when it does; otherwise one concrete uncovered shape, one witness
+    /// per column.
+    ///
+    /// It is the usefulness question asked of the all-wildcard row, in the
+    /// standard matrix form, and the whole of it is the three cases of
+    /// [`ValueSpace`] applied to the FIRST column:
+    ///
+    /// - a CLOSED space whose constructors the column all names: descend into
+    ///   each one, the payload columns spliced in where the head column was, so
+    ///   a hole below the tag is found by the same walk that finds one at it;
+    /// - a closed space with constructors left over: those are the hole, and
+    ///   the columns behind it are asked of the rows that match anything here;
+    /// - an OPEN space: no set of tests names it all, so the same question is
+    ///   asked of the rows that match anything here, and the witness is `_`.
+    ///
+    /// This is what makes the rule descend: coverage is decided by the whole
+    /// pattern TREE, not its root. `Pair::Of(Align::Start)` names the variant
+    /// `Of` and reaches the first case, where `Align`'s own space is asked the
+    /// same question and answers `End`.
+    fn uncovered_shape(
+        &mut self,
+        rows: Vec<Vec<ExprPattern>>,
+        column_type_ids: Vec<TypeId>,
+        scope_id: Id,
+        budget: &mut u32,
+    ) -> Option<Vec<Witness>> {
+        let Some((head_type_id, rest_type_ids)) = column_type_ids.split_first() else {
+            // Nothing left to ask: a row that survived here is a pattern that
+            // matched every column, so a value is uncovered exactly when no row
+            // remains.
+            return rows.is_empty().then(Vec::new);
+        };
+        // Exhausting the budget answers "covered", which is the old behaviour —
+        // it can lose a diagnostic, never invent one.
+        *budget = budget.checked_sub(1)?;
+        let head_type_id = *head_type_id;
+        match self.coverage_value_space(head_type_id) {
+            ValueSpace::Enum(enum_id, variant_count) => {
+                let tested = rows
+                    .iter()
+                    .filter_map(|row| match row.first() {
+                        Some(ExprPattern::Variant(head_enum_id, variant_index, _))
+                            if *head_enum_id == enum_id =>
+                        {
+                            Some(*variant_index)
+                        }
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                let untested = (0..variant_count)
+                    .filter(|variant_index| !tested.contains(variant_index))
+                    .collect::<Vec<_>>();
+                if !untested.is_empty() {
+                    let behind = self.uncovered_shape(
+                        default_rows(&rows),
+                        rest_type_ids.to_vec(),
+                        scope_id,
+                        budget,
+                    )?;
+                    let mut witness = vec![Witness::Variants(enum_id, untested)];
+                    witness.extend(behind);
+                    return Some(witness);
+                }
+                for variant_index in 0..variant_count {
+                    let payload_type_ids =
+                        self.coverage_payload_types(enum_id, variant_index, head_type_id, scope_id);
+                    let arity = payload_type_ids.len();
+                    let specialized =
+                        specialize_rows_by_variant(&rows, enum_id, variant_index, arity);
+                    let mut column_type_ids = payload_type_ids;
+                    column_type_ids.extend_from_slice(rest_type_ids);
+                    if let Some(mut inner) =
+                        self.uncovered_shape(specialized, column_type_ids, scope_id, budget)
+                    {
+                        let payload = inner.drain(..arity).collect();
+                        let mut witness = vec![Witness::Variant(enum_id, variant_index, payload)];
+                        witness.extend(inner);
+                        return Some(witness);
+                    }
+                }
+                None
+            }
+            ValueSpace::Tuple(element_type_ids) => {
+                let arity = element_type_ids.len();
+                let specialized = specialize_rows_by_tuple(&rows, arity);
+                let mut column_type_ids = element_type_ids;
+                column_type_ids.extend_from_slice(rest_type_ids);
+                let mut inner =
+                    self.uncovered_shape(specialized, column_type_ids, scope_id, budget)?;
+                let elements = inner.drain(..arity).collect();
+                let mut witness = vec![Witness::Tuple(elements)];
+                witness.extend(inner);
+                Some(witness)
+            }
+            ValueSpace::Open => {
+                let behind = self.uncovered_shape(
+                    default_rows(&rows),
+                    rest_type_ids.to_vec(),
+                    scope_id,
+                    budget,
+                )?;
+                let mut witness = vec![Witness::Anything];
+                witness.extend(behind);
+                Some(witness)
+            }
+        }
+    }
+
+    /// A variant's own name, or `_` if the id pair does not name one.
+    fn variant_name(&self, enum_id: Id, variant_index: usize) -> &str {
+        self.enums
+            .get(&enum_id)
+            .and_then(|declaration| declaration.variants.get(variant_index))
+            .map_or("_", |variant| variant.name)
+    }
+
+    /// `Enum::Variant`, the way an author writes the pattern that would cover
+    /// it — the witness has to be WRITABLE, not merely recognisable.
+    ///
+    /// `bool` is the one enum whose variants are not written that way: `true`
+    /// and `false` are the literals the parser takes, and `bool::true` is not a
+    /// pattern it accepts at all. So they are spelled bare.
+    fn witness_variant_name(&self, enum_id: Id, variant_index: usize) -> String {
+        if self.bool_enum_id == Some(enum_id) {
+            return self.variant_name(enum_id, variant_index).to_string();
+        }
+        match self.enums.get(&enum_id) {
+            Some(declaration) => format!(
+                "{}::{}",
+                declaration.name,
+                self.variant_name(enum_id, variant_index)
+            ),
+            None => "_".to_string(),
+        }
+    }
+
+    /// A witness as source-shaped text — a pattern that would cover it, so
+    /// `Pair::Of(Align::End)` and `Tree::Node(_, _)`, payload arity and all.
+    ///
+    /// A `Variants` witness names its FIRST variant: the message points at one
+    /// concrete uncovered value, and the whole set is only listed where it has
+    /// always been, at the subject's own level. Where the untested set is the
+    /// WHOLE variant set the position rules nothing out, so it reads `_` — the
+    /// `bool` slot of `Holder::Of((Align::End, _))` is uncovered for either
+    /// value, and naming one of them would be arbitrary.
+    fn render_witness(&self, witness: &Witness) -> String {
+        match witness {
+            Witness::Anything => "_".to_string(),
+            Witness::Variants(enum_id, variant_indices) => {
+                let variant_count = self
+                    .enums
+                    .get(enum_id)
+                    .map_or(0, |declaration| declaration.variants.len());
+                match variant_indices.first() {
+                    Some(variant_index) if variant_indices.len() < variant_count => {
+                        let arity = self.variant_payload_arity(*enum_id, *variant_index);
+                        let payload = vec![Witness::Anything; arity];
+                        self.render_variant(*enum_id, *variant_index, &payload)
+                    }
+                    _ => "_".to_string(),
+                }
+            }
+            Witness::Variant(enum_id, variant_index, payload) => {
+                self.render_variant(*enum_id, *variant_index, payload)
+            }
+            Witness::Tuple(elements) => format!("({})", self.render_witnesses(elements)),
+        }
+    }
+
+    fn variant_payload_arity(&self, enum_id: Id, variant_index: usize) -> usize {
+        self.enums
+            .get(&enum_id)
+            .and_then(|declaration| declaration.variants.get(variant_index))
+            .map_or(0, |variant| variant.data_type_ids.len())
+    }
+
+    fn render_variant(&self, enum_id: Id, variant_index: usize, payload: &[Witness]) -> String {
+        let name = self.witness_variant_name(enum_id, variant_index);
+        if payload.is_empty() {
+            name
+        } else {
+            format!("{}({})", name, self.render_witnesses(payload))
+        }
+    }
+
+    fn render_witnesses(&self, witnesses: &[Witness]) -> String {
+        witnesses
+            .iter()
+            .map(|witness| self.render_witness(witness))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// `match subject { .. }`: once the subject type is known, resolve each leg's
     /// patterns (typing captures) and guard, check exhaustiveness, and type the
     /// match as the unification of its leg bodies. Defers while the subject, a
@@ -25820,76 +26185,89 @@ impl<'src> Analyzer<'src> {
                 )
             })
         };
-        match &subject_type {
-            Type::Enum(enum_id, _) if !has_catch_all => {
-                // Each unguarded variant pattern (in any leg) covers its variant.
-                let covered = resolved_legs
-                    .iter()
-                    .filter(|(_, guard, _)| guard.is_none())
-                    .flat_map(|(patterns, _, _)| patterns)
-                    .filter_map(|pattern| match pattern {
-                        ExprPattern::Variant(_, variant_index, _) => Some(*variant_index),
-                        _ => None,
-                    })
-                    .collect::<HashSet<_>>();
-                // A variant written only on a GUARDED leg is still missing, and
-                // that is the confusing case — the author sees the variant's
-                // name in the match. Collect those guards so the note can point
-                // at one.
-                let guards_over_missing_variants = resolved_legs
-                    .iter()
-                    .filter_map(|(patterns, guard, _)| {
-                        let guard_id = (*guard)?;
-                        patterns
-                            .iter()
-                            .any(|pattern| match pattern {
-                                ExprPattern::Variant(_, variant_index, _) => {
-                                    !covered.contains(variant_index)
-                                }
-                                _ => false,
-                            })
-                            .then_some(guard_id)
-                    })
-                    .collect::<Vec<_>>();
-                let missing = self
-                    .enums
-                    .get(enum_id)
-                    .unwrap()
-                    .variants
-                    .iter()
-                    .enumerate()
-                    .filter(|(variant_index, _)| !covered.contains(variant_index))
-                    .map(|(_, variant)| format!("'{}'", variant.name))
-                    .collect::<Vec<_>>();
-                if !missing.is_empty() {
-                    self.diagnostics.push(Error {
-                        note: guarded_leg_note(self, &guards_over_missing_variants),
-                        span: prepped.span,
-                        msg: format!("match is not exhaustive: missing {}", missing.join(", ")),
-                    });
-                }
-            }
-            // A non-enum subject (e.g. a `str` matched with literals) has an
-            // unbounded domain, so it needs an explicit catch-all. Tuples and
-            // not-yet-known types are exempt — but that exemption answers the
-            // DOMAIN question ("which values can the subject take?"), and it
-            // never licensed a guard (B115): it lapses when the final leg is
-            // guarded, because then there is nothing behind it to fall through
-            // to whatever the subject's type.
-            Type::Tuple(_) | Type::Unknown | Type::Any | Type::Never | Type::Generic(_)
-                if !guarded_final_leg => {}
-            _ if !has_catch_all => {
-                let guards = resolved_legs
-                    .iter()
-                    .filter_map(|(_, guard, _)| *guard)
-                    .collect::<Vec<_>>();
+        // A not-yet-known, `any`, `never` or still-generic subject is exempt:
+        // that exemption answers the DOMAIN question ("which values can the
+        // subject take?") and there is no answer to give. It never licensed a
+        // guard (B115), so it lapses when the final leg is guarded — then there
+        // is nothing behind that leg to fall through to, whatever the subject.
+        // A TUPLE subject used to sit in this list and no longer does (B118):
+        // its domain is perfectly well known, as the product of its elements',
+        // and the walk below asks it.
+        let exempt_subject = matches!(
+            subject_type,
+            Type::Unknown | Type::Any | Type::Never | Type::Generic(_)
+        );
+        if !exempt_subject || guarded_final_leg {
+            // One matrix row per unguarded pattern (an or-pattern contributes
+            // one per alternative), one column: the subject.
+            let rows = resolved_legs
+                .iter()
+                .filter(|(_, guard, _)| guard.is_none())
+                .flat_map(|(patterns, _, _)| patterns)
+                .map(|pattern| vec![pattern.clone()])
+                .collect::<Vec<_>>();
+            let mut budget = COVERAGE_WALK_STEP_BUDGET;
+            let witness = self
+                .uncovered_shape(rows, vec![subject_type_id], prepped.scope_id, &mut budget)
+                .and_then(|witnesses| witnesses.into_iter().next());
+            if let Some(witness) = witness {
+                // Which guards the note may point at. A guarded leg naming a
+                // variant the unguarded legs left uncovered is the confusing
+                // case — the author can see the variant's name in the match —
+                // so where the hole IS a set of the subject's own variants, the
+                // note points into it; anywhere else any guard will do, because
+                // a guard is the only reason an author expects a leg to count
+                // that this walk did not.
+                let guards = match &witness {
+                    Witness::Variants(_, untested) => resolved_legs
+                        .iter()
+                        .filter_map(|(patterns, guard, _)| {
+                            let guard_id = (*guard)?;
+                            patterns
+                                .iter()
+                                .any(|pattern| match pattern {
+                                    ExprPattern::Variant(_, variant_index, _) => {
+                                        untested.contains(variant_index)
+                                    }
+                                    _ => false,
+                                })
+                                .then_some(guard_id)
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => resolved_legs
+                        .iter()
+                        .filter_map(|(_, guard, _)| *guard)
+                        .collect::<Vec<_>>(),
+                };
+                // Three ways to name a hole, in order of how much the walk
+                // learned about it. A witness that rules nothing out is the
+                // whole domain, and the fix is a catch-all — that is every
+                // unbounded scalar, and `(_, _)` for a tuple of them. A set of
+                // the subject's own variants is named by variant, as it has
+                // been since §1.5. Anything else is a hole BELOW the top level,
+                // and the message names one concrete value that falls in it.
+                let msg = if witness.is_unconstrained() {
+                    "match is not exhaustive: add a catch-all `_` leg".to_string()
+                } else if let Witness::Variants(enum_id, untested) = &witness {
+                    let missing = untested
+                        .iter()
+                        .map(|variant_index| {
+                            format!("'{}'", self.variant_name(*enum_id, *variant_index))
+                        })
+                        .collect::<Vec<_>>();
+                    format!("match is not exhaustive: missing {}", missing.join(", "))
+                } else {
+                    format!(
+                        "match is not exhaustive: missing {}",
+                        self.render_witness(&witness)
+                    )
+                };
                 self.diagnostics.push(Error {
                     note: guarded_leg_note(self, &guards),
                     span: prepped.span,
-                    msg: "match is not exhaustive: add a catch-all `_` leg".to_string(),
+                    msg,
                 });
             }
-            _ => {}
         }
 
         // The match's type unifies the leg body types. When the match itself sits

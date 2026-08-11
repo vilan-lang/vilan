@@ -51923,6 +51923,13 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
     // nothing outside it to name. A nested LITERAL is the same argument for a
     // primitive. Both keep the bare `else` they have always had, which is why
     // the whole corpus moved zero bytes.
+    //
+    // B118 edited the literal half's program, not its claim. `Wrapped::Of(1),
+    // Wrapped::Of(2)` was accepted as total over an `i32` payload — shape (c)
+    // of the coverage walk's holes — so the leg carrying the literal is now a
+    // leg BEFORE an irrefutable one. It keeps its test either way, and the
+    // final leg still drops its condition with no trap behind it, which is all
+    // the narrow rule ever claimed here.
     let javascript = compile(
         r#"
         import std::print;
@@ -51933,7 +51940,7 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
             match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b" }
         }
         fun literal(w: Wrapped): str {
-            match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
         }
         fun main() { print(nested(Pair::Of(Inner::B))); print(literal(Wrapped::Of(2))); }
         "#,
@@ -51949,7 +51956,7 @@ fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
     );
     assert!(
         javascript.contains("\tif ($c[0] === 0 && $c[1] === 1) {\n\t\t$d = \"one\";\n\t} else {"),
-        "the literal final leg should still drop its condition, got:\n{javascript}"
+        "the literal leg should keep its nested test, got:\n{javascript}"
     );
 }
 
@@ -52168,15 +52175,13 @@ fn b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else() {
 }
 
 #[test]
-#[ignore = "known bug: exhaustiveness is checked on the TOP-LEVEL variant set \
-            only, so a refutable nested pattern is accepted as total — see \
-            backed-enums.md §12.4"]
 fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
     // Found probing B114, and it is the analyzer's, not the trap's: `Pair` has
-    // one variant, so §1.5's by-name check calls this total and the single leg
-    // becomes the bare `else`. `Pair::Of(Inner::B)` then runs the `Inner::A`
-    // arm. The right answer is a compile error naming the missing case — a trap
-    // would paper over a missing check with a runtime throw.
+    // one variant, so §1.5's by-name check called this total and the single leg
+    // became the bare `else`. `Pair::Of(Inner::B)` then ran the `Inner::A` arm.
+    // The right answer is a compile error naming the missing case — a trap
+    // would paper over a missing check with a runtime throw. Closed by B118's
+    // coverage walk, which asks the pattern TREE rather than its root.
     assert_fails_with(
         r#"
         import std::print;
@@ -52187,7 +52192,7 @@ fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
         }
         fun main() { print(label(Pair::Of(Inner::B))); }
         "#,
-        "match is not exhaustive",
+        "match is not exhaustive: missing Pair::Of(Inner::B)",
     );
 }
 
@@ -54776,14 +54781,20 @@ fn b115_a_guarded_final_leg_in_the_sequence_emitter_runs_the_covering_leg() {
 }
 
 #[test]
-fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
-    // Why the lowering's half is load-bearing and not merely belt-and-braces.
-    // `Pair::Of(Align::Start)` is counted as covering the variant `Of`, so the
-    // checker calls this match exhaustive on a proof that does not hold, and
-    // the guarded final leg is REACHABLE. With the guard dropped it answered
-    // "guarded" for `Of(End)` whatever the guard said — the emission was wrong
-    // on its own terms, not merely downstream of a bad verdict. The leg keeps
-    // its guard here exactly as anywhere else.
+fn b115_a_guarded_final_leg_keeps_its_guard_behind_a_nested_proof() {
+    // The lowering's half, over a NESTED proof: the coverage that licenses the
+    // bare `else` comes from two legs testing below the tag, and the guarded
+    // final leg behind them keeps its test, its prelude and its guard exactly
+    // as it does behind a flat one.
+    //
+    // B118 retired this pin's original program. It was written when
+    // `Pair::Of(Align::Start)` alone counted as covering the variant `Of`, so
+    // the checker accepted a proof that did not hold and the guarded final leg
+    // was REACHABLE — the point being that the emission was wrong on its own
+    // terms, not merely downstream of a bad verdict. The coverage walk now
+    // descends, so that program is refused outright
+    // (`b118_a_refutable_payload_pattern_does_not_prove_coverage`) and the
+    // shape it demonstrated no longer exists to test.
     let javascript = compile(
         r#"
         import std::print;
@@ -54792,6 +54803,7 @@ fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
         fun f(p: Pair, count: i32): str {
             match p {
                 Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
                 Pair::Of(let x) if count > 0 => "guarded",
             }
         }
@@ -54810,19 +54822,14 @@ fn b115_a_guarded_final_leg_keeps_its_guard_where_the_proof_is_holed() {
 }
 
 #[test]
-#[ignore = "the coverage walk counts a leg whose payload pattern is REFUTABLE \
-            as covering its variant; a separate, pre-existing hole whose \
-            unguarded form is equally wrong"]
-fn b115_a_refutable_payload_pattern_should_not_prove_coverage() {
-    // The one residual, stated as what it is: the match above is NOT
-    // exhaustive — `Of(End)` with a false guard matches no leg — and the
-    // checker should say so. It does not, because the coverage walk asks only
-    // which VARIANT a pattern names and never whether the pattern can fail
-    // below the tag. Not B115's hole: the same walk accepts
-    // `match p { Pair::Of(Align::Start) => "s" }` alone, which answers "s" for
-    // `Of(End)` with no guard anywhere in sight. Closing it wants real
-    // nested-pattern usefulness analysis, which is its own measurement.
-    assert_fails_with(
+fn b118_a_refutable_payload_pattern_does_not_prove_coverage() {
+    // B115's residual, closed. The match is NOT exhaustive — `Of(End)` with a
+    // false guard matches no leg — and the checker now says so. It did not,
+    // because the coverage walk asked only which VARIANT a pattern names and
+    // never whether the pattern can fail below the tag. The note is what makes
+    // the message legible when the leg the author believes covers the case is
+    // the guarded one.
+    assert_fails_noting(
         r#"
         enum Align { Start, End }
         enum Pair { Of(Align) }
@@ -54834,6 +54841,580 @@ fn b115_a_refutable_payload_pattern_should_not_prove_coverage() {
         }
         fun main() { }
         "#,
-        "match is not exhaustive",
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B118 — the coverage walk's nested and refutable holes (capture-clones.md §12).
+//
+// One rule, stated over patterns: an unguarded leg proves coverage only for the
+// value-space its whole pattern TREE covers, not its root. An enum position is
+// covered when every variant is named AND each named variant's payload
+// positions are; a tuple position when its elements are; an OPEN position
+// (`i32`, `str`, a struct, a still-abstract parameter) only by a binder or `_`.
+// What does not change: a guard still proves nothing (B115), and `_` still
+// proves everything.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b118_a_refutable_payload_pattern_is_not_exhaustive_unguarded() {
+    // Shape (a), and the headline: no guard anywhere, one variant, one leg —
+    // and before the walk descended this compiled and answered "s" for
+    // `Of(End)`. An IN-SET value, silently mislabelled, with no host boundary
+    // involved. The witness names the value that had no leg.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+    );
+}
+
+#[test]
+fn b118_full_nested_variant_coverage_is_exhaustive() {
+    // The other direction, which is what makes the rule a rule and not a ban on
+    // nested patterns: name every variant of the payload's enum and the match
+    // is total. Run, so the answer is pinned and not merely the verdict.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); print(label(Pair::Of(Align::Start))); }
+        "#,
+        "e\ns\n",
+    );
+}
+
+#[test]
+fn b118_a_binder_or_wildcard_payload_covers_its_variant() {
+    // The two irrefutable payload forms, both still total. `Pair::Of(let a)`
+    // and `Pair::Of(_)` say nothing about `Align`, which is exactly why they
+    // cover all of it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun bound(p: Pair): str { match p { Pair::Of(let a) => "bound" } }
+        fun wild(p: Pair): str { match p { Pair::Of(_) => "wild" } }
+        fun main() { print(bound(Pair::Of(Align::End))); print(wild(Pair::Of(Align::End))); }
+        "#,
+        "bound\nwild\n",
+    );
+}
+
+#[test]
+fn b118_the_witness_names_the_one_uncovered_variant() {
+    // Two of three named: the message must not say "Align" or "the payload",
+    // it must name the value that falls through. This is the difference between
+    // a diagnostic an author can act on and one they have to decode.
+    assert_fails_with(
+        r#"
+        enum Align { Start, Middle, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::Middle)",
+    );
+}
+
+#[test]
+fn b118_a_tuple_subject_of_literals_is_not_exhaustive() {
+    // Shape (b), in its UNGUARDED form — B115 lapsed the tuple exemption only
+    // for a guarded final leg, so this compiled and answered "y" for `(7, 8)`.
+    // The exemption is gone: a tuple's domain is the product of its elements',
+    // which the walk knows how to ask.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32)): str {
+            match p { (1, 2) => "x", (3, 4) => "y" }
+        }
+        fun main() { print(f((7, 8))); }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_binders_is_still_exhaustive_and_runs() {
+    // The tuple direction that must not move: every element a binder, so the
+    // leg matches every tuple. `(1, 2)` before it keeps its test.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32)): str {
+            match p { (1, 2) => "x", (let a, let b) => "rest" }
+        }
+        fun main() { print(f((1, 2))); print(f((7, 8))); }
+        "#,
+        "x\nrest\n",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_enums_needs_every_combination() {
+    // A tuple whose elements are CLOSED: the domain is finite, so literals are
+    // not the problem — a missing combination is. Three of four named, and the
+    // witness is the fourth, spelled as the tuple pattern that would cover it.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing (Align::End, Align::End)",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_enums_fully_covered_runs() {
+    // The same subject with the fourth combination written: total, and the
+    // answers are pinned in both elements' directions.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+                (Align::End, Align::End) => "ee",
+            }
+        }
+        fun main() { print(f((Align::End, Align::Start))); print(f((Align::End, Align::End))); }
+        "#,
+        "es\nee\n",
+    );
+}
+
+#[test]
+fn b118_a_tuple_element_binder_covers_that_element() {
+    // Mixed refutability across a tuple's columns: the first element is tested
+    // exhaustively, the second is bound. Two legs cover four values.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        fun f(p: (Align, bool)): str {
+            match p { (Align::Start, let flag) => "s", (Align::End, let flag) => "e" }
+        }
+        fun main() { print(f((Align::End, true))); print(f((Align::Start, false))); }
+        "#,
+        "e\ns\n",
+    );
+}
+
+#[test]
+fn b118_coverage_is_the_union_over_legs_not_a_property_of_one() {
+    // The ordering-sensitive shape, and the reason the walk is a matrix rather
+    // than a per-leg predicate: neither leg covers the subject, and together
+    // they still leave exactly one value — `(End, Start)`. A per-leg rule
+    // could only answer "no leg is total", which names nothing.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p { (Align::Start, let b) => "s", (let a, Align::End) => "e" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing (Align::End, Align::Start)",
+    );
+}
+
+#[test]
+fn b118_a_literal_payload_does_not_prove_coverage() {
+    // Shape (c): an `i32` payload has no finite set of literals that exhausts
+    // it, so no number of legs makes this total. The witness is the binder form
+    // that would.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Wrapped { Of(i32) }
+        fun f(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
+        }
+        fun main() { print(f(Wrapped::Of(9))); }
+        "#,
+        "match is not exhaustive: missing Wrapped::Of(_)",
+    );
+}
+
+#[test]
+fn b118_a_str_payload_literal_does_not_prove_coverage() {
+    // The same argument for the other unbounded scalar — one rule over OPEN
+    // domains, not a rule about integers.
+    assert_fails_with(
+        r#"
+        enum Named { Of(str) }
+        fun f(n: Named): str {
+            match n { Named::Of("a") => "A", Named::Of("b") => "B" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Named::Of(_)",
+    );
+}
+
+#[test]
+fn b118_a_binder_payload_over_an_open_domain_runs() {
+    // And the fix an author writes, run: the literal leg keeps its test and the
+    // binder leg takes everything else.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Wrapped { Of(i32) }
+        fun f(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
+        }
+        fun main() { print(f(Wrapped::Of(1))); print(f(Wrapped::Of(9))); }
+        "#,
+        "one\nmany\n",
+    );
+}
+
+#[test]
+fn b118_two_levels_of_nesting_are_walked() {
+    // Depth, which is where a one-level patch would stop: the hole is two
+    // payloads down, and the witness spells the whole path to it.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun f(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Outer::Of(Mid::Of(Align::End))",
+    );
+}
+
+#[test]
+fn b118_a_tuple_inside_a_variant_payload_is_walked() {
+    // Mixed nesting, enum-of-tuple: the walk changes shape at each level and
+    // the witness reproduces both. The `bool` slot is untested entirely, so it
+    // reads `_` rather than an arbitrary one of its two values.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Holder { Of((Align, bool)) }
+        fun f(h: Holder): str {
+            match h { Holder::Of((Align::Start, let flag)) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Holder::Of((Align::End, _))",
+    );
+}
+
+#[test]
+fn b118_a_multi_payload_variant_needs_every_position() {
+    // The multi-parameter form: one variant, two payload slots, and coverage is
+    // the product. Three of four combinations named, and the witness names the
+    // fourth in both slots.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Two { Of(Align, bool) }
+        fun f(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Two::Of(Align::End, false)",
+    );
+}
+
+#[test]
+fn b118_a_multi_payload_variant_fully_covered_runs() {
+    // Its twin, total and run — the product written out.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Two { Of(Align, bool) }
+        fun f(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+                Two::Of(Align::End, false) => "ef",
+            }
+        }
+        fun main() { print(f(Two::Of(Align::End, false))); }
+        "#,
+        "ef\n",
+    );
+}
+
+#[test]
+fn b118_a_recursive_enum_terminates_and_is_walked() {
+    // A self-referential payload is the walk's termination question: descending
+    // into `Node`'s payload lands back on `Tree`. It terminates because the
+    // matrix drives it — a column of binders is dropped, not descended — and
+    // the witness is a legal pattern at every depth it reached.
+    assert_fails_with(
+        r#"
+        enum Tree { Leaf, Node(Tree, Tree) }
+        fun depth(t: Tree): i32 {
+            match t { Tree::Leaf => 0, Tree::Node(Tree::Leaf, let right) => 1 }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Tree::Node(Tree::Node(_, _), _)",
+    );
+}
+
+#[test]
+fn b118_a_recursive_enum_covered_one_level_down_runs() {
+    // Its twin: the same shape with the deeper case written is total, and the
+    // walk stops there rather than unfolding the type forever.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Tree { Leaf, Node(Tree, Tree) }
+        fun depth(t: Tree): i32 {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Node(Tree::Leaf, let right) => 1,
+                Tree::Node(Tree::Node(let a, let b), let right) => 2,
+            }
+        }
+        fun main() { print(depth(Tree::Node(Tree::Leaf, Tree::Leaf))); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b118_a_generic_payload_is_substituted_before_it_is_walked() {
+    // `Option<Align>`'s payload is the declared `T` until the matched value's
+    // arguments are substituted in — the same substitution `resolve_pattern`
+    // applies when it binds `Some(let x)`. Without it the payload column would
+    // be an abstract parameter and the hole invisible.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        enum Align { Start, End }
+        fun f(o: Option<Align>): str {
+            match o { Option::Some(Align::Start) => "s", Option::None => "n" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Option::Some(Align::End)",
+    );
+}
+
+#[test]
+fn b118_leg_order_does_not_change_the_verdict() {
+    // Coverage is a property of the SET of unguarded legs. The same three legs
+    // in a different order are total either way, and the answers follow the
+    // legs, not the walk.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align), Other }
+        fun forward(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun backward(p: Pair): str {
+            match p { Pair::Other => "o", Pair::Of(Align::End) => "e", Pair::Of(Align::Start) => "s" }
+        }
+        fun main() {
+            print(forward(Pair::Of(Align::End)));
+            print(backward(Pair::Of(Align::End)));
+            print(backward(Pair::Other));
+        }
+        "#,
+        "e\ne\no\n",
+    );
+}
+
+#[test]
+fn b118_an_or_pattern_contributes_each_alternative() {
+    // An or-pattern is several patterns sharing a body, and each alternative is
+    // its own row in the matrix — so two nested alternatives on ONE leg cover
+    // the payload exactly as two legs would.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair): str {
+            match p { Pair::Of(Align::Start), Pair::Of(Align::End) => "either" }
+        }
+        fun main() { print(f(Pair::Of(Align::End))); }
+        "#,
+        "either\n",
+    );
+}
+
+#[test]
+fn b118_a_guarded_nested_leg_still_proves_nothing() {
+    // B115's rule, unchanged one level down: the leg naming `Align::End` is
+    // guarded, so the walk does not count it and the payload is holed. The
+    // note points at the guard, which is the only reason the author expected
+    // the leg to count.
+    assert_fails_noting(
+        r#"
+        enum Align { Start, End }
+        enum Pair { Of(Align), Other }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) if count > 0 => "e",
+                Pair::Other => "o",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b118_a_catch_all_still_proves_everything_below_the_top_level() {
+    // The other thing that does not change: a `_` leg covers every value at
+    // every depth, so no amount of refutable nesting before it makes a match
+    // non-exhaustive.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, Middle, End }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun f(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s", _ => "other" }
+        }
+        fun main() { print(f(Outer::Of(Mid::Of(Align::End)))); }
+        "#,
+        "other\n",
+    );
+}
+
+#[test]
+fn b118_a_backed_payload_needs_its_whole_variant_set() {
+    // The walk asks the VARIANT SET, and a backed enum's variant set is the
+    // same set whatever its values lower to — so shape (a) is refused
+    // identically when `Align` is backed. This is the composition point with
+    // B114: the trap answers for values outside the set, and it was never the
+    // answer to a missing leg inside it.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+    );
+}
+
+#[test]
+fn b118_the_membership_trap_no_longer_fires_on_an_in_set_value() {
+    // B114 §12.4's interaction, verified from the other side. Under the hole a
+    // match could reach the trap with every value IN set, and the trap then
+    // named an in-set value as out-of-set. That match is now refused (pinned
+    // above), so the only way to reach the trap is the one it was designed for:
+    // a value the HOST invented. Both directions in one program — the in-set
+    // payload answers, the invented one traps and names itself.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "e\nAlign: \"middle\" is not one of its values\n",
+        "an in-set payload must answer and only an invented one may trap"
+    );
+}
+
+#[test]
+fn b118_the_witness_is_a_pattern_that_closes_the_hole() {
+    // The message's contract, checked by using it: whatever the diagnostic
+    // names is a legal pattern, and adding it as a leg makes the match total.
+    // Pinned across all three witness shapes at once — a nested variant, a
+    // multi-slot variant with an untested slot, and a tuple.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Holder { Of((Align, bool)) }
+        enum Two { Of(Align, bool) }
+        fun nested(h: Holder): str {
+            match h {
+                Holder::Of((Align::Start, let flag)) => "s",
+                Holder::Of((Align::End, _)) => "e",
+            }
+        }
+        fun slots(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+                Two::Of(Align::End, false) => "ef",
+            }
+        }
+        fun tupled(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+                (Align::End, Align::End) => "ee",
+            }
+        }
+        fun main() {
+            print(nested(Holder::Of((Align::End, true))));
+            print(slots(Two::Of(Align::End, false)));
+            print(tupled((Align::End, Align::End)));
+        }
+        "#,
+        "e\nef\nee\n",
     );
 }

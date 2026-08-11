@@ -83,6 +83,44 @@ function wrapped(signal, wrap) {
 	}
 	return $l;
 }
+function labelled(pair) {
+	const $o = pair;
+	let $p = null;
+	if ($o[0] === 0 && $o[1] === "start") {
+		$p = "start";
+	} else if ($o[0] === 0 && $o[1] === "end") {
+		$p = "end";
+	} else {
+		__enum_trap("Align", $o[1]);
+	}
+	return $p;
+}
+function counted(boxed) {
+	const $q = boxed;
+	let $r = null;
+	if ($q[0] === 0 && $q[1] === 1) {
+		$r = "one";
+	} else {
+		const n = $q[1];
+		$r = "many";
+	}
+	return $r;
+}
+function paired(pair) {
+	const $s = pair;
+	let $t = null;
+	if ($s[0] === "start" && $s[1] === true) {
+		$t = "start!";
+	} else if ($s[0] === "start" && $s[1] === false) {
+		$t = "start";
+	} else if ($s[0] === "end") {
+		const flag = $s[1];
+		$t = "end";
+	} else {
+		__enum_trap("Align", $s[0]);
+	}
+	return $t;
+}
 console.log(classify("quit"));
 console.log(classify("y"));
 console.log(classify(""));
@@ -98,3 +136,8 @@ console.log(aligned("end", 0));
 console.log(aligned("end", 5));
 console.log(wrapped([ 1 ], [ 1 ]));
 console.log(wrapped([ 1 ], [ 0, 3 ]));
+console.log(labelled([ 0, "end" ]));
+console.log(counted([ 0, 1 ]));
+console.log(counted([ 0, 9 ]));
+console.log(paired([ "start", true ]));
+console.log(paired([ "end", false ]));
