@@ -206,6 +206,13 @@ tree:
   (`shell.replace("<!--app-->", render(app()))` — recommendation: honest,
   zero new surface) vs a `render_into(shell, marker, view)` convenience in
   std.
+  *Re-read 2026-08-11 (the owner, deciding fullstack-dx.md §10.4): this
+  decline was scoped to the zero-knowledge wrapper — "honest, zero new
+  surface" is a cost-benefit call about a helper that saved nothing — not a
+  boundary on std and the document. `render_into` stays declined on its own
+  terms; fullstack-dx §5's `Document` supersedes the splice by EARNING its
+  surface (tags derived from the build, loud faults), which is exactly what
+  the wrapper lacked.*
 - **(c) S3 in this arc or on demand**: recommendation — build S1+S2, ship,
   and let kolt's real usage decide whether the double-fetch hurts enough to
   pull S3 forward.

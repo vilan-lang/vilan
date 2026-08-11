@@ -1,13 +1,13 @@
 # Dev-time freshness — data a running server serves (backlog E55, general half)
 
-> **Status: DRAFT — for review** (2026-08-10). Scoped by the owner's ruling the
-> same day: treat *revalidating boot-time reads* and *a general re-run-on-round
-> hook* as **one design**, not two — the read idiom may simply be the hook
-> applied to `fs`. This note surveys the shapes and recommends a direction; it
-> proposes no code. The mechanical half of E55 (css hot-swap fetching from the
-> dev channel instead of the app's own stale route) shipped separately and
-> needed no design call — the dev channel's `/asset/<name>` route and the `css`
-> event's asset name already existed; the shim just wasn't using them.
+> **Status: RULED 2026-08-11 — §3's recommendation is DECLINED; §5 records the
+> owner's superseding design.** The hook is out (it cannot fire for the
+> headline case — see §5), asset freshness moves to fullstack-dx.md's
+> `serve_build`/`Document` as their dev-mode policy, and the manual path gets
+> two thin primitives: `is_watching()` and `force_refresh()`. §0–§4 stand as
+> the survey record. The mechanical half of E55 (css hot-swap fetching from
+> the dev channel instead of the app's own stale route) shipped separately
+> and needed no design call.
 
 ## 0. The problem
 
@@ -198,3 +198,50 @@ nothing in this survey needs it to close the E55 gap.
   (mirroring HMR's own gating), or does plain `vilan run` also get it
   (always `false`), for one uniform API regardless of how the process was
   started?
+
+## 5. The ruling (2026-08-11) — declining §3, and what ships instead
+
+§3's hook is declined, for a flaw §3 itself did not state: **the hook is
+keyed to rounds, and the headline case produces no round.** Editing
+`app.html` is invisible to the watcher (`.vl`-only, the §2(iii) invariant),
+so a re-run-on-round hook fires for exactly the edits that were already
+half-served and never for the one that motivated E55 — closing that gap
+would drag (iii) back in, the one shape this note agreed not to touch. The
+problem is pull-shaped: every HTTP request is an opportunity to be fresh,
+and no signaling protocol is needed to take it.
+
+What ships instead, per the owner's design:
+
+1. **Asset freshness belongs to the abstraction that owns the assets.**
+   fullstack-dx.md's `serve_build` (S3) and `Document` (S5) serve the build's
+   own files; freshness is their *dev-mode policy* — revalidate per request
+   when watching, serve from memory in release. The dev channel's push half
+   (css swap, js swap) already exists; the shell needs only per-request
+   re-read plus a reload to be seen. hmr.md §8 is untouched: asset freshness
+   is not server-code hot-swap; restart remains the model for code.
+2. **Two primitives for the hand-rolled path**, in the process layer
+   (`std::process::dev` or the thin equivalent — the §4 "surface shape"
+   question resolves THIN):
+   - `is_watching(): bool` — §1's signal, carried by an env var the watcher
+     sets on its Node child. Uniform API (§4's scope question): defined under
+     every run, `true` only under `run --watch`.
+   - `force_refresh(): void` — asks every connected browser to reload once.
+     Plumbing: the watcher hands its child the dev channel's port (env); the
+     call POSTs to a new dev-channel endpoint; the channel broadcasts a
+     `reload` event; the shim calls `location.reload()`. A no-op when not
+     watching. The shim's never-reload doctrine (the stale-server loop
+     hazard) is intact: that rule forbids *version-gap-triggered automatic*
+     reloads — this is one-shot and user-initiated, and the reloaded page's
+     shim has nothing to re-fire.
+   The composed manual mechanism the owner sketched — check `is_watching`,
+   re-read cheaply, `force_refresh`, the browser re-pulls fresh bytes — works
+   with no watcher plumbing at all. Its one rough edge is F13 (no `stat`), so
+   a hand-rolled change-detector polls by re-read-and-compare until F13
+   ships.
+3. **(iii) stays out**, now on two grounds: it touches the load-bearing
+   invariant, and nothing needs it — the abstraction covers the common case
+   and the primitives cover the rest. Deferred, not a permanent non-goal.
+
+§4's questions resolve with the ruling: the signaling-plumbing question
+DISSOLVES (no hook, no plumbing); the surface is thin; (iii) deferred; the
+signal is uniform. Nothing here remains the owner's to rule.

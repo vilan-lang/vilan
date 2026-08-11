@@ -1,13 +1,15 @@
 # Full-stack setup — the document, the assets, a server that grows (E56)
 
 > Status: RATIFIED 2026-08-11 as recommended ("The recommendations for …
-> fullstack-dx.md look good") — the nine recommended answers of §10 stand;
-> §10.4 carried NO recommendation by design and remains the owner's reading
-> of their own ssr.md §6(b) decline, still owed. One post-ratification
-> amendment in flight: dev-mode asset freshness joins `serve_build`/`Document`
-> as their dev policy (the dev-refresh.md revision records why). Filed from
-> backlog E56, the owner's 2026-08-10 charter (`backlog-2026-07-18.md`,
-> section E item 56).
+> fullstack-dx.md look good") — the nine recommended answers of §10 stand,
+> and §10.4 CLOSED the same day: the owner re-read ssr.md §6(b) and ruled
+> the decline was scoped to the zero-knowledge wrapper, not a boundary on
+> std and the document (the §6(b) addendum records it) — `render_into` stays
+> declined on its own terms and §5's `Document` proceeds. One
+> post-ratification amendment: dev-mode asset freshness joins
+> `serve_build`/`Document` as their dev policy (dev-refresh.md §5 records
+> why). Every slice of §8 is unblocked. Filed from backlog E56, the owner's
+> 2026-08-10 charter (`backlog-2026-07-18.md`, section E item 56).
 >
 > Origin: the owner built a real full-stack todo app
 > (`vilan-playground/todo`) and the *setup* fought back. The charter names
