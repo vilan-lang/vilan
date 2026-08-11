@@ -809,3 +809,190 @@ rule 1's half.
 
 **No corpus golden moved**, and no docs page changed: the fix removes a
 false positive, and nothing documented ever claimed the tail-only rule.
+
+## 13. B122 — rule 3 asks its question of the LEAF, closing §11.3's owed measurement, 2026-08-10
+
+§12.3's filed pair, closed, and §11.3 candidate (d)'s measurement — deferred
+twice — finally taken. Two shapes, opposite directions, one cause: the escape
+check (and the root-set inference that feeds its exemptions) asked "does this
+RETURN POSITION hand back a view" of the position as a whole. An `if`/`match`
+tail with one owned arm and one view arm is never, itself, a view expression,
+so the question was never asked of the arm that mattered — in either
+direction.
+
+### 13.1 Verify first: both filed shapes reproduce exactly as recorded
+
+This family has a history of filed mechanisms being wrong (B116 survived its
+own invalid repro; B102 twice), so both shapes were built and run against the
+live compiler before anything else:
+
+```vilan
+impl Holder {
+    fun early(&self, flag: bool): Inner {
+        if flag { ret &self.inner; }   // refused: "a view cannot escape its scope"
+        Inner { n = 0 }
+    }
+    fun conditional(&self, flag: bool): Inner {
+        if flag { Inner { n = 0 } } else { &self.inner }   // compiles
+    }
+}
+```
+
+```vilan
+fun grab(flag: bool): Inner {
+    let local = Inner { n = 3 };
+    if flag { Inner { n = 0 } } else { &local }   // compiles — should not
+}
+```
+
+Both reproduced precisely as §12.3 described: `early` refused, `conditional`
+clean; `grab` compiled (and ran — the frame is a dead owner, so the alias is
+benign as emitted, B100's own finding) where the same shape spelled with an
+early `ret &local;` was already refused. No correction needed this time — the
+premises held.
+
+### 13.2 Two whole-position questions, not one
+
+`check_view_escape`'s `ret` loop was already leaf-wise in the sense that
+matters — `Expr::FunctionReturn(Some(value_id))` names exactly one leaf, the
+`ret`'s own operand — so `early`'s refusal was not that loop asking the wrong
+question. It was `return_position_hands_back_no_view`'s answer being wrong,
+and that traced one level further: `infer_borrows`'s root-set walk
+(`collect_borrows_positions`) called `collect_tail_leaves` on `function.body.1`
+alone, never on a `ret`'s value. `early`'s tail is the plain `Inner { n = 0 }`,
+which projects nothing — so `early.borrows` stayed empty, and
+`return_position_hands_back_no_view`'s exemption
+(`!function.borrows.is_empty() && derives_from_view_param(value_id)`) had
+nothing to read. `conditional`'s tail *is* the `if`, so its leaves — including
+`&self.inner` — feed the same walk and its root-set is `{0}`; the two
+spellings disagreed only because one seam fed the root-set and the other
+didn't, which is the exact shape B116 already fixed once for
+`compute_return_clone_sites` and `compute_return_value_crossings` and had not
+yet reached this third reader.
+
+`grab`'s hole was the opposite defect in the opposite loop. `check_view_escape`
+carried a *second* mechanism for the tail specifically —
+`escapes_as_view(function.body.1, ..)`, asked once per function, not per leaf —
+and `is_view_expr` only matches `Expr::Reference` and a view-holding
+`Expr::Local` directly: an `if` is neither, so the question was **never asked**
+whenever the tail was a conditional. Whether the hidden arm was `&self.inner`
+(sound, B116's `early`) or `&local` (unsound, rule 3's whole reason to exist)
+made no difference — the whole-body question doesn't reach either.
+
+### 13.3 The fix: two seams get the leaf walk B116 already proved
+
+**`infer_borrows`** now joins `return_sites` the way `compute_return_value_crossings`
+already does: each function's root-set walk runs once over `function.body.1`
+and once more over each of its `ret`s, unioned into the same fixpoint. This
+alone closes `early` — `early.borrows` becomes `{0}`, matching `conditional`'s,
+and `return_position_hands_back_no_view` reads the same answer through either
+spelling.
+
+**`check_view_escape`** drops its two special-cased loops (the per-expr
+`Expr::FunctionReturn` match arm and the per-function tail loop) for one walk:
+every function's `(function_id, function.body.1)` pair, unioned with every
+`return_sites` entry (already both the tail *and* each `ret`, for a function
+with a declared return type — `HashSet<(Id, Id)>` dedupes the resulting
+overlap rather than re-walking the same seam twice), each run through
+`collect_tail_leaves` — the identical helper rule 1's return clause and the
+resource-crossing scan already use for these seams — and each leaf asked
+`escapes_as_view(leaf) && !return_position_hands_back_no_view(function, leaf)`
+on its own. `grab`'s `&local` arm is now a leaf in its own right, asked
+regardless of its owned sibling; `early`'s `&self.inner` is asked as the same
+leaf the `ret` loop used to isolate by hand. One mechanism now answers what
+two half-mechanisms used to split between them.
+
+### 13.4 A finding on the way: the closure `ret` regression
+
+Deleting the per-expr `Expr::FunctionReturn` arm outright — reasoning that
+`return_sites` plus the new seam walk covers every `ret` — was wrong for one
+case and caught by the full `inference` run before it shipped:
+`a_closures_ret_still_cannot_hand_back_a_view` went from refused to compiling
+cleanly. A closure's `ret`s never enter `return_sites` (`ret-checking.md`:
+they check against the closure's *inferred* tail type, not a declared one),
+so the old per-expr loop was the *only* place that caught them — unconditionally,
+with no exemption, because a closure may not declare `borrows` and is
+second-class all the way (P4c). The new seam walk, built from
+`self.functions` and `return_sites`, never sees a closure at all. The arm is
+back, narrowed to exactly the leaves the seam walk does not cover
+(`!function_return_value_ids.contains(value_id)`), unconditional exactly as
+before. The closure TAIL's own whole-block blindness
+(`escapes_as_view(closure.return_)` asks the same whole-position question the
+function tail loop used to) is untouched and unfixed here — it predates this
+lane, self-masked in every existing pin by the `ret` loop independently
+catching the same leaf, and is not one of B122's two filed shapes. Filed, not
+fixed: a closure tail's own conditional-arm blindness is the same family of
+bug at a third reader, `infer_borrows` and `check_view_escape`'s function seam
+being the first two.
+
+### 13.5 Coverage
+
+`b116_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail` and
+`b116_a_conditional_tail_arm_may_not_escape_a_view_of_a_local` (§12.3) are
+un-`#[ignore]`d and renamed for the bug that closes them
+(`b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail`,
+`b122_a_conditional_tail_arm_may_not_escape_a_view_of_a_local`). Four more
+pin the semantics the two filed shapes only sampled: arm order reversed
+(`b122_a_conditional_tail_arm_order_does_not_matter`), a view of a local two
+`if`s deep (`b122_a_nested_conditional_arm_may_not_escape_a_view_of_a_local`),
+the identical shape as a `match` tail
+(`b122_a_match_leg_may_not_escape_a_view_of_a_local`), and the mix that proves
+the walk is leaf-wise rather than merely wider —  one arm a sound parameter
+view, the other an unsound local view — which must refuse **exactly once**,
+naming the local arm's own span, not the parameter arm's and not the
+enclosing `if`'s (`b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf`,
+`assert_fails_once_with` + `assert_fails_spanning`). Every pin B109/B116 left
+standing — the still-refused whole-local return, both resource refusals, the
+sanctioned `borrows` projection, the closure boundary — stayed green
+throughout (2182 passed, 0 failed, 5 `#[ignore]`d, none of them B122's, for
+the full `inference` binary).
+
+Two plants, isolating the two fixes:
+
+| plant | red |
+|---|---|
+| `infer_borrows`'s `ret` join removed | 1 (`b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail`) |
+| `check_view_escape`'s leaf walk replaced with the whole seam | 5 (every local-view pin: arm order both ways, nested, `match`, the mixed leaf) |
+
+Each plant reddened exactly its own half and nothing else, confirming the two
+fixes are independent — `infer_borrows`'s join answers the false positive,
+`check_view_escape`'s leaf walk answers the hole, and neither substitutes for
+the other.
+
+### 13.6 The owed measurement: zero, a fourth time
+
+§11.3 candidate (d) deferred "how many shapes does widening the escape check's
+reach move" to its own measurement; §12.3 deferred it again. Taken now, three
+ways:
+
+1. **Compile-based, full-scan.** `std` (both platform layers, every module
+   force-imported so nothing is skipped as frozen — the S1 differential's own
+   technique, `check_scope_differential.rs`) plus all 114 `vilan/test/*.vl`
+   programs (each self-contained: no local imports to resolve), analyzed under
+   the pre-fix and post-fix analyzer, diffing every `"a view cannot escape its
+   scope"` diagnostic's message and exact span text. **Zero diagnostics,
+   either tree, either side.**
+2. **CLI-based, every example and benchmark project.** `vilan check` run from
+   each of the 13 `vilan.toml` roots under `vilan/examples` and
+   `vilan/benchmarks`, old binary against new, diffing raw output.
+   **Zero diffs.**
+3. **Structural, whole tree.** `grep -rn 'ret &'` across `std`, `macro_std`,
+   `test`, `examples`, `benchmarks`, `docs` — shape 1's necessary precondition
+   — and a broader pass for `} else { &`-shaped conditional arms — shape 2's.
+   **Zero hits**, `macro_std` included (too small and too purpose-built for a
+   compile-based full-scan sweep of its own to be worth building; the grep
+   covers it directly).
+
+| site | old verdict | new verdict | triage |
+|---|---|---|---|
+| *(none — the sweep found no site to report)* | | | |
+
+The measurement table is empty because there is nothing to triage: every
+verdict the tree contains is unchanged by the fix, because the tree contains
+neither filed shape. This is the same answer §11.5 and §12's own coverage
+reached for the sibling arms in this family — third and fourth, now — and it
+is the reason the fix is provably safe to ship without a single golden
+touched: `cargo test -p vilan-cli --test corpus` moved **zero bytes**, and
+`cargo test -p vilan-core --test docs` is unaffected (no documented example
+depends on the tail-only rule, because the tail-only rule was never a
+documented contract — only an implementation gap).
