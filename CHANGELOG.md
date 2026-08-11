@@ -116,6 +116,14 @@ The one part of completion that legitimately reads the buffer you are mid-keystr
 
 ---
 
+**A view-returning function's escape check now looks at each RETURN separately, instead of asking one question about the whole thing.** Two shapes disagreed with what is the same program spelled two ways. `if flag { ret &self.inner; } Inner { n = 0 }` was refused — "a view cannot escape its scope" — while its conditional-tail twin, `if flag { Inner { n = 0 } } else { &self.inner }`, compiled clean: a sound view of a loaned parameter, refused only because it arrived beside an owned sibling through an early `ret`. And, the direction that actually matters: `if flag { Inner { n = 0 } } else { &local }`, a view of a LOCAL escaping through one arm of a conditional tail, compiled — exactly what this check exists to catch — because "is this whole `if` a view expression" is never true for an `if` with an owned arm, so the arm holding the view was never examined at all.
+
+Both traced to the same gap: the check asked its question of a return position as a whole rather than of each value an `if` or `match` tail can actually evaluate to. It now walks every such leaf on its own — whichever arm holds the view, however deeply nested the conditional, and whether the tail is an `if` chain or a `match` — so a sound view and an unsound one sitting in sibling arms of the same return are told apart correctly, and the diagnostic for the unsound one points at that arm, not at the enclosing expression.
+
+The standard library (every module, both platform layers), the regression corpus, and every example and benchmark project were swept under both the old and new rule: nothing in the shipped tree hits either shape, so nothing moved.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
