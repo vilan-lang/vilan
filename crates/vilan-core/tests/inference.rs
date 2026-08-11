@@ -32919,6 +32919,10 @@ fn derive_partialeq_rejects_a_resource_field() {
 #[test]
 fn derive_accepts_a_data_type() {
     // The control: the same three derives on a plain-data struct compile.
+    // `Json` is deliberately not added here — `Wire` already synthesizes the
+    // `Json`/`FromJson` impls (§3.9), so combining the two derives on one
+    // type is a duplicate-impl conflict unrelated to this file's checks;
+    // Json's own no-resource control is `b120_a_json_derived_struct_with_no_resource_stays_legal`.
     assert_compiles(
         r#"
         [derive(Wire, Hashable, PartialEq)]
@@ -51972,16 +51976,16 @@ fn b114_a_written_catch_all_is_still_the_authors_own_arm() {
 }
 
 #[test]
-#[ignore = "known limit: a backed test in an EARLIER leg still reaches the final \
-            leg's bare `else` — a distinct shape from B114's, needing a message \
-            the trap point cannot compute; see backed-enums.md §12.4"]
-fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
-    // Found probing B114. The final leg carries no backed test, so it drops its
-    // condition as it always did — but an EARLIER leg's nested `Align` test can
-    // fail for an out-of-set value, and the fall-through then answers
-    // `Pair::Other` confidently. The trap point cannot name the offending value
-    // in general: which payload slot holds it depends on which variant the
-    // subject is, and the final leg's arm is reached from all of them.
+fn b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
+    // §12.4's filed hazard, closed (backed-enums.md §13). The final leg
+    // carries no backed test, so `trap_tests` (the §12.1 mechanism) is empty
+    // and the leg's own condition is still dropped — but `Of`'s two legs,
+    // together, are its ONLY handler, both testing a specific `Align`
+    // literal. Reaching this point with the subject's tag actually `Of`
+    // means neither literal matched, which is possible only when the payload
+    // left `Align`'s set. The fix re-dispatches on the tag INSIDE the dropped
+    // leg's body: `Of` traps, and only the tag that owns the leg (`Other`)
+    // still runs the author's own arm.
     let javascript = compile(
         r#"
         import std::print;
@@ -51995,8 +51999,171 @@ fn b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
     )
     .expect("a clean compile");
     assert!(
-        javascript.contains("__enum_trap"),
-        "an out-of-set payload must not become `Pair::Other`, got:\n{javascript}"
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "the bare `else` should re-dispatch on the tag, trapping `Of` and \
+         keeping `Other`'s own arm underneath, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\n",
+        "the legitimate `Pair::Other` path must be unchanged"
+    );
+}
+
+#[test]
+fn b121_an_out_of_set_payload_in_an_earlier_leg_traps_instead_of_misfiling() {
+    // The behavior the emission buys: a host-invented `Of` payload traps
+    // instead of silently answering `Other`. Driven both ways, alongside the
+    // in-set control the analyzer itself cannot construct as `Pair::Of` with
+    // a bad `Align` — only `[0, "middle"]`, built by hand, can.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::Start)));
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "s\ne\no\nAlign: \"middle\" is not one of its values\n",
+        "every in-set path stays unchanged and the out-of-set `Of` payload \
+         names the enum and the raw value, not `Pair::Other`"
+    );
+}
+
+#[test]
+fn b121_two_partitioned_variants_each_trap_their_own_enum() {
+    // Generalizes the anchor to TWO tags each exhausted by backed literals
+    // (`Of`/`Align`, `Alt`/`Display`), with `Other` the true bare leg. The
+    // re-dispatch chains in the order the tags first appear, and each traps
+    // only its own enum — the K=1 shape per tag, §12.1's format unchanged.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Display { Block = "block", Inline = "inline" }
+        enum Pair { Of(Align), Alt(Display), Other }
+        fun label(p: Pair): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+                Pair::Alt(Display::Block) => "b",
+                Pair::Alt(Display::Inline) => "i",
+                Pair::Other => "o",
+            }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else if ($a[0] === 1) {\n\
+             \t\t\t__enum_trap(\"Display\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "both partitioned tags should chain, in declaration order, each \
+         trapping its own enum, got:\n{javascript}"
+    );
+    let driven = format!(
+        "{javascript}\n\
+         try {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n\
+         try {{ label([ 1, \"grid\" ]); }} catch (error) {{ console.log(error); }}\n\
+         console.log(label([ 2 ]));\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "o\n\
+         Align: \"middle\" is not one of its values\n\
+         Display: \"grid\" is not one of its values\n\
+         o\n",
+        "each tag should trap its own enum, and the true bare leg is unaffected"
+    );
+}
+
+#[test]
+fn b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap() {
+    // The mechanism's own boundary: a tag covered by an IRREFUTABLE payload
+    // leg of its own (`Pair::Of(let _)`) already matches THAT leg earlier in
+    // the else-if chain, so the re-dispatch's `Of` branch is unreachable —
+    // present in the source (harmless dead code) but never the path taken.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(let _) => "x", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!("{javascript}\nconsole.log(label([ 0, \"middle\" ]));\n");
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "x\no\nx\n",
+        "an out-of-set `Align` under a leg that already covers `Of` unconditionally \
+         takes that leg, same as any other value — it never reaches the trap"
+    );
+}
+
+#[test]
+fn b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else() {
+    // §12.2's narrow rule extended to the new mechanism: an UNBACKED nested
+    // enum's runtime domain IS its variant set (the language wrote the
+    // discriminant), so `Of`'s two legs testing `Inner::A`/`Inner::B` carry
+    // no `BackedTest` at all — `earlier_variant_traps` never gets an entry
+    // for `Of`, and the final leg's bare `else` is exactly what it always
+    // was, byte for byte.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b", Pair::Other => "o" }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an all-unbacked match needs no trap of any kind, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"o\";\n\t}"),
+        "the final leg's bare `else` should be untouched, got:\n{javascript}"
     );
 }
 
@@ -53143,6 +53310,149 @@ fn b117_a_plain_data_wire_derive_is_untouched() {
         }
         "#,
         "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+// B120 — §10.8's "left open, filed not fixed": `Json` had no boundary check
+// at all, so a resource FIELD inside a `[derive(Json)]` plain-data struct
+// reached the generated-code error class §10.8 exists to remove ("`Db` has
+// no method `to_json`"). `check_json_boundary` is `check_partialeq_boundary`'s
+// twin, not `check_wire_boundary`'s: Json's codegen reads `to_json`/
+// `from_json_value` straight off each field's own type, so there is no
+// all-fields type DOMAIN to police — only the resource-field reject.
+
+#[test]
+fn b120_derive_json_rejects_a_resource_field() {
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_nested_resource_field() {
+    // Containment two levels deep: `Holder` is a resource by CONTAINING `Db`
+    // (no `resource` modifier of its own), and `Envelope`'s check names ITS
+    // OWN field (`holder`) and its immediate type (`Holder`) — the root cause
+    // of `Envelope` not being serializable, without walking further down to
+    // blame `Db` by name (that is `Holder`'s own business, if it ever derives
+    // anything).
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Holder { db: Db }
+        [derive(Json)]
+        struct Envelope { holder: Holder }
+        fun main() {}
+        "#,
+        "field `holder` of `[derive(Json)]` type `Envelope` is the resource `Holder`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_resource_enum_payload() {
+    // The enum shape: a resource PAYLOAD, not a struct field — the same
+    // `collect_derived_members` enum arm Wire's check already reuses.
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        enum Wrapper { Holds(Db), Empty }
+        fun main() {}
+        "#,
+        "variant `Holds` payload 0 of `[derive(Json)]` type `Wrapper` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_a_json_derived_struct_with_no_resource_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        struct Note { id: i32, text: str }
+        fun main() {
+            print(Note { id = 7, text = "hi" }.to_json());
+        }
+        "#,
+        "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+#[test]
+fn b120_the_resource_field_reject_and_the_declared_modifier_refusal_compose() {
+    // §10.8's declared-modifier refusal (the DERIVE's subject) and B120's
+    // field check (destruction.md §8's shape, now Json's too) are two
+    // different rules answering two different questions — verified to
+    // compose the way Wire's family already does: each fires ALONE where
+    // only one applies...
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource struct `Conn`",
+    );
+    // ...and, driven at the OTHER type — a plain-data struct holding that
+    // same refused resource by field — the field check fires on its own,
+    // naming the field, exactly as Wire's `b117_a_refused_wire_derive_still_meets_the_resource_field_reject`
+    // does.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        [derive(Json)]
+        struct Envelope { conn: Conn }
+        fun main() {}
+        "#,
+        "field `conn` of `[derive(Json)]` type `Envelope` is the resource `Conn`",
+    );
+}
+
+#[test]
+fn b120_json_has_no_rpc_escape_to_close() {
+    // §10.8's collector-skip closure exists because `wire_names` has a SECOND
+    // reader (`[rpc]`'s signature check) that would trust a refused type back
+    // onto the wire if the name were left registered. `check_json_boundary`
+    // builds no name set at all — there is nothing analogous for a `[rpc]`
+    // check to consult, so there is no escape to close: a `[derive(Json)]`
+    // resource struct used as an `[rpc]` parameter is rejected for the
+    // ordinary, pre-existing reason (it was never `Wire`, which is the only
+    // thing `[rpc]` signatures require), unaffected by this file's checks.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        struct Pool {}
+        impl Pool {
+            [rpc] fun adopt(self, conn: Conn): i32 { 0 }
+        }
+        fun main() {}
+        "#,
+        "of `[rpc]` method `adopt` is `Conn`, which is not Wire",
+    );
+}
+
+#[test]
+fn b120_a_resource_by_containment_still_names_only_its_field() {
+    // Keyed on the DECLARED `resource` modifier (§10.8): a type that is a
+    // resource by CONTAINMENT (no modifier of its own) gets exactly ONE
+    // message — the field check's — never the subject-level refusal too.
+    assert_fails_without(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "cannot be derived for the resource",
     );
 }
 

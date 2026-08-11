@@ -4524,6 +4524,85 @@ impl<'src> Transformer<'src> {
                         &mut trap_tests,
                     );
                 }
+                // B121 (backed-enums.md §13): a backed test in an EARLIER leg
+                // can ALSO be what the bare `else` needs to trap for — a
+                // hazard §12.1 does not reach because it only asks the FINAL
+                // leg's own pattern. `Pair::Of(Align::Start) => .., Pair::Of
+                // (Align::End) => .., Pair::Other => ..` carries no backed
+                // test in `Other`'s leg (so `trap_tests` above is empty, same
+                // as an ordinary bare `else`), but every `Of` leg tests a
+                // SPECIFIC `Align` literal — together they are `Of`'s only
+                // handler, so reaching this point with the subject's tag
+                // actually `Of` is possible only when the payload left
+                // `Align`'s set. §12.1's message still applies (which VALUE
+                // left its set, not which TEST failed) but its trap point
+                // does not: the payload slot depends on which variant the
+                // subject turns out to be, which the final leg's own pattern
+                // cannot say. So this re-dispatches on the tag INSIDE the
+                // dropped leg's body instead — one partitioned variant at a
+                // time, in the order its legs first appear — and traps only
+                // for a tag that never got an unconditional (irrefutable-
+                // payload) leg of its own; a tag covered that way already
+                // matches its own leg earlier in the chain and never reaches
+                // here, so re-testing it would-be dead code, not a wrong
+                // trap. The final leg's own tag is what is left once none of
+                // the partitioned ones matched, and it keeps the author's own
+                // body underneath, unchanged.
+                let mut earlier_variant_traps: Vec<(usize, js::Node<'src>, Vec<BackedTest<'src>>)> =
+                    Vec::new();
+                if trap_tests.is_empty()
+                    && let Some(final_leg_index) = compiled_legs.len().checked_sub(1)
+                    && let Some((final_enum_id, final_variant_index)) = legs
+                        .get(final_leg_index)
+                        .and_then(|leg| match &leg.pattern {
+                            ExprPattern::Variant(enum_id, variant_index, _) => {
+                                Some((*enum_id, *variant_index))
+                            }
+                            _ => None,
+                        })
+                {
+                    for leg in legs.iter().take(final_leg_index) {
+                        let ExprPattern::Variant(enum_id, variant_index, _) = &leg.pattern else {
+                            continue;
+                        };
+                        if *enum_id != final_enum_id || *variant_index == final_variant_index {
+                            continue;
+                        }
+                        let mut tests = Vec::new();
+                        self.backed_pattern_tests(
+                            &leg.pattern,
+                            js::Node::Local(subject_name.clone()),
+                            &mut tests,
+                        );
+                        if tests.is_empty() {
+                            continue;
+                        }
+                        match earlier_variant_traps
+                            .iter_mut()
+                            .find(|(index, _, _)| index == variant_index)
+                        {
+                            Some((_, _, existing)) => {
+                                for test in tests {
+                                    let already_seen = existing.iter().any(|seen: &BackedTest| {
+                                        seen.enum_id == test.enum_id
+                                            && Self::same_trap_accessor(&seen.value, &test.value)
+                                    });
+                                    if !already_seen {
+                                        existing.push(test);
+                                    }
+                                }
+                            }
+                            None => {
+                                let tag_test = self.variant_tag_test(
+                                    *enum_id,
+                                    *variant_index,
+                                    &js::Node::Local(subject_name.clone()),
+                                );
+                                earlier_variant_traps.push((*variant_index, tag_test, tests));
+                            }
+                        }
+                    }
+                }
                 // The analyzer verified exhaustiveness, so an UNGUARDED final
                 // leg can always be the `else` branch — its whole test is
                 // dropped. Backed tests are the exception (§9/§11.6): the leg
@@ -4536,7 +4615,23 @@ impl<'src> Transformer<'src> {
                 // composes cleanly: an in-set value this guard rejects was
                 // taken by an earlier leg, so only an out-of-set value reaches
                 // the trap, exactly as when the final leg is unguarded.
-                if let Some(last_leg) = compiled_legs.last_mut()
+                let last_leg_droppable = compiled_legs
+                    .last()
+                    .is_some_and(|leg| leg.guard_condition.is_none());
+                if last_leg_droppable && trap_tests.is_empty() && !earlier_variant_traps.is_empty()
+                {
+                    let mut chain = js::IfBranch::Else(std::mem::take(
+                        &mut compiled_legs.last_mut().expect("checked above").body,
+                    ));
+                    for (_, tag_test, tests) in earlier_variant_traps.into_iter().rev() {
+                        let trap = self.trap_body(tests);
+                        chain = js::IfBranch::If(Box::new(tag_test), trap, Some(Box::new(chain)));
+                    }
+                    let last_leg = compiled_legs.last_mut().expect("checked above");
+                    last_leg.body = vec![js::Node::If(chain)];
+                    last_leg.pattern_condition = None;
+                    last_leg.prelude.clear();
+                } else if let Some(last_leg) = compiled_legs.last_mut()
                     && last_leg.guard_condition.is_none()
                 {
                     if trap_tests.is_empty() {
@@ -4545,7 +4640,6 @@ impl<'src> Transformer<'src> {
                     last_leg.prelude.clear();
                 }
                 if !trap_tests.is_empty() {
-                    self.used_helpers.insert("__enum_trap");
                     // ONE backed test is the whole story: reaching the trap
                     // proves that value left its set, so it is named
                     // unconditionally — which is the shipped §9 emission when
@@ -4559,27 +4653,7 @@ impl<'src> Transformer<'src> {
                     // knowable by asking each value whether it is in its enum's
                     // set at all. The first that is not is named; the last is
                     // what is left when none of the others answered.
-                    let final_test = trap_tests.len() - 1;
-                    let mut trap_body = Vec::new();
-                    for (index, test) in trap_tests.into_iter().enumerate() {
-                        let trap = js::Node::Call(
-                            Box::new(js::Node::Local("__enum_trap".to_string())),
-                            vec![
-                                js::Node::String(Cow::Borrowed(test.enum_name)),
-                                test.value.clone(),
-                            ],
-                        );
-                        match self.backed_value_membership(test.enum_id, &test.value) {
-                            Some(membership) if index < final_test => {
-                                trap_body.push(js::Node::If(js::IfBranch::If(
-                                    Box::new(js::Node::Unary('!', Box::new(membership))),
-                                    vec![trap],
-                                    None,
-                                )))
-                            }
-                            _ => trap_body.push(trap),
-                        }
-                    }
+                    let trap_body = self.trap_body(trap_tests);
                     compiled_legs.push(MatchLeg {
                         pattern_condition: None,
                         prelude: Vec::new(),
@@ -4836,6 +4910,91 @@ impl<'src> Transformer<'src> {
         (0..enum_.variants.len())
             .filter_map(|variant_index| self.scalar_variant_test(enum_id, variant_index, value))
             .reduce(|a, b| js::Node::Binary(BinaryOp::Or, Box::new(a), Box::new(b)))
+    }
+
+    /// The runtime test for "is this value variant `variant_index` of
+    /// `enum_id`" — a native scalar comparison for `bool`/backed enums, else
+    /// the array's own discriminant slot at index 0. `compile_pattern`'s
+    /// `Variant` arm builds exactly this (inline, for the pattern it is
+    /// walking); B121's earlier-leg re-dispatch needs the same test for a leg
+    /// it is NOT walking through `compile_pattern` (it reads straight off the
+    /// leg list), so it is pulled out here rather than duplicated ad hoc.
+    fn variant_tag_test(
+        &self,
+        enum_id: Id,
+        variant_index: usize,
+        subject: &js::Node<'src>,
+    ) -> js::Node<'src> {
+        self.scalar_variant_test(enum_id, variant_index, subject)
+            .unwrap_or_else(|| {
+                js::Node::Binary(
+                    BinaryOp::Eq,
+                    Box::new(js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number("0".to_string(), None)),
+                    )),
+                    Box::new(js::Node::Number(variant_index.to_string(), None)),
+                )
+            })
+    }
+
+    /// Whether two trap accessors read the exact same slot. Restricted to the
+    /// `Local`/`PropertyIndex`/`Number` shapes `backed_pattern_tests` ever
+    /// builds (a chain of property reads off the match subject) — B121's
+    /// per-variant grouping uses it to tell "the same `Align` slot, tested by
+    /// two different legs of the same variant" from "two different slots that
+    /// happen to share an enum", without a general `js::Node` equality that
+    /// would have to answer for every other variant too. Anything outside
+    /// that shape compares unequal, which only costs a redundant (harmless)
+    /// trap test — never a wrong one.
+    fn same_trap_accessor(a: &js::Node<'src>, b: &js::Node<'src>) -> bool {
+        match (a, b) {
+            (js::Node::Local(left), js::Node::Local(right)) => left == right,
+            (js::Node::Number(left, _), js::Node::Number(right, _)) => left == right,
+            (
+                js::Node::PropertyIndex(left_object, left_index),
+                js::Node::PropertyIndex(right_object, right_index),
+            ) => {
+                Self::same_trap_accessor(left_object, right_object)
+                    && Self::same_trap_accessor(left_index, right_index)
+            }
+            _ => false,
+        }
+    }
+
+    /// The `__enum_trap` sequence for a set of backed tests read while
+    /// reaching one point of a match: `K` tests become `K − 1`
+    /// membership-guarded traps and one bare one (backed-enums.md §12.1) —
+    /// the last needs no guard because it is what is left once none of the
+    /// others answered. Factored out of `Expr::Match`'s final-leg trap so
+    /// B121's earlier-leg re-dispatch can build the identical shape for a
+    /// DIFFERENT reason to be there (a variant whose own legs, not the final
+    /// one, exhausted their literals) without a second implementation to
+    /// drift out of step with the first.
+    fn trap_body(&mut self, tests: Vec<BackedTest<'src>>) -> Vec<js::Node<'src>> {
+        self.used_helpers.insert("__enum_trap");
+        let final_test = tests.len() - 1;
+        let mut body = Vec::new();
+        for (index, test) in tests.into_iter().enumerate() {
+            let trap = js::Node::Call(
+                Box::new(js::Node::Local("__enum_trap".to_string())),
+                vec![
+                    js::Node::String(Cow::Borrowed(test.enum_name)),
+                    test.value.clone(),
+                ],
+            );
+            match self.backed_value_membership(test.enum_id, &test.value) {
+                Some(membership) if index < final_test => {
+                    body.push(js::Node::If(js::IfBranch::If(
+                        Box::new(js::Node::Unary('!', Box::new(membership))),
+                        vec![trap],
+                        None,
+                    )))
+                }
+                _ => body.push(trap),
+            }
+        }
+        body
     }
 
     /// B53 (rule 1): whether this capture's slot read copies AT THIS EMISSION.

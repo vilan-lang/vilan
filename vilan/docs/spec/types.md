@@ -189,6 +189,29 @@ match pair {
 If one arm tests **more than one** backed enum, the panic names whichever
 value actually left its set.
 
+A backed test can also live in an EARLIER arm than the one that becomes the
+`else` — a different variant's payload, tested across several arms with no
+arm of its own left over for it:
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // together, `Of`'s only handler
+    Pair::Other            => "o",
+}
+// an out-of-set `Of` payload traps instead of silently answering `Other`:
+//   Align: "middle" is not one of its values
+```
+
+`Other`'s own arm carries no backed test, so the exhaustiveness proof that
+drops its condition is still a proof about `Pair`'s VARIANT set, not about
+`Align`'s runtime domain — the same gap the payload form above closes, one
+level up. The two `Of` arms above are the only place `Align` is ever tested,
+so reaching the `else` with the subject's tag actually `Of` is possible only
+when its payload left `Align`'s set; the trap fires there, naming `Align`
+and the raw value, and `Other`'s own arm still answers for a genuine
+`Pair::Other`.
+
 Only the exhaustive form is affected. A `match` you gave a `_` arm keeps
 it — an out-of-set value takes the arm you wrote, which is the answer you
 asked for — and `is` and `==` compare against a literal, so they answer

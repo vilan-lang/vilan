@@ -1807,6 +1807,13 @@ pub struct Analyzer<'src> {
     /// compared by value (equality copies). Ordinary data fields need no
     /// all-fields gate, so this list feeds only the resource check.
     partialeq_types_to_check: Vec<WireTypeCheck<'src>>,
+    /// `[derive(Json)]` types awaiting the resource-field reject
+    /// (backed-enums.md §10.8's residual, B120) — the `PartialEq` shape, not
+    /// the `Wire` one: `to_json`/`from_json_value` are read straight off each
+    /// field's own type by codegen, so Json has no all-fields type DOMAIN the
+    /// way Wire does (`is_wire_type`) — an ordinary field imposes no
+    /// requirement and this list feeds only the resource check.
+    json_types_to_check: Vec<WireTypeCheck<'src>>,
     /// Per-instantiation resource classification memo (`type_is_resource`,
     /// destruction.md §3): keyed by the interned instantiation `TypeId`, so
     /// `Option<Database>` and `Option<i32>` cache independently. Holds only
@@ -2762,6 +2769,7 @@ impl<'src> Analyzer<'src> {
             hashable_names: HashSet::default(),
             hashable_types_to_check: Vec::new(),
             partialeq_types_to_check: Vec::new(),
+            json_types_to_check: Vec::new(),
             resource_classification: HashMap::default(),
             generic_type_applications: Vec::new(),
             reported_container_structures: HashSet::default(),
@@ -4035,6 +4043,21 @@ impl<'src> Analyzer<'src> {
             .push((name, declaration_id, members));
     }
 
+    /// Record a `[derive(Json)]` struct/enum for the resource-field reject
+    /// (backed-enums.md §10.8's residual, B120) — `PartialEq`'s shape exactly:
+    /// `to_json`/`from_json_value` are read off each field's own type by
+    /// codegen, so there is no all-fields type domain to check the way Wire's
+    /// `is_wire_type` does, and hence no name set and no syntactic recursion;
+    /// the members feed only `check_json_boundary`.
+    fn collect_json_type(&mut self, item: &'src Node<'src>, declaration_id: Id) {
+        let Some(name) = Self::derivable_type_name(item) else {
+            return;
+        };
+        let members = self.collect_derived_members(item, declaration_id);
+        self.json_types_to_check
+            .push((name, declaration_id, members));
+    }
+
     /// A field type is Hashable iff it is a scalar (any numeric, `str`, `bool`), a
     /// `List`/`Option` of Hashable (recursing into the element), a bare-lowered
     /// enum (its backing value is its key), or a named `[derive(Hashable)]` type.
@@ -4125,6 +4148,38 @@ impl<'src> Analyzer<'src> {
                              copy it); compare a plain-data projection instead"
                         ),
                     }, *declaration_id);
+                }
+            }
+        }
+    }
+
+    /// Enforce the `[derive(Json)]` resource reject (backed-enums.md §10.8's
+    /// residual, B120): a resource FIELD is rejected with the same
+    /// resource-specific steer `check_wire_boundary` gives its own field
+    /// check (destruction.md §8) — a resource is not plain data, so
+    /// serializing it would copy it out of its owner. Ordinary data fields
+    /// impose no requirement (unlike Wire, Json has no all-fields type
+    /// domain: any type with its own `to_json` serializes). Runs after all
+    /// modules are walked (so resource-ness is fully known).
+    fn check_json_boundary(&mut self) {
+        let checks = std::mem::take(&mut self.json_types_to_check);
+        for (type_name, declaration_id, members) in &checks {
+            for (label, type_node, field_type_id, span) in members {
+                if self.type_is_resource(*field_type_id) {
+                    let rendered = render_type(type_node);
+                    self.push_anchored(
+                        Error {
+                            note: None,
+                            span: *span,
+                            msg: format!(
+                                "{label} of `[derive(Json)]` type `{type_name}` is the resource \
+                             `{rendered}`: a resource is not plain data and cannot be \
+                             serialized (serializing it would copy it out of its owner); \
+                             serialize a plain-data projection (an id, a key) instead"
+                            ),
+                        },
+                        *declaration_id,
+                    );
                 }
             }
         }
@@ -17612,20 +17667,29 @@ impl<'src> Analyzer<'src> {
                 }
                 // Walk the wrapped item FIRST, so its fields resolve to type ids
                 // before the derive collectors read them (the all-fields checks
-                // — Wire/Hashable/PartialEq — carry each member's resolved type to
-                // test it for resource-ness). `walk_expr_node` returns the
-                // struct/enum entity id.
+                // — Wire/Hashable/PartialEq/Json — carry each member's resolved
+                // type to test it for resource-ness). `walk_expr_node` returns
+                // the struct/enum entity id.
                 let declaration_id = self.walk_expr_node(inner, scope_id);
-                // A `Wire` derive REFUSED for a resource subject (B117) records
-                // nothing: the name must not enter `wire_names`, or a refused
-                // `resource struct Conn` would still satisfy `is_wire_type` and
-                // sail through the `[rpc]` signature check. The refusal is the
+                // A `Wire`/`Json` derive REFUSED for a resource subject (B117)
+                // records nothing: the name must not enter `wire_names` (Wire's
+                // case — a refused `resource struct Conn` would still satisfy
+                // `is_wire_type` and sail through the `[rpc]` signature check),
+                // and for either derive it would print a second message for a
+                // struct whose OWN subject is already refused (B120: Json's
+                // resource-field reject has no name set to protect, but the
+                // double-message problem is the same). The refusal is the
                 // expander's (`macros.rs`'s `Node::Derive` arm) — the boundary
                 // check would only add a second message for one mistake.
                 if derives.iter().any(|(name, _)| *name == "Wire")
                     && resource_derive_refusal("Wire", inner).is_none()
                 {
                     self.collect_wire_type(&inner.0, declaration_id);
+                }
+                if derives.iter().any(|(name, _)| *name == "Json")
+                    && resource_derive_refusal("Json", inner).is_none()
+                {
+                    self.collect_json_type(&inner.0, declaration_id);
                 }
                 if derives.iter().any(|(name, _)| *name == "Hashable") {
                     self.collect_hashable_type(&inner.0, declaration_id);
@@ -33575,6 +33639,7 @@ fn analyze_over_world<'src>(
     analyzer.check_invalidation();
     analyzer.check_reseat_escape();
     analyzer.check_wire_boundary();
+    analyzer.check_json_boundary();
     analyzer.check_hashable_boundary();
     analyzer.check_partialeq_boundary();
     analyzer.check_rpc_signatures();
