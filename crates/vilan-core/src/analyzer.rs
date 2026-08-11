@@ -373,8 +373,9 @@ fn default_rows(rows: &[Vec<ExprPattern>]) -> Vec<Vec<ExprPattern>> {
 /// The coverage walk's step budget. The walk is a usefulness analysis, whose
 /// worst case is exponential in the pattern depth; a program that reaches this
 /// is treated as covered, so the budget can only ever LOSE a diagnostic, never
-/// invent one. The tree's most expensive match costs three figures less than
-/// this (`capture-clones.md` §12.4).
+/// invent one. It is set five orders of magnitude above the measured need: over
+/// the 23 478 walks the tree's own sources provoke, the most expensive match
+/// costs EIGHT steps (`capture-clones.md` §12.5).
 const COVERAGE_WALK_STEP_BUDGET: u32 = 200_000;
 
 #[derive(Debug, Clone)]
@@ -25901,9 +25902,15 @@ impl<'src> Analyzer<'src> {
     }
 
     /// `Enum::Variant`, the way an author writes the pattern that would cover
-    /// it. Always qualified, `bool::true` included: the witness names a path,
-    /// not a spelling.
+    /// it — the witness has to be WRITABLE, not merely recognisable.
+    ///
+    /// `bool` is the one enum whose variants are not written that way: `true`
+    /// and `false` are the literals the parser takes, and `bool::true` is not a
+    /// pattern it accepts at all. So they are spelled bare.
     fn witness_variant_name(&self, enum_id: Id, variant_index: usize) -> String {
+        if self.bool_enum_id == Some(enum_id) {
+            return self.variant_name(enum_id, variant_index).to_string();
+        }
         match self.enums.get(&enum_id) {
             Some(declaration) => format!(
                 "{}::{}",
@@ -25914,26 +25921,52 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// A witness as source-shaped text — `Pair::Of(Align::End)`, `(_, _)`.
+    /// A witness as source-shaped text — a pattern that would cover it, so
+    /// `Pair::Of(Align::End)` and `Tree::Node(_, _)`, payload arity and all.
+    ///
     /// A `Variants` witness names its FIRST variant: the message points at one
     /// concrete uncovered value, and the whole set is only listed where it has
-    /// always been, at the subject's own level.
+    /// always been, at the subject's own level. Where the untested set is the
+    /// WHOLE variant set the position rules nothing out, so it reads `_` — the
+    /// `bool` slot of `Holder::Of((Align::End, _))` is uncovered for either
+    /// value, and naming one of them would be arbitrary.
     fn render_witness(&self, witness: &Witness) -> String {
         match witness {
             Witness::Anything => "_".to_string(),
-            Witness::Variants(enum_id, variant_indices) => match variant_indices.first() {
-                Some(variant_index) => self.witness_variant_name(*enum_id, *variant_index),
-                None => "_".to_string(),
-            },
-            Witness::Variant(enum_id, variant_index, payload) => {
-                let name = self.witness_variant_name(*enum_id, *variant_index);
-                if payload.is_empty() {
-                    name
-                } else {
-                    format!("{}({})", name, self.render_witnesses(payload))
+            Witness::Variants(enum_id, variant_indices) => {
+                let variant_count = self
+                    .enums
+                    .get(enum_id)
+                    .map_or(0, |declaration| declaration.variants.len());
+                match variant_indices.first() {
+                    Some(variant_index) if variant_indices.len() < variant_count => {
+                        let arity = self.variant_payload_arity(*enum_id, *variant_index);
+                        let payload = vec![Witness::Anything; arity];
+                        self.render_variant(*enum_id, *variant_index, &payload)
+                    }
+                    _ => "_".to_string(),
                 }
             }
+            Witness::Variant(enum_id, variant_index, payload) => {
+                self.render_variant(*enum_id, *variant_index, payload)
+            }
             Witness::Tuple(elements) => format!("({})", self.render_witnesses(elements)),
+        }
+    }
+
+    fn variant_payload_arity(&self, enum_id: Id, variant_index: usize) -> usize {
+        self.enums
+            .get(&enum_id)
+            .and_then(|declaration| declaration.variants.get(variant_index))
+            .map_or(0, |variant| variant.data_type_ids.len())
+    }
+
+    fn render_variant(&self, enum_id: Id, variant_index: usize, payload: &[Witness]) -> String {
+        let name = self.witness_variant_name(enum_id, variant_index);
+        if payload.is_empty() {
+            name
+        } else {
+            format!("{}({})", name, self.render_witnesses(payload))
         }
     }
 
