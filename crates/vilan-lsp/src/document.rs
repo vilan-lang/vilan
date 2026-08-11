@@ -3048,8 +3048,9 @@ impl Document {
         };
         let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
             // Not an origin — a same-file `mod`, or a namespace already in the
-            // program under some other name.
-            return self.namespace_completions_by_name(program, segments[segments.len() - 1]);
+            // program under some other name. The last segment is the namespace
+            // being descended into, which is all the by-name lookup reads.
+            return self.namespace_completions_by_name(program, rest.last().unwrap_or(origin));
         };
         match rest.split_first() {
             None => origin_member_completions(&module_roots, surface.as_deref()),
