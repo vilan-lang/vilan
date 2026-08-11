@@ -8,6 +8,10 @@ tracks the latest state.
 
 ## Unreleased
 
+**A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
+
+---
+
 **Organize Imports no longer prunes a module import used only through `::`.** `import std::math;` referenced only as `math::min(1, 2)` — never by its bare name — was reported unused and removed on save. A static accessor's subject resolves through the same type-position lookup as a struct, an enum, a trait, or a generic, and the definition it records feeds every "is this import used" check in the editor; a module was the one namespace kind that lookup forgot, so `math`'s use site recorded no definition at all and looked referenced nowhere. It now resolves like the others — a module reached only through `::` keeps its import, in a single import or shrunk out of a brace set, exactly like a struct or function would. Go-to-definition on a module name at a `::` use site picks up the same fix and now jumps to the module; it already worked on the module name written inside the `import` statement itself.
 
 ---

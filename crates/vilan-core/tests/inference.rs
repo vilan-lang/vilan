@@ -32832,6 +32832,10 @@ fn derive_partialeq_rejects_a_resource_field() {
 #[test]
 fn derive_accepts_a_data_type() {
     // The control: the same three derives on a plain-data struct compile.
+    // `Json` is deliberately not added here — `Wire` already synthesizes the
+    // `Json`/`FromJson` impls (§3.9), so combining the two derives on one
+    // type is a duplicate-impl conflict unrelated to this file's checks;
+    // Json's own no-resource control is `b120_a_json_derived_struct_with_no_resource_stays_legal`.
     assert_compiles(
         r#"
         [derive(Wire, Hashable, PartialEq)]
@@ -53056,6 +53060,149 @@ fn b117_a_plain_data_wire_derive_is_untouched() {
         }
         "#,
         "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+// B120 — §10.8's "left open, filed not fixed": `Json` had no boundary check
+// at all, so a resource FIELD inside a `[derive(Json)]` plain-data struct
+// reached the generated-code error class §10.8 exists to remove ("`Db` has
+// no method `to_json`"). `check_json_boundary` is `check_partialeq_boundary`'s
+// twin, not `check_wire_boundary`'s: Json's codegen reads `to_json`/
+// `from_json_value` straight off each field's own type, so there is no
+// all-fields type DOMAIN to police — only the resource-field reject.
+
+#[test]
+fn b120_derive_json_rejects_a_resource_field() {
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_nested_resource_field() {
+    // Containment two levels deep: `Holder` is a resource by CONTAINING `Db`
+    // (no `resource` modifier of its own), and `Envelope`'s check names ITS
+    // OWN field (`holder`) and its immediate type (`Holder`) — the root cause
+    // of `Envelope` not being serializable, without walking further down to
+    // blame `Db` by name (that is `Holder`'s own business, if it ever derives
+    // anything).
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Holder { db: Db }
+        [derive(Json)]
+        struct Envelope { holder: Holder }
+        fun main() {}
+        "#,
+        "field `holder` of `[derive(Json)]` type `Envelope` is the resource `Holder`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_resource_enum_payload() {
+    // The enum shape: a resource PAYLOAD, not a struct field — the same
+    // `collect_derived_members` enum arm Wire's check already reuses.
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        enum Wrapper { Holds(Db), Empty }
+        fun main() {}
+        "#,
+        "variant `Holds` payload 0 of `[derive(Json)]` type `Wrapper` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_a_json_derived_struct_with_no_resource_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        struct Note { id: i32, text: str }
+        fun main() {
+            print(Note { id = 7, text = "hi" }.to_json());
+        }
+        "#,
+        "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+#[test]
+fn b120_the_resource_field_reject_and_the_declared_modifier_refusal_compose() {
+    // §10.8's declared-modifier refusal (the DERIVE's subject) and B120's
+    // field check (destruction.md §8's shape, now Json's too) are two
+    // different rules answering two different questions — verified to
+    // compose the way Wire's family already does: each fires ALONE where
+    // only one applies...
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource struct `Conn`",
+    );
+    // ...and, driven at the OTHER type — a plain-data struct holding that
+    // same refused resource by field — the field check fires on its own,
+    // naming the field, exactly as Wire's `b117_a_refused_wire_derive_still_meets_the_resource_field_reject`
+    // does.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        [derive(Json)]
+        struct Envelope { conn: Conn }
+        fun main() {}
+        "#,
+        "field `conn` of `[derive(Json)]` type `Envelope` is the resource `Conn`",
+    );
+}
+
+#[test]
+fn b120_json_has_no_rpc_escape_to_close() {
+    // §10.8's collector-skip closure exists because `wire_names` has a SECOND
+    // reader (`[rpc]`'s signature check) that would trust a refused type back
+    // onto the wire if the name were left registered. `check_json_boundary`
+    // builds no name set at all — there is nothing analogous for a `[rpc]`
+    // check to consult, so there is no escape to close: a `[derive(Json)]`
+    // resource struct used as an `[rpc]` parameter is rejected for the
+    // ordinary, pre-existing reason (it was never `Wire`, which is the only
+    // thing `[rpc]` signatures require), unaffected by this file's checks.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        struct Pool {}
+        impl Pool {
+            [rpc] fun adopt(self, conn: Conn): i32 { 0 }
+        }
+        fun main() {}
+        "#,
+        "of `[rpc]` method `adopt` is `Conn`, which is not Wire",
+    );
+}
+
+#[test]
+fn b120_a_resource_by_containment_still_names_only_its_field() {
+    // Keyed on the DECLARED `resource` modifier (§10.8): a type that is a
+    // resource by CONTAINMENT (no modifier of its own) gets exactly ONE
+    // message — the field check's — never the subject-level refusal too.
+    assert_fails_without(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "cannot be derived for the resource",
     );
 }
 
