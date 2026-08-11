@@ -1062,3 +1062,274 @@ value over a plain description, the dev server's page is the same rendering
 performed CLI-side, and §9's item shrinks from "design a dev server's HTML" to
 "serve `Document::of(build).html()`". That is worth recording precisely so the
 two do not get designed twice.
+
+## 6. Seam (c) — what `vilan init` becomes
+
+### 6.1 init's own constraints, read out of the code
+
+`vilan init` is not a free surface, and the charter is right to say so. Four
+constraints bind any change here, all verified:
+
+1. **Templates are `include_str!`-embedded** from
+   `crates/vilan-cli/templates/<template>/`, as a static table of
+   `(destination, contents)` pairs (`crates/vilan-cli/src/init.rs:86-144`; the
+   fullstack arm lists exactly six files at `:117-142`). An installed binary
+   carries its scaffolds and never looks for a templates directory
+   (`init.rs:17-29`).
+2. **One substitution token, `{{name}}`** (`init.rs:54`, `:233-235`). "Nothing
+   else in a template is templated; a scaffold is a file you can read."
+   Whatever the template becomes, it stays a readable file, not a generator.
+3. **`every_template_scaffolds_exactly_its_embedded_files_already_formatted`**
+   (`crates/vilan-cli/tests/init.rs:356-387`) — the scaffold's file set must
+   equal the directory's, `vilan fmt --check .` must pass on a fresh scaffold,
+   and no `{{name}}` may survive.
+4. **The field-by-field manifest gate**
+   (`the_fullstack_template_matches_the_blessed_example_layout`,
+   `tests/init.rs:275-346`). Against each of the three blessed examples —
+   `walkthrough`, `todo`, `ssr` — it asserts the scaffold's `[package] root`,
+   `entry` and `target`; that the blessed shape is one package (no `[project]`,
+   no `[library]`); that the **entry name lists are equal and in the same
+   order**; and per entry, `target`, `path` and `split`.
+
+Constraint 4 has a fifth clause that turns out to be the binding one for seam
+(b), and it is worth quoting because nothing else in the tree says it:
+
+```rust
+// tests/init.rs:334-344 — ...and the layout the manifest implies is on disk in both.
+for relative in ["src/client.vl", "src/server.vl", "src/app.html"] {
+    assert!(project.join(relative).is_file(), "the scaffold is missing {relative}");
+    assert!(directory.join(relative).is_file(), "{example} is missing {relative}");
+}
+```
+
+**`src/app.html` is a pinned member of the blessed full-stack shape, in the
+scaffold and in three examples simultaneously.** So the template cannot lose
+its shell alone: rung 2 in the scaffold is a change to `walkthrough`, `todo`,
+`ssr` and this test in one commit. That is the gate working exactly as designed
+— it exists to keep the scaffold and the corpus the same shape — and it is the
+reason §6.3 recommends what it does.
+
+Note also what the gate does *not* cover: it compares manifests and three
+filenames, and says nothing about the contents of `server.vl`. The ceremony of
+§3.1–§3.3 is replicated between scaffold and examples by convention, not by
+test — which is how the scaffold came to carry the stale-read pattern
+`dev-refresh.md` §2(iv) names.
+
+### 6.2 The template at each rung
+
+Today (`templates/fullstack/src/server.vl`, 25 counted lines, 22 ceremony):
+
+```vilan
+let client_js = fs::read_file_to_str("dist/client.js");
+let shell = fs::read_file_to_str("src/app.html");
+let client_css = if fs::exists("dist/client.css") { fs::read_file_to_str("dist/client.css") } else { "" };
+Server::builder()
+    .port(8080)
+    .on_request(|request| {
+        match request.path() {
+            "/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
+            "/client.css" => Response::builder().set_header("Content-Type", "text/css").body(client_css).build(),
+            _ => Response::builder().set_header("Content-Type", "text/html").body(shell).build(),
+        }
+    })
+    .on_start(|server| print(greeting() + " — http://localhost:8080/"))
+    .build()
+    .start();
+```
+
+**With seam (a) only** — nothing changes. The template already uses the
+builder, which is the good side of (a); what (a) buys it is that the *next*
+step is additive. One comment line can now say something true:
+`// add rpc later with .with_service(…) — nothing here has to move.`
+That sentence is the charter's "a server that grows", and it costs one line of
+the opening argument.
+
+**At rung 1** — the three reads, the `fs::exists` guard and the route table go;
+the two ceremony imports go with them:
+
+```vilan
+let build = build_of("client")!;
+let shell = fs::read_file_to_str("src/app.html");
+Server::builder()
+    .port(8080)
+    .serve_build(build)
+    .on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(shell).build())
+    .on_start(|server| print(greeting() + " — http://localhost:8080/"))
+    .build()
+    .start();
+```
+
+25 counted lines become 12; 22 ceremony lines become 6. `src/app.html` is
+untouched, and its comments — which currently explain that `vilan build .`
+writes `dist/client.css` and that `src/server.vl` serves it at that path — get
+to say something shorter, because only half of it is still the reader's problem.
+
+**At rung 0+** — one word longer, and the scaffold now meets the charter's bar:
+
+```vilan
+let document = Document::from_shell(fs::read_file_to_str("src/app.html"), build)!;
+```
+
+A scaffolded project whose `app.html` loses its `<link>` no longer starts. That
+is the single highest-value line in this section: the failure the charter was
+written about becomes impossible in the file every new user edits first.
+
+**At rung 2** — `src/app.html` is deleted and the document is built:
+
+```vilan
+let page = Document::of(build)
+    .title("{{name}}")
+    .head("<style>body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; }</style>")
+    .html();
+```
+
+Six template files become five, and the `{{name}}` substitution moves from
+`app.html` into `server.vl` — where it already appears, so no new mechanism.
+
+### 6.3 The recommendation, and its cost
+
+**Ship the template at rung 1 + rung 0+. Do not ship it at rung 2.**
+
+The reasoning is about what a scaffold is for. `vilan init`'s server file is a
+teaching artifact read by someone who has never seen the language; §2.2 measured
+it at 22 ceremony lines to 1 of intent, which teaches that a vilan server is
+mostly filesystem plumbing. Rung 1 fixes that — the file becomes six lines of
+which four are about *this app*. Rung 0+ then makes the remaining hand-written
+artifact safe, which is precisely the demonstration the charter asks for: the
+shell is still yours, and we will still tell you when it is wrong.
+
+Rung 2 in the scaffold trades that for a smaller file and a larger surprise. A
+web developer opening a new project expects to find the HTML; not finding it
+is the kind of magic that makes a framework feel like one, and the charter's
+third clause — *progressively lowering to full control* — reads better as "the
+file is here, and it is checked" than as "there is no file until you ask". Rung
+2 belongs in `docs/guide/` as the step you take when you have decided you do not
+care about the document, which is a real and common decision and not the
+default one.
+
+The cost of that recommendation, stated: the blessed examples keep their
+`app.html`, so `tests/init.rs:335` needs no change and neither do `walkthrough`,
+`todo` or `ssr`. The cost of the *other* choice is one commit touching four
+projects and one test — not large, but it is a corpus-wide shape change and it
+should be the owner's, so it is §10.6.
+
+Two smaller template notes:
+
+- **`examples/todo` and `examples/walkthrough` should move to the builder**
+  when (a) lands, even though `serve_service` keeps working (§4.6). They are
+  the two files the owner transcribed from (§2.1), and they are the two that
+  currently teach the dead end. `examples/ssr` and `examples/fullstack` are
+  already on the builder and gain only `serve_build`.
+- **The `browser` template is unaffected by (a) and (b) alike** — it has no
+  server, so its `index.html` is loaded from the filesystem or a static host,
+  and its coupling is checked by the substring assertions at
+  `tests/init.rs:141-162`. It is, however, the one project in the tree that
+  `hmr.md` §9's dev server would serve, so it is the thing that ties §5.10 to
+  a real user.
+
+## 7. Reconciliation with the ratified records
+
+The charter asks for tensions to be addressed head-on. There are six, and each
+is resolved by being precise about what was actually decided.
+
+### 7.1 `ssr.md` §6(b) — the declined `render_into`
+
+What was declined, verbatim:
+
+> **(b) The splice API**: v1 keeps the shell splice in user code
+> (`shell.replace("<!--app--></!--app-->", render(app()))` — recommendation: honest, zero
+> new surface) vs a `render_into(shell, marker, view)` convenience in std.
+
+Three things about that decline matter here. First, its stated reason is
+**"zero new surface"** — a cost argument, not a correctness one, and one that
+was correct at the time: a helper that takes a string, a marker and a view, and
+performs a `replace`, buys a user nothing they cannot write, and buys std a
+maintenance obligation. Second, it was scoped **to v1** of an arc whose subject
+was rendering, not documents. Third, §5.8's proposal **is not `render_into`**.
+It is a method on a `Document` value that this paper argues must exist for
+seam (b)'s own reasons, and it takes **no marker at all** — the mount element
+is a property of the document, so the failure mode the marker creates (F5) is
+deleted rather than wrapped.
+
+So the reconciliation is: `render_into(shell, marker, view)` stays declined,
+and stays declined for the reason §6(b) gave. `Document::render(view)` is a
+different thing, whose cost is already paid by the design that carries it, and
+whose benefit is the removal of a silent failure that `ssr.md` did not have to
+weigh because SSR's marker was one string in one example at the time and is now
+the pattern every SSR app in the language copies.
+
+If the owner disagrees — if the decline was about the *idea* of std knowing
+what an HTML document is, not about the helper's shape — then §5's whole rung 2
+falls, rung 1 and the validator stand alone, and the paper is still worth
+having. That is §10.4.
+
+### 7.2 `hmr.md` §8 — server-side HMR stays a permanent non-goal
+
+> **Server-side HMR**: a non-goal, permanently — restart is the model for the
+> Node leg; the process is cheap and correctness is free.
+
+Nothing in this paper makes a running server's *code* replaceable. `serve_build`
+changes where the asset bytes are read (from three `let`s at the top of `main`
+to one library call in the request path), which is a question about **data
+freshness**, not code identity — the distinction `dev-refresh.md` §0 already
+drew and labelled: "A server that restarts on every code change can still serve
+week-old bytes for a file it read once at the top of `main`; closing that gap
+doesn't reopen the server-side-HMR question." This paper inherits that line
+unchanged.
+
+Two smaller §8 clauses are also respected: the dev channel keeps binding
+`127.0.0.1` and serving only `dist/` artifacts, and nothing here asks it to
+serve a user's page (§5.10 explicitly defers `hmr.md` §9's dev server).
+
+### 7.3 `dev-refresh.md` — the boundary, in both directions
+
+E55's general half is DRAFTED and awaiting ratification. This paper **does not
+redesign it, does not depend on its outcome, and does not pre-empt its open
+questions** (§4 of that note: the signalling plumbing, the process-layer
+surface's shape, whether (iii) is a permanent non-goal, and the scope of the
+dev signal). What it does is supply the call site that note says the
+revalidating read is missing — §2(i)'s "a primitive in search of a call site
+that invokes it more than once" — by moving the read out of `main` and into
+`serve_build`. Sequencing: either can ship first. If E55 lands first,
+`serve_build` is written against the hook. If seam (b) lands first,
+`serve_build` reads per request the plain way and gains the hook in a
+one-line change.
+
+### 7.4 `bundle-splitting.md` — splitting stays opt-in; the manifest changes
+
+Untouched: `split = true` remains a `vilan build` optimisation that `run`
+ignores and says so once (§4, §10); single-file emission stays first-class;
+nothing here recommends any example declare `split` (§9 measured that none
+should).
+
+Changed, and put to the owner as §10.3: the sidecar becomes the leg's build
+manifest and is written on every build of the leg. §5.9 argues this
+*strengthens* §9's stated invariant rather than weakening it, but it does
+reverse one ratified sentence and churn a byte-pinned golden, and a ratified
+sentence should not be reversed inside a design note.
+
+One further alignment: §9 recorded that `<link rel="modulepreload">` "is a
+page's decision, not a compiler's", and that "an SSR server can [write it], and
+now has `chunks.json` to write it from". A `Document` built from a `LegBuild`
+is exactly the thing that can, and §9's recorded first-paint fix becomes
+reachable without any new information. This paper does not propose emitting the
+preload in v1 — it is a performance decision with its own measurement — but it
+notes that rung 2 is where it would go.
+
+### 7.5 `ssr.md` §6(a) — the process `ui` stays fragment-only
+
+§6(a) ratified omitting `mount`/`mount_root` from the process layer. §5.5's
+`Document` is a string builder precisely so that call stays made: no `View`
+grows document semantics, no process-layer mount is needed, and the two `ui`
+implementations' differential pin (`ssr.md` §4, S1) is unaffected because
+`Document` sits above `render(view)` and calls it.
+
+### 7.6 `transport-rpc.md` §4.2 — `serve_service`'s contract is preserved
+
+§4.2 records `serve_service` as "`serve_connected` with that registry as its
+connection lifecycle", and that "manual wiring stays available
+(`serve_connected` + your own attach) for SSE clients and custom session
+state". §4.6 keeps both signatures and both behaviours; `Service::new` *is* the
+registry lifecycle and `Service::on_connect`/`on_disconnect` *is* the manual
+wiring, so the two documented paths become two constructors of one value rather
+than two functions with different arities.
