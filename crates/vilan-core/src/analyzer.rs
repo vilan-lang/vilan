@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
+use crate::closest_name;
 use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -1566,7 +1567,12 @@ pub struct StructInitializerConstraint<'src> {
     pub struct_fields: Vec<Field<'src>>,
     pub generic_argument_ids: Vec<TypeId>,
     pub generic_parameter_constraint_ids: Vec<TypeId>,
-    pub fields: Vec<(&'src str, Id, Span)>,
+    /// One entry per initializer field: its name, the value expression's id,
+    /// the VALUE's span (for type-mismatch diagnostics, which anchor on the
+    /// value), and the NAME's own span (E58: the unknown-field diagnostic and
+    /// its closest-name quickfix anchor on the name instead — the field
+    /// itself is what's wrong, not the value assigned to it).
+    pub fields: Vec<(&'src str, Id, Span, Span)>,
     pub fields_span: Span,
 }
 
@@ -1799,7 +1805,7 @@ impl<'src> StructInitializerConstraint<'src> {
         scope_id: Id,
         name: &'src str,
         generic_argument_ids: Vec<TypeId>,
-        e_fields: Vec<(&'src str, Id, Span)>,
+        e_fields: Vec<(&'src str, Id, Span, Span)>,
         fields_span: Span,
     ) -> Self {
         Self {
@@ -18671,6 +18677,16 @@ impl<'src> Analyzer<'src> {
                     .0
                     .iter()
                     .map(|x| {
+                        // The field's NAME always leads its entry, both in
+                        // `name: value` and in the shorthand `name` alone —
+                        // `x.1` is the whole entry's span either way, so the
+                        // name's own span is that span's first `name.len()`
+                        // bytes (E58: the unknown-field diagnostic anchors
+                        // here, not on the value).
+                        let name_span = Span {
+                            start: x.1.start,
+                            end: x.1.start + x.0.0.len(),
+                        };
                         (
                             x.0.0,
                             x.0.1
@@ -18687,6 +18703,7 @@ impl<'src> Analyzer<'src> {
                                     local_id
                                 }),
                             x.0.1.as_ref().map(|y| y.1).unwrap_or(x.1),
+                            name_span,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -26419,7 +26436,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         let mut deferred = false;
-        for (field_name, field_value, field_value_span) in &constraint.fields {
+        for (field_name, field_value, field_value_span, field_name_span) in &constraint.fields {
             let field = struct_fields
                 .iter()
                 .enumerate()
@@ -26427,9 +26444,24 @@ impl<'src> Analyzer<'src> {
             let (struct_field_index, struct_field) = match field {
                 Some(field) => field,
                 None => {
+                    // E58: a name close enough to be a plausible typo of a
+                    // REAL field rides as a note — the scan runs only here,
+                    // once the plain lookup above has already failed, so a
+                    // correctly-named initializer never pays for it.
+                    let note = closest_name::closest_name(
+                        field_name,
+                        struct_fields.iter().map(|field| field.name),
+                    )
+                    .map(|suggestion| {
+                        Note::here(*field_name_span, format!("did you mean `{suggestion}`?"))
+                    });
                     self.diagnostics.push(Error {
-                        note: None,
-                        span: *field_value_span,
+                        note,
+                        // The NAME's span, not the value's (E58 — see
+                        // `StructInitializerConstraint::fields`'s doc): the
+                        // field itself is what doesn't exist, and this is
+                        // also the span the closest-name quickfix rewrites.
+                        span: *field_name_span,
                         msg: format!("struct '{}' has no field '{}'", struct_name, field_name),
                     });
                     continue;
@@ -26500,7 +26532,8 @@ impl<'src> Analyzer<'src> {
             .iter()
             .any(|parameter| !substitution_context.contains_key(parameter))
         {
-            for (field_name, field_value, _field_value_span) in &constraint.fields {
+            for (field_name, field_value, _field_value_span, _field_name_span) in &constraint.fields
+            {
                 let Some(struct_field) = struct_fields
                     .iter()
                     .find(|field| *field.name == **field_name)
