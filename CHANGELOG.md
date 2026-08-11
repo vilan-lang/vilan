@@ -100,6 +100,12 @@ Nothing in the standard library, the examples, the documentation, or the regress
 
 ---
 
+**Completion holds still while you type, like every other editor feature.** The language server keeps two views of an open file — the text you are editing and the text it last analyzed — and every feature built from analysis is supposed to answer in the older text's coordinates until the newer analysis lands, a few dozen milliseconds later. Completion was the one exception: it converted the cursor straight through the *current* buffer's coordinates and fed that offset to the scope and receiver lookups, which are answered from the analysis. While the two stayed in step — the common case — nothing showed. Mid-edit, an unrelated change elsewhere in the file (anything typed above the cursor, including on an earlier line) could resolve the cursor's scope wrong, so completion silently offered a different set of names than the ones actually in scope, or a `.` resolved a stale receiver's members instead of the one you are looking at.
+
+The one part of completion that legitimately reads the buffer you are mid-keystroke in — deciding whether the cursor sits right after `.`, `?.`, or `::` — is unchanged; that decision is about the character just typed and always answers correctly. Only the lookups that walk the analyzed program now convert the cursor through the analyzed text first, the same conversion hover, go-to-definition, references, rename, the outline, and inlay hints already made.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
