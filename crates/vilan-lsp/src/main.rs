@@ -2832,6 +2832,73 @@ mod snapshot_consistency_tests {
         );
     }
 
+    // E52×E53, the union case: code-position `Name::` completion resolves the
+    // left segment through the SCOPE CHAIN (`namespace_in_scope`, E53) — an
+    // analyzed-space lookup born on a branch that never saw E52's conversion,
+    // so their composition is the one place the live offset could leak back
+    // in. The fixture's enum lives inside a `mod`, reachable only through the
+    // mod's own scope: a skewed live offset resolves the cursor into (or past)
+    // the LAST function's scope via `scope_at`'s nearest-before fallback,
+    // where `Palette` is not a name at all and the answer collapses to empty.
+    #[tokio::test]
+    async fn path_completion_answers_the_analyzed_snapshot_while_typing() {
+        const PATH_SOURCE: &str = "mod colors {\n\tenum Palette { Red, Blue }\n\tfun inside(): i32 {\n\t\tlet pick = Palette::Red;\n\t\t1\n\t}\n}\n\nfun outside(): i32 {\n\tlet unrelated = 100;\n\tunrelated\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(PATH_SOURCE));
+        // Right after `Palette::`, before `Red` — a path trigger inside the mod.
+        let position = position_at(PATH_SOURCE, "Palette::Red", 9);
+        let params = |uri: &Url| CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let baseline = backend.completion(params(&uri)).await.expect("completion");
+        let labels_of = |response: &Option<CompletionResponse>| match response {
+            Some(CompletionResponse::Array(items)) => items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels_of(&baseline).contains(&"Red".to_string()),
+            "the fixture must offer the mod-scoped enum's variants: {baseline:?}",
+        );
+        // Widen the first line by 80 bytes — the cursor's line/column never
+        // move, so the live trigger scan still finds the same `::` and the
+        // same `Palette`, isolating the divergence to the scope resolution.
+        let edited =
+            PATH_SOURCE.replacen("mod colors", &format!("mod {}colors", "x".repeat(80)), 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&edited);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert_ne!(
+                document.analyzed_offset(position),
+                document.line_index.offset(position),
+                "the fixture must skew the inbound conversion at {position:?}",
+            );
+        }
+        let mid_edit = backend
+            .completion(params(&uri))
+            .await
+            .expect("completion mid-edit");
+        assert_eq!(
+            labels_of(&baseline),
+            labels_of(&mid_edit),
+            "the mod-scoped namespace still resolves from the analyzed snapshot",
+        );
+    }
+
     // E52: the `.`/`?.`/`::` trigger scan itself must stay LIVE — the fix
     // converts only the downstream scope/entity lookups. A `.` typed on a line
     // that exists ONLY in the live buffer (appended after the last analysis

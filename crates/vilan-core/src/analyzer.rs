@@ -2405,24 +2405,122 @@ pub struct Analyzer<'src> {
 
 static EMPTY_SPAN: Span = Span { start: 0, end: 0 };
 
-// Flattens an `import`/`use` tree into (path, leaf-name) pairs, e.g.
-// `a::{ b, c::d }` becomes `([a], b)` and `([a, c], d)`.
-/// Whether `op` is an arithmetic operator that a type can overload by
-/// implementing the corresponding `std::operators` trait.
-/// The top-level names a module's items declare — what an `import` can name.
-/// Feeds the B4 import steer's std index; wrappers unwrap, variants are not
-/// leaf-importable and stay out.
-fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>) {
+/// One name an `import` may bind from a module, with what it names and — for an
+/// enum — the variants a further path segment reaches
+/// (`std::option::Option::Some`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Importable<'src> {
+    pub name: &'src str,
+    pub kind: ImportableKind,
+    /// An enum's variant names, in declaration order. Empty for every other kind
+    /// — an enum is the only member whose own namespace an import may descend
+    /// into (`resolve_import` descends through `Expr::Module` and `Expr::Enum`,
+    /// and a module's sub-modules register flat under their package, never
+    /// inside it).
+    pub variants: Vec<&'src str>,
+}
+
+/// What an [`Importable`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportableKind {
+    Function,
+    Macro,
+    Struct,
+    Enum,
+    Trait,
+    /// A module-level `let` — a constant or a shared value.
+    Value,
+    /// A nested `mod` block.
+    Module,
+    /// A name the module RE-EXPORTS (`export import pkg::io::print`) rather than
+    /// declares. std's `lib.vl` is nothing but these.
+    Reexport,
+}
+
+/// Every name a module's top level makes importable: its declarations and its
+/// explicit re-exports.
+///
+/// A plain `import`/`use` at a module's top level also lands in that module's
+/// scope, so `resolve_import` would accept it through this module too — that is
+/// deliberately **not** offered here. Naming a module's own implementation
+/// imports through it is an accident of how it is written, and the B4 import
+/// steer already draws exactly this line (`import_steer_inner` skips entities
+/// whose source is not the module's own). `export import` is the opposite case:
+/// the module is publishing the name on purpose, and std's `lib.vl` — which
+/// declares nothing at all — is entirely made of them.
+fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'src>>) {
     for item in items {
-        match unwrap_item(item) {
-            Node::Func(function) | Node::MacroFun(function) => out.push(function.name.0),
-            Node::Struct(name, ..) | Node::Enum(name, ..) | Node::Trait(name, ..) => {
-                out.push(name.0)
+        if let Node::Export(inner) = &item.0 {
+            if let Node::Import(branch) | Node::Use(branch) = &inner.0 {
+                let mut entries = Vec::new();
+                flatten_namespace_branch(branch, Vec::new(), &mut entries);
+                for (path, leaf, _) in entries {
+                    // A `self` leaf re-binds the namespace it sits in
+                    // (`Option::{ self }` publishes `Option`), exactly as
+                    // `resolve_import` reads it.
+                    let name = if leaf == "self" {
+                        match path.last() {
+                            Some((last, _)) => *last,
+                            None => continue,
+                        }
+                    } else {
+                        leaf
+                    };
+                    out.push(Importable {
+                        name,
+                        kind: ImportableKind::Reexport,
+                        variants: Vec::new(),
+                    });
+                }
+                continue;
             }
-            Node::Let(name, ..) => out.push(name.0),
-            _ => {}
         }
+        let (name, kind, variants) = match unwrap_item(item) {
+            Node::Func(function) => (function.name.0, ImportableKind::Function, Vec::new()),
+            Node::MacroFun(function) => (function.name.0, ImportableKind::Macro, Vec::new()),
+            Node::Struct(name, ..) => (name.0, ImportableKind::Struct, Vec::new()),
+            Node::Enum(name, _, _, variants) => (
+                name.0,
+                ImportableKind::Enum,
+                variants.0.iter().map(|variant| variant.0.0).collect(),
+            ),
+            Node::Trait(name, ..) => (name.0, ImportableKind::Trait, Vec::new()),
+            Node::Let(name, ..) => (name.0, ImportableKind::Value, Vec::new()),
+            Node::Module(name, _) => (*name, ImportableKind::Module, Vec::new()),
+            _ => continue,
+        };
+        out.push(Importable {
+            name,
+            kind,
+            variants,
+        });
     }
+}
+
+/// The top-level names a module's items DECLARE — the B4 import steer's view of
+/// [`collect_importables`]. A re-export and a nested `mod` are importable but do
+/// not steer: the steer answers "which module defines this name", and pointing
+/// at a module that merely forwards it (or at a block inside another file) would
+/// name the wrong file. Widening it is its own decision, taken there.
+fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>) {
+    let mut importables = Vec::new();
+    collect_importables(items, &mut importables);
+    out.extend(
+        importables
+            .iter()
+            .filter(|importable| {
+                matches!(
+                    importable.kind,
+                    ImportableKind::Function
+                        | ImportableKind::Macro
+                        | ImportableKind::Struct
+                        | ImportableKind::Enum
+                        | ImportableKind::Trait
+                        | ImportableKind::Value
+                )
+            })
+            .map(|importable| importable.name),
+    );
 }
 
 /// Strips a top-level item's wrappers (`export`, a derive, a service, a macro
@@ -2627,6 +2725,8 @@ fn operator_trait_method(op: BinaryOp) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Flattens an `import`/`use` tree into (path, leaf-name) pairs, e.g.
+/// `a::{ b, c::d }` becomes `([a], b)` and `([a, c], d)`.
 pub(crate) fn flatten_namespace_branch<'src>(
     branch: &ImportBranch<'src>,
     path: Vec<(&'src str, Span)>,
@@ -31277,7 +31377,12 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// directory Rust cannot spell in UTF-8 still opens. The NAME must be `str` — a
 /// module name is a vilan identifier, and a non-UTF-8 file stem can never be
 /// one, so such a file is deliberately not listed as a module.
-fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
+///
+/// The listing is of the DIRECTORY, not of an import namespace: `lib.vl` is
+/// listed under the name `lib`, because that is what the directory holds. A
+/// caller offering module names to a user filters it out (it is the package's
+/// surface, integrated into the package name itself).
+pub fn modules_in_root(root: &Path) -> Vec<(String, PathBuf)> {
     let mut modules = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return modules;
@@ -31431,7 +31536,12 @@ impl PackageSpec {
     /// matching layers (most-specific first, shadowing the base), then the base,
     /// then the *non-matching* layers last — so a cross-platform module still loads
     /// for typing (its cross-platform import having been reported at the `import`).
-    fn search_roots(&self, platform: Platform) -> Vec<&Path> {
+    ///
+    /// Public because it IS the answer to "what may an import name here": the
+    /// language server enumerates its candidates from the same ordered roots the
+    /// loader resolves through, so completion and resolution can never disagree
+    /// about which layer a module comes from.
+    pub fn search_roots(&self, platform: Platform) -> Vec<&Path> {
         let mut roots: Vec<&Path> = self
             .matching_layers(platform)
             .into_iter()
@@ -31472,6 +31582,32 @@ fn resolve_module_in_roots(roots: &[&Path], name: &str) -> Option<ModuleResoluti
     roots
         .iter()
         .find_map(|root| resolve_module_file(root, name))
+}
+
+/// The source file module `name` resolves to under `roots` — the loader's own
+/// resolution ([`resolve_module_in_roots`]), exposed for callers that need the
+/// file without loading the module: the language server's import-path
+/// completion, which must reach a module the program never loaded.
+pub fn module_source_file(roots: &[&Path], name: &str) -> Option<PathBuf> {
+    resolve_module_in_roots(roots, name).map(|resolution| resolution.path)
+}
+
+/// Every name an `import` may bind from the module file at `path`, loaded ON
+/// DEMAND — the point of an import is to reach something the program has not
+/// loaded, so the analyzed `Program` cannot answer this.
+///
+/// It is the loader's own read of a module ([`load_package_module`]), which
+/// means it goes through the process-global, content-keyed parse cache and the
+/// open-document overlay: a module is parsed once per distinct content for the
+/// whole process, and an editor query for a module the user is editing sees the
+/// unsaved buffer. A file that cannot be read answers empty — an editor query
+/// must degrade, never fail.
+pub fn module_importables(path: &Path) -> Vec<Importable<'static>> {
+    let mut importables = Vec::new();
+    if let Some(loaded) = load_package_module(path) {
+        collect_importables(&loaded.ast.0, &mut importables);
+    }
+    importables
 }
 
 /// The dependency graph available to a program: the flat set of reachable

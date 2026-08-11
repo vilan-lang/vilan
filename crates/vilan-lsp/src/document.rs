@@ -15,8 +15,8 @@ use vilan_core::node::Convention;
 use vilan_core::token::Token;
 use vilan_core::type_::Type;
 use vilan_core::{
-    Error, Manifest, Platform as BuildPlatform, Program, Span, Workspace as BuildWorkspace,
-    analyze_source,
+    Error, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
+    Workspace as BuildWorkspace, analyze_source,
 };
 
 use crate::line_index::LineIndex;
@@ -45,6 +45,63 @@ impl ProjectContext {
             pkg_root: None,
             workspace: BuildWorkspace::default(),
             manifest_problem: None,
+        }
+    }
+}
+
+/// The package roots an `import`/`use` path in this file resolves against, kept
+/// from the analysis that produced the `Program` (E57).
+///
+/// Import-path completion cannot read its candidates out of the `Program`: the
+/// point of an import is to reach a module that has NOT been loaded, and the
+/// head of the path names an *origin* — `std`, `pkg`, a dependency package —
+/// which is not an entity at all. So it reads the package tree, and it must read
+/// the same tree the loader would: these are the very values
+/// `analyze_on_this_thread` handed to `analyze_source`, kept instead of dropped.
+///
+/// The platform is not among them — it selects which of a library's layers a
+/// module resolves from, and the analysis records the one it settled on as
+/// `Program::platform`.
+struct ImportRoots {
+    /// The `std` library's layered spec (`resolve_std`).
+    std: PackageSpec,
+    /// Where `import pkg::..` siblings live — this file's package source root.
+    pkg_root: PathBuf,
+    /// The entry package's direct dependencies, each under the name an import
+    /// addresses it by.
+    dependencies: Vec<(String, PackageSpec)>,
+}
+
+impl ImportRoots {
+    /// The source roots `origin::` resolves its modules from, in the loader's
+    /// own order, together with the package SURFACE (`lib.vl`) that origin
+    /// publishes. `None` when `origin` names no origin.
+    ///
+    /// A library has a surface — `import std::print` names a leaf of std's
+    /// `lib.vl`, which declares nothing and re-exports everything. The entry
+    /// package does not: a `[package]` has a `main.vl`, and its modules are
+    /// addressed by path. This mirrors the loader exactly, which searches the
+    /// layered `search_roots` for `std` and a dependency, and the single
+    /// `pkg_root` for the entry's own `pkg::`.
+    fn origin_roots(
+        &self,
+        origin: &str,
+        platform: BuildPlatform,
+    ) -> Option<(Vec<&Path>, Option<PathBuf>)> {
+        fn library(spec: &PackageSpec, platform: BuildPlatform) -> (Vec<&Path>, Option<PathBuf>) {
+            (
+                spec.search_roots(platform),
+                spec.surface.then(|| spec.base_root.join("lib.vl")),
+            )
+        }
+        match origin {
+            "std" => Some(library(&self.std, platform)),
+            "pkg" => Some((vec![self.pkg_root.as_path()], None)),
+            _ => self
+                .dependencies
+                .iter()
+                .find(|(name, _)| name == origin)
+                .map(|(_, spec)| library(spec, platform)),
         }
     }
 }
@@ -690,21 +747,81 @@ fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
 
 /// Whether `offset` sits inside a `use`/`import` item — where a name is being
 /// bound into scope, not called, so even a function completes to a bare name
-/// (`use std::math::sqrt`, not `sqrt(…)`). Imports are single-line,
-/// newline-terminated items, so this reads the current line's leading keyword
-/// (a leading `export` prefix — `export import …` — is skipped). Multi-line
-/// braced groups past their first line are not recognized; the corpus has none.
+/// (`use std::math::sqrt`, not `sqrt(…)`), and where the candidates themselves
+/// come from the package tree rather than from scope (E57).
 fn in_import_path(text: &str, offset: usize) -> bool {
+    import_path_prefix(text, offset).is_some()
+}
+
+/// The import path typed so far on the line ending at `offset` — everything
+/// after the `import`/`use` keyword — or `None` when the line is not an import
+/// item.
+///
+/// Imports are single-line, newline-terminated items, so this reads the current
+/// line's leading keyword (a leading `export` prefix — `export import …` — is
+/// skipped). Multi-line braced groups past their first line are not recognized;
+/// the corpus has none.
+fn import_path_prefix(text: &str, offset: usize) -> Option<&str> {
     let offset = offset.min(text.len());
     let line_start = text[..offset].rfind('\n').map(|at| at + 1).unwrap_or(0);
-    let mut words = text[line_start..offset].split_whitespace();
-    let first = words.next().unwrap_or("");
-    let keyword = if first == "export" {
-        words.next().unwrap_or("")
-    } else {
-        first
+    let mut line = text[line_start..offset].trim_start();
+    if let Some(after_export) = strip_keyword(line, "export") {
+        line = after_export.trim_start();
+    }
+    let after_keyword = strip_keyword(line, "import").or_else(|| strip_keyword(line, "use"))?;
+    Some(after_keyword.trim_start())
+}
+
+/// `text` with a leading `keyword` removed — only when it stands there as a
+/// WHOLE word, so `imported = 5` is an assignment and `used` is a name.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    match rest.as_bytes().first() {
+        Some(byte) if is_identifier_byte(*byte) => None,
+        _ => Some(rest),
+    }
+}
+
+/// The import path's COMPLETED segments to the left of the cursor — the partial
+/// name being typed is never one of them, so `import std::js|` yields `["std"]`
+/// and `import s|` yields `[]`.
+///
+/// A brace set completes at the same level as the path before it: every leaf in
+/// `import std::json::{ Json, |` is one more member of `std::json`, so the
+/// innermost open brace splits the path from the partial name exactly as the
+/// final `::` does otherwise — which is what makes brace-position completion
+/// fall out of the routing rather than need its own machinery.
+///
+/// `None` when the line is not an import path, or when a segment is not an
+/// identifier (a nested brace set, a half-typed operator): completion answers
+/// nothing rather than guessing at a shape it does not understand.
+fn import_path_segments(text: &str, offset: usize) -> Option<Vec<&str>> {
+    let prefix = import_path_prefix(text, offset)?;
+    let (path, in_braces) = match prefix.rfind('{') {
+        Some(brace) => (&prefix[..brace], true),
+        None => (prefix, false),
     };
-    keyword == "import" || keyword == "use"
+    let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+    if in_braces {
+        // The text before a brace ends at its `::`, leaving a trailing empty
+        // piece; a brace directly after the keyword (`import { … }`) leaves the
+        // whole path empty.
+        segments.retain(|segment| !segment.is_empty());
+    } else {
+        // The last piece is the partial name under the cursor — empty right
+        // after a `::`, and never a completed segment.
+        segments.pop();
+    }
+    segments
+        .iter()
+        .all(|segment| is_identifier(segment))
+        .then_some(segments)
+}
+
+/// Whether `name` is a vilan identifier — a non-empty run of identifier bytes
+/// that does not start with a digit.
+fn is_identifier(name: &str) -> bool {
+    !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_identifier_byte)
 }
 
 /// Clamp a rendered hover preview to its display budget, cutting at a char
@@ -809,6 +926,11 @@ pub struct Document {
     /// The `vilan.toml` failure behind this analysis, if any — published as one
     /// diagnostic on the manifest itself (see [`ManifestProblem`]).
     manifest_problem: Option<ManifestProblem>,
+    /// What an `import`/`use` path in this file can reach (E57) — the analysis's
+    /// own `std` spec, package root, and dependency packages, kept so completion
+    /// can enumerate modules the `Program` never loaded. `None` on the degraded
+    /// internal-error document, which resolved nothing.
+    import_roots: Option<ImportRoots>,
 }
 
 /// A semantic-token classification (E2): precision highlighting from the
@@ -1008,6 +1130,7 @@ impl Document {
             retained_tail_start: usize::MAX,
             platform_requirements: HashMap::default(),
             manifest_problem: None,
+            import_roots: None,
         }
     }
 
@@ -1035,6 +1158,22 @@ impl Document {
         // `std` is resolved as a library (its layered roots) from the std directory
         // — the manifest when present, else a bare base layer (L2).
         let std = vilan_core::manifest::resolve_std(std_dir);
+        // The same roots the analysis just resolved, kept for import-path
+        // completion — which reaches modules the analysis never loaded, so the
+        // `Program` cannot tell it where they live (E57).
+        let import_roots = ImportRoots {
+            std: std.clone(),
+            pkg_root: pkg_root.clone(),
+            dependencies: context
+                .workspace
+                .entry_dependencies
+                .iter()
+                .filter_map(|(name, index)| {
+                    let spec = context.workspace.packages.get(*index)?;
+                    Some((name.clone(), spec.clone()))
+                })
+                .collect(),
+        };
         let (program, diagnostics) = analyze_source(
             leaked,
             &std,
@@ -1098,6 +1237,7 @@ impl Document {
             retained_tail_start: usize::MAX,
             platform_requirements,
             manifest_problem,
+            import_roots: Some(import_roots),
         }
     }
 
@@ -1403,6 +1543,7 @@ impl Document {
             entity_spans,
             platform_requirements,
             manifest_problem,
+            import_roots,
         } = analysis;
         // The analysis side, in full.
         self.analyzed_index = analyzed_index;
@@ -1415,6 +1556,7 @@ impl Document {
         self.entity_spans = entity_spans;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
+        self.import_roots = import_roots;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -2695,7 +2837,16 @@ impl Document {
         if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
             return self.macro_name_completions(program);
         }
-        let mut candidates = if start >= 1 && bytes[start - 1] == b'.' {
+        // An import path is its own world (E57): a name there is being reached
+        // FOR THE FIRST TIME, so none of the in-scope machinery below applies —
+        // candidates come from the package tree, and the head of the path names
+        // an origin (`std`, `pkg`, a dependency), which is not an entity at all.
+        // This check routes the GATHERING; the shaping post-pass below is the
+        // separate, older use of it.
+        let in_import = in_import_path(text, offset);
+        let mut candidates = if in_import {
+            self.import_completions(program, text, offset)
+        } else if start >= 1 && bytes[start - 1] == b'.' {
             // `a?.` completes on the LIFTED element (`Option<Profile>` offers
             // Profile's members — proposal/try-and-lift.md §5).
             if start >= 2 && bytes[start - 2] == b'?' {
@@ -2704,7 +2855,7 @@ impl Document {
                 self.member_completions(program, start - 1)
             }
         } else if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
-            self.path_completions(program, text, start - 2)
+            self.code_path_completions(program, text, start - 2)
         } else {
             // No member/path trigger: the cursor's own scope, resolved in
             // ANALYZED space (E52) — `path_completions` needs no such
@@ -2719,10 +2870,10 @@ impl Document {
         // for every candidate; the signature and docs still show (WO-3 escape
         // hatches).
         let next_is_open_paren = bytes.get(offset).copied() == Some(b'(');
-        let in_import = in_import_path(text, offset);
         // An import path takes names, so the construct snippets (`for …`,
-        // `fun …`) have no business there — drop them entirely (E14). (Member
-        // and path positions never produce snippets in the first place.)
+        // `fun …`) have no business there — drop them entirely (E14). Import
+        // completion no longer produces any (it never reaches
+        // `scope_completions`), so this now only guards the invariant.
         if in_import {
             candidates.retain(|candidate| !matches!(candidate.kind, CompletionKind::Snippet));
         }
@@ -2908,10 +3059,71 @@ impl Document {
         best.map(|(_, id)| id)
     }
 
-    /// Items reachable through `left::` — an enum's variants and methods, a
-    /// struct's methods, or a module's members — where `left` is the identifier
-    /// ending just before the `::` at `colon_offset`.
-    fn path_completions(
+    /// Candidates for an `import`/`use` path (E57), routed by how many segments
+    /// precede the cursor:
+    ///
+    /// - **none** (`import |`, `import s|`) — the ORIGINS: `std`, `pkg`, and
+    ///   each dependency package's import name. Not the names in scope, not the
+    ///   keywords, not the construct snippets — none of them may follow
+    ///   `import`, and offering them is what the head position did before.
+    /// - **one** (`import std::|`) — that origin's modules, enumerated from its
+    ///   source roots, plus the package's own `lib.vl` surface where it has one
+    ///   (`import std::print`).
+    /// - **two or more** (`import std::json::|`) — the named module's importable
+    ///   names, LOADED ON DEMAND. The point of an import is to reach a module
+    ///   the program has not loaded, so the analyzed `Program` cannot answer;
+    ///   the load is the loader's own, through its content-keyed parse cache.
+    ///   A further segment descends into an enum's variants
+    ///   (`import std::option::Option::Some`), the only namespace past a module
+    ///   that `resolve_import` descends into.
+    ///
+    /// A head naming none of the origins falls back to the whole-`Program`
+    /// lookup by name — that is what serves a same-file `mod` block
+    /// (`import geometry::area`), and global reach is correct HERE, which is the
+    /// half of E53's split that stays.
+    ///
+    /// Anything that does not resolve answers EMPTY. A completion request is
+    /// answered on the editor's critical path: it never errors, and a module
+    /// that is not there is simply not offered.
+    fn import_completions(&self, program: &Program, text: &str, offset: usize) -> Vec<Completion> {
+        let Some(segments) = import_path_segments(text, offset) else {
+            return Vec::new();
+        };
+        let Some(roots) = self.import_roots.as_ref() else {
+            // The degraded internal-error document resolved no package tree, so
+            // there is nothing to enumerate.
+            return Vec::new();
+        };
+        let Some((origin, rest)) = segments.split_first() else {
+            return origin_completions(roots);
+        };
+        let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
+            // Not an origin — a same-file `mod`, or a namespace already in the
+            // program under some other name. The last segment is the namespace
+            // being descended into, which is all the by-name lookup reads.
+            return self.namespace_completions_by_name(program, rest.last().unwrap_or(origin));
+        };
+        match rest.split_first() {
+            None => origin_member_completions(&module_roots, surface.as_deref()),
+            Some((module, past_module)) => {
+                module_member_completions(&module_roots, module, past_module)
+            }
+        }
+    }
+
+    /// Items reachable through `left::` in CODE — an enum's variants and
+    /// statics, a struct's statics, or a module's members — where `left` is the
+    /// identifier ending just before the `::` at `colon_offset`.
+    ///
+    /// `left` is resolved THROUGH SCOPE (E53). Matching it against every loaded
+    /// module's declarations by name, which is what this did, offered whatever
+    /// any module in the process happened to declare — and nine std modules are
+    /// ALWAYS loaded for the derive prelude, so `Json::` completed `parse`,
+    /// `stringify`, and friends in a file that never imported `std::json`. An
+    /// import path is the opposite case, where reaching what is not in scope is
+    /// the entire point; it is served by [`Self::import_completions`], which
+    /// keeps the by-name lookup ([`Self::namespace_completions_by_name`]).
+    fn code_path_completions(
         &self,
         program: &Program,
         text: &str,
@@ -2920,31 +3132,87 @@ impl Document {
         let Some(left) = identifier_ending_at(text, colon_offset) else {
             return Vec::new();
         };
+        let analyzed_offset = self.to_analyzed_offset(colon_offset);
+        let Some(namespace) = self.namespace_in_scope(program, left, analyzed_offset) else {
+            return Vec::new();
+        };
+        self.namespace_completions(program, namespace)
+    }
+
+    /// The struct / enum / module `name` denotes at `analyzed_offset` — the
+    /// cursor's scope out to global: locals, parameters, this file's top-level
+    /// items, and everything a `use`/`import` bound.
+    ///
+    /// No same-file fallback of the kind [`Self::same_file_variable`] gives
+    /// member completion, and none is needed: a type is declared at a file's TOP
+    /// LEVEL, so it lives in the global scope that every scope chains to, and it
+    /// stays reachable however badly the cursor's own statement is mid-edit. The
+    /// fallback exists for member completion because a `let` binding lives in
+    /// the very scope a broken statement drops.
+    fn namespace_in_scope(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
+        self.binding_in_scope(program, name, analyzed_offset)
+            .filter(|id| self.is_namespace(program, *id))
+    }
+
+    /// Whether `id` names something a `::` path descends into.
+    fn is_namespace(&self, program: &Program, id: Id) -> bool {
+        program.enums.contains_key(&id)
+            || program.structs.contains_key(&id)
+            || program.modules.contains_key(&id)
+    }
+
+    /// The items `namespace::` offers: an enum's variants plus its statics, a
+    /// struct's statics, a module's members. Empty for anything else.
+    fn namespace_completions(&self, program: &Program, namespace: Id) -> Vec<Completion> {
         let mut items = Vec::new();
-        for (enum_id, enumeration) in &program.enums {
-            if enumeration.name == left {
-                for variant in &enumeration.variants {
-                    items.push(Completion::bare(
-                        variant.name.to_string(),
-                        CompletionKind::EnumVariant,
-                    ));
+        if let Some(enumeration) = program.enums.get(&namespace) {
+            for variant in &enumeration.variants {
+                items.push(Completion::bare(
+                    variant.name.to_string(),
+                    CompletionKind::EnumVariant,
+                ));
+            }
+            self.push_methods(program, namespace, false, &mut items);
+        } else if program.structs.contains_key(&namespace) {
+            self.push_methods(program, namespace, false, &mut items);
+        } else if let Some(module) = program.modules.get(&namespace) {
+            if let Some(scope) = program.scopes.get(&module.body.1) {
+                for (name, id) in &scope.name_to_id_map {
+                    let kind = self.kind_of(program, *id);
+                    items.push(self.entity_completion(program, name.to_string(), *id, kind));
                 }
-                self.push_methods(program, *enum_id, false, &mut items);
             }
         }
-        for (struct_id, structure) in &program.structs {
-            if structure.name == left {
-                self.push_methods(program, *struct_id, false, &mut items);
+        items
+    }
+
+    /// The items `name::` offers, looked up across the WHOLE program by name —
+    /// every loaded enum, struct, and module, in scope or not.
+    ///
+    /// Correct in an import path and wrong everywhere else (E53). An import is
+    /// how a name gets into scope, so requiring it to be in scope already would
+    /// answer nothing; and this is what serves a same-file `mod` block
+    /// (`import geometry::area`), whose namespace is not an origin's.
+    fn namespace_completions_by_name(&self, program: &Program, name: &str) -> Vec<Completion> {
+        let mut items = Vec::new();
+        for (id, enumeration) in &program.enums {
+            if enumeration.name == name {
+                items.extend(self.namespace_completions(program, *id));
             }
         }
-        for module in program.modules.values() {
-            if module.name == left {
-                if let Some(scope) = program.scopes.get(&module.body.1) {
-                    for (name, id) in &scope.name_to_id_map {
-                        let kind = self.kind_of(program, *id);
-                        items.push(self.entity_completion(program, name.to_string(), *id, kind));
-                    }
-                }
+        for (id, structure) in &program.structs {
+            if structure.name == name {
+                items.extend(self.namespace_completions(program, *id));
+            }
+        }
+        for (id, module) in &program.modules {
+            if module.name == name {
+                items.extend(self.namespace_completions(program, *id));
             }
         }
         items
@@ -3144,6 +3412,108 @@ impl Document {
 
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The origins an import path may start with: the two the loader always knows
+/// (`std`, `pkg`) plus every dependency package, under the name this file
+/// addresses it by (E57).
+fn origin_completions(roots: &ImportRoots) -> Vec<Completion> {
+    let mut items = vec![
+        Completion::bare("std".to_string(), CompletionKind::Module),
+        Completion::bare("pkg".to_string(), CompletionKind::Module),
+    ];
+    items.extend(
+        roots
+            .dependencies
+            .iter()
+            .map(|(name, _)| Completion::bare(name.clone(), CompletionKind::Module)),
+    );
+    items
+}
+
+/// What `origin::` offers: every module under the origin's source roots, in the
+/// loader's own root order (an earlier root shadows a later one, so a matching
+/// platform layer wins over the base), followed by the names its `lib.vl`
+/// surface publishes.
+fn origin_member_completions(module_roots: &[&Path], surface: Option<&Path>) -> Vec<Completion> {
+    let mut items = Vec::new();
+    let mut seen: HashSet<String> = HashSet::default();
+    for root in module_roots {
+        for (name, _path) in vilan_core::analyzer::modules_in_root(root) {
+            // `lib.vl` is the package's SURFACE, integrated into the package
+            // name itself — its members are offered right here, one loop down,
+            // and `import std::lib` is not how anyone reaches them.
+            if name == "lib" || !seen.insert(name.clone()) {
+                continue;
+            }
+            items.push(Completion::bare(name, CompletionKind::Module));
+        }
+    }
+    for importable in surface
+        .map(vilan_core::analyzer::module_importables)
+        .unwrap_or_default()
+    {
+        if seen.insert(importable.name.to_string()) {
+            items.push(importable_completion(&importable));
+        }
+    }
+    items
+}
+
+/// What `origin::module::` offers: the module's own importable names, read on
+/// demand from its source file. `past_module` are the segments beyond it — an
+/// enum name descends into that enum's variants, which is the only descent
+/// `resolve_import` makes past a module; anything deeper offers nothing.
+fn module_member_completions(
+    module_roots: &[&Path],
+    module: &str,
+    past_module: &[&str],
+) -> Vec<Completion> {
+    let Some(path) = vilan_core::analyzer::module_source_file(module_roots, module) else {
+        return Vec::new();
+    };
+    let importables = vilan_core::analyzer::module_importables(&path);
+    let Some((name, past_enum)) = past_module.split_first() else {
+        return importables.iter().map(importable_completion).collect();
+    };
+    if !past_enum.is_empty() {
+        return Vec::new();
+    }
+    importables
+        .iter()
+        .find(|importable| {
+            importable.name == *name
+                && importable.kind == vilan_core::analyzer::ImportableKind::Enum
+        })
+        .map(|enumeration| {
+            enumeration
+                .variants
+                .iter()
+                .map(|variant| Completion::bare(variant.to_string(), CompletionKind::EnumVariant))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One importable name as a completion candidate. Bare by construction — an
+/// import binds a name, it never calls it — so the shaping post-pass in
+/// [`Document::completion`] has nothing left to strip.
+fn importable_completion(importable: &vilan_core::analyzer::Importable) -> Completion {
+    use vilan_core::analyzer::ImportableKind;
+    let kind = match importable.kind {
+        ImportableKind::Function => CompletionKind::Function,
+        ImportableKind::Macro => CompletionKind::Macro,
+        ImportableKind::Struct => CompletionKind::Struct,
+        ImportableKind::Enum => CompletionKind::Enum,
+        ImportableKind::Trait => CompletionKind::Trait,
+        ImportableKind::Value => CompletionKind::Variable,
+        ImportableKind::Module => CompletionKind::Module,
+        // A re-export names whatever it points at, and the module file that
+        // publishes it does not say what that is — following the path to find
+        // out is a further load per candidate, deliberately not paid here.
+        ImportableKind::Reexport => CompletionKind::Variable,
+    };
+    Completion::bare(importable.name.to_string(), kind)
 }
 
 /// The nominal name in a rendered type label: `struct Point` -> `Point`,
@@ -5129,6 +5499,28 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("no `{label}` completion offered"))
     }
 
+    /// The completion labels at the `|` cursor in the FIRST of `files`, with the
+    /// whole set written to a real package directory on disk — what
+    /// [`completion_items_at_cursor`] cannot give, since `import pkg::…` needs
+    /// siblings to find and a sibling module needs a file.
+    fn workspace_completions_at_cursor(files: &[(&str, &str)]) -> Vec<String> {
+        let (entry_name, entry_source) = files[0];
+        let offset = entry_source
+            .find('|')
+            .expect("test source needs a `|` cursor marker");
+        let entry_text = entry_source.replace('|', "");
+        let mut written: Vec<(&str, &str)> = vec![(entry_name, &entry_text)];
+        written.extend_from_slice(&files[1..]);
+        let (directory, document) = analyze_workspace(&written);
+        let labels = document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        labels
+    }
+
     #[test]
     fn lifted_member_completion_offers_the_element() {
         let labels = completions_at_cursor(
@@ -5354,6 +5746,43 @@ pub(crate) mod tests {
         assert!(!in_import_path("used = 5", 8), "a word starting with `use`");
     }
 
+    // E57: the path split that routes every level of import completion. The
+    // partial name under the cursor is never a completed segment — that is what
+    // makes `import s|` a HEAD position and `import std::|` a one-segment one —
+    // and a brace set splits at its brace exactly as the path splits at `::`.
+    #[test]
+    fn import_path_segments_are_the_completed_ones() {
+        fn at_end(line: &str) -> Option<Vec<&str>> {
+            import_path_segments(line, line.len())
+        }
+        assert_eq!(at_end("import "), Some(vec![]), "the head, nothing typed");
+        assert_eq!(at_end("import s"), Some(vec![]), "the head, mid-word");
+        assert_eq!(at_end("import std::"), Some(vec!["std"]));
+        assert_eq!(at_end("import std::js"), Some(vec!["std"]), "mid-word");
+        assert_eq!(at_end("import std::json::"), Some(vec!["std", "json"]));
+        assert_eq!(
+            at_end("export import pkg::shapes::Point::"),
+            Some(vec!["pkg", "shapes", "Point"]),
+            "an `export` prefix is skipped, and the path runs as deep as it is typed"
+        );
+        assert_eq!(
+            at_end("import std::json::{ Json, J"),
+            Some(vec!["std", "json"]),
+            "a brace set is one more member of the namespace before it"
+        );
+        assert_eq!(
+            at_end("import std::{ "),
+            Some(vec!["std"]),
+            "a brace set directly under an origin"
+        );
+        assert_eq!(at_end("fun main() { sqrt"), None, "not an import line");
+        assert_eq!(
+            at_end("import std::{ json::{ pa"),
+            None,
+            "a nested brace set is a shape this does not read — it guesses at nothing"
+        );
+    }
+
     // E14: at a scope position (an open function body) each shape-heavy
     // construct completes as a SNIPPET-kind template carrying its exact
     // tab-stopped body. The bodies are pinned verbatim — house style (tab
@@ -5430,18 +5859,18 @@ pub(crate) mod tests {
         );
     }
 
-    // E14: an import path (`import st|`, which reaches scope completion — the
-    // char before `st` is a space) offers no construct snippets; the post-pass
-    // drops them. Bare keywords survive (so the list is non-vacuous), proving
-    // the drop is targeted at snippets, not the whole list.
+    // E14: an import path (`import st|`) offers no construct snippets. It once
+    // reached `scope_completions` and had them dropped by a post-pass; E57
+    // routes it to import completion instead, which never produces one. The
+    // non-vacuity witness moves with it: the list is the ORIGINS now, not the
+    // keywords, because a keyword may not follow `import` either — which is the
+    // same argument E14 made about the snippets, carried to its conclusion.
     #[test]
     fn construct_snippets_are_absent_in_import_path() {
         let items = completion_items_at_cursor("import st|\nfun main() {}\n");
         assert!(
-            items
-                .iter()
-                .any(|c| matches!(c.kind, CompletionKind::Keyword)),
-            "the import-path completion still ran (keywords present): {:?}",
+            items.iter().any(|c| c.label == "std"),
+            "the import-path completion still ran (origins present): {:?}",
             items.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
         assert!(
@@ -5797,6 +6226,254 @@ pub(crate) mod tests {
         assert!(
             !labels.contains(&"bump".to_string()),
             "instance excluded: {labels:?}"
+        );
+    }
+
+    // --- E53: a code-position `Name::` answers from SCOPE, not from every
+    // module the process happens to have loaded ---
+
+    // The headline case. `compare.vl` is one of the nine std modules the loader
+    // ALWAYS pulls in for the derive prelude, so its `enum Ordering` sits in
+    // every program ever analyzed — and matching the left of `::` against
+    // `program.enums` by name offered its variants in a file that had never
+    // heard of `std::compare`.
+    #[test]
+    fn code_path_completion_excludes_the_always_loaded_prelude() {
+        let labels = completions_at_cursor("fun main() {\n\tlet o = Ordering::|\n}\n");
+        assert!(
+            !labels.contains(&"Less".to_string()),
+            "`std::compare` was never imported: {labels:?}"
+        );
+        let json = completions_at_cursor("fun main() {\n\tlet k = JsonKind::|\n}\n");
+        assert!(
+            !json.contains(&"Number".to_string()),
+            "`std::json` was never imported: {json:?}"
+        );
+    }
+
+    // The same exclusion for a type in the user's own package: a sibling module
+    // is loaded (the entry imports something else from it) and declares `Color`,
+    // but this file never brought `Color` into scope.
+    #[test]
+    fn code_path_completion_excludes_an_unimported_same_named_type() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "import pkg::palette::shade;\nfun main() {\n\tlet c = Color::|\n}\n",
+            ),
+            (
+                "palette.vl",
+                "enum Color { Red, Green, Blue }\nfun shade(): i32 { 1 }\n",
+            ),
+        ]);
+        assert!(
+            !labels.contains(&"Red".to_string()),
+            "`Color` is declared in a loaded module but never imported here: {labels:?}"
+        );
+    }
+
+    // The flip side, and the reason the exclusion is a scope question rather
+    // than a "std is off limits" rule: import the very same type and it
+    // completes.
+    #[test]
+    fn code_path_completion_includes_an_imported_type() {
+        let labels = completions_at_cursor(
+            "import std::compare::Ordering;\nfun main() {\n\tlet o = Ordering::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Less".to_string()),
+            "an imported enum completes: {labels:?}"
+        );
+        let workspace = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "import pkg::palette::Color;\nfun main() {\n\tlet c = Color::|\n}\n",
+            ),
+            ("palette.vl", "enum Color { Red, Green, Blue }\n"),
+        ]);
+        assert!(
+            workspace.contains(&"Red".to_string()),
+            "an imported package enum completes: {workspace:?}"
+        );
+    }
+
+    // A type declared in the file being edited is in scope by declaration, and
+    // stays so even when the cursor's own statement has not parsed — the case
+    // `same_file_namespace` exists for, and the one a naive scope-only rule
+    // would have broken.
+    #[test]
+    fn code_path_completion_survives_an_unparsed_statement() {
+        let labels = completions_at_cursor(
+            "enum Color { Red, Green, Blue }\nfun main() {\n\tlet c = ((( Color::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Red".to_string()),
+            "a locally-declared enum completes mid-edit: {labels:?}"
+        );
+    }
+
+    // --- E57: import-path completion ---
+
+    // The head of an import path names an ORIGIN, which is not an entity: no
+    // lookup against the program can ever answer it, which is why `import std::`
+    // completed nothing at all. It offers the origins, and only those — a
+    // keyword, a construct snippet, and a name in scope are all ungrammatical
+    // after `import`.
+    #[test]
+    fn import_head_offers_the_origins_and_nothing_else() {
+        let items =
+            completion_items_at_cursor("fun helper() {}\nimport |\nfun main() { helper(); }\n");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"std"), "the std origin: {labels:?}");
+        assert!(labels.contains(&"pkg"), "the pkg origin: {labels:?}");
+        assert!(
+            !labels.contains(&"fun"),
+            "a keyword may not follow `import`: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"helper"),
+            "a name in scope may not follow `import`: {labels:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Snippet)),
+            "no construct snippets: {labels:?}"
+        );
+    }
+
+    // `import std::` lists the std tree — the embedded/checked-out std the
+    // analysis itself resolved, enumerated from its layered roots. Asserted by
+    // membership, never as a frozen list: std grows.
+    #[test]
+    fn import_lists_the_std_modules() {
+        let labels = completions_at_cursor("import std::|\nfun main() {}\n");
+        for module in ["json", "math", "option", "list"] {
+            assert!(
+                labels.contains(&module.to_string()),
+                "`std::{module}` is a module: {labels:?}"
+            );
+        }
+        // A layer directory is not a path segment: `src/process/fs.vl` is
+        // `std::fs`, and `process` is a module in its own right, not a namespace.
+        assert!(
+            labels.contains(&"fs".to_string()),
+            "a layered module lists under its own name: {labels:?}"
+        );
+        // `lib.vl` is the package SURFACE, not a module of it — and its
+        // re-exports are offered right here, under the origin.
+        assert!(
+            !labels.contains(&"lib".to_string()),
+            "`import std::lib` is not a thing: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"print".to_string()),
+            "std's `lib.vl` surface is reachable as `std::print`: {labels:?}"
+        );
+    }
+
+    // `import pkg::` lists the package's OWN source files, by the same names the
+    // module loader resolves them under — including the directory form.
+    #[test]
+    fn import_lists_the_packages_own_modules() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::|\nfun main() {}\n"),
+            ("palette.vl", "enum Color { Red }\n"),
+            ("shapes/lib.vl", "struct Point { x: i32 }\n"),
+        ]);
+        assert!(
+            labels.contains(&"palette".to_string()),
+            "a flat sibling module: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"shapes".to_string()),
+            "a directory module resolves under its directory's name: {labels:?}"
+        );
+    }
+
+    // The load-on-demand case, in the shape it actually happens: the buffer is
+    // ahead of the analysis (150 ms of debounce), so the program the document
+    // holds knows nothing of `std::math` — and the candidates still arrive,
+    // because they come from the module file, not from the program.
+    #[test]
+    fn import_members_load_a_module_the_program_never_did() {
+        let mut document = analyze_text("fun main() {}\n");
+        assert!(
+            !document
+                .program
+                .as_ref()
+                .expect("analyzed")
+                .modules
+                .values()
+                .any(|module| module.name == "random"),
+            "`std::random` is outside the always-loaded prelude's closure"
+        );
+        let typed = "import std::random::\nfun main() {}\n";
+        document.set_text(typed);
+        let labels: Vec<String> = document
+            .completion(typed.find('\n').expect("end of the import line"))
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        assert!(
+            labels.contains(&"range".to_string()) && labels.contains(&"Random".to_string()),
+            "`std::random`'s members, loaded on demand: {labels:?}"
+        );
+    }
+
+    // A brace set completes at the level of the path before it — one more member
+    // of the same namespace — which falls out of splitting the path at the brace
+    // exactly as it splits at the final `::`.
+    #[test]
+    fn import_completes_inside_a_brace_set() {
+        let labels = completions_at_cursor("import std::compare::{ Ordering, |\nfun main() {}\n");
+        assert!(
+            labels.contains(&"PartialEq".to_string()),
+            "a further member of the same module: {labels:?}"
+        );
+    }
+
+    // Past a module, an enum is the one namespace an import descends into —
+    // `resolve_import` descends through modules and enums and nothing else.
+    #[test]
+    fn import_descends_into_an_enums_variants() {
+        let labels = completions_at_cursor("import std::compare::Ordering::|\nfun main() {}\n");
+        assert!(
+            labels.contains(&"Less".to_string()),
+            "an enum's variants are importable: {labels:?}"
+        );
+    }
+
+    // A module that does not resolve answers EMPTY. The request is on the
+    // editor's critical path: it degrades, it never errors, and it never panics.
+    #[test]
+    fn an_import_of_a_module_that_is_not_there_is_empty() {
+        assert!(
+            completions_at_cursor("import std::no_such_module::|\nfun main() {}\n").is_empty(),
+            "a module that fails to load offers nothing"
+        );
+        assert!(
+            completions_at_cursor("import no_such_origin::|\nfun main() {}\n").is_empty(),
+            "a head that names no origin and no loaded namespace offers nothing"
+        );
+    }
+
+    // The routing is one-way: import completion answers import lines, and a
+    // plain code position is untouched — no origins leak into it.
+    #[test]
+    fn origins_do_not_leak_into_a_code_position() {
+        let items = completion_items_at_cursor("fun main() {\n\tlet x = |\n}\n");
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Keyword)),
+            "a code position still offers keywords"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Snippet)),
+            "a code position still offers construct snippets"
         );
     }
 
