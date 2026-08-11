@@ -1671,3 +1671,124 @@ fn b112_an_r11_violation_splits_across_the_caller_and_the_generic() {
         "and the note points into the generic body's own file"
     );
 }
+
+// --- The import-path enumeration primitives (E57) ---------------------------
+//
+// Import-path completion has to answer about modules the program has NOT
+// loaded, so it reads the package tree directly: `modules_in_root` lists what an
+// origin holds, `module_source_file` resolves one name through the loader's own
+// root order, and `module_importables` reads a module's importable names through
+// the loader's own content-keyed parse cache. These pin that trio against the
+// REAL std tree — the same source of truth the loader resolves from — rather
+// than a fixture, because a hardcoded module list is exactly the failure mode.
+
+/// The std module names an import may reach for `platform`, deduped in the
+/// loader's own root order (an earlier root shadows a later one).
+fn std_module_names(platform: Platform) -> Vec<String> {
+    let spec = std_spec();
+    let mut names: Vec<String> = Vec::new();
+    for root in spec.search_roots(platform) {
+        for (name, _path) in vilan_core::analyzer::modules_in_root(root) {
+            if name != "lib" && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn the_std_listing_comes_from_the_std_tree() {
+    let names = std_module_names(Platform::default());
+    for expected in ["json", "math", "option", "list", "string"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "`std::{expected}` is a std module: {names:?}"
+        );
+    }
+    // A layer's directory is NOT a path segment: `src/process/fs.vl` is
+    // `std::fs`, and the layer name never appears in an import.
+    assert!(
+        names.contains(&"fs".to_string()),
+        "a layered module lists under its own name: {names:?}"
+    );
+    assert!(
+        !names.contains(&"lib".to_string()),
+        "the package surface `lib.vl` is not a module: {names:?}"
+    );
+}
+
+#[test]
+fn module_source_file_resolves_through_the_loaders_root_order() {
+    let spec = std_spec();
+    let platform = Platform::default();
+    let roots = spec.search_roots(platform);
+    let json = vilan_core::analyzer::module_source_file(&roots, "json")
+        .expect("`std::json` resolves to a file");
+    assert!(json.ends_with("json.vl"), "resolved {json:?}");
+    assert_eq!(
+        vilan_core::analyzer::module_source_file(&roots, "no_such_std_module"),
+        None,
+        "a name that is not a module resolves to nothing"
+    );
+}
+
+#[test]
+fn module_importables_reads_a_modules_declarations_on_demand() {
+    let spec = std_spec();
+    let roots = spec.search_roots(Platform::default());
+    let path = vilan_core::analyzer::module_source_file(&roots, "json").expect("std::json");
+    let importables = vilan_core::analyzer::module_importables(&path);
+    let named = |name: &str| importables.iter().find(|item| item.name == name).cloned();
+    let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
+
+    let json = named("Json").unwrap_or_else(|| panic!("`Json` is declared in json.vl: {names:?}"));
+    assert_eq!(json.kind, vilan_core::analyzer::ImportableKind::Trait);
+    // An `external struct` / `external fun` is importable like any other
+    // declaration — `import std::json::JsonValue` is the common case.
+    assert_eq!(
+        named("JsonValue").map(|item| item.kind),
+        Some(vilan_core::analyzer::ImportableKind::Struct),
+        "an external struct is importable: {names:?}"
+    );
+    // An enum carries its variants, so a further segment
+    // (`std::json::JsonKind::Number`) has something to complete against.
+    let kind = named("JsonKind").expect("`JsonKind` is an enum in json.vl");
+    assert_eq!(kind.kind, vilan_core::analyzer::ImportableKind::Enum);
+    assert!(
+        kind.variants.contains(&"Number") && kind.variants.contains(&"Object"),
+        "JsonKind's variants: {:?}",
+        kind.variants
+    );
+    // json.vl's own implementation imports are NOT published through it.
+    assert!(
+        named("Shared").is_none(),
+        "a module's own `import` is not importable through it: {names:?}"
+    );
+}
+
+#[test]
+fn module_importables_publishes_a_libs_reexports() {
+    // std's `lib.vl` declares nothing at all — it is entirely `export import`,
+    // and those leaves are exactly what `import std::print` names.
+    let spec = std_spec();
+    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("lib.vl"));
+    let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
+    assert!(names.contains(&"print"), "std's surface: {names:?}");
+    assert!(names.contains(&"panic"), "std's surface: {names:?}");
+    assert!(
+        importables
+            .iter()
+            .all(|item| item.kind == vilan_core::analyzer::ImportableKind::Reexport),
+        "every one of them is a re-export: {names:?}"
+    );
+}
+
+#[test]
+fn module_importables_of_an_unreadable_file_is_empty() {
+    // A module that fails to load answers EMPTY. An editor query degrades; it
+    // never fails, and it never panics.
+    assert!(
+        vilan_core::analyzer::module_importables(&PathBuf::from("/no/such/module.vl")).is_empty()
+    );
+}
