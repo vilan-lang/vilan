@@ -1237,7 +1237,7 @@ is resolved by being precise about what was actually decided.
 What was declined, verbatim:
 
 > **(b) The splice API**: v1 keeps the shell splice in user code
-> (`shell.replace("<!--app--></!--app-->", render(app()))` — recommendation: honest, zero
+> (`shell.replace("<!--app-->", render(app()))` — recommendation: honest, zero
 > new surface) vs a `render_into(shell, marker, view)` convenience in std.
 
 Three things about that decline matter here. First, its stated reason is
@@ -1333,3 +1333,270 @@ state". §4.6 keeps both signatures and both behaviours; `Service::new` *is* the
 registry lifecycle and `Service::on_connect`/`on_disconnect` *is* the manual
 wiring, so the two documented paths become two constructors of one value rather
 than two functions with different arities.
+
+## 8. Slices
+
+Suite-gated, docs in the same commit, per-case pins — the house discipline.
+S1 is independent of everything else; S2 gates S3; S3 gates S4 and S5.
+
+1. **S1 — the server that grows.** `Service`, `ServerBuilder::with_service`,
+   the build-time fold of services in front of `on_request`, the path-routing
+   upgrade dispatcher, and `serve_rpc` / `serve_service` / `serve_connected`
+   rewritten as four-line bodies over it with their signatures unchanged.
+   **Gate**: the existing e2e suite is the pin — `crates/vilan-cli/tests/
+   rpc_http.rs`, `transport_robustness.rs` and `streaming.rs` drive all three
+   `serve_*` forms and the benchmarks drive two more, so an unchanged suite is
+   an unchanged wire. **New pins, each planted red**: services answer before
+   `on_request` regardless of call order; two services on distinct mounts each
+   answer their own; an upgrade routes to its mount's service; the segment
+   match lets `/rpcs` through where `starts_with` swallowed it; `serve_service`
+   over the layer is byte-identical on the wire to `serve_service` today.
+   Docs: `docs/std/process.md`, `docs/guide/services.md`.
+2. **S2 — the channel.** `LegBuild`, `build_of(leg)`, and the manifest
+   extension (§10.3's ruling decides whether this is an always-written
+   `<leg>.chunks.json` or something else). **Gate**: the split fixture's
+   goldens (`crates/vilan-cli/tests/split/golden/`) churn by exactly the added
+   fields; a non-splitting leg now writes a manifest whose `chunks` is empty;
+   `build_of` on a leg that was never built is a named error, not a panic.
+3. **S3 — rung 1.** `ServerBuilder::serve_build`, the extension→content-type
+   table, and the consumer sweep: `examples/todo`, `examples/walkthrough`,
+   `examples/ssr`, `examples/fullstack` and the `init` template all lose their
+   reads and route tables in one commit. **Gate**: every example's existing
+   e2e still passes unchanged (they assert served bytes, which do not move);
+   `examples/fullstack` serves its chunks with no `ChunkFile` type in the tree;
+   a leg that gains `split = true` serves its chunks with no server edit —
+   planted by adding `split` to the fixture and asserting the routes appear.
+4. **S4 — the validator.** `ShellFault`, `check_shell`,
+   `Document::from_shell`, and the template's one-line adoption. **Gate**: one
+   pin per fault variant, each planted by breaking a real shell — delete the
+   `<link>` from a scaffolded project and assert the server refuses to boot
+   naming the file; add a `<link>` to a leg with no styles; rename the mount
+   div; and the F6 case, a `type="module"` shell over a splitting leg.
+5. **S5 — rung 2.** `Document::of` and the builder methods, `Document::render`,
+   `examples/ssr` losing its `<!--ssr-->` marker. **Gate**: the property that
+   makes the two entry points one design — *every document `Document::of` can
+   produce passes `check_shell`* — pinned over the builder's option space, in
+   the spirit of `ssr.md` §4's cross-implementation differential; plus
+   `examples/ssr`'s existing e2e, which asserts server-rendered content before
+   any JS and a replacing client boot, unchanged after the marker is gone.
+6. **The two independents**, either of which can ship alone and neither of
+   which needs a design: `ServerBuilder::on_stop` made real (§9.1), and
+   `mount_root` naming the id it could not find (§9.5).
+
+## 9. Bycatch — found by the survey, not E56's to fix
+
+### 9.1 `ServerBuilder::on_stop` is a documented no-op
+
+`ServerBuilder` declares the field (`http.vl:264`), initialises it
+(`:274`), exposes a setter (`:364-366`), and **`build()` does not carry it into
+`Server`** (`:369-375`) — `Server` has no `on_stop` field (`:245-256`) and
+`start()` never calls one. It is documented as public API in
+`vilan/docs/std/process.md:55`. So `.on_stop(|server| cleanup())` compiles,
+type-checks, reads correctly, and never runs. There is also no `Server::stop`,
+so there is nothing that could fire it.
+
+This is a one-field fix plus a decision about what "stop" means (there is no
+shutdown path today), and it is squarely in seam (a)'s neighbourhood without
+being seam (a)'s problem. **File it.**
+
+### 9.2 The chunk base resolution has never executed
+
+§3.5. `document.currentScript` is `null` in a module script; all eleven shells
+in and around the tree use `type="module"`; the emitted guard therefore always
+takes `base = ""`, which resolves the chunk `import()` against the document URL
+— the exact miss `bundle-splitting.md` §8 names. It has gone unnoticed because
+no example splits and the split fixture runs under Node. **File it against the
+A16 line**: either the shell must be a classic script when a leg splits (which
+is what `LegBuild.classic_script` and F6 exist to enforce, so E56 can carry the
+*detection*), or the base must be resolved by something a module script has —
+`import.meta.url`, which is exactly the right answer for a module and is
+available in every environment the bundle runs in.
+
+### 9.3 `std::fs` cannot read bytes
+
+`vilan/std/src/process/fs.vl` is twenty lines: `read_file_bytes(path,
+encoding): str` (misleadingly named — it returns a decoded string),
+`write_file`, and `exists`. There is no binary read, no directory listing, and
+no stat. Consequences: no vilan program can serve an image, a font, or a
+favicon; nothing can enumerate a directory; and `dev-refresh.md` §2(i)'s
+mtime-revalidating read has no `stat` to call. **File it** — it is a std gap
+that E56 walks past four times and never needs, but the next paper will.
+
+### 9.4 Two documentation drifts in `examples/todo`
+
+`examples/todo/src/server.vl:3-4`'s header comment says the file uses
+`std::rpc_server::serve_connected`; the import at `:12` and the call at `:28`
+are `serve_service`. And `examples/todo/src/app.html:6` closes `</head>` on the
+same line as the stylesheet `<link>`, with the opening `<head>` three lines
+above — valid HTML, but it reads as a mistake and it is the first shell many
+readers see. Both are one-line fixes for whichever slice touches the file next.
+
+### 9.5 `mount_root` on a missing id fails as a null dereference
+
+`get_element_by_id(id): Element` (`browser/dom.vl:13-14`) has no `Option`
+return, so a missing element is JS `null` typed as `Element`, and
+`mount(id, view)`'s `element.clear()` (`browser/ui.vl:665-668`) throws
+`Cannot read properties of null (reading …)`. The id the user got wrong appears
+nowhere in the message. This is F4's runtime half and the cheapest loud win in
+the whole survey — a guarded lookup that names the id — and it is worth doing
+**whether or not any of §5 ships**, because it is the one check that works
+without knowing anything about the build.
+
+## 10. Open questions — the owner's to rule
+
+### 10.1 Does the ladder go past rung 1 at all? — recommend: yes, and it is the paper's biggest ask
+
+Rung 1 (`serve_build`) is nearly uncontroversial: it deletes derivable code and
+adds a value that describes a build. Rung 2 asks **std to know what an HTML
+document is**, which it has never known, and which is a genuinely different
+kind of commitment — a surface that will grow (meta tags, preload hints, CSP,
+`<base>`, i18n attributes) and that has no obvious stopping point. **Draft: in
+scope, bounded by §5.5's "the intersection of the seven shells plus
+`head`/`body` escape hatches", and reviewed again if the first three feature
+requests are all in `head()`.** The cost of saying no: F1, F2, F3 and F6 are
+still caught by the validator, F5 (the SSR marker) is not, and the charter's
+"easy to set up" clause is answered only for the server, not for the page.
+
+### 10.2 Where does `LegBuild` come from? — recommend: a read manifest for v1, compiler-minted recorded
+
+Two shapes. **(A) Read** an always-written `dist/<leg>.chunks.json` at the
+server, through E55's freshness hook. Costs nothing in the compiler, and makes
+a build fact into a boot-time failure. **(B) Compiler-minted**: the CLI hands
+the server leg's build a description of the browser leg's outputs, and
+`build_of("client")` is a constant. Workspace members already build in
+declaration order specifically so "the server's `dist/client.js` exists"
+(`crates/vilan-cli/src/main.rs:1814-1817`), so the ordering is there — but the
+*plumbing* is not: legs compile independently today and nothing passes one
+leg's outputs to another's build. That is real new machinery and it is this
+paper's largest single cost. **Draft: (A) now, (B) recorded as the end-state**,
+because (B)'s payoff is moving four checks from boot to compile time, which is
+better but not different in kind. Flagged because (B) is the only shape that
+could ever make a wrong shell a *compile* error, which is the strongest reading
+of "LOUD".
+
+### 10.3 Is the chunks sidecar allowed to become the leg's build manifest? — recommend: yes
+
+It means writing `<leg>.chunks.json` on every build of the leg rather than only
+when it splits, adding `styles` and `classic_script`, and reversing
+`bundle-splitting.md` §9's "dropping `split` takes the manifest with it".
+§5.9 argues the invariant is preserved and strengthened. **Draft: do it.**
+Flagged because it reverses a ratified sentence and churns a byte-pinned golden
+(`crates/vilan-cli/tests/split/golden/app.chunks.json`), and a design note
+should not reverse a ratified sentence on its own authority. The alternative —
+a second sidecar next to the first — is worse on every axis except this one.
+
+### 10.4 Was `ssr.md` §6(b)'s decline about the helper, or about the idea? — flagged, no recommendation
+
+§7.1 reads it as a cost argument about a specific three-argument helper, which
+makes `Document::render` a different question. If the owner meant it as "std
+does not model documents", then §10.1 is already answered no and rung 2 falls.
+**No draft**: this is a reading of the owner's own prior ruling and only the
+owner can settle which reading was meant. It is asked separately from §10.1
+because the two could be answered differently — one may want rung 2 *and* want
+the record to say the earlier decline was narrower than it looked.
+
+### 10.5 Should the reactive session registry be keyed by service? — recommend: no, record the constraint
+
+`std::rpc`'s `reactive_sessions` is keyed by connection id alone
+(`rpc.vl:1006-1012`), and connection ids are minted from one module-level
+counter in `rpc_server.vl` (`:97-106`). Two services therefore share one id
+space and one registry — which *works*, because ids stay unique. **Draft: leave
+it, and say so in the doc comment**, since keying by `(service, connection)`
+buys isolation nobody has asked for and touches a shipped `Client::connect`
+contract (`transport-rpc.md` §4.2). Flagged because "two services share a
+global session table" is the kind of thing that is fine until it is not.
+
+### 10.6 What rung does `vilan init` ship? — recommend: rung 1 + the validator
+
+§6.3. The alternative (rung 2, no `app.html` in the scaffold) is defensible and
+is a smaller file, and it costs one commit touching `walkthrough`, `todo`,
+`ssr`, the template and `tests/init.rs:335` — because that gate pins
+`src/app.html` as a member of the blessed shape in all four places at once.
+**Draft: rung 1 + validator in the scaffold, rung 2 in `docs/guide/`.** Flagged
+because the scaffold is the language's opening argument and the owner should
+choose what it argues.
+
+### 10.7 How loud is loud? — recommend: refuse to boot
+
+§5.6. A shell fault stops the server from starting, with a message naming the
+file, the fault and the fix; `check_shell` returns a `Result` so an app can
+choose otherwise. The alternative is a startup warning, which the eleven shells
+of §2.2 suggest would be read exactly as often as the console line that already
+reports F3. **Draft: refuse.** Flagged because refusing to boot on a *style*
+problem is a strong position and it is the owner's bar to set.
+
+### 10.8 Route matching — segment, not prefix? — recommend: yes
+
+§4.3. `path.starts_with("/rpc")` shadows `/rpcs`; matching the path *segment*
+does not. This is a behaviour change for any program with a route beginning
+`/rpc`, `/send` or `/events` — a set this survey believes is empty and a corpus
+check would settle. **Draft: change it, as part of S1, with the corpus check
+run first and reported.**
+
+### 10.9 Middleware — declined? — recommend: yes, declined with the reason recorded
+
+§4.5. `on_request` is one closure, so wrapping it is already the language's
+answer; a `next`-passing layer stack multiplies async coloring for no
+capability; there is no demand. **Draft: decline, and record `Mount` as the
+shape it would be built on if it is ever wanted**, so "a service" and "a layer"
+never become two concepts.
+
+### 10.10 The names — the owner's, as always
+
+`LegBuild` / `build_of(leg)` / `serve_build` / `Document` / `check_shell` /
+`ShellFault` / `Service` / `with_service`. Two are worth a second look:
+`LegBuild` reads oddly beside `[entry.<name>]` (the manifest calls them
+entries, the CLI calls them legs, and the docs use both), and `Document` is a
+big name for a small struct. Alternatives considered and not preferred:
+`Emitted` / `Artifacts` / `BuildOutput` for the first, `Page` / `Shell` /
+`Html` for the second. **Draft: as listed**, with `Shell` as the runner-up for
+`Document` since every existing doc comment in the tree already calls the thing
+"the HTML shell".
+
+## 11. The recommendations, collected
+
+1. **Build the layer, not a fourth boot function.** `Service` +
+   `ServerBuilder::with_service`, services answering before `on_request` —
+   which is what `connected_response` already does — with a longest-mount
+   tiebreak and one path-routing upgrade dispatcher. `serve_rpc`,
+   `serve_service` and `serve_connected` keep their signatures and become
+   four-line bodies over it. **S1.** (§4)
+2. **Give the server leg a value describing the browser leg's build.**
+   `LegBuild` + `build_of(leg)`, from an extended, always-written manifest.
+   This is the whole of the fix; everything else in §5 is a use of it. **S2.**
+   (§5.2, §10.2, §10.3)
+3. **Serve the build, not a list of files.** `serve_build` installs one route
+   per artifact with derived content types, in front of `on_request`, and takes
+   E55's freshness hook as its single read site. It deletes 34 of
+   `examples/fullstack`'s 52 ceremony lines and 8 of `examples/todo`'s 10.
+   **S3.** (§5.4)
+4. **Make validation the primitive and generation the sugar.** `check_shell` +
+   `Document::from_shell` first; `Document::of` is the same rules applied to
+   markup std wrote. This is the only shape in which the escape hatch is safe
+   rather than merely available, and it is the paper's central claim. **S4,
+   S5.** (§5.6)
+5. **Delete the SSR marker rather than checking it.** `Document::render(view)`
+   splices into the mount element the document already knows, so F5 has nothing
+   to misspell. `render_into(shell, marker, view)` stays declined for the reason
+   `ssr.md` §6(b) gave. **S5.** (§5.8, §7.1)
+6. **Ship the scaffold at rung 1 + the validator**, not rung 2: 25 lines to 12,
+   22 ceremony lines to 6, and a shell that cannot silently lose its stylesheet
+   link — with the raw file still there to read. **S3, S4.** (§6.3)
+7. **Leave alone**: server-side HMR (`hmr.md` §8 — permanently a non-goal, and
+   nothing here touches it); the process-layer `ui`'s fragment-only surface
+   (`ssr.md` §6a); `split` as a build-only optimisation (`bundle-splitting.md`
+   §4, §10); the `<link>` idiom the css hot-swap depends on (`hmr.md` §2 and
+   its appendix); `serve_service`'s signature and the manual-wiring path
+   (`transport-rpc.md` §4.2); the session registry's key (§10.5).
+8. **Decline, with reasons**: middleware (§4.5); a general `Mount` abstraction
+   built before its third customer (§4.5); a static file server (§5.10); a
+   `View`-shaped document (§5.5); configurable asset route prefixes in v1
+   (§5.4); the modulepreload emission (§7.4).
+9. **File separately** (§9): `ServerBuilder::on_stop` is a documented no-op;
+   the chunk base resolution has never executed and `import.meta.url` is its
+   real answer; `std::fs` cannot read bytes, list a directory, or stat;
+   `mount_root` fails as a null dereference instead of naming the id it could
+   not find; two documentation drifts in `examples/todo`.
+10. **Do not redesign E55.** `dev-refresh.md` §3's hook is the freshness
+    mechanism; this paper supplies the call site that note says it is missing
+    (§2(i)), and the two can ship in either order. (§5.9, §7.3)
