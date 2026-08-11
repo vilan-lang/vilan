@@ -376,6 +376,23 @@ pub struct Completion {
     /// (`CompletionKind::Snippet`, from [`CONSTRUCT_SNIPPETS`]); `None` for every
     /// other candidate (E14).
     pub snippet: Option<SnippetInsertion>,
+    /// The import this candidate needs before it resolves (E54c) — `None` for
+    /// a candidate already reachable without one (every candidate except the
+    /// ones [`Document::auto_import_completions`] adds). The server
+    /// (`to_completion_item`) turns `Some` into a labeled `detail` (the
+    /// module, e.g. `std::json`) and the `additionalTextEdits` that insert
+    /// the import when the candidate is accepted.
+    pub needs_import: Option<AutoImport>,
+}
+
+/// The ready-made import edit an auto-import completion candidate carries
+/// (E54c): the module path (for the popup's `detail` label) and the
+/// [`vilan_core::formatter::insert_import`] edit that adds it, already
+/// computed against the live buffer.
+pub struct AutoImport {
+    pub module_path: Vec<String>,
+    pub edit_span: Span,
+    pub edit_replacement: String,
 }
 
 impl Completion {
@@ -389,6 +406,7 @@ impl Completion {
             documentation: None,
             call_parameters: None,
             snippet: None,
+            needs_import: None,
         }
     }
 
@@ -407,6 +425,7 @@ impl Completion {
                 body: body.to_string(),
                 fallback: keyword.to_string(),
             }),
+            needs_import: None,
         }
     }
 }
@@ -2528,6 +2547,163 @@ impl Document {
         )
     }
 
+    // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
+
+    /// Every place `name` may be imported from — origins in loader order
+    /// (`std`, `pkg`, each dependency by its import name), the package's own
+    /// surface before its modules within an origin — searched via the E57
+    /// machinery (import-path completion's own candidate source, repointed at
+    /// a NAME instead of a path prefix). Each hit is the segments an `import`
+    /// needs before `name` (`["std", "json"]` for `Json`; `["std"]` for a
+    /// name std's own surface re-exports directly, like `print`). More than
+    /// one hit is a genuine ambiguity: the caller decides (E54b offers one
+    /// action per candidate; E54d's "fix all" skips the name rather than
+    /// guess).
+    ///
+    /// One full-origin scan per call — bounded by std's own module count
+    /// (E57: ~0.64 ms cold / 0.035 ms warm per module through the shared
+    /// parse cache), which is fine for an on-demand quickfix but too slow to
+    /// pay per candidate on every keystroke; [`Self::auto_import_completions`]
+    /// uses the cheaper already-loaded `Program` maps instead.
+    fn import_candidates(&self, program: &Program, name: &str) -> Vec<Vec<String>> {
+        let Some(roots) = self.import_roots.as_ref() else {
+            return Vec::new();
+        };
+        let mut origins: Vec<String> = vec!["std".to_string(), "pkg".to_string()];
+        origins.extend(
+            roots
+                .dependencies
+                .iter()
+                .map(|(dep_name, _)| dep_name.clone()),
+        );
+        let mut candidates = Vec::new();
+        for origin in &origins {
+            let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
+                continue;
+            };
+            if let Some(surface_path) = &surface {
+                if vilan_core::analyzer::module_importables(surface_path)
+                    .iter()
+                    .any(|importable| importable.name == name)
+                {
+                    candidates.push(vec![origin.clone()]);
+                }
+            }
+            let mut seen_modules: HashSet<String> = HashSet::new();
+            for root in &module_roots {
+                for (module_name, module_path) in vilan_core::analyzer::modules_in_root(root) {
+                    if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
+                        continue;
+                    }
+                    if vilan_core::analyzer::module_importables(&module_path)
+                        .iter()
+                        .any(|importable| importable.name == name)
+                    {
+                        candidates.push(vec![origin.clone(), module_name]);
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The quickfix menu for the diagnostics overlapping `range` (LIVE
+    /// space — safe because the caller gates staleness first, S3: while
+    /// non-stale, live spans and this document's own `diagnostics` spans
+    /// address the same text): one action per unambiguous add-import
+    /// candidate (E54b — several when a name is AMBIGUOUS across modules,
+    /// never guessed), and the field-rename fix on a closest-name suggestion
+    /// (E58c). Reads THIS document's own diagnostics directly rather than the
+    /// client-echoed `context.diagnostics` — only ours carries the span and
+    /// note data a fix needs, and the staleness refusal is what makes that a
+    /// safe substitution.
+    pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
+        let mut fixes = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue; // an edit can only ever reach this document
+            }
+            if !spans_overlap(diagnostic.span, range) {
+                continue;
+            }
+            if let Some(name) = unresolved_name(&diagnostic.msg) {
+                for module_path in self.import_candidates(program, name) {
+                    let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+                    let Some(edit) =
+                        vilan_core::formatter::insert_import(&self.text, &path_refs, name)
+                    else {
+                        continue;
+                    };
+                    fixes.push(QuickFix {
+                        title: format!("Import `{name}` from {}", module_path.join("::")),
+                        span: edit.span,
+                        replacement: edit.replacement,
+                    });
+                }
+            } else if let Some(suggestion) = diagnostic
+                .note
+                .as_ref()
+                .and_then(|note| closest_name_suggestion(&note.msg))
+            {
+                fixes.push(QuickFix {
+                    title: format!("Change to `{suggestion}`"),
+                    span: diagnostic.span,
+                    replacement: suggestion.to_string(),
+                });
+            }
+        }
+        fixes
+    }
+
+    /// Every unambiguous missing-import fix in the file, folded into ONE edit
+    /// (E54d, the "add all missing imports" source action): each unresolved
+    /// name with EXACTLY one candidate module gets imported; an AMBIGUOUS
+    /// name (more than one candidate) is skipped outright — this action never
+    /// guesses between modules. Fixes apply SEQUENTIALLY against a running
+    /// copy of the text, so two names newly imported from the same module
+    /// merge into one brace set exactly as two separate manual add-imports
+    /// would (`insert_import` sees the first one already landed on the
+    /// second call). `None` when there's nothing unambiguous to add.
+    pub fn add_all_missing_imports_edit(&self, program: &Program) -> Option<(Span, String)> {
+        let mut names: Vec<&str> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue;
+            }
+            if let Some(name) = unresolved_name(&diagnostic.msg) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        let mut working = self.text.clone();
+        let mut changed = false;
+        for name in names {
+            let candidates = self.import_candidates(program, name);
+            let [module_path] = candidates.as_slice() else {
+                continue; // zero or ambiguous candidates: never guess
+            };
+            let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+            if let Some(edit) = vilan_core::formatter::insert_import(&working, &path_refs, name) {
+                working = splice(&working, edit.span, &edit.replacement);
+                changed = true;
+            }
+        }
+        changed.then(|| (Span::from(0..self.text.len()), working))
+    }
+
     /// A struct/enum/trait target when the cursor is on a type *use* (e.g.
     /// `Option` in `Option<T>`), which lives in `type_references` rather than as
     /// an entity.
@@ -2861,7 +3037,18 @@ impl Document {
             // ANALYZED space (E52) — `path_completions` needs no such
             // conversion, since it answers by NAME across the whole program
             // rather than by scope containment.
-            self.scope_completions(program, self.to_analyzed_offset(offset))
+            let mut scope_candidates =
+                self.scope_completions(program, self.to_analyzed_offset(offset));
+            // E54c: importable-but-unimported names, LABELED and edit-carrying
+            // (E53's rule stands — nothing here is silent). Only at this bare
+            // scope position; a `.`/`::` receiver is already resolved to
+            // something in scope, so there is nothing to import there.
+            let in_scope: HashSet<&str> = scope_candidates
+                .iter()
+                .map(|candidate| candidate.label.as_str())
+                .collect();
+            scope_candidates.extend(self.auto_import_completions(program, &in_scope));
+            scope_candidates
         };
         // A call-shaped insertion is wrong when the callee is already
         // parenthesized — the char right after the cursor is `(`, so the user
@@ -3218,6 +3405,99 @@ impl Document {
         items
     }
 
+    /// Importable-but-unimported candidates at a bare scope position (E54c):
+    /// every function/struct/enum/trait/module-level value a directly-loaded
+    /// `std` or `pkg` child module declares as its OWN top-level item (not a
+    /// re-export or an import it merely forwards — a plain `import`/`use`
+    /// inside a module lands in that module's scope too, and counting it
+    /// would offer the same name a second time), whose name isn't already in
+    /// `in_scope`.
+    ///
+    /// This is the SAME whole-program-by-name territory E53 walled off from
+    /// silent, unscoped completion ([`Self::namespace_completions_by_name`],
+    /// just above) — reused here on purpose and EXPLICITLY: every candidate
+    /// is LABELED with its declaring module (`to_completion_item` shows it as
+    /// `detail`) and carries the text edit that adds the import, so accepting
+    /// one is never a surprise (E53's rule stands: nothing silent came back).
+    ///
+    /// Dependency packages are not scanned here — reaching them the way
+    /// [`Self::import_candidates`] does is a disk-bound full-origin scan, fine
+    /// for an on-demand quickfix but too slow to pay on every keystroke.
+    /// Sorted alphabetically and capped at [`AUTO_IMPORT_COMPLETION_CAP`] so a
+    /// std-heavy file's loaded surface cannot flood the popup — candidates
+    /// beyond the cap are the ones that would sort last, not a `Program`
+    /// hash-order artifact.
+    fn auto_import_completions(
+        &self,
+        program: &Program,
+        in_scope: &HashSet<&str>,
+    ) -> Vec<Completion> {
+        let mut candidates: Vec<(String, CompletionKind, Vec<String>)> = Vec::new();
+        for root in ["std", "pkg"] {
+            let Some(&root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            let Some(root_module) = program.modules.get(&root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            for &child_id in root_scope.name_to_id_map.values() {
+                let Some(child_module) = program.modules.get(&child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                let child_source = program.source_of(child_id);
+                for (&name, &entity_id) in &child_scope.name_to_id_map {
+                    if in_scope.contains(name) {
+                        continue;
+                    }
+                    if program.source_of(entity_id) != child_source {
+                        continue;
+                    }
+                    let kind = self.kind_of(program, entity_id);
+                    if matches!(
+                        kind,
+                        CompletionKind::Module | CompletionKind::Keyword | CompletionKind::Snippet
+                    ) {
+                        continue;
+                    }
+                    candidates.push((
+                        name.to_string(),
+                        kind,
+                        vec![root.to_string(), child_module.name.to_string()],
+                    ));
+                }
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
+        let source = self.line_index.text();
+        candidates
+            .into_iter()
+            .filter_map(|(name, kind, module_path)| {
+                let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+                let edit = vilan_core::formatter::insert_import(source, &path_refs, &name)?;
+                Some(Completion {
+                    label: name,
+                    kind,
+                    detail: None,
+                    documentation: None,
+                    call_parameters: None,
+                    snippet: None,
+                    needs_import: Some(AutoImport {
+                        module_path,
+                        edit_span: edit.span,
+                        edit_replacement: edit.replacement,
+                    }),
+                })
+            })
+            .collect()
+    }
+
     /// Names visible at `analyzed_offset` (ANALYZED space — the cursor's scope,
     /// then each enclosing scope up to global) plus the language keywords.
     fn scope_completions(&self, program: &Program, analyzed_offset: usize) -> Vec<Completion> {
@@ -3412,6 +3692,77 @@ impl Document {
 
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The cap [`Document::auto_import_completions`] truncates to (E54c) — a
+/// std-heavy file can have a large loaded surface, and this is what keeps a
+/// bare scope completion from drowning the popup in auto-import candidates
+/// beneath the names actually in scope.
+const AUTO_IMPORT_COMPLETION_CAP: usize = 20;
+
+/// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
+/// `(span, replacement)` this document's own text needs — LIVE space, same
+/// convention as [`Document::organize_import_edits`].
+pub struct QuickFix {
+    pub title: String,
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
+/// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
+/// find" shapes B4's import steer already targets
+/// (`analyzer.rs::import_steer`/`import_steer_inner`). `None` for every other
+/// diagnostic shape (a module-path segment, a trait, a struct field, a
+/// context …) — E54's add-import quickfix is deliberately scoped to these
+/// two; the others are the filing's own later customers (E58d's rule for the
+/// closest-name primitive applies here too).
+fn unresolved_name(message: &str) -> Option<&str> {
+    for prefix in ["cannot find '", "cannot find type '"] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some(end) = rest.find('\'') {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    None
+}
+
+/// The suggested name in a "did you mean" note E58 attaches to the
+/// invalid-initializer-field diagnostic (`analyzer.rs`) — the note text IS
+/// the fix's source of truth, so the LSP quickfix never recomputes its own
+/// closest-name guess and risks disagreeing with the diagnostic it's fixing.
+/// Anchored to the note starting with EXACTLY `did you mean` — the unrelated
+/// field/method-callable ambiguity note (`analyzer.rs`, "...: did you mean
+/// the plain access `x.member`?") uses the same words mid-sentence, never at
+/// the very start, so it can never match here.
+fn closest_name_suggestion(note_message: &str) -> Option<&str> {
+    note_message
+        .strip_prefix("did you mean `")?
+        .strip_suffix("`?")
+}
+
+/// Whether two spans share at least one byte position — touching counts, so
+/// a zero-width cursor range sitting right at a diagnostic's edge still
+/// overlaps it.
+fn spans_overlap(a: Span, b: Span) -> bool {
+    a.start <= b.end && b.start <= a.end
+}
+
+/// Replaces the byte range `span` in `source` with `replacement`. The
+/// primitive [`Document::add_all_missing_imports_edit`] folds a SEQUENCE of
+/// `insert_import` edits through, each computed against the previous
+/// splice's result — so two new imports from the same not-yet-imported
+/// module land in one merged brace set, exactly as two separate manual
+/// add-imports would.
+fn splice(source: &str, span: Span, replacement: &str) -> String {
+    let range = span.into_range();
+    let mut result =
+        String::with_capacity(source.len() - (range.end - range.start) + replacement.len());
+    result.push_str(&source[..range.start]);
+    result.push_str(replacement);
+    result.push_str(&source[range.end..]);
+    result
 }
 
 /// The origins an import path may start with: the two the loader always knows
@@ -3689,6 +4040,260 @@ pub(crate) mod tests {
                 .is_some_and(|path| path.ends_with("helper.vl")),
             "{:?}",
             helper_error.path
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E54/E58: the quickfix home, add-import, auto-import completion ------
+
+    // A single unambiguous candidate: one quickfix, titled with its module,
+    // whose edit — applied and re-analyzed — actually resolves the name.
+    #[test]
+    fn quickfix_offers_and_applies_an_add_import_for_an_unambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("analyzed cleanly enough to have a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(fixes[0].title.contains("help_topic"), "{}", fixes[0].title);
+        assert!(fixes[0].title.contains("pkg::topic"), "{}", fixes[0].title);
+        assert_eq!(fixes[0].replacement, "import pkg::topic::help_topic;\n");
+        // Applied: splice the edit in and re-analyze — the name now resolves.
+        let mut applied = text.to_string();
+        applied.replace_range(fixes[0].span.into_range(), &fixes[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An AMBIGUOUS name — two sibling modules each declare it — offers one
+    // quickfix PER CANDIDATE, never a guess.
+    #[test]
+    fn quickfix_offers_one_action_per_candidate_for_an_ambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tshared();\n}\n"),
+            ("alpha.vl", "fun shared() {}\n"),
+            ("beta.vl", "fun shared() {}\n"),
+        ]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let mut fixes = document.quickfixes(program, whole_file);
+        fixes.sort_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(
+            fixes.len(),
+            2,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(fixes[0].title.contains("pkg::alpha"), "{}", fixes[0].title);
+        assert!(fixes[1].title.contains("pkg::beta"), "{}", fixes[1].title);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // "Add all missing imports" fixes every UNAMBIGUOUS name and skips the
+    // ambiguous one outright — never guessing between `alpha` and `beta`.
+    #[test]
+    fn add_all_missing_imports_skips_an_ambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n\tshared();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+            ("alpha.vl", "fun shared() {}\n"),
+            ("beta.vl", "fun shared() {}\n"),
+        ]);
+        let program = document.program.as_ref().unwrap();
+        let (_span, new_text) = document
+            .add_all_missing_imports_edit(program)
+            .expect("the unambiguous fix alone is still something to add");
+        assert!(
+            new_text.contains("import pkg::topic::help_topic;"),
+            "{new_text}"
+        );
+        // `shared()` (the call) is untouched original text — what must be
+        // ABSENT is an IMPORT of it, from either candidate module.
+        assert!(
+            !new_text.contains("import pkg::alpha::shared")
+                && !new_text.contains("import pkg::beta::shared"),
+            "an ambiguous name must never be guessed: {new_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E58c: the field-rename quickfix rewrites exactly the diagnostic's span
+    // (the field name) with the closest-name suggestion the analyzer noted.
+    #[test]
+    fn quickfix_rewrites_a_misspelled_initializer_field_to_the_closest_name() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Config {\n\tentries: i32,\n}\n\nfun main() {\n\tlet _ = Config { entires = 5 };\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(fixes[0].title, "Change to `entries`");
+        assert_eq!(fixes[0].replacement, "entries");
+        let expected_start = text.find("entires").unwrap();
+        assert_eq!(
+            fixes[0].span,
+            Span {
+                start: expected_start,
+                end: expected_start + "entires".len(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E54c: an unimported name in an ALREADY-LOADED module (loaded because a
+    // sibling name from it is imported) is offered at a bare scope position,
+    // labeled with its module and carrying the brace-set-extension edit.
+    //
+    // The fixture's names are `AAA_`-prefixed on purpose: real std is
+    // analyzed alongside this tiny fixture (the LSP always loads it), and its
+    // OWN loaded prelude modules contribute plenty of unimported candidates
+    // of their own — capitalized type/trait names that, in default string
+    // order, sort before any ordinary lowercase identifier. Without forcing
+    // this fixture's names to sort first, `AUTO_IMPORT_COMPLETION_CAP` would
+    // be spent entirely on std's surface before ever reaching this file's
+    // own candidates, and the assertions below would test std's names by
+    // accident instead of this fixture's.
+    #[test]
+    fn auto_import_completion_offers_a_labeled_edit_carrying_sibling_from_an_already_loaded_module()
+    {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::AAA_greet;\n\nfun main() {\n\tAAA_greet();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun AAA_greet() {}\n\nfun AAA_farewell() {}\n"),
+        ]);
+        let marker = "AAA_greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let farewell = candidates
+            .iter()
+            .find(|candidate| candidate.label == "AAA_farewell")
+            .expect("an unimported sibling in an already-loaded module is offered");
+        let auto_import = farewell
+            .needs_import
+            .as_ref()
+            .expect("labeled with the import it needs");
+        assert_eq!(
+            auto_import.module_path,
+            vec!["pkg".to_string(), "helper".to_string()]
+        );
+        // `helper` is already imported (bare `AAA_greet`): the edit EXTENDS
+        // it into a two-member set rather than inserting a new line.
+        assert_eq!(auto_import.edit_replacement, "{ AAA_farewell, AAA_greet }");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A name already offered from SCOPE is never duplicated as an auto-import
+    // candidate — the in-scope one is the only match on the menu. (Same
+    // `AAA_`-prefix reasoning as above.)
+    #[test]
+    fn a_name_already_in_scope_is_not_offered_as_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::AAA_greet;\n\nfun AAA_farewell() {}\n\n\
+                 fun main() {\n\tAAA_greet();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun AAA_greet() {}\n\nfun AAA_farewell() {}\n"),
+        ]);
+        let marker = "AAA_greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let farewells: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.label == "AAA_farewell")
+            .collect();
+        assert_eq!(
+            farewells.len(),
+            1,
+            "the in-scope declaration only, no auto-import duplicate"
+        );
+        assert!(farewells[0].needs_import.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E54c's cap: a module with many unimported siblings doesn't flood the
+    // popup — the count never exceeds `AUTO_IMPORT_COMPLETION_CAP`, though at
+    // least one still comes through. `AAA`-prefixed names (see above) so this
+    // fixture's own 29 unimported candidates are what compete for the cap's
+    // 20 slots, not std's much larger loaded surface.
+    #[test]
+    fn auto_import_completions_are_capped() {
+        let many_functions: String = (0..30)
+            .map(|index| format!("fun AAA{index:02}() {{}}\n"))
+            .collect();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::AAA00;\n\nfun main() {\n\tAAA00();\n\t\n}\n",
+            ),
+            ("helper.vl", &many_functions),
+        ]);
+        let marker = "AAA00();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let auto_import_labels: Vec<&str> = candidates
+            .iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        assert!(
+            auto_import_labels.len() <= AUTO_IMPORT_COMPLETION_CAP,
+            "expected the cap to hold, got {}: {auto_import_labels:?}",
+            auto_import_labels.len()
+        );
+        assert!(
+            auto_import_labels
+                .iter()
+                .all(|label| label.starts_with("AAA")),
+            "expected the fixture's own 29 unimported siblings to fill the \
+             cap, not std's: {auto_import_labels:?}"
+        );
+        assert_eq!(
+            auto_import_labels.len(),
+            AUTO_IMPORT_COMPLETION_CAP,
+            "29 candidates over a cap of {AUTO_IMPORT_COMPLETION_CAP} should saturate it: {auto_import_labels:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
