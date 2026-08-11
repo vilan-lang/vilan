@@ -689,3 +689,376 @@ thing rather than a replacement for the first.
   today, which is what makes the corpus and e2e suites the gate.
 - Server-side HMR. Untouched and still a permanent non-goal (`hmr.md` §8);
   nothing here makes a running server's *code* replaceable (§7.2).
+
+## 5. Seam (b) — the document
+
+### 5.1 The bar, restated as failure modes
+
+The charter's bar is three clauses: *easy to set up, LOUD when wrong,
+progressively lowering to full control*. The middle clause is the one that
+decides the design, so it is restated here as the list of things that are wrong
+today and silent. Each is real: each was either shipped by the owner, is
+present in this repository, or is one edit away in a file this repository
+ships.
+
+| | Failure | Today's symptom | Where it lives |
+|---|---|---|---|
+| **F1** | The build emitted styles; the shell links none | none at all — the page renders unstyled and correct-looking | the owner's shipped bug; latent in `examples/ssr` and `examples/fullstack` (§2.2) |
+| **F2** | The shell links a stylesheet the build did not emit | the `_ =>` arm answers the `.css` request with the HTML document, 200 (§3.3); the browser drops it silently | any project that deletes its last `const style()` |
+| **F3** | The shell's `<script src>` misses the route table | HTML served as JavaScript; MIME refusal; blank page; one console line | any rename of a leg |
+| **F4** | `<div id>` and `mount_root(id)` disagree | `Cannot read properties of null` in `element.clear()` (`browser/ui.vl:665-668`) | any project |
+| **F5** | The SSR marker is missing or misspelled | `str::replace` no-ops; the shell serves empty; the client then renders it correctly, so only a crawler ever sees the bug | `examples/ssr`, and every SSR app written from it |
+| **F6** | A leg splits and the shell uses `type="module"` | chunk `import()` resolves against the document URL; nested routes 404 | every shell in the tree (§3.5) |
+| **F7** | The build emits a new artifact the server has no route for | 404, or the `_ =>` arm's HTML-as-anything | any leg that gains `split = true` |
+| **F8** | The bytes on disk moved after the server read them | stale asset served forever | `dev-refresh.md` §0 — E55, not re-solved here |
+
+F1–F7 share one root: **a fact the build knew was restated by hand somewhere
+else, and nothing compared the two copies.** That is what the design has to
+close, and it closes all seven the same way.
+
+### 5.2 What the build knows, and what the server can ask
+
+The build's knowledge, at the moment `write_assets` and `write_chunks` run
+(`crates/vilan-cli/src/main.rs:2265`, `:2291`):
+
+- the leg's name and its bundle filename (`dist/<leg>.js`) —
+  `crates/vilan-cli/src/main.rs:1523`;
+- **whether a stylesheet was emitted at all**, because `write_assets` iterates
+  `assemble_assets` and writes one file per asset kind actually collected — a
+  program with no `const style()` produces no `css` entry and therefore no
+  file;
+- every chunk it wrote, with its arm and tag, which it serializes into
+  `dist/<leg>.chunks.json` (`main.rs:2330-2345`);
+- how the bundle must be loaded, since it emitted the `__chunk_registry`
+  base resolution itself (`transformer.rs:760-772`).
+
+What the server can ask today, exhaustively: `fs::exists(path)` and
+`fs::read_file_to_str(path)` — that is the whole of `std::fs`
+(`vilan/std/src/process/fs.vl`, 20 lines, three functions). Both take a path
+the user typed. There is no third thing.
+
+So the design's first move is not an abstraction, it is a **channel**: a value
+naming what a leg's build produced, reachable from the server leg.
+
+```vilan
+/// What one browser leg's build emitted, as the build itself knows it.
+struct LegBuild {
+    /// The leg's name — `client` for `[entry.client]`.
+    leg: str,
+    /// The eager bundle's filename, e.g. `client.js`.
+    bundle: str,
+    /// The style sidecar's filename, when the build emitted one. `None` means
+    /// the leg compiled no styles — a fact a shell must respect and cannot
+    /// see today (F1, F2).
+    styles: Option<str>,
+    /// The route chunks, in the build's own order. Empty for a leg that does
+    /// not `split` (`bundle-splitting.md` §4).
+    chunks: List<str>,
+    /// Whether the bundle must be loaded as a classic script — true exactly
+    /// when the leg splits, because chunk resolution reads
+    /// `document.currentScript` (§3.5).
+    classic_script: bool,
+}
+
+/// The description of `leg`'s most recent build.
+fun build_of(leg: str): Result<LegBuild, BuildError>
+```
+
+Where the value comes from is the paper's largest cost and is put to the owner
+as §10.2. The recommendation is the cheap one for v1 — read an extended,
+always-written `dist/<leg>.chunks.json` through E55's freshness hook — with a
+compiler-minted constant recorded as the end-state. §5.9 and §10.3 carry the
+detail.
+
+### 5.3 The ladder
+
+Three rungs and a validator. Each is independently adoptable; none requires the
+one above it; the bottom one is what exists today and is not going anywhere.
+
+| Rung | The server says | What it stops writing |
+|---|---|---|
+| **0** | today's code, unchanged | nothing — the escape hatch |
+| **0+** | `check_shell(shell, build, "app")!` | *nothing* — it stops being silent (§5.6) |
+| **1** | `.serve_build(build_of("client")!)` | the reads, the content-type table, the chunk plumbing |
+| **2** | `Document::of(build).title("Todo").html()` | `app.html` itself |
+
+### 5.4 Rung 1 — the served build
+
+```vilan
+impl ServerBuilder {
+    /// Serve one leg's build output: one route per artifact at `/<filename>`,
+    /// with the content type its extension implies, read through the dev
+    /// freshness hook (`dev-refresh.md` §3). Installed like a service (§4.3):
+    /// these routes answer before `on_request`, so the app's own catch-all
+    /// still gets every path they do not claim.
+    fun serve_build(own self, build: LegBuild): ServerBuilder
+}
+```
+
+This is `with_service`'s sibling and deliberately the same shape (§4.5): a
+library value claiming a set of paths in front of the app's handler. It is
+where F7 goes to die — a leg that gains `split = true` gains its chunk routes
+with no server edit, which is what `bundle-splitting.md` §3 wanted the sidecar
+for in the first place — and it is what `dev-loop.md` § "Serving the chunks"
+is describing when it says a static host "needs nothing".
+
+What it deletes, measured against §2.2: `examples/fullstack`'s server loses its
+two reads, its seven-line route match, and all 25 lines of `ChunkFile`,
+`route_chunks` and `find_chunk` — 34 of its 52 ceremony lines, replaced by one.
+`examples/todo`'s loses 8 of 10.
+
+Three details that are decisions, not defaults:
+
+- **Route shape.** `/<filename>`, so `dist/client.js` serves at `/client.js`
+  — which is what every shell in the tree already asks for, so no shell
+  changes. A `.at("/static/")` prefix is the obvious extension and is *not*
+  proposed for v1: the moment the prefix is configurable, the shell has to be
+  told about it, and a second string contract is exactly what this paper is
+  removing. Rung 2's `Document` could carry the prefix and keep them in sync,
+  which is the argument for adding it *later*, on top of rung 2, not now.
+- **Content types** come from the extension: `.js` → `text/javascript`,
+  `.css` → `text/css`, `.json` → `application/json`. A short fixed table in
+  std, not a user-facing map. Anything not in the table is not served by
+  `serve_build`, because `serve_build` serves *the build*, not a directory —
+  and this is the reason it is not a general static-file server (§5.10).
+- **Missing artifacts are loud.** `build_of` names a file the leg emitted; if
+  it is not on disk, that is a broken build, and `serve_build` reports it at
+  boot naming the file and the leg rather than 404ing at request time.
+
+### 5.5 Rung 2 — the document
+
+```vilan
+/// The HTML document a browser leg is loaded by, built from what that leg's
+/// build emitted — so the `<script>`, the `<link>` and the mount element
+/// cannot disagree with the artifacts they name.
+struct Document { … }
+
+impl Document {
+    /// The default document for a build: doctype, `<html lang>`, charset,
+    /// viewport, `<title>`, the stylesheet link IF AND ONLY IF the build
+    /// emitted styles, the mount element, and the bundle's script tag in the
+    /// form the build requires (§3.5).
+    fun of(build: LegBuild): Document
+
+    fun title(own self, title: str): Document
+    fun lang(own self, lang: str): Document
+    /// The mount element's id — the other end of `mount_root(id, …)`.
+    /// Defaults to `"app"`, which is what all seven shells in the tree use.
+    fun mount(own self, id: str): Document
+    /// Raw markup appended inside `<head>`: a favicon, an og: tag, a CSP,
+    /// an inline `<style>` for the page frame (which two templates want).
+    fun head(own self, markup: str): Document
+    /// Raw markup appended inside `<body>`, before the script tag.
+    fun body(own self, markup: str): Document
+    /// Server-rendered markup for the mount element (`ssr.md` §1) — the
+    /// splice, with no marker string in it. §5.8.
+    fun render(own self, view: View): Document
+
+    fun html(self): str
+}
+```
+
+`Document` is a **string builder, not a `View`**, and that is a decision worth
+stating because the opposite is the obvious guess. Making the document a `View`
+would mean the process-layer `ui` grows `<html>`/`<head>`/`<body>` semantics
+and a document-level mount — and `ssr.md` §6(a) ratified the process layer as
+*fragment-only*, with `mount`/`mount_root` deliberately omitted ("the natural
+`fun app(): View` factoring makes it unreachable"). A `View`-shaped document
+reopens that call for no gain: a document is not a reactive tree, nothing binds
+to it, and it is serialized exactly once per request. **Declining is a
+decision, not an omission.** `Document` composes *with* `View` at one point —
+`render(view)` — and nowhere else.
+
+Two more calls made explicitly:
+
+- **The default document is opinionated and small**: `<!doctype html>`,
+  `<html lang="en">`, `<meta charset="utf-8">`, the viewport meta, `<title>`,
+  the conditional `<link>`, `<div id="app">`, the script tag. That is the
+  intersection of the seven shells in §2.2, and every one of them is
+  reconstructible from it plus `head`/`body`. The `<style>` block that two
+  templates carry for page framing is `head()`'s first customer.
+- **`html()` returns a `str`, not a `Response`.** Rung 2 hands the app a
+  string; the app decides the status code, the headers and which paths get it.
+  A `Document` that knew about HTTP would have to know about routing, and then
+  it is a framework.
+
+### 5.6 Generation versus validation — the paper's central claim
+
+The charter asks for a ladder "progressively lowering to full control". The
+obvious reading is that the rungs are *generation* — more generated at the top,
+less at the bottom — and that the bottom rung is the raw shell. That reading
+produces a design that fails the charter's own middle clause, and the reason is
+worth stating carefully.
+
+A generator only protects documents it generated. The user who most needs F1–F7
+caught is exactly the user who dropped to the raw shell — because they wanted a
+CSP header, or a font preload, or an analytics snippet, or a `<base>` tag — and
+under a generation-only ladder, stepping down one rung steps out of every check
+at the same time. That is today's behavior, relabelled as a feature.
+
+**So: validation is the primitive, and generation is sugar over it.**
+
+```vilan
+enum ShellFault {
+    /// The build emitted styles and the document links no stylesheet. (F1)
+    StylesNotLinked(str),
+    /// The document links a stylesheet this build did not emit. (F2)
+    LinkedStyleMissing(str),
+    /// The document loads a script this build did not emit. (F3)
+    ScriptNotEmitted(str),
+    /// This build's bundle is loaded by no `<script>` in the document. (F3)
+    BundleNotLoaded(str),
+    /// No element carries the id the client mounts into. (F4)
+    MountMissing(str),
+    /// The leg splits, and its bundle is loaded as a module script, so chunk
+    /// resolution will miss on every nested route. (F6)
+    ModuleScriptWithChunks(str),
+}
+
+/// Check a hand-authored shell against a leg's build. Every fault, not the
+/// first — a shell with two problems should report two.
+fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>>
+
+/// A hand-authored shell, checked. The rung-0 escape hatch, made safe: the
+/// same `Document` value, its markup supplied rather than generated.
+fun Document::from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>>
+```
+
+`Document::of` is then **`from_shell` over markup it wrote itself**, and its
+guarantee is that the check it would run cannot fail. One set of rules, one
+implementation, two entry points — which is also the property that keeps the
+generator and the checker from drifting, the way the two `ui` implementations
+are kept from drifting by `ssr.md` §4's differential pin. The same instrument
+applies here: *every document `Document::of` can produce passes `check_shell`*
+is a property test, and it is the gate this slice owes.
+
+**How loud is loud?** The recommendation: `check_shell` returns a `Result`, so
+an application can decide; the sugar every template uses is `!`, so a broken
+document **stops the server from starting** with a message naming the fault,
+the file and the fix. The owner's bug would have read:
+
+```
+error: src/app.html links no stylesheet, but the `client` build emitted
+       dist/client.css
+  note: add `<link rel="stylesheet" href="/client.css" />` inside <head>
+  note: or call `.styles(Ignored)` if the page loads its styles another way
+```
+
+Refusing to boot is defensible precisely because the check is cheap, total, and
+about the *build*, not about the request: it cannot fail intermittently, and a
+server that starts with a document that cannot work is worse than one that does
+not start. An app that genuinely means it says so, once, in code.
+
+### 5.7 Rung 0 stays, and is the reason the rest is shaped this way
+
+Nothing above removes the ability to write `fs::read_file_to_str("src/app.html")`
+and a `match request.path()`. Rung 0 is not deprecated, not warned about, and
+not scheduled for removal, and the design owes it three things:
+
+1. `serve_build` is *additive* on the builder, so an app can serve the build
+   and still answer `/legacy.js` from its own handler.
+2. `check_shell` takes a `str`, so it works on a shell produced any way at all
+   — read from disk, templated, fetched from a CMS.
+3. `Document::html()` returns a `str`, so an app can take the generated
+   document and post-process it with the same string operations it uses today.
+
+The escape hatch is only credible if the rungs above it are made of the same
+material, which is why every piece of this design is a plain value: a
+description, a string, a `Result`.
+
+### 5.8 SSR — the marker, and what replaces it
+
+`ssr.md` §4 (S2) shipped the splice as user code:
+`shell.replace("<!--ssr-->", render(app()))`. That is F5: a string literal in
+`.vl` that must equal a string literal in `.html`, whose mismatch is a silent
+no-op, whose only observer is a crawler.
+
+`Document::render(view)` removes the marker rather than checking it. The
+document already knows where the mount element is — it is the same `mount(id)`
+the client attaches to — so server-rendered markup goes *inside that element*
+by construction, and there is nothing to spell wrong:
+
+```vilan
+Document::of(build).title("Notes").render(app()).html()
+```
+
+For rung 0, `from_shell` still needs a marker (the shell was hand-authored and
+the document cannot find the mount element's contents without one), so
+`ShellFault` gains no marker case and `Document::from_shell(...).render(view)`
+splices into the *element the check already located by id* — the mount element
+— rather than into a comment. That means **the `<!--ssr-->` convention becomes
+unnecessary at every rung**, and `examples/ssr` loses its marker.
+
+§7.1 handles the ratified-decline reconciliation; the short version is that
+`ssr.md` §6(b) declined `render_into(shell, marker, view)` because it was new
+surface for a one-line string replace, and this is a method on a value the
+charter requires to exist for entirely different reasons.
+
+### 5.9 Chunks, styles, and freshness — the three interactions
+
+**Chunks.** `bundle-splitting.md` §3's sidecar is exactly the description this
+design needs, and it is written **only when the leg splits**; §9 ratified the
+sweep that removes it when `split` is dropped, on the grounds that "a manifest
+outliving its chunks is one that LIES". The recommendation is to **extend the
+sidecar into the leg's build manifest and write it on every build of the leg,
+chunks or none** — keeping the filename, adding `styles` and `classic_script`,
+and leaving `"chunks": []` when there are none. This does not weaken §9's
+invariant: the invariant is *the leg's last build owns the file*, which the
+sweep enforces and which an always-written manifest enforces more strongly (a
+present-but-empty chunk list is a positive statement; an absent file is an
+ambiguity between "did not split" and "was never built"). It does churn a
+byte-pinned golden and reverse one ratified line, so it is §10.3, the owner's.
+
+**Styles.** `ui-styling.md` §4 ratified "browser builds emit `<out>.css`; the
+html host links it", and §0bis records the template's `fs::exists` guard as the
+state of the art. `LegBuild.styles: Option<str>` is that guard, answered by the
+build instead of by a filesystem probe, and F1/F2 are the two directions the
+probe cannot check. The `<link>` idiom itself is preserved unchanged, which
+matters: `hmr.md` §2 and its 2026-08-10 appendix both depend on the stylesheet
+being a findable `<link>` whose `href` ends in the sidecar's name, and the css
+hot-swap supersedes it (`link.disabled = true`) rather than replacing it, so
+"a plain page reload starts clean from a freshly parsed `app.html`". A
+generated document must therefore emit a real `<link>` with the sidecar's
+filename in its href — which it does — and must not inline styles, which it
+does not.
+
+**Freshness.** `dev-refresh.md` §3 recommends the re-run-on-round hook as the
+one mechanism and `fs`-specific sugar over it. This paper **does not redesign
+that and does not need to**, because the two concerns separate cleanly:
+
+- the **description** (`LegBuild`) is a build fact — it changes only when the
+  build changes, which under `run --watch` means the server restarted anyway
+  for a code change, or did not need to for a css-only round;
+- the **bytes** are what go stale, and `serve_build` is the single place they
+  are read, so it is the single call site E55's hook has to reach. That is
+  strictly better than today's three-reads-in-`main`, and it is the
+  restructuring `dev-refresh.md` §2(i) says the revalidating read needs: "a
+  primitive in search of a call site that invokes it more than once".
+
+`dev-refresh.md` §2(iv) hands this paper the template question explicitly ("It
+is **not** the larger question backlog item 56 opens … that charter is
+explicitly out of scope here and is its own design note"). The handoff is
+returned in kind: E55 ships the hook; `serve_build` is its first and best
+customer; neither blocks the other, and if E55 ships first the template edit is
+mechanical, exactly as §2(iv) predicts.
+
+### 5.10 What this is not: a static file server, and the single-leg gap
+
+`serve_build` serves **a build**, not a directory. It will not serve a favicon,
+an image, or a `robots.txt`, and that is deliberate — a directory server has a
+traversal-safety surface, a MIME-type surface and a caching surface, and none of
+them are E56's subject. It is also, today, impossible: `std::fs` cannot read a
+binary file at all (`read_file_bytes(path, encoding): str` is the only read, and
+it returns a string — `vilan/std/src/process/fs.vl:5-6`), so no vilan program
+can serve a PNG. That is filed as bycatch (§9.3).
+
+`hmr.md` §9 records the adjacent gap: "grow the dev channel's static serving
+into a tiny dev server (`index.html` + bundle) so `run --watch` works without a
+Node leg". Rung 2 is half of what that needs — a browser-only project has no
+server leg to call `Document::of` from, but the CLI has the same `LegBuild`
+information and could render the same document. **Recommendation: do not build
+it in this arc, and note the alignment.** If `Document` lands in std as a plain
+value over a plain description, the dev server's page is the same rendering
+performed CLI-side, and §9's item shrinks from "design a dev server's HTML" to
+"serve `Document::of(build).html()`". That is worth recording precisely so the
+two do not get designed twice.
