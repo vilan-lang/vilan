@@ -1988,6 +1988,11 @@ impl LanguageServer for Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return Ok(None);
             };
+            // Deliberately the LIVE index, unlike every sibling handler below:
+            // completion's trigger scan (`.`/`?.`/`::`, the partial identifier)
+            // reads the buffer the user is mid-keystroke in. `Document::completion`
+            // converts to the ANALYZED offset internally wherever it touches
+            // `program` data (scope/entity lookups) — see its doc comment (E52).
             let offset = document.line_index.offset(position);
             let mode = self
                 .config
@@ -2547,6 +2552,19 @@ mod snapshot_consistency_tests {
         Position::new(2, 6)
     }
 
+    /// The `Position` of `needle` in `text`, plus `delta` characters — the
+    /// `Position` analogue of `document::tests::offset_at`, for the completion
+    /// pins below, which drive the `Backend` (positions, not raw offsets).
+    /// ASCII-only fixtures throughout, so a byte offset doubles as a UTF-16
+    /// `character` count.
+    fn position_at(text: &str, needle: &str, delta: usize) -> Position {
+        let offset = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in the pin source"))
+            + delta;
+        LineIndex::new(text).position(offset)
+    }
+
     #[tokio::test]
     async fn hover_answers_the_analyzed_snapshot_while_typing() {
         let (service, _socket) = backend();
@@ -2664,6 +2682,218 @@ mod snapshot_consistency_tests {
             .await
             .expect("symbols mid-edit");
         assert_eq!(format!("{baseline:?}"), format!("{mid_edit:?}"));
+    }
+
+    // E52: completion was the one query left wired to the LIVE index for its
+    // scope/entity lookups — every other handler above converts through
+    // `analyzed_offset` first. A scope-position completion (no `.`/`::` before
+    // the cursor) must resolve the SAME enclosing scope while the buffer is
+    // ahead of the analysis.
+    //
+    // TWO functions, deliberately, rather than `WIRING_SOURCE`'s one: `value`
+    // and `other` there share a single scope, so ANY offset near that fixture
+    // resolves the same scope-completion set regardless of which byte it names
+    // — a pin built on it would stay green even feeding the raw live offset
+    // straight into `scope_at` (proven while designing this pin: it did). Two
+    // functions means the wrong scope is a different, checkable set of names.
+    #[tokio::test]
+    async fn completion_answers_the_analyzed_snapshot_while_typing() {
+        const SCOPE_SOURCE: &str =
+            "fun first() {\n\tlet alpha = 1;\n}\n\nfun second() {\n\tlet beta = 2;\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(SCOPE_SOURCE));
+        // Inside `beta`'s declaration — a scope position, no `.`/`::` before it.
+        let position = position_at(SCOPE_SOURCE, "beta", 2);
+        let params = |uri: &Url| CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let baseline = backend.completion(params(&uri)).await.expect("completion");
+        let labels_of = |response: &Option<CompletionResponse>| match response {
+            Some(CompletionResponse::Array(items)) => items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels_of(&baseline).contains(&"beta".to_string()),
+            "the fixture must offer the local: {baseline:?}",
+        );
+        // Widen the FIRST line by enough bytes that the live offset this
+        // `Position` names overruns the whole analyzed text — line/column are
+        // unchanged, so the trigger scan still takes the scope-completion
+        // branch both times, isolating the divergence to `scope_at`.
+        let edited = SCOPE_SOURCE.replacen("fun first", &format!("fun {}first", "x".repeat(80)), 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&edited);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert_ne!(
+                document.analyzed_offset(position),
+                document.line_index.offset(position),
+                "the fixture must skew the inbound conversion at {position:?}",
+            );
+        }
+        let mid_edit = backend
+            .completion(params(&uri))
+            .await
+            .expect("completion mid-edit");
+        assert_eq!(
+            labels_of(&baseline),
+            labels_of(&mid_edit),
+            "the same enclosing scope resolves from the analyzed snapshot",
+        );
+    }
+
+    // E52, member-completion variant: the RECEIVER's type also resolves
+    // through a `program` lookup (`entity_at`, off a complex/chained receiver
+    // rather than a bare name — `widget` is a FIELD, not a binding, so
+    // `binding_in_scope`/`same_file_variable` cannot resolve it and completion
+    // falls all the way to the `entity_at`-only path, which has no
+    // scope-search fallback to mask an offset error), and must answer the
+    // analyzed snapshot too — the "pre-edit receiver" symptom.
+    //
+    // Unlike the WIRING fixtures above, this skew widens an EARLY LINE by a
+    // few characters rather than prepending a whole one: the receiver's own
+    // line/column never move, only its BYTE offset does, so the SAME
+    // `Position` is valid before and after — completion's live trigger scan
+    // (deliberately untouched by the fix) still finds the same `.` both
+    // times, isolating the divergence to the downstream entity lookup.
+    #[tokio::test]
+    async fn member_completion_answers_the_analyzed_snapshot_while_typing() {
+        const MEMBER_SOURCE: &str = "struct Widget {\n\tsize: i32,\n}\n\nstruct Container {\n\twidget: Widget,\n}\n\nfun main() {\n\tlet box = Container { widget = Widget { size = 1 } };\n\tbox.widget.size;\n}\n";
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend
+            .documents
+            .insert(uri.clone(), document(MEMBER_SOURCE));
+        // Right after `box.widget.`, before `size` — a member trigger on a
+        // chained field access, with no typed prefix.
+        let position = position_at(MEMBER_SOURCE, "box.widget.size", 11);
+        let params = |uri: &Url| CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let baseline = backend.completion(params(&uri)).await.expect("completion");
+        let labels_of = |response: &Option<CompletionResponse>| match response {
+            Some(CompletionResponse::Array(items)) => items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels_of(&baseline).contains(&"size".to_string()),
+            "the fixture must offer the field: {baseline:?}",
+        );
+        // Widen the first struct declaration by one character — every byte
+        // from `struct Container` onward shifts, but no line moves.
+        let edited = MEMBER_SOURCE.replacen("struct Widget", "struct  Widget", 1);
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&edited);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert_ne!(
+                document.analyzed_offset(position),
+                document.line_index.offset(position),
+                "the fixture must skew the inbound conversion at {position:?}",
+            );
+        }
+        let mid_edit = backend
+            .completion(params(&uri))
+            .await
+            .expect("completion mid-edit");
+        assert_eq!(
+            labels_of(&baseline),
+            labels_of(&mid_edit),
+            "the receiver still resolves to Widget from the analyzed snapshot",
+        );
+    }
+
+    // E52: the `.`/`?.`/`::` trigger scan itself must stay LIVE — the fix
+    // converts only the downstream scope/entity lookups. A `.` typed on a line
+    // that exists ONLY in the live buffer (appended after the last analysis
+    // landed) must still be recognized as a member trigger and reach the
+    // member path, falling back through `same_file_variable` for the receiver
+    // (the salvage path `receiver_nominal_id` documents) rather than silently
+    // taking the scope-completion branch.
+    #[tokio::test]
+    async fn completion_after_a_dot_typed_on_a_live_only_line_still_offers_members() {
+        const BASE: &str = "struct Widget {\n\tsize: i32,\n}\n\nfun main() {\n\tlet item = Widget { size = 1 };\n}\n";
+        let live = BASE.replacen(
+            "\tlet item = Widget { size = 1 };\n}\n",
+            "\tlet item = Widget { size = 1 };\n\titem.\n}\n",
+            1,
+        );
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = uri();
+        backend.documents.insert(uri.clone(), document(BASE));
+        backend
+            .documents
+            .get_mut(&uri)
+            .expect("open")
+            .set_text(&live);
+        let position = position_at(&live, "item.\n", 5);
+        {
+            let document = backend.documents.get(&uri).expect("open");
+            assert!(document.is_stale(), "the buffer is ahead of the analysis");
+            assert_ne!(
+                document.analyzed_text(),
+                document.line_index.text(),
+                "the `item.` line must exist only in the live text",
+            );
+        }
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion on a live-only line");
+        let labels: Vec<String> = match &response {
+            Some(CompletionResponse::Array(items)) => {
+                items.iter().map(|item| item.label.clone()).collect()
+            }
+            other => panic!("the array form is expected, got {other:?}"),
+        };
+        assert!(
+            labels.contains(&"size".to_string()),
+            "the trigger scan must still find the `.` in the LIVE text and \
+             reach the member path: {labels:?}",
+        );
+        assert!(
+            !labels.contains(&"fun".to_string()),
+            "a keyword candidate would mean the dispatch fell through to \
+             scope completions instead of the member path: {labels:?}",
+        );
     }
 
     // S4, pin 12: an analysis that finishes AFTER the document was closed is
