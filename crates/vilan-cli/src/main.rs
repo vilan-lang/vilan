@@ -3345,7 +3345,15 @@ mod tests {
         assert_eq!(snippet(multibyte, &(5..7)), "");
         // Past the end — a span from a longer file.
         assert_eq!(snippet(multibyte, &(400..420)), "");
-        // Inverted — never produced, never sliced either.
-        assert_eq!(snippet(multibyte, &(6..4)), "");
+        // Inverted — never produced, never sliced either. The range is
+        // DELIBERATELY reversed (this pins that `snippet` tolerates one, not
+        // that anyone would write `6..4` by accident), so clippy's "probably a
+        // mistake" lint is silenced for this one assertion rather than fixed
+        // away. (The allow needs its own block: clippy ignores an attribute
+        // placed directly on a macro-invocation statement.)
+        #[allow(clippy::reversed_empty_ranges)]
+        {
+            assert_eq!(snippet(multibyte, &(6..4)), "");
+        }
     }
 }
