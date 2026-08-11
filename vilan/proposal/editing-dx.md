@@ -1,6 +1,9 @@
 # In-progress-change diagnostics — the DX survey (E49)
 
-> Status: DRAFT (awaiting owner review) — filed from backlog E49, the owner's 2026-08-09 charter.
+> Status: RATIFIED 2026-08-11 ("The recommendations for editing-dx.md … look
+> good") — slices S1–S6 are free for lanes, S1 (the statement synchronizer,
+> the blackout's fix) first among them. Filed from backlog E49, the owner's
+> 2026-08-09 charter.
 >
 > Origin: backlog E49 (`backlog-2026-07-18.md:591-608`). The charter's premise:
 > "code MID-EDIT is the diagnostic path's most common input, and several shapes
