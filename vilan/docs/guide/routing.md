@@ -150,14 +150,14 @@ That's the standard history-API fallback, and the catch-all in your http
 handler does it:
 
 ```vilan,fragment
-serve_service(4000, protocol, |request| {
-	match request.path() {
-		"/client.js" => …,
-		"/client.css" => …,
-		_ => …app shell html…,   // every route serves the shell
-	}
-})
+serve_service(4000, protocol, build_handler(build, |request| {
+	…app shell html…   // every path the build does not claim serves the shell
+}))
 ```
+
+`build_handler(build, …)` answers the build's own artifacts (`/client.js`,
+`/client.css`, and any route chunks) and hands everything else to your
+fallback, which is the catch-all deep links need.
 
 On the client side, a deep-linked page usually needs data that hasn't
 synced yet. Mount it under `when(present)` so it appears when the data

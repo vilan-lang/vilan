@@ -859,7 +859,7 @@ fn hmr_round(
                 // `dist/` bundles, exactly as `run_workspace` /
                 // `build_and_spawn_run`.
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
-                match spawn_node(&script, args, Some(&root)) {
+                match spawn_watched_node(&script, args, Some(&root)) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
                         eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -969,7 +969,7 @@ fn build_and_spawn_run(
     if run_build_hooks(&project).is_err() {
         return None;
     }
-    let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd) {
+    let launch = |script: &Path, cwd: Option<&Path>| match spawn_watched_node(script, args, cwd) {
         Ok(child) => Some(child),
         Err(error) => {
             eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -2900,10 +2900,42 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// round's kill takes the program's whole process tree, and the CLI's own death
 /// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
 fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
+    spawn_node_with_env(script, args, cwd, &[])
+}
+
+/// The environment variable a `--watch` session sets on its Node child, and the
+/// whole of `std::process::is_watching()`'s plumbing (`dev-refresh.md` §1, and
+/// §5 item 2's thin surface): no wire protocol, no socket, nothing that can
+/// fail independently of the process actually starting, and nothing to clean up
+/// after a crashed watcher. `is_watching()` is defined under every run and is
+/// `true` only when this is set.
+const WATCHING_ENV: &str = "VILAN_WATCHING";
+
+/// [`spawn_node`] for a child a `--watch` session owns — the one difference is
+/// [`WATCHING_ENV`]. Both watch paths (the HMR round and the plain restart
+/// loop) go through it; plain `vilan run` does not, which is what makes
+/// `is_watching()` answer the question it is named for.
+fn spawn_watched_node(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> std::io::Result<ManagedChild> {
+    spawn_node_with_env(script, args, cwd, &[(WATCHING_ENV, "1")])
+}
+
+fn spawn_node_with_env(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
     command.arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    for (name, value) in env {
+        command.env(name, value);
     }
     command.spawn().map(ManagedChild::adopt)
 }

@@ -53,8 +53,12 @@ impl ServerBuilder {
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
 	fun on_stop(own self, callback: |Server| void): ServerBuilder
+	fun serve_build(own self, build: LegBuild): ServerBuilder   // one route per artifact
 	fun build(self): Server
 }
+// The same routing for a boot function that hands you only a fallback
+// (`serve_service`, `serve_connected`):
+fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response
 impl Server {
 	fun start(self)        // begin listening; holds the event loop
 	fun port(self): i32    // the bound port (see below)
@@ -103,6 +107,28 @@ fun main() {
 }
 ```
 
+`serve_build` is the one call that replaces the boot reads and the
+content-type table a full-stack server used to write by hand. It takes a
+[`LegBuild`](#stdbuild) and installs one route per artifact at
+`/<file name>` — the bundle, the style sidecar if the leg emitted one, and
+every route chunk — in front of `on_request`, whatever order the chain was
+written in. So the app's catch-all still answers every path the build does
+not claim, and a leg that gains `split = true` gains its chunk routes with
+no server edit.
+
+Three details are decisions, not defaults. The route shape is
+`/<file name>`, which is what every shell already asks for, so adopting it
+moves no HTML. Content types come from a short fixed table (`.js`/`.mjs`,
+`.css`, `.json`, `.html`); anything else is not served, because
+`serve_build` serves a *build*, not a directory. And an artifact the build
+named but did not write **stops the server at boot**, naming the file and
+the leg, rather than 404ing for the life of the process.
+
+Freshness is its dev-mode policy: under `vilan run --watch`
+([`is_watching`](#stdprocess)) each asset is re-read per request, so a
+rebuild is served without a restart; otherwise the copy read at boot is
+served from memory.
+
 A **streaming** response holds the connection open: once the status and
 headers are written, `on_open` receives the live `ResponseStream` and
 writes chunks over time (SSE's shape; a suspending `on_open` runs as
@@ -134,8 +160,13 @@ each handler runs in a turn (`AtEnd`). Details and the client side:
 ```vilan,fragment
 fun exists(path: str): bool                // sync
 fun read_file_to_str(path: str): str       // async, UTF-8
+fun read_file_to_str_sync(path: str): str  // sync, UTF-8 — blocks the event loop
 fun write_file(path: str, contents: str)   // async
 ```
+
+Prefer the async read. The sync one exists for a read that must complete
+inside a callback that cannot suspend — `serve_build`'s dev-mode
+revalidation is the case it was added for.
 
 ## std::build
 
@@ -174,7 +205,15 @@ fun args(): List<str>            // CLI arguments
 fun env(key: str): Option<str>   // environment variable
 fun exit(code: i32)
 fun scan(): str                  // read a line from stdin
+fun is_watching(): bool          // is this a `vilan run --watch` child?
 ```
+
+`is_watching()` is defined under every run and is `true` only under
+`vilan run --watch`, so a program branches on it without knowing how it
+was started. It is about *data* freshness, not code: `serve_build` uses it
+to revalidate its assets per request while watching, and a hand-rolled
+server can do the same. Server-side hot-swapping of code is not a thing
+here and is not planned — the node leg restarts.
 
 A completed `main` ends the process; long-lived programs must hold it open
 (a listening server does; a socket-holding client needs an explicit wait).

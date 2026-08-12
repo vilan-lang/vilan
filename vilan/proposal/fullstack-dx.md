@@ -1667,3 +1667,145 @@ the five; (b) suppressing the `styles` report reddens two. The split
 fixture's own goldens and the three `split.rs` pins that read the manifest's
 *absence* as "did not split" now read its `chunks` list, which is what they
 meant.
+
+## 13. S3 shipped — rung 1, and the dev policy (2026-08-11)
+
+`ServerBuilder::serve_build`, the extension→content-type table, the consumer
+sweep, and — the post-ratification amendment §0 records — dev-mode asset
+freshness as `serve_build`'s own policy (`dev-refresh.md` §5, items 1–2a).
+
+### 13.1 The surface
+
+```vilan
+impl ServerBuilder {
+	fun serve_build(own self, build: LegBuild): ServerBuilder
+}
+fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response
+```
+
+`ServerBuilder` gains one field, `assets: List<BuildAsset>`, and `build()`
+gains one responsibility: fold the build's routes in front of the user's
+`request_handler`. The fold is a pure function of the field, so `Server`
+still holds exactly one request handler and `start()` is untouched — the
+shape §4.2 promised for `with_service`, arrived at independently for its
+sibling. Installing before or after `.on_request(…)` behaves identically,
+which is the property a field (rather than a wrapper applied at call time)
+buys.
+
+The content-type table is `.js`/`.mjs` → `text/javascript`, `.css` →
+`text/css`, `.json` → `application/json`, `.html` → `text/html`. Anything
+else is **not served** rather than guessed at (§5.10): four rows, covering
+exactly what a vilan build can emit. A query string is stripped before
+matching, so `/client.js?v=2` is the bundle — a cache-buster is not a
+different file.
+
+**`build_handler` is the slice's one unplanned name, and it is a direct
+consequence of S1 not being in this slice.** `serve_service` and
+`serve_connected` construct their own `Server` and hand the app only a
+`fallback`, which is §3.7's whole complaint; until `with_service` lands,
+`examples/todo` and `examples/walkthrough` have no builder to install
+`serve_build` on, and the sweep's mandate covers them. `build_handler` is
+the same fold, the same reads, the same freshness policy, exposed as a
+`|Request| Response` — composable exactly as `rpc_response` is (§3.7's
+"honourable exception"). When S1 lands, those two examples take
+`.with_service(…) + .serve_build(…)` on a builder and `build_handler` has
+nothing left to do; it is not load-bearing for the design and should be
+reviewed for removal then.
+
+One language fact forced the shape: the two forms cannot share their outer
+body because the fallback's COLOR differs — `ServerBuilder`'s handler is
+`async` and `serve_service`'s is not, and a closure that calls an async
+closure is async. They share `asset_response`, which is where the policy
+lives; the duplication is four lines of `match`.
+
+### 13.2 The dev policy, and a sync read
+
+Under `run --watch`, `serve_build` re-reads each asset per request; outside
+one, it serves the copy read at boot. `dev-refresh.md` §5's argument in one
+line: the problem is pull-shaped, every HTTP request is an opportunity to be
+fresh, and taking it needs no signalling protocol — which is what sank the
+re-run-on-round hook, since editing `app.html` produces no round to fire on.
+
+The signal is **`VILAN_WATCHING=1`**, set by `spawn_watched_node` on the
+Node child of both watch paths (the HMR round and the plain restart loop)
+and by neither `vilan run` nor `vilan build`. `std::process::is_watching()`
+reads it. Placement: `std::process`, not a new `std::dev` twin —
+`vilan/std/src/browser/dev.vl` already owns that module name, and a process
+twin with a different surface would trip `std_twin_parity`'s inventory gate
+for no gain. `std::process` is where `env`, `args` and `exit` already live,
+and `is_watching` is an env lookup. §4's scope question resolves as §5 ruled:
+DEFINED under every run, `true` only under a watch.
+
+**One std addition fell out of it**: `fs::read_file_to_str_sync`. The
+revalidating read runs inside a request handler that, in the
+`serve_service` shape, cannot suspend — so the async read cannot be used
+there. A synchronous read is also the better trade for a dev-only
+revalidation and removes an await from the release path entirely. Recorded
+here because §9.3 files `std::fs`'s gaps as bycatch and this is a (small)
+one closed in passing.
+
+### 13.3 The consumer sweep — the ceremony numbers, re-measured
+
+Counted by §1.2's rule (non-blank, non-comment lines), before → after:
+
+| File | lines | ceremony |
+|---|---|---|
+| `examples/fullstack/server/src/main.vl` | 56 → **25** | 52 → ~7 |
+| `templates/fullstack/src/server.vl` | 25 → **16** | 22 → **7** |
+| `examples/ssr/src/server.vl` | 20 → **17** | 15 → ~6 |
+| `examples/todo/src/server.vl` | 19 → **13** | 10 → 5 |
+| `examples/walkthrough/src/server.vl` | 19 → **13** | 10 → 5 |
+
+The template lands where §6.2 predicted almost exactly — *"25 counted lines
+become 16; 22 ceremony lines become 6"* — the one extra being that
+`serve_build(build)` is its own chain line beside `let build = …`.
+`examples/fullstack` loses 31 lines net: the two boot reads, the seven-line
+route match, and the whole `ChunkFile` / `route_chunks` / `find_chunk` block
+§5.4 measured at 25 lines. **There is no `ChunkFile` type left in the tree.**
+
+`todo` and `walkthrough` land short of §5.4's predicted "8 of 10" for the
+reason 13.1 gives: without S1 they keep `serve_service`, and therefore keep
+`import std::fs` and `import std::http::Response` for the shell they still
+read and answer by hand. The three reads did become one and the five-line
+table did become one call — 6 lines each — and the remaining gap closes when
+S1 lets them move to the builder (§6.3's own note says they should).
+
+`vilan/docs/guide/{walkthrough,ssr,routing,styling,persistence,services}.md`
+were taught the new idiom in the same commit; `docs/std/process.md` carries
+`serve_build`, `build_handler`, `is_watching` and the sync read.
+
+### 13.4 The gates
+
+Every example's existing e2e passes **unchanged** — not one assertion in
+`tests/examples.rs`, `tests/ssr_fullstack.rs` or `tests/init.rs` moved,
+including the init template's field-by-field manifest gate and its
+spawn-and-fetch e2e (`/`, `/client.js`, `/client.css`, the `{display:flex}`
+rule). They assert served bytes, and the bytes did not move.
+
+`crates/vilan-cli/tests/serve_build.rs`, six pins:
+
+- one route per artifact with its content type; a query string does not
+  change which artifact; an unclaimed path still reaches `on_request`;
+  `/dist/client.js` is not a route (a build, not a directory);
+- **a leg that gains `split = true` serves its chunks with no server edit** —
+  the manifest is rewritten with `split = true` and the server file is then
+  asserted BYTE-IDENTICAL across the two halves, so the three chunk routes
+  can only have come from the build;
+- a named artifact that is not on disk stops the server, naming the file and
+  the leg;
+- the dev policy BOTH ways: bytes moved under a running server are served
+  fresh with `VILAN_WATCHING=1` and from the boot copy without it;
+- `is_watching()` is `false` under plain `vilan run`;
+- `run --watch` really does set the signal on its child.
+
+Planted red, each restored: serving `asset.content` unconditionally (E55's
+defect) reddens the dev pin; revalidating unconditionally reddens its release
+half; dropping `chunks` from `artifacts()` reddens the split pin; and
+spawning the watch child without `VILAN_WATCHING` reddens the watcher pin.
+
+### 13.5 Bycatch cleared in passing
+
+§9.4's two drifts in `examples/todo`, both in files this sweep rewrote:
+`src/server.vl`'s header said `serve_connected` where the code says
+`serve_service`, and `src/app.html:6` closed `</head>` on the stylesheet
+`<link>`'s own line. Both fixed.

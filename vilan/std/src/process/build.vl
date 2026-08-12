@@ -20,6 +20,7 @@ import pkg::fs;
 import pkg::io::panic;
 import pkg::json::{ JsonValue, coerce_bool, coerce_str };
 import pkg::option::Option::{ None, Some, self };
+import pkg::process::is_watching;
 import pkg::result::Result::{ Err, Ok, self };
 
 /// What one browser leg's build emitted, as the build itself knows it.
@@ -150,6 +151,84 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 		chunks = chunks,
 		classic_script = coerce_bool(manifest.field("classic_script")),
 	})
+}
+
+/// One artifact of a build, ready to answer a request: where it is asked for,
+/// where it lives, what it is, and the bytes read when the server booted.
+struct BuildAsset {
+	/// The url this artifact answers on — `/client.js`.
+	url: str,
+	/// Where it lives on disk — `dist/client.js`.
+	file: str,
+	/// What its extension implies (`content_type_of`).
+	content_type: str,
+	/// The bytes read at boot. What is served outside a watch, and what makes a
+	/// missing artifact a boot-time failure rather than a 404 per request.
+	content: str,
+}
+
+/// Read every artifact `build` names, ONCE, at boot — the list
+/// `ServerBuilder::serve_build` installs in front of the app's own handler.
+///
+/// A named artifact that is not on disk is a broken build, and it STOPS the
+/// server, naming the file and the leg (`fullstack-dx.md` §5.4). 404ing it per
+/// request would be the same silence this design exists to remove: the build
+/// said it wrote the file, so its absence is not a routing question.
+fun load_build(build: LegBuild): List<BuildAsset> {
+	mut assets: List<BuildAsset> = [];
+	for artifact in build.artifacts() {
+		let (url, file) = artifact;
+		match content_type_of(file) {
+			// Not served rather than guessed at: `serve_build` serves a build,
+			// not a directory. Nothing a vilan build emits lands here today.
+			None => {},
+			Some(let content_type) => {
+				if !fs::exists(file) {
+					panic(i"the `{build.leg}` build names {file}, which is not on disk — rebuild the leg (`vilan build .`), and run the server from the project root");
+				}
+				assets.push(BuildAsset {
+					url = url,
+					file = file,
+					content_type = content_type,
+					content = fs::read_file_to_str_sync(file),
+				});
+			},
+		}
+	}
+	assets
+}
+
+/// The artifact `path` asks for, if this build has one. A query string is
+/// ignored, so `/client.js?v=2` reaches the bundle — a cache-buster is not a
+/// different file.
+fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
+	let route = path.split("?")[0];
+	for asset in assets {
+		if asset.url == route {
+			ret Some(asset);
+		}
+	}
+	None
+}
+
+/// The bytes to serve for `asset` right now — the dev-mode freshness policy
+/// (`dev-refresh.md` §5, item 1).
+///
+/// Under `run --watch`, re-read per request: every request is an opportunity to
+/// be fresh, and taking it needs no signalling protocol at all — which is the
+/// flaw that sank the re-run-on-round hook, since editing `app.html` produces
+/// no round to fire on. Outside a watch, serve the copy read at boot: the bytes
+/// cannot move under a running server that nobody is editing, and a release
+/// server should not pay a syscall per asset request.
+///
+/// This makes the SERVER's copies fresh. The dev channel's push half (the css
+/// and js hot-swaps) is untouched and remains the way a browser is told.
+fun asset_body(asset: BuildAsset): str {
+	if is_watching() {
+		fs::read_file_to_str_sync(asset.file)
+	} else {
+		asset.content
+	}
 }
 
 /// The content type `file`'s extension implies, or `None` for an extension

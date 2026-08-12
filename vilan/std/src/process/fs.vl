@@ -18,3 +18,19 @@ external fun exists(path: str): bool;
 fun read_file_to_str(path: str): str {
 	read_file_bytes(path, "utf8")
 }
+
+/// The synchronous read (`node:fs` `readFileSync`) — for a read that must
+/// complete inside a callback that cannot suspend.
+///
+/// Prefer `read_file_to_str`: this one blocks the event loop for the length of
+/// the read, which is the wrong trade for anything on a server's hot path. It
+/// exists because a synchronous request handler has no other option, and
+/// `serve_build`'s dev-mode revalidation is exactly that — a re-read per
+/// request, under `run --watch` only, of a file the build just wrote.
+[extern("node:fs", "readFileSync")]
+external fun read_file_bytes_sync(path: str, encoding: str): str;
+
+/// Reads a UTF-8 text file to a string, synchronously. See `read_file_bytes_sync`.
+fun read_file_to_str_sync(path: str): str {
+	read_file_bytes_sync(path, "utf8")
+}

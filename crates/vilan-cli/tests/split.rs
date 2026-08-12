@@ -899,10 +899,13 @@ fn http_get(port: u16, path: &str) -> Vec<u8> {
 
 #[test]
 fn a_split_builds_chunks_are_servable_through_the_manifest() {
-    // `bundle-splitting.md` §S4, item 7. `chunks.json` exists so a hand-written
-    // server can serve the chunk files without hard-coding a route per file —
-    // the shape `examples/fullstack`'s server now carries and the docs teach.
-    // This is that shape, over a leg that really did split, actually served.
+    // `bundle-splitting.md` §S4, item 7. `chunks.json` exists so a server can
+    // serve the chunk files without hard-coding a route per file. The blessed
+    // way to do that is now `serve_build` (`fullstack-dx.md` §5.4, pinned in
+    // `tests/serve_build.rs`, and adopted by `examples/fullstack`); what THIS
+    // pins is that the manifest stays a plain, hand-readable JSON contract —
+    // rung 0 is not deprecated, and a server that iterates the file itself must
+    // keep working (§5.7).
     let port = free_port();
     let staged = stage_workspace("served");
     std::fs::write(
