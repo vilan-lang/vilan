@@ -271,17 +271,35 @@ covers `force_refresh()` only.
   function so the HTTP handler — which has the client registry but no
   `&DevChannel` (the channel that owns one lives on the main watch thread,
   not the accept loop) — can reach it too.
-- **The primitive**: `std::dev::force_refresh(): void`, in a NEW file,
-  `std/src/process/dev.vl` — the process layer's `std::dev`, a different
-  module from the browser one (`std/src/browser/dev.vl`) under the same
-  import name, resolved per platform exactly as `std::ui` already is
-  (`process/ui.vl` vs `browser/ui.vl`). Reads `VILAN_HMR_PORT`
+- **The primitive**: `std::watch::force_refresh(): void`, in a NEW file,
+  `std/src/process/watch.vl`. §5's own prose names it "`std::process::dev`
+  or the thin equivalent" — the thin equivalent is what shipped, and the
+  name deviates from a literal reuse of `dev` for a reason the full suite
+  caught, not a stylistic choice: `std_twin_parity.rs`'s `TWINNED_MODULES`
+  comment already documents `dev` as **deliberately single-platform**
+  (browser-only, "no counterpart to be held against" — the same status
+  `db`/`fs`/`http`/`process`/`rpc_server` have on the process side). A
+  first pass DID reuse `dev` (mirroring `std::ui`'s browser/process twin,
+  which shares one component surface by design); `cargo nextest run
+  --workspace` caught it immediately —
+  `std_twin_parity::the_twin_inventory_is_known` failed, correctly: the two
+  `dev`s share no component source the way `std::ui`'s two halves do (five
+  unrelated names, `hmr_active`/`on_teardown`/`stash`/`take` vs
+  `force_refresh`), so forcing them into the twin-parity mechanism would
+  have meant five dishonest `ALLOWED_DIVERGENCES` entries justifying a
+  divergence that was never the kind that gate exists to hold together.
+  `watch` sidesteps it cleanly — a new, ordinary single-platform module,
+  no twin, nothing for that gate to say. Reads `VILAN_HMR_PORT`
   (`std::process::env`); absent ⇒ no-op. Present ⇒ fire-and-forget —
   `async post(url, "").send()` — so `force_refresh` stays a plain, SYNC
   `void` function (not inferred-async): calling it never spreads asyncness
   to its caller, the same reasoning `std::fetch`'s own docs give for `let
   _sent = async cell.write(..)`. `std::fetch` is a base (all-platform)
   module, so the process layer reaches it with no new dependency.
+  MERGE NOTE: if the serve-build lane's `is_watching()` independently
+  created its own `std/src/process/dev.vl` (the literal reading of §5's
+  prose), it will hit the identical `std_twin_parity` failure — reconcile
+  to `std::watch` rather than re-opening the twin.
 - **The shim**: unchanged. `hmr_shim.js`'s `handleEvent` already had
   `case "reload": reload(); break;` (the cycle-16 rework) — a one-shot
   `location.reload()`, wired to nothing until this cycle gave the dev
@@ -309,7 +327,7 @@ covers `force_refresh()` only.
   A second test pins the no-op case directly: a plain `vilan run` (no
   `--watch`, so `VILAN_HMR_PORT` is never set) calling `force_refresh()`
   exits cleanly under `support::run_liveness()`'s bound.
-- **Docs**: `docs/std/process.md` (`## std::dev (process)`, cross-linked
-  from `docs/std/dev.md`'s browser page) and `docs/guide/dev-loop.md`
+- **Docs**: `docs/std/process.md` (`## std::watch`, cross-linked from
+  `docs/std/dev.md`'s browser page) and `docs/guide/dev-loop.md`
   (`## Freshness for a hand-rolled server`), both gated by
   `cargo test -p vilan-core --test docs`.
