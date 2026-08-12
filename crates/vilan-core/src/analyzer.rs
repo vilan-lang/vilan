@@ -208,6 +208,20 @@ pub enum ExprIfBranch {
     Else((Vec<Id>, Id)),
 }
 
+/// Whether `branch` ends in an `else` on every path — the `if` produces a
+/// value only when this holds (`Type::Void` otherwise, `infer_type_path`'s
+/// `Expr::If` arm). Hoisted out of that arm (editing-dx.md §17, regime 2) so
+/// `check_return_position` can ask the same syntactic question when the
+/// mismatch it is diagnosing is a bare `if` in tail position, without
+/// re-deriving the answer from the inferred type.
+fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
+    match branch {
+        ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
+        ExprIfBranch::If(_, _, None) => false,
+        ExprIfBranch::Else(_) => true,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExprMatchLeg {
     pub pattern: ExprPattern,
@@ -21637,13 +21651,6 @@ impl<'src> Analyzer<'src> {
             // miscompiled the call to its trait's abstract body (B17). Without
             // a final `else` the `if` is a statement, so it is void.
             Expr::If(branch) => {
-                fn has_final_else(branch: &ExprIfBranch) -> bool {
-                    match branch {
-                        ExprIfBranch::If(_, _, Some(next)) => has_final_else(next),
-                        ExprIfBranch::If(_, _, None) => false,
-                        ExprIfBranch::Else(_) => true,
-                    }
-                }
                 // Every branch's trailing expression id, in source order.
                 fn trailing_ids(branch: &ExprIfBranch, out: &mut Vec<Id>) {
                     match branch {
@@ -21656,7 +21663,7 @@ impl<'src> Analyzer<'src> {
                         ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
                     }
                 }
-                if has_final_else(branch) {
+                if if_branch_has_final_else(branch) {
                     let mut trailings = Vec::new();
                     trailing_ids(branch, &mut trailings);
                     // The `if`'s type is the unification of its branches; infer
@@ -25169,14 +25176,29 @@ impl<'src> Analyzer<'src> {
         // VALUE is a distinct mistake from an ordinary type mismatch — the
         // parser's synthesized `Expr::Void` tail is the marker (nothing else
         // manufactures one at this span): a REAL void-typed tail (an `if`
-        // with no `else`, a void call) is a genuine value the body produced
-        // and stays on the plain message, already A1-anchored at its own
-        // span (§3.3, left alone — no refinement here).
+        // with no `else`, a void call) is a genuine value the body produced,
+        // so the span stays A1-anchored at the `if` itself (§3.3, unchanged).
+        // Regime 2 (editing-dx.md §17, the residual §16 deferred): an `if`
+        // with no `else` is a SYNTACTICALLY distinguishable sub-case of
+        // "genuine void value" — `if_branch_has_final_else` is the same
+        // question `infer_type_path`'s `Expr::If` arm asked to produce the
+        // `Void` in the first place, asked again here rather than threading a
+        // provenance flag through inference — so its wording names the gap
+        // instead of falling through to the generic mismatch phrasing. A
+        // void CALL in tail position asks the same question, finds an
+        // `Expr::If` not present, and correctly stays on the generic message.
         let msg = if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void)) {
             self.missing_return_value_message(
                 last_statement_id,
                 target_return_type,
                 substitution_context,
+            )
+        } else if let Some(Expr::If(branch)) = self.expr_id_to_expr_map.get(&body_id)
+            && !if_branch_has_final_else(branch)
+        {
+            let expected = self.pretty_print_type(target_return_type, substitution_context);
+            format!(
+                "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
             let expected = self.pretty_print_type(target_return_type, substitution_context);

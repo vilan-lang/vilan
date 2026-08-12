@@ -214,6 +214,10 @@ Nothing that was already complete changes: `_` and a binder still cover everythi
 
 ---
 
+**A missing-return diagnostic on an `if` with no `else` now names the gap.** `fun classify(n: i32): str { if n > 0 { "positive" } }` failed with the generic `` Expected str, but got void instead. `` — correct, but silent about *why* the value came back void, unlike every other shape of this mistake (which already say "this body ends without producing a value" or "the `;` discards this body's last value"). It now reads `` Expected str, but got void instead: an `if` with no `else` produces void. `` for exactly this shape — an `if`/`else if` chain with no final `else`, in tail position — leaving the fix (add the missing branch) implied by naming the cause. Every other route to a void tail (no tail at all, a discarded last statement, a void call) is unaffected; the anchor was already correct here and does not move.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.

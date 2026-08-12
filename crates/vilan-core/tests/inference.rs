@@ -11284,19 +11284,42 @@ fn a_declaration_as_the_last_statement_does_not_trigger_regime_1_prime() {
 }
 
 // P25 — regime 2: an `if` with no `else` in tail position is a REAL
-// expression (not the parser's synthesized `Void`), so its span is already
-// A1-compliant — correct anchor, `if`-no-`else` refinement not built in this
-// slice (editing-dx.md §3.6's "one refinement", not required for A1).
-// Regression guard: confirms the unrefined shape is untouched by S3's other
-// changes.
+// expression (not the parser's synthesized `Void`), so its span was already
+// A1-compliant (§3.3, unchanged) — what §16 deferred as "needs a provenance
+// channel" and §17 builds: the WORDING now names the missing `else` as the
+// gap (`if_branch_has_final_else` asked again at the diagnostic site,
+// editing-dx.md §17.1) instead of the generic mismatch phrasing regimes 1/1'
+// no longer use for their own gap.
 #[test]
-fn missing_return_value_regime_2_if_with_no_else_is_unchanged() {
+fn missing_return_value_regime_2_if_with_no_else_names_the_gap() {
     assert_fails_with(
         r#"
         fun classify(n: i32): str {
         	if n > 0 {
         		"positive"
         	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// Regression guard for the refinement's own boundary: a void-typed CALL in
+// tail position (no trailing `;` — that would be regime 1, §3.2) is a real
+// value the body produced too, but it is not an `if`, so it must keep the
+// plain mismatch message rather than being swept into regime 2's wording.
+#[test]
+fn missing_return_value_a_void_call_tail_keeps_the_generic_message() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun classify(n: i32): str {
+        	print(n)
         }
 
         fun main() {
