@@ -2672,6 +2672,34 @@ impl Document {
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
                 });
+            } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
+                // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
+                // span IS the gap — the parser's `gap_span` already computed
+                // "the last character before the `;` belongs", one character
+                // wide (§4.4/§15.5) — so the fix is a zero-width insertion
+                // right after it. No program lookup needed: the parser's
+                // anchor is the whole answer.
+                let insertion = diagnostic.span.end;
+                fixes.push(QuickFix {
+                    title: "Insert `;`".to_string(),
+                    span: Span::from(insertion..insertion),
+                    replacement: ";".to_string(),
+                });
+            } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
+                && let Some(semicolon_span) =
+                    trailing_semicolon_to_remove(&self.text, program, diagnostic.span)
+            {
+                // Regime 1' (S3, editing-dx.md §17.4): the diagnostic anchors
+                // at the callable's closing BRACE, not the `;` — the fix
+                // locates the `;` from the program's own last-statement
+                // bookkeeping (the same question `missing_return_value_
+                // message` asks analyzer-side) rather than guessing from the
+                // brace backwards through possible comments.
+                fixes.push(QuickFix {
+                    title: "Remove `;`".to_string(),
+                    span: semicolon_span,
+                    replacement: String::new(),
+                });
             }
         }
         fixes
@@ -3816,6 +3844,74 @@ fn closest_name_suggestion(note_message: &str) -> Option<&str> {
         .strip_suffix("`?")
 }
 
+/// S2's parse-error message (`parsing.rs::render`, `ParseErrorReason::
+/// MissingTerminator`) — matched by PREFIX since a curated parse error can
+/// carry a trailing `" in <context>"` label (`render`'s own context loop),
+/// which none of the three `note_terminator` call sites currently reach but
+/// nothing guarantees against structurally.
+const MISSING_TERMINATOR_MESSAGE: &str = "expected `;` to end this statement";
+
+/// Regime 1's message suffix (`analyzer.rs::missing_return_value_message`) —
+/// matched by SUFFIX (own sentence, own period) so it can't fire on regime
+/// 1's sibling wording ("this body ends without producing a value.") which
+/// names a DIFFERENT, non-fixable gap (no statement to blame at all).
+const DISCARDED_VALUE_MESSAGE: &str = "the `;` discards this body's last value.";
+
+/// The `;` a regime-1' diagnostic ("the `;` discards this body's last
+/// value") names, located from the program's own bookkeeping rather than
+/// guessed from the brace backwards. `diagnostic_span` is the callable's
+/// closing-brace anchor (S3, editing-dx.md §16/§3.9) — unique per callable
+/// in one file — so it pairs with exactly one function or (braced) closure,
+/// whose last STATEMENT id (excluding the trailing `;`, consumed separately
+/// per §15.6) is already what the analyzer's own
+/// `missing_return_value_message` asks about. From that statement's span
+/// end, `;` is found by scanning forward past ASCII whitespace only — a
+/// comment in the gap declines the fix rather than guessing past it (B4:
+/// no fix is better than a wrong one).
+fn trailing_semicolon_to_remove(
+    text: &str,
+    program: &Program,
+    diagnostic_span: Span,
+) -> Option<Span> {
+    let last_statement_id = program
+        .functions
+        .values()
+        .find(|function| {
+            program
+                .span_map
+                .get(&function.body.1)
+                .is_some_and(|span| **span == diagnostic_span)
+        })
+        .and_then(|function| function.body.0.last().copied())
+        .or_else(|| {
+            program.closures.values().find_map(|closure| {
+                let Expr::Block((statement_ids, _)) = program.entity_map.get(&closure.return_)?
+                else {
+                    return None;
+                };
+                let block_span = **program.span_map.get(&closure.return_)?;
+                let brace_span = Span {
+                    start: block_span.end.saturating_sub(1),
+                    end: block_span.end,
+                };
+                if brace_span != diagnostic_span {
+                    return None;
+                }
+                statement_ids.last().copied()
+            })
+        })?;
+    let statement_span = **program.span_map.get(&last_statement_id)?;
+    let bytes = text.as_bytes();
+    let mut cursor = statement_span.end;
+    loop {
+        match bytes.get(cursor) {
+            Some(byte) if byte.is_ascii_whitespace() => cursor += 1,
+            Some(b';') => return Some(Span::from(cursor..cursor + 1)),
+            _ => return None,
+        }
+    }
+}
+
 /// Whether two spans share at least one byte position — touching counts, so
 /// a zero-width cursor range sitting right at a diagnostic's edge still
 /// overlaps it.
@@ -4298,6 +4394,82 @@ pub(crate) mod tests {
             Span {
                 start: expected_start,
                 end: expected_start + "entires".len(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E61/S2 (editing-dx.md §17.4): the missing-terminator diagnostic's own
+    // gap span becomes an insertion point, exercised directly against
+    // `quickfixes` (main.rs's end-to-end tests cover the handler wiring).
+    #[test]
+    fn quickfix_offers_an_insert_semicolon_fix_at_the_gap() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet x: i32 = 1\n\tx;\n}\n")]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(fixes[0].title, "Insert `;`");
+        assert_eq!(fixes[0].replacement, ";");
+        let insertion = text.find(" 1\n").map(|p| p + 2).unwrap(); // right after `1`
+        assert_eq!(
+            fixes[0].span,
+            Span {
+                start: insertion,
+                end: insertion,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E61/S3-residual (editing-dx.md §17.4), the CLOSURE shape: regime 1'
+    // fires the same way for a closure whose expected return type is known
+    // (S3-ii, `check_return_position` reached through the closure's
+    // annotation route) — the `;`-locating scan reaches it through
+    // `program.closures`, not `program.functions`, proving that branch is
+    // not dead code.
+    #[test]
+    fn quickfix_removes_a_discarding_semicolon_inside_a_closure() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet scale: |i32| i32 = |value| { value * 2; };\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let remove_fixes: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title == "Remove `;`")
+            .collect();
+        assert_eq!(
+            remove_fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(remove_fixes[0].replacement, "");
+        // The `;` right before the closure's own closing brace — not the
+        // outer `let`'s statement-terminating `;` two characters later.
+        let semicolon = text.find("2; }").map(|p| p + 1).unwrap();
+        assert_eq!(
+            remove_fixes[0].span,
+            Span {
+                start: semicolon,
+                end: semicolon + 1,
             }
         );
         let _ = std::fs::remove_dir_all(&dir);

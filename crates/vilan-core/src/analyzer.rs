@@ -208,6 +208,20 @@ pub enum ExprIfBranch {
     Else((Vec<Id>, Id)),
 }
 
+/// Whether `branch` ends in an `else` on every path — the `if` produces a
+/// value only when this holds (`Type::Void` otherwise, `infer_type_path`'s
+/// `Expr::If` arm). Hoisted out of that arm (editing-dx.md §17, regime 2) so
+/// `check_return_position` can ask the same syntactic question when the
+/// mismatch it is diagnosing is a bare `if` in tail position, without
+/// re-deriving the answer from the inferred type.
+fn if_branch_has_final_else(branch: &ExprIfBranch) -> bool {
+    match branch {
+        ExprIfBranch::If(_, _, Some(next)) => if_branch_has_final_else(next),
+        ExprIfBranch::If(_, _, None) => false,
+        ExprIfBranch::Else(_) => true,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExprMatchLeg {
     pub pattern: ExprPattern,
@@ -18202,12 +18216,37 @@ impl<'src> Analyzer<'src> {
                         && let Some(return_type_id) = return_type_id
                     {
                         self.expected_types.insert(expr_id, return_type_id);
-                        self.constraints.push(Constraint::ReturnType {
-                            body_id: expr_id,
-                            return_type_id,
-                            last_statement_id,
-                        });
                         self.return_sites.push((id, expr_id));
+                        // P28 dedup (editing-dx.md §17.2; deferred at §16 as
+                        // needing "the tail-construction site to know a
+                        // preceding `ret` already diverged"): when the
+                        // block's own last STATEMENT is itself a `ret`,
+                        // that `ret`'s own return-position check (pushed at
+                        // its construction site, below) already reports
+                        // whatever is wrong with this function's return
+                        // value — the synthesized void tail after it is
+                        // unreachable, and checking IT too is B5's "second
+                        // diagnostic that adds no information", not a
+                        // second mistake. Narrow on purpose: a `ret` is the
+                        // one statement shape that already owns an
+                        // independent `Constraint::ReturnType` of its own: a
+                        // last statement that diverges some OTHER way (a
+                        // `jump`, an exhaustive `if`/`match`) raises a
+                        // different, unfiled question about the TAIL's own
+                        // inferred type and is left alone.
+                        let tail_is_reachable = !last_statement_id.is_some_and(|statement_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(&statement_id),
+                                Some(Expr::FunctionReturn(_))
+                            )
+                        });
+                        if tail_is_reachable {
+                            self.constraints.push(Constraint::ReturnType {
+                                body_id: expr_id,
+                                return_type_id,
+                                last_statement_id,
+                            });
+                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(
@@ -21794,13 +21833,6 @@ impl<'src> Analyzer<'src> {
             // miscompiled the call to its trait's abstract body (B17). Without
             // a final `else` the `if` is a statement, so it is void.
             Expr::If(branch) => {
-                fn has_final_else(branch: &ExprIfBranch) -> bool {
-                    match branch {
-                        ExprIfBranch::If(_, _, Some(next)) => has_final_else(next),
-                        ExprIfBranch::If(_, _, None) => false,
-                        ExprIfBranch::Else(_) => true,
-                    }
-                }
                 // Every branch's trailing expression id, in source order.
                 fn trailing_ids(branch: &ExprIfBranch, out: &mut Vec<Id>) {
                     match branch {
@@ -21813,7 +21845,7 @@ impl<'src> Analyzer<'src> {
                         ExprIfBranch::Else((_, trailing)) => out.push(*trailing),
                     }
                 }
-                if has_final_else(branch) {
+                if if_branch_has_final_else(branch) {
                     let mut trailings = Vec::new();
                     trailing_ids(branch, &mut trailings);
                     // The `if`'s type is the unification of its branches; infer
@@ -23652,6 +23684,43 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// C3 (diagnostics-standard.md, editing-dx.md §17.3 — the residual §16
+    /// deferred): a secondary note pointing at `id`'s declaration site,
+    /// resolved the same way `callable_name` names it — a
+    /// `Function`/`ExternalFunction` id directly, or a method's `member_id`
+    /// through its `Expr::Function`/`Expr::ExternalFunction` indirection.
+    /// `None` when `id` names nothing declared in source (nothing to point
+    /// at). Matches the wording the codebase already uses for this note
+    /// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs);
+    /// `source` is set unconditionally, per the two existing analyzer.rs
+    /// C3 notes (the trait-member and generic-bound ones) — the render
+    /// side (`main.rs`) filters it against the primary span's own file, so
+    /// a same-file note costs nothing extra to compute.
+    fn declared_here_note(&self, id: Id) -> Option<crate::error::Note> {
+        let (name, name_span) = if let Some(function) = self.functions.get(&id) {
+            (function.name, function.name_span)
+        } else if let Some(external) = self.external_functions.get(&id) {
+            (external.name, external.name_span)
+        } else {
+            match self.expr_id_to_expr_map.get(&id)? {
+                Expr::Function(function_id) => {
+                    let function = self.functions.get(function_id)?;
+                    (function.name, function.name_span)
+                }
+                Expr::ExternalFunction(function_id) => {
+                    let external = self.external_functions.get(function_id)?;
+                    (external.name, external.name_span)
+                }
+                _ => return None,
+            }
+        };
+        Some(crate::error::Note {
+            span: name_span,
+            msg: format!("`{name}` is declared here"),
+            source: self.source_of_id(id),
+        })
+    }
+
     /// S4 (editing-dx.md §6.2): the call-argument-count message, naming the
     /// callee and — for the too-few case — the first missing parameter by
     /// name and declared type. Arguments bind positionally, so with fewer
@@ -24116,7 +24185,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
-                            note: None,
+                            note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg: self.argument_count_message(
                                 self.callable_name(function_id),
@@ -24960,7 +25029,7 @@ impl<'src> Analyzer<'src> {
             // with parameters 1.. only.
             let argument_parameter_ids = parameter_ids.get(1..).unwrap_or(&[]);
             self.diagnostics.push(Error {
-                note: None,
+                note: self.declared_here_note(member_id),
                 span: self.clamp_span_to_first_line(arguments_span, call_id),
                 msg: self.argument_count_message(
                     self.callable_name(member_id),
@@ -25326,14 +25395,29 @@ impl<'src> Analyzer<'src> {
         // VALUE is a distinct mistake from an ordinary type mismatch — the
         // parser's synthesized `Expr::Void` tail is the marker (nothing else
         // manufactures one at this span): a REAL void-typed tail (an `if`
-        // with no `else`, a void call) is a genuine value the body produced
-        // and stays on the plain message, already A1-anchored at its own
-        // span (§3.3, left alone — no refinement here).
+        // with no `else`, a void call) is a genuine value the body produced,
+        // so the span stays A1-anchored at the `if` itself (§3.3, unchanged).
+        // Regime 2 (editing-dx.md §17, the residual §16 deferred): an `if`
+        // with no `else` is a SYNTACTICALLY distinguishable sub-case of
+        // "genuine void value" — `if_branch_has_final_else` is the same
+        // question `infer_type_path`'s `Expr::If` arm asked to produce the
+        // `Void` in the first place, asked again here rather than threading a
+        // provenance flag through inference — so its wording names the gap
+        // instead of falling through to the generic mismatch phrasing. A
+        // void CALL in tail position asks the same question, finds an
+        // `Expr::If` not present, and correctly stays on the generic message.
         let msg = if matches!(self.expr_id_to_expr_map.get(&body_id), Some(Expr::Void)) {
             self.missing_return_value_message(
                 last_statement_id,
                 target_return_type,
                 substitution_context,
+            )
+        } else if let Some(Expr::If(branch)) = self.expr_id_to_expr_map.get(&body_id)
+            && !if_branch_has_final_else(branch)
+        {
+            let expected = self.pretty_print_type(target_return_type, substitution_context);
+            format!(
+                "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
             let expected = self.pretty_print_type(target_return_type, substitution_context);
@@ -27011,6 +27095,7 @@ impl<'src> Analyzer<'src> {
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
+        let struct_name_span = struct_.name_span;
         if constraint.fields.len() != struct_fields.len() {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
@@ -27018,11 +27103,17 @@ impl<'src> Analyzer<'src> {
                 &constraint.fields,
                 constraint.fields_span,
             );
-            self.diagnostics.push(Error {
-                note: None,
-                span,
-                msg,
+            // C3 (editing-dx.md §17.3): "declared here" at the struct's own
+            // name, the same note style S4's call-argument sites use for
+            // their subject (`declared_here_note`) — built by hand here
+            // rather than through that helper since the subject is a
+            // `Struct`, not a callable.
+            let note = Some(crate::error::Note {
+                span: struct_name_span,
+                msg: format!("`{}` is declared here", constraint.struct_name),
+                source: self.source_of_id(struct_id),
             });
+            self.diagnostics.push(Error { note, span, msg });
             return Resolution::Failed;
         }
         let initializer_id = constraint.initializer_id;

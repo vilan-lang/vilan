@@ -11498,19 +11498,42 @@ fn a_declaration_as_the_last_statement_does_not_trigger_regime_1_prime() {
 }
 
 // P25 — regime 2: an `if` with no `else` in tail position is a REAL
-// expression (not the parser's synthesized `Void`), so its span is already
-// A1-compliant — correct anchor, `if`-no-`else` refinement not built in this
-// slice (editing-dx.md §3.6's "one refinement", not required for A1).
-// Regression guard: confirms the unrefined shape is untouched by S3's other
-// changes.
+// expression (not the parser's synthesized `Void`), so its span was already
+// A1-compliant (§3.3, unchanged) — what §16 deferred as "needs a provenance
+// channel" and §17 builds: the WORDING now names the missing `else` as the
+// gap (`if_branch_has_final_else` asked again at the diagnostic site,
+// editing-dx.md §17.1) instead of the generic mismatch phrasing regimes 1/1'
+// no longer use for their own gap.
 #[test]
-fn missing_return_value_regime_2_if_with_no_else_is_unchanged() {
+fn missing_return_value_regime_2_if_with_no_else_names_the_gap() {
     assert_fails_with(
         r#"
         fun classify(n: i32): str {
         	if n > 0 {
         		"positive"
         	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// Regression guard for the refinement's own boundary: a void-typed CALL in
+// tail position (no trailing `;` — that would be regime 1, §3.2) is a real
+// value the body produced too, but it is not an `if`, so it must keep the
+// plain mismatch message rather than being swept into regime 2's wording.
+#[test]
+fn missing_return_value_a_void_call_tail_keeps_the_generic_message() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun classify(n: i32): str {
+        	print(n)
         }
 
         fun main() {
@@ -11650,15 +11673,15 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
     );
 }
 
-// P28 — a B5 violation NOT closed by this slice: a bare `ret` in a
-// value-returning function still reports the same root cause twice (once at
-// the `ret`, once at the synthesized void tail after it) — S3's parser fix
-// (editing-dx.md §3.9) makes BOTH anchors correct and visible where the tail
-// one used to be an invisible zero-width point; it does not deduplicate
-// them. Pinned as today's true (still-doubled) behavior, not ignored, since
-// nothing here is wrong on its own — §12 files the count as owed and unmet.
+// P28 — the B5 violation §16 left unclosed, closed here (editing-dx.md
+// §17.2): a bare `ret` in a value-returning function used to report the
+// same root cause twice (once at the `ret`, once at the synthesized void
+// tail after it — both correctly anchored since S3's parser fix, which is
+// what made the duplicate visible enough to fix). The tail-construction
+// site now knows a preceding `ret` already diverged and skips its own
+// redundant constraint, so only the `ret`'s own check fires.
 #[test]
-fn a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic() {
+fn a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic() {
     let source = r#"
         fun total(a: i32): i32 {
         	ret;
@@ -11668,32 +11691,38 @@ fn a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic() {
         	total(1);
         }
         "#;
-    let diagnostics = failure_diagnostics(source);
-    let matching: Vec<_> = diagnostics
-        .iter()
-        .filter(|(message, _)| {
-            message
-                == "Expected i32, but got void instead: this body ends without producing a value."
-        })
-        .collect();
-    assert_eq!(
-        matching.len(),
-        2,
-        "expected the known B5 duplicate (one at `ret`, one at the tail); got: {diagnostics:#?}"
+    assert_fails_once_with(
+        source,
+        "Expected i32, but got void instead: this body ends without producing a value.",
     );
     let ret_span = source.find("ret").map(|start| start..start + "ret".len());
-    let brace_span = source.find('}').map(|start| start..start + 1);
+    let diagnostics = failure_diagnostics(source);
     assert!(
-        matching
+        diagnostics
             .iter()
             .any(|(_, range)| Some(range.clone()) == ret_span),
-        "expected one diagnostic at `ret`; got: {matching:#?}"
+        "expected the sole diagnostic at `ret`, not the synthesized tail; got: {diagnostics:#?}"
     );
-    assert!(
-        matching
-            .iter()
-            .any(|(_, range)| Some(range.clone()) == brace_span),
-        "expected one diagnostic at the closing brace; got: {matching:#?}"
+}
+
+// The same dedup, for a `ret` whose VALUE is wrong rather than missing — a
+// second B5 violation the survey never named (found while building the
+// fix, same mechanism): before the fix this ALSO doubled, pairing the
+// value mismatch at `ret` with a spurious "ends without producing a value"
+// at the tail for code that, once the first error is fixed, is complete.
+#[test]
+fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
+    assert_fails_once_with(
+        r#"
+        fun total(a: i32): i32 {
+        	ret "nope";
+        }
+
+        fun main() {
+        	total(1);
+        }
+        "#,
+        "Expected i32, but got",
     );
 }
 
@@ -24788,6 +24817,29 @@ fn call_argument_count_too_many_names_only_the_callee() {
     );
 }
 
+// The C3 "declared here" note (editing-dx.md §17.3, the residual §16
+// deferred): an arity mismatch also notes the callee's OWN declaration, in
+// the wording the codebase already uses for this note
+// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs) — so a
+// call far from its definition doesn't leave the reader hunting for it.
+#[test]
+fn call_argument_count_notes_the_callees_declaration() {
+    assert_fails_noting(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "`distance` expects 2 arguments",
+        "distance",
+        "`distance` is declared here",
+    );
+}
+
 // P16 — a method call behaves identically, naming the METHOD (not the
 // receiver or the struct).
 #[test]
@@ -24829,6 +24881,31 @@ fn method_argument_count_too_many_names_only_the_method() {
         "#,
         "(1, 2, 3)",
         "`shift` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 note again, for a METHOD's arity: notes the method's own
+// declaration inside `impl Point`, not the struct itself — `declared_here_
+// note` resolves `member_id` the same way `callable_name` does.
+#[test]
+fn method_argument_count_notes_the_methods_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "`shift` expects 2 arguments",
+        "shift",
+        "`shift` is declared here",
     );
 }
 
@@ -24908,6 +24985,27 @@ fn struct_initializer_field_count_too_many_names_the_struct_and_spans_the_extra_
         "#,
         "z",
         "`Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`.",
+    );
+}
+
+// The C3 note for a struct-field count mismatch: notes the struct's OWN
+// declaration, the same wording and mechanism as the call-arity notes
+// above, built by hand at the initializer's own push site (the subject is
+// a `Struct`, which `declared_here_note` — scoped to callables — does not
+// resolve).
+#[test]
+fn struct_initializer_field_count_notes_the_structs_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "`Point` expects 2 fields",
+        "Point",
+        "`Point` is declared here",
     );
 }
 

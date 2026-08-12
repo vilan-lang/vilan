@@ -250,6 +250,18 @@ Nothing that was already complete changes: `_` and a binder still cover everythi
 
 ---
 
+**A missing-return diagnostic on an `if` with no `else` now names the gap.** `fun classify(n: i32): str { if n > 0 { "positive" } }` failed with the generic `` Expected str, but got void instead. `` — correct, but silent about *why* the value came back void, unlike every other shape of this mistake (which already say "this body ends without producing a value" or "the `;` discards this body's last value"). It now reads `` Expected str, but got void instead: an `if` with no `else` produces void. `` for exactly this shape — an `if`/`else if` chain with no final `else`, in tail position — leaving the fix (add the missing branch) implied by naming the cause. Every other route to a void tail (no tail at all, a discarded last statement, a void call) is unaffected; the anchor was already correct here and does not move.
+
+---
+
+**An argument- or field-count mismatch now notes where the subject was declared.** `` `distance` expects 2 arguments, but got 1 instead: `y: i32` is missing. `` named the callee, but not where to go look at it — the same gap a struct-field-count mismatch had for the struct. Both now carry a secondary note pointing at the subject's own declaration (`` `distance` is declared here ``, `` `Point` is declared here ``), in the same style the compiler already uses for a note elsewhere in the file (a trait's own declaration of a missing method, a compile-time call chain). A plain function call, a method call, and a struct initializer all get it; the message itself is unchanged.
+
+---
+
+**Two more diagnostics now offer a quick fix: a missing `;`, and the `;` that silently discarded a return value.** Both steers already existed as message text; the editor now offers to apply them directly. "Expected `;` to end this statement" gets an "Insert `;`" action at exactly the gap the diagnostic points at. "...the `;` discards this body's last value" — a function or closure whose last statement would satisfy the declared return type if its trailing `;` weren't there — gets a "Remove `;`" action, which finds the right `;` from the same bookkeeping the diagnostic itself used, not by guessing backward from the closing brace; a comment sitting between the statement and its `;` (an unusual shape) is left alone rather than risking a wrong edit.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
