@@ -84,6 +84,12 @@ The edit itself reuses the formatter's understanding of import structure rather 
 
 ---
 
+**Auto-import completion now surfaces your own package's names before it reaches for std's.** That completion is capped at 20 candidates so a std-heavy file's loaded surface can't flood the popup, but the cap used to fill purely alphabetically — and `std`'s always-loaded prelude contributes enough capitalized trait and type names (`Add`, `BitAnd`, `BitOr`, …) to fill all 20 slots on their own, ahead of a small real file's own unimported names, which are ordinary lowercase identifiers and so sorted behind every one of them. A real project's own names could be crowded out entirely by a library it merely has loaded.
+
+Every `pkg` candidate now ranks ahead of every `std` one, regardless of what either is named — the file you're actually writing wins the cap first, and `std` only spends the slots your own names didn't need. The cap itself stays at 20; the count was never the problem, only the order that filled it.
+
+---
+
 **A misspelled field in a struct initializer now gets a suggestion — and a fix.** `Config { entires = 5 }` against a struct with an `entries` field used to answer with a bare "struct 'Config' has no field 'entires'". It now adds a note, "did you mean `entries`?", when a real field is a close-enough edit distance away — close enough that `"entires"` suggests `"entries"` but `"x"` never suggests anything at all, however similar `entries` may look to a human skimming the diagnostics list. The scan runs only once the plain name lookup has already failed, so correctly-spelled code pays nothing for it. The editor turns the suggestion into a quickfix, "Change to `entries`", that rewrites exactly the misspelled name — and the diagnostic's own span moved to match, from the field's value to the field's name, which is what a rename needs to replace.
 
 ---
