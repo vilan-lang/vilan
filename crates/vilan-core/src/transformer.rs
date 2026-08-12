@@ -689,6 +689,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__fs_stat",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -701,6 +702,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_ready",
         "__chunk_load",
         "__chunk_preload",
+        "__is_null",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -830,6 +832,13 @@ fn helper_source(name: &str) -> &'static str {
              \t__chunk_load(arm, () => {}, () => {});\n\
              }"
         }
+        // `std::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
+        // whether a host value is JS `null`/`undefined` — `Element` (and any
+        // other opaque `external struct` handle) has no vilan-visible way to
+        // ask this itself.
+        "__is_null" => {
+            "function __is_null(value) {\n\treturn value === null || value === undefined;\n}"
+        }
         "__random_int" => {
             "function __random_int(low, high) {\n\
              \treturn Math.floor(Math.random() * (high - low + 1)) + low;\n\
@@ -927,6 +936,26 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // `std::fs::stat` (F13, fullstack-dx.md §9.3): `fs.promises.stat`
+        // wrapped so a missing path reads back the `Option` array `None`
+        // instead of throwing — vilan has no `try`/`catch`, so the ENOENT
+        // catch has to live here. Every other failure re-throws, matching
+        // `read_bytes`/`read_dir`/`read_file_to_str`'s posture. The dynamic
+        // `import` is self-contained on purpose (no co-declared static
+        // import to coordinate with, the same reason `__hmac_sha512` reaches
+        // for the global `crypto` instead) and Node caches module resolution,
+        // so a hot loop does not re-resolve the module per call.
+        "__fs_stat" => {
+            "async function __fs_stat(path) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \ttry {\n\
+             \t\treturn [ 0, await fsPromises.stat(path) ];\n\
+             \t} catch (error) {\n\
+             \t\tif (error && error.code === \"ENOENT\") return [ 1 ];\n\
+             \t\tthrow error;\n\
+             \t}\n\
+             }"
+        }
         // Cryptographically random bytes.
         "__random_bytes" => {
             "function __random_bytes(length) {\n\treturn crypto.getRandomValues(new Uint8Array(length));\n}"

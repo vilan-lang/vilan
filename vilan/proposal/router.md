@@ -109,6 +109,7 @@ the render closure:
 ```vilan
 view("main").swap(route, |current| match current {
     Route::Home => home_page(),
+    Route::Login => login_page(),
     Route::Workspace(let org, let inner) => workspace_layout(org, inner),
     Route::NotFound => not_found_page(),
 })

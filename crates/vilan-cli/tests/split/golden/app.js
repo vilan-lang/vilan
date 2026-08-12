@@ -57,6 +57,9 @@ function __clone(value) {
 function __hmr_active() {
 	return typeof globalThis.__VILAN_HMR__ !== "undefined";
 }
+function __is_null(value) {
+	return value === null || value === undefined;
+}
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
 }
@@ -345,8 +348,17 @@ function place(self, parent) {
 function apply(self, parent, name) {
 	parent[0].setAttribute(name, self);
 }
-function mount(id, view2) {
+function mount_target(id) {
 	const element = document.getElementById(id);
+	if (__is_null(element)) {
+		(() => {
+			throw "mount: no element with id \'" + id + "\'";
+		})();
+	}
+	return element;
+}
+function mount(id, view2) {
+	const element = mount_target(id);
 	element.replaceChildren();
 	element.appendChild(view2[0]);
 }

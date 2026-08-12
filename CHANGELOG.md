@@ -8,6 +8,16 @@ tracks the latest state.
 
 ## Unreleased
 
+**`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
+
+`read_bytes(path): Bytes` is the true binary read — a host `Buffer` binds directly to `Bytes` (the same interop `std::http`'s `read_request_bytes` already relies on), with no decode in between. `read_dir(path): List<str>` lists a directory's immediate entries by name, flat and unordered (v1 deliberately does not recurse or expose file-vs-directory kind — call `stat` per entry for that). `stat(path): Option<Stat>` reads size, last-modified time (`modified_at_ms`, epoch milliseconds), and `is_directory`; unlike every other read in this module, a missing path is `None` rather than a thrown exception — `stat` exists for a caller that wants to ask "is this here yet", not one that already expects it to be. The misleadingly-named `read_file_bytes` is renamed to `read_file_encoded` (no alias kept — pre-1.0, and its only caller, `read_file_to_str`, moved with it in the same commit).
+
+---
+
+**`mount`/`mount_root` on a missing element id now fails loud, naming the id.** `get_element_by_id` hands back JS `null` typed as `Element` when nothing on the page has that id, and mounting into it used to throw "Cannot read properties of null (reading …)" — the id the caller got wrong appeared nowhere in the message. The shared lookup both `mount` and `mount_root` go through now checks for that first and panics naming the id (`mount: no element with id 'app'`) instead of leaving the null dereference to speak for itself. The happy path — an id that exists — is unchanged.
+
+---
+
 **A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
 
 ---

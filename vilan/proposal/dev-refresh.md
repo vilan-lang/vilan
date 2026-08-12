@@ -235,9 +235,10 @@ What ships instead, per the owner's design:
      shim has nothing to re-fire.
    The composed manual mechanism the owner sketched — check `is_watching`,
    re-read cheaply, `force_refresh`, the browser re-pulls fresh bytes — works
-   with no watcher plumbing at all. Its one rough edge is F13 (no `stat`), so
-   a hand-rolled change-detector polls by re-read-and-compare until F13
-   ships.
+   with no watcher plumbing at all. Its one rough edge was F13 (no `stat`), so
+   a hand-rolled change-detector polled by re-read-and-compare until F13
+   **shipped 2026-08-11** — `fs::stat(path): Option<Stat>` gives the
+   mtime-revalidating form its `stat` call.
 3. **(iii) stays out**, now on two grounds: it touches the load-bearing
    invariant, and nothing needs it — the abstraction covers the common case
    and the primitives cover the rest. Deferred, not a permanent non-goal.

@@ -1369,6 +1369,46 @@ a directory; and `dev-refresh.md` §2(i)'s mtime-revalidating read has no `stat`
 to call. **File it** — a std gap E56 walks past four times and never needs, but
 the next paper will.
 
+**SHIPPED 2026-08-11 (backlog F13; cycle 18, lane loud-basket).** The surface
+decisions, recorded here because this is where the gap was filed:
+
+- **`read_bytes(path): Bytes`** — `readFile` with NO encoding argument, which
+  hands back a host `Buffer`; `Buffer instanceof Uint8Array` is `true`
+  (runtime-verified), so it binds to `Bytes` directly, exactly the interop
+  `read_request_bytes` (`process/http.vl`) already relies on. No conversion
+  step, no new host glue.
+- **`read_dir(path): List<str>`** — entry NAMES only, un-prefixed, in
+  whatever order `fs.promises.readdir` hands back (NOT guaranteed
+  alphabetical — runtime-verified sorted on this filesystem, but Node's own
+  contract makes no such promise). Deliberately flat: no recursion, no
+  dirent-kind distinction. A caller that needs file-vs-directory calls `stat`
+  per entry — restraint recorded, not an oversight.
+- **`stat(path): Option<Stat>`** — the one non-throwing read in the module,
+  by deliberate decision. `read_bytes`/`read_dir`/`read_file_to_str` keep
+  `read_file_to_str`'s original posture (throw host-side on ANY failure,
+  missing path included); `stat` alone flattens ENOENT to `None` because its
+  customer (dev-refresh.md §2(i)'s poller) calls it PRECISELY to ask whether
+  a path exists yet — an expected outcome to branch on, not an exceptional
+  one to crash on. Every other stat failure (permissions, …) still throws.
+  Implemented as an opaque `RawStat` (three typed accessors, mirroring
+  `process/db.vl`'s `Row`) copied into a real `Stat` struct in ordinary
+  vilan code — struct literals compile to positional arrays, so hand-writing
+  one in raw JS glue would have been fragile; letting the compiler build it
+  is not. `mtimeMs` reads back as a plain `f64` (runtime-verified: `typeof
+  "number"`, not `"bigint"` — that only happens under the `{ bigint: true }`
+  stat option, never passed here).
+- **`read_file_bytes` renamed to `read_file_encoded`** — the misleadingly
+  named function (returns a decoded `str`, not bytes) is gone under that
+  name; no deprecated alias, per `numeric-types.md` §8's precedent for a
+  pre-1.0 rename that fixes a wrong name. Its only caller, `read_file_to_str`,
+  moved with it in the same commit; nothing else in the tree called it.
+
+Runtime-verified against the real host filesystem (`crates/vilan-cli/tests/
+fs.rs`), not just compiled: binary round-trip through a non-UTF-8 byte, flat
+directory listing, `stat` hit/miss/directory, the still-throws posture on a
+missing `read_bytes`/`read_dir` path, and `read_file_to_str` unaffected by
+the rename underneath it. Docs: `docs/std/process.md`'s `std::fs` fragment.
+
 ### 9.4 Two documentation drifts in `examples/todo`
 
 `src/server.vl:3-4`'s header comment says the file uses
@@ -1388,6 +1428,18 @@ nowhere in the message. This is F4's runtime half and the cheapest loud win in
 the whole survey — a guarded lookup that names the id — and it is worth doing
 **whether or not any of §5 ships**, because it is the one check that works
 without knowing anything about the build.
+
+**SHIPPED 2026-08-11 (backlog A24; cycle 18, lane loud-basket).** `mount`'s
+shared lookup now panics `mount: no element with id '{id}'` when
+`get_element_by_id` comes back JS `null`; `get_element_by_id`'s own signature
+is untouched (a real `Option<Element>` return stays a separate, wider API
+question, deliberately not taken here). The `vilan/test` corpus goldens are
+zero movement (none of them call `mount`/`mount_root`); the ONE golden that
+does — `crates/vilan-cli/tests/split`'s pinned fixture, whose `app.vl` calls
+`mount_root` — legitimately grew the new guard's few lines and was
+regenerated after a byte-diff review (the three route chunks and the
+manifest stayed untouched, matching splitting's own "moves route-exclusive
+code and nothing else" rule).
 
 ## 10. Open questions — the owner's to rule
 
