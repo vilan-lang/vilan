@@ -25,7 +25,7 @@
 //! The result is `Program::async_functions`, read by the transformer.
 
 use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
-use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
@@ -472,6 +472,36 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     for (error, source) in initializer_refusals {
         program.push_diagnostic(error, source);
     }
+
+    // --- B119 (view-invalidation.md §4): materialize the per-CALL-SITE
+    // answer the view rule reads. The fixpoint above already decided it for
+    // every edge — it is what made each caller async — but it decided it as a
+    // per-NODE boolean and threw the sites away. One more pass over the same
+    // edges, with the same `call_suspends`, records them.
+    //
+    // Runs here, after `async_values` / `awaited_calls` took their adopted and
+    // value-flow entries, so the channels those opened are seen; and once,
+    // per analysis, not per query.
+    //
+    // Initializer calls are deliberately absent: a module-level initializer
+    // that suspends is refused outright above, and the invalidation scan does
+    // not walk initializers, so there is no site here to answer for.
+    let mut suspending_calls: HashSet<Id> = HashSet::default();
+    let mut dispatch_verdicts: HashMap<(bool, Option<TypeId>, &str), bool> = HashMap::default();
+    for node in graph.nodes() {
+        for call in graph.calls_of(node.id()) {
+            if call_suspends_memoized(
+                program,
+                call,
+                &held_values,
+                &async_set,
+                &mut dispatch_verdicts,
+            ) {
+                suspending_calls.insert(call.call_id);
+            }
+        }
+    }
+    program.suspending_calls = suspending_calls;
 
     program.async_functions = async_set;
 }
@@ -1742,30 +1772,10 @@ fn base_fixpoint(
             if async_set.contains(&id) {
                 continue;
             }
-            let calls_async = graph.calls_of(id).iter().any(|call| match call.target {
-                CallTarget::Function(callee) | CallTarget::External(callee) => {
-                    async_set.contains(&callee)
-                }
-                // A trait/generic-bounded dispatch: async if any candidate impl is.
-                CallTarget::Indirect(
-                    IndirectReason::GenericMember | IndirectReason::TraitDispatch,
-                ) => dispatch_candidates(program, call.call_id)
-                    .iter()
-                    .any(|member| async_set.contains(member)),
-                // A call through an `async || T`-typed value IS an await
-                // point — asyncness rides the type (J2), or the VALUE FLOW:
-                // a binding holding an async closure, an async field read, an
-                // async-returning call, a directly-applied async closure
-                // literal (the lowered `run` body). Other higher-order calls
-                // stay conservative (the concrete target isn't recoverable),
-                // as do variant constructors.
-                _ => program
-                    .function_calls
-                    .get(&call.call_id)
-                    .is_some_and(|function_call| {
-                        subject_awaits(program, function_call.subject_id, held_values, async_set, 0)
-                    }),
-            });
+            let calls_async = graph
+                .calls_of(id)
+                .iter()
+                .any(|call| call_suspends(program, call, held_values, async_set));
             if calls_async {
                 async_set.insert(id);
                 changed = true;
@@ -1775,6 +1785,91 @@ fn base_fixpoint(
             break;
         }
     }
+}
+
+/// Whether one call site suspends its caller — i.e. whether the emission
+/// `await`s it, which is the same thing: an `await` yields to the microtask
+/// queue whatever it is handed, so any turn may run before the caller resumes.
+///
+/// This is the single per-call test [`base_fixpoint`] propagates over AND the
+/// one B119's view rule reads back (`Program::suspending_calls`). One
+/// definition, so the checker's answer and the emitter's cannot drift.
+///
+/// A trait/generic-bounded dispatch is suspending when ANY candidate impl is,
+/// matching what the fixpoint already does to decide the caller's own
+/// asyncness. It is an over-approximation on purpose: the concrete member is
+/// chosen per monomorphized instance, and no pre-monomorphization pass can
+/// know which one this site gets.
+fn call_suspends(
+    program: &Program,
+    call: &Call,
+    held_values: &HashMap<Id, Vec<Id>>,
+    async_set: &HashSet<Id>,
+) -> bool {
+    match call.target {
+        CallTarget::Function(callee) | CallTarget::External(callee) => async_set.contains(&callee),
+        CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch) => {
+            dispatch_candidates(program, call.call_id)
+                .iter()
+                .any(|member| async_set.contains(member))
+        }
+        // A call through an `async || T`-typed value IS an await point —
+        // asyncness rides the type (J2), or the VALUE FLOW: a binding holding
+        // an async closure, an async field read, an async-returning call, a
+        // directly-applied async closure literal (the lowered `run` body).
+        // Other higher-order calls stay conservative (the concrete target
+        // isn't recoverable), as do variant constructors.
+        _ => program
+            .function_calls
+            .get(&call.call_id)
+            .is_some_and(|function_call| {
+                subject_awaits(program, function_call.subject_id, held_values, async_set, 0)
+            }),
+    }
+}
+
+/// [`call_suspends`] with the DISPATCH verdict memoized by dispatch key.
+///
+/// `dispatch_candidates` scans every impl and every trait for the member name,
+/// so asking it once per indirect edge — rather than once per node that has not
+/// flipped yet, which is all the fixpoint ever does — is what an unmemoized
+/// materialization pass measured at +2.0 ms of an 18 ms post-pass phase. The
+/// verdict is a function of the dispatch record alone, so one entry per
+/// distinct `(constraint-or-type, member)` answers every site that shares it:
+/// +0.3 ms.
+///
+/// Sound only once `async_set` is FINAL — a growing set would strand a `false`
+/// — which is exactly where the materialization runs, and why `base_fixpoint`
+/// cannot share the memo.
+fn call_suspends_memoized<'src>(
+    program: &Program<'src>,
+    call: &Call,
+    held_values: &HashMap<Id, Vec<Id>>,
+    async_set: &HashSet<Id>,
+    verdicts: &mut HashMap<(bool, Option<TypeId>, &'src str), bool>,
+) -> bool {
+    if !matches!(
+        call.target,
+        CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch)
+    ) {
+        return call_suspends(program, call, held_values, async_set);
+    }
+    // No dispatch record is `dispatch_candidates`' own empty answer.
+    let Some(dispatch) = dispatch_at(program, call.call_id) else {
+        return false;
+    };
+    let key = match dispatch {
+        GenericDispatch::OnConstraint(constraint_id, member) => (true, Some(constraint_id), member),
+        GenericDispatch::OnType(type_id, member) => (false, type_id, member),
+    };
+    if let Some(verdict) = verdicts.get(&key) {
+        return *verdict;
+    }
+    let verdict = dispatch_candidates(program, call.call_id)
+        .iter()
+        .any(|member| async_set.contains(member));
+    verdicts.insert(key, verdict);
+    verdict
 }
 
 /// A function's ADAPTIVE parameters: plain (unmarked), closure-typed, with a
