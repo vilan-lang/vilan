@@ -8,6 +8,16 @@ tracks the latest state.
 
 ## Unreleased
 
+**`ServerBuilder` composes an rpc service instead of replacing a boot function to get one.** `Service::new(protocol)` + `ServerBuilder::with_service` install an rpc service's routes and WebSocket handshake directly on a `Server::builder()` chain, answering before `on_request` — so an app that starts as a plain page and later wants rpc adds `.with_service(...)` rather than rewriting its whole boot function into `serve_service`. Two services coexist on separate mounts (`Service::new(protocol).at("/admin/")`), each answering only its own `{mount}events`/`{mount}send`/`{mount}rpc` routes and its own WebSocket upgrades, picked by longest mount and independent of the order `.with_service` was called in. `serve_rpc`, `serve_service` and `serve_connected` keep their exact signatures — they're four-line bodies over this layer now, and every existing caller (examples, the guide, the e2e suite, the benchmarks) is untouched down to the wire.
+
+One route-matching bug is fixed along the way: a service used to swallow any path merely *starting with* one of its routes (`/rpc` matching `/rpcs`, `/sendmail`, `/events-archive` too), silently shadowing an application route with no way for the app to see it happen. Matching is now a path SEGMENT — the route itself, or the route followed by `?` — so only the real route answers.
+
+---
+
+**`ServerBuilder::on_stop` now actually fires.** It compiled, type-checked, and read correctly since it shipped, and never ran: `build()` dropped the callback on the floor, and there was no `Server::stop` that could have fired it anyway. `Server::stop()` now exists — it closes the listener and fires `on_stop` once the listener has actually finished closing, not merely been asked to. Stopping a `Server` value `start()` never touched (built but never started, or a copy taken before `on_start` ran) is a no-op rather than an error.
+
+---
+
 **A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
 
 ---
