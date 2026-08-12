@@ -295,6 +295,7 @@ mod tests {
     use super::*;
     use crate::document::tests::{analyze_workspace, std_root};
     use std::path::Path;
+    use tower_lsp::lsp_types::Position;
 
     /// Analyze `relative` under `dir` as an open document (its own entry,
     /// like the server does for every open file).
@@ -718,6 +719,53 @@ mod tests {
         apply(&mut editor, state.plan_close(&uri));
         assert_eq!(visible(&editor), BTreeMap::new());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // S3 (editing-dx.md §3.2): a missing return value used to publish a
+    // ZERO-WIDTH range one byte PAST the closing brace — `start == end`, and
+    // VS Code draws a caret for that, not an underline, so the diagnostic
+    // was invisible in the editor even though the CLI rendered it
+    // tolerably. It now publishes the brace itself, exactly one character
+    // wide: `[2:0 .. 2:1]` on this source, where line 2 is the lone `}`.
+    #[test]
+    fn a_missing_return_value_publishes_a_one_character_range_not_a_zero_width_one() {
+        let (dir, _) = analyze_workspace(&[(
+            "main.vl",
+            "fun total(a: i32, b: i32): i32 {\n\tlet sum: i32 = a + b;\n}\n\n\
+             fun main() { total(1, 2); }\n",
+        )]);
+        let mut state = PublishState::new();
+        let (uri, document) = open(&dir, "main.vl");
+        let published = state.plan_publish(&uri, &document);
+        let group = published
+            .iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .expect("main.vl publishes its own diagnostic");
+        let diagnostic = group
+            .iter()
+            .find(|item| {
+                item.message
+                    .contains("this body ends without producing a value")
+            })
+            .expect("the missing-return-value diagnostic is published");
+        assert_eq!(
+            diagnostic.range.start,
+            Position {
+                line: 2,
+                character: 0
+            },
+            "the `}}` starts line 2 (0-based)"
+        );
+        assert_eq!(
+            diagnostic.range.end,
+            Position {
+                line: 2,
+                character: 1
+            },
+            "one character wide — not the old start == end zero-width range"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

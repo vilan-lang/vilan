@@ -1208,6 +1208,17 @@ impl Document {
                 if program.source_of(*id) != Some(SourceId(0)) {
                     continue;
                 }
+                // A synthesized `Expr::Void` (S3, editing-dx.md §3.9: the
+                // parser's filler for a block with no trailing expression,
+                // now spanning the closing brace instead of a zero-width
+                // point past it) is not something the user wrote and has no
+                // meaningful hover — excluded here so a cursor on the brace
+                // still finds the next-smallest REAL entity around it (the
+                // enclosing function, as before this span widened from
+                // zero).
+                if matches!(program.entity_map.get(id), Some(Expr::Void)) {
+                    continue;
+                }
                 let range = span.into_range();
                 if range.start < range.end {
                     entity_spans.push((range.start, range.end, *id));
