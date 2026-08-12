@@ -6743,7 +6743,6 @@ fn a_closures_ret_still_cannot_hand_back_a_view() {
 }
 
 #[test]
-#[ignore] // B123: the closure tail's own whole-block blindness, unfixed.
 fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
     // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
     // `check_view_escape`'s FUNCTION seam a leaf walk, but the closure seam
@@ -6754,9 +6753,10 @@ fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local(
     // regardless of this hole — so the blindness was self-masked. Here there is
     // no `ret` anywhere: the view of a closure-local reaches the caller only
     // through one arm of the closure's conditional TAIL, and the whole-block
-    // question is `false` for an `if`, so nothing asks the arm that matters.
-    // Wrongly compiles today (verified against the live compiler); the `ret`
-    // spelling of the identical shape is already refused
+    // question was `false` for an `if`, so nothing asked the arm that
+    // mattered. Wrongly compiled before this fix (verified against the live
+    // compiler, planted red); the `ret` spelling of the identical shape was
+    // already refused
     // (`b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local`).
     assert_fails_with(
         r#"
