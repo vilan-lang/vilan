@@ -14,6 +14,10 @@ tracks the latest state.
 
 ---
 
+**`mount`/`mount_root` on a missing element id now fails loud, naming the id.** `get_element_by_id` hands back JS `null` typed as `Element` when nothing on the page has that id, and mounting into it used to throw "Cannot read properties of null (reading …)" — the id the caller got wrong appeared nowhere in the message. The shared lookup both `mount` and `mount_root` go through now checks for that first and panics naming the id (`mount: no element with id 'app'`) instead of leaving the null dereference to speak for itself. The happy path — an id that exists — is unchanged.
+
+---
+
 **A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
 
 ---

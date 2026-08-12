@@ -1429,6 +1429,13 @@ the whole survey — a guarded lookup that names the id — and it is worth doin
 **whether or not any of §5 ships**, because it is the one check that works
 without knowing anything about the build.
 
+**SHIPPED 2026-08-11 (backlog A24; cycle 18, lane loud-basket).** `mount`'s
+shared lookup now panics `mount: no element with id '{id}'` when
+`get_element_by_id` comes back JS `null`; `get_element_by_id`'s own signature
+is untouched (a real `Option<Element>` return stays a separate, wider API
+question, deliberately not taken here). Happy-path bytes unchanged — verified
+against the corpus goldens (zero movement).
+
 ## 10. Open questions — the owner's to rule
 
 ### 10.1 Does the ladder go past rung 1 at all? — recommend: yes, and it is the paper's biggest ask

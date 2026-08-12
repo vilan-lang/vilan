@@ -702,6 +702,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_ready",
         "__chunk_load",
         "__chunk_preload",
+        "__is_null",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -830,6 +831,13 @@ fn helper_source(name: &str) -> &'static str {
             "function __chunk_preload(arm) {\n\
              \t__chunk_load(arm, () => {}, () => {});\n\
              }"
+        }
+        // `std::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
+        // whether a host value is JS `null`/`undefined` — `Element` (and any
+        // other opaque `external struct` handle) has no vilan-visible way to
+        // ask this itself.
+        "__is_null" => {
+            "function __is_null(value) {\n\treturn value === null || value === undefined;\n}"
         }
         "__random_int" => {
             "function __random_int(low, high) {\n\
