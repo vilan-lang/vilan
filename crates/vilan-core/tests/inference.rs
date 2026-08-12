@@ -6775,6 +6775,188 @@ fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local(
 }
 
 #[test]
+fn b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local() {
+    // The REFUSE-direction agreement pin (B116/B122 style): the same shape,
+    // spelled the two ways a closure return can be spelled, must answer
+    // identically. The `ret` spelling was already refused (the per-expr
+    // `Expr::FunctionReturn` arm has no exemption for a closure either), and
+    // is not new — what B123 fixes is that the conditional-tail spelling used
+    // to disagree, letting the identical view of a closure-local through.
+    // Both refuse now.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_ret = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { ret &local; }
+                Inner { n = 0 }
+            };
+            print(via_ret(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_tail = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { Inner { n = 0 } } else { &local }
+            };
+            print(via_tail(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_ret_and_conditional_tail_arm_agree_accepting_an_owned_leaf() {
+    // The ACCEPT-direction agreement pin. Unlike the function seam (B122's
+    // `b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail`), a
+    // closure has no exemption at all to accept a SOUND view through — it may
+    // not declare `borrows`, so every view leaf is unconditionally an escape
+    // (P4c). The accept side that exists is the neutral one: an OWNED leaf,
+    // which `escapes_as_view` was never going to flag either way, must still
+    // compile through both spellings after the leaf walk — proving the walk
+    // widens what gets ASKED, not what gets REFUSED.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_ret = |flag: bool| {
+                if flag { ret Inner { n = 1 }; }
+                Inner { n = 0 }
+            };
+            let via_tail = |flag: bool| {
+                if flag { Inner { n = 1 } } else { Inner { n = 0 } }
+            };
+            print(via_ret(true).n);
+            print(via_tail(false).n);
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+#[test]
+fn b123_a_closure_conditional_tail_arm_order_does_not_matter() {
+    // The mirror of `b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local`:
+    // the view-of-a-local arm FIRST, the owned arm second. `collect_tail_leaves`
+    // walks both arms of an `if`/`else` regardless of order.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { &local } else { Inner { n = 0 } }
+            };
+            print(grab(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_nested_closure_conditional_arm_may_not_escape_a_view_of_a_closure_local() {
+    // `collect_tail_leaves_if`'s recursion into a nested `if`'s own branches
+    // reaches the closure seam too — a view of a closure-local buried two
+    // levels deep is still a leaf the walk finds.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool, other: bool| {
+                let local = Inner { n = 3 };
+                if flag {
+                    if other { Inner { n = 1 } } else { Inner { n = 2 } }
+                } else {
+                    &local
+                }
+            };
+            print(grab(false, false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_match_leg_may_not_escape_a_view_of_a_closure_local() {
+    // `collect_tail_leaves`'s `match` arm reaches the closure seam too: one
+    // leg owned, one leg a view of a closure-local, and the local leg is
+    // still examined on its own.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Choice { A, B }
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |choice: Choice| {
+                let local = Inner { n = 3 };
+                match choice {
+                    Choice::A => Inner { n = 0 },
+                    Choice::B => &local,
+                }
+            };
+            print(grab(Choice::A).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_mixed_leaf_closure_return_refuses_each_forbidden_view_leaf_separately() {
+    // Three arms: one owned, one a view of a CAPTURE (`&h.inner`, the same
+    // shape `a_closures_ret_still_cannot_hand_back_a_view` already refuses
+    // through `ret`), one a view of a closure-LOCAL. Unlike the function
+    // seam's mixed pin (`b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf`,
+    // which has one SOUND leaf and refuses exactly once), a closure has no
+    // sound view leaf at all — both view arms are forbidden, so the leaf walk
+    // must refuse BOTH, separately, each naming its own span rather than
+    // collapsing into one diagnostic or naming the enclosing `if`.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun main() {
+            let h = Holder { inner = Inner { n = 9 } };
+            let grab = |flag: bool, other: bool| {
+                if flag {
+                    Inner { n = 0 }
+                } else if other {
+                    &h.inner
+                } else {
+                    let local = Inner { n = 3 };
+                    &local
+                }
+            };
+            print(grab(false, false).n);
+        }
+        "#;
+    let matching = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("a view cannot escape its scope"))
+        .count();
+    assert_eq!(
+        matching, 2,
+        "expected exactly two escape diagnostics, one per forbidden view leaf"
+    );
+    assert_fails_spanning(source, "&h.inner", "a view cannot escape its scope");
+    assert_fails_spanning(source, "&local", "a view cannot escape its scope");
+}
+
+#[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
     // result's element grew `xs`. Printed 3.
