@@ -497,7 +497,7 @@ pub fn post_analysis_passes(
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
     async_infer::infer(program, &call_graph);
-    // E3's implicit half (B119, view-invalidation.md §4): a view may not live
+    // E3's implicit half (B119, view-invalidation.md §7): a view may not live
     // across a call that CAN SUSPEND, which is the call graph's answer, not the
     // `await` token's. `check_invalidation` recorded the candidate sites inside
     // `analyze()` (it owns view liveness); this decides them against the

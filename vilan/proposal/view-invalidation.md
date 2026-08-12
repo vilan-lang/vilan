@@ -213,17 +213,19 @@ here. B112's survey found the gap; cycle 15 pinned the `&` form (a free
 parameter and an `&self` receiver, which is an ordinary `Ref` parameter and
 anchors on the `self` token).
 
-**A gap the pins found, still open.** The signature rule fires only when the
-body contains an EXPLICIT `await` token (`saw_await`), so the implicit-await
-spelling — calling an async function without the keyword, which
-`spec/execution.md` §7 sanctions — bypasses it for both forms: `async fun
-stash(viewed: &mut Point) { let beat = tick(); viewed.x = beat; }` compiles,
-and emits `const beat = await (tick());` with the caller's view live across
-it. Tightening the gate to *declared* asyncness is not a one-liner: it would
-also reject an `async fun m(&self)` whose body never suspends, which B29's
-declared-async impl of a sync trait method relies on. Pinned `#[ignore]`d
-(`an_implicit_await_does_not_lift_the_async_view_parameter_rule`) as the
-desired outcome.
+**A gap the pins found — CLOSED 2026-08-12, see §7.** The signature rule
+fired only when the body contained an EXPLICIT `await` token (`saw_await`),
+so the implicit-await spelling — calling an async function without the
+keyword, which `spec/execution.md` §7 sanctions — bypassed it for both
+forms: `async fun stash(viewed: &mut Point) { let beat = tick(); viewed.x =
+beat; }` compiled, and emitted `const beat = await (tick());` with the
+caller's view live across it. Tightening the gate to *declared* asyncness
+was not the fix: it would also reject an `async fun m(&self)` whose body
+never suspends, which B29's declared-async impl of a sync trait method
+relies on. The answer is the CALL GRAPH's — a call gates the rule when it
+can suspend — and declared asyncness read of the CALLEE, never of the body
+being checked, is what lets both hold at once. Rules 1 and 3 turned out to
+share the hole; §7 closes all three.
 
 ### Relation to A6
 
@@ -289,3 +291,151 @@ destruction semantics add. That is honest runtime-check territory
 (generation counters on containers, poisoned views), needs a cost model,
 and should be sized only after E2/E3 have been in use — the static rules
 may leave the dynamic remainder too rare to justify machinery.
+
+## 7. B119 — the gate asks the call graph, not the token
+
+Status: **SHIPPED 2026-08-12** (cycle 19; ruled by the owner the same day).
+§3's "gap the pins found, still open" is closed, and it was wider than
+filed: all THREE of E3's arms were gated on `saw_await`, so the
+implicit-await spelling walked past every one of them. The filing named
+the signature rule because that is where the `&`-form probe found it.
+
+### What was actually broken (reproduced before touching anything)
+
+Three programs, all compiling clean on the pre-fix binary, all emitting a
+real suspension:
+
+| Arm | Program | Emission |
+|---|---|---|
+| Signature (§3 rule 2) | `async fun stash(viewed: &mut Point) { let beat = tick(); … }` | `async function stash(viewed) { const beat = await (tick()); … }` |
+| Signature, `&` form | `async fun peek(viewed: &Point) { let beat = tick(); … }` | same shape |
+| Signature, one hop | `fun hop(): i32 { tick() }` between them | `async function hop() { return await (tick()); }`, then `await (hop())` |
+| Body (§3 rule 1) | a `let view = &mut point;` live across `tick()` | `const beat = await (tick());` with `view` live |
+| Closure (§3 rule 3) | `async { let beat = tick(); view = beat; }` | the spawned closure awaits with the capture live |
+
+The hop case is the one that settles the shape of the fix: `hop` declares
+nothing. A gate keyed on the callee's DECLARATION sees a plain `fun` and
+lets it through; only the fixpoint sees that `hop` calls `tick` and is
+therefore itself suspending.
+
+### The rule as shipped
+
+> A call gates the view rule when it **can suspend** — when the emission
+> `await`s it. The explicit `await` token stays SUFFICIENT; it stops being
+> NECESSARY.
+
+"Can suspend" is `Program::suspending_calls`, and E3's three arms read it
+unchanged in shape:
+
+- **body rule** — no view may be live across a suspending call;
+- **signature rule** — a body containing one may not take view parameters;
+- **closure rule** — a closure body containing one may not capture a view.
+
+A body "contains one" when it holds an `await` token or makes a suspending
+call. Neither test descends into a nested closure or `async` block, which
+is what keeps a spawn's awaits off its creator — the same boundary
+`CallGraph::build` already draws, and the reason the graph can answer for
+the analyzer's own scan.
+
+### Why this composes with B29, rather than colliding with it
+
+The filing warned that tightening the gate to *declared* asyncness would
+break B29's async-impl-of-a-sync-trait freedom, whose pin
+(`a_declared_async_impl_of_a_sync_trait_method_is_permitted`) depends on
+`async fun m(&self)` with a non-suspending body staying legal. The ruling
+asserts both hold. They do, and the reason is a distinction the old gate
+had no way to make:
+
+**Declared asyncness is a property of the CALLEE, read at a call site — it
+is never read of the body being checked.** A JS `async function` runs
+synchronously until its first `await`. So:
+
+- `async fun quiet(viewed: &mut Point) { viewed.x = 5; }` never yields.
+  Its caller's `await (quiet(point))` resolves after the body has already
+  finished with `viewed`. The signature rule does not fire, and B29's pin
+  — which does not even call `m` — is untouched.
+- A body that CALLS such an impl is a different question, and the answer
+  is yes, it suspends: `await (m(s))` yields to the microtask queue even
+  when `m` returns an already-resolved promise, so any turn may run before
+  the caller resumes. `calling_an_async_impl_of_a_sync_trait_method_
+  suspends_the_caller` pins that, and it is a genuine hazard the old gate
+  missed, not a cost of the new one.
+
+The runtime truth, not the declaration, is what both answers are read off
+— which is why there is no conflict to trade away.
+
+### Trait dispatch: conservatively suspending, and why that is the right seam
+
+A `T::member()` / re-dispatched trait call cannot be pinned to one callee
+before monomorphization, so it counts as suspending when **any** candidate
+impl is async. That is an over-approximation, and its false-positive
+surface is real and worth naming: a program whose only instantiation
+selects a sync impl, while some other impl of the same trait is async, has
+its view parameters refused for a suspension its instance never performs.
+
+It is nonetheless the right answer here, because it is the SAME
+over-approximation `async_infer` already uses to decide the caller's own
+asyncness. Refining the checker below the emitter would mean the analysis
+disagreed with the marking derived from it; the two must move together or
+neither is trustworthy. No program in the tree hits the surface (the
+survey below), so the trade is currently free — and if it ever bites, the
+refinement (`dispatch_candidates_for`, platform coloring's per-instance
+narrowing) exists and should be applied to both at once.
+
+### Where it lives, and why it is not one pass
+
+`check_invalidation` runs inside `analyze()`; the call graph and the async
+fixpoint run after it, in `post_analysis_passes`. The check cannot move to
+the facts (it owns view liveness and the S1 frozen filter), and the facts
+cannot move to the check (E35: one graph per analysis, built where it is).
+So the analyzer RECORDS the candidate sites and
+`analyzer::check_view_suspensions` decides them — the `drop_method_checks`
+idiom, which exists for exactly this shape.
+
+The suspension answer itself is not new machinery. `async_infer`'s
+fixpoint already decided, for every call edge, whether it awaits — that is
+what made each caller async — but it decided it as a per-node boolean and
+discarded the sites. `call_suspends` is that same per-call test factored
+out of `base_fixpoint`, so the checker's answer and the emitter's cannot
+drift; one further pass over the same edges records the sites into
+`suspending_calls`. There is no second fixpoint, and none was needed.
+
+**Cost.** Interleaved A/B, 80 samples per arm, on the `todo` example's
+post-pass phase (median 18.1 ms): **+1.15 ms (+6.1%)** for the
+materialization pass as first written, **+0.70 ms (+3.9%)** memoized. The
+whole cost was `dispatch_candidates`, which scans every impl and trait for
+the member name — the fixpoint calls it only for nodes that have not
+flipped yet, the materialization for every indirect edge. Memoizing the
+verdict by dispatch key (sound only because `async_set` is final there,
+which is why `base_fixpoint` cannot share the memo) halves it. Below the
+noise floor of a real compile: 60 corpus programs built through each
+binary, 15.10 s vs 15.13 s.
+
+### The survey
+
+Zero newly-flagged sites, on every surface:
+
+| Surface | Extent | Flagged |
+|---|---|---|
+| std, both layers, FULL scan | every module, process + browser | 0 |
+| corpus | 114 programs, byte-identical goldens | 0 |
+| docs fences | 110, all compiled by the docs gate | 0 |
+| every `.vl` under `vilan/` + `crates/` | 229 files | 0 |
+| project roots (examples, benchmarks, `init` templates, CLI fixtures) | 21 `vilan.toml` roots | 0 |
+| proposal + docs `vilan` fences, structural | 316 scanned | 0 |
+
+The one fence holding both a view and an `await` is §1's own exhibit of
+`mutate_across_await` — an EXPLICIT await, refused since 2026-07-09, and
+labelled there as the historical probe. Not a flip.
+
+### Residue
+
+- The `+=` shape reports the closure-capture diagnostic twice (the
+  compound re-read is a second `Expr::Local` reference to the same view).
+  Pre-existing and symmetric across both gates — the token path does it
+  identically — so it is recorded here, not folded in.
+- Module-level binding initializers have no entry in `suspending_calls`:
+  their calls are not graph `nodes()`, an initializer that suspends is
+  refused outright by `async_infer`, and the invalidation scan does not
+  walk initializers. Nothing to answer for today; a future initializer
+  scan would need the edges added.

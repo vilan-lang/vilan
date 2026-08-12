@@ -593,7 +593,7 @@ pub struct ViewSuspensionChecks<'src> {
 
 /// E3's crossing diagnostic (view-invalidation.md §3), in one voice for both
 /// spellings of the suspension: the `await` the user wrote, and the implicit
-/// one a call to a suspending callee performs (B119, §4). The token form is
+/// one a call to a suspending callee performs (B119, §7). The token form is
 /// unchanged; the implicit form says WHICH call suspends, because there is no
 /// token under the span to make that obvious.
 fn view_crossing_message(view_name: &str, root_name: Option<&str>, callee: Option<&str>) -> String {
@@ -2124,7 +2124,7 @@ pub struct Analyzer<'src> {
     /// async only by inference. Populated by `check_drop_impls`.
     drop_method_checks: Vec<(Id, Span, String)>,
     /// The E3 view sites awaiting the suspension verdict (B119,
-    /// view-invalidation.md §4): recorded by `check_invalidation`'s scan,
+    /// view-invalidation.md §7): recorded by `check_invalidation`'s scan,
     /// decided by `check_view_suspensions` after `async_infer` settles which
     /// calls suspend. Moved onto the `Program` for the same reason
     /// `drop_method_checks` is.
@@ -30506,7 +30506,7 @@ pub struct Program<'src> {
     /// `async_functions` — an awaiting drop body is async only by inference.
     pub drop_method_checks: Vec<(Id, Span, String)>,
     /// The E3 view sites awaiting the suspension verdict (B119,
-    /// view-invalidation.md §4). Read by [`check_view_suspensions`] AFTER
+    /// view-invalidation.md §7). Read by [`check_view_suspensions`] AFTER
     /// `async_infer` fills [`Self::suspending_calls`] — whether a call
     /// suspends is a call-graph property, not a token.
     pub view_suspension_checks: ViewSuspensionChecks<'src>,
@@ -35314,7 +35314,7 @@ fn analyze_over_world<'src>(
     }
 }
 
-/// E3's implicit half (B119, view-invalidation.md §4): decide the view sites
+/// E3's implicit half (B119, view-invalidation.md §7): decide the view sites
 /// `check_invalidation` could not, now that `async_infer` has said which calls
 /// suspend.
 ///

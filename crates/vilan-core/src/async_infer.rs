@@ -473,7 +473,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
         program.push_diagnostic(error, source);
     }
 
-    // --- B119 (view-invalidation.md §4): materialize the per-CALL-SITE
+    // --- B119 (view-invalidation.md §7): materialize the per-CALL-SITE
     // answer the view rule reads. The fixpoint above already decided it for
     // every edge — it is what made each caller async — but it decided it as a
     // per-NODE boolean and threw the sites away. One more pass over the same
