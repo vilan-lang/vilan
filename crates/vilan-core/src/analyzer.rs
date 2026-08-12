@@ -18059,12 +18059,37 @@ impl<'src> Analyzer<'src> {
                         && let Some(return_type_id) = return_type_id
                     {
                         self.expected_types.insert(expr_id, return_type_id);
-                        self.constraints.push(Constraint::ReturnType {
-                            body_id: expr_id,
-                            return_type_id,
-                            last_statement_id,
-                        });
                         self.return_sites.push((id, expr_id));
+                        // P28 dedup (editing-dx.md §17.2; deferred at §16 as
+                        // needing "the tail-construction site to know a
+                        // preceding `ret` already diverged"): when the
+                        // block's own last STATEMENT is itself a `ret`,
+                        // that `ret`'s own return-position check (pushed at
+                        // its construction site, below) already reports
+                        // whatever is wrong with this function's return
+                        // value — the synthesized void tail after it is
+                        // unreachable, and checking IT too is B5's "second
+                        // diagnostic that adds no information", not a
+                        // second mistake. Narrow on purpose: a `ret` is the
+                        // one statement shape that already owns an
+                        // independent `Constraint::ReturnType` of its own: a
+                        // last statement that diverges some OTHER way (a
+                        // `jump`, an exhaustive `if`/`match`) raises a
+                        // different, unfiled question about the TAIL's own
+                        // inferred type and is left alone.
+                        let tail_is_reachable = !last_statement_id.is_some_and(|statement_id| {
+                            matches!(
+                                self.expr_id_to_expr_map.get(&statement_id),
+                                Some(Expr::FunctionReturn(_))
+                            )
+                        });
+                        if tail_is_reachable {
+                            self.constraints.push(Constraint::ReturnType {
+                                body_id: expr_id,
+                                return_type_id,
+                                last_statement_id,
+                            });
+                        }
                     }
                     let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
                     self.functions.insert(

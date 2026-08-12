@@ -11459,15 +11459,15 @@ fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
     );
 }
 
-// P28 — a B5 violation NOT closed by this slice: a bare `ret` in a
-// value-returning function still reports the same root cause twice (once at
-// the `ret`, once at the synthesized void tail after it) — S3's parser fix
-// (editing-dx.md §3.9) makes BOTH anchors correct and visible where the tail
-// one used to be an invisible zero-width point; it does not deduplicate
-// them. Pinned as today's true (still-doubled) behavior, not ignored, since
-// nothing here is wrong on its own — §12 files the count as owed and unmet.
+// P28 — the B5 violation §16 left unclosed, closed here (editing-dx.md
+// §17.2): a bare `ret` in a value-returning function used to report the
+// same root cause twice (once at the `ret`, once at the synthesized void
+// tail after it — both correctly anchored since S3's parser fix, which is
+// what made the duplicate visible enough to fix). The tail-construction
+// site now knows a preceding `ret` already diverged and skips its own
+// redundant constraint, so only the `ret`'s own check fires.
 #[test]
-fn a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic() {
+fn a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic() {
     let source = r#"
         fun total(a: i32): i32 {
         	ret;
@@ -11477,32 +11477,38 @@ fn a_bare_ret_still_duplicates_the_synthesized_tail_diagnostic() {
         	total(1);
         }
         "#;
-    let diagnostics = failure_diagnostics(source);
-    let matching: Vec<_> = diagnostics
-        .iter()
-        .filter(|(message, _)| {
-            message
-                == "Expected i32, but got void instead: this body ends without producing a value."
-        })
-        .collect();
-    assert_eq!(
-        matching.len(),
-        2,
-        "expected the known B5 duplicate (one at `ret`, one at the tail); got: {diagnostics:#?}"
+    assert_fails_once_with(
+        source,
+        "Expected i32, but got void instead: this body ends without producing a value.",
     );
     let ret_span = source.find("ret").map(|start| start..start + "ret".len());
-    let brace_span = source.find('}').map(|start| start..start + 1);
+    let diagnostics = failure_diagnostics(source);
     assert!(
-        matching
+        diagnostics
             .iter()
             .any(|(_, range)| Some(range.clone()) == ret_span),
-        "expected one diagnostic at `ret`; got: {matching:#?}"
+        "expected the sole diagnostic at `ret`, not the synthesized tail; got: {diagnostics:#?}"
     );
-    assert!(
-        matching
-            .iter()
-            .any(|(_, range)| Some(range.clone()) == brace_span),
-        "expected one diagnostic at the closing brace; got: {matching:#?}"
+}
+
+// The same dedup, for a `ret` whose VALUE is wrong rather than missing — a
+// second B5 violation the survey never named (found while building the
+// fix, same mechanism): before the fix this ALSO doubled, pairing the
+// value mismatch at `ret` with a spurious "ends without producing a value"
+// at the tail for code that, once the first error is fixed, is complete.
+#[test]
+fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
+    assert_fails_once_with(
+        r#"
+        fun total(a: i32): i32 {
+        	ret "nope";
+        }
+
+        fun main() {
+        	total(1);
+        }
+        "#,
+        "Expected i32, but got",
     );
 }
 
