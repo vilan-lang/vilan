@@ -154,13 +154,12 @@ The rules are short:
 A running server that reads a file once at boot (`fs::read_file_to_str`
 before `Server::builder()...start()`, say) keeps serving those bytes for
 the life of the process — editing that file produces no round the server
-itself ever sees. Two thin primitives, `std::dev` on the process side,
-close that gap for code you wrote by hand:
+itself ever sees. `std::watch` closes that gap for code you wrote by hand:
 
 ```vilan,norun
-import std::dev;
 import std::fs;
 import std::http::{ Response, Server };
+import std::watch;
 
 fun main() {
 	Server::builder()
@@ -171,7 +170,7 @@ fun main() {
 			// Tell every connected browser to reload once it has the fresh
 			// bytes. A no-op outside `run --watch`, so it costs nothing to
 			// leave the call in a shipped build.
-			dev::force_refresh();
+			watch::force_refresh();
 			Response::builder().body(shell).build()
 		})
 		.build()
@@ -184,7 +183,7 @@ channel this server's `run --watch` session started — it has no effect on
 a plain `vilan run`, and it is not how `run --watch`'s own `swap`/`css`
 push works (those fire automatically, on a round; this is the manual,
 explicit escape hatch for state a round can't see). Reference:
-[`std::dev` (process)](../std/process.md).
+[`std::watch`](../std/process.md).
 
 ## Picking which server to run
 

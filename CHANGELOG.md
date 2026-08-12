@@ -8,7 +8,7 @@ tracks the latest state.
 
 ## Unreleased
 
-**A hand-rolled server can now ask a connected browser to reload, on demand.** `std::dev::force_refresh()` (the process-layer `std::dev`, alongside the browser one) POSTs to the dev channel `run --watch` already runs, which broadcasts a one-shot reload to every connected browser. It's for the case the automatic `swap`/`css` push doesn't reach: a server that reads a file once at boot (a stylesheet, a template) and now re-reads it on request — call `force_refresh()` after the re-read and the browser picks up the fresh bytes. A no-op outside `run --watch`, so the call costs nothing left in a shipped build. See [the dev loop guide](https://vilan-lang.org/docs/guide/dev-loop.html#freshness-for-a-hand-rolled-server).
+**A hand-rolled server can now ask a connected browser to reload, on demand.** `std::watch::force_refresh()` POSTs to the dev channel `run --watch` already runs, which broadcasts a one-shot reload to every connected browser. It's for the case the automatic `swap`/`css` push doesn't reach: a server that reads a file once at boot (a stylesheet, a template) and now re-reads it on request — call `force_refresh()` after the re-read and the browser picks up the fresh bytes. A no-op outside `run --watch`, so the call costs nothing left in a shipped build. See [the dev loop guide](https://vilan-lang.org/docs/guide/dev-loop.html#freshness-for-a-hand-rolled-server).
 
 ---
 
