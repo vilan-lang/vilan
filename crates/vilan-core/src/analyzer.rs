@@ -13739,6 +13739,15 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // B123: the closure seam gets the same leaf walk B122 gave the
+        // function seam (`element-clones.md` §13.4/§14) — `closure.return_`
+        // is the closure's own tail id, exactly parallel to a function's
+        // `function.body.1`, so an `if`/`match` tail with one owned arm no
+        // longer hides the arm that projects a view behind the arm that
+        // doesn't. Unlike the function seam, no exemption is asked here: a
+        // closure may not declare `borrows`, so a closure return has no sound
+        // view to let through (P4c, second-class all the way) — every leaf
+        // that is a view is an escape.
         let closure_returns: Vec<Id> = self
             .closures
             .iter()
@@ -13748,8 +13757,12 @@ impl<'src> Analyzer<'src> {
             .map(|(_, closure)| closure.return_)
             .collect();
         for return_id in closure_returns {
-            if self.escapes_as_view(return_id, &view_bindings, &capturing) {
-                escapes.push(return_id);
+            let mut leaves = Vec::new();
+            self.collect_tail_leaves(return_id, &mut leaves);
+            for leaf in leaves {
+                if self.escapes_as_view(leaf, &view_bindings, &capturing) {
+                    escapes.push(leaf);
+                }
             }
         }
         for expr_id in escapes {

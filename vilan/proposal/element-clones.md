@@ -996,3 +996,167 @@ touched: `cargo test -p vilan-cli --test corpus` moved **zero bytes**, and
 `cargo test -p vilan-core --test docs` is unaffected (no documented example
 depends on the tail-only rule, because the tail-only rule was never a
 documented contract — only an implementation gap).
+
+## 14. B123 — the closure seam gets the same leaf walk, closing the filed residual
+
+§13.4's finding, filed rather than fixed: `check_view_escape` carries a
+*third* reader of the same whole-position question, alongside the two
+`infer_borrows`/`check_view_escape` function-seam readers B122 closed —
+`escapes_as_view(closure.return_)`, asked once per closure, never leaf-wise.
+Recorded as `OPEN` (backlog B123) rather than folded into B122 because it was
+not one of B122's two filed shapes, and because every pin in the suite that
+could have exercised it happened to also spell a `ret` — which a *different*,
+already leaf-wise mechanism (the per-expr `Expr::FunctionReturn` arm,
+unconditional for a closure since B122's near-miss restored it) catches on
+its own. The bug and its mask are independent facts; B123 is the lane that
+had to tell them apart before touching anything.
+
+### 14.1 The un-masking pin comes first
+
+A masked bug is not evidence of a safe bug — only evidence that every
+*existing* probe happens to trip a second mechanism first. The brief called
+for constructing the disagreeing case before writing any fix: a view leaving
+through one arm of a closure's conditional TAIL, with no `ret` anywhere in
+the program, so the per-expr arm has nothing to catch and only the
+whole-block question is left to answer.
+
+```vilan
+import std::print;
+struct Inner { n: i32 }
+fun main() {
+    let grab = |flag: bool| {
+        let local = Inner { n = 3 };
+        if flag { Inner { n = 0 } } else { &local }
+    };
+    print(grab(false).n);
+}
+```
+
+Built and run against the live (pre-fix) compiler: it compiled clean. The
+emitted JS confirms what the checker missed — `local` is the same array
+object handed back through the `else` arm, an alias exactly as unsound in
+kind as the function-level `grab` §13.1 already proved rule 3 exists to
+refuse:
+
+```js
+const grab = (flag) => {
+	const local = [ 3 ];
+	let $a = null;
+	if (flag) { $a = [ 0 ]; } else { $a = local; }
+	return $a;
+};
+```
+
+The identical shape spelled with an early `ret &local;` in place of the
+conditional tail was already refused, confirming the two spellings of one
+expression disagreed — the same shape of disagreement §13's `grab` had, one
+level further down the reader stack. This is the pin
+(`b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local`),
+planted `#[ignore]`d and confirmed red before any fix line was written. A
+second construction — a captured place (`&h.inner`, `h` an owned local in the
+enclosing function) escaping the same way — reproduced the identical hole,
+confirming the un-masking is not specific to a closure-local's storage but to
+the conditional-tail SHAPE itself, exactly as `is_view_expr`'s failure to
+match `Expr::If` predicts. **Verdict: the hole is real, not merely filed.**
+
+### 14.2 The fix: the closure seam's leaf walk, no exemption
+
+`closure.return_` is a closure's own tail id, positionally identical to a
+function's `function.body.1` — both are what `walk_expr_node` returns for the
+body, so both terminate at a `Block`'s tail, an `if`'s arms, or a `match`'s
+legs. `collect_tail_leaves`, unchanged since B122, already walks exactly that
+shape regardless of which seam owns the id. The fix asks it of
+`closure.return_` the way the function seam asks it of `function.body.1` and
+each `return_sites` entry, then asks `escapes_as_view` of each leaf on its
+own instead of once for the whole position:
+
+```rust
+for return_id in closure_returns {
+    let mut leaves = Vec::new();
+    self.collect_tail_leaves(return_id, &mut leaves);
+    for leaf in leaves {
+        if self.escapes_as_view(leaf, &view_bindings, &capturing) {
+            escapes.push(leaf);
+        }
+    }
+}
+```
+
+One asymmetry from the function seam, by design rather than omission: no
+`return_position_hands_back_no_view` exemption is asked afterward. That
+exemption exists because a `borrows` function may soundly return a view of a
+loaned parameter; a closure may not declare `borrows` at all (P4c — a closure
+that captures a view is second-class all the way, and cannot hand one back
+either), so it has no sound view leaf to exempt. Every leaf the walk finds
+that is a view is unconditionally an escape, matching the per-expr `ret` arm
+it now agrees with.
+
+### 14.3 Coverage
+
+`b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local`
+is the un-masking pin (§14.1), un-`#[ignore]`d once the fix lands. Six more
+round out the semantics the two constructions in §14.1 only sampled:
+
+- `b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local` —
+  the REFUSE-direction agreement pin (B116/B122 style): the `ret` spelling
+  and the conditional-tail spelling of the identical view-of-a-closure-local
+  now answer identically. The `ret` side was never broken (§13.4's near-miss
+  already restored it); what changes here is that the tail side stops
+  disagreeing with it.
+- `b123_a_closure_ret_and_conditional_tail_arm_agree_accepting_an_owned_leaf` —
+  the ACCEPT-direction counterpart, and where the closure seam's agreement
+  pin necessarily differs from the function seam's
+  (`b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail`, which
+  pins two spellings *accepting a sound view*). No such case exists for a
+  closure — §14.2's whole point is that it has no sound view to accept — so
+  the accept side pins the neutral case instead: an OWNED leaf, which
+  `escapes_as_view` was never going to flag through either spelling, still
+  compiles through both after the leaf walk widens what gets ASKED. This is
+  what the independence plant (below) confirms does not depend on the fix.
+- `b123_a_closure_conditional_tail_arm_order_does_not_matter` — the
+  view-of-a-local arm first, the owned arm second.
+- `b123_a_nested_closure_conditional_arm_may_not_escape_a_view_of_a_closure_local` —
+  a view two `if`s deep, reached through `collect_tail_leaves_if`'s existing
+  recursion.
+- `b123_a_closure_match_leg_may_not_escape_a_view_of_a_closure_local` — the
+  identical shape as a `match` tail.
+- `b123_a_mixed_leaf_closure_return_refuses_each_forbidden_view_leaf_separately` —
+  the closure-domain shape of B122's mixed-leaf pin, and where it necessarily
+  diverges: `b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf` mixes
+  one SOUND leaf (a parameter view) with one unsound leaf and refuses exactly
+  once, because the function seam's exemption tells the two apart. A closure
+  has no exemption to tell them apart with — a captured-place view and a
+  closure-local view sitting in sibling arms of the same three-way
+  conditional are BOTH forbidden, so the walk must refuse both, separately,
+  each naming its own arm's span (`&h.inner`, `&local`) rather than
+  collapsing into one diagnostic or naming the enclosing `if`. Asserted as
+  exactly two matching diagnostics, not one and not merged.
+
+Every B122 pin and the pre-existing `a_closures_ret_still_cannot_hand_back_a_view`
+stayed green throughout (2259 passed, 0 failed, 3 `#[ignore]`d, none of them
+B123's, for the full `inference` binary).
+
+Two plants:
+
+| plant | red |
+|---|---|
+| the un-masking pin, run against the live compiler before any fix line existed | 1 (planted `#[ignore]`d, confirmed via `cargo test -p vilan-core --test inference … -- --ignored`) |
+| the closure seam's leaf walk reverted to the old whole-position `escapes_as_view(closure.return_)` call, all seven pins left in place | 6 of the 7 new pins (every one that names a view leaf); the accept-agreement pin stays green, correctly — an owned leaf was never going to be flagged by either the whole-position question or the leaf walk, so it is not evidence for or against this fix |
+
+The second plant is also the independence proof the brief asked for: with
+the closure seam reverted, every B122 function-seam pin (6) and the
+pre-existing `a_closures_ret_still_cannot_hand_back_a_view` stayed green —
+the closure fix touches nothing the function seam or the per-expr `ret` arm
+reads, so reverting it cannot and does not redden either.
+
+### 14.4 Zero movement, checker-only
+
+`cargo test -p vilan-cli --test corpus` moved **zero bytes** (`every_corpus_golden_is_byte_identical`
+green) and `cargo test -p vilan-core --test docs` compiled every fenced
+example unchanged (`every_doc_example_compiles` green) — the regression
+corpus and the documented surface contain neither the closure-local nor the
+captured-place shape, so the fix is provably inert against everything
+shipped. `cargo build` and the full `inference` binary are both clean
+(§14.3). B123 closes SHIPPED: the un-masking construction in §14.1 is the
+finding this record required before a fix could be justified — the hole was
+real, not a hypothetical extension of B122's rule.
