@@ -392,10 +392,17 @@ fn run_watch_tells_its_child_it_is_watching() {
     // spawns. Without this the policy above is a claim about an environment
     // variable nobody sets.
     let staged = stage("watchrun", free_port(), Client::Styled, false);
+    // The probe stays alive only long enough for the harness to read its
+    // marker, then SELF-EXPIRES: kill_watcher cannot reap the watcher's node
+    // grandchild (the E60 mechanism), so an unbounded sleep here leaked one
+    // process per run. Fifteen seconds is orders beyond the marker's
+    // boot-time print under any load, and an orphan now dies on its own —
+    // the watcher's restart loop may respawn it once inside the kill window,
+    // and that respawn self-expires the same way.
     std::fs::write(
         staged.join("src/server.vl"),
         "import std::io::print;\nimport std::watch::is_watching;\nimport std::time::sleep;\n\n\
-         async fun main() {\n\tprint(i\"watching={is_watching()}\");\n\tsleep(600000);\n}\n",
+         async fun main() {\n\tprint(i\"watching={is_watching()}\");\n\tsleep(15000);\n}\n",
     )
     .expect("write the probe");
 
