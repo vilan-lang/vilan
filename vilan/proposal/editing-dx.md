@@ -1588,3 +1588,181 @@ be unavailable — that is a survey finding, not an implementation detail.
    standard (§10.2); `parsing.rs`'s "at the closing brace" comment is one byte
    off (§10.4); `Span::to_end()` has no callers (§10.4); E49's "E38 family"
    framing describes an inherited *gate*, not a shared subject (§10.3).
+
+## 15. Implementation notes — the recovery lane (S1, S2, S6)
+
+Shipped as the `recovery` lane of cycle 18, in three commits: the synchronizer
+with the `;` vocabulary (S1+S2, which §11 pairs), the item-keyword reach the
+first commit's scan turned out to need, and `check`'s goal split (S6). §8's
+three clauses are pins in `crates/vilan-core/tests/parser_recovery.rs`, the
+blackout itself is pinned at the wire in `crates/vilan-lsp/src/publish.rs` and
+at the analyzer in `inference.rs`, and the corpus goldens did not move a byte.
+
+### 15.1 The synchronizer, and the two loops
+
+`Parser::recover_statement` is the whole of S1: a declined statement is
+reported once and the cursor moves to the next boundary, at both loops
+(`parse_program`, `parse_block_clean`). §10.1 was right that this is not a new
+proposal — the design was `frontend.md`'s, ratified and unbuilt — and right
+that it is the file's load-bearing change. Three things followed from it that
+§11's sizing did not name:
+
+**`parse_block_clean` had to try the TAIL before recovering.** A block's
+trailing expression is a statement that legitimately declines — `x + y` before
+`}` is not a statement, it is the block's value — so the loop tries the tail on
+every decline and only recovers when that fails too. Without this the parser
+would report a diagnostic on every clean value-returning function in the
+corpus.
+
+**The block's `nested_delimiters` site retired.** Past its `{`,
+`parse_block_clean` can no longer decline: a broken statement is recovered
+individually, and a body that runs out of input reports ``unclosed `{` `` at the
+opener and keeps what it parsed. That made `recover_delimited("block", …)`
+unreachable and it is deleted — nine sites remain, not ten. This is §2.2
+mechanism 2 fixed at the root rather than narrowed: the survey proposed
+narrowing the blast radius by making `scan_balanced` tolerant, and the honest
+fix was for the block never to reach region-skipping at all.
+
+**`emit_leftover_error` retired with it.** `parse_program` now consumes the
+whole token stream by construction — there are no leftovers to report — and a
+`debug_assert` in `parse_with` holds that invariant. Its farthest-failure logic
+lives on in `emit_statement_failure`, which is the same choice made per
+statement instead of once at the end.
+
+### 15.2 Where the boundaries are, and the two that reach inside a region
+
+`;` at statement depth (resume after it), the enclosing `}` (resume on it), an
+item keyword, and — added beyond `frontend.md`'s list — a statement-head
+keyword. The last one is what keeps §8 clause 3 honest for shape (a): syncing
+from a missing `;` to the *next* `;` would swallow the following statement
+whole, and the following statement is exactly the one whose diagnostics clause
+3 promises to keep. `let`/`mut`/`ret`/`jump`/`if`/`for`/`match`/`const`/`async`
+cannot continue the broken statement, so stopping there costs nothing.
+
+Identifiers and literals are deliberately not boundaries. They begin an
+expression statement, but they also appear all through a broken one, and
+resuming mid-garbage reports again — the cascade §9 records vilan as not
+having, and must keep not having.
+
+Two boundaries reach INSIDE a region the scan is skipping, each because the
+token cannot be part of one:
+
+- **a `;` whose innermost opener is `(`.** A call's arguments and a
+  parenthesized expression admit no semicolon (the constructs that do,
+  `[value; length]` and a block's statements, sit under `[` or `{`), so it
+  terminates a statement written below the unfinished region. Without this,
+  `print(` followed by three statements swallowed all three.
+- **an item keyword with no `{` open above it.** `fun broken( {` leaves the
+  parameter list open, and the scan ran to end of input — the file-tail
+  blackout again, one layer above the statement loop. The pre-fix tree for a
+  four-item file was `([], 0..74)`. A `{` on the stack means a block or closure
+  body, where a nested `fun` is ordinary code; the pin for that shape stays
+  green with the reach removed, which is what makes it a guard rather than a
+  restatement.
+
+Statement heads get no such reach: `if`/`match`/`async` are perfectly good
+arguments.
+
+### 15.3 Which diagnostic a recovered statement reports
+
+Three-way, in the order the grades ask for. A committed demand that failed
+strictly inside an unfinished region wins — that is §5.1's `found ';' expected
+',' or ')'`, the best diagnostic in the survey, and P8 keeps it. Otherwise, an
+opener still unclosed at the boundary reports ``unclosed `X` `` at the opener
+(§5.3). Otherwise the farthest failure, or the position's own fallback.
+
+The failure-within rule is `recover_delimited`'s own, reused: it is the same
+question ("did anything inside the region locate a real error?") and deserved
+the same answer rather than a second one.
+
+Note what this means for P14 and P8, which the survey grades separately: they
+are the SAME shape to the parser — an argument list that reached a `;` — and
+they now produce the same message. P14's `let b: i32 = 2` reads as an argument,
+a committed demand fails at its `;`, and the located message wins. The survey
+recorded a count for P14 and no message; the count is 1, as it was.
+
+### 15.4 §4.4's anchor: one character, not zero
+
+§4.4 asks for two things that cannot both be built: "a zero-width span at the
+end of the previous token", and "rendered as a one-character caret at that
+position". There is no rendering layer between them — `line_index.rs` converts
+both ends verbatim (§3.2 measures exactly that) — so a zero-width span is a
+zero-width LSP range, which VS Code draws as nothing. The implementation takes
+the rendered intent: the **last character of the previous token**, which is
+what §4.4's own drawing puts the caret under (the `}` of `… y = 4 }`), computed
+on a char boundary so a token ending in a multi-byte character still slices.
+
+`Span::to_end()` therefore still has zero callers (§10.4). It is left alone
+rather than deleted: `frontend.md` §2 lists it in the span API the cutover
+committed to, and removing it is not this lane's call.
+
+### 15.5 S2's scope: three sites, not `expect_ctrl`'s set
+
+§11 asks for `;` on the committed side of the noting rule "(`expect_ctrl`, plus
+the six bare `eat_ctrl(';')` statement sites)". Widening `expect_ctrl`'s match
+would have reached two `;` demands that are not statement terminators at all:
+the `[T; length]` array type and the `[value; length]` repeat fork, both of
+which spell `;` as a fork between two readings. A failure there would have
+reported "expected `;` to end this statement" in type position.
+
+So the terminator is its own demand (`note_terminator`) at the three sites that
+genuinely have one: the expression statement (which serves both loops), the
+import statement, and the use statement. The `fun`-body and `struct`-body forms
+(`;` or `{ … }`) are forks too and are left silent. P2, P3 and P4 are all
+covered by those three; P5's silence is pinned as a non-diagnostic.
+
+### 15.6 S6: nothing to suppress, and what a salvaged tree does produce
+
+§13.1's mitigation — "suppressing diagnostics whose span falls inside a
+recovered region" — needs no code, and the reason is worth recording: a
+salvaged tree holds nothing inside a skipped region to diagnose. A dropped
+statement is not in the tree; a garbled region's `Node::Error` placeholder
+types as nothing and reports nothing. Pinned as
+`a_recovered_region_produces_no_analyzer_diagnostics_of_its_own`.
+
+What a salvaged tree does produce is a different class the survey did not
+name — **consequence** diagnostics, from what recovery removed rather than from
+what it kept: a body that lost its tail reads as `void` against a declared
+return type, a declaration that did not parse leaves its name unbound at every
+call site. These are reported, beside the parse error that explains them. They
+are not suppressed, for two reasons: the anchors lane's S3 owns the void-tail
+diagnostic and would be fighting a suppression written here, and a rule broad
+enough to catch them ("drop analyzer diagnostics when the file has a parse
+error") is the blackout with extra steps.
+
+`build` is untouched, per §13.1's draft. The two goals now differ at one
+`CompileGoal` parameter through `compile_unit`/`compile_to_js`; emission gained
+a parse-clean gate of its own, so no goal can reach codegen with a recovered
+tree.
+
+### 15.7 §8's bar, measured after
+
+| Clause | Before | After |
+|---|---|---|
+| 1 — one missing token, one diagnostic | met (P6/P14) | met, and pinned with exact counts |
+| 2 — N errors, N diagnostics, same body or after an unclosed delimiter | not met | met (two per body, two across an unclosed `(`) |
+| 3 — a parse error never removes a diagnostic from a region it does not contain | not met | met at statement, body, item and file-tail scope |
+
+Clause 3's one residual is textual containment: a statement swallowed INTO an
+unfinished `(` — `print(` on one line, `let b = 2;` on the next — is read as an
+argument and is lost with the region. There is no reading in which it is both
+an argument and a statement. Everything past that statement's `;` resumes, and
+the pin says so rather than leaving it to be discovered.
+
+### 15.8 Drift found while building
+
+- **§3.8.1 is stale.** The server advertises `QUICKFIX` today, alongside
+  Organize Imports and a fix-all kind, and ships quickfixes for the
+  add-missing-import and misspelled-field diagnostics. The survey's "there is
+  no quick-fix surface" was true when it was written and is not now; the
+  insert-`;` and remove-`;` actions §3.8.1 defers are ordinary work on an
+  existing surface, not a prerequisite.
+- **The B38 salvage-tail pins needed a new break shape.** They keyed on a stray
+  top-level token truncating the parse, which S1 no longer does; their own
+  premise assertion caught it, as it was written to. They now use an
+  unterminated `i"""`, which truncates at the LEXER and is beyond a parser's
+  recovery — the honest remaining shape for that feature.
+- **`a_top_level_error_salvages_the_prefix_and_drops_the_tail`** pinned the
+  blackout as a contract ("the tail after a top-level stray token is not
+  recovered"). It is now
+  `a_top_level_error_keeps_the_items_on_both_sides`.
