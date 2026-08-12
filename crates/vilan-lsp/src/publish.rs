@@ -329,6 +329,99 @@ mod tests {
         visible
     }
 
+    /// One analysis of `text` as the open entry, published through the planner —
+    /// byte-identical to what `Backend::publish_document` puts on the wire
+    /// (`editing-dx.md` §1.3: the handler is a pure transmitter).
+    fn published(text: &str) -> Vec<Diagnostic> {
+        let path = std::env::temp_dir().join(format!("vilan_publish_{}.vl", std::process::id()));
+        let uri = Url::from_file_path(&path).unwrap();
+        let document = Document::analyze(text, &std_root(), &path);
+        PublishState::new()
+            .plan_publish(&uri, &document)
+            .into_iter()
+            .find(|(target, _)| *target == uri)
+            .map(|(_, group)| group)
+            .unwrap_or_default()
+    }
+
+    /// The BLACKOUT (`editing-dx.md` §2, the survey's headline finding), pinned at
+    /// the wire: while a file did not parse, the editor lost every diagnostic the
+    /// file already had and gained one anchored on a line the user was not editing.
+    ///
+    /// This is P30's keystroke table, stages 0 and 2. The standing type error on
+    /// line 2 must be published UNCHANGED — same message, same range — while the
+    /// call on line 3 is half typed; before the statement/item synchronizer (S1)
+    /// stage 2 published exactly one diagnostic, `found '}' expected an
+    /// expression`, on the function's closing brace, and the real error the user
+    /// may well have opened the file to fix was gone.
+    #[test]
+    fn a_half_typed_statement_does_not_black_out_the_files_other_diagnostics() {
+        let settled = published("fun main() {\n\tlet wrong: i32 = \"text\";\n\tprint(1);\n}\n");
+        let standing: Vec<_> = settled
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("Expected i32, but got str instead.")
+            })
+            .collect();
+        assert_eq!(
+            standing.len(),
+            1,
+            "the premise: the settled buffer has exactly one standing type error: {settled:#?}"
+        );
+        let standing_range = standing[0].range;
+
+        // The user goes back and starts retyping line 3. The buffer does not parse.
+        let mid_edit = published("fun main() {\n\tlet wrong: i32 = \"text\";\n\tprint(\n}\n");
+        assert!(
+            mid_edit
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unclosed `(`")),
+            "the syntax error is reported, at the opener: {mid_edit:#?}"
+        );
+        let survivors: Vec<_> = mid_edit
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("Expected i32, but got str instead.")
+            })
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the standing diagnostic must survive a parse error in another \
+             statement: {mid_edit:#?}"
+        );
+        assert_eq!(
+            survivors[0].range, standing_range,
+            "and must not move while the file below it is unparseable"
+        );
+    }
+
+    /// The same law across FUNCTIONS, and in the direction that used to lose the
+    /// most (`editing-dx.md` §2.2's P31 row B): an unclosed `(` ABOVE a type
+    /// error. The parse stopped at the unclosed region, so everything below the
+    /// cursor — the whole file tail — stopped being checked.
+    #[test]
+    fn an_unclosed_delimiter_does_not_black_out_the_file_tail() {
+        let mid_edit =
+            published("fun one() {\n\tprint(\n}\nfun two() {\n\tlet bad: i32 = \"text\";\n}\n");
+        assert!(
+            mid_edit
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unclosed `(`")),
+            "{mid_edit:#?}"
+        );
+        assert!(
+            mid_edit.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Expected i32, but got str instead.")),
+            "the diagnostic below the broken function must survive: {mid_edit:#?}"
+        );
+    }
+
     // A module-attributed diagnostic reaches the editor WITH its note (backlog
     // E17): the note is a second location plus a message, which is exactly LSP
     // related information. The publisher's module branch used to build the

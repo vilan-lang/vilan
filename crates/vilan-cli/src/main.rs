@@ -715,6 +715,7 @@ fn hmr_round(
         let (javascript, assets, sources) = match compile_unit(
             unit,
             *platform,
+            CompileGoal::Emit,
             false,
             matches!(platform, Platform::Browser),
             Some(&mut overlay_text),
@@ -981,8 +982,16 @@ fn build_and_spawn_run(
                 );
                 return None;
             }
-            let (javascript, assets, _sources) =
-                compile_unit(&unit, Platform::default(), false, false, None, None).ok()?;
+            let (javascript, assets, _sources) = compile_unit(
+                &unit,
+                Platform::default(),
+                CompileGoal::Emit,
+                false,
+                false,
+                None,
+                None,
+            )
+            .ok()?;
             // Assets go beside the *canonical* build output — `<entry>.css`, where
             // `build` writes them and the served program reads them — not beside the
             // /tmp watch script Node executes (which nothing serves). Each watch
@@ -1681,9 +1690,26 @@ fn git_deps() -> vilan_core::git_dep::GitDeps {
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the
 /// emitted JavaScript (or a failure code after reporting).
+/// What a compile is FOR — the one thing that changes how a file which did not
+/// parse cleanly is treated (`editing-dx.md` S6/§13.1).
+///
+/// `Emit` keeps the historical contract: a file whose parse was not clean is not
+/// analyzed at all, so a broken build reports its parse errors and nothing else.
+/// `Check` analyzes the salvaged tree instead — the same tree, on the same parse,
+/// that the language server has analyzed since the H6 cutover — so a syntax error
+/// in one statement stops hiding the type errors everywhere else in the file
+/// (§2.2 mechanism 1, measured as P29). Neither goal ever emits JavaScript from a
+/// recovered tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompileGoal {
+    Emit,
+    Check,
+}
+
 fn compile_unit(
     unit: &Unit,
     platform: Platform,
+    goal: CompileGoal,
     emit_debug: bool,
     hmr: bool,
     overlay: Option<&mut String>,
@@ -1713,6 +1739,7 @@ fn compile_unit(
         &unit.entry,
         &unit.pkg_root,
         platform,
+        goal,
         &options,
         &workspace,
         emit_debug,
@@ -1735,6 +1762,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     let (javascript, assets, _sources) = match compile_unit(
         unit,
         platform,
+        CompileGoal::Emit,
         emit_debug,
         false,
         None,
@@ -1777,7 +1805,15 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
 
 /// Type-checks a lone package / bare file, writing no output.
 fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
-    match compile_unit(unit, platform, emit_debug, false, None, None) {
+    match compile_unit(
+        unit,
+        platform,
+        CompileGoal::Check,
+        emit_debug,
+        false,
+        None,
+        None,
+    ) {
         Ok(_) => {
             println!(
                 "{}: {}",
@@ -1794,7 +1830,7 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
 fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     let platform = Platform::default();
     let (javascript, assets, _sources) =
-        match compile_unit(unit, platform, false, false, None, None) {
+        match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
             Ok(compiled) => compiled,
             Err(code) => return code,
         };
@@ -1886,7 +1922,7 @@ fn build_workspace_artifacts(
         let mut chunks = Vec::new();
         let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
         let (javascript, assets, _sources) =
-            compile_unit(unit, *platform, debug, false, None, sink)?;
+            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
         let output = artifact_path(&dist, &unit.name, *platform);
         write_assets(&output, &assets);
         // Unconditional: this is also where a previous build's chunks are swept
@@ -1915,7 +1951,16 @@ fn build_workspace_artifacts(
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
     let mut ok = true;
     for (unit, platform) in members {
-        ok &= compile_unit(unit, *platform, debug, false, None, None).is_ok();
+        ok &= compile_unit(
+            unit,
+            *platform,
+            CompileGoal::Check,
+            debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok();
     }
     if ok {
         ExitCode::SUCCESS
@@ -2169,6 +2214,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         file,
         &pkg_root,
         Platform::default(),
+        CompileGoal::Emit,
         &options,
         &workspace,
         false,
@@ -2433,6 +2479,7 @@ fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
     platform: Platform,
+    goal: CompileGoal,
     options: &BuildOptions,
     workspace: &Workspace,
     emit_debug: bool,
@@ -2508,17 +2555,24 @@ fn compile_to_js(
     let mut overlay_diagnostics: Vec<hmr::OverlayDiagnostic> = Vec::new();
 
     // On a cache miss the handwritten frontend parses the entry, always returning
-    // a (possibly recovered) tree alongside every diagnostic. A batch compile does
-    // not analyze a file that failed to parse cleanly — its parse errors are
-    // reported and the build fails — so the freshly parsed tree is taken only when
-    // the parse produced no diagnostics.
+    // a (possibly recovered) tree alongside every diagnostic.
+    //
+    // `build` does not analyze a file that failed to parse cleanly — its parse
+    // errors are reported and the build fails — so the freshly parsed tree is
+    // taken only when the parse produced no diagnostics. `check` DOES analyze it
+    // (`editing-dx.md` S6/§13.1): its whole job is to answer questions about a
+    // file the user is still writing, and dropping the tree meant one missing `;`
+    // anywhere blinded it to everything else in the file (§2.2 mechanism 1,
+    // measured as P29). The tree is the same one `analyze_source` has handed the
+    // language server since the H6 cutover, now that S1's synchronizer makes it
+    // cover the whole file rather than the prefix before the first syntax error.
     let mut parse_errors: Vec<vilan_core::parsing::ParseError> = Vec::new();
     let fresh_root: Option<vilan_core::Spanned<vilan_core::node::NodeList>> = match &cached {
         None => {
             let (tree, errors) = vilan_core::parsing::parse(src.as_str());
-            let clean = errors.is_empty();
+            let analyzable = errors.is_empty() || goal == CompileGoal::Check;
             parse_errors = errors;
-            tree.filter(|_| clean).map(|(mut items, span)| {
+            tree.filter(|_| analyzable).map(|(mut items, span)| {
                 // Elements desugar, then bare-`?` marks become lift regions,
                 // before analysis (element-syntax.md §4, expression-lifting.md);
                 // the cached path gets both inside `parse_clean_cached`, so
@@ -2643,7 +2697,12 @@ fn compile_to_js(
             );
         }
 
-        if analyzer_errors.is_empty() && noted_errors == 0 {
+        // Never emit from a recovered tree — `check` reaches here with one, and
+        // codegen over a tree with statements missing would describe a program
+        // nobody wrote. (`clean` below already refuses to RETURN the output; this
+        // is what stops it being produced, and with it every transformer panic a
+        // salvaged tree could provoke.)
+        if analyzer_errors.is_empty() && noted_errors == 0 && parse_errors.is_empty() {
             // `--print-chunks` (bundle-splitting.md S1): report what a split
             // build would chunk. Analysis-only — the emitted JavaScript below
             // is untouched — and gated on a clean analysis, so a failing build
