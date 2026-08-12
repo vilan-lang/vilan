@@ -203,13 +203,25 @@ fn to_completion_item(
     // its bare label, `sort_text: None` falling back to it per the LSP spec)
     // and above a construct snippet (`~`-prefixed, above): `|` (0x7C) sits
     // between every label's leading alphanumeric and `~` (0x7E) in ASCII.
+    //
+    // WITHIN that `|` band, `origin_tier` (E59) buckets before the label:
+    // a single digit right after `|` sorts every candidate of a lower tier
+    // (the user's own `pkg`) strictly before every candidate of a higher one
+    // (`std`'s always-loaded surface), regardless of what the labels
+    // themselves are — a plain per-label sort could never do this, since
+    // `std`'s capitalized prelude names (`Add`, `BitAnd`, …) sort ahead of
+    // an ordinary lowercase identifier in bare string order. The same tier
+    // also drives which candidates survive `AUTO_IMPORT_COMPLETION_CAP`'s
+    // truncation (`Document::auto_import_completions`) — one field, read in
+    // both places, so the server's own candidate order and the client's
+    // displayed order can't drift apart.
     if let Some(auto_import) = completion.needs_import {
         item.detail = Some(auto_import.module_path.join("::"));
         item.additional_text_edits = Some(vec![TextEdit {
             range: line_index.range(&auto_import.edit_span),
             new_text: auto_import.edit_replacement,
         }]);
-        item.sort_text = Some(format!("|{}", item.label));
+        item.sort_text = Some(format!("|{}{}", auto_import.origin_tier, item.label));
     }
     item
 }
@@ -858,19 +870,21 @@ mod completion_item_tests {
 
     /// An auto-import candidate as `Document::auto_import_completions` hands
     /// it over (E54c): labeled with its module and carrying the edit that
-    /// adds it.
-    fn auto_import_candidate() -> Completion {
+    /// adds it. `tier` mirrors [`crate::document::AutoImport::origin_tier`]
+    /// (E59) — `2` is `std`'s.
+    fn auto_import_candidate(label: &str, module_path: &[&str], tier: u8) -> Completion {
         Completion {
-            label: "Json".to_string(),
+            label: label.to_string(),
             kind: CompletionKind::Struct,
             detail: None,
             documentation: None,
             call_parameters: None,
             snippet: None,
             needs_import: Some(AutoImport {
-                module_path: vec!["std".to_string(), "json".to_string()],
+                module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },
-                edit_replacement: "import std::json::Json;\n".to_string(),
+                edit_replacement: format!("import {}::{label};\n", module_path.join("::")),
+                origin_tier: tier,
             }),
         }
     }
@@ -956,7 +970,7 @@ mod completion_item_tests {
     fn auto_import_candidate_is_labeled_and_carries_its_edit() {
         let index = LineIndex::new("fun main() {}\n");
         let item = to_completion_item(
-            auto_import_candidate(),
+            auto_import_candidate("Json", &["std", "json"], 2),
             CompletionFunctionCall::Full,
             true,
             &index,

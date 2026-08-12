@@ -393,6 +393,11 @@ pub struct AutoImport {
     pub module_path: Vec<String>,
     pub edit_span: Span,
     pub edit_replacement: String,
+    /// This candidate's auto-import ranking tier (E59, [`import_origin_tier`]),
+    /// carried through so the server (`main::to_completion_item`) can bucket
+    /// the client-visible `sort_text` by it without re-deriving it from
+    /// `module_path` — one computation, read in two places.
+    pub origin_tier: u8,
 }
 
 impl Completion {
@@ -3434,16 +3439,36 @@ impl Document {
     /// Dependency packages are not scanned here — reaching them the way
     /// [`Self::import_candidates`] does is a disk-bound full-origin scan, fine
     /// for an on-demand quickfix but too slow to pay on every keystroke.
-    /// Sorted alphabetically and capped at [`AUTO_IMPORT_COMPLETION_CAP`] so a
-    /// std-heavy file's loaded surface cannot flood the popup — candidates
-    /// beyond the cap are the ones that would sort last, not a `Program`
-    /// hash-order artifact.
+    ///
+    /// **Position-aware filtering, declined (E59):** the caller (`completion`)
+    /// reaches this function from one branch only — no preceding `.` or `::`
+    /// — used identically for a bare value expression and a bare type
+    /// annotation; neither it nor this function is told which. Telling them
+    /// apart is not a read of data some earlier pass already computed (the
+    /// analyzed `Program`'s own `type_references` only covers RESOLVED code,
+    /// not the very position being typed); it is new syntactic analysis —
+    /// scanning back past whatever sits before the cursor to find the
+    /// enclosing form (`let x: |`, `fun f(): |`, `List<|>`, `x as |`, a
+    /// struct field type, …), each a different shape, unlike
+    /// [`in_import_path`]'s single-line anchor. Declined here; recorded as
+    /// E59's residual.
+    ///
+    /// Ranked by [`import_origin_tier`] (E59), THEN alphabetically within a
+    /// tier, and capped at [`AUTO_IMPORT_COMPLETION_CAP`] — applied in that
+    /// order, before the truncation, which is the point: a plain alphabetical
+    /// sort let the always-loaded `std` prelude's capitalized trait/type names
+    /// (`Add`, `BitAnd`, …) fill the whole cap ahead of a small real file's
+    /// own unimported names, which sort no higher than any other lowercase
+    /// identifier. Tiering the user's own `pkg` ahead of `std` means the
+    /// cap's last-to-survive candidates are always `std`'s, never `pkg`'s —
+    /// a std-heavy file's loaded surface still cannot flood the popup, and
+    /// now `std` only spends slots `pkg` didn't need.
     fn auto_import_completions(
         &self,
         program: &Program,
         in_scope: &HashSet<&str>,
     ) -> Vec<Completion> {
-        let mut candidates: Vec<(String, CompletionKind, Vec<String>)> = Vec::new();
+        let mut candidates: Vec<(u8, String, CompletionKind, Vec<String>)> = Vec::new();
         for root in ["std", "pkg"] {
             let Some(&root_module_id) = program.module_id_by_name.get(root) else {
                 continue;
@@ -3454,6 +3479,7 @@ impl Document {
             let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
                 continue;
             };
+            let tier = import_origin_tier(root);
             for &child_id in root_scope.name_to_id_map.values() {
                 let Some(child_module) = program.modules.get(&child_id) else {
                     continue;
@@ -3477,6 +3503,7 @@ impl Document {
                         continue;
                     }
                     candidates.push((
+                        tier,
                         name.to_string(),
                         kind,
                         vec![root.to_string(), child_module.name.to_string()],
@@ -3484,12 +3511,12 @@ impl Document {
                 }
             }
         }
-        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
         let source = self.line_index.text();
         candidates
             .into_iter()
-            .filter_map(|(name, kind, module_path)| {
+            .filter_map(|(tier, name, kind, module_path)| {
                 let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
                 let edit = vilan_core::formatter::insert_import(source, &path_refs, &name)?;
                 Some(Completion {
@@ -3503,6 +3530,7 @@ impl Document {
                         module_path,
                         edit_span: edit.span,
                         edit_replacement: edit.replacement,
+                        origin_tier: tier,
                     }),
                 })
             })
@@ -3709,7 +3737,42 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// std-heavy file can have a large loaded surface, and this is what keeps a
 /// bare scope completion from drowning the popup in auto-import candidates
 /// beneath the names actually in scope.
+///
+/// Kept at 20 by E59: the filing that found the flood was explicit that the
+/// cap's SIZE was never the bug — a popup already offers 20 auto-import
+/// candidates beneath the in-scope ones, plenty for a human to scan, and
+/// [`import_origin_tier`] fixes which 20 those are. No evidence turned up
+/// that a real file needs more of its own names surfaced at once than this;
+/// raising it would only hand `std` back more of the slots `pkg` still
+/// doesn't need.
 const AUTO_IMPORT_COMPLETION_CAP: usize = 20;
+
+/// An auto-import candidate's ranking tier by where it comes from (E59): the
+/// user's own package (`pkg`) outranks the standard library (`std`) — a real
+/// file's own unimported names are a far likelier completion target than the
+/// always-loaded prelude's surface, which used to fill the whole cap first
+/// purely because its capitalized trait/type names (`Add`, `BitAnd`, …) sort
+/// ahead of an ordinary lowercase identifier in bare alphabetical order. Used
+/// both pre-truncation ([`Document::auto_import_completions`]'s sort) and in
+/// the client-visible `sort_text` (`main::to_completion_item`, via
+/// [`AutoImport::origin_tier`]) — the one mapping, read in both places.
+///
+/// Tier 1 is reserved for a dependency package's names, ranked between the
+/// two: closer to the user's intent than `std`'s always-loaded surface (the
+/// user chose to add the dependency), but not the user's own authored code.
+/// It is unreachable today — `auto_import_completions` only ever calls this
+/// with `"std"` or `"pkg"`, since E54 scoped this keystroke-path candidate
+/// gathering to those two roots (a dependency scan is the disk-bound
+/// full-origin one `Document::import_candidates` pays for the on-demand
+/// quickfix, not this path) — recorded here for whenever that changes rather
+/// than left for a future tier scheme to rediscover.
+fn import_origin_tier(root: &str) -> u8 {
+    match root {
+        "pkg" => 0,
+        "std" => 2,
+        _ => 1,
+    }
+}
 
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
