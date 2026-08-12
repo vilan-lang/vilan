@@ -585,6 +585,61 @@ fn an_unfinished_call_gives_up_only_to_the_next_statement_terminator() {
 }
 
 #[test]
+fn a_missing_semicolon_keeps_the_statement_it_should_have_terminated() {
+    // The statement parsed perfectly; only its terminator is absent, and the
+    // token after it can only begin a new one. Dropping it would unbind `origin`
+    // at every use below — a screenful of "cannot find" on correct lines, from a
+    // statement the parser read without difficulty.
+    let source =
+        "fun main() {\n\tlet origin: i32 = 3\n\tlet total: i32 = origin + 1;\n\tprint(total);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    let tree = tree_of(source);
+    // The BINDING, not merely the name — `origin + 1` below mentions it either
+    // way, so a substring pin on the bare name would pass on a dropped statement.
+    assert!(
+        tree.contains("Let((\"origin\""),
+        "the statement missing its `;` is kept, not skipped: {tree}"
+    );
+    assert!(
+        tree.contains("Let((\"total\""),
+        "and so is the one after it: {tree}"
+    );
+}
+
+#[test]
+fn a_missing_semicolon_on_an_import_keeps_the_import() {
+    // The same, for the two non-expression statements that take a terminator.
+    // P3's file used to lose its `import` — so every use of `print` below
+    // reported "cannot find 'print' in this scope" as well.
+    let source = "import std::print
+
+fun main() {\n\tprint(1);\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(reported.len(), 1, "{reported:#?}");
+    assert!(
+        tree_of(source).contains("Import"),
+        "the import survives its missing `;`"
+    );
+}
+
+#[test]
+fn a_statement_that_is_not_merely_missing_its_semicolon_is_still_skipped() {
+    // The boundary condition that keeps insertion from cascading: `1` is not a
+    // statement anyone wrote, so `print 1);` takes the skipping path and reports
+    // once — §5.2's accepted outcome for a missing OPENING paren. Two broken
+    // statements report twice, one each, and neither multiplies.
+    let reported = diagnostics("fun main() {\n\tprint 1);\n\tfoo bar baz;\n}\n");
+    assert_eq!(reported.len(), 2, "one per broken statement: {reported:#?}");
+    assert!(
+        reported
+            .iter()
+            .all(|(message, _)| message == "expected `;` to end this statement"),
+        "{reported:#?}"
+    );
+}
+
+#[test]
 fn a_missing_semicolon_on_a_void_bodys_last_statement_stays_silent() {
     // P5, pinned as a NON-diagnostic: the statement legally becomes the block's
     // tail expression, and a void tail in a void function is fine

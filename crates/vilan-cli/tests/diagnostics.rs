@@ -609,7 +609,10 @@ fn check_analyzes_a_file_that_did_not_parse_cleanly() {
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(!output.status.success(), "a broken file still fails `check`");
+    assert!(
+        !output.status.success(),
+        "a broken file still fails `check`"
+    );
     assert!(
         stderr.contains("expected `;` to end this statement"),
         "the parse error is still reported: {stderr}"
@@ -642,5 +645,8 @@ fn build_reports_only_the_parse_error_and_emits_nothing() {
         "`build` does not analyze a recovered tree — its output contract is \
          unchanged (§13.1: change `check`, leave `build`): {stderr}"
     );
-    assert!(!emitted, "and nothing is written from a tree that did not parse");
+    assert!(
+        !emitted,
+        "and nothing is written from a tree that did not parse"
+    );
 }

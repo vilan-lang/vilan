@@ -55670,3 +55670,25 @@ fn a_recovered_region_produces_no_analyzer_diagnostics_of_its_own() {
             .any(|message| message.contains("Expected i32, but got str instead."))
     );
 }
+
+/// A parse error must not MANUFACTURE a diagnostic either — the other direction
+/// of §8 clause 3, and the one a synchronizer gets wrong by default. A statement
+/// whose only fault is its missing `;` is kept, so the names it binds stay bound
+/// and the lines below it, which are correct, stay quiet.
+#[test]
+fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
+    let messages = all_diagnostics(
+        "import std::print;\n\
+         fun main() {\n\
+         \tlet origin: i32 = 3\n\
+         \tlet total: i32 = origin + 1;\n\
+         \tprint(total);\n\
+         }\n",
+    );
+    assert_eq!(
+        messages.len(),
+        1,
+        "one missing token, one diagnostic — and no `cannot find 'origin'`: {messages:#?}"
+    );
+    assert!(messages[0].contains("expected `;` to end this statement"));
+}

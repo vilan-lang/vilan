@@ -930,6 +930,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.position = resume;
     }
 
+    /// Recover a statement whose only fault is the missing `;`: the body parsed to
+    /// completion and the token after it can only begin a fresh statement or item
+    /// (or end the block, or the file), so the terminator is the one thing absent.
+    /// Report it at the gap and KEEP the statement.
+    ///
+    /// Skipping it instead would be honest about the syntax and wrong about the
+    /// program: dropping `import std::print` because its `;` is missing unbinds
+    /// `print` at every call site below, and dropping `let origin = …` unbinds
+    /// `origin` — a screenful of "cannot find" on lines that are correct, from a
+    /// statement the parser read perfectly well. This is `editing-dx.md` §8
+    /// clause 3 in the direction the survey did not measure: a parse error that
+    /// must not remove a diagnostic must not manufacture one either.
+    ///
+    /// The boundary condition is what keeps it from cascading. Only a KEYWORD
+    /// head (or `}`, or end of input) counts, never an identifier or a literal:
+    /// `print 1);` would resume at `1`, which is not a statement anyone wrote, so
+    /// it takes the skipping path and reports once (§5.2's accepted outcome).
+    fn recover_missing_terminator(&mut self) -> Option<Spanned<Node<'src>>> {
+        let statement = self.attempt(|parser| {
+            // The three forms that take a terminator — the same three
+            // `note_terminator` records one for.
+            let body = parser
+                .attempt(Self::parse_expression)
+                .or_else(|| parser.attempt(Self::parse_import))
+                .or_else(|| parser.attempt(Self::parse_use))?;
+            let at_a_fresh_statement = parser.at_end()
+                || parser.peek_is_ctrl('}')
+                || parser.peek().is_some_and(starts_statement_or_item);
+            at_a_fresh_statement.then_some(body)
+        })?;
+        self.emit_failure(
+            self.position,
+            vec![TERMINATOR_EXPECTED.to_string()],
+            Vec::new(),
+        );
+        Some(statement)
+    }
+
     /// The located diagnostic for a statement that declined at `start`: the
     /// farthest failure when it lies at or past the statement's head (the deepest
     /// the parser got), else the head token itself with the position's own
@@ -1185,7 +1223,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             match self.parse_statement() {
                 Some(statement) => statements.push(statement),
-                None => self.recover_statement(self.position, false),
+                None => match self.recover_missing_terminator() {
+                    Some(statement) => statements.push(statement),
+                    None => self.recover_statement(self.position, false),
+                },
             }
         }
         (statements, self.span_from(0))
@@ -2389,6 +2430,10 @@ impl<'a, 'src> Parser<'a, 'src> {
             }) {
                 tail = Some(expression);
                 break;
+            }
+            if let Some(statement) = self.recover_missing_terminator() {
+                statements.push(statement);
+                continue;
             }
             self.recover_statement(self.position, true);
         }

@@ -1663,7 +1663,32 @@ token cannot be part of one:
 Statement heads get no such reach: `if`/`match`/`async` are perfectly good
 arguments.
 
-### 15.3 Which diagnostic a recovered statement reports
+### 15.3 Insertion, where skipping would manufacture a diagnostic
+
+Synchronizing is the wrong recovery for shape (a), and the survey could not have
+seen it because it measured what the compiler *said*, not what a fixed compiler
+would then say. A missing `;` is not a statement the parser failed to read — it
+read the statement perfectly and wants one more token. Skipping it is honest
+about the syntax and wrong about the program: dropping `let origin: Point = …`
+unbinds `origin` at every use below it, and dropping `import std::print` unbinds
+`print` in the whole file. P2 and P3 measured that way came back with the right
+diagnostic and a screenful of "cannot find" beneath it, on lines that were
+correct.
+
+So a statement whose body parsed to completion, and whose next token can only
+BEGIN a fresh statement or item, is kept: `recover_missing_terminator` reports
+the gap and pushes the statement. §8 clause 3 in the direction the survey did
+not measure — a parse error that must not remove a diagnostic must not
+manufacture one either.
+
+The keyword-head boundary is what keeps this from cascading, and it is the same
+token class the synchronizer syncs on. An identifier or a literal does not
+qualify, so `print 1);` still takes the skipping path and reports once (§5.2's
+accepted outcome for a missing opening paren) rather than accepting `print`,
+resuming at `1`, and reporting again. Pinned both ways: two pins that need
+insertion, and one that stays green with insertion removed.
+
+### 15.4 Which diagnostic a recovered statement reports
 
 Three-way, in the order the grades ask for. A committed demand that failed
 strictly inside an unfinished region wins — that is §5.1's `found ';' expected
@@ -1681,7 +1706,7 @@ they now produce the same message. P14's `let b: i32 = 2` reads as an argument,
 a committed demand fails at its `;`, and the located message wins. The survey
 recorded a count for P14 and no message; the count is 1, as it was.
 
-### 15.4 §4.4's anchor: one character, not zero
+### 15.5 §4.4's anchor: one character, not zero
 
 §4.4 asks for two things that cannot both be built: "a zero-width span at the
 end of the previous token", and "rendered as a one-character caret at that
@@ -1696,7 +1721,7 @@ on a char boundary so a token ending in a multi-byte character still slices.
 rather than deleted: `frontend.md` §2 lists it in the span API the cutover
 committed to, and removing it is not this lane's call.
 
-### 15.5 S2's scope: three sites, not `expect_ctrl`'s set
+### 15.6 S2's scope: three sites, not `expect_ctrl`'s set
 
 §11 asks for `;` on the committed side of the noting rule "(`expect_ctrl`, plus
 the six bare `eat_ctrl(';')` statement sites)". Widening `expect_ctrl`'s match
@@ -1711,7 +1736,7 @@ import statement, and the use statement. The `fun`-body and `struct`-body forms
 (`;` or `{ … }`) are forks too and are left silent. P2, P3 and P4 are all
 covered by those three; P5's silence is pinned as a non-diagnostic.
 
-### 15.6 S6: nothing to suppress, and what a salvaged tree does produce
+### 15.7 S6: nothing to suppress, and what a salvaged tree does produce
 
 §13.1's mitigation — "suppressing diagnostics whose span falls inside a
 recovered region" — needs no code, and the reason is worth recording: a
@@ -1723,8 +1748,9 @@ types as nothing and reports nothing. Pinned as
 What a salvaged tree does produce is a different class the survey did not
 name — **consequence** diagnostics, from what recovery removed rather than from
 what it kept: a body that lost its tail reads as `void` against a declared
-return type, a declaration that did not parse leaves its name unbound at every
-call site. These are reported, beside the parse error that explains them. They
+return type, a declaration the parser could not read at all leaves its name
+unbound at every call site. (The commonest source of those — a statement
+dropped over its missing `;` — is gone, §15.3.) These are reported, beside the parse error that explains them. They
 are not suppressed, for two reasons: the anchors lane's S3 owns the void-tail
 diagnostic and would be fighting a suppression written here, and a rule broad
 enough to catch them ("drop analyzer diagnostics when the file has a parse
@@ -1735,7 +1761,7 @@ error") is the blackout with extra steps.
 a parse-clean gate of its own, so no goal can reach codegen with a recovered
 tree.
 
-### 15.7 §8's bar, measured after
+### 15.8 §8's bar, measured after
 
 | Clause | Before | After |
 |---|---|---|
@@ -1749,7 +1775,7 @@ argument and is lost with the region. There is no reading in which it is both
 an argument and a statement. Everything past that statement's `;` resumes, and
 the pin says so rather than leaving it to be discovered.
 
-### 15.8 Drift found while building
+### 15.9 Drift found while building
 
 - **§3.8.1 is stale.** The server advertises `QUICKFIX` today, alongside
   Organize Imports and a fix-all kind, and ships quickfixes for the
