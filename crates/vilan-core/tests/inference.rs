@@ -11724,6 +11724,32 @@ fn unknown_initializer_field_spans_the_name_not_the_value() {
     );
 }
 
+// S5 (editing-dx.md §7.2, P20): the survey's exact reproduction of the OLD
+// bug — widen the VALUE and confirm the underline does NOT widen with it.
+// Before E58 the span tracked `field_value_span` unconditionally, so a
+// five-character value produced a five-character underline three columns
+// away from the name it was supposedly about; P19's `= 5` alone doesn't
+// distinguish "anchored on the name" from "anchored on a value that happens
+// to be short", since both are one character. This is what proves the
+// anchor MOVED, not just that it currently sits somewhere plausible.
+#[test]
+fn unknown_initializer_field_with_a_wide_value_still_spans_the_name() {
+    assert_fails_spanning(
+        r#"
+        struct Point {
+        	x: i32,
+        	y: i32,
+        }
+
+        fun main() {
+        	let _ = Point { x = 3, yy = 40000 };
+        }
+        "#,
+        "yy",
+        "struct 'Point' has no field 'yy'",
+    );
+}
+
 // A clear typo of a real field gets a "did you mean" note, anchored at the
 // misspelled name — the threshold's suggest side (a single transposed pair).
 #[test]
