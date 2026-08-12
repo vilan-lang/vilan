@@ -37,14 +37,6 @@ impl Span {
     pub fn into_range(self) -> Range<usize> {
         self.start..self.end
     }
-
-    /// A zero-width span at this span's end (`3..7` becomes `7..7`).
-    pub fn to_end(self) -> Self {
-        Span {
-            start: self.end,
-            end: self.end,
-        }
-    }
 }
 
 impl From<Range<usize>> for Span {
