@@ -24267,6 +24267,29 @@ fn call_argument_count_too_many_names_only_the_callee() {
     );
 }
 
+// The C3 "declared here" note (editing-dx.md §17.3, the residual §16
+// deferred): an arity mismatch also notes the callee's OWN declaration, in
+// the wording the codebase already uses for this note
+// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs) — so a
+// call far from its definition doesn't leave the reader hunting for it.
+#[test]
+fn call_argument_count_notes_the_callees_declaration() {
+    assert_fails_noting(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "`distance` expects 2 arguments",
+        "distance",
+        "`distance` is declared here",
+    );
+}
+
 // P16 — a method call behaves identically, naming the METHOD (not the
 // receiver or the struct).
 #[test]
@@ -24308,6 +24331,31 @@ fn method_argument_count_too_many_names_only_the_method() {
         "#,
         "(1, 2, 3)",
         "`shift` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 note again, for a METHOD's arity: notes the method's own
+// declaration inside `impl Point`, not the struct itself — `declared_here_
+// note` resolves `member_id` the same way `callable_name` does.
+#[test]
+fn method_argument_count_notes_the_methods_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "`shift` expects 2 arguments",
+        "shift",
+        "`shift` is declared here",
     );
 }
 
@@ -24387,6 +24435,27 @@ fn struct_initializer_field_count_too_many_names_the_struct_and_spans_the_extra_
         "#,
         "z",
         "`Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`.",
+    );
+}
+
+// The C3 note for a struct-field count mismatch: notes the struct's OWN
+// declaration, the same wording and mechanism as the call-arity notes
+// above, built by hand at the initializer's own push site (the subject is
+// a `Struct`, which `declared_here_note` — scoped to callables — does not
+// resolve).
+#[test]
+fn struct_initializer_field_count_notes_the_structs_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "`Point` expects 2 fields",
+        "Point",
+        "`Point` is declared here",
     );
 }
 

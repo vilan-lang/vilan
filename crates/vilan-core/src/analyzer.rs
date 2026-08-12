@@ -23527,6 +23527,43 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// C3 (diagnostics-standard.md, editing-dx.md §17.3 — the residual §16
+    /// deferred): a secondary note pointing at `id`'s declaration site,
+    /// resolved the same way `callable_name` names it — a
+    /// `Function`/`ExternalFunction` id directly, or a method's `member_id`
+    /// through its `Expr::Function`/`Expr::ExternalFunction` indirection.
+    /// `None` when `id` names nothing declared in source (nothing to point
+    /// at). Matches the wording the codebase already uses for this note
+    /// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs);
+    /// `source` is set unconditionally, per the two existing analyzer.rs
+    /// C3 notes (the trait-member and generic-bound ones) — the render
+    /// side (`main.rs`) filters it against the primary span's own file, so
+    /// a same-file note costs nothing extra to compute.
+    fn declared_here_note(&self, id: Id) -> Option<crate::error::Note> {
+        let (name, name_span) = if let Some(function) = self.functions.get(&id) {
+            (function.name, function.name_span)
+        } else if let Some(external) = self.external_functions.get(&id) {
+            (external.name, external.name_span)
+        } else {
+            match self.expr_id_to_expr_map.get(&id)? {
+                Expr::Function(function_id) => {
+                    let function = self.functions.get(function_id)?;
+                    (function.name, function.name_span)
+                }
+                Expr::ExternalFunction(function_id) => {
+                    let external = self.external_functions.get(function_id)?;
+                    (external.name, external.name_span)
+                }
+                _ => return None,
+            }
+        };
+        Some(crate::error::Note {
+            span: name_span,
+            msg: format!("`{name}` is declared here"),
+            source: self.source_of_id(id),
+        })
+    }
+
     /// S4 (editing-dx.md §6.2): the call-argument-count message, naming the
     /// callee and — for the too-few case — the first missing parameter by
     /// name and declared type. Arguments bind positionally, so with fewer
@@ -23991,7 +24028,7 @@ impl<'src> Analyzer<'src> {
                     };
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
-                            note: None,
+                            note: self.declared_here_note(function_id),
                             span: self.clamp_span_to_first_line(arguments_span, call_id),
                             msg: self.argument_count_message(
                                 self.callable_name(function_id),
@@ -24835,7 +24872,7 @@ impl<'src> Analyzer<'src> {
             // with parameters 1.. only.
             let argument_parameter_ids = parameter_ids.get(1..).unwrap_or(&[]);
             self.diagnostics.push(Error {
-                note: None,
+                note: self.declared_here_note(member_id),
                 span: self.clamp_span_to_first_line(arguments_span, call_id),
                 msg: self.argument_count_message(
                     self.callable_name(member_id),
@@ -26901,6 +26938,7 @@ impl<'src> Analyzer<'src> {
         let struct_ = self.structs.get(&struct_id).expect("checked above");
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
+        let struct_name_span = struct_.name_span;
         if constraint.fields.len() != struct_fields.len() {
             let (msg, span) = self.struct_field_count_message(
                 constraint.struct_name,
@@ -26908,11 +26946,17 @@ impl<'src> Analyzer<'src> {
                 &constraint.fields,
                 constraint.fields_span,
             );
-            self.diagnostics.push(Error {
-                note: None,
-                span,
-                msg,
+            // C3 (editing-dx.md §17.3): "declared here" at the struct's own
+            // name, the same note style S4's call-argument sites use for
+            // their subject (`declared_here_note`) — built by hand here
+            // rather than through that helper since the subject is a
+            // `Struct`, not a callable.
+            let note = Some(crate::error::Note {
+                span: struct_name_span,
+                msg: format!("`{}` is declared here", constraint.struct_name),
+                source: self.source_of_id(struct_id),
             });
+            self.diagnostics.push(Error { note, span, msg });
             return Resolution::Failed;
         }
         let initializer_id = constraint.initializer_id;

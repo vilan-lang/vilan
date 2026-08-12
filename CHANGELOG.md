@@ -218,6 +218,10 @@ Nothing that was already complete changes: `_` and a binder still cover everythi
 
 ---
 
+**An argument- or field-count mismatch now notes where the subject was declared.** `` `distance` expects 2 arguments, but got 1 instead: `y: i32` is missing. `` named the callee, but not where to go look at it — the same gap a struct-field-count mismatch had for the struct. Both now carry a secondary note pointing at the subject's own declaration (`` `distance` is declared here ``, `` `Point` is declared here ``), in the same style the compiler already uses for a note elsewhere in the file (a trait's own declaration of a missing method, a compile-time call chain). A plain function call, a method call, and a struct initializer all get it; the message itself is unchanged.
+
+---
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.
