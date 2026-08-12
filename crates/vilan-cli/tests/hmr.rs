@@ -1420,14 +1420,14 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
     outcome.unwrap();
 }
 
-// --- dev-refresh.md §5 item 2: `std::dev::force_refresh()` -------------------
+// --- dev-refresh.md §5 item 2: `std::watch::force_refresh()` -------------------
 
-/// A server that calls `std::dev::force_refresh()` on every request except
+/// A server that calls `std::watch::force_refresh()` on every request except
 /// `/shutdown` (E60: this server deliberately outlives rounds — the whole
 /// point is to answer a trigger request after round 1 — so it needs its own
 /// death, exactly the css e2e's mimic-server shape).
 fn force_refresh_server_source() -> String {
-    "import std::dev;\nimport std::http::{ Response, Server };\nimport std::print;\nimport std::process;\n\n\
+    "import std::watch;\nimport std::http::{ Response, Server };\nimport std::print;\nimport std::process;\n\n\
      fun main() {\n\
      \tServer::builder()\n\
      \t\t.port(0)\n\
@@ -1438,7 +1438,7 @@ fn force_refresh_server_source() -> String {
      \t\t\t\t\tResponse::builder().body(\"\").build()\n\
      \t\t\t\t}\n\
      \t\t\t\t_ => {\n\
-     \t\t\t\t\tdev::force_refresh();\n\
+     \t\t\t\t\twatch::force_refresh();\n\
      \t\t\t\t\tResponse::builder().body(\"triggered\").build()\n\
      \t\t\t\t}\n\
      \t\t\t}\n\
@@ -1590,7 +1590,7 @@ fn force_refresh_is_a_no_op_outside_a_watch_session() {
     write(
         &dir,
         "src/main.vl",
-        "import std::dev;\nimport std::print;\n\nfun main() {\n\tdev::force_refresh();\n\tprint(\"done\");\n}\n",
+        "import std::watch;\nimport std::print;\n\nfun main() {\n\twatch::force_refresh();\n\tprint(\"done\");\n}\n",
     );
 
     let liveness = support::run_liveness();
