@@ -548,6 +548,28 @@ fn assert_fails_with(source: &str, message_part: &str) {
     }
 }
 
+/// Asserts compilation fails with EXACTLY ONE diagnostic containing
+/// `message_part` — for a rule whose reach is wide enough that the multiplicity
+/// is part of the claim (B103: one inferred `List<Guard>` reaches R10 as the
+/// literal, the binding, every read of it, and the aggregate holding it, and it
+/// is one mistake).
+#[track_caller]
+fn assert_fails_once_with(source: &str, message_part: &str) {
+    match compile(source) {
+        Ok(_) => panic!("expected a compile error, but it compiled cleanly"),
+        Err(errors) => {
+            let matching = errors
+                .iter()
+                .filter(|error| error.contains(message_part))
+                .count();
+            assert_eq!(
+                matching, 1,
+                "expected exactly one diagnostic containing {message_part:?}; got: {errors:#?}"
+            );
+        }
+    }
+}
+
 /// Asserts compilation fails and that NO diagnostic mentions `message_part` —
 /// for a fix whose point is that a misleading message is gone, not merely that
 /// a better one was added beside it.
@@ -5609,6 +5631,1331 @@ fn a_closure_returning_its_own_view_parameters_field_copies() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B104 (the classification residual B100 filed). `infer_borrows` recorded `fun
+// copy(&self): Holder { self }` as borrowing its receiver — so its result bound
+// as a VIEW at every call site — although B100 made that return a COPY. The
+// root-set arm whose leaf is a PLACE is the one rule 1's return clause reaches,
+// so the two passes now answer the same way about the same seam: where the
+// return copies, the place LEFT the loan and the function projects nothing.
+// `check_view_escape` still accepts the forwarder, for the same reason (nothing
+// escapes when nothing aliased leaves). See proposal/element-clones.md §9.3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_by_value_forwarders_result_binds_mut() {
+    // The filed repro. Both halves in one program: the result is `mut`-bindable
+    // (it is a value, not a view), and writing it leaves the receiver alone
+    // (B100's copy is what makes the first half true).
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = h.copy();
+            c.pair.1 = 42;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n3\n",
+    );
+}
+
+#[test]
+fn a_free_by_value_forwarders_result_binds_mut() {
+    // The free-function spelling: nothing here is special to a receiver, and
+    // the caller's own value is untouched by the write to the copy.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun copy_of(h: &Holder): Holder { h }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut c = copy_of(&h);
+            c.pair.1 = 42;
+            h.pair.1 = 99;
+            print(c.pair.1);
+            print(h.pair.1);
+        }
+        "#,
+        "42\n99\n",
+    );
+}
+
+#[test]
+fn a_by_value_forwarder_still_passes_the_escape_check() {
+    // The hazard B100 recorded when it refused candidate (c): emptying the
+    // root-set makes `check_view_escape` reject the body outright, turning a
+    // program that compiles into an error. It must not, and the reason is rule
+    // 3's own: the return hands back a value, so no view escapes.
+    assert_compiles(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun copy(&self): Holder { self }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.copy().pair.1);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn a_view_returning_forwarders_result_is_still_a_view() {
+    // The other direction, one word apart: the same body under a `&mut Holder`
+    // return is a projection, its result is a view, and a view cannot be `mut`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun me(&mut self): &mut Holder borrows self { self }
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            mut w = h.me();
+            print(w.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_view_of_a_local_still_cannot_escape_a_by_value_return() {
+    // The escape the new clause must not swallow: rule 1 leaves a place rooted
+    // at a LOCAL alone (the frame is a dead owner donating its storage), so no
+    // copy converts this one and the view still dangles.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        impl Holder {
+            fun bad(&self): (i32, i32) { let v = &self.pair; v }
+        }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            print(h.bad().1);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_scalar_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // A scalar has no aggregate storage for rule 1 to copy, so the alias
+    // survives the return and the (conservative) borrow classification must
+    // survive with it — rule 4 still sees a live view into `n`. Pins the gate
+    // as CLONEABLE-AGGREGATE-only rather than by-value-only.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            n = 9;
+            print(m);
+        }
+        "#,
+        "rule 4",
+    );
+}
+
+#[test]
+fn a_generic_view_forwarded_into_a_by_value_return_keeps_its_borrow() {
+    // The generic twin, and why `Type::Generic` is excluded even though rule 1
+    // admits it: a `&T` parameter lowers as a `(base, key)` pair at a scalar
+    // instantiation, which `__clone` cannot collapse. The alias survives, so
+    // the view classification does too.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun same<T>(v: &T): T { v }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut c = same(&h);
+            print(c.pair.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_borrows_call_chain_into_a_by_value_return_keeps_its_borrow() {
+    // The Call arm is deliberately ungated: rule 1 never reaches a call leaf
+    // (it is not a place), so no copy is inserted and the result really does
+    // alias whatever the signature says. Calling it a borrow is what keeps the
+    // call site honest about that.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            let h = Holder { pair = (7, 3) };
+            mut p = get(&h);
+            print(p.1);
+        }
+        "#,
+        "cannot be `mut`",
+    );
+}
+
+#[test]
+fn a_wrapped_view_return_is_still_a_borrow() {
+    // The wrapped arm is ungated for the same reason, and its signature could
+    // not carry the gate anyway: `Option<&mut Inner>` is not a view return by
+    // `returns_view`, which reads the TOP-LEVEL type node.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun inner_mut(&mut self): Option<&mut Inner> { Some(&mut self.inner) }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 1 } };
+            match h.inner_mut() {
+                Some(let v) => { v.n = 77; }
+                None => {}
+            }
+            print(h.inner.n);
+        }
+        "#,
+        "77\n",
+    );
+}
+
+#[test]
+fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
+    // The resource half of the gate is a guard, not a live case: R1 refuses
+    // moving a resource out of a loan before the classification is ever
+    // consulted. Pinned so the guard's unreachability is a fact, not a hope.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard {
+            fun drop(own self) { print("drop " + self.tag); }
+            fun take(&self): Guard { self }
+        }
+        fun main() {
+            let g = Guard { tag = "a" };
+            print(g.take().tag);
+        }
+        "#,
+        "cannot move the resource",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B108 / B109 (B104's bycatch, both of them rule 1's). The return seam reached
+// only leaves that are PLACES, so two leaf shapes handed back a caller's
+// storage untouched — `&self.inner` (a `&place`, whose `place_root` is `None`)
+// and `peek(h)` (a `borrows` call, likewise) — and a THIRD leaf, the scalar
+// view, reached the seam but fell out of the copy's type filter and handed back
+// its `(base, key)` pair as the value.
+//
+// One rule for all three: the seam reads THROUGH a view leaf to the storage it
+// names (`returned_value_places`, the return twin of B97's
+// `capture_subject_places`), and materializes a VALUE there — `__clone` for a
+// cloneable aggregate, the READ for a scalar (a scalar's copy IS its read,
+// B81). A RESOURCE crosses out of the loan instead, which the move scan judges
+// exactly as it judges the bare place twin. The borrow CLASSIFICATION is
+// untouched: gating it too was measured and refused (it turns seven compiling
+// shapes into "a view cannot escape its scope" and reddens B104's own chain
+// pin). See proposal/element-clones.md §11.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_scalar_view_forwarded_into_a_by_value_return_hands_back_the_value() {
+    // B108's filed repro. Printed `[ [ 5 ], 0 ]` — the view's runtime pair, not
+    // the i32 the signature promises. The copy machinery is aggregate-shaped
+    // and `__clone` cannot collapse a pair; the crossing emits the read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun same(v: &mut i32): i32 { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&mut n);
+            print(m);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_generic_view_forwarded_into_a_by_value_return_reads_at_a_scalar() {
+    // B108's second shape, and the reason the read cannot be decided where the
+    // copy is: a generic `&T` is a `(base, key)` pair at exactly its scalar
+    // instantiations and the aggregate's own reference everywhere else, which
+    // is abstract in the analyzer. Printed `[ [ 5 ], 0 ]` — and `__clone`,
+    // which rule 1 does insert here (`Type::Generic` is admitted), deep-COPIED
+    // the pair rather than collapsing it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun same<T>(v: &T): T { v }
+        fun main() {
+            mut n = 5;
+            let m = same(&n);
+            print(m);
+        }
+        "#,
+        "5\n",
+    );
+}
+
+#[test]
+fn a_scalar_reference_leaf_in_a_by_value_return_reads_the_place() {
+    // The `&place` spelling of the same crossing, which is B108 and B109 at
+    // once: `&self.n` lowers to the pair `[self, 0]`, and by-value out it must
+    // be the field READ. Printed `[ [ 99 ], 0 ]` — the pair, and a LIVE one, so
+    // the later write showed through it too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { n: i32 }
+        impl Holder {
+            fun grab(&self): i32 { &self.n }
+        }
+        fun main() {
+            mut h = Holder { n = 3 };
+            let v = h.grab();
+            h.n = 99;
+            print(v);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_scalar_borrows_call_leaf_in_a_by_value_return_reads_the_place() {
+    // The third spelling: a `borrows` call returning `&i32`, one indirection
+    // over. Same pair, same live alias, same read.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { n: i32 }
+        fun peek(h: &Holder): &i32 borrows h { &h.n }
+        fun get(h: &Holder): i32 { peek(h) }
+        fun main() {
+            mut h = Holder { n = 3 };
+            let v = get(&h);
+            h.n = 99;
+            print(v);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_reference_leaf_in_a_by_value_return_copies() {
+    // B109's filed repro. `&self.inner` is not a place, so
+    // `compute_return_clone_sites` never saw it and the caller's result WAS the
+    // receiver's field. Printed 99.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self): Inner { &self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_leaf_in_a_by_value_return_copies() {
+    // B109's second shape, one indirection over: the tail is a call, so rule 1
+    // had no place to copy and the by-value signature handed back the callee's
+    // alias. Printed 99. Which places a call names is read from the callee's
+    // `borrows` clause at the call site — B97's answer, asked at a return.
+    //
+    // The classification stays a VIEW here (B104's ungated Call arm, whose own
+    // pin is the `mut` twin of this program): conservative, and the copy is
+    // what makes it merely conservative rather than wrong.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder): (i32, i32) { peek(h) }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let p = get(&h);
+            h.pair.1 = 99;
+            print(p.1);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_mut_reference_leaf_in_a_by_value_return_copies() {
+    // The `&mut` spelling of B109's first shape — one character apart, same
+    // answer, because what decides is the SIGNATURE (B100's finding) and not
+    // the leaf's own view-ness.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&mut self): Inner { &mut self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_free_parameters_reference_leaf_in_a_by_value_return_copies() {
+    // Nothing here is special to a receiver: a free `&` parameter is the same
+    // loan, and `place_root` walks to it the same way.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun grab_of(h: &Holder): Inner { &h.inner }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = grab_of(&h);
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_nested_reference_leaf_in_a_by_value_return_copies() {
+    // Depth is the place walk's business, not the seam's: `&self.mid.inner`
+    // roots at `self` like `&self.inner` does.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Mid { inner: Inner }
+        struct Holder { mid: Mid }
+        impl Holder {
+            fun grab(&self): Inner { &self.mid.inner }
+        }
+        fun main() {
+            mut h = Holder { mid = Mid { inner = Inner { n = 3 } } };
+            let i = h.grab();
+            h.mid.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_tail_if_arms_reference_leaf_in_a_by_value_return_copies() {
+    // The seam is keyed by the LEAF, so a tail `if` copies per arm — the same
+    // reason B100 pinned its own conditional shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner, other: Inner }
+        impl Holder {
+            fun grab(&self, first: bool): Inner {
+                if first { &self.inner } else { &self.other }
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 }, other = Inner { n = 5 } };
+            let i = h.grab(true);
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_method_leaf_in_a_by_value_return_copies() {
+    // The method spelling of the call shape: the projected argument is the
+    // receiver, at position 0 of the call.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun peek(&self): &Inner borrows self { &self.inner }
+            fun grab(&self): Inner { self.peek() }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let i = h.grab();
+            h.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_chain_leaf_in_a_by_value_return_copies() {
+    // The CHAIN, which is what makes the read-through recursive: the outer
+    // call's projected argument is itself a call, and only one more step
+    // reaches a place at all. Without the recursion this hands back the alias.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Mid { inner: Inner }
+        struct Outer { mid: Mid }
+        impl Mid {
+            fun slot(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        impl Outer {
+            fun mid_mut(&mut self): &mut Mid borrows self { &mut self.mid }
+        }
+        fun grab(o: &mut Outer): Inner { o.mid_mut().slot() }
+        fun main() {
+            mut o = Outer { mid = Mid { inner = Inner { n = 3 } } };
+            let i = grab(&mut o);
+            o.mid.inner.n = 99;
+            print(i.n);
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn a_borrows_call_on_a_local_in_a_by_value_return_copies_nothing() {
+    // The elision the new arms must not eat, and it is B100's own: the frame is
+    // a dead owner at the return, so a projection of a LOCAL donates its
+    // storage. Reading through the call reaches `h`, a local, and stops.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun peek(h: &Holder): &Inner borrows h { &h.inner }
+        fun make(): Inner { let h = Holder { inner = Inner { n = 3 } }; peek(&h) }
+        fun main() { print(make().n); }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "a dead owner's donation copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn an_owned_call_leaf_in_a_by_value_return_copies_nothing() {
+    // The other half of "a call owns its result": a callee with no `borrows`
+    // clause projects nothing, so reading through it names no place and the
+    // seam has nothing to copy.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun fresh(): Inner { Inner { n = 3 } }
+        fun grab(h: &Holder): Inner { fresh() }
+        fun main() {
+            let h = Holder { inner = Inner { n = 1 } };
+            print(grab(&h).n);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            !js.contains("__clone"),
+            "an owned call result copied:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "3\n");
+}
+
+#[test]
+fn a_reference_leaf_in_a_view_return_still_aliases() {
+    // Rule 3's sanctioned projection, unchanged: the signature returns a view,
+    // so nothing crosses and `&mut self.inner` stays the alias it is for.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun peek(&mut self): &mut Inner borrows self { &mut self.inner }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            h.peek().n = 99;
+            print(h.inner.n);
+        }
+        "#,
+        "99\n",
+    );
+}
+
+#[test]
+fn a_reference_leaf_handing_back_a_resource_is_refused() {
+    // R1: a resource cannot copy, so the crossing is a MOVE out of the loan —
+    // and `&self.g` is `self.g` with a `&` in front of it, which the move scan
+    // already refuses as a partial move. Before the fix this compiled and
+    // printed the tag with no `drop` at all: the resource left the loan
+    // uncopied AND undestroyed.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self): Guard { &self.g }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take().tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn a_borrows_call_leaf_handing_back_a_resource_is_refused() {
+    // The call spelling of the same crossing: the place it names is the loaned
+    // parameter itself, so the diagnostic is R3's — the same one the bare
+    // forwarder `fun take(&self): Guard { self }` already gets.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        fun peek(h: &Holder): &Guard borrows h { &h.g }
+        fun take(h: &Holder): Guard { peek(h) }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(take(&h).tag);
+        }
+        "#,
+        "cannot move the resource `h` out of this function",
+    );
+}
+
+#[test]
+fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
+    // And the CROSSING is what decides, not the reference: under a view return
+    // the very same `&self.g` is rule 3's projection, moves nothing, and stays
+    // legal — the two programs differ only in the return type. (The owner's
+    // scope-end teardown is `destruction.md`'s subject, not this seam's.)
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun peek(&self): &Guard borrows self { &self.g }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.peek().tag);
+        }
+        "#,
+        "a\n",
+    );
+}
+
+// B116 — the `ret` spelling of a return position gets the tail's analysis.
+//
+// `check_view_escape` read `Expr::FunctionReturn` as an unconditional escape and
+// exempted only `function.body.1`, so `ret &self.inner;` was refused while the
+// tail spelling one line away compiled (element-clones.md §11.6). A `ret` is a
+// return position exactly like the tail (`ret-checking.md`) and rule 1's return
+// clause already treated it as one — `return_sites` carries both — so the two
+// spellings disagreed about a value the compiler had already decided to copy.
+//
+// Every pin below is the SAME program in both spellings: a conditional early
+// `ret` whose fall-through tail is the same expression. That shape is what
+// isolates the escape question from `ret`'s own early-return-only rule — a body
+// that ENDS in `ret x;` is separately a type error ("Expected Inner, but got
+// void"), which is why B116's filed repro could not be the probe.
+
+#[test]
+fn b116_the_ret_spelling_of_a_reference_leaf_agrees_with_the_tail() {
+    // B109's first shape, both spellings in one function. The `ret` was refused;
+    // the tail compiled and copied. Both now emit the copy, and the same one.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun grab(&self, flag: bool): Inner {
+                if flag { ret &self.inner; }
+                &self.inner
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.grab(true);
+            let tail = h.grab(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function grab(self, flag) {\n\
+             \tif (flag) {\n\t\treturn __clone(self[0]);\n\t}\n\
+             \treturn __clone(self[0]);\n}"
+        ),
+        "both spellings should emit the same copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n3\n",
+        "neither spelling may hand back the receiver's field"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_scalar_view_reads_the_place() {
+    // B108's shape: a scalar has no aggregate to clone, so its copy is its READ
+    // (`v[0][v[1]]`). The `ret` gets the same read, not a refusal and not the
+    // runtime pair.
+    let javascript = compile(
+        r#"
+        import std::print;
+        fun same(v: &mut i32, flag: bool): i32 {
+            if flag { ret v; }
+            v
+        }
+        fun main() { mut n = 5; print(same(&mut n, true)); print(same(&mut n, false)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "function same(v, flag) {\n\
+             \tif (flag) {\n\t\treturn v[0][v[1]];\n\t}\n\
+             \treturn v[0][v[1]];\n}"
+        ),
+        "both spellings should read the scalar place, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "5\n5\n",
+        "neither spelling may hand back the view pair"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_borrows_call_leaf_copies() {
+    // B109's second shape: the leaf is a CALL, so the places it hands back are
+    // read from the callee's `borrows` clause. Same answer at the `ret`.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Holder { pair: (i32, i32) }
+        fun peek(h: &Holder): &(i32, i32) borrows h { &h.pair }
+        fun get(h: &Holder, flag: bool): (i32, i32) {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            mut h = Holder { pair = (7, 3) };
+            let early = get(&h, true);
+            h.pair.1 = 99;
+            print(early.1);
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\tif (flag) {\n\t\treturn __clone(peek(h2));\n\t}\n\treturn __clone(peek(h2));"
+        ),
+        "both spellings should copy the call's projection, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "neither spelling may hand back the callee's alias"
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused() {
+    // A resource cannot copy (R1), so the crossing is a MOVE and the move scan
+    // refuses it — and it must refuse the `ret` for the SAME reason and with the
+    // same words, not because the escape check happened to reject the spelling.
+    // Lifting the escape check without telling the crossing about `ret` would
+    // have compiled this and leaked the guard uncopied AND undestroyed, which is
+    // exactly the bug B109 shipped to close.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool): Guard {
+                if flag { ret &self.g; }
+                &self.g
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_resource_borrows_call_is_refused() {
+    // The call spelling of the same crossing, where the place named is the
+    // loaned parameter itself — R3's diagnostic, at the `ret` as at the tail.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        fun peek(h: &Holder): &Guard borrows h { &h.g }
+        fun take(h: &Holder, flag: bool): Guard {
+            if flag { ret peek(h); }
+            peek(h)
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(take(&h, true).tag);
+        }
+        "#,
+        "cannot move the resource `h` out of this function",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_view_of_a_local_still_cannot_escape() {
+    // The half that must NOT move. Rule 1's return clause leaves a LOCAL alone —
+    // the frame is a dead owner donating its storage — so no copy happens and
+    // the view really would dangle. Agreement means agreeing on the refusals
+    // too: this is refused in both spellings, as the tail always was.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { ret &local; }
+            &local
+        }
+        fun main() { print(grab(true).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b116_the_ret_spelling_of_a_borrows_projection_is_sanctioned() {
+    // The escape check's OTHER exemption, which the `ret` also never got: a
+    // `borrows` function may hand back a view of a view parameter, because the
+    // caller's argument outlives the call. Rule 3's sanctioned case, now
+    // reachable through either spelling — and it emits the projection, not a
+    // copy, in both.
+    let javascript = compile(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun view_of(h: &Holder, flag: bool): &Inner borrows h {
+            if flag { ret &h.inner; }
+            &h.inner
+        }
+        fun main() { let h = Holder { inner = Inner { n = 3 } }; print(view_of(&h, true).n); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif (flag) {\n\t\treturn h2[0];\n\t}\n\treturn h2[0];"),
+        "a sanctioned projection must not gain a copy, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "3\n",
+        "the projection should reach the field"
+    );
+}
+
+#[test]
+fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
+    // The crossing half of B116, isolated: the resource leaves through the
+    // `ret` and the TAIL hands back an owned value, so the tail's own crossing
+    // says nothing about it. `compute_return_value_crossings` walked
+    // `function.body.1` alone, so the `ret`'s `&self.g` named no place and R1
+    // never saw the move. It is joined to the return positions now, and the
+    // move scan answers with the bare twin's diagnostic.
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource struct Guard { tag: str }
+        impl Guard { fun drop(own self) { print("drop " + self.tag); } }
+        struct Holder { g: Guard }
+        impl Holder {
+            fun take(&self, flag: bool): Guard {
+                if flag { ret &self.g; }
+                Guard { tag = "fresh" }
+            }
+        }
+        fun main() {
+            let h = Holder { g = Guard { tag = "a" } };
+            print(h.take(true).tag);
+        }
+        "#,
+        "cannot move a resource field out of a live aggregate",
+    );
+}
+
+#[test]
+fn b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail() {
+    // Found closing B116 and closed by B122: the two spellings here were
+    // examined by different questions. The tail loop asked
+    // `escapes_as_view(function.body.1)` of the WHOLE body, and an `if` with
+    // one owned arm is not a view expression, so it was never asked at all;
+    // the `ret` arm asked the leaf, which is. `infer_borrows` walked only the
+    // tail, so the function's root-set stayed empty when a view reached the
+    // caller only through a `ret` — and rule 1's return clause copied it
+    // regardless, which is what made the refusal a false positive rather than
+    // a disagreement about the rule. `element-clones.md` §13 closes the
+    // measurement §11.3 candidate (d) deferred.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        impl Holder {
+            fun early(&self, flag: bool): Inner {
+                if flag { ret &self.inner; }
+                Inner { n = 0 }
+            }
+            fun conditional(&self, flag: bool): Inner {
+                if flag { Inner { n = 0 } } else { &self.inner }
+            }
+        }
+        fun main() {
+            mut h = Holder { inner = Inner { n = 3 } };
+            let early = h.early(true);
+            let tail = h.conditional(false);
+            h.inner.n = 99;
+            print(early.n);
+            print(tail.n);
+        }
+        "#,
+        "3\n3\n",
+    );
+}
+
+#[test]
+fn b122_a_conditional_tail_arm_may_not_escape_a_view_of_a_local() {
+    // The other side of the same hole, and the one that mattered more: rule 3
+    // exists to refuse exactly this, and a second owned arm hid it — the whole
+    // body's "is this a view expression" question is `false` for an `if` with
+    // one owned arm, so the view arm was never asked at all. The `ret`
+    // spelling was already refused, so the two spellings used to disagree in
+    // the direction that let code through. (Benign as emitted — the frame is
+    // dead and nothing else holds the storage — but it was the rule not being
+    // applied, not the rule deciding.) `check_view_escape` now asks each
+    // return LEAF (`collect_tail_leaves`), so this arm is examined on its own.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { Inner { n = 0 } } else { &local }
+        }
+        fun main() { print(grab(false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_conditional_tail_arm_order_does_not_matter() {
+    // The mirror of the previous pin: the view-of-a-local arm FIRST, the owned
+    // arm second. `collect_tail_leaves` walks both arms of an `if`/`else`
+    // regardless of order, so which side hides which is not the question —
+    // every leaf gets asked.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { &local } else { Inner { n = 0 } }
+        }
+        fun main() { print(grab(false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_nested_conditional_arm_may_not_escape_a_view_of_a_local() {
+    // `collect_tail_leaves` recurses into a nested `if`'s own branches
+    // (`collect_tail_leaves_if`), so a view of a local buried two levels deep
+    // is still a leaf the walk reaches, not just the immediate arms of the
+    // outermost `if`.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun grab(flag: bool, other: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag {
+                if other { Inner { n = 1 } } else { Inner { n = 2 } }
+            } else {
+                &local
+            }
+        }
+        fun main() { print(grab(false, false).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_match_leg_may_not_escape_a_view_of_a_local() {
+    // The same walk over a `match` tail (`collect_tail_leaves`'s other arm):
+    // one leg owned, one leg a view of a local, and the local leg is still
+    // examined on its own regardless of which leg the whole match's TYPE
+    // would suggest is representative.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Choice { A, B }
+        struct Inner { n: i32 }
+        fun grab(choice: Choice): Inner {
+            let local = Inner { n = 3 };
+            match choice {
+                Choice::A => Inner { n = 0 },
+                Choice::B => &local,
+            }
+        }
+        fun main() { print(grab(Choice::A).n); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf() {
+    // The multi-leaf mix the leaf-wise walk exists to get right: one arm
+    // projects a PARAMETER (sound — the caller's argument outlives the call)
+    // and the other a LOCAL (unsound). Leaf-wise, the two are asked
+    // separately and answered separately — exactly one diagnostic, and its
+    // span is the local arm, not the parameter arm and not the whole `if`.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun grab(h: &Holder, flag: bool): Inner {
+            let local = Inner { n = 3 };
+            if flag { &h.inner } else { &local }
+        }
+        fun main() {
+            let h = Holder { inner = Inner { n = 9 } };
+            print(grab(&h, true).n);
+        }
+        "#;
+    assert_fails_once_with(source, "a view cannot escape its scope");
+    assert_fails_spanning(source, "&local", "a view cannot escape its scope");
+}
+
+#[test]
+fn a_closures_ret_still_cannot_hand_back_a_view() {
+    // The boundary of B116's lift. A closure's rets check against its INFERRED
+    // tail type and never enter `return_sites`, so they get no exemption — which
+    // is right, because a closure may not declare `borrows` and cannot return a
+    // view at all (`compute_return_clone_sites` relies on exactly that).
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun main() {
+            let h = Holder { inner = Inner { n = 3 } };
+            let f = |flag: bool| { if flag { ret &h.inner; } &h.inner };
+            print(f(true).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local() {
+    // The un-masking pin (`element-clones.md` §13.4 / backlog B123): B122 gave
+    // `check_view_escape`'s FUNCTION seam a leaf walk, but the closure seam
+    // kept the old whole-position question — `escapes_as_view(closure.return_)`
+    // asks the closure's whole `Block`/`If`, never leaf-wise, and `is_view_expr`
+    // matches neither directly. Every existing pin happened to also spell a
+    // `ret`, which the per-expr `Expr::FunctionReturn` arm catches unconditionally
+    // regardless of this hole — so the blindness was self-masked. Here there is
+    // no `ret` anywhere: the view of a closure-local reaches the caller only
+    // through one arm of the closure's conditional TAIL, and the whole-block
+    // question was `false` for an `if`, so nothing asked the arm that
+    // mattered. Wrongly compiled before this fix (verified against the live
+    // compiler, planted red); the `ret` spelling of the identical shape was
+    // already refused
+    // (`b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local`).
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { Inner { n = 0 } } else { &local }
+            };
+            print(grab(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_ret_and_conditional_tail_arm_agree_refusing_a_view_of_a_closure_local() {
+    // The REFUSE-direction agreement pin (B116/B122 style): the same shape,
+    // spelled the two ways a closure return can be spelled, must answer
+    // identically. The `ret` spelling was already refused (the per-expr
+    // `Expr::FunctionReturn` arm has no exemption for a closure either), and
+    // is not new — what B123 fixes is that the conditional-tail spelling used
+    // to disagree, letting the identical view of a closure-local through.
+    // Both refuse now.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_ret = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { ret &local; }
+                Inner { n = 0 }
+            };
+            print(via_ret(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_tail = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { Inner { n = 0 } } else { &local }
+            };
+            print(via_tail(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_ret_and_conditional_tail_arm_agree_accepting_an_owned_leaf() {
+    // The ACCEPT-direction agreement pin. Unlike the function seam (B122's
+    // `b122_a_ret_beside_an_owned_tail_agrees_with_the_conditional_tail`), a
+    // closure has no exemption at all to accept a SOUND view through — it may
+    // not declare `borrows`, so every view leaf is unconditionally an escape
+    // (P4c). The accept side that exists is the neutral one: an OWNED leaf,
+    // which `escapes_as_view` was never going to flag either way, must still
+    // compile through both spellings after the leaf walk — proving the walk
+    // widens what gets ASKED, not what gets REFUSED.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let via_ret = |flag: bool| {
+                if flag { ret Inner { n = 1 }; }
+                Inner { n = 0 }
+            };
+            let via_tail = |flag: bool| {
+                if flag { Inner { n = 1 } } else { Inner { n = 0 } }
+            };
+            print(via_ret(true).n);
+            print(via_tail(false).n);
+        }
+        "#,
+        "1\n0\n",
+    );
+}
+
+#[test]
+fn b123_a_closure_conditional_tail_arm_order_does_not_matter() {
+    // The mirror of `b123_a_closure_conditional_tail_arm_may_not_escape_a_view_of_a_closure_local`:
+    // the view-of-a-local arm FIRST, the owned arm second. `collect_tail_leaves`
+    // walks both arms of an `if`/`else` regardless of order.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool| {
+                let local = Inner { n = 3 };
+                if flag { &local } else { Inner { n = 0 } }
+            };
+            print(grab(false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_nested_closure_conditional_arm_may_not_escape_a_view_of_a_closure_local() {
+    // `collect_tail_leaves_if`'s recursion into a nested `if`'s own branches
+    // reaches the closure seam too — a view of a closure-local buried two
+    // levels deep is still a leaf the walk finds.
+    assert_fails_with(
+        r#"
+        import std::print;
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |flag: bool, other: bool| {
+                let local = Inner { n = 3 };
+                if flag {
+                    if other { Inner { n = 1 } } else { Inner { n = 2 } }
+                } else {
+                    &local
+                }
+            };
+            print(grab(false, false).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_closure_match_leg_may_not_escape_a_view_of_a_closure_local() {
+    // `collect_tail_leaves`'s `match` arm reaches the closure seam too: one
+    // leg owned, one leg a view of a closure-local, and the local leg is
+    // still examined on its own.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Choice { A, B }
+        struct Inner { n: i32 }
+        fun main() {
+            let grab = |choice: Choice| {
+                let local = Inner { n = 3 };
+                match choice {
+                    Choice::A => Inner { n = 0 },
+                    Choice::B => &local,
+                }
+            };
+            print(grab(Choice::A).n);
+        }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b123_a_mixed_leaf_closure_return_refuses_each_forbidden_view_leaf_separately() {
+    // Three arms: one owned, one a view of a CAPTURE (`&h.inner`, the same
+    // shape `a_closures_ret_still_cannot_hand_back_a_view` already refuses
+    // through `ret`), one a view of a closure-LOCAL. Unlike the function
+    // seam's mixed pin (`b122_a_mixed_leaf_return_refuses_only_the_local_view_leaf`,
+    // which has one SOUND leaf and refuses exactly once), a closure has no
+    // sound view leaf at all — both view arms are forbidden, so the leaf walk
+    // must refuse BOTH, separately, each naming its own span rather than
+    // collapsing into one diagnostic or naming the enclosing `if`.
+    let source = r#"
+        import std::print;
+        struct Inner { n: i32 }
+        struct Holder { inner: Inner }
+        fun main() {
+            let h = Holder { inner = Inner { n = 9 } };
+            let grab = |flag: bool, other: bool| {
+                if flag {
+                    Inner { n = 0 }
+                } else if other {
+                    &h.inner
+                } else {
+                    let local = Inner { n = 3 };
+                    &local
+                }
+            };
+            print(grab(false, false).n);
+        }
+        "#;
+    let matching = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("a view cannot escape its scope"))
+        .count();
+    assert_eq!(
+        matching, 2,
+        "expected exactly two escape diagnostics, one per forbidden view leaf"
+    );
+    assert_fails_spanning(source, "&h.inner", "a view cannot escape its scope");
+    assert_fails_spanning(source, "&local", "a view cannot escape its scope");
+}
+
 #[test]
 fn a_list_literal_element_copies_its_source_place() {
     // B54: `[xs]` installed the caller's storage as element 0, so growing the
@@ -10078,6 +11425,307 @@ fn ret_with_a_value_in_an_undeclared_void_function_is_allowed() {
     );
 }
 
+// --- S3: the missing return value re-anchored (editing-dx.md §3) ----------
+// The known-bad shape the charter named first: a missing return value used
+// to underline the WHOLE closure (or, worse, the whole call) rather than the
+// gap. Three regimes, per §3.2-§3.4; pins below are named after the paper's
+// probes (P21-P28).
+
+// P22 — regime 1: a named function whose body ends in a non-expression
+// statement (here a `let`) has NO tail to anchor at all. Old behavior: a
+// zero-width point one byte PAST the closing brace (invisible in an editor,
+// §3.2). New: the closing brace itself, one character wide.
+#[test]
+fn missing_return_value_regime_1_anchors_the_closing_brace() {
+    assert_fails_spanning(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	let sum: i32 = a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// Regime 1' for a NAMED function (not one of the paper's own probes — P24's
+// closure shape is the paper's example, but the same statement-based
+// distinction applies to a plain function body, and CLAUDE.md's "per case,
+// not per example" wants the edge covered directly): the last statement IS
+// an expression whose value would satisfy the return type, discarded only by
+// its trailing `;` — the sharper, actionable message.
+#[test]
+fn missing_return_value_regime_1_prime_named_function_names_the_semicolon() {
+    assert_fails_spanning(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// A last statement that reconciles by NAME-COINCIDENCE only, not because
+// removing its `;` would make it the tail: `let` is a declaration, not an
+// expression, even though its own type (i32) happens to match the return
+// type. Regression guard for the bug this shape reproduced during
+// development (a bare `self.variables` miss let a `let`'s binding type stand
+// in for "the last statement's value").
+#[test]
+fn a_declaration_as_the_last_statement_does_not_trigger_regime_1_prime() {
+    assert_fails_with(
+        r#"
+        fun total(a: i32, b: i32): i32 {
+        	let sum: i32 = a + b;
+        }
+
+        fun main() {
+        	total(1, 2);
+        }
+        "#,
+        "this body ends without producing a value.",
+    );
+}
+
+// P25 — regime 2: an `if` with no `else` in tail position is a REAL
+// expression (not the parser's synthesized `Void`), so its span was already
+// A1-compliant (§3.3, unchanged) — what §16 deferred as "needs a provenance
+// channel" and §17 builds: the WORDING now names the missing `else` as the
+// gap (`if_branch_has_final_else` asked again at the diagnostic site,
+// editing-dx.md §17.1) instead of the generic mismatch phrasing regimes 1/1'
+// no longer use for their own gap.
+#[test]
+fn missing_return_value_regime_2_if_with_no_else_names_the_gap() {
+    assert_fails_with(
+        r#"
+        fun classify(n: i32): str {
+        	if n > 0 {
+        		"positive"
+        	}
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead: an `if` with no `else` produces void.",
+    );
+}
+
+// Regression guard for the refinement's own boundary: a void-typed CALL in
+// tail position (no trailing `;` — that would be regime 1, §3.2) is a real
+// value the body produced too, but it is not an `if`, so it must keep the
+// plain mismatch message rather than being swept into regime 2's wording.
+#[test]
+fn missing_return_value_a_void_call_tail_keeps_the_generic_message() {
+    assert_fails_with(
+        r#"
+        import std::print;
+
+        fun classify(n: i32): str {
+        	print(n)
+        }
+
+        fun main() {
+        	classify(1);
+        }
+        "#,
+        "Expected str, but got void instead.",
+    );
+}
+
+// P23 — regime 3, unannotated closure bound to an annotated `let`: the
+// closure's OWN parameters need no annotation (`|value|`, filled by
+// bidirectional inference from `|i32| i32`); once they reconcile, the body
+// checks in RETURN POSITION against the annotation's return half instead of
+// the whole closure value being compared at the `let` — the closing BRACE,
+// not the closure's `|params| { .. }` span, `points.map(..)`'s whole call,
+// or anything else upstream.
+#[test]
+fn missing_return_value_regime_3_context_closure_anchors_its_own_brace() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value| {
+        		let doubled: i32 = value * 2;
+        	};
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// P24 — the one-line spelling of the same shape: the whole mistake is one
+// character (`;`), and the message now names it. Old behavior: 22 characters
+// underlined (the whole closure) to ask for one to be deleted.
+#[test]
+fn missing_return_value_regime_3_context_closure_one_liner_names_the_semicolon() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value| { value * 2; };
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// P26 — the root-cause probe: a closure's OWN return-type annotation
+// (`: i32`) used to be parsed, re-printed by the formatter, and completely
+// ignored by type checking (`Closure::return_type` had no analyzer reader at
+// all). It now gets rule 2 "directly" — the same return-position check a
+// named function's declared return type gets — independent of any
+// surrounding context.
+#[test]
+fn missing_return_value_regime_3_annotated_closure_is_newly_checked() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let scale: |i32| i32 = |value: i32|: i32 { print(value); };
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+}
+
+// An annotated closure whose body actually satisfies its OWN declared
+// return type compiles clean — the new check is additive, not a false
+// positive on the common case.
+#[test]
+fn an_annotated_closure_whose_body_satisfies_its_own_return_type_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+
+        fun main() {
+        	let scale: |i32| i32 = |value: i32|: i32 { value * 2 };
+        	print(scale(5));
+        }
+        "#,
+        "10\n",
+    );
+}
+
+// P27 — the contrast that bounds the fix: when the PARAMETER type is what
+// differs (not the return type), the whole-closure anchor is correct and
+// stays untouched — nothing narrower would be honest about a closure that,
+// as written, is the wrong VALUE.
+#[test]
+fn missing_return_value_regime_3_parameter_mismatch_keeps_the_whole_value_anchor() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let scale: |i32| i32 = |value: str| { 1 };
+        }
+        "#,
+        "|value: str| { 1 }",
+        "Expected |i32| i32, but got |str| i32 instead.",
+    );
+}
+
+// P21 — KNOWN, NOT FIXED by this slice: the closure's void return
+// propagates through a GENERIC binding (`map<U>`'s `U`) before the mismatch
+// surfaces, one level out, on the initializer — a different, harder
+// mechanism (tracing the root cause back through generic instantiation)
+// than the direct context-return-type case P23/P24 cover. `type_is_ground`
+// deliberately declines to route a still-abstract target through the new
+// check (I5/B19's family — see its own doc comment), which is what leaves
+// this one on today's path.
+#[test]
+#[ignore = "S3 residue (editing-dx.md P21): the closure's void return reaches List<void> \
+            through a generic binding before it mismatches, one level out — the new \
+            return-position check only fires when the expected return type is fully \
+            ground, so this stays on the whole-call anchor. Un-ignore once generic-return \
+            provenance tracing ships."]
+fn missing_return_value_regime_3_through_a_generic_binding_is_not_yet_fixed() {
+    assert_fails_spanning(
+        r#"
+        import std::print;
+
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	mut points: List<Point> = List::new();
+        	points.push(Point { x = 1, y = 10 });
+        	let widths: List<i32> = points.map(|point| {
+        		point.x * 2;
+        	});
+        	print(widths.len());
+        }
+        "#,
+        "}",
+        "Expected i32, but got void instead: the `;` discards this body's last value.",
+    );
+}
+
+// P28 — the B5 violation §16 left unclosed, closed here (editing-dx.md
+// §17.2): a bare `ret` in a value-returning function used to report the
+// same root cause twice (once at the `ret`, once at the synthesized void
+// tail after it — both correctly anchored since S3's parser fix, which is
+// what made the duplicate visible enough to fix). The tail-construction
+// site now knows a preceding `ret` already diverged and skips its own
+// redundant constraint, so only the `ret`'s own check fires.
+#[test]
+fn a_bare_ret_no_longer_duplicates_the_synthesized_tail_diagnostic() {
+    let source = r#"
+        fun total(a: i32): i32 {
+        	ret;
+        }
+
+        fun main() {
+        	total(1);
+        }
+        "#;
+    assert_fails_once_with(
+        source,
+        "Expected i32, but got void instead: this body ends without producing a value.",
+    );
+    let ret_span = source.find("ret").map(|start| start..start + "ret".len());
+    let diagnostics = failure_diagnostics(source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(_, range)| Some(range.clone()) == ret_span),
+        "expected the sole diagnostic at `ret`, not the synthesized tail; got: {diagnostics:#?}"
+    );
+}
+
+// The same dedup, for a `ret` whose VALUE is wrong rather than missing — a
+// second B5 violation the survey never named (found while building the
+// fix, same mechanism): before the fix this ALSO doubled, pairing the
+// value mismatch at `ret` with a spurious "ends without producing a value"
+// at the tail for code that, once the first error is fixed, is complete.
+#[test]
+fn a_mistyped_ret_value_no_longer_duplicates_the_synthesized_tail_diagnostic() {
+    assert_fails_once_with(
+        r#"
+        fun total(a: i32): i32 {
+        	ret "nope";
+        }
+
+        fun main() {
+        	total(1);
+        }
+        "#,
+        "Expected i32, but got",
+    );
+}
+
 // A generic return type checks `ret` by unification, exactly like the tail.
 #[test]
 fn generic_return_rets_bind_like_the_tail() {
@@ -10290,6 +11938,145 @@ fn unknown_struct_spans_the_initializer() {
         "#,
         "Pointt { x = 1 }",
         "unknown struct",
+    );
+}
+
+// --- E58: closest-name suggestion on an invalid initializer field --------------
+// The scan (vilan_core::closest_name) runs ONLY once a field name has already
+// failed to resolve — the calls below all live inside the "no such field" arm,
+// so a struct initializer that resolves cleanly never reaches it at all.
+
+// An unknown initializer field now anchors on the NAME, not the value it was
+// given — the span the E58 rename quickfix rewrites (main.rs/document.rs).
+// This also proves the count-mismatch shape untouched by the same edit: it
+// returns before this per-field loop even runs.
+#[test]
+fn unknown_initializer_field_spans_the_name_not_the_value() {
+    assert_fails_spanning(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entires = 5 };
+        }
+        "#,
+        "entires",
+        "struct 'Config' has no field 'entires'",
+    );
+}
+
+// S5 (editing-dx.md §7.2, P20): the survey's exact reproduction of the OLD
+// bug — widen the VALUE and confirm the underline does NOT widen with it.
+// Before E58 the span tracked `field_value_span` unconditionally, so a
+// five-character value produced a five-character underline three columns
+// away from the name it was supposedly about; P19's `= 5` alone doesn't
+// distinguish "anchored on the name" from "anchored on a value that happens
+// to be short", since both are one character. This is what proves the
+// anchor MOVED, not just that it currently sits somewhere plausible.
+#[test]
+fn unknown_initializer_field_with_a_wide_value_still_spans_the_name() {
+    assert_fails_spanning(
+        r#"
+        struct Point {
+        	x: i32,
+        	y: i32,
+        }
+
+        fun main() {
+        	let _ = Point { x = 3, yy = 40000 };
+        }
+        "#,
+        "yy",
+        "struct 'Point' has no field 'yy'",
+    );
+}
+
+// A clear typo of a real field gets a "did you mean" note, anchored at the
+// misspelled name — the threshold's suggest side (a single transposed pair).
+#[test]
+fn unknown_initializer_field_notes_a_close_typo() {
+    assert_fails_noting(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entires = 5 };
+        }
+        "#,
+        "struct 'Config' has no field 'entires'",
+        "entires",
+        "did you mean `entries`?",
+    );
+}
+
+// The threshold's refuse side: a name with almost nothing in common with the
+// real field gets no note at all — the diagnostic still fires, bare.
+#[test]
+fn unknown_initializer_field_far_from_every_real_field_gets_no_note() {
+    let source = r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { x = 5 };
+        }
+        "#;
+    let diagnostics = failure_diagnostics_with_notes(source);
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|(message, _, _)| message.contains("struct 'Config' has no field 'x'"))
+        .collect();
+    assert_eq!(matching.len(), 1, "got: {diagnostics:#?}");
+    assert!(
+        matching[0].2.is_none(),
+        "expected no note on a far-off field name; got: {:#?}",
+        matching[0]
+    );
+}
+
+// Structural non-vacuity for the "runs only on the invalid-name path" rule
+// (CLAUDE.md: "assert the diagnostic path, not performance" — the scan call
+// sits textually inside the `None` arm of the field lookup, so a program that
+// never reaches that arm never reaches the scan): a correctly-named
+// initializer produces no diagnostic at all, note included.
+#[test]
+fn a_correctly_named_initializer_field_gets_no_diagnostic() {
+    assert_compiles(
+        r#"
+        struct Config {
+        	entries: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entries = 5 };
+        }
+        "#,
+    );
+}
+
+// The field-COUNT mismatch is a different diagnostic entirely (it returns
+// before the per-field, closest-name-scanning loop even runs) — pinned
+// unaffected by the E58 edit. Message per S4 (editing-dx.md §7.1): names
+// the struct and the missing field.
+#[test]
+fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
+    assert_fails_with(
+        r#"
+        struct Config {
+        	entries: i32,
+        	limit: i32,
+        }
+
+        fun main() {
+        	let _ = Config { entries = 5 };
+        }
+        "#,
+        "`Config` expects 2 fields, but got 1 instead: `limit` is missing.",
     );
 }
 
@@ -15043,6 +16830,423 @@ fn an_async_function_with_a_view_parameter_is_rejected() {
         main();
         "#;
     assert_fails_spanning(source, "value", "cannot take '&mut' parameters");
+}
+
+// The `&` half of the same signature rule (`view-invalidation.md` §3: "an `async
+// fun` may not declare `&`/`&mut` parameters"). Only the `&mut` spelling above
+// was ever pinned — B112's survey found the gap. A SHARED view is no safer than
+// a mutable one here: the hazard is the caller's claim outliving its epoch while
+// the callee sits suspended, and reading through a stale view is the read half
+// of exactly that. The message names the form it saw, so the two spellings are
+// separately observable.
+
+#[test]
+fn an_async_function_with_a_shared_view_parameter_is_rejected() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        async fun peek(viewed: &Point) {
+            await tick();
+            let _seen = viewed.x;
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            peek(&point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&' parameters");
+}
+
+#[test]
+fn an_async_method_with_a_shared_view_receiver_is_rejected() {
+    // A receiver is an ordinary parameter with a `&` convention, so `&self`
+    // meets the same rule and anchors on the `self` token.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick() {
+            let _beat = 1;
+        }
+        impl Point {
+            async fun peek(&self) {
+                await tick();
+                let _seen = self.x;
+            }
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            point.peek();
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "self", "cannot take '&' parameters");
+}
+
+// --- B119: the view gate asks the CALL GRAPH, not the `await` token ---------
+//
+// Filed 2026-08-10 probing the `&` form; the bug was the GATE's, not the
+// form's — both spellings escaped. The signature rule fired only when the body
+// held an explicit `await`, so the IMPLICIT-await spelling
+// (`spec/execution.md` §7: calling an async function without the keyword, the
+// sanctioned form) bypassed it entirely, and the emission proved the
+// suspension real: `const beat = await (tick());` with the caller's view live
+// across it.
+//
+// Ruled 2026-08-12: a call gates the view rule when it CAN SUSPEND — the
+// callee is declared `async`, or is transitively suspending. The token stays
+// SUFFICIENT (every pin above is untouched); it stops being NECESSARY.
+// Declared asyncness is read of the CALLEE at a call site, never of the body
+// being checked — which is what keeps B29's freedom below intact rather than
+// merely tolerated.
+#[test]
+fn an_implicit_await_does_not_lift_the_async_view_parameter_rule() {
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun stash(viewed: &mut Point) {
+            let beat = tick();
+            viewed.x = beat;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn an_implicit_await_does_not_lift_the_shared_view_parameter_rule() {
+    // The `&` spelling of the filed shape — the same gate, the other form.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun peek(viewed: &Point) {
+            let beat = tick();
+            let _seen = viewed.x + beat;
+        }
+        fun main() {
+            let point = Point { x = 1, y = 2 };
+            peek(&point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&' parameters");
+}
+
+#[test]
+fn an_implicit_await_through_a_sync_declared_hop_is_still_a_suspension() {
+    // The transitive half of the rule: `hop` declares nothing, but it calls
+    // `tick`, so `async_infer` makes it async and `stash` awaits it —
+    // `return await (tick());` inside `hop`, `await (hop())` inside `stash`.
+    // A gate keyed on the callee's DECLARATION would miss this entirely; the
+    // fixpoint's is what sees it.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun hop(): i32 { tick() }
+        async fun stash(viewed: &mut Point) {
+            let beat = hop();
+            viewed.x = beat;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn an_implicit_await_refuses_every_view_parameter_of_the_body() {
+    // Multi-parameter: one suspension point condemns the whole signature, and
+    // each form anchors at its own parameter with its own spelling.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun stash(viewed: &mut Point, other: &Point) {
+            let beat = tick();
+            viewed.x = beat + other.y;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            let seen = Point { x = 3, y = 4 };
+            stash(&mut point, &seen);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+    assert_fails_spanning(source, "other", "cannot take '&' parameters");
+}
+
+#[test]
+fn a_view_across_an_implicit_await_in_the_body_is_rejected() {
+    // E3's BODY rule had the identical hole, and the same answer closes it.
+    // The diagnostic anchors at the CALL — there is no token to point at — and
+    // names it, so the reader can see which call suspends.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = tick();
+            view.x = beat;
+        }
+        fun main() { flow(); }
+        main();
+        "#;
+    // Occurrence 1 — occurrence 0 is `tick()` inside the declaration itself.
+    assert_fails_spanning_nth(source, "tick()", 1, "the implicit 'await' of 'tick'");
+    assert_fails_with(source, "'view' (a view into 'point') is still live here");
+}
+
+#[test]
+fn an_async_closure_capturing_a_view_across_an_implicit_await_is_rejected() {
+    // E3's CLOSURE rule, third arm of the same gate.
+    let source = r#"
+        async fun tick(): i32 { 1 }
+        fun main() {
+            mut a = 5;
+            let view = &mut a;
+            let task = async {
+                let beat = tick();
+                view = beat;
+            };
+        }
+        main();
+        "#;
+    assert_fails_with(source, "an async closure cannot capture the view 'view'");
+}
+
+#[test]
+fn an_explicit_await_reports_its_crossing_exactly_once() {
+    // The token path and the call-site path both see `await tick()` — the
+    // awaited call is the token's own suspension written out. Only the token
+    // reports it, or every existing `await` diagnostic would have doubled.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = await tick();
+            view.x = beat;
+        }
+        fun main() { flow(); }
+        main();
+        "#;
+    let crossings = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("cannot hold a view across"))
+        .count();
+    assert_eq!(crossings, 1, "expected exactly one crossing diagnostic");
+}
+
+#[test]
+fn a_body_with_both_await_spellings_reports_its_signature_once() {
+    // Mixed: the token settles the signature rule, so the call-site path never
+    // records a candidate for this body and the parameter is named once.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun stash(viewed: &mut Point) {
+            let beat = await tick();
+            let more = tick();
+            viewed.x = beat + more;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            stash(&mut point);
+        }
+        main();
+        "#;
+    let refusals = failure_diagnostics(source)
+        .into_iter()
+        .filter(|(message, _)| message.contains("cannot take '&mut' parameters"))
+        .count();
+    assert_eq!(refusals, 1, "expected exactly one signature diagnostic");
+}
+
+#[test]
+fn a_declared_async_body_that_never_suspends_keeps_its_view_parameters() {
+    // THE composition with B29, at function granularity. The gate asks what
+    // the BODY does, never what the declaration says: a JS `async function`
+    // runs synchronously to its first `await`, so a body with no suspension
+    // point never yields and its view parameter is safe for exactly as long as
+    // it is the body's own. Tightening the gate to declared asyncness — the
+    // reading the filing warned against — would redden this and, with it,
+    // `a_declared_async_impl_of_a_sync_trait_method_is_permitted`.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun quiet(viewed: &mut Point) {
+            viewed.x = 5;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            quiet(&mut point);
+        }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn calling_an_async_impl_of_a_sync_trait_method_suspends_the_caller() {
+    // The other side of the same composition, and the RUNTIME truth decides
+    // it: B29 lets `S`'s `m` be `async` under a sync trait declaration, and
+    // `async_infer` propagates that through the contract — the emission is
+    // `await (m(s))` inside `caller`. An `await` yields to the microtask queue
+    // even for an already-resolved promise, so `caller`'s views really are
+    // held across a suspension and the rule must say so. B29's own pin never
+    // calls `m`, which is why both hold.
+    let source = r#"
+        trait T { fun m(&self): void; }
+        struct S {}
+        impl S with T { async fun m(&self): void {} }
+        struct Point { x: i32, y: i32 }
+        fun caller(viewed: &mut Point, s: &S) {
+            s.m();
+            viewed.x = 5;
+        }
+        fun main() {
+            mut point = Point { x = 1, y = 2 };
+            let s = S {};
+            caller(&mut point, &s);
+        }
+        main();
+        "#;
+    assert_fails_spanning(source, "viewed", "cannot take '&mut' parameters");
+}
+
+#[test]
+fn a_sync_call_with_a_view_live_across_it_stays_legal() {
+    // The NEGATIVE. Nothing in this program can suspend, so a view lives
+    // across the call untouched — the rule must not fire on a call merely for
+    // being a call.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        fun beat(): i32 { 7 }
+        fun flow() {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let value = beat();
+            view.x = value;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a_sync_call_inside_an_async_body_keeps_a_live_view_legal() {
+    // The negative again, one frame in: an async CALLER is not a suspension —
+    // only the suspension points inside it are — so a purely sync call with a
+    // view live across it compiles inside an `async fun` too.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        fun beat(): i32 { 7 }
+        async fun flow() {
+            let _warm = tick();
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let value = beat();
+            view.x = value;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn a_view_declared_after_an_implicit_await_stays_legal() {
+    // Ordering: liveness runs from the declaration, so a suspension BEFORE the
+    // view is not a crossing. The same conservatism E3 has always had, now
+    // applied to the implicit spelling.
+    assert_compiles(
+        r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow() {
+            let beat = tick();
+            mut point = Point { x = beat, y = 2 };
+            let view = &mut point;
+            view.x = 9;
+        }
+        fun main() { flow(); }
+        main();
+        "#,
+    );
+}
+
+#[test]
+fn an_implicit_await_nested_in_a_branch_still_crosses_a_live_view() {
+    // Nested: the suspension is inside an `if` arm, the view outside it.
+    let source = r#"
+        struct Point { x: i32, y: i32 }
+        async fun tick(): i32 { 1 }
+        async fun flow(flag: bool) {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            if flag {
+                let beat = tick();
+                view.x = beat;
+            }
+        }
+        fun main() { flow(true); }
+        main();
+        "#;
+    assert_fails_with(source, "cannot hold a view across the implicit 'await'");
+}
+
+#[test]
+fn an_implicit_await_in_a_for_mut_loop_crosses_the_loop_binding() {
+    // Nested, and the view is the LOOP BINDING — live across every iteration.
+    let source = r#"
+        async fun tick(): i32 { 1 }
+        async fun stream() {
+            mut items = [ 1, 2, 3 ];
+            for e in &mut items {
+                let _beat = tick();
+            }
+        }
+        fun main() { stream(); }
+        main();
+        "#;
+    assert_fails_with(source, "cannot hold a view across the implicit 'await'");
+}
+
+#[test]
+fn an_implicit_await_of_a_method_names_the_method_in_the_crossing() {
+    // The diagnostic's voice on a receiver call: the callee is resolved
+    // through the wired subject, so the message names `tick`, not the
+    // receiver.
+    let source = r#"
+        struct Clock { ticks: i32 }
+        impl Clock {
+            async fun tick(&self): i32 { 1 }
+        }
+        struct Point { x: i32, y: i32 }
+        async fun flow(clock: Clock) {
+            mut point = Point { x = 1, y = 2 };
+            let view = &mut point;
+            let beat = clock.tick();
+            view.x = beat;
+        }
+        fun main() { flow(Clock { ticks = 0 }); }
+        main();
+        "#;
+    assert_fails_with(source, "the implicit 'await' of 'tick'");
 }
 
 #[test]
@@ -22548,7 +24752,9 @@ fn a_fn_typed_binding_checks_its_arguments() {
 #[test]
 fn a_fn_typed_binding_checks_its_arity() {
     // The arity check comes from the same path, so it reports the declaration's
-    // parameter count rather than silently accepting.
+    // parameter count rather than silently accepting — and (S4,
+    // editing-dx.md §6.2) names it by the DECLARATION's name, `helper`, even
+    // though the call goes through the binding `f`.
     assert_fails_with(
         r#"
         fun helper(i: i32): i32 {
@@ -22560,7 +24766,246 @@ fn a_fn_typed_binding_checks_its_arity() {
             let bad = f(1, 2);
         }
         "#,
-        "Expected 1 argument, but got 2 instead.",
+        "`helper` expects 1 argument, but got 2 instead.",
+    );
+}
+
+// --- S4: count messages name their subject (editing-dx.md §6-7) -----------
+// `Expected 2 arguments, but got 1 instead.` named neither the callee nor
+// what was missing; a struct-field count named neither the struct. Both now
+// do, and the too-few direction also names the missing parameter/field by
+// name and (for a call) its declared type — arguments and fields bind
+// positionally/by-name, so which one is missing is unambiguous. Too many
+// names the callee (P15/P16) but, for a call, not which argument is extra
+// (B4: no principled guess); a struct literal's extra field IS identifiable
+// (P18), since fields are named.
+
+// P15 — a plain function call, too few arguments.
+#[test]
+fn call_argument_count_too_few_names_the_callee_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "(3)",
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+}
+
+// P15 — the same call, too many arguments: the callee is named; which
+// argument is extra is not (B4 — no principled guess).
+#[test]
+fn call_argument_count_too_many_names_only_the_callee() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3, 4, 5);
+        }
+        "#,
+        "(3, 4, 5)",
+        "`distance` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 "declared here" note (editing-dx.md §17.3, the residual §16
+// deferred): an arity mismatch also notes the callee's OWN declaration, in
+// the wording the codebase already uses for this note
+// (``` `{name}` is declared here ```, const_eval.rs / init_order.rs) — so a
+// call far from its definition doesn't leave the reader hunting for it.
+#[test]
+fn call_argument_count_notes_the_callees_declaration() {
+    assert_fails_noting(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "`distance` expects 2 arguments",
+        "distance",
+        "`distance` is declared here",
+    );
+}
+
+// P16 — a method call behaves identically, naming the METHOD (not the
+// receiver or the struct).
+#[test]
+fn method_argument_count_too_few_names_the_method_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "(1)",
+        "`shift` expects 2 arguments, but got 1 instead: `dy: i32` is missing.",
+    );
+}
+
+#[test]
+fn method_argument_count_too_many_names_only_the_method() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1, 2, 3);
+        }
+        "#,
+        "(1, 2, 3)",
+        "`shift` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// The C3 note again, for a METHOD's arity: notes the method's own
+// declaration inside `impl Point`, not the struct itself — `declared_here_
+// note` resolves `member_id` the same way `callable_name` does.
+#[test]
+fn method_argument_count_notes_the_methods_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "`shift` expects 2 arguments",
+        "shift",
+        "`shift` is declared here",
+    );
+}
+
+// P17 — a wrapped argument list clamps its span to the first line: a count
+// is a property of the whole list, not of how many lines the formatter
+// split it across (§13.3). Checked by byte offset, not `assert_fails_spanning`,
+// because the clamped span is not a source SUBSTRING (it ends mid-line at
+// the newline, not at a token boundary the snippet-search would find).
+#[test]
+fn call_argument_count_span_clamps_to_the_first_line_of_a_wrapped_list() {
+    let source = "
+        fun distance(x: i32, y: i32): i32 {
+        \tx + y
+        }
+
+        fun main() {
+        \tdistance(
+        \t\t3,
+        \t);
+        }
+        ";
+    let diagnostics = failure_diagnostics(source);
+    let (message, range) = diagnostics
+        .iter()
+        .find(|(message, _)| message.contains("`distance` expects 2 arguments"))
+        .expect("the arity diagnostic is published");
+    assert_eq!(
+        message,
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+    let call_open_paren = source.rfind("distance(").unwrap() + "distance".len();
+    let first_line_end = source[call_open_paren..].find('\n').unwrap() + call_open_paren;
+    assert_eq!(
+        range.start, call_open_paren,
+        "starts at the argument list's `(`"
+    );
+    assert!(
+        range.end <= first_line_end,
+        "clamped to the first line: {range:?} runs past {first_line_end} into the second"
+    );
+    assert!(
+        range.end > call_open_paren,
+        "not clamped into nothing: {range:?}"
+    );
+}
+
+// P18 — a struct initializer, too few fields: names the struct and the
+// missing field; the brace region stays the anchor (the gap has no
+// narrower home).
+#[test]
+fn struct_initializer_field_count_too_few_names_the_struct_and_the_missing_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "{ x = 3 }",
+        "`Point` expects 2 fields, but got 1 instead: `y` is missing.",
+    );
+}
+
+// P18 — too many fields: unlike an extra call argument, an extra struct
+// field IS identifiable (fields are named), so this direction gets a steer
+// too, and the anchor moves to the offending field's NAME.
+#[test]
+fn struct_initializer_field_count_too_many_names_the_struct_and_spans_the_extra_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3, y = 4, z = 5 };
+        }
+        "#,
+        "z",
+        "`Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`.",
+    );
+}
+
+// The C3 note for a struct-field count mismatch: notes the struct's OWN
+// declaration, the same wording and mechanism as the call-arity notes
+// above, built by hand at the initializer's own push site (the subject is
+// a `Struct`, which `declared_here_note` — scoped to callables — does not
+// resolve).
+#[test]
+fn struct_initializer_field_count_notes_the_structs_declaration() {
+    assert_fails_noting(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "`Point` expects 2 fields",
+        "Point",
+        "`Point` is declared here",
     );
 }
 
@@ -26729,6 +29174,107 @@ fn hashable_builds_a_reusable_container() {
         }
         "#,
         "2\n1\n",
+    );
+}
+
+#[test]
+fn b110_two_hashes_compare_with_partial_eq() {
+    // hashable-keys.md §3.2/§8: `Hash` is `==`-comparable, so equal values hash
+    // equal and different values do not — over a primitive, a string, and a
+    // derived aggregate. The impl existed only on paper: `==` on a `Hash`
+    // reported "type 'Hash' does not implement the `PartialEq` operator".
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        [derive(Hashable)]
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+            let k = 7;
+            print(k.hash() == k.hash());        // true
+            print(k.hash() == 8.hash());        // false
+            print("a".hash() == "a".hash());    // true
+            print("a".hash() == "b".hash());    // false
+            let p = Point { x = 1, y = 2 };
+            print(p.hash() == Point { x = 1, y = 2 }.hash());  // true
+            print(p.hash() == Point { x = 9, y = 2 }.hash());  // false
+            print(p.hash() != Point { x = 9, y = 2 }.hash());  // true
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_equality_does_not_recurse_into_its_own_impl() {
+    // The reason `eq`'s body is `hashes_equal` and not `self == b`: `Hash` is
+    // opaque and NOT a native-operator type, so a `==` in the body dispatches
+    // back into this same impl — `function eq(self, b) { return eq(self, b); }`,
+    // which stack-overflowed at runtime while compiling clean. The `.eq()` call
+    // reaches the body directly, so it is the arm the operator lowering skips.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash().eq(1.hash()));  // true
+            print(1.hash().eq(2.hash()));  // false
+            print(1.hash().ne(2.hash()));  // true — the inherited default
+        }
+        "#,
+        "true\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn b110_hash_satisfies_a_partial_eq_bound() {
+    // What the impl buys beyond the operator: `Hash` now grounds a
+    // `T: PartialEq` bound, so it nests in the conditional impls and in generic
+    // user code. `Option<Hash>` is the conditional impl; `same` is the bound.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::compare::PartialEq;
+        import std::hash::{ Hashable, Hash };
+        import std::option::Option::{ self, Some, None };
+
+        fun same<T: PartialEq>(a: T, b: T): bool {
+            a == b
+        }
+
+        fun main() {
+            print(same(1.hash(), 1.hash()));  // true
+            print(same(1.hash(), 2.hash()));  // false
+            let here: Option<Hash> = Some(1.hash());
+            print(here == Some(1.hash()));    // true
+            print(here == Some(2.hash()));    // false
+            print(here == None);              // false
+        }
+        "#,
+        "true\nfalse\ntrue\nfalse\nfalse\n",
+    );
+}
+
+#[test]
+fn b110_hash_is_still_not_ordered_or_arithmetic() {
+    // `Hash` gained equality, not the rest of the operator surface. It is
+    // deliberately absent from `is_native_operator_type` for exactly this: an
+    // opaque key has no order, and `<` on one would compare canonical JSON
+    // strings lexicographically.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+
+        fun main() {
+            print(1.hash() < 2.hash());
+        }
+        "#,
+        "does not implement the `PartialOrd` operator",
     );
 }
 
@@ -31196,6 +33742,302 @@ fn r10_leaves_a_generic_aggregate_over_a_resource_alone() {
     );
 }
 
+// --- B103: R10 is asked of an INFERRED container too — containment decides -----
+// --- whatever the type's provenance (destruction.md §4 R10).
+
+/// A resource whose teardown is observable, for the B103 routes. Each route is
+/// the SAME program in a different spelling: a `List` (or `Shared`, or a tuple)
+/// holding a `Guard`, with nothing written down for the walk to record.
+fn b103_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Guard {{ label: str }}
+        impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn r10_refuses_an_inferred_list_of_a_resource() {
+    // The filed repro. `mut arr: List<Guard> = [..]` was rejected as designed and
+    // the same program with the annotation DELETED compiled — and leaked, since a
+    // `List` is not a resource by containment and the binding took no teardown.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr = [Guard { label = "one" }];
+            print("end");
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_grown_from_an_empty_literal() {
+    // The element type arrives at the `push`, not at the literal — an empty
+    // literal mints an inference slot (B16), and the slot grounds to `Guard`.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr = [];
+            arr.push(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_from_an_inferred_return_type() {
+    // No annotation anywhere: the function's return type is inferred from its
+    // tail, and the caller's binding from the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun make() { [Guard { label = "one" }] }
+        fun main() {
+            let xs = make();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_a_generic_hands_back_at_a_resource() {
+    // `List<T>` is written, but it is a container at a RESOURCE only where `T`
+    // binds — and that binding is inferred at the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun wrap<T>(own value: T): List<T> { [value] }
+        fun main() {
+            let xs = wrap(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_a_closure_returns() {
+    // A closure's return type is never written, so the container exists only in
+    // the solver's answer for the call.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let make = || [Guard { label = "one" }];
+            let xs = make();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_reached_through_an_inferred_aggregate() {
+    // A19's per-instantiation descent, at an instantiation nobody wrote:
+    // `Inner<Guard>` comes from the field initializer's type.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        struct Inner<T> { items: List<T> }
+        fun main() {
+            let holder = Inner { items = [Guard { label = "one" }] };
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`, reached through `Inner.items`",
+    );
+}
+
+#[test]
+fn r10_refuses_an_inferred_shared_of_a_resource() {
+    // Not only `List`: every rejecting head is asked the same question, and
+    // `Shared::new(..)` names none of them.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`Shared` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_nested_inside_an_inferred_list() {
+    // The descent now enters a container's OWN type arguments. `List<List<Guard>>`
+    // holds no resource argument — `List<Guard>` is not a resource — so the outer
+    // head alone answers "no", and the inner spelling that used to carry the
+    // report does not exist here.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut nested = [[Guard { label = "one" }]];
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_inside_an_inferred_tuple() {
+    // A tuple is a value aggregate with no head to ask, and the descent had no
+    // arm for one at all.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let pair = (1, [Guard { label = "one" }]);
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_list_argument_bound_to_a_generic_parameter() {
+    // The container type exists only as the callee's `List<T>` and the argument's
+    // own (unrecorded) type: R10 asked per instantiation is what sees it.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun consume<T>(own items: List<T>) {}
+        fun main() {
+            consume([Guard { label = "one" }]);
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_a_generic_body_builds() {
+    // The half no whole-program sweep can reach: the `List<Guard>` exists only
+    // INSIDE the instantiated body, and the caller's program never has the type.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun stash<T>(own value: T) { let items = [value]; }
+        fun main() {
+            stash(Guard { label = "one" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_refuses_a_container_temporary_that_binds_no_name() {
+    // Nothing records this list's type: it is never bound, and `len` is native so
+    // there is no body for the per-instantiation scan. The method call's own
+    // substitution is where the receiver's type is written down.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            let count = [Guard { label = "one" }].len();
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_reports_an_inferred_container_once_per_container() {
+    // The multiplicity IS the claim (B5). The inferred type reaches the check
+    // from the literal, the binding, both reads, and the `Inner<Guard>` holding
+    // it — and a second binding of the same type is the same fact.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut first = [Guard { label = "one" }];
+            mut second = [Guard { label = "two" }];
+            first.push(Guard { label = "three" });
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_reports_an_annotated_container_once_even_though_inference_agrees() {
+    // The written spelling keeps its anchor and its single report: the inferred
+    // tier never repeats a container a spelling already named.
+    assert_fails_once_with(
+        &b103_program(
+            r#"
+        fun main() {
+            mut arr: List<Guard> = [Guard { label = "one" }];
+        }
+        "#,
+        ),
+        "`List` cannot hold the resource `Guard`",
+    );
+}
+
+#[test]
+fn r10_leaves_an_inferred_container_of_data_alone() {
+    // The other direction, and the reason the sweep cannot simply reject every
+    // inferred container: a `List` of data is the ordinary case, and the resource
+    // beside it drops on its own.
+    assert_compiles_and_runs(
+        &b103_program(
+            r#"
+        fun main() {
+            mut names = ["a"];
+            names.push("b");
+            let held = Guard { label = "one" };
+            print(i"{names.len()}");
+        }
+        "#,
+        ),
+        "2\ndropped one\n",
+    );
+}
+
+#[test]
+fn r10_leaves_an_inferred_fixed_array_of_resources_alone() {
+    // The pinned control, in the inferred spelling: `[Guard; 2]` is a value
+    // aggregate, a resource BY CONTAINMENT, and it drops in reverse element
+    // order — which is why R10 must not reach it, annotation or none.
+    assert_compiles_and_runs(
+        &b103_program(
+            r#"
+        fun main() {
+            let pair: [Guard; 2] = [Guard { label = "one" }, Guard { label = "two" }];
+            print("end");
+        }
+        "#,
+        ),
+        "end\ndropped two\ndropped one\n",
+    );
+}
+
 // --- R12: a resource cannot coerce to `any` (argument, binding, return) --------
 
 #[test]
@@ -31308,6 +34150,10 @@ fn derive_partialeq_rejects_a_resource_field() {
 #[test]
 fn derive_accepts_a_data_type() {
     // The control: the same three derives on a plain-data struct compile.
+    // `Json` is deliberately not added here — `Wire` already synthesizes the
+    // `Json`/`FromJson` impls (§3.9), so combining the two derives on one
+    // type is a duplicate-impl conflict unrelated to this file's checks;
+    // Json's own no-resource control is `b120_a_json_derived_struct_with_no_resource_stays_legal`.
     assert_compiles(
         r#"
         [derive(Wire, Hashable, PartialEq)]
@@ -33974,6 +36820,220 @@ fn containment_only_resource_drops_its_fields() {
         }
         "#,
         "body\nitem\n",
+    );
+}
+
+// === B113: the PLAIN-struct containment matrix, verified 2026-08-10 ============
+// B109's arc observed a struct with a resource FIELD running no scope-end
+// destructor and corrected a draft pin to match. The observation was PROBE
+// IDIOM, not a defect (destruction.md §3): its probe wrote `impl Res { fun
+// drop(own self) }` — an inherent method that happens to be spelled `drop` —
+// where the language hook is `impl Res with Drop { fun drop(&mut self) }`, so
+// no destructor was ever registered and none could run. The control that
+// exonerates containment is `b113_an_inherent_method_named_drop_never_runs`
+// below: the SAME idiom is equally silent on a bare resource with no
+// containing struct at all.
+//
+// Every shape below tears down correctly, and each is its own pin per the
+// per-case rule. The declared-`resource` twin is
+// `containment_only_resource_drops_its_fields` directly above; the enum-payload
+// shape is `drop_enum_payload_drops_with_the_value`; the fixed-array shape is
+// `an_element_write_drops_the_old_value`'s trailing teardown.
+
+/// The B113 matrix's shared prelude: a leaf resource that announces its
+/// teardown. Each shape supplies its own containing type, which is the one
+/// variable under test.
+fn b113_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::print;
+        import std::drop::Drop;
+        resource struct Leaf {{ tag: str }}
+        impl Leaf with Drop {{ fun drop(&mut self) {{ print(self.tag); }} }}
+        {body}
+        "#
+    )
+}
+
+#[test]
+fn b113_a_plain_struct_with_a_resource_field_drops_it_at_scope_end() {
+    // THE question B113 asks. A struct with no `resource` modifier of its own is
+    // a resource by containment (destruction.md §3), so its local takes the
+    // scope-end teardown and the contained leaf is destroyed.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            let bag = Bag { item = Leaf { tag = "leaf" } };
+            print("body");
+        }
+        "#,
+        ),
+        "body\nleaf\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_struct_drops_its_resource_fields_in_reverse_declaration_order() {
+    // The order rule (§5) does not care that the aggregate is a resource only by
+    // inference: fields drop in reverse declaration order either way.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { first: Leaf, second: Leaf }
+        fun main() {
+            let bag = Bag { first = Leaf { tag = "first" }, second = Leaf { tag = "second" } };
+            print("body");
+        }
+        "#,
+        ),
+        "body\nsecond\nfirst\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_struct_nested_in_a_plain_struct_drops_transitively() {
+    // Containment is RECURSIVE: neither aggregate is declared `resource`, and
+    // the leaf is two levels down. The trailing field drops before the nested
+    // aggregate's, whose own fields then drop in reverse — one order rule
+    // applied at each level.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Inner { one: Leaf, two: Leaf }
+        struct Outer { inner: Inner, tail: Leaf }
+        fun main() {
+            let outer = Outer {
+                inner = Inner { one = Leaf { tag = "one" }, two = Leaf { tag = "two" } },
+                tail = Leaf { tag = "tail" },
+            };
+            print("body");
+        }
+        "#,
+        ),
+        "body\ntail\ntwo\none\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_containment_struct_moved_into_an_own_parameter_drops_in_the_callee() {
+    // R3 + §5: the move hands ownership to the callee, whose scope end runs the
+    // teardown — so the leaf is destroyed BEFORE the caller's next statement.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun sink(own bag: Bag) { print("in-sink"); }
+        fun main() {
+            let bag = Bag { item = Leaf { tag = "leaf" } };
+            sink(bag);
+            print("after");
+        }
+        "#,
+        ),
+        "in-sink\nleaf\nafter\n",
+    );
+}
+
+#[test]
+fn b113_overwriting_a_plain_containment_struct_drops_the_old_value() {
+    // R2 over an inferred resource: the outgoing aggregate's field is destroyed
+    // at the write, the incoming one at the scope end.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            mut bag = Bag { item = Leaf { tag = "first" } };
+            print("before");
+            bag = Bag { item = Leaf { tag = "second" } };
+            print("after");
+        }
+        "#,
+        ),
+        "before\nfirst\nafter\nsecond\n",
+    );
+}
+
+#[test]
+fn b113_a_returned_plain_containment_struct_drops_at_the_callers_scope_end() {
+    // R4: the return moves the aggregate out, so the callee's scope end must NOT
+    // destroy it — the single teardown belongs to the caller's binding.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun make(): Bag { Bag { item = Leaf { tag = "leaf" } } }
+        fun main() {
+            let bag = make();
+            print("body");
+        }
+        "#,
+        ),
+        "body\nleaf\n",
+    );
+}
+
+#[test]
+fn b113_a_tuple_local_drops_its_resource_members_in_reverse_order() {
+    // The positional aggregate, which had only a component-WRITE pin
+    // (`a_tuple_component_write_drops_the_old_value`) and no scope-end one: a
+    // tuple is a value aggregate, so any resource member marks the whole.
+    assert_compiles_and_runs(
+        &b113_program(
+            r#"
+        fun main() {
+            let pair = (Leaf { tag = "a" }, Leaf { tag = "b" });
+            print("body");
+        }
+        "#,
+        ),
+        "body\nb\na\n",
+    );
+}
+
+#[test]
+fn b113_a_plain_containment_struct_is_move_only() {
+    // The other half of "containment decides": inference does not buy teardown
+    // alone, it buys the whole R-rule surface. A plain struct holding a resource
+    // moves on binding exactly as a declared one does.
+    assert_fails_with(
+        &b113_program(
+            r#"
+        struct Bag { item: Leaf }
+        fun main() {
+            let a = Bag { item = Leaf { tag = "leaf" } };
+            let b = a;
+            print(a.item.tag);
+        }
+        "#,
+        ),
+        "after it was moved",
+    );
+}
+
+#[test]
+fn b113_an_inherent_method_named_drop_never_runs() {
+    // The control that diagnoses B109's observation, and the reason it is filed
+    // here rather than as a defect. `impl Leaf { fun drop(own self) }` declares
+    // an ordinary method whose name happens to be `drop`; the language hook is
+    // the TRAIT impl (`impl Leaf with Drop`, `&mut self` — a by-value receiver
+    // on the trait is rejected by `a_drop_impl_with_a_by_value_receiver_is_rejected`).
+    // So no destructor is registered and nothing runs — and the subject here is
+    // a BARE resource local with no containing struct at all, which is what
+    // clears containment: the silence is identical with and without it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource struct Leaf { tag: str }
+        impl Leaf { fun drop(own self) { print(i"drop {self.tag}"); } }
+        fun main() {
+            let leaf = Leaf { tag = "leaf" };
+            print("body");
+        }
+        "#,
+        "body\n",
     );
 }
 
@@ -45221,9 +48281,9 @@ fn b74_a_static_and_a_method_of_one_name_collide() {
     // The truth about namespaces, pinned: there is only ONE. `declarations` is
     // keyed by name alone, and the static is the declaration that dies —
     // `Bag::tag()` resolves the inherent METHOD first and then fails on arity
-    // ("Expected 1 argument, but got 0"), a report of a declaration that was
-    // never reachable by either call form. So they collide, and the error lands
-    // where the fix does.
+    // ("`tag` expects 1 argument, but got 0 instead"), a report of a
+    // declaration that was never reachable by either call form. So they
+    // collide, and the error lands where the fix does.
     assert_fails_spanning_nth(
         r#"
         struct Bag { n: i32 }
@@ -48519,14 +51579,15 @@ fn b79_an_overflowing_discriminant_is_rejected_rather_than_zeroed() {
 }
 
 #[test]
-fn b79_the_i64_bounds_themselves_are_legal() {
-    // The negative bound is one PAST the positive one, because the minus
-    // applies to the magnitude rather than being parsed into it — the same
-    // rule `-128i8` follows. Off-by-one here would reject a legal program.
+fn b79_the_bounds_themselves_are_legal() {
+    // Off-by-one here would reject a legal program. (B106 moved the bound from
+    // `i64` to `i53` and made it SYMMETRIC: `i64`'s negative end reaches one
+    // further only because two's complement does, and a JS number has no such
+    // asymmetry.)
     assert_compiles_and_runs(
         r#"
         import std::print;
-        enum Edge { Min = -9223372036854775808, Max = 9223372036854775807 }
+        enum Edge { Min = -9007199254740991, Max = 9007199254740991 }
         fun main() {
             print(match Edge::Min { Edge::Min => "min", Edge::Max => "max" });
         }
@@ -48541,10 +51602,10 @@ fn b79_a_discriminant_sequence_cannot_run_past_the_bound() {
     // debug compiler here and wrapped the release one.
     assert_fails_with(
         r#"
-        enum Edge { A = 9223372036854775807, B }
+        enum Edge { A = 9007199254740991, B }
         fun main() { }
         "#,
-        "variant 'B' continues the discriminant sequence past 9223372036854775807",
+        "variant 'B' continues the discriminant sequence past 9007199254740991",
     );
 }
 
@@ -49617,12 +52678,24 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     // `js::Node::Number` is — which is what makes the feature a widening rather
     // than a new lowering. Compared as WHOLE EMISSIONS, so a divergence
     // anywhere in the shape (a temp, a wrapper, a jump table) fails this.
+    //
+    // THE REFERENCE SHAPE MOVED, and §9.2's slice 2 asks that the weakening be
+    // written on the pin rather than absorbed silently. Under §9's ratified (b)
+    // the backed side's exhaustive match keeps its last variant test and gains a
+    // trap `else`, so the raw side is given the same shape — every value tested,
+    // a `_` arm last — instead of the two-test-plus-bare-`else` chain it used to
+    // be compared against. The claim this protects survives in a marginally
+    // WEAKER form: not "a backed match emits what a raw `str` match emits", but
+    // "a backed match emits what a raw `str` match WITH A TRAP ARM emits". That
+    // is still the whole of §1.4's point — the codegen path is shared, the trap
+    // included; what it no longer says is that a backed match costs a raw one's
+    // exact bytes.
     let backed = compile(
         r#"
         import std::print;
         enum Align { Start = "start", End = "end", Center = "center" }
-        fun classify(a: Align): i32 {
-            match a { Align::Start => 0, Align::End => 1, Align::Center => 2 }
+        fun classify(a: Align): str {
+            match a { Align::Start => "s", Align::End => "e", Align::Center => "c" }
         }
         fun main() { print(classify(Align::End)); }
         "#,
@@ -49631,16 +52704,726 @@ fn b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets() {
     let raw = compile(
         r#"
         import std::print;
-        fun classify(a: str): i32 {
-            match a { "start" => 0, "end" => 1, _ => 2 }
+        fun classify(a: str): str {
+            match a { "start" => "s", "end" => "e", "center" => "c", _ => "trap" }
         }
         fun main() { print(classify("end")); }
         "#,
     )
     .expect("a clean compile");
+    // The reference side cannot SPELL the trap — `__enum_trap` is a compiler
+    // helper, not a callable — so the two differences the trap arm makes are
+    // reconciled here, and named rather than hidden: the helper's own
+    // definition (emitted once per file, on demand) and the trap statement
+    // standing where the raw match's `_` arm assigns. Everything the pin is
+    // about — the chain, its temps, the tested constants, the arm the trap
+    // occupies — is still compared byte for byte.
+    let reference = format!(
+        "function __enum_trap(name, value) {{\n\
+         \tthrow name + \": \" + JSON.stringify(value) + \" is not one of its values\";\n\
+         }}\n{}",
+        raw.replace("$b = \"trap\";", "__enum_trap(\"Align\", $a);")
+    );
     assert_eq!(
-        backed, raw,
-        "a backed enum's match should emit exactly what the raw `str` match emits"
+        backed, reference,
+        "a backed enum's match should emit exactly what a raw `str` match with a trap arm emits"
+    );
+}
+
+// --- B76 §9: the trap arm --------------------------------------------------
+//
+// `backed-enums.md` §9, candidate (b) RATIFIED 2026-08-09. A backed enum lowers
+// to a bare host primitive, so §1.5's exhaustiveness proof is over the vilan
+// VARIANT SET and never was a proof about the runtime value's domain — the
+// host's. P12 measured where that gap is observable and it is one construct:
+// `is`, `==` and a `_`-armed match all answer `false`/`_` for a value outside
+// the set (honest), while an exhaustive match's last arm is a bare `else` that
+// answers with a confident wrong variant (P11). So every exhaustive match over
+// a backed enum now tests its last variant too and traps in the `else`.
+
+#[test]
+fn b76_an_exhaustive_string_backed_match_traps_instead_of_falling_through() {
+    // §9.5 slice 1, the `str` backing. Every variant is tested — including the
+    // last, which used to ride the bare `else` — and the `else` names the enum
+    // and the raw value.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() { print(label(Align::Center)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"} else if ($a === "flex-end") {"#),
+        "the LAST variant should get its own test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t__enum_trap(\"Align\", $a);\n\t}"),
+        "the `else` should be the trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("function __enum_trap(name, value) {"),
+        "the trap helper should be emitted on demand, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_an_exhaustive_integer_backed_match_traps_too() {
+    // §9.5 slice 1, the integer backing. §9's ruling is about the host
+    // boundary, not about strings — P14 measured the same delta on `Ordering`,
+    // the one backed enum std already shipped, and `vilan/test/enum-discriminant.mjs`
+    // is the corpus golden that moved for it.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Ordering { Less = -1, Equal = 0, Greater = 1 }
+        fun describe(order: Ordering): str {
+            match order { Ordering::Less => "less", Ordering::Equal => "equal", Ordering::Greater => "greater" }
+        }
+        fun main() { print(describe(Ordering::Greater)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a === 1) {"),
+        "the LAST variant should get its own test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Ordering\", $a);"),
+        "the `else` should be the trap, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_is_the_exhaustive_case_only() {
+    // §9's scope, from the other side. A match the author already gave a
+    // catch-all is not exhaustive-by-variants: its `_` is a real arm the author
+    // wrote and means, an out-of-set value takes it, and P12 calls that answer
+    // honest. Nothing changes — no extra test, no trap, no helper.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun label(align: Align): str {
+            match align { Align::Start => "s", _ => "other" }
+        }
+        fun main() { print(label(Align::End)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "a match with a user `_` arm should keep its bare `else`, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"other\";\n\t}"),
+        "the user's arm should still be the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_reaches_only_backed_enums() {
+    // §3.1(b)'s conjunction decides this, as it decides the lowering: an enum
+    // without a backing value keeps the `[index, ..data]` array form, whose
+    // `[0]` slot the language itself writes, so its exhaustiveness proof IS a
+    // proof about the runtime value and its bare `else` stays honest. `bool`
+    // lowers to a native scalar through its own special case rather than a
+    // backing value (§3.4 rejects a `bool` backing) and is not covered either.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Plain { A, B, C }
+        fun plain(p: Plain): str { match p { Plain::A => "a", Plain::B => "b", Plain::C => "c" } }
+        fun boolean(b: bool): str { match b { true => "t", false => "f" } }
+        fun opt(o: Option<i32>): i32 { match o { Option::Some(let n) => n, Option::None => 0 } }
+        fun main() { print(plain(Plain::C)); print(boolean(false)); print(opt(Option::Some(3))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "only a BACKED enum's match should trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"c\";\n\t}"),
+        "the plain enum's last arm should still be the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_the_trap_arm_fires_on_a_host_supplied_value() {
+    // The behavioral half, and B107's own repro (§9.2's P16): a function-typed
+    // parameter's parameter is a return position wearing a parameter's clothes
+    // — the HOST constructs the value — and before this the program printed
+    // `e`, `Align::End`, confidently, exit 0. It now trap. `forEach` is the
+    // host helper: it calls the handler with each element, so the second call
+    // hands vilan a value outside `Align`'s set with nothing in between.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("Array.prototype.forEach.call")]
+        external fun for_each_align(values: List<str>, handler: |Align| void): void;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            for_each_align([ "center" ], |a| print(label(a)));
+            for_each_align([ "middle" ], |a| print(label(a)));
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "c\n",
+        "the in-set value should still label normally"
+    );
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "the trap should name the enum and the raw value, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
+#[test]
+fn b76_the_trap_arm_reaches_the_edge_shapes_of_a_match() {
+    // The forms a one-happy-path pin would miss, all three in one emission.
+    //
+    // A ONE-VARIANT enum: the single arm used to BE the bare `else`, so the
+    // match emitted no test at all — now it tests and traps.
+    //
+    // A GUARDED final leg: the guard is still dropped, as it always was, and
+    // only the pattern test is kept. The trap answers for values outside the
+    // set, not for a guard that rejects an in-set one, so `Center if flag`
+    // followed by a bare `Center` behaves exactly as before.
+    //
+    // The SEQUENCE emission (B59): a guard needing statement slots turns the
+    // whole match into a flat `matched`-flag sequence rather than an else-if
+    // chain, a second emitter that has to grow the arm too. There the trap is
+    // the final `if (!matched)`.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum One { Only = "only" }
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        fun single(o: One): str { match o { One::Only => "o" } }
+        fun guarded(a: Align, flag: bool): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if flag => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun sequenced(a: Align, o: Option<i32>): str {
+            match a {
+                Align::Start => "s",
+                Align::Center if o is Option::Some(let n) && n > 1 => "c!",
+                Align::Center => "c",
+                Align::End => "e",
+            }
+        }
+        fun main() {
+            print(single(One::Only));
+            print(guarded(Align::End, false));
+            print(sequenced(Align::End, Option::None));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif ($a === \"only\") {\n\t\t$b = \"o\";\n\t} else {\n\t\t__enum_trap(\"One\", $a);\n\t}"),
+        "a one-variant match should test its single arm and trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else if ($c === \"flex-end\") {\n\t\t$d = \"e\";\n\t} else {\n\t\t__enum_trap(\"Align\", $c);\n\t}"),
+        "a guarded match's final leg should keep only its PATTERN test, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif (!($h)) {\n\t\t__enum_trap(\"Align\", $e);\n\t}"),
+        "the sequence emission should trap on the unmatched flag, got:\n{javascript}"
+    );
+    // And it still runs the in-set values the way it always did.
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\ne\ne\n",
+        "the in-set paths must be unchanged"
+    );
+}
+
+#[test]
+fn b114_the_trap_arm_reaches_a_nested_backed_pattern() {
+    // §11.6's residual, closed. `match p { Pair::Of(Align::Start) => .. }`
+    // dropped the LAST leg's whole condition, nested variant test included, so
+    // an out-of-set `Align` inside the payload landed on the last arm
+    // confidently. The trap question is now asked of the pattern TREE, and the
+    // value it names is the one the dropped test compared — the payload slot,
+    // not the subject.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else if ($a[0] === 0 && $a[1] === \"flex-end\") {\n\t\t$b = \"e\";\n\
+             \t} else {\n\t\t__enum_trap(\"Align\", $a[1]);\n\t}"
+        ),
+        "the final leg should keep its nested test and trap at the PAYLOAD slot, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\n",
+        "the in-set path must be unchanged"
+    );
+}
+
+#[test]
+fn b114_a_nested_trap_names_the_out_of_set_payload() {
+    // The behavior the emission buys: driven with a payload the host invented,
+    // the match says so instead of answering `Align::End`. `__enum_trap` throws
+    // a bare string, which is `panic()`'s shape.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::Start))); }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "s\nAlign: \"middle\" is not one of its values\n",
+        "the nested trap should name the enum and the raw payload value"
+    );
+}
+
+#[test]
+fn b114_a_trap_reads_through_every_payload_it_is_nested_under() {
+    // Two levels of payload, and a TUPLE subject — the two other ways a backed
+    // test rides in a condition. The accessor the trap names is
+    // `compile_pattern`'s own, so it tracks the nesting exactly.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun deep(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s", Outer::Of(Mid::Of(Align::End)) => "e" }
+        }
+        fun paired(a: Align, flag: bool): str {
+            match (a, flag) {
+                (Align::Start, true) => "st",
+                (Align::Start, false) => "sf",
+                (Align::End, true) => "et",
+                (Align::End, false) => "ef",
+            }
+        }
+        fun main() {
+            print(deep(Outer::Of(Mid::Of(Align::End))));
+            print(paired(Align::End, false));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $a[1][1]);"),
+        "a twice-nested payload should trap at the inner slot, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $c[0]);"),
+        "a tuple subject should trap at the tuple's own element, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\nef\n",
+        "the in-set paths must be unchanged"
+    );
+}
+
+#[test]
+fn b114_several_backed_tests_in_one_leg_name_the_one_that_left_its_set() {
+    // The question §11.6 filed as needing a message design §9 does not have:
+    // `Two::Of(Align::End, Display::Inline)` carries TWO backed tests, and which
+    // of them failed is not knowable from the leg's condition. It IS knowable by
+    // asking each value whether it is in its enum's set AT ALL, which is a
+    // different question from "did this leg match" — so §9's message stands and
+    // the trap block orders the tests instead. The last needs no membership
+    // check: it is what is left when none of the others answered.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Display { Block = "block", Inline = "inline" }
+        enum Two { Of(Align, Display) }
+        fun label(t: Two): str {
+            match t {
+                Two::Of(Align::Start, Display::Block) => "sb",
+                Two::Of(Align::Start, Display::Inline) => "si",
+                Two::Of(Align::End, Display::Block) => "eb",
+                Two::Of(Align::End, Display::Inline) => "ei",
+            }
+        }
+        fun main() { print(label(Two::Of(Align::End, Display::Inline))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif (!($a[1] === \"flex-start\" || $a[1] === \"flex-end\")) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t}\n\
+             \t\t__enum_trap(\"Display\", $a[2]);\n\t}"
+        ),
+        "the trap should ask each backed test for SET MEMBERSHIP in order, got:\n{javascript}"
+    );
+    let driven = format!(
+        "{javascript}\n\
+         try {{ label([ 0, \"middle\", \"inline\" ]); }} catch (error) {{ console.log(error); }}\n\
+         try {{ label([ 0, \"flex-end\", \"grid\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "ei\n\
+         Align: \"middle\" is not one of its values\n\
+         Display: \"grid\" is not one of its values\n",
+        "each direction should name the value that actually left its set"
+    );
+}
+
+#[test]
+fn b114_a_nested_backed_test_reaches_the_sequence_emitter_too() {
+    // B59's flat `matched`-flag emission is the second shape a match takes, and
+    // §11.3 had to teach the top-level trap about it. The nested trap arrives
+    // through the same appended leg, so it needs to learn nothing.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::option::Option;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair, o: Option<i32>): str {
+            match p {
+                Pair::Of(Align::Start) if o is Option::Some(let n) && n > 1 => "s!",
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+            }
+        }
+        fun main() { print(label(Pair::Of(Align::End), Option::None)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("\tif (!($d)) {\n\t\t__enum_trap(\"Align\", $a[1]);\n\t}"),
+        "the sequence emission should trap at the nested slot, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "e\n",
+        "the in-set path must be unchanged"
+    );
+}
+
+#[test]
+fn b114_a_match_carrying_no_backed_test_keeps_its_bare_else() {
+    // The NARROW rule, which is the true one. §11.6 warned the generalization
+    // "changes the emission of matches over UNBACKED enums", and it does not:
+    // the trap keys on a BACKED test, and an unbacked enum's discriminant is the
+    // compiler's own — its runtime domain IS its variant set, so there is
+    // nothing outside it to name. A nested LITERAL is the same argument for a
+    // primitive. Both keep the bare `else` they have always had, which is why
+    // the whole corpus moved zero bytes.
+    //
+    // B118 edited the literal half's program, not its claim. `Wrapped::Of(1),
+    // Wrapped::Of(2)` was accepted as total over an `i32` payload — shape (c)
+    // of the coverage walk's holes — so the leg carrying the literal is now a
+    // leg BEFORE an irrefutable one. It keeps its test either way, and the
+    // final leg still drops its condition with no trap behind it, which is all
+    // the narrow rule ever claimed here.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner) }
+        enum Wrapped { Of(i32) }
+        fun nested(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b" }
+        }
+        fun literal(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
+        }
+        fun main() { print(nested(Pair::Of(Inner::B))); print(literal(Wrapped::Of(2))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an unbacked nested test must not grow a trap, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif ($a[0] === 0 && $a[1][0] === 0) {\n\t\t$b = \"a\";\n\t} else {"),
+        "the unbacked final leg should still drop its condition, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\tif ($c[0] === 0 && $c[1] === 1) {\n\t\t$d = \"one\";\n\t} else {"),
+        "the literal leg should keep its nested test, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b114_a_written_catch_all_is_still_the_authors_own_arm() {
+    // P13's rule, unchanged one level down: a `_` the author wrote IS the trap
+    // arm, and the compiler must not add a second one behind it.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", _ => "other" }
+        }
+        fun main() { print(label(Pair::Of(Align::Start))); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "a written catch-all needs no trap behind it, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else() {
+    // §12.4's filed hazard, closed (backed-enums.md §13). The final leg
+    // carries no backed test, so `trap_tests` (the §12.1 mechanism) is empty
+    // and the leg's own condition is still dropped — but `Of`'s two legs,
+    // together, are its ONLY handler, both testing a specific `Align`
+    // literal. Reaching this point with the subject's tag actually `Of`
+    // means neither literal matched, which is possible only when the payload
+    // left `Align`'s set. The fix re-dispatches on the tag INSIDE the dropped
+    // leg's body: `Of` traps, and only the tag that owns the leg (`Other`)
+    // still runs the author's own arm.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "the bare `else` should re-dispatch on the tag, trapping `Of` and \
+         keeping `Other`'s own arm underneath, got:\n{javascript}"
+    );
+    assert_eq!(
+        run_js(&javascript).expect("a clean run"),
+        "o\n",
+        "the legitimate `Pair::Other` path must be unchanged"
+    );
+}
+
+#[test]
+fn b121_an_out_of_set_payload_in_an_earlier_leg_traps_instead_of_misfiling() {
+    // The behavior the emission buys: a host-invented `Of` payload traps
+    // instead of silently answering `Other`. Driven both ways, alongside the
+    // in-set control the analyzer itself cannot construct as `Pair::Of` with
+    // a bad `Align` — only `[0, "middle"]`, built by hand, can.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::Start)));
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "s\ne\no\nAlign: \"middle\" is not one of its values\n",
+        "every in-set path stays unchanged and the out-of-set `Of` payload \
+         names the enum and the raw value, not `Pair::Other`"
+    );
+}
+
+#[test]
+fn b121_two_partitioned_variants_each_trap_their_own_enum() {
+    // Generalizes the anchor to TWO tags each exhausted by backed literals
+    // (`Of`/`Align`, `Alt`/`Display`), with `Other` the true bare leg. The
+    // re-dispatch chains in the order the tags first appear, and each traps
+    // only its own enum — the K=1 shape per tag, §12.1's format unchanged.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Display { Block = "block", Inline = "inline" }
+        enum Pair { Of(Align), Alt(Display), Other }
+        fun label(p: Pair): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+                Pair::Alt(Display::Block) => "b",
+                Pair::Alt(Display::Inline) => "i",
+                Pair::Other => "o",
+            }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(
+            "\t} else {\n\
+             \t\tif ($a[0] === 0) {\n\
+             \t\t\t__enum_trap(\"Align\", $a[1]);\n\
+             \t\t} else if ($a[0] === 1) {\n\
+             \t\t\t__enum_trap(\"Display\", $a[1]);\n\
+             \t\t} else {\n\
+             \t\t\t$b = \"o\";\n\
+             \t\t}\n\
+             \t}"
+        ),
+        "both partitioned tags should chain, in declaration order, each \
+         trapping its own enum, got:\n{javascript}"
+    );
+    let driven = format!(
+        "{javascript}\n\
+         try {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n\
+         try {{ label([ 1, \"grid\" ]); }} catch (error) {{ console.log(error); }}\n\
+         console.log(label([ 2 ]));\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "o\n\
+         Align: \"middle\" is not one of its values\n\
+         Display: \"grid\" is not one of its values\n\
+         o\n",
+        "each tag should trap its own enum, and the true bare leg is unaffected"
+    );
+}
+
+#[test]
+fn b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap() {
+    // The mechanism's own boundary: a tag covered by an IRREFUTABLE payload
+    // leg of its own (`Pair::Of(let _)`) already matches THAT leg earlier in
+    // the else-if chain, so the re-dispatch's `Of` branch is unreachable —
+    // present in the source (harmless dead code) but never the path taken.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(let _) => "x", Pair::Other => "o" }
+        }
+        fun main() {
+            print(label(Pair::Of(Align::End)));
+            print(label(Pair::Other));
+        }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!("{javascript}\nconsole.log(label([ 0, \"middle\" ]));\n");
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "x\no\nx\n",
+        "an out-of-set `Align` under a leg that already covers `Of` unconditionally \
+         takes that leg, same as any other value — it never reaches the trap"
+    );
+}
+
+#[test]
+fn b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else() {
+    // §12.2's narrow rule extended to the new mechanism: an UNBACKED nested
+    // enum's runtime domain IS its variant set (the language wrote the
+    // discriminant), so `Of`'s two legs testing `Inner::A`/`Inner::B` carry
+    // no `BackedTest` at all — `earlier_variant_traps` never gets an entry
+    // for `Of`, and the final leg's bare `else` is exactly what it always
+    // was, byte for byte.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner), Other }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a", Pair::Of(Inner::B) => "b", Pair::Other => "o" }
+        }
+        fun main() { print(label(Pair::Other)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an all-unbacked match needs no trap of any kind, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("\t} else {\n\t\t$b = \"o\";\n\t}"),
+        "the final leg's bare `else` should be untouched, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b114_a_refutable_nested_pattern_is_not_exhaustive() {
+    // Found probing B114, and it is the analyzer's, not the trap's: `Pair` has
+    // one variant, so §1.5's by-name check called this total and the single leg
+    // became the bare `else`. `Pair::Of(Inner::B)` then ran the `Inner::A` arm.
+    // The right answer is a compile error naming the missing case — a trap
+    // would paper over a missing check with a runtime throw. Closed by B118's
+    // coverage walk, which asks the pattern TREE rather than its root.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Inner { A, B }
+        enum Pair { Of(Inner) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Inner::A) => "a" }
+        }
+        fun main() { print(label(Pair::Of(Inner::B))); }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Inner::B)",
     );
 }
 
@@ -50198,125 +53981,275 @@ fn b76_an_unbacked_enum_still_serializes_by_variant_name() {
     );
 }
 
-// --- B76 §7.2 (DEFERRED at ratification): an extern may not RETURN a backed
-// enum ------------------------------------------------------------------------
+// --- B76 §7.2, LIFTED (§9): an extern may RETURN a backed enum ---------------
 //
-// The parameter direction is safe — vilan constructs the value, so it is always
-// in the set. The return direction is not, and what happens then is the reason
-// for the deferral: an exhaustive `match` compiles its last arm to a bare
-// `else` (there is no "impossible" trap arm), so a host value outside the set
-// silently takes whichever arm happens to be last. It is not detectably wrong;
-// it is confidently the WRONG VARIANT. Host boundaries keep the wrapper /
-// `parse()` path, where an out-of-set value honestly yields `None`, until
-// backed enums grow a trap-arm story.
+// The deferral existed for one behavior — "confidently the wrong variant" — and
+// §9's trap arm removes it rather than re-arguing it. The refusal that stood in
+// the meantime is deleted, along with the hole B107 found in it: it worked by
+// ENUMERATING the positions a host can construct a value from (return type,
+// generic arguments, tuple elements, array elements) and had already missed
+// one, a function-typed parameter's parameters. The trap asks nothing about
+// provenance, so it has nothing to enumerate and nothing to miss.
+//
+// What is NOT claimed: the boundary still does not check. A host value outside
+// the set enters unremarked, exactly as an `external fun f(): i32` answering
+// `"hello"` does. `parse` is the non-panicking alternative and stays the shape
+// to reach for when an out-of-set value is an expected input rather than a bug.
 
 #[test]
-fn b76_an_external_fun_cannot_return_a_backed_enum() {
-    assert_fails_with(
+fn b76_an_external_fun_can_return_a_backed_enum() {
+    // The inversion of the refusal, at every shape it used to refuse: the bare
+    // enum, the integer backing, and the nested forms its walker followed
+    // (`Option<Align>`, `List<Align>`).
+    assert_compiles(
         r#"
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Align;
         fun main() { }
         "#,
-        "'get_align' is `external`, so it cannot return the backed enum 'Align'",
     );
-    // The message names the way out rather than only the prohibition (B6).
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        fun main() { }
-        "#,
-        "convert with `Align::parse`",
-    );
-    // The INTEGER backing is refused for the same reason — §7.2 is about the
-    // host boundary, not about strings.
-    assert_fails_with(
+    assert_compiles(
         r#"
         enum Code { Ok = 200, NotFound = 404 }
         [extern("getCode")]
         external fun get_code(): Code;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Code'",
     );
-}
-
-#[test]
-fn b76_the_refusal_reaches_a_backed_enum_nested_in_the_return_type() {
-    // `Option<Align>` and `List<Align>` carry a host-supplied backing value in
-    // exactly the same way, and the wrapper path is what each of them wants.
-    assert_fails_with(
+    assert_compiles(
         r#"
         import std::option::Option;
         enum Align { Start = "start", End = "end" }
         [extern("getAlign")]
         external fun get_align(): Option<Align>;
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
-    );
-    assert_fails_with(
-        r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        [extern("getAligns")]
         external fun get_aligns(): List<Align>;
         fun main() { }
         "#,
-        "cannot return the backed enum 'Align'",
+    );
+    // A backed enum on an `external struct`'s method, the receiver form the
+    // refusal also caught.
+    assert_compiles(
+        r#"
+        enum Align { Start = "start", End = "end" }
+        external struct Widget;
+        impl Widget {
+            [extern(method, "getAlign")]
+            external fun align(self): Align;
+        }
+        fun main() { }
+        "#,
     );
 }
 
 #[test]
-fn b76_the_refusal_is_the_return_direction_only() {
-    // The parameter direction is the whole point of the feature — the extern
-    // takes the enum, because the enum IS the string — and it stays legal, as
-    // does an unbacked enum in either direction.
-    assert_compiles(
+fn b76_an_external_returned_backed_enum_round_trips_and_traps() {
+    // The runtime proof, both directions in one program. `String` is the host
+    // helper: `String(x)` is `x` for a string, so the extern hands vilan
+    // whatever it is given — a legal value on the first call and `"middle"` on
+    // the second, which is exactly what §7.2 said nothing could stop.
+    //
+    // Nothing stops it now either. What changed is what happens next: the value
+    // reaches a `match` and is NAMED rather than becoming `Align::End`.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
-        enum Align { Start = "start", End = "end" }
-        [extern("setAlign")]
-        external fun set_align(value: Align): void;
-        fun main() { set_align(Align::Start); }
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("String")]
+        external fun host_align(text: str): Align;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            let legal = host_align("flex-end");
+            print(legal == Align::End);
+            print(label(legal));
+            print(label(host_align("middle")));
+        }
         "#,
     );
-    assert_compiles(
-        r#"
-        enum Plain { A, B }
-        [extern("getPlain")]
-        external fun get_plain(): Plain;
-        fun main() { }
-        "#,
+    assert_eq!(
+        stdout, "true\ne\n",
+        "a legal host value should round-trip as its variant"
     );
-    // The refusal does not depend on declaration order.
-    assert_fails_with(
-        r#"
-        [extern("getAlign")]
-        external fun get_align(): Align;
-        enum Align { Start = "start", End = "end" }
-        fun main() { }
-        "#,
-        "cannot return the backed enum 'Align'",
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "an out-of-set host value should trap, got:\n{stderr}"
     );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
 }
 
 #[test]
-fn b76_the_sanctioned_shape_is_the_backing_type_plus_parse() {
-    // What §7.2 steers to, compiled: the extern speaks the host's own type and
-    // `parse` is the guard, answering `None` for a value outside the set.
-    assert_compiles(
+fn b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration() {
+    // B107 / §9.2's P16, closed. `external fun on(handler: |Align| void)` is a
+    // return position wearing a parameter's clothes — the HOST constructs the
+    // value — and the refusal, which enumerated positions, compiled it clean
+    // and let a host `handler("middle")` print `e` at exit 0.
+    //
+    // It still compiles clean; the refusal is gone. The value is caught one
+    // step later, by the trap, which is the whole argument for (b) over (a):
+    // the guard is at the `else`, so the position the value came in through
+    // never had to be listed.
+    let (stdout, stderr, code) = compile_and_run_status(
         r#"
+        import std::print;
+        enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+        [extern("Array.prototype.forEach.call")]
+        external fun on_each_align(values: List<str>, handler: |Align| void): void;
+        fun label(align: Align): str {
+            match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+        }
+        fun main() {
+            on_each_align([ "flex-start" ], |a| print(label(a)));
+            on_each_align([ "middle" ], |a| print(label(a)));
+        }
+        "#,
+    );
+    assert_eq!(
+        stdout, "s\n",
+        "the in-set callback value should label normally"
+    );
+    assert!(
+        stderr.contains(r#"Align: "middle" is not one of its values"#),
+        "the callback's out-of-set value should trap, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
+}
+
+#[test]
+fn b76_the_parse_path_is_the_non_panicking_alternative() {
+    // What the deferral steered to is not retired by the lift — it is now the
+    // CHOICE. Bind the backing type and `parse` when an out-of-set value is an
+    // input you mean to handle; return the enum directly when it would be a
+    // bug. Both compile, and this pins the difference at runtime: `parse`
+    // answers `None` where the direct return would have trapped.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
         import std::option::Option;
-        enum Align { Start = "start", End = "end" }
-        [extern("getAlign")]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [extern("String")]
         [doc(hidden)]
-        external fun get_align_raw(): str;
-        fun get_align(): Option<Align> { Align::parse(get_align_raw()) }
-        fun main() { }
+        external fun host_align_raw(text: str): str;
+        fun host_align(text: str): Option<Align> { Align::parse(host_align_raw(text)) }
+        fun main() {
+            print(match host_align("flex-end") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+            print(match host_align("middle") {
+                Option::Some(let a) => a.value(),
+                Option::None => "none",
+            });
+        }
+        "#,
+        "flex-end\nnone\n",
+    );
+}
+
+// --- B76 §4.2/§9.6: `json.vl`'s kind() family ---------------------------------
+//
+// §4.2's contingency, taken now that §7.2 has lifted. `kind()` returns the
+// backed enum `JsonKind` and the four `is_*` predicates delete; §9.6's corrected
+// shape is that the 13 in-file sites are `==` comparisons, NOT a match — so
+// they pay nothing (`$a === "number"` either way), they gain no trap, and
+// §4.2's "covered for free by exhaustiveness" was wrong about them.
+//
+// What the closed type buys is that `Object` and `Null` — the two members of
+// the documented set that never got a predicate — are now as usable as the
+// other four.
+
+#[test]
+fn b76_json_kind_is_a_backed_enum_carrying_the_intrinsic_strings() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let value = parse_json_value("{\"n\":1,\"s\":\"x\",\"b\":true,\"a\":[],\"z\":null}");
+            print(value.kind() == JsonKind::Object);
+            print(value.field("n").kind() == JsonKind::Number);
+            print(value.field("s").kind() == JsonKind::String);
+            print(value.field("b").kind() == JsonKind::Bool);
+            print(value.field("a").kind() == JsonKind::Array);
+            // The two members that never got a predicate, now first-class.
+            print(value.field("z").kind() == JsonKind::Null);
+            print(JsonKind::Number.value());
+        }
+        "#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\nnumber\n",
+    );
+}
+
+#[test]
+fn b76_json_kind_comparisons_emit_what_the_predicates_compiled_to() {
+    // §9.6's first claim, checked in bytes: the site is the same `===` against
+    // the same literal `is_number()`'s body used to compile to, and the wrapper
+    // is no longer emitted at all (emission is demand-driven, §8.2(a)). That is
+    // why the rewrite is a net REDUCTION rather than a cost.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() { print(parse_json_value("1").kind() == JsonKind::Number); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains(r#"__json_kind("#),
+        "the intrinsic should still be the whole of it, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains(r#" === "number""#),
+        "the comparison should be against the raw string, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("function is_number"),
+        "the deleted predicate should emit nothing, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("__enum_trap"),
+        "an `==` is not a match, so §9.6 pays no trap cost, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b76_a_json_kind_outside_the_set_compares_false_and_traps_in_a_match() {
+    // The honest edge, recorded rather than papered over. A `JsonValue` is
+    // whatever the host handed over, so `field()` on an absent key is
+    // `undefined`, whose kind is none of the six. `==` answers `false` — the
+    // behavior the `is_*` predicates had — and an exhaustive `match` over
+    // `JsonKind` is the construct that says so instead of guessing, which is
+    // exactly what §9's trap is for.
+    let (stdout, stderr, code) = compile_and_run_status(
+        r#"
+        import std::print;
+        import std::json::{ JsonKind, parse_json_value };
+        fun main() {
+            let absent = parse_json_value("{}").field("nope");
+            print(absent.kind() == JsonKind::Null);
+            print(absent.kind() == JsonKind::Object);
+            print(match absent.kind() {
+                JsonKind::Null => "null",
+                JsonKind::Bool => "bool",
+                JsonKind::Number => "number",
+                JsonKind::String => "string",
+                JsonKind::Array => "array",
+                JsonKind::Object => "object",
+            });
+        }
         "#,
     );
+    assert_eq!(
+        stdout, "false\nfalse\n",
+        "`==` should answer false for a kind outside the set"
+    );
+    assert!(
+        stderr.contains(r#"JsonKind: "undefined" is not one of its values"#),
+        "an exhaustive match should trap naming the raw kind, got:\n{stderr}"
+    );
+    assert_ne!(code, 0, "a trapped program must not exit 0");
 }
 
 // --- B76 §4.2: std's eleven CSS wrappers, deleted ----------------------------
@@ -50368,4 +54301,2513 @@ fn b76_style_wrappers_still_write_the_same_declaration() {
         "#,
         "sfatq7m s1g8z7cm\nclosest-corner\n",
     );
+}
+
+// A RESOURCE backed enum: the conversions used to be synthesized for it, and
+// `fun value(self)` reads a resource out of a loan — so the declaration itself
+// failed, with an error about a body the author never wrote. A resource's
+// identity is not its copyable backing value (the rule `check_hashable_boundary`
+// already states for a resource field), so it is offered neither conversions nor
+// `Hashable`.
+
+#[test]
+fn a_resource_backed_enum_declares_without_synthesized_conversions() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {
+            let handle = Handle::Open;
+            print(handle == Handle::Open);
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn a_resource_backed_enum_has_no_value_member() {
+    assert_fails_with(
+        r#"
+        import std::print;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() { print(Handle::Open.value()); }
+        "#,
+        "no method 'value'",
+    );
+}
+
+#[test]
+fn a_resource_backed_enum_is_not_hashable() {
+    // The resource rule wins over the bare-lowering one: a resource cannot be
+    // hashed by value, so it is not a key however it lowers.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {
+            mut seen: Set<Handle> = Set::new();
+            seen.insert(Handle::Open);
+            print(seen.len());
+        }
+        "#,
+        "does not implement trait 'Hashable'",
+    );
+}
+
+// B117 — §10.5's rule at the DERIVE. A resource is an owned handle, not plain
+// data: `Wire::rebuild` and `FromJson::from_json` both MINT a `Self` out of
+// bytes, which for a resource is a twin nothing owns. The subject of the derive
+// was the one position nothing tested — `check_wire_boundary` had covered the
+// resource FIELD since destruction.md §8 — so all four shapes (backed/plain enum
+// × `Wire`/`Json`, and the struct twin) reached the generators. The enum shapes
+// then failed inside `match self` with "cannot move the resource `self` out of
+// this function", an error about a body the author never wrote; the STRUCT
+// shapes were worse, compiling clean and giving a resource a serialized form.
+
+#[test]
+fn b117_wire_is_refused_for_a_backed_resource_enum() {
+    assert_fails_spanning(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "Wire",
+        "`Wire` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_wire_is_refused_for_a_plain_resource_enum() {
+    // The plain shape reaches a different generator (externally tagged, no
+    // `value()`), and the refusal is above both.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open, Closed }
+        fun main() {}
+        "#,
+        "`Wire` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_backed_resource_enum() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_plain_resource_enum() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource enum Handle { Open, Closed }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource enum `Handle`",
+    );
+}
+
+#[test]
+fn b117_wire_is_refused_for_a_resource_struct() {
+    // The struct twin USED TO COMPILE: a struct's `describe` reads its fields
+    // through the loan, so nothing moved and nothing complained — the derive
+    // silently handed a resource a wire format.
+    assert_fails_spanning(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "Wire",
+        "`Wire` cannot be derived for the resource struct `Conn`",
+    );
+}
+
+#[test]
+fn b117_json_is_refused_for_a_resource_struct() {
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource struct `Conn`",
+    );
+}
+
+#[test]
+fn b117_the_refusal_replaces_the_generated_code_error() {
+    // The point of refusing at the derive rather than after expansion: nothing
+    // is generated, so the author never meets a diagnostic about a body they
+    // did not write.
+    assert_fails_without(
+        r#"
+        [derive(Wire)]
+        resource enum Handle { Open = 1, Closed = 2 }
+        fun main() {}
+        "#,
+        "in code generated by this attribute",
+    );
+}
+
+#[test]
+fn b117_a_refused_wire_derive_leaves_the_resource_not_wire() {
+    // A refused derive must not register the name as Wire. `[rpc]`'s signature
+    // check reads `wire_names` and has no resource guard of its own — the
+    // resource-FIELD rejects do, which is why this is the shape that shows it —
+    // so a refused `Conn` left in the set would still cross the wire, and the
+    // refusal would be advice rather than a rule.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        struct Pool {}
+        impl Pool {
+            [rpc] fun adopt(self, conn: Conn): i32 { 0 }
+        }
+        fun main() {}
+        "#,
+        "of `[rpc]` method `adopt` is `Conn`, which is not Wire",
+    );
+}
+
+#[test]
+fn b117_a_refused_wire_derive_still_meets_the_resource_field_reject() {
+    // The other reader of `wire_names`: a plain-data type holding the refused
+    // resource is rejected at the field, by the resource arm that precedes the
+    // not-Wire one.
+    assert_fails_with(
+        r#"
+        [derive(Wire)]
+        resource struct Conn { id: i32 }
+        [derive(Wire)]
+        struct Envelope { conn: Conn }
+        fun main() {}
+        "#,
+        "field `conn` of `[derive(Wire)]` type `Envelope` is the resource `Conn`",
+    );
+}
+
+#[test]
+fn b117_the_other_derives_on_a_resource_survive_the_refusal() {
+    // Only `Wire`/`Json` are refused, and per derive NAME: `PartialEq`/`Debug`
+    // on a resource struct read their fields through the loan and stay legal
+    // (`resource_struct_carries_a_derive_through_expansion`).
+    assert_fails_once_with(
+        r#"
+        import std::print;
+        [derive(PartialEq, Wire, Debug)]
+        resource struct Session { id: i32, name: str }
+        fun main() {
+            let session = Session { id = 1, name = "a" };
+            print(session.debug());
+        }
+        "#,
+        "cannot be derived for the resource struct `Session`",
+    );
+}
+
+#[test]
+fn b117_a_resource_by_containment_still_names_its_field() {
+    // Keyed on the DECLARED `resource` modifier: a type that is a resource by
+    // containment has its root cause in the field, which `check_wire_boundary`
+    // already names — one mistake, one message, not two.
+    assert_fails_without(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Wire)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "cannot be derived for the resource",
+    );
+}
+
+#[test]
+fn b117_a_plain_data_wire_derive_is_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::encode_json;
+        [derive(Wire)]
+        struct Note { id: i32, text: str }
+        fun main() {
+            print(encode_json(Note { id = 7, text = "hi" }));
+        }
+        "#,
+        "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+// B120 — §10.8's "left open, filed not fixed": `Json` had no boundary check
+// at all, so a resource FIELD inside a `[derive(Json)]` plain-data struct
+// reached the generated-code error class §10.8 exists to remove ("`Db` has
+// no method `to_json`"). `check_json_boundary` is `check_partialeq_boundary`'s
+// twin, not `check_wire_boundary`'s: Json's codegen reads `to_json`/
+// `from_json_value` straight off each field's own type, so there is no
+// all-fields type DOMAIN to police — only the resource-field reject.
+
+#[test]
+fn b120_derive_json_rejects_a_resource_field() {
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_nested_resource_field() {
+    // Containment two levels deep: `Holder` is a resource by CONTAINING `Db`
+    // (no `resource` modifier of its own), and `Envelope`'s check names ITS
+    // OWN field (`holder`) and its immediate type (`Holder`) — the root cause
+    // of `Envelope` not being serializable, without walking further down to
+    // blame `Db` by name (that is `Holder`'s own business, if it ever derives
+    // anything).
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        struct Holder { db: Db }
+        [derive(Json)]
+        struct Envelope { holder: Holder }
+        fun main() {}
+        "#,
+        "field `holder` of `[derive(Json)]` type `Envelope` is the resource `Holder`",
+    );
+}
+
+#[test]
+fn b120_derive_json_rejects_a_resource_enum_payload() {
+    // The enum shape: a resource PAYLOAD, not a struct field — the same
+    // `collect_derived_members` enum arm Wire's check already reuses.
+    assert_fails_with(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        enum Wrapper { Holds(Db), Empty }
+        fun main() {}
+        "#,
+        "variant `Holds` payload 0 of `[derive(Json)]` type `Wrapper` is the resource `Db`",
+    );
+}
+
+#[test]
+fn b120_a_json_derived_struct_with_no_resource_stays_legal() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::Json;
+        [derive(Json)]
+        struct Note { id: i32, text: str }
+        fun main() {
+            print(Note { id = 7, text = "hi" }.to_json());
+        }
+        "#,
+        "{\"id\":7,\"text\":\"hi\"}\n",
+    );
+}
+
+#[test]
+fn b120_the_resource_field_reject_and_the_declared_modifier_refusal_compose() {
+    // §10.8's declared-modifier refusal (the DERIVE's subject) and B120's
+    // field check (destruction.md §8's shape, now Json's too) are two
+    // different rules answering two different questions — verified to
+    // compose the way Wire's family already does: each fires ALONE where
+    // only one applies...
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        fun main() {}
+        "#,
+        "`Json` cannot be derived for the resource struct `Conn`",
+    );
+    // ...and, driven at the OTHER type — a plain-data struct holding that
+    // same refused resource by field — the field check fires on its own,
+    // naming the field, exactly as Wire's `b117_a_refused_wire_derive_still_meets_the_resource_field_reject`
+    // does.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        [derive(Json)]
+        struct Envelope { conn: Conn }
+        fun main() {}
+        "#,
+        "field `conn` of `[derive(Json)]` type `Envelope` is the resource `Conn`",
+    );
+}
+
+#[test]
+fn b120_json_has_no_rpc_escape_to_close() {
+    // §10.8's collector-skip closure exists because `wire_names` has a SECOND
+    // reader (`[rpc]`'s signature check) that would trust a refused type back
+    // onto the wire if the name were left registered. `check_json_boundary`
+    // builds no name set at all — there is nothing analogous for a `[rpc]`
+    // check to consult, so there is no escape to close: a `[derive(Json)]`
+    // resource struct used as an `[rpc]` parameter is rejected for the
+    // ordinary, pre-existing reason (it was never `Wire`, which is the only
+    // thing `[rpc]` signatures require), unaffected by this file's checks.
+    assert_fails_with(
+        r#"
+        [derive(Json)]
+        resource struct Conn { id: i32 }
+        struct Pool {}
+        impl Pool {
+            [rpc] fun adopt(self, conn: Conn): i32 { 0 }
+        }
+        fun main() {}
+        "#,
+        "of `[rpc]` method `adopt` is `Conn`, which is not Wire",
+    );
+}
+
+#[test]
+fn b120_a_resource_by_containment_still_names_only_its_field() {
+    // Keyed on the DECLARED `resource` modifier (§10.8): a type that is a
+    // resource by CONTAINMENT (no modifier of its own) gets exactly ONE
+    // message — the field check's — never the subject-level refusal too.
+    assert_fails_without(
+        r#"
+        resource struct Db { handle: i32 }
+        [derive(Json)]
+        struct Envelope { db: Db }
+        fun main() {}
+        "#,
+        "cannot be derived for the resource",
+    );
+}
+
+// §7.1/§8.5: a bare-lowered enum IS its backing value at runtime — a plain JS
+// number or string, which `canonical_hash` returns unchanged — so the backing
+// value is the key and `Map<Align, V>` / `Set<Align>` work without a derive.
+// The impl is synthesized beside `value()`/`parse()`, off the same opt-in.
+
+#[test]
+fn b76_a_string_backed_enum_keys_a_map() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut widths: Map<Align, i32> = Map::new();
+            widths.insert(Align::Start, 1);
+            widths.insert(Align::End, 2);
+            print(widths.get(Align::Start).unwrap_or(0));
+            print(widths.get(Align::End).unwrap_or(0));
+            print(widths.contains_key(Align::Start));
+            print(widths.len());
+            widths.remove(Align::Start);
+            print(widths.contains_key(Align::Start));
+        }
+        "#,
+        "1\n2\ntrue\n2\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_an_integer_backed_enum_keys_a_set() {
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Level { Low = 0, High = 1 }
+        fun main() {
+            mut seen: Set<Level> = Set::new();
+            seen.insert(Level::High);
+            print(seen.contains(Level::High));
+            print(seen.contains(Level::Low));
+            // A second insert of the same variant is the same key.
+            seen.insert(Level::High);
+            print(seen.len());
+        }
+        "#,
+        "true\nfalse\n1\n",
+    );
+}
+
+#[test]
+fn b76_an_auto_incremented_backing_keys_a_set() {
+    // `Hashable` keys off the LOWERING rule (payload-free plus one explicit
+    // value), not off the stricter "every variant carries a written literal"
+    // rule `value()`/`parse()` need — so the C-style tail comes along.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Walked { A = 5, B, C }
+        fun main() {
+            mut seen: Set<Walked> = Set::new();
+            seen.insert(Walked::B);
+            print(seen.contains(Walked::B));
+            print(seen.contains(Walked::C));
+            print(seen.len());
+        }
+        "#,
+        "true\nfalse\n1\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enums_hash_is_its_backing_values_hash() {
+    // Coherence, observed the way a user-built container observes it (a
+    // `Map<Hash, ..>`, which is what `collections.md` documents): one variant is
+    // one key however the hash is re-derived, two variants are two keys, and the
+    // enum's key is its BACKING VALUE's key — the identity the whole design
+    // rests on.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::{ Hash, Hashable };
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut by_hash: Map<Hash, i32> = Map::new();
+            by_hash.insert(Align::Start.hash(), 10);
+            by_hash.insert(Align::End.hash(), 20);
+            print(by_hash.len());
+            print(by_hash.get(Align::Start.hash()).unwrap_or(0));
+            // Re-derived from a second mention of the same variant: same key.
+            by_hash.insert(Align::Start.hash(), 11);
+            print(by_hash.len());
+            // The backing value, and the raw string it is, hash to that key too.
+            print(by_hash.get(Align::Start.value().hash()).unwrap_or(0));
+            print(by_hash.get("flex-start".hash()).unwrap_or(0));
+        }
+        "#,
+        "2\n10\n2\n11\n11\n",
+    );
+}
+
+#[test]
+fn b76_an_integer_backed_enums_hash_is_its_numbers_hash() {
+    // The other backing, same identity — and the cross-check that a backed
+    // enum does NOT collide with an unrelated key of the other shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::{ Hash, Hashable };
+        enum Level { Low = 0, High = 1 }
+        fun main() {
+            mut by_hash: Map<Hash, str> = Map::new();
+            by_hash.insert(Level::High.hash(), "high");
+            print(by_hash.get(1.hash()).unwrap_or("miss"));
+            print(by_hash.get("1".hash()).unwrap_or("miss"));
+        }
+        "#,
+        "high\nmiss\n",
+    );
+}
+
+#[test]
+fn b76_std_ordering_keys_a_map() {
+    // The backed enum std already shipped, now a key without ceremony.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::compare::Ordering;
+        fun main() {
+            mut labels: Map<Ordering, str> = Map::new();
+            labels.insert(Ordering::Less, "lt");
+            labels.insert(Ordering::Greater, "gt");
+            print(labels.get(Ordering::Less).unwrap_or("?"));
+            print(labels.len());
+        }
+        "#,
+        "lt\n2\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_key_emits_its_bare_value() {
+    // Nothing wraps the key on the way into the map: the emitted program hands
+    // the native string straight to `insert`, exactly as §1.3's host-boundary
+    // probe found for a call.
+    let javascript = compile(
+        r#"
+        import std::print;
+        import std::map::Map;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut widths: Map<Align, i32> = Map::new();
+            widths.insert(Align::Start, 1);
+            print(widths.len());
+        }
+        "#,
+    )
+    .expect("expected a clean compile");
+    assert!(javascript.contains(r#""flex-start""#), "{javascript}");
+    assert!(!javascript.contains("[ 0 ]"), "{javascript}");
+}
+
+#[test]
+fn b76_a_plain_enum_is_still_not_hashable() {
+    // The §3.1(b) conjunction decides this too: `enum Plain { A, B }` keeps its
+    // `[0]`/`[1]` ARRAY form, so it is an aggregate with no bare value to key
+    // by — exactly the reference-identity footgun `Hashable` exists to stop.
+    // It needs `[derive(Hashable)]` like any other aggregate.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Plain { A, B, C }
+        fun main() {
+            mut seen: Set<Plain> = Set::new();
+            seen.insert(Plain::B);
+            print(seen.len());
+        }
+        "#,
+        "'Plain' does not implement trait 'Hashable'",
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_keys_a_set_with_the_derive() {
+    // The escape hatch the previous pin points at, and it works by value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Plain { A, B, C }
+        fun main() {
+            mut seen: Set<Plain> = Set::new();
+            seen.insert(Plain::B);
+            print(seen.contains(Plain::B));
+            print(seen.contains(Plain::C));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_payload_enum_is_still_not_hashable() {
+    // The tagged-array lowering is out of scope: a payload enum gets no
+    // synthesized `Hashable` and is refused at the key, with the ordinary bound
+    // diagnostic rather than a runtime surprise.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Payload { Num(i32), Text(str) }
+        fun main() {
+            mut seen: Set<Payload> = Set::new();
+            seen.insert(Payload::Num(3));
+            print(seen.len());
+        }
+        "#,
+        "'Payload' does not implement trait 'Hashable'",
+    );
+}
+
+#[test]
+fn b76_a_payload_enum_keys_a_set_with_the_derive() {
+    // Its route is unchanged by this arc: the derive, with its all-fields gate.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Payload { Num(i32), Text(str) }
+        fun main() {
+            mut seen: Set<Payload> = Set::new();
+            seen.insert(Payload::Num(3));
+            print(seen.contains(Payload::Num(3)));
+            print(seen.contains(Payload::Num(4)));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_backed_enum_field_of_a_derived_hashable_type_is_accepted() {
+    // The two oracles have to agree: the impl table says `Align` is a key, so
+    // the derive's syntactic all-fields check must not reject it as a FIELD.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        [derive(Hashable)]
+        struct Slot { align: Align, index: i32 }
+        fun main() {
+            mut seen: Set<Slot> = Set::new();
+            seen.insert(Slot { align = Align::Start, index = 1 });
+            print(seen.contains(Slot { align = Align::Start, index = 1 }));
+            print(seen.contains(Slot { align = Align::End, index = 1 }));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn b76_a_plain_enum_field_of_a_derived_hashable_type_still_needs_its_own_derive() {
+    // The contrast that keeps the previous pin honest: the field rule tracks
+    // the lowering, not "is an enum".
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::Hashable;
+        enum Plain { A, B }
+        [derive(Hashable)]
+        struct Slot { plain: Plain }
+        fun main() { print(1); }
+        "#,
+        "field `plain` of `[derive(Hashable)]` type `Slot` is `Plain`",
+    );
+}
+
+#[test]
+fn b76_a_redundant_hashable_derive_on_a_backed_enum_is_a_no_op() {
+    // The derive and the synthesis emit the identical `canonical_hash(self)`
+    // body, so there is nothing for a duplicate-impl error to protect — and a
+    // program written before the impl was synthesized keeps compiling.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::set::Set;
+        import std::hash::Hashable;
+        [derive(Hashable)]
+        enum Align { Start = "flex-start", End = "flex-end" }
+        fun main() {
+            mut seen: Set<Align> = Set::new();
+            seen.insert(Align::Start);
+            print(seen.contains(Align::Start));
+        }
+        "#,
+        "true\n",
+    );
+}
+
+#[test]
+fn b76_a_hand_written_hashable_impl_on_a_backed_enum_collides() {
+    // A hand-written impl may mean something else, and which one wins is B73's
+    // open specificity question — so it stays a duplicate, reported AT the
+    // author's impl with a note saying the other one is the compiler's.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::hash::{ Hashable, Hash, canonical_hash };
+        enum Align { Start = "flex-start", End = "flex-end" }
+        impl Align with Hashable {
+            fun hash(self): Hash { canonical_hash(self) }
+        }
+        fun main() { print(1); }
+        "#,
+        "'Hashable' is already implemented for 'Align'",
+    );
+}
+
+#[test]
+fn b76_a_generic_backed_enum_gets_no_hashable() {
+    // §8.2(d)'s rule, unchanged: a generic enum gets no synthesized members at
+    // all, `Hashable` included.
+    assert_fails_with(
+        r#"
+        import std::print;
+        import std::set::Set;
+        enum Phantom<T> { A = 1, B = 2 }
+        fun main() {
+            mut seen: Set<Phantom<i32>> = Set::new();
+            seen.insert(Phantom::A);
+            print(seen.len());
+        }
+        "#,
+        "does not implement trait 'Hashable'",
+    );
+}
+
+// B105 (a compound assignment evaluated an impure subscript twice). `x op= v`
+// desugars to `x = x op v`, which walks the TARGET PLACE twice — so every
+// effectful subscript in it ran twice: `ys[bump()] += 1` emitted
+// `__at_put(ys, bump(), __at(ys, bump()) + 1)`. Each is now evaluated once,
+// into a temp both walks name. A PURE subscript is left alone.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_compound_assignment_evaluates_an_impure_index_once() {
+    // The filed repro, counted: one call, and the increment lands once.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] += 1;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_evaluates_the_index_before_the_value() {
+    // Source order: the subscript, then the read, then the right-hand side.
+    // The un-hoisted emission ran them in that order too (a JS call evaluates
+    // its arguments left to right), so the temp must not reorder anything.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun index(): i32 { print("index"); 0 }
+        fun amount(): i32 { print("amount"); 5 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[index()] += amount();
+            print(ys[0]);
+        }
+        "#,
+        "index\namount\n15\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_with_a_pure_index_mints_no_temp() {
+    // The other direction, in bytes: evaluating `index` twice is not an
+    // observable difference, so the emission is exactly what it was. Hoisting
+    // unconditionally is *correct* and was measured — it moves this shape's
+    // golden and buys nothing (proposal/transparent-references.md).
+    let source = r#"
+        import std::print;
+        fun main() {
+            mut ys = [10, 20];
+            let index = 1;
+            ys[index] += 5;
+            print(ys[1]);
+        }
+        "#;
+    match compile(source) {
+        Ok(js) => assert!(
+            js.contains("__at_put(ys, index, __at(ys, index) + 5)"),
+            "a pure subscript was hoisted into a temp:\n{js}"
+        ),
+        Err(errors) => panic!("expected a clean compile, got: {errors:#?}"),
+    }
+    assert_compiles_and_runs(source, "25\n");
+}
+
+#[test]
+fn a_compound_assignment_hoists_an_index_in_the_targets_subject() {
+    // The subscript is not at the top of the target place — `cells[bump()].n`
+    // is a FIELD of an indexed element — so the hoist walks the whole spine.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        struct Cell { n: i32 }
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut cells = [Cell { n = 10 }, Cell { n = 20 }];
+            cells[bump()].n += 1;
+            print(cells[0].n);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_hoists_every_index_of_a_nested_target() {
+    // Two subscripts, each effectful and each its own temp, minted root-first
+    // so the calls run in source order.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun row(): i32 { print("row"); 0 }
+        fun column(): i32 { print("column"); 1 }
+        fun main() {
+            mut grid = [[1, 2], [3, 4]];
+            grid[row()][column()] += 100;
+            print(grid[0][1]);
+        }
+        "#,
+        "row\ncolumn\n102\n",
+    );
+}
+
+#[test]
+fn a_compound_assignment_through_a_view_hoists_its_index() {
+    // R5 wraps a view target and its synthesized re-read alike in a `Dereference`,
+    // so the analyzer's compound mark sits one node down. The hoist looks under it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun add(v: &mut List<i32>) {
+            v[bump()] += 1;
+        }
+        fun main() {
+            mut ys = [10, 20];
+            add(&mut ys);
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "11\n1\n",
+    );
+}
+
+#[test]
+fn a_plain_indexed_assignment_still_evaluates_its_index_once() {
+    // The neighbour that was always right: a non-compound write walks the
+    // target once, and the hoist must not touch it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        mut calls = 0;
+        fun bump(): i32 {
+            calls = calls + 1;
+            0
+        }
+        fun main() {
+            mut ys = [10, 20];
+            ys[bump()] = 99;
+            print(ys[0]);
+            print(calls);
+        }
+        "#,
+        "99\n1\n",
+    );
+}
+
+#[test]
+fn two_hand_written_subscripts_are_not_collapsed_into_one() {
+    // Why the compound-ness comes from the analyzer's record and not from the
+    // shape: `ys[first()] = ys[second()] + 1` looks exactly like the desugared
+    // form and means something else entirely. Both calls run, at their own
+    // indices.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun first(): i32 { print("first"); 0 }
+        fun second(): i32 { print("second"); 1 }
+        fun main() {
+            mut ys = [10, 20];
+            ys[first()] = ys[second()] + 1;
+            print(ys[0]);
+            print(ys[1]);
+        }
+        "#,
+        "first\nsecond\n21\n20\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B106 (a discriminant past 2^53 is unrepresentable in the emission). A backed
+// enum IS its backing value at runtime, emitted as a bare JS numeric literal —
+// and a double holds integers exactly only to 2^53 - 1, so
+// `= 9007199254740993` emitted a literal the host reads back as `…992`.
+// Self-consistent in-tree (every site emitted the same wrong number) and wrong
+// across a host boundary. The range check lands in B79's validation family, at
+// i53's edge, and the diagnostic names the emission target as the reason.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b106_the_i53_edge_is_a_legal_discriminant() {
+    // 2^53 - 1: the largest integer a JS number holds exactly, and the last one
+    // that round-trips through the emitted literal.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Max = 9007199254740991 }
+        fun main() {
+            print(match Edge::Max { Edge::Zero => "zero", Edge::Max => "max" });
+        }
+        "#,
+        "max\n",
+    );
+}
+
+#[test]
+fn b106_one_past_the_i53_edge_is_refused() {
+    // One more, and the emitted literal is a different number than the source
+    // wrote. The diagnostic states the bound AND why it is that bound.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Over = 9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9007199254740992` is out of range \
+         (-9007199254740991 ..= 9007199254740991): a backed enum is a JS number \
+         at runtime, and an integer past 2^53 - 1 has no exact double, so the \
+         emitted literal would be a different value",
+    );
+}
+
+#[test]
+fn b106_the_negative_i53_edge_is_legal_and_one_past_it_is_refused() {
+    // The negative twin, and the change B106 makes to B79's shape: the bound is
+    // SYMMETRIC. `i64`'s negative end reached one further because two's
+    // complement does; a JS number has no such asymmetry, so `-9007199254740991`
+    // is the last legal value in that direction too.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Edge { Zero = 0, Min = -9007199254740991 }
+        fun main() {
+            print(match Edge::Min { Edge::Zero => "zero", Edge::Min => "min" });
+        }
+        "#,
+        "min\n",
+    );
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Under = -9007199254740992 }
+        fun main() { }
+        "#,
+        "the enum discriminant `-9007199254740992` is out of range",
+    );
+}
+
+#[test]
+fn b106_the_old_i64_bound_is_now_refused() {
+    // The value B79 accepted and this fix does not — the one that made the
+    // range a lie: `i64::MAX` cannot be an emitted JS literal at all.
+    assert_fails_with(
+        r#"
+        enum Edge { Zero = 0, Max = 9223372036854775807 }
+        fun main() { }
+        "#,
+        "the enum discriminant `9223372036854775807` is out of range",
+    );
+}
+
+#[test]
+fn b106_a_continued_discriminant_stops_at_the_same_edge() {
+    // A continued value is emitted as the same bare literal, so the sequence
+    // must stop where an explicit discriminant does — one rule, not two.
+    assert_fails_with(
+        r#"
+        enum Walk { A = 9007199254740990, B, C }
+        fun main() { }
+        "#,
+        "variant 'C' continues the discriminant sequence past 9007199254740991, \
+         the largest integer a JS number holds exactly",
+    );
+}
+
+#[test]
+fn b106_a_hex_discriminant_is_range_checked_too() {
+    // The range check always spoke radix 16 (B79's fix); the narrower bound
+    // inherits that, so hex cannot smuggle a value past it.
+    assert_fails_with(
+        r#"
+        enum Mask { Zero = 0, Wide = 0x20000000000000 }
+        fun main() { }
+        "#,
+        "the enum discriminant `0x20000000000000` is out of range",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Mask { Zero = 0, Edge = 0x1FFFFFFFFFFFFF }
+        fun main() {
+            print(match Mask::Edge { Mask::Zero => "zero", Mask::Edge => "edge" });
+        }
+        "#,
+        "edge\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B111 (a walked discriminant gets `value()`/`parse()`). `enum Walked { A = 5,
+// B, C }` lowers to the bare numbers 5/6/7 — the walk resolves every variant by
+// continuing the C-style sequence — but the generators read the declaration
+// separately and bailed on the first variant with no WRITTEN literal, so the
+// enum got no `value()`, no `parse()`, and the name-tagged JSON shape of an
+// unbacked enum. The fix is one reader (`read_enum_backing`, backed-enums.md
+// §10) shared by the walk, the generators, and §3.7's duplicate check, so a
+// variant's effective backing is computed once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b111_a_walked_discriminant_gets_value_and_parse() {
+    // The headline: `B` wrote nothing, is 6 at runtime, and now says so. The
+    // round trip goes out through `value()` and back through `parse()`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            print(Walked::A.value());  // 5
+            print(Walked::B.value());  // 6 — the walked one
+            print(Walked::C.value());  // 7
+            print(match Walked::parse(6) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                        // 6
+            print(match Walked::parse(99) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                        // -1
+        }
+        "#,
+        "5\n6\n7\n6\n-1\n",
+    );
+}
+
+#[test]
+fn b111_a_walk_from_the_implicit_zero_gets_them_too() {
+    // The `enum Level { Low = 0, Mid, High }` shape §3.1(b) names: one explicit
+    // value converts the whole declaration, so the other two walk from it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Level { Low = 0, Mid, High }
+
+        fun main() {
+            print(Level::High.value());  // 2
+            print(match Level::parse(1) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                          // 1
+        }
+        "#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn b111_a_negative_walk_gets_them_too() {
+    // The sequence continues from a negative value the same way, and `parse`'s
+    // `if`/`else if` chain (not a `match`) is what lets a negative literal be
+    // compared at all — the reason §3.8 chose that shape.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Signed { Less = -1, Equal, Greater }
+
+        fun main() {
+            print(Signed::Less.value());     // -1
+            print(Signed::Equal.value());    // 0
+            print(Signed::Greater.value());  // 1
+            print(match Signed::parse(0) {
+                Some(let variant) => variant.value(),
+                None => -99,
+            });                              // 0
+        }
+        "#,
+        "-1\n0\n1\n0\n",
+    );
+}
+
+#[test]
+fn b111_a_written_literal_keeps_its_own_spelling() {
+    // The unified reader resolves values, but the generator still reprints the
+    // literal the author WROTE where there is one: hex stays hex in the
+    // generated `parse` chain. Only the walked variant, which wrote nothing, is
+    // rendered from the resolved value.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Hexed { A = 0x10, B, C = 0x20 }
+
+        fun main() {
+            print(Hexed::A.value());  // 16
+            print(Hexed::B.value());  // 17
+            print(Hexed::C.value());  // 32
+            print(match Hexed::parse(17) {
+                Some(let variant) => variant.value(),
+                None => -1,
+            });                       // 17
+        }
+        "#,
+        "16\n17\n32\n17\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_collision_is_still_rejected() {
+    // §3.7's uniqueness rule already counted walked values, and it still does:
+    // `B` walks onto 6 and `C` writes 6. Unifying the readers must not make the
+    // generator's view of the enum the one validation trusts.
+    assert_fails_with(
+        r#"
+        enum Walked { A = 5, B, C = 6 }
+        fun main() { }
+        "#,
+        "variant 'C' has discriminant 6, which 'B' already uses; two variants of \
+         'Walked' cannot share one",
+    );
+}
+
+#[test]
+fn b111_a_broken_walk_generates_no_conversions() {
+    // The other half of the collision rule. A generator emits vilan SOURCE, so
+    // it stays silent on a declaration the walk already rejects — otherwise the
+    // generated `parse` chain would compare against a value the compiler does
+    // not believe in and report the enum a second time, from inside code the
+    // author never wrote. The cost is the `has no method` at the call site,
+    // which is what a broken enum has always produced.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Walked { A = 5, B, C = 6 }
+        fun main() { print(Walked::A.value()); }
+        "#,
+        "Walked has no method 'value'",
+    );
+}
+
+#[test]
+fn b111_a_string_backing_still_needs_a_literal_per_variant() {
+    // §3.1(a) is untouched by the unification: there is no successor of
+    // `"start"`, so the walk has nothing to continue and the missing value is a
+    // hard error rather than a silently synthesized one.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "flex-start", End }
+        fun main() { }
+        "#,
+        "variant 'End' has no backing value, and a string backing has no successor \
+         to continue from; give every variant of 'Align' its own string",
+    );
+}
+
+#[test]
+fn b111_a_fully_written_string_enum_is_unchanged() {
+    // The other half of the same claim: a string-backed enum still gets its
+    // conversions, and they still carry the author's own text.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::option::Option::{ self, Some, None };
+
+        enum Align { Start = "flex-start", End = "flex-end" }
+
+        fun main() {
+            print(Align::Start.value());  // flex-start
+            print(match Align::parse("flex-end") {
+                Some(let variant) => variant.value(),
+                None => "miss",
+            });                           // flex-end
+            print(match Align::parse("center") {
+                Some(let variant) => variant.value(),
+                None => "miss",
+            });                           // miss
+        }
+        "#,
+        "flex-start\nflex-end\nmiss\n",
+    );
+}
+
+#[test]
+fn b111_the_i53_continuation_edge_still_holds_through_the_unified_reader() {
+    // B106's edge is enforced inside the one reader now, so it has to hold for
+    // every consumer at once: the sequence stops where an explicit discriminant
+    // does, and a walk that runs off the end is refused rather than generating
+    // conversions over a value the emission cannot carry.
+    assert_fails_with(
+        r#"
+        enum Walk { A = 9007199254740990, B, C }
+        fun main() { }
+        "#,
+        "variant 'C' continues the discriminant sequence past 9007199254740991, \
+         the largest integer a JS number holds exactly",
+    );
+    // The last legal walk, and the `i53` backing type it forces: a value past
+    // `i32` cannot narrow to the default integer.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Walk { A = 9007199254740990, B }
+        fun main() {
+            let widest: i53 = Walk::B.value();
+            print(widest);
+        }
+        "#,
+        "9007199254740991\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_enum_serializes_as_its_backing_value() {
+    // §3.9 over the same reading: the derived `Json` shape follows the RUNTIME
+    // representation. A walked enum lowered to bare numbers while encoding the
+    // variant NAME — `Walked::B` was the number 6 and went out as `"B"`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::json::{ Json, FromJson };
+        import std::result::Result::{ self, Ok, Err };
+
+        [derive(Json)]
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            print(Walked::B.to_json());  // 6
+            print(match Walked::from_json("6") {
+                Ok(let back) => back.value(),
+                Err(_) => -1,
+            });                          // 6
+            print(match Walked::from_json("99") {
+                Ok(let back) => back.value(),
+                Err(_) => -1,
+            });                          // -1
+        }
+        "#,
+        "6\n6\n-1\n",
+    );
+}
+
+#[test]
+fn b111_a_walked_enum_is_hashable_and_keys_by_its_value() {
+    // The `Hashable` synthesis always keyed off the runtime representation, so
+    // a walked enum already had it. The unification must not narrow that to the
+    // generators' stricter rule — this is the pin that would catch it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        import std::map::Map;
+        import std::hash::Hashable;
+
+        enum Walked { A = 5, B, C }
+
+        fun main() {
+            mut widths: Map<Walked, i32> = Map::new();
+            widths.insert(Walked::B, 42);
+            print(widths.contains_key(Walked::B));  // true
+            print(Walked::B.hash() == 6.hash());    // true — the enum IS 6
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+#[test]
+fn b111_a_plain_enum_is_still_not_backed() {
+    // §3.1(b)'s conjunction is untouched: with no explicit value anywhere the
+    // enum keeps its `[index, ..data]` array form and gets no conversions.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Plain { A, B }
+        fun main() { print(Plain::A.value()); }
+        "#,
+        "Plain has no method 'value'",
+    );
+}
+
+#[test]
+fn b111_a_payload_variant_still_blocks_the_conversions() {
+    // §3.3: a payload anywhere flips the enum to the tagged form, so no backing
+    // value in it reaches the runtime and no conversion may claim otherwise.
+    assert_fails_with(
+        r#"
+        enum Mixed { A = 1, B(i32) }
+        fun main() { }
+        "#,
+        "an explicit backing value is only meaningful when every variant is \
+         data-less, and 'B' carries a payload",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B115 — a guarded FINAL match leg drops its guard.
+//
+// The lowering made the final leg the bare `else` on the strength of the
+// analyzer's exhaustiveness proof — but that proof counts UNGUARDED legs only
+// (a guard tests the value, which the checker does not reason about), so a
+// guarded final leg never carried it. Two halves, and the checker's was right:
+// it refuses `match a { A => .., B if c => .. }` outright ("missing 'B'"). What
+// let the shape through was the checker's *exemptions* — a tuple/generic
+// subject skipped the question entirely, and a REFUTABLE tuple pattern counted
+// as an irrefutable catch-all. The rule shipped: exhaustiveness is proven by
+// unguarded legs only, whatever the subject's type, so a match whose last leg
+// is guarded must be exhaustive WITHOUT it; and the lowering keeps that leg's
+// test, prelude and guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b115_a_guarded_final_leg_on_an_enum_is_not_exhaustive() {
+    // The checker's half, and it was already right: the coverage walk counts
+    // unguarded legs, so 'B' is missing even though the author wrote its name.
+    // The note is what makes that legible — it points at the guard.
+    assert_fails_noting(
+        r#"
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B if count > 0 => "b",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'B'",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_backed_enum_is_not_exhaustive() {
+    // Same walk, backed subject: the trap arm answers for values outside the
+    // SET and never for a guard that rejects an in-set one, so it does not
+    // excuse the missing variant.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "s", End = "e" }
+        fun f(a: Align, count: i32): str {
+            match a {
+                Align::Start => "start",
+                Align::End if count > 0 => "end",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing 'End'",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_tuple_subject_is_refused() {
+    // A tuple subject is exempt from the DOMAIN question ("which values can the
+    // subject take?"), and that exemption is what B115 rode in on: it never
+    // licensed a guard. This program ran the guarded arm when the guard was
+    // false.
+    assert_fails_noting(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (let a, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_generic_subject_is_refused() {
+    // The same exemption, reached through a generic parameter rather than a
+    // tuple — one rule, not two.
+    assert_fails_with(
+        r#"
+        fun f<T>(v: T, count: i32): str {
+            match v {
+                let x if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_lone_guarded_leg_is_refused() {
+    // The single-leg shape: nothing precedes the guard, so nothing can carry
+    // the proof. It is the smallest program in the family.
+    assert_fails_with(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (let a, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_an_int_subject_is_refused() {
+    // An unbounded scalar domain always needed a catch-all, and a guarded leg
+    // is not one — this direction already held, and it is pinned so the shape
+    // has a test of its own rather than being inferred from the tuple's.
+    assert_fails_with(
+        r#"
+        fun f(n: i32, count: i32): str {
+            match n {
+                1 => "one",
+                _ if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_on_a_str_subject_is_refused() {
+    assert_fails_with(
+        r#"
+        fun f(s: str, count: i32): str {
+            match s {
+                "quit" => "leaving",
+                let other if count > 0 => other,
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_refutable_tuple_pattern_is_not_a_catch_all() {
+    // The second half of what let the tuple shape compile: `(1, 2)` is a TEST,
+    // and the catch-all walk counted every `ExprPattern::Tuple` as a
+    // destructure. With it miscounted, the match above had a "catch-all" and
+    // the guarded-final question was never asked.
+    assert_fails_with(
+        r#"
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (3, let b) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b115_a_tuple_of_binders_is_still_a_catch_all() {
+    // The other direction of the same walk, so the narrowing cannot silently
+    // become "a tuple pattern is never a catch-all": every element is a binder,
+    // so the leg matches every value. The guarded leg AFTER it is what makes
+    // this non-vacuous — a real catch-all is what licenses one, and the leg is
+    // dead where it stands (the lowering stops at the catch-all), so it is the
+    // catch-all that is emitted as the `else`.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32), count: i32): str {
+            match p {
+                (1, 2) => "x",
+                (let a, let b) => "rest",
+                (3, 4) if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f((7, 8), 5)); print(f((3, 4), 5)); }
+        "#,
+        "rest\nrest\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_leg_before_a_catch_all_runs_both_ways() {
+    // The shape the author should write, pinned at RUN time in both
+    // directions — the guard is honoured when it holds and the catch-all takes
+    // the value when it does not. This is what B115 silently broke when the
+    // guarded leg was last instead.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B if count > 0 => "guarded",
+                _ => "fallback",
+            }
+        }
+        fun main() {
+            print(f(E::B, 5));
+            print(f(E::B, 0));
+            print(f(E::A, 0));
+        }
+        "#,
+        "guarded\nfallback\na\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard() {
+    // The lowering's half. The legs before it cover every variant, so the match
+    // is exhaustive without the guarded leg and the checker accepts it — and
+    // the leg is unreachable, which is exactly why the guard must survive: drop
+    // it and the leg becomes the `else` it is not, answering for values the
+    // legs above it already took.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, 0)); print(f(E::B, 5)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a[0] === 1 && count > 0) {"),
+        "the final leg should keep its test AND its guard, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("} else {\n\t\t$b = \"guarded\";"),
+        "the final leg must not become the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_runs_the_leg_the_earlier_legs_cover() {
+    // The same program, run. It pins the ANSWER, not the guard: an accepted
+    // match's guarded final leg is unreachable by construction (the legs that
+    // carry the proof take every value first), so dropping the guard is
+    // invisible here — measured, by planting the drop and watching this stay
+    // green. The emission pins above and below are where the drop shows.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        fun f(e: E, count: i32): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, 0)); print(f(E::B, 5)); print(f(E::A, 5)); }
+        "#,
+        "b\nb\na\n",
+    );
+}
+
+#[test]
+fn b115_the_trap_composes_with_a_guarded_final_leg() {
+    // backed-enums.md §11.3 recorded the collision and left it: "the trap keeps
+    // the test and still drops the guard". Both now, and they compose without
+    // either learning about the other — the leg keeps test AND guard, and the
+    // trap is still the `else`. The message stays honest because an in-set
+    // value this guard rejects was taken by one of the legs above.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "s", End = "e" }
+        fun f(a: Align, count: i32): str {
+            match a {
+                Align::Start => "start",
+                Align::End => "end",
+                Align::End if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(Align::End, 0)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("} else if ($a === \"e\" && count > 0) {"),
+        "the backed final leg should keep its test AND its guard, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("__enum_trap(\"Align\", $a);"),
+        "the trap should still be the `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard_in_the_sequence_emitter() {
+    // B59's other emitter (capture-clones.md §5): a guard needing a statement
+    // slot — here an `is` test — turns the match into a flat `matched`-flag
+    // sequence rather than an else-if chain. The final leg's guard was dropped
+    // there too, and with it the prelude the guard's temporary lives in.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum E { A, B }
+        enum Wrap { One(i32), Two }
+        fun f(e: E, w: Wrap): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if w is Wrap::One(let n) && n > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, Wrap::Two)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("$d = false;"),
+        "a guard needing a slot should pick the sequence emitter, got:\n{javascript}"
+    );
+    assert!(
+        javascript.contains("if ($c[0] === 0 && $c[1] > 0) {"),
+        "the final leg's guard should survive into its slot, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_in_the_sequence_emitter_runs_the_covering_leg() {
+    // The same program, run: `w` is `Two`, so the guard rejects and the leg
+    // above must be the answer. Like its chain twin, this pins the answer
+    // rather than the guard — the guarded leg is unreachable in an accepted
+    // match.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum E { A, B }
+        enum Wrap { One(i32), Two }
+        fun f(e: E, w: Wrap): str {
+            match e {
+                E::A => "a",
+                E::B => "b",
+                E::B if w is Wrap::One(let n) && n > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(E::B, Wrap::Two)); print(f(E::B, Wrap::One(3))); }
+        "#,
+        "b\nb\n",
+    );
+}
+
+#[test]
+fn b115_a_guarded_final_leg_keeps_its_guard_behind_a_nested_proof() {
+    // The lowering's half, over a NESTED proof: the coverage that licenses the
+    // bare `else` comes from two legs testing below the tag, and the guarded
+    // final leg behind them keeps its test, its prelude and its guard exactly
+    // as it does behind a flat one.
+    //
+    // B118 retired this pin's original program. It was written when
+    // `Pair::Of(Align::Start)` alone counted as covering the variant `Of`, so
+    // the checker accepted a proof that did not hold and the guarded final leg
+    // was REACHABLE — the point being that the emission was wrong on its own
+    // terms, not merely downstream of a bad verdict. The coverage walk now
+    // descends, so that program is refused outright
+    // (`b118_a_refutable_payload_pattern_does_not_prove_coverage`) and the
+    // shape it demonstrated no longer exists to test.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) => "e",
+                Pair::Of(let x) if count > 0 => "guarded",
+            }
+        }
+        fun main() { print(f(Pair::Of(Align::End), 0)); }
+        "#,
+    )
+    .expect("a clean compile");
+    assert!(
+        javascript.contains("count > 0"),
+        "the final leg's guard should survive, got:\n{javascript}"
+    );
+    assert!(
+        !javascript.contains("} else {\n\t\t$b = \"guarded\";"),
+        "the final leg must not become the bare `else`, got:\n{javascript}"
+    );
+}
+
+#[test]
+fn b118_a_refutable_payload_pattern_does_not_prove_coverage() {
+    // B115's residual, closed. The match is NOT exhaustive — `Of(End)` with a
+    // false guard matches no leg — and the checker now says so. It did not,
+    // because the coverage walk asked only which VARIANT a pattern names and
+    // never whether the pattern can fail below the tag. The note is what makes
+    // the message legible when the leg the author believes covers the case is
+    // the guarded one.
+    assert_fails_noting(
+        r#"
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(let x) if count > 0 => "guarded",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B118 — the coverage walk's nested and refutable holes (capture-clones.md §12).
+//
+// One rule, stated over patterns: an unguarded leg proves coverage only for the
+// value-space its whole pattern TREE covers, not its root. An enum position is
+// covered when every variant is named AND each named variant's payload
+// positions are; a tuple position when its elements are; an OPEN position
+// (`i32`, `str`, a struct, a still-abstract parameter) only by a binder or `_`.
+// What does not change: a guard still proves nothing (B115), and `_` still
+// proves everything.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b118_a_refutable_payload_pattern_is_not_exhaustive_unguarded() {
+    // Shape (a), and the headline: no guard anywhere, one variant, one leg —
+    // and before the walk descended this compiled and answered "s" for
+    // `Of(End)`. An IN-SET value, silently mislabelled, with no host boundary
+    // involved. The witness names the value that had no leg.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+    );
+}
+
+#[test]
+fn b118_full_nested_variant_coverage_is_exhaustive() {
+    // The other direction, which is what makes the rule a rule and not a ban on
+    // nested patterns: name every variant of the payload's enum and the match
+    // is total. Run, so the answer is pinned and not merely the verdict.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); print(label(Pair::Of(Align::Start))); }
+        "#,
+        "e\ns\n",
+    );
+}
+
+#[test]
+fn b118_a_binder_or_wildcard_payload_covers_its_variant() {
+    // The two irrefutable payload forms, both still total. `Pair::Of(let a)`
+    // and `Pair::Of(_)` say nothing about `Align`, which is exactly why they
+    // cover all of it.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun bound(p: Pair): str { match p { Pair::Of(let a) => "bound" } }
+        fun wild(p: Pair): str { match p { Pair::Of(_) => "wild" } }
+        fun main() { print(bound(Pair::Of(Align::End))); print(wild(Pair::Of(Align::End))); }
+        "#,
+        "bound\nwild\n",
+    );
+}
+
+#[test]
+fn b118_the_witness_names_the_one_uncovered_variant() {
+    // Two of three named: the message must not say "Align" or "the payload",
+    // it must name the value that falls through. This is the difference between
+    // a diagnostic an author can act on and one they have to decode.
+    assert_fails_with(
+        r#"
+        enum Align { Start, Middle, End }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::Middle)",
+    );
+}
+
+#[test]
+fn b118_a_tuple_subject_of_literals_is_not_exhaustive() {
+    // Shape (b), in its UNGUARDED form — B115 lapsed the tuple exemption only
+    // for a guarded final leg, so this compiled and answered "y" for `(7, 8)`.
+    // The exemption is gone: a tuple's domain is the product of its elements',
+    // which the walk knows how to ask.
+    assert_fails_with(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32)): str {
+            match p { (1, 2) => "x", (3, 4) => "y" }
+        }
+        fun main() { print(f((7, 8))); }
+        "#,
+        "match is not exhaustive: add a catch-all `_` leg",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_binders_is_still_exhaustive_and_runs() {
+    // The tuple direction that must not move: every element a binder, so the
+    // leg matches every tuple. `(1, 2)` before it keeps its test.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        fun f(p: (i32, i32)): str {
+            match p { (1, 2) => "x", (let a, let b) => "rest" }
+        }
+        fun main() { print(f((1, 2))); print(f((7, 8))); }
+        "#,
+        "x\nrest\n",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_enums_needs_every_combination() {
+    // A tuple whose elements are CLOSED: the domain is finite, so literals are
+    // not the problem — a missing combination is. Three of four named, and the
+    // witness is the fourth, spelled as the tuple pattern that would cover it.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing (Align::End, Align::End)",
+    );
+}
+
+#[test]
+fn b118_a_tuple_of_enums_fully_covered_runs() {
+    // The same subject with the fourth combination written: total, and the
+    // answers are pinned in both elements' directions.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+                (Align::End, Align::End) => "ee",
+            }
+        }
+        fun main() { print(f((Align::End, Align::Start))); print(f((Align::End, Align::End))); }
+        "#,
+        "es\nee\n",
+    );
+}
+
+#[test]
+fn b118_a_tuple_element_binder_covers_that_element() {
+    // Mixed refutability across a tuple's columns: the first element is tested
+    // exhaustively, the second is bound. Two legs cover four values.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        fun f(p: (Align, bool)): str {
+            match p { (Align::Start, let flag) => "s", (Align::End, let flag) => "e" }
+        }
+        fun main() { print(f((Align::End, true))); print(f((Align::Start, false))); }
+        "#,
+        "e\ns\n",
+    );
+}
+
+#[test]
+fn b118_coverage_is_the_union_over_legs_not_a_property_of_one() {
+    // The ordering-sensitive shape, and the reason the walk is a matrix rather
+    // than a per-leg predicate: neither leg covers the subject, and together
+    // they still leave exactly one value — `(End, Start)`. A per-leg rule
+    // could only answer "no leg is total", which names nothing.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        fun f(p: (Align, Align)): str {
+            match p { (Align::Start, let b) => "s", (let a, Align::End) => "e" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing (Align::End, Align::Start)",
+    );
+}
+
+#[test]
+fn b118_a_literal_payload_does_not_prove_coverage() {
+    // Shape (c): an `i32` payload has no finite set of literals that exhausts
+    // it, so no number of legs makes this total. The witness is the binder form
+    // that would.
+    assert_fails_with(
+        r#"
+        import std::print;
+        enum Wrapped { Of(i32) }
+        fun f(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }
+        }
+        fun main() { print(f(Wrapped::Of(9))); }
+        "#,
+        "match is not exhaustive: missing Wrapped::Of(_)",
+    );
+}
+
+#[test]
+fn b118_a_str_payload_literal_does_not_prove_coverage() {
+    // The same argument for the other unbounded scalar — one rule over OPEN
+    // domains, not a rule about integers.
+    assert_fails_with(
+        r#"
+        enum Named { Of(str) }
+        fun f(n: Named): str {
+            match n { Named::Of("a") => "A", Named::Of("b") => "B" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Named::Of(_)",
+    );
+}
+
+#[test]
+fn b118_a_binder_payload_over_an_open_domain_runs() {
+    // And the fix an author writes, run: the literal leg keeps its test and the
+    // binder leg takes everything else.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Wrapped { Of(i32) }
+        fun f(w: Wrapped): str {
+            match w { Wrapped::Of(1) => "one", Wrapped::Of(let n) => "many" }
+        }
+        fun main() { print(f(Wrapped::Of(1))); print(f(Wrapped::Of(9))); }
+        "#,
+        "one\nmany\n",
+    );
+}
+
+#[test]
+fn b118_two_levels_of_nesting_are_walked() {
+    // Depth, which is where a one-level patch would stop: the hole is two
+    // payloads down, and the witness spells the whole path to it.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun f(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Outer::Of(Mid::Of(Align::End))",
+    );
+}
+
+#[test]
+fn b118_a_tuple_inside_a_variant_payload_is_walked() {
+    // Mixed nesting, enum-of-tuple: the walk changes shape at each level and
+    // the witness reproduces both. The `bool` slot is untested entirely, so it
+    // reads `_` rather than an arbitrary one of its two values.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Holder { Of((Align, bool)) }
+        fun f(h: Holder): str {
+            match h { Holder::Of((Align::Start, let flag)) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Holder::Of((Align::End, _))",
+    );
+}
+
+#[test]
+fn b118_a_multi_payload_variant_needs_every_position() {
+    // The multi-parameter form: one variant, two payload slots, and coverage is
+    // the product. Three of four combinations named, and the witness names the
+    // fourth in both slots.
+    assert_fails_with(
+        r#"
+        enum Align { Start, End }
+        enum Two { Of(Align, bool) }
+        fun f(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Two::Of(Align::End, false)",
+    );
+}
+
+#[test]
+fn b118_a_multi_payload_variant_fully_covered_runs() {
+    // Its twin, total and run — the product written out.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Two { Of(Align, bool) }
+        fun f(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+                Two::Of(Align::End, false) => "ef",
+            }
+        }
+        fun main() { print(f(Two::Of(Align::End, false))); }
+        "#,
+        "ef\n",
+    );
+}
+
+#[test]
+fn b118_a_recursive_enum_terminates_and_is_walked() {
+    // A self-referential payload is the walk's termination question: descending
+    // into `Node`'s payload lands back on `Tree`. It terminates because the
+    // matrix drives it — a column of binders is dropped, not descended — and
+    // the witness is a legal pattern at every depth it reached.
+    assert_fails_with(
+        r#"
+        enum Tree { Leaf, Node(Tree, Tree) }
+        fun depth(t: Tree): i32 {
+            match t { Tree::Leaf => 0, Tree::Node(Tree::Leaf, let right) => 1 }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Tree::Node(Tree::Node(_, _), _)",
+    );
+}
+
+#[test]
+fn b118_a_recursive_enum_covered_one_level_down_runs() {
+    // Its twin: the same shape with the deeper case written is total, and the
+    // walk stops there rather than unfolding the type forever.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Tree { Leaf, Node(Tree, Tree) }
+        fun depth(t: Tree): i32 {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Node(Tree::Leaf, let right) => 1,
+                Tree::Node(Tree::Node(let a, let b), let right) => 2,
+            }
+        }
+        fun main() { print(depth(Tree::Node(Tree::Leaf, Tree::Leaf))); }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b118_a_generic_payload_is_substituted_before_it_is_walked() {
+    // `Option<Align>`'s payload is the declared `T` until the matched value's
+    // arguments are substituted in — the same substitution `resolve_pattern`
+    // applies when it binds `Some(let x)`. Without it the payload column would
+    // be an abstract parameter and the hole invisible.
+    assert_fails_with(
+        r#"
+        import std::option::Option;
+        enum Align { Start, End }
+        fun f(o: Option<Align>): str {
+            match o { Option::Some(Align::Start) => "s", Option::None => "n" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Option::Some(Align::End)",
+    );
+}
+
+#[test]
+fn b118_leg_order_does_not_change_the_verdict() {
+    // Coverage is a property of the SET of unguarded legs. The same three legs
+    // in a different order are total either way, and the answers follow the
+    // legs, not the walk.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align), Other }
+        fun forward(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }
+        }
+        fun backward(p: Pair): str {
+            match p { Pair::Other => "o", Pair::Of(Align::End) => "e", Pair::Of(Align::Start) => "s" }
+        }
+        fun main() {
+            print(forward(Pair::Of(Align::End)));
+            print(backward(Pair::Of(Align::End)));
+            print(backward(Pair::Other));
+        }
+        "#,
+        "e\ne\no\n",
+    );
+}
+
+#[test]
+fn b118_an_or_pattern_contributes_each_alternative() {
+    // An or-pattern is several patterns sharing a body, and each alternative is
+    // its own row in the matrix — so two nested alternatives on ONE leg cover
+    // the payload exactly as two legs would.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Pair { Of(Align) }
+        fun f(p: Pair): str {
+            match p { Pair::Of(Align::Start), Pair::Of(Align::End) => "either" }
+        }
+        fun main() { print(f(Pair::Of(Align::End))); }
+        "#,
+        "either\n",
+    );
+}
+
+#[test]
+fn b118_a_guarded_nested_leg_still_proves_nothing() {
+    // B115's rule, unchanged one level down: the leg naming `Align::End` is
+    // guarded, so the walk does not count it and the payload is holed. The
+    // note points at the guard, which is the only reason the author expected
+    // the leg to count.
+    assert_fails_noting(
+        r#"
+        enum Align { Start, End }
+        enum Pair { Of(Align), Other }
+        fun f(p: Pair, count: i32): str {
+            match p {
+                Pair::Of(Align::Start) => "s",
+                Pair::Of(Align::End) if count > 0 => "e",
+                Pair::Other => "o",
+            }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+        "count > 0",
+        "this leg is guarded, and a guarded leg cannot prove exhaustiveness",
+    );
+}
+
+#[test]
+fn b118_a_catch_all_still_proves_everything_below_the_top_level() {
+    // The other thing that does not change: a `_` leg covers every value at
+    // every depth, so no amount of refutable nesting before it makes a match
+    // non-exhaustive.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, Middle, End }
+        enum Mid { Of(Align) }
+        enum Outer { Of(Mid) }
+        fun f(o: Outer): str {
+            match o { Outer::Of(Mid::Of(Align::Start)) => "s", _ => "other" }
+        }
+        fun main() { print(f(Outer::Of(Mid::Of(Align::End)))); }
+        "#,
+        "other\n",
+    );
+}
+
+#[test]
+fn b118_a_backed_payload_needs_its_whole_variant_set() {
+    // The walk asks the VARIANT SET, and a backed enum's variant set is the
+    // same set whatever its values lower to — so shape (a) is refused
+    // identically when `Align` is backed. This is the composition point with
+    // B114: the trap answers for values outside the set, and it was never the
+    // answer to a missing leg inside it.
+    assert_fails_with(
+        r#"
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s" }
+        }
+        fun main() { }
+        "#,
+        "match is not exhaustive: missing Pair::Of(Align::End)",
+    );
+}
+
+#[test]
+fn b118_the_membership_trap_no_longer_fires_on_an_in_set_value() {
+    // B114 §12.4's interaction, verified from the other side. Under the hole a
+    // match could reach the trap with every value IN set, and the trap then
+    // named an in-set value as out-of-set. That match is now refused (pinned
+    // above), so the only way to reach the trap is the one it was designed for:
+    // a value the HOST invented. Both directions in one program — the in-set
+    // payload answers, the invented one traps and names itself.
+    let javascript = compile(
+        r#"
+        import std::print;
+        enum Align { Start = "flex-start", End = "flex-end" }
+        enum Pair { Of(Align) }
+        fun label(p: Pair): str {
+            match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+        }
+        fun main() { print(label(Pair::Of(Align::End))); }
+        "#,
+    )
+    .expect("a clean compile");
+    let driven = format!(
+        "{javascript}\ntry {{ label([ 0, \"middle\" ]); }} catch (error) {{ console.log(error); }}\n"
+    );
+    assert_eq!(
+        run_js(&driven).expect("a clean run"),
+        "e\nAlign: \"middle\" is not one of its values\n",
+        "an in-set payload must answer and only an invented one may trap"
+    );
+}
+
+#[test]
+fn b118_the_witness_is_a_pattern_that_closes_the_hole() {
+    // The message's contract, checked by using it: whatever the diagnostic
+    // names is a legal pattern, and adding it as a leg makes the match total.
+    // Pinned across all three witness shapes at once — a nested variant, a
+    // multi-slot variant with an untested slot, and a tuple.
+    assert_compiles_and_runs(
+        r#"
+        import std::print;
+        enum Align { Start, End }
+        enum Holder { Of((Align, bool)) }
+        enum Two { Of(Align, bool) }
+        fun nested(h: Holder): str {
+            match h {
+                Holder::Of((Align::Start, let flag)) => "s",
+                Holder::Of((Align::End, _)) => "e",
+            }
+        }
+        fun slots(t: Two): str {
+            match t {
+                Two::Of(Align::Start, true) => "st",
+                Two::Of(Align::Start, false) => "sf",
+                Two::Of(Align::End, true) => "et",
+                Two::Of(Align::End, false) => "ef",
+            }
+        }
+        fun tupled(p: (Align, Align)): str {
+            match p {
+                (Align::Start, Align::Start) => "ss",
+                (Align::Start, Align::End) => "se",
+                (Align::End, Align::Start) => "es",
+                (Align::End, Align::End) => "ee",
+            }
+        }
+        fun main() {
+            print(nested(Holder::Of((Align::End, true))));
+            print(slots(Two::Of(Align::End, false)));
+            print(tupled((Align::End, Align::End)));
+        }
+        "#,
+        "e\nef\nee\n",
+    );
+}
+
+// --- The blackout: analysis survives a parse error (editing-dx.md S1/S6) -------
+//
+// `analyze_source` runs the analyzer on the SALVAGED tree, so these pins measure
+// what the language server publishes and — since S6 — what batch `vilan check`
+// prints. The survey's §2 finding is that a file which does not parse used to
+// lose every diagnostic it already had: `vilan check` analyzed nothing at all
+// (mechanism 1, P29), and the salvage the server did get was prefix-only, with
+// the enclosing body emptied (mechanisms 2 and 3, P30/P31).
+//
+// Each pin below asserts BOTH halves — the parse error is reported, AND the
+// analyzer diagnostics elsewhere in the file are still there — because either one
+// alone passes vacuously on the behavior it is meant to exclude.
+
+/// Every diagnostic message a source produces, parse and analysis together, in
+/// the order `analyze_source` returns them.
+#[track_caller]
+fn all_diagnostics(source: &str) -> Vec<String> {
+    match compile(source) {
+        Ok(_) => panic!("expected diagnostics, but it compiled cleanly"),
+        Err(messages) => messages,
+    }
+}
+
+#[track_caller]
+fn assert_reports_all(source: &str, expected: &[&str]) {
+    let messages = all_diagnostics(source);
+    for part in expected {
+        assert!(
+            messages.iter().any(|message| message.contains(part)),
+            "no diagnostic contains {part:?}; got: {messages:#?}"
+        );
+    }
+}
+
+/// P29, the batch shape: one parse error in `broken`, two genuine type errors in
+/// `main`. All three are reported. Before S1/S6 this file produced exactly one
+/// diagnostic — the parse error — and one missing `;` anywhere in a file blinded
+/// the checker to everything else in it.
+#[test]
+fn a_parse_error_does_not_hide_the_analyzer_errors_in_another_function() {
+    assert_reports_all(
+        "import std::print;\n\
+         fun broken() {\n\
+         \tlet a: i32 = 1\n\
+         \tprint(a);\n\
+         }\n\
+         fun main() {\n\
+         \tlet bad: i32 = \"text\";\n\
+         \tlet other: str = 5;\n\
+         \tprint(bad);\n\
+         }\n",
+        &[
+            "expected `;` to end this statement",
+            "Expected i32, but got str instead.",
+            "Expected str, but got i32 instead.",
+        ],
+    );
+}
+
+/// P30 stage 2, the keystroke the survey measured: a standing type error one line
+/// above a half-typed call. The editor used to show ONLY `found '}' expected an
+/// expression`, anchored on a brace the user never touched — the standing error
+/// disappeared for the two keystrokes between `print(` and `print(1)`.
+#[test]
+fn a_standing_type_error_survives_a_half_typed_call_below_it() {
+    assert_reports_all(
+        "fun main() {\n\tlet wrong: i32 = \"text\";\n\tprint(\n}\n",
+        &[
+            "unclosed `(`: expected a matching `)`",
+            "Expected i32, but got str instead.",
+        ],
+    );
+}
+
+/// P31 row B, the shape a typing user is in constantly: an unclosed `(` ABOVE a
+/// type error. The row the survey singles out as losing the most — "everything
+/// below the cursor stops being checked" — because an unclosed region defeated
+/// recovery and the statement loop stopped there.
+#[test]
+fn an_unclosed_delimiter_above_a_type_error_no_longer_erases_it() {
+    assert_reports_all(
+        "fun one() {\n\
+         \tprint(\n\
+         }\n\
+         fun two() {\n\
+         \tlet bad: i32 = \"text\";\n\
+         }\n",
+        &[
+            "unclosed `(`: expected a matching `)`",
+            "Expected i32, but got str instead.",
+        ],
+    );
+}
+
+/// The same, in ONE body: the broken statement is dropped and its siblings are
+/// still analyzed. This is mechanism 2 — the enclosing `{…}` used to be skipped
+/// wholesale and replaced by an empty block, so every statement in the body
+/// stopped existing along with the half-typed one.
+#[test]
+fn a_broken_statement_does_not_erase_its_siblings_diagnostics() {
+    assert_reports_all(
+        "fun main() {\n\
+         \tlet above: i32 = \"text\";\n\
+         \tlet broken: i32 = ;\n\
+         \tlet below: str = 5;\n\
+         }\n",
+        &[
+            "found ';' expected an expression",
+            "Expected i32, but got str instead.",
+            "Expected str, but got i32 instead.",
+        ],
+    );
+}
+
+/// The analyzer says nothing INSIDE a recovered region — §13.1's proposed
+/// mitigation ("suppress diagnostics whose span falls inside one") turns out to
+/// need no code, because a salvaged tree holds nothing there to diagnose: the
+/// garbled `(1 +)` becomes a `Node::Error` placeholder that types as nothing and
+/// reports nothing, while the standing error beside it is untouched.
+#[test]
+fn a_recovered_region_produces_no_analyzer_diagnostics_of_its_own() {
+    let messages =
+        all_diagnostics("fun main() {\n\tlet x: i32 = (1 +);\n\tlet bad: i32 = \"text\";\n}\n");
+    assert_eq!(
+        messages.len(),
+        2,
+        "the parse error and the standing error, and nothing from the placeholder: {messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("found ')' expected an expression"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Expected i32, but got str instead."))
+    );
+}
+
+/// A parse error must not MANUFACTURE a diagnostic either — the other direction
+/// of §8 clause 3, and the one a synchronizer gets wrong by default. A statement
+/// whose only fault is its missing `;` is kept, so the names it binds stay bound
+/// and the lines below it, which are correct, stay quiet.
+#[test]
+fn a_missing_semicolon_does_not_unbind_what_its_statement_declared() {
+    let messages = all_diagnostics(
+        "import std::print;\n\
+         fun main() {\n\
+         \tlet origin: i32 = 3\n\
+         \tlet total: i32 = origin + 1;\n\
+         \tprint(total);\n\
+         }\n",
+    );
+    assert_eq!(
+        messages.len(),
+        1,
+        "one missing token, one diagnostic — and no `cannot find 'origin'`: {messages:#?}"
+    );
+    assert!(messages[0].contains("expected `;` to end this statement"));
 }

@@ -137,9 +137,13 @@ An integer backing value is an **integer**, not a general `NUMBER`: a
 fractional part (`= 1.5`) and a type suffix (`= 1u32`, and `= 1_000`,
 which lexes as `1` with the trailer `_000`) are both errors rather than
 being silently discarded. Hex is read as hex (`= 0xFF` is 255). The value
-must fit a signed 64-bit integer, and so must the implicit continuation:
-a variant with no backing value takes the previous variant's plus one,
-starting at 0, and running past the bound is an error rather than a wrap.
+must lie in **`-9007199254740991 ..= 9007199254740991`** — `i53`, the
+widest integer a runtime number holds exactly — because a backed enum *is*
+that number at runtime, and a discriminant past the bound would reach the
+host as a different value than the source wrote. The bound is symmetric.
+The implicit continuation obeys it too: a variant with no backing value
+takes the previous variant's plus one, starting at 0, and running past the
+bound is an error rather than a wrap.
 
 **A string backing must be written on every variant.** There is no
 successor of `"start"` for the continuation rule to hand out, and the
@@ -426,3 +430,35 @@ classic mistyped-variant trap is a resolution error instead of a silent
 catch-all. `bool` and `null` literals match as variants of their enums.
 The `let`/parameter binder grammar (names and tuples, §3.3) is the
 irrefutable subset; refutable forms (literals, variants) are match-only.
+A tuple pattern is irrefutable only when its elements are: `(let a, let b)`
+is a destructure and matches everything, `(1, 2)` is a test.
+
+A `match` must be **exhaustive**, and exhaustiveness is proven by
+**unguarded** legs only — a guard tests the value, which the check does
+not reason about, so a guarded leg proves nothing about what the match
+covers. What an unguarded leg proves is the value-space its whole pattern
+**tree** covers, not its root, and the check descends accordingly:
+
+- an **enum** position needs every variant named, and each named
+  variant's payload positions covered in turn, so
+  `Pair::Of(Align::Start)` alone leaves `Pair::Of(Align::End)` missing
+  however few variants `Pair` has;
+- a **tuple** position needs its elements covered — as a product, so
+  `(1, 2)` and `(3, 4)` leave every other pair missing;
+- an **open** position (`i32`, `str`, a struct, a still-abstract type
+  parameter) is covered only by a binder or `_`. No number of literals
+  exhausts it: `Wrapped::Of(1)`, `Wrapped::Of(2)`, … is never total.
+
+A subject whose type is not yet known, or is `any`, `never`, or a generic
+parameter, is exempt: the question is which values the subject can take,
+and there is no answer to give. The diagnostic names one uncovered value
+as a pattern that would cover it — *"missing `Pair::Of(Align::End)`"* —
+or asks for a catch-all where the hole is the whole domain. The
+consequence lands on the **last** leg, the one that answers for whatever
+the legs above it did not take: a `match` whose final leg is guarded must
+be exhaustive without it, so `match a { A => …, B if c => … }` is refused
+whatever the subject's type ("match is not exhaustive"). Write the guard
+with a catch-all after it — `B if c => …, _ => …` — and the value the
+guard rejects has somewhere to go. A guard is tested wherever its leg
+stands, the last one included; no leg is silently promoted to a
+catch-all.

@@ -24,10 +24,9 @@
 //!
 //! The result is `Program::async_functions`, read by the transformer.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
-use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
+use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
 
@@ -38,12 +37,12 @@ use crate::type_::{Type, TypeId};
 /// `adapted_instances` and diagnostics, none of which the graph is derived
 /// from, so its view of the program is bit-for-bit the one it used to build.
 pub fn infer(program: &mut Program, graph: &CallGraph) {
-    let mut async_set: HashSet<Id> = HashSet::new();
+    let mut async_set: HashSet<Id> = HashSet::default();
 
     // Every value each binding ever holds — its initializer plus every
     // reassignment (`mut` rebinds) — for async ADOPTION: a binding holding
     // an async closure through any of them awaits when called.
-    let mut held_values: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut held_values: HashMap<Id, Vec<Id>> = HashMap::default();
     for (variable_id, variable) in &program.variables {
         if let Some(initial) = variable.initial {
             held_values.entry(*variable_id).or_default().push(initial);
@@ -144,7 +143,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     // ADAPTS instead of erroring — the worklist above; void-returning
     // parameters stay legal as spawn semantics.)
     let mut divergences: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    let no_flags: HashMap<Id, bool> = HashMap::new();
+    let no_flags: HashMap<Id, bool> = HashMap::default();
     for function_call in program.function_calls.values() {
         let Some(Expr::Local(target)) = program.entity_map.get(&function_call.subject_id) else {
             continue;
@@ -338,7 +337,7 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
                             &held_values,
                             &async_set,
                             &initializer_adaptive,
-                            &HashMap::new(),
+                            &HashMap::default(),
                             &[],
                             callee,
                             call.call_id,
@@ -473,6 +472,36 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     for (error, source) in initializer_refusals {
         program.push_diagnostic(error, source);
     }
+
+    // --- B119 (view-invalidation.md §7): materialize the per-CALL-SITE
+    // answer the view rule reads. The fixpoint above already decided it for
+    // every edge — it is what made each caller async — but it decided it as a
+    // per-NODE boolean and threw the sites away. One more pass over the same
+    // edges, with the same `call_suspends`, records them.
+    //
+    // Runs here, after `async_values` / `awaited_calls` took their adopted and
+    // value-flow entries, so the channels those opened are seen; and once,
+    // per analysis, not per query.
+    //
+    // Initializer calls are deliberately absent: a module-level initializer
+    // that suspends is refused outright above, and the invalidation scan does
+    // not walk initializers, so there is no site here to answer for.
+    let mut suspending_calls: HashSet<Id> = HashSet::default();
+    let mut dispatch_verdicts: HashMap<(bool, Option<TypeId>, &str), bool> = HashMap::default();
+    for node in graph.nodes() {
+        for call in graph.calls_of(node.id()) {
+            if call_suspends_memoized(
+                program,
+                call,
+                &held_values,
+                &async_set,
+                &mut dispatch_verdicts,
+            ) {
+                suspending_calls.insert(call.call_id);
+            }
+        }
+    }
+    program.suspending_calls = suspending_calls;
 
     program.async_functions = async_set;
 }
@@ -788,9 +817,9 @@ fn compute_adaptation(
         members
     };
 
-    let mut instance_async: HashMap<InstanceKey, bool> = HashMap::new();
-    let mut origins: HashMap<InstanceKey, Id> = HashMap::new();
-    let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::new();
+    let mut instance_async: HashMap<InstanceKey, bool> = HashMap::default();
+    let mut origins: HashMap<InstanceKey, Id> = HashMap::default();
+    let mut dependents: HashMap<InstanceKey, HashSet<InstanceKey>> = HashMap::default();
     let mut pending: Vec<InstanceKey> = program
         .functions
         .keys()
@@ -809,7 +838,7 @@ fn compute_adaptation(
                     held_values,
                     async_set,
                     &adaptive,
-                    &HashMap::new(),
+                    &HashMap::default(),
                     &[],
                     callee,
                     call.call_id,
@@ -938,16 +967,16 @@ fn compute_adaptation(
 
     // --- Final pass: with every flag stable, collect each instance's
     // emission decisions and the context-dependent diagnostics.
-    let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::new();
+    let mut instances: HashMap<InstanceKey, crate::analyzer::AdaptedInstance> = HashMap::default();
     let mut diagnostics: Vec<(crate::error::Error, SourceId)> = Vec::new();
-    let mut reported: HashSet<(Id, Id)> = HashSet::new();
+    let mut reported: HashSet<(Id, Id)> = HashSet::default();
     // A.4's escape positions, collected once — the same positions the global
     // divergence checks refuse, asked again per instance (`escape_violations_in`).
     // Deduplicated by value expression, so one escaping store reports once
     // however many instances reach it.
     let field_stores = plain_closure_field_stores(program);
     let return_sites = plain_closure_return_sites(program);
-    let mut reported_escapes: HashSet<Id> = HashSet::new();
+    let mut reported_escapes: HashSet<Id> = HashSet::default();
     // C1: this pass is FIRST-WINS across instances — `reported` and
     // `reported_escapes` let one instance claim a violation and silence the
     // others — and each instance anchors its diagnostic at its OWN origin. So a
@@ -1391,7 +1420,7 @@ fn sync_violations_at(
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
     };
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     for (argument, parameter) in function_call.argument_ids.iter().zip(&function.parameters) {
         // B61: the contract, not the adaptation shape — a `sync` marker binds a
         // void-returning callback too.
@@ -1459,7 +1488,7 @@ fn extern_violations_at(
     let Some(function_call) = program.function_calls.get(&call_id) else {
         return;
     };
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     for (argument, parameter) in function_call.argument_ids.iter().zip(&external.parameters) {
         // The typed channel: a declared `async |…| T` parameter means the
         // host awaits the closure itself (`__nursery_run`'s body parameter).
@@ -1595,7 +1624,7 @@ fn escape_violations_in(
     reported: &mut HashSet<Id>,
     diagnostics: &mut Vec<(crate::error::Error, SourceId)>,
 ) {
-    let empty_flags = HashMap::new();
+    let empty_flags = HashMap::default();
     let escapes_here = |value_id: Id| {
         value_async_in(program, held_values, async_set, flags, bits, value_id)
             && !value_async_in(program, held_values, async_set, &empty_flags, &[], value_id)
@@ -1743,30 +1772,10 @@ fn base_fixpoint(
             if async_set.contains(&id) {
                 continue;
             }
-            let calls_async = graph.calls_of(id).iter().any(|call| match call.target {
-                CallTarget::Function(callee) | CallTarget::External(callee) => {
-                    async_set.contains(&callee)
-                }
-                // A trait/generic-bounded dispatch: async if any candidate impl is.
-                CallTarget::Indirect(
-                    IndirectReason::GenericMember | IndirectReason::TraitDispatch,
-                ) => dispatch_candidates(program, call.call_id)
-                    .iter()
-                    .any(|member| async_set.contains(member)),
-                // A call through an `async || T`-typed value IS an await
-                // point — asyncness rides the type (J2), or the VALUE FLOW:
-                // a binding holding an async closure, an async field read, an
-                // async-returning call, a directly-applied async closure
-                // literal (the lowered `run` body). Other higher-order calls
-                // stay conservative (the concrete target isn't recoverable),
-                // as do variant constructors.
-                _ => program
-                    .function_calls
-                    .get(&call.call_id)
-                    .is_some_and(|function_call| {
-                        subject_awaits(program, function_call.subject_id, held_values, async_set, 0)
-                    }),
-            });
+            let calls_async = graph
+                .calls_of(id)
+                .iter()
+                .any(|call| call_suspends(program, call, held_values, async_set));
             if calls_async {
                 async_set.insert(id);
                 changed = true;
@@ -1778,11 +1787,96 @@ fn base_fixpoint(
     }
 }
 
+/// Whether one call site suspends its caller — i.e. whether the emission
+/// `await`s it, which is the same thing: an `await` yields to the microtask
+/// queue whatever it is handed, so any turn may run before the caller resumes.
+///
+/// This is the single per-call test [`base_fixpoint`] propagates over AND the
+/// one B119's view rule reads back (`Program::suspending_calls`). One
+/// definition, so the checker's answer and the emitter's cannot drift.
+///
+/// A trait/generic-bounded dispatch is suspending when ANY candidate impl is,
+/// matching what the fixpoint already does to decide the caller's own
+/// asyncness. It is an over-approximation on purpose: the concrete member is
+/// chosen per monomorphized instance, and no pre-monomorphization pass can
+/// know which one this site gets.
+fn call_suspends(
+    program: &Program,
+    call: &Call,
+    held_values: &HashMap<Id, Vec<Id>>,
+    async_set: &HashSet<Id>,
+) -> bool {
+    match call.target {
+        CallTarget::Function(callee) | CallTarget::External(callee) => async_set.contains(&callee),
+        CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch) => {
+            dispatch_candidates(program, call.call_id)
+                .iter()
+                .any(|member| async_set.contains(member))
+        }
+        // A call through an `async || T`-typed value IS an await point —
+        // asyncness rides the type (J2), or the VALUE FLOW: a binding holding
+        // an async closure, an async field read, an async-returning call, a
+        // directly-applied async closure literal (the lowered `run` body).
+        // Other higher-order calls stay conservative (the concrete target
+        // isn't recoverable), as do variant constructors.
+        _ => program
+            .function_calls
+            .get(&call.call_id)
+            .is_some_and(|function_call| {
+                subject_awaits(program, function_call.subject_id, held_values, async_set, 0)
+            }),
+    }
+}
+
+/// [`call_suspends`] with the DISPATCH verdict memoized by dispatch key.
+///
+/// `dispatch_candidates` scans every impl and every trait for the member name,
+/// so asking it once per indirect edge — rather than once per node that has not
+/// flipped yet, which is all the fixpoint ever does — is what an unmemoized
+/// materialization pass measured at +2.0 ms of an 18 ms post-pass phase. The
+/// verdict is a function of the dispatch record alone, so one entry per
+/// distinct `(constraint-or-type, member)` answers every site that shares it:
+/// +0.3 ms.
+///
+/// Sound only once `async_set` is FINAL — a growing set would strand a `false`
+/// — which is exactly where the materialization runs, and why `base_fixpoint`
+/// cannot share the memo.
+fn call_suspends_memoized<'src>(
+    program: &Program<'src>,
+    call: &Call,
+    held_values: &HashMap<Id, Vec<Id>>,
+    async_set: &HashSet<Id>,
+    verdicts: &mut HashMap<(bool, Option<TypeId>, &'src str), bool>,
+) -> bool {
+    if !matches!(
+        call.target,
+        CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch)
+    ) {
+        return call_suspends(program, call, held_values, async_set);
+    }
+    // No dispatch record is `dispatch_candidates`' own empty answer.
+    let Some(dispatch) = dispatch_at(program, call.call_id) else {
+        return false;
+    };
+    let key = match dispatch {
+        GenericDispatch::OnConstraint(constraint_id, member) => (true, Some(constraint_id), member),
+        GenericDispatch::OnType(type_id, member) => (false, type_id, member),
+    };
+    if let Some(verdict) = verdicts.get(&key) {
+        return *verdict;
+    }
+    let verdict = dispatch_candidates(program, call.call_id)
+        .iter()
+        .any(|member| async_set.contains(member));
+    verdicts.insert(key, verdict);
+    verdict
+}
+
 /// A function's ADAPTIVE parameters: plain (unmarked), closure-typed, with a
 /// RESOLVED non-void return. `sync`/`async`-marked and void/unresolved ones
 /// never adapt (contract, spawn, or no known lie).
 fn adaptive_params_of(program: &Program) -> HashMap<Id, HashSet<Id>> {
-    let mut adaptive: HashMap<Id, HashSet<Id>> = HashMap::new();
+    let mut adaptive: HashMap<Id, HashSet<Id>> = HashMap::default();
     for (function_id, function) in &program.functions {
         let params: HashSet<Id> = function
             .parameters

@@ -7,6 +7,11 @@
 > until backed enums grow a trap-arm story for the bare-`else` hazard
 > §7.2 records. Implementation is the v0.35.0 backed-enums lane.
 >
+> §9 RATIFIED 2026-08-09 (owner): trap-arm candidate (b) — every
+> exhaustive backed-enum match emits the trap `else`; §7.2's deferral
+> LIFTS, its refusal (and B107's hole with it) deletes, json.vl's
+> kind() family deletes. The cycle-14 trap-arm lane implements.
+>
 > Prior status: DRAFT (awaiting owner review)
 >
 > Origin: OWNER NOTE 1 on `bindgen.md` (§9.4), recorded 2026-08-06 during the
@@ -1100,14 +1105,36 @@ rather than fixed here.
 
 ### 8.4 Two limits found, both pre-existing
 
-- **A discriminant past 2^53 is not representable.** `enum E { A =
-  9007199254740993 }` emits the JS number literal
-  `9007199254740993`, which JavaScript reads as `9007199254740992`. The
-  emission is self-consistent (the `match` compares the same literal), so
-  nothing in-tree miscompiles — but a value crossing a host boundary
-  would. This predates backed enums and is untouched by them; the arc's
-  only concession is that `value()`/`parse()` are not synthesized there,
-  rather than being synthesized with a return type that lies.
+- **A discriminant past 2^53 is not representable — CLOSED as B106,
+  2026-08-10.** `enum E { A = 9007199254740993 }` emitted the JS number
+  literal `9007199254740993`, which JavaScript reads as
+  `9007199254740992`. The emission was self-consistent (the `match`
+  compared the same literal), so nothing in-tree miscompiled — but a value
+  crossing a host boundary would. This predated backed enums and was
+  untouched by them; the arc's only concession was that `value()`/`parse()`
+  are not synthesized there, rather than being synthesized with a return
+  type that lies.
+
+  The fix is a range check in B79's validation family (`backing_value`),
+  at **i53's edge** rather than `i64`'s: the bound belongs to the
+  *emission*, not to the compiler's storage type, and the diagnostic says
+  so ("a backed enum is a JS number at runtime, and an integer past
+  2^53 - 1 has no exact double, so the emitted literal would be a
+  different value"). Two consequences worth naming:
+
+  - The bound is now **symmetric**. B79's reached one further on the
+    negative side because two's complement does — a fact about `i64`, not
+    about a JS number, and the old pin asserting `Min =
+    -9223372036854775808` legal was pinning the bug's own shape.
+  - The **implicit continuation** stops at the same edge, because a
+    continued value is emitted as the same bare literal. One rule, not two.
+
+  A value in `(i53, i64]` is now a compile error rather than a silently
+  wrong literal, and `integer_backing_type`'s `None` arm — §3.8's "no
+  conversions where the type would lie" — is reachable only for a
+  discriminant the check has already rejected. Zero in-tree flips: the
+  sweep finds no `.vl` anywhere with a discriminant past i53. Pins: the
+  `b106_*` family plus B79's two rewritten bound pins.
 - **bindgen's PROPERTIES keep their TODO.** §4.1 specifies the parameter
   and return directions; a property is both, through separate externs, so
   one bound type cannot serve it. The TODO now names the spellings that
@@ -1125,3 +1152,1222 @@ is now the shipped pitch — so `Map<Align, T>` failing on a missing
 `Hashable` is the first thing a user will hit. The case for a
 compiler-derived `Hashable` on bare-lowered enums is stronger than the
 paper could state it.
+
+## 9. The trap arm — a design note for lifting §7.2 (cycle 13)
+
+> **DESIGN NOTE, not a ratification and not an implementation.** §7.2 is
+> DEFERRED "until backed enums grow a trap-arm story for the bare-`else`
+> hazard". This is that story, written for the owner's queue. Nothing here
+> is built; §9.5 is a recommendation to accept or reject, and §9.6 is the
+> worked example of what accepting buys.
+>
+> Probes P11–P16 ran against `target/debug/vilan` built in the
+> `docs-trap-note` worktree from `next @92db7d2` — the shipped v0.35.0
+> backed-enum implementation, not the paper's model of it. P16 found a live
+> hole in the refusal §8.2(f) describes, which changes the weighing.
+
+### 9.1 The hazard, re-measured — and it is narrower than §7.2 states
+
+> **P11.** The shipped emission for an exhaustive three-variant string-backed
+> `match`:
+>
+> ```vilan
+> enum Align { Start = "flex-start", Center = "center", End = "flex-end" }
+> fun label(align: Align): str {
+>     match align { Align::Start => "s", Align::Center => "c", Align::End => "e" }
+> }
+> ```
+> ```js
+> if ($a === "flex-start")   { $b = "s"; }
+> else if ($a === "center")  { $b = "c"; }
+> else                       { $b = "e"; }
+> ```
+>
+> Driving the emitted function directly: `label("middle") === "e"`. §7.2's
+> "confidently the wrong variant" is exact, and still true of the build.
+
+> **P12.** The other three ways a backed enum can be tested, same enum, one
+> program:
+>
+> | source | emitted | on an out-of-set value |
+> |---|---|---|
+> | `a is Align::End` | `$a === "flex-end"` | `false` — honest |
+> | `a == Align::End` | `a === "flex-end"` | `false` — honest |
+> | `match a { Align::Start => .., _ => .. }` | `if ($a === "flex-start") .. else ..` | takes `_` — honest |
+
+P12 is the useful narrowing and the paper does not currently say it: **the
+hazard is confined to the last arm of an exhaustive `match`.** Everywhere
+else the feature emits a `===` against a literal, and a `===` against a
+literal answers `false` for a value outside the set, which is the correct
+answer. There is exactly one construct in the language that converts an
+out-of-set value into a confident lie, and it converts it into precisely one
+variant: whichever the analyzer ordered last.
+
+That matters for scope. A trap-arm design does not have to guard the
+boundary, or the type, or the value. It has to guard one `else`.
+
+### 9.2 A hole in the refusal itself (P16) — and why it re-ranks the candidates
+
+> **P16.** §8.2(f) says the refusal "searches the whole return type". It does
+> not search a function-typed **parameter's** parameters, where the host is
+> the one constructing the value:
+>
+> ```vilan
+> [extern("onAlignChange")]
+> external fun on_align_change(handler: |Align| void): void;
+> ```
+>
+> This compiles clean today — `vilan check` reports no errors — while
+> `external fun host_align(): Align` and `external fun align(self): Align` on
+> an `external struct` are both correctly refused. Run against a host that
+> calls `handler("middle")`, the program prints `e`: `Align::End`,
+> confidently, exit 0.
+
+§7.2's premise for allowing the parameter direction is "vilan constructs the
+value, so it is always in the set". That premise fails for a **callback**
+parameter, which is a return position wearing a parameter's clothes. The
+refusal inherited the premise rather than the position, so it enumerates
+host-constructing positions and has already missed one.
+
+This should be filed as a bug against the shipped refusal regardless of what
+happens to §7.2 — it is a live instance of the exact hazard the deferral
+exists to prevent. But it also carries a design argument: **any answer built
+on "find the places the host supplies a value" has to be exhaustive over the
+language's positions to be worth anything, and one attempt already was
+not.** An answer built on "guard the one `else`" does not have to enumerate
+anything.
+
+### 9.3 The trap arm already exists in the emission (P13, P14)
+
+> **P13.** A `_` arm on an ALREADY-EXHAUSTIVE backed-enum match is accepted
+> today — no unreachable-arm diagnostic — and emits exactly the trap shape:
+> every variant gets its own `===` and the `_` becomes the bare `else`.
+>
+> ```js
+> if ($a === "flex-start")    { $b = "s"; }
+> else if ($a === "center")   { $b = "c"; }
+> else if ($a === "flex-end") { $b = "e"; }   // the last arm, now tested
+> else                        { $b = "trap"; } // the trap
+> ```
+
+So no candidate below needs a new codegen path. `scalar_variant_test` already
+produces both shapes; what a trap arm changes is only whether the compiler
+emits the second shape when the author wrote the first. The difference
+between the three candidates is **who writes the arm and when** — not what
+it compiles to.
+
+> **P14.** The byte delta, measured on three enums (whole emissions, this
+> worktree's binary):
+>
+> | enum | backing | variants | today | with a trap arm | delta |
+> |---|---|---|---|---|---|
+> | `Align` | `str` | 3 | 211 | 259 | **+48** |
+> | `Display` | `str` | 7 | 353 | 392 | **+39** |
+> | `Ordering` (`vilan/test/enum-discriminant.vl:15`) | `i32` | 3 | 329 | 368 | **+39** |
+>
+> The delta is **per match, not per variant** — the 7-variant enum is the
+> cheapest of the three. It decomposes as one added `===` test (12 bytes plus
+> the last variant's literal as written) plus one `else` block (13 bytes plus
+> the trap statement), so a real helper call lands around 50–55 bytes.
+
+The runtime cost is the mirror image and just as small: matching the *last*
+variant goes from N−1 comparisons to N. The trap branch itself runs never.
+
+**Corpus-wide, "always trap" costs 39 bytes.** The tree contains exactly ONE
+exhaustive match over a backed enum — `vilan/test/enum-discriminant.vl:15` —
+across 112 corpus programs totalling 213,335 bytes of goldens, i.e. **0.018%**
+of the corpus, in one file. `style.vl` contributes nothing, because §8.1's
+rewrite collapsed all eleven wrappers to `.value()`; there is no `match` left
+there to pay for. That is the measurement §6's slice 3 would need, and it is
+not a cost worth an argument.
+
+### 9.4 The three candidates
+
+**(a) A trap arm at host-tainted values only.**
+
+The value carries a provenance bit from an `external fun`'s return, and a
+`match` on a tainted subject gains the arm; everything else emits as today.
+
+On the sub-question of what the arm *does*: **panic, naming the enum and the
+raw value** — not an `Option`-shaped result. An `Option`-shaped result would
+make a `match` expression's type depend on where its subject came from: the
+same three arms are `str` for one caller and `Option<str>` for another. That
+is not a trap-arm design, it is an effect system, and it is a much larger
+paper than this one. A panic reading `Align: host value "middle" is not one
+of its values` is the honest report, and it should emit through the same
+`throw` shape `panic()` already uses rather than inventing a second failure
+path.
+
+Costs: a taint analysis through the analyzer that survives assignment, field
+reads, list elements, closure capture and calls — new machinery in exactly
+the two places §1.4 and §1.5 were pleased to leave untouched. Its emitted
+size today is **zero**, but only because the refusal makes the taint set
+empty; zero is the cost of doing nothing. And per P16 it inherits the
+liability that sank the refusal: it must be right about every position from
+which a host value can enter, and it makes one `match`'s emission a function
+of a fact established elsewhere in the program — the property that produces
+bugs reproducing in one program and not another.
+
+**(b) Exhaustive matches on backed enums always emit a trap `else`.**
+
+Costs, all measured above: +39 bytes on the whole corpus; ~50 bytes per match
+in user code; one extra comparison when the last variant matches.
+
+What it breaks, concretely: `b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets`
+(`crates/vilan-core/tests/inference.rs:49612`) asserts **byte equality** of
+two whole emissions — a backed-enum match against a raw-`str` match with a
+`_` arm. Under (b) the backed side gains an arm the raw side does not, and
+the pin fails by construction. It **rewrites rather than retires**: give the
+raw side its own trap-shaped `_` arm and the equality holds again, since P13
+shows the two are the same emission. The claim it protects — §1.4/P2's "a
+string backing needs no new codegen path" — survives in a marginally weaker
+form (the reference shape becomes "a raw `str` match with a trap arm"), and
+that weakening should be written on the pin rather than absorbed silently.
+
+The real objection is philosophical: the compiler proves the match total in
+§1.5 and then emits code for the impossible case. The answer is that §1.5's
+proof is over the vilan-side *variant set*, and was never a proof about the
+runtime *value* — a backed enum lowers to a bare host primitive (§3.5), so
+its runtime domain is the host's, not the language's. Rust faces the same
+gap on a `repr` enum built from a transmuted byte and answers with `unsafe`;
+vilan has no `unsafe`, so a trap is how it pays.
+
+**(c) The boundary stays where §7.2 put it; `json.vl` uses `parse()` at its
+own boundary.**
+
+Two readings, and they measure differently.
+
+*As status quo* — leave `json.vl` alone — this is §8.3, already taken.
+Re-verified here rather than inherited: `kind()` and its four predicates have
+**13 call sites, all inside `json.vl`, and zero callers anywhere in
+`vilan/std/src`, `vilan/test`, `vilan/examples` or `vilan/docs`.** The
+standing cost is §4.2's 15 lines and 4 functions, plus the two members of the
+documented set that never got a predicate (`"object"`, `"null"`) staying
+uncovered — `is_null()` does not close that gap, being a separate intrinsic
+that tests the value against `null` rather than reading `kind()`.
+
+*As written* — `kind()` actually routing through `parse()` — it is **worse
+than doing nothing**:
+
+> **P15.** `fun kind_of(value: JsonValue): Option<JsonKind> {
+> JsonKind::parse(value.kind()) }` over the six-member set emits a **425-byte**
+> six-arm `===` chain, and every call allocates an `Option` (`[ 0, "number" ]`)
+> that each predicate must then unwrap — replacing today's single
+> `__json_kind(value) === "number"`.
+
+And neither reading closes P16, which is a hole in the language, not in
+`json.vl`.
+
+### 9.5 Recommendation: (b), always trap
+
+**Recommend (b).** Three reasons, in the order they should be weighed:
+
+1. **It is the only candidate that does not have to enumerate anything.** P16
+   is the argument: the refusal already tried to name every host-constructing
+   position and missed callback parameters. A trap arm asserts what §1.5
+   already proved, at the one place P12 shows the proof can be violated — it
+   never asks where the value came from. Adopting (b) also makes P16 *moot
+   rather than fixed*, because lifting the refusal removes the incomplete
+   check along with its hole.
+2. **The measured cost does not support the argument against it.** +39 bytes
+   on a 213 KB corpus, ~50 per match in user code, one extra `===` on the
+   last-variant path, and no new analysis in the analyzer or the transformer
+   — P13 shows the emission already exists.
+3. **It changes §7.2's answer from "allow it and hope" to "allow it and
+   find out".** §7.2 recommended allowing the return direction on consistency
+   grounds — `external fun f(): i32` returning `"hello"` is equally unchecked
+   — and the deferral was the owner declining that trade. (b) does not
+   re-argue it; it removes it. Under (b) a bogus host value is not detected
+   at the boundary (nothing is), but it can no longer become a *confident*
+   variant: the first `match` that meets it says so, loudly, with the raw
+   value in the message. Backed enums end up better checked than `i32`, which
+   is an asymmetry worth naming out loud rather than discovering later.
+
+Rejecting (a) is chiefly about the analyzer: it buys a strictly smaller
+guarantee than (b) for a strictly larger implementation, and it makes the
+emission of a `match` depend on a caller. Rejecting (c) is not a criticism of
+§8.3 — leaving it was right while the deferral stood — but (c) is a decision
+not to have a trap-arm story, and this note exists because one was asked for.
+
+Slices, if (b) is accepted:
+
+1. The trap arm in `scalar_variant_test`'s exhaustive path, plus the helper.
+   One pin per backing (`str`, integer), each proven non-vacuous.
+2. Rewrite `b76_a_match_on_a_string_backing_is_the_same_chain_a_raw_str_gets`
+   to compare against a raw-`str` match with a trap arm, and record on the
+   pin why the reference shape moved.
+3. Lift §7.2's refusal — which deletes the check P16 found the hole in. A pin
+   that the callback shape now traps rather than lying is the regression test
+   for P16.
+4. §4.2's `json.vl` deletion (§9.6), and `docs/std/encoding.md` in the same
+   commit per the house rule.
+
+Steps 1 and 2 are independent of 3 and 4 and ship on their own; the trap arm
+is worth having whether or not the boundary ever opens.
+
+### 9.6 Worked example — `json.vl`'s fifteen lines, and what they actually cost
+
+§4.2's contingency is the right test of the winner because §8.3 already
+established it has no external callers, so the whole change is one file.
+
+Under (b), `external fun kind(self): JsonKind` becomes legal, the four
+predicates delete, and the 13 in-file call sites become
+`value.kind() == JsonKind::Number`. The result is better than §4.2 predicted
+in one way and worse in another, and both are worth writing down before
+anyone implements it:
+
+- **The 13 sites pay nothing.** P12 measured `==` on a backed enum as
+  `$a === "number"` — the same comparison against the same literal
+  `is_number()`'s body compiles to today. The four predicate wrappers stop
+  being emitted (emission is demand-driven, §8.2(a)), so the rewrite is a
+  net *reduction* in emitted bytes as well as the promised −15 source lines.
+- **The rewrite pays no trap cost either**, because `==` is not a `match`:
+  there is no exhaustive match over `JsonKind` in the rewritten file, so (b)'s
+  ~50-byte-per-match cost applies at zero sites in the worked example.
+- **§4.2's claim that `"object"` and `"null"` are "covered for free by
+  exhaustiveness" does not survive contact with this shape.** Exhaustiveness
+  covers a `match`; the 13 sites are `==` comparisons and get no coverage
+  from it. Buying that coverage means writing the decode checks *as* a match
+  over `JsonKind` — which is a better file, and which is then exactly the
+  site that pays (b)'s one added `===` and gains the trap. That is the trade
+  §4.2 should have stated, and it is small in both directions.
+
+So the winner's worked example costs `json.vl` nothing and returns 15 lines
+and four functions — which is what §4.2 promised, arrived at for a slightly
+different reason than §4.2 gave.
+
+## 10. §7.1 resolved (cycle 13) — `Hashable` for bare-lowered enums
+
+§8.5's "still open, and now stronger" is closed. §7.1's recommendation was
+to leave the question to `hashable-keys.md`, on the ground that solving it
+"for bare-lowered enums only would create a rule that half the enums in a
+program satisfy for reasons invisible at their declaration". The survey
+that opened this arc found that objection does not hold, for a reason the
+paper could not have known: the reason is **not** invisible at the
+declaration. It is the `= "flex-start"` — the same mark that makes the
+enum bare-lowered, gives it `value()`/`parse()`, changes what `Wire` puts
+on the wire, and decides how it crosses a host boundary. A backed enum's
+declaration already announces four consequences; this is the fifth, and it
+is announced by the same character.
+
+### 10.1 The mechanism, and the two it was chosen over
+
+**Synthesized beside `value()`/`parse()`** — `backed_enum_hashable_source`,
+emitted from `collect_backed_enum_impls_in` alongside §8.2(a)'s generator,
+as the ordinary vilan source `impl E with Hashable { fun hash(self): Hash {
+canonical_hash(self) } }`.
+
+The body is the primitive one-liner because the enum IS the primitive.
+`canonical_hash` returns a non-object unchanged, so hashing `Align::Start`
+and hashing `"flex-start"` are the same operation on the same runtime
+datum. Nothing new is defined; the identity `value()` already is, is
+stated as a trait impl so bound resolution can find it.
+
+Two alternatives were surveyed and rejected on evidence:
+
+- **A blanket impl over bare-lowered enums.** Not expressible: the
+  language's blanket impls (`impl type T: Display`) are bounded by a
+  TRAIT, and "bare-lowered" is a representation property with no trait to
+  name. A compiler-side blanket would have been the first special case in
+  `satisfies_trait_bound`, which has none, and it would have satisfied only
+  one of the two Hashable oracles (§10.3).
+- **A derive.** `[derive(Hashable)]` already worked on a backed enum
+  before this arc — that is precisely the problem. It is opt-in, and §7.3's
+  argument against `[derive(Backed)]` applies verbatim: the backing value
+  is already the opt-in, so a derive is a second switch for one decision.
+  A rule half the enums satisfy is bad; a rule the author must remember
+  twice is worse.
+
+### 10.2 The unbacked C-like enum does NOT come along
+
+Asked directly, and the answer is no, on the lowering. `enum Plain { A, B }`
+is **not** bare-lowered — §3.1(b)'s conjunction requires an explicit
+backing value, and without one the enum keeps the tagged `[0]`/`[1]` array
+form (P1, re-verified against the worktree binary: `show([ 1 ])`). So it is
+an aggregate, a fresh array per mention, which is exactly the
+by-reference key hazard `hashable-keys.md` §1 exists to prevent. The
+"the lowering IS the key" argument does not reach it, and it keeps needing
+`[derive(Hashable)]` like every other aggregate. Pinned both ways: the
+refusal, and the derive still working.
+
+The verdict generalizes: `Hashable` tracks the LOWERING, not "is an enum".
+That is also why it keys off §3.1(b)'s conjunction rather than off §3.8's
+stricter "every variant carries a written literal" — `enum Walked { A = 5,
+B, C }` is bare-lowered and hashes, though §8.4's sibling limit (below)
+means it gets no `value()`.
+
+### 10.3 The two Hashable oracles had to be made to agree
+
+The language holds two independent answers to "is this Hashable?": the
+impl table, through `satisfies_trait_bound`, which decides a KEY; and the
+syntactic `is_hashable_type`, which decides a FIELD of a
+`[derive(Hashable)]` type. Synthesizing the impl moved only the first, and
+the disagreement was immediately visible — `[derive(Hashable)] struct Slot
+{ align: Align }` was rejected for a field the key check accepts. The enum
+walk now records a bare-lowered enum's name in `hashable_names` off the
+authoritative `Enum::backing`, so both answer the same. Pinned as a pair,
+with the unbacked contrast beside it so the field rule cannot drift back
+to "is an enum".
+
+### 10.4 Collisions: the derive stands down, a hand-written impl does not
+
+A backed enum carrying `[derive(Hashable)]` would have been a duplicate
+impl — and, because both impls are synthesized, a duplicate reported with
+no span to point at. It is made a **no-op** instead: the synthesis stands
+down when the derive is present, so exactly one impl exists either way.
+This is not leniency, it is that there is nothing to protect — the two
+generators emit the identical `canonical_hash(self)` — and it keeps a
+program written before this arc compiling.
+
+A HAND-WRITTEN `impl Align with Hashable` stays a duplicate error. It may
+mean something else (§4 of `hashable-keys.md` is explicit that a custom
+impl is the feature), and which of two applicable impls wins is B73's open
+specificity question, not this pass's to answer.
+
+That error needed §8.2(a)'s treatment, extended from members to trait
+impls: a compiler-synthesized impl now sorts FIRST whatever its entity id,
+so the error lands on the declaration the author can edit, and the note
+says "'Hashable' is synthesized for 'Align' by the compiler" rather than
+pointing the author's own impl back at itself.
+
+### 10.5 A resource enum: a bug found, and fixed
+
+`resource enum Handle { Open = 1 }` did not compile — at its DECLARATION,
+with "cannot move the resource `self` out of this function". `value()` was
+being synthesized for it, and `fun value(self)` reads a resource out of a
+loan, so the author met an error about a body they never wrote. Nothing in
+the tree had a resource backed enum, so it had never been seen.
+
+A resource's identity is not its copyable backing value — the rule
+`check_hashable_boundary` already states for a resource FIELD — so a
+resource enum is offered no `value()`, no `parse`, and no `Hashable`, on
+the §8.2(d) precedent ("a generic enum gets no conversions"), and the
+declaration compiles. Three pins.
+
+### 10.6 Two limits, both left where they were found — BOTH CLOSED (cycle 14)
+
+> Both bullets below are the record as written in cycle 13. The first is
+> closed by §10.7, the second by `hashable-keys.md` §3.2's implementation
+> note (`impl Hash with PartialEq`, over a `hashes_equal` intrinsic — the
+> obvious body recurses).
+
+- **`enum Walked { A = 5, B, C }` gets no `value()`/`parse()`.** §3.8's
+  generator requires a written literal per variant because it reprints
+  each one; the walker's rule only requires the conjunction. So the
+  C-style auto-incremented tail is bare-lowered, hashes, matches and
+  crosses a host boundary as its number, but has no conversions —
+  `Level::High.value()` is "no method 'value'" on a declaration
+  `docs/spec/types.md` presents as backed. Pre-existing, untouched here.
+  Closing it means computing the implied discriminants syntactically,
+  which is the walker's `next_discriminant` (with B79's overflow rule)
+  duplicated into the macro-expansion reader — a refactor that wants the
+  two readers unified, not a third copy.
+- **`Hash` is not `PartialEq`.** `hashable-keys.md` §3.2 specifies
+  "`==`-comparable — native `===` on the underlying value (`impl Hash with
+  PartialEq`)" and it did not ship: `k.hash() == k.hash()` is "type 'Hash'
+  does not implement the `PartialEq` operator". §8's own test plan asks
+  for that pin, so the gap is in `hashable-keys.md`'s ledger, not this
+  paper's. Coherence is pinned here through a `Map<Hash, V>` instead,
+  which is the capability `docs/std/collections.md` documents and a
+  stronger observation anyway: it tests the keying, not an operator.
+
+
+### 10.7 The readers unified (cycle 14) — one answer to "what is this variant worth"
+
+§10.6's first bullet named the shape of the fix and it is the shape taken:
+the two readers are unified, not copied a third time.
+
+**What was actually wrong.** Nothing in this paper ever said a walked
+variant is worth less than a written one. The divergence was structural —
+two pieces of code read the same declaration at two different times and
+answered differently:
+
+| | the lowering walk | the `value()`/`parse()` generator |
+|---|---|---|
+| when | the semantic walk | derive-expansion, *before* the walk |
+| a variant with no literal | continues the C-style sequence | **bails on the whole enum** |
+| what a value is | `BackingValue::Int(i64)` / `Str` | the literal's own text, reprinted |
+| how a number is read | `u128` magnitude + sign | a second `i128` re-parse |
+
+So `enum Walked { A = 5, B, C }` lowered to the bare numbers 5/6/7 —
+matched as them, hashed as them, crossed a host boundary as them — while
+having no `value()`, no `parse()`, and the name-tagged JSON shape of an
+**unbacked** enum. `Walked::B` was the number 6 and went out on the wire
+as `"B"`.
+
+**The shape.** One function, `read_enum_backing(name, variants)`, walks the
+declaration once and returns, per variant, its effective `BackingValue`,
+the literal it wrote (if any), and what is wrong with it — plus the
+§3.1(b) conjunction for the enum. It is **pure**: it builds `Error`s and
+hands them back rather than pushing them, because its two callers want
+opposite things from a broken declaration. The walk pushes them at the
+point it always did. The generators, which run earlier and have no
+diagnostic sink at all, read them only as "this declaration is broken,
+emit nothing" — so one mistake stays one message.
+
+Four readings collapsed into it: the walk's inline loop, the
+`value()`/`parse()` generator, `backed_enum_backing_type` (the `Json`/`Wire`
+derives'), and `enum_is_bare_lowered` (the `Hashable` gate). `next_discriminant`
+still exists exactly once.
+
+**§3.7's validation is the same reading.** It always counted walked values
+— `enum E { A = 1, B = 0, C }` collided on C — and it still does, now from
+inside the shared reader, so `enum Walked { A = 5, B, C = 6 }` is rejected
+naming `B`. That was not a change; the point is that it can no longer
+*become* one, because the validation and the generators no longer have
+separate opinions about what `B` is worth.
+
+**What a generated body prints.** The resolved value and the written
+spelling are kept side by side, and the generator prefers the spelling: hex
+stays hex in `parse`'s `===` chain, exactly as §8.2 decided. Only a walked
+variant, which wrote nothing, is rendered from its resolved value.
+
+**Consequences taken deliberately.**
+
+- **The derived `Json`/`Wire` shape follows the lowering.** A walked enum
+  now serializes as its backing value, like every other backed enum. This
+  is the same wire-format sentence §3.9 already carries, applied to the
+  enums it was silently skipping — and it is the *correction* of a
+  disagreement between an enum's runtime representation and its own
+  encoding, not a new divergence.
+- **`Hashable` is deliberately NOT gated on cleanliness.** The two kinds of
+  member want opposite answers on a broken enum: a source generator must
+  stay silent, while `Hashable` must track the runtime representation,
+  which a broken enum still has. The walk keys `hashable_names` off exactly
+  the conjunction, and §10.3's two oracles have to keep agreeing.
+- **`resource` is now one rule.** `backed_enum_backing_type_of` was the
+  reader that omitted §10.5's resource exclusion, so a `[derive(Wire)]`
+  `resource enum Handle { Open = 1 }` generated impls calling a `value()`
+  no resource enum has — four errors inside code the author never wrote.
+  It now lands on the plain path and gets the same diagnostic a plain
+  resource enum gets. (`Wire`/`Json` on a resource enum is unsupported
+  either way; only the message changes.)
+- **`integer_backing_type` became total.** It used to re-parse the written
+  literals in `i128` and return `Option`, `None` for a value outside `i53`.
+  Every value it sees now came through the one literal reader, which
+  rejects those (B106) and whose rejection makes the enum unclean — so the
+  out-of-range arm had no reachable input left.
+
+Thirteen pins (`b111_*`), proven non-vacuous by restoring the
+written-literal-per-variant rule: six go red, and the seven pinning the
+rules that must *not* move — the walked collision, `§3.1(a)`'s string
+requirement, the payload rejection, the plain-enum conjunction, `Hashable`
+— stay green.
+
+### 10.8 The parenthesis paid — `Wire`/`Json` refuse a resource (cycle 15, B117)
+
+§10.7's `resource` bullet ends with a parenthesis: *"`Wire`/`Json` on a
+resource enum is unsupported either way; only the message changes."* B117
+asked what "unsupported" ought to *say*. It probed first for a design
+question — is there a legitimate serialize-a-resource story? — and there is
+not, for a reason the trait signatures state outright:
+
+```vilan,fragment
+trait Wire {
+	fun describe<S: Serialize>(self, serializer: S);
+	fun rebuild<D: Deserialize>(deserializer: D): Self;   // ← mints a Self
+}
+```
+
+`rebuild` — and `FromJson::from_json` beside it — builds a `Self` out of
+bytes. For plain data that is the whole point; for a resource it is a
+second handle to a thing that has exactly one owner, owned by nobody,
+closed by nobody. The write half is no better: `describe(self)` reads an
+owned handle out of a loan. So the answer is a REFUSAL, and it is not a new
+rule — it is §10.5's ("a resource's identity is not its copyable backing
+value") and destruction.md §8's, in the one position nobody had tested.
+
+**What the position was.** `check_wire_boundary` had rejected a resource
+FIELD since §8, with a resource-specific steer. Nothing tested the SUBJECT
+of the derive. So:
+
+| subject | before | |
+|---|---|---|
+| `resource enum` (backed or plain) | "cannot move the resource `self` out of this function" | an error about a body the author never wrote |
+| `resource struct` | **compiled** | the derive silently gave a resource a wire format; `encode_json(conn)` ran and printed `{"id":7}` |
+
+The struct half is the worse one and it was not in the filing: a struct's
+generated `describe`/`to_json` read fields THROUGH the loan, so nothing
+moved and nothing complained. Only `decode_json` failed, and by accident —
+an R11 move-clean message pointing into `std/src/json.vl`.
+
+**Where it is answered.** In the macro expander's `Node::Derive` arm, above
+the split between the vilan-source macros (`std/src/json.vl`) and the Rust
+generators — the one seam both backends pass through, so they cannot
+disagree, and the only one with a diagnostic sink (§10.7 recorded that the
+generators have none). A refused derive generates NOTHING, which is what
+turns the symptom off: there is no body left to fail in. §10.5 chose the
+same shape for `value()`/`parse()`, one layer down.
+
+Two consequences worth stating:
+
+- **Keyed on the DECLARED `resource` modifier, not on classified
+  resource-ness.** A type that is a resource by CONTAINMENT has its root
+  cause in the field, and `check_wire_boundary` already names that field.
+  Gating on classification would print two messages for one mistake.
+- **A refused `Wire` records no name.** `collect_wire_type` is skipped, so
+  the resource never enters `wire_names` — otherwise `[rpc]`'s signature
+  check, which reads that set and has no resource guard of its own, would
+  still let it cross the wire and the refusal would be advice rather than a
+  rule. That is the pin (`b117_a_refused_wire_derive_leaves_the_resource_not_wire`)
+  that the resource-field rejects cannot stand in for, because they precede
+  the not-Wire test and fire either way.
+
+Twelve pins (`b117_*`) over the four refused shapes, the two readers of
+`wire_names`, the containment control, the sibling derives (`PartialEq` and
+`Debug` on a resource struct stay legal — they read through the loan) and a
+plain-data control. Both mechanisms planted individually: with the expander
+guard removed eight go red; with the collector guard removed the `[rpc]`
+one does.
+
+**Left open, filed not fixed.** `Json` has no boundary check at all — no
+`collect_json_type`, no `check_json_boundary` — so a resource FIELD inside a
+`[derive(Json)]` plain-data struct still lands as "in code generated by this
+attribute: `Db` has no method `to_json`", the generated-code class this
+section exists to remove. `Wire`'s twin has had its field check since §8.
+Small, and adjacent; not B117's. Closed at §10.9 (B120, cycle 17).
+
+### 10.9 The residual closed — `Json`'s field check, `PartialEq`'s shape (cycle 17, B120)
+
+§10.9 built the twin §10.8 filed: `collect_json_type` / `check_json_boundary`,
+registered at the same `Node::Derive` seam and run alongside
+`check_wire_boundary` post-walk. The one design question — which EXISTING
+check is Json's field rule the twin *of* — is not obvious from the name
+alone, so it is worth stating precisely.
+
+`Wire`'s field check (§8) is two rules riding one collector: a resource
+reject (this section's business) AND an all-fields type DOMAIN check
+(`is_wire_type` — a field must be a scalar, `List`/`Option` of Wire, or
+another `[derive(Wire)]` type), because Wire's wire format is closed: the
+codec only knows how to describe/rebuild that fixed vocabulary.
+`PartialEq`'s field check (§8, same section) is ONE rule: the resource
+reject alone — "any two values compare" is true of a field's OWN type
+whatever it is, so there is no second, narrower vocabulary to enforce.
+
+Json's own codegen settles which shape it is: a `[derive(Json)]` struct's
+`to_json`/`from_json_value` call each field's OWN `to_json`/
+`from_json_value` (`struct_impl_source`'s `"Json" | "Wire"` arm, the same
+code both derives share) — unconditionally, whatever the field's type. There
+is no Json-specific vocabulary to fence a field into: ANY type with its own
+`Json` impl serializes, the same freedom `PartialEq` has and `Wire` does not.
+So `collect_json_type` builds no name set (no `json_names`) and no syntactic
+recursion — the exact absence `collect_partialeq_type`'s own doc comment
+already states for its own reason — and `check_json_boundary` is one `if
+type_is_resource` arm, `check_partialeq_boundary` with the derive name and
+the steer swapped:
+
+```
+{label} of `[derive(Json)]` type `{type_name}` is the resource `{rendered}`:
+a resource is not plain data and cannot be serialized (serializing it would
+copy it out of its owner); serialize a plain-data projection (an id, a key)
+instead
+```
+
+**The declared-modifier seam composes, unchanged.** §10.8's
+`resource_derive_refusal` already matched on `"Json"` (it was written for
+both derives from the start — only the FIELD check was the gap), so nothing
+there needed touching. The `Node::Derive` walk's collector call carries the
+same guard Wire's does: `resource_derive_refusal("Json", inner).is_none()`
+before `collect_json_type` runs, for the identical reason — a `[derive(Json)]
+resource struct Conn` is refused at the SUBJECT already, and collecting
+`Conn`'s own fields for the boundary check besides would print a second
+message for one mistake. Unlike Wire, this guard protects no name set (there
+is none to protect) — it exists purely to keep the two diagnostics from both
+firing on the same type. Verified both ways: a type whose OWN subject is
+refused prints exactly that one message
+(`b120_a_resource_by_containment_still_names_only_its_field`'s sibling
+control), and a DIFFERENT plain-data type holding that same refused resource
+by field still gets its own, independent field-check message
+(`b120_the_resource_field_reject_and_the_declared_modifier_refusal_compose`)
+— the same composition Wire's `b117_a_refused_wire_derive_still_meets_the_resource_field_reject`
+already proved.
+
+**The `[rpc]` escape Wire had to close does not exist for Json.** §10.8's
+collector-skip guard protects `wire_names`, which `check_rpc_signatures` and
+`check_expose_fields` both read (via `is_wire_type`) to decide what may cross
+an `[rpc]` boundary or be `[expose]`d. Neither reads anything Json-shaped —
+`grep` over `analyzer.rs` finds exactly one name set for this whole family
+(`wire_names`) and two readers of it, both Wire-only. Since
+`check_json_boundary` builds no `json_names` (there was never a domain to
+name), there is nothing for a hypothetical Json-aware `[rpc]` check to trust
+mistakenly, because no such check exists or is implied by anything Json
+does. A `[derive(Json)] resource struct Conn` used as an `[rpc]` parameter is
+refused for the ordinary, pre-existing reason — it was never `Wire`, which is
+the only thing an `[rpc]` signature requires — unaffected by this section's
+checks (`b120_json_has_no_rpc_escape_to_close`).
+
+**Nested containment names the immediate field, not the ultimate resource.**
+A struct containing a struct containing a resource (`Envelope { holder:
+Holder }`, `Holder { db: Db }`, neither `Envelope` nor `Holder` declared
+`resource`) gets ONE message, on `Envelope`'s own field, naming `Holder` —
+not `Db`. `check_json_boundary` (like `check_wire_boundary` before it) does
+not recurse past the immediate field's type; `Holder`'s resource-ness is
+supplied whole by `type_is_resource`'s own containment classification
+(§3), which IS recursive, so the check only ever asks one question per
+field: "is THIS field's type a resource, whatever the reason". Containment's
+root cause is the field the `[derive(Json)]` type itself declares, which is
+what the diagnostic can act on — a caller cannot make `Db` less of a
+resource from inside `Envelope`, only stop holding a `Holder` (or a `Db`)
+directly (`b120_derive_json_rejects_a_nested_resource_field`).
+
+Seven pins (`b120_*`): the direct field, the two-level nested field, the
+enum payload shape (`collect_derived_members`'s enum arm, already shared
+with Wire — no new collection code needed), the no-resource control, the
+composition pair (subject-refused alone, field-check alone on a different
+type), the containment control (one message, not two), and the `[rpc]`
+non-escape. Planted by removing `check_json_boundary` from the post-walk
+call list: four go red, each reproducing exactly the generated-code error
+class this section exists to remove (`Db has no method 'to_json'` /
+`cannot find 'from_json_value' in Db`); the no-resource and containment
+controls correctly stay green, since neither depends on the removed call.
+
+Files: `crates/vilan-core/src/analyzer.rs` (the `json_types_to_check` field,
+`collect_json_type`, `check_json_boundary`, the `Node::Derive` collector
+call, the post-walk `check_json_boundary()` call — all adjacent to their
+Wire/PartialEq counterparts); `crates/vilan-core/tests/inference.rs` (the
+seven `b120_*` pins, plus `derive_accepts_a_data_type`'s comment noting why
+`Json` is not added to that control's derive list — `Wire` already
+synthesizes the `Json`/`FromJson` impls, so combining the two on one type is
+an unrelated duplicate-impl conflict). Corpus goldens: **0 moved** (`cargo
+test -p vilan-cli --test corpus`, rebuilt binary) — no program in the tree
+carries a `[derive(Json)]` resource field.
+
+## 11. Implementation notes — the trap arm and the lift (cycle 14)
+
+§9's candidate (b) shipped as ratified, and with it §7.2's deferral, §4.2's
+`json.vl` contingency, and B107. What follows is what the build found: the
+one measurement §9 stated that did not survive contact, the places (b)
+turned out to be wider than the note claimed, and the residual it does not
+cover.
+
+### 11.1 The measured cost — §9.3's "+39" is superseded
+
+P14 measured the delta with a **placeholder** trap statement (`$b = "trap";`,
+13 bytes), and said so in the same breath: "a real helper call lands around
+50–55 bytes". The real numbers, this worktree's binary, whole emissions:
+
+| | §9.3 | shipped |
+|---|---|---|
+| per exhaustive match | ~50–55 (estimated) | **56** (`Ordering`) – **62** (`Align`) |
+| the helper, once per emitting file | not counted | **111** |
+| the corpus | +39 | **+167**, still one program |
+
+The per-match figure is P14's estimate, confirmed. The corpus figure is not
+P14's, because P14's did not include a helper it explicitly declined to
+model. The decomposition is unchanged and holds exactly: one added `===`
+test (12 bytes plus the last variant's literal as written) plus one `else`
+block, and the 7-variant enum is still cheaper than the 3-variant one — the
+cost is per match, per the enum's LAST literal, not per variant.
+
+**On the whole arc the corpus SHRANK: −184 bytes** across 114 goldens. The
+trap costs +167 in `enum-discriminant.mjs` and §11.4's `json.vl` rewrite
+returns −351. §9.3's "not a cost worth an argument" is if anything
+understated.
+
+The helper rather than an inline `throw` was a deliberate trade and it is
+the wrong one at exactly one call site: inline is ~95 bytes per match with
+no fixed cost, so a file with ONE exhaustive match (which is the corpus,
+today) pays 95 where the helper pays 167, and a file with three or more
+pays less. It was chosen for the reason that outlives the byte count —
+the message is defined once, so every trap in every program reads the same
+and `JSON.stringify` quotes a string backing without each site paying for
+the quoting.
+
+### 11.2 The message: `Align: "middle" is not one of its values`
+
+§9.4's illustrative wording is *`Align: host value "middle" is not one of
+its values`*, and the shipped message drops **"host"**. That is not
+tidying: §9.4 wrote it inside candidate (a), where provenance is a tracked
+fact. (b)'s first argument for itself is that it "never asks where the
+value came from" (§9.5.1), so a message asserting the value came from the
+host would be claiming exactly the thing the design declines to know.
+Everything else is as §9.4 specifies — a panic, not an `Option`; the enum
+and the raw value named; emitted through the same `throw`-a-string shape
+`panic()` uses, so the CLI reports it as an ordinary vilan panic.
+
+`__enum_trap` has a macro-time mirror in the interpreter, worded
+identically (`Failure::Thrown`, the `__at` precedent). It is unreachable
+from a const-eval in practice — the folded value is in-set by construction
+— but the emitted-vs-interpreted helper pair is a parity contract in this
+codebase and a one-sided one is how they drift.
+
+### 11.3 Where (b) turned out to be wider than §9 says
+
+- **A ONE-VARIANT backed enum gains a test where it had none.** `match o
+  { One::Only => .. }` compiled to no branch at all — the single arm WAS
+  the bare `else`. §9's framing ("the last arm of an exhaustive match")
+  covers it, but the shape is worth naming because it is the one case
+  where the trap adds a conditional rather than extending a chain.
+- **The B59 SEQUENCE emitter needed the arm too.** A guard needing
+  statement slots turns a match into a flat `matched`-flag sequence rather
+  than an else-if chain. §9.3's P13 measured the chain only. Appending
+  the trap as an ordinary final leg (no pattern, no guard) makes both
+  emitters produce it without either learning anything: the chain renders
+  it as the `else`, the sequence as the closing `if (!matched)`.
+- **A GUARDED final leg keeps only its PATTERN test.** The pre-existing
+  code dropped the last leg's test, guard and guard prelude together. The
+  trap keeps the test and still drops the guard, deliberately: the trap
+  answers for values outside the SET, and a guard that rejects an in-set
+  value must keep falling through exactly as it did. (That fall-through is
+  itself questionable — `match a { A => .., B if c => .. }` runs `B`'s arm
+  when `!c` — but it is pre-existing, orthogonal, and not this lane's.)
+
+  **Superseded 2026-08-10 (B115).** The parenthesis was the bug, and it is
+  fixed: a guarded final leg now keeps its guard as well as its test, and
+  the shape the parenthesis describes is refused outright — exhaustiveness
+  is proven by unguarded legs only, so a match whose last leg is guarded
+  must be exhaustive without it. The two compose with neither emitter
+  learning about the other: the leg keeps test AND guard, the trap is
+  still the `else`, and the message stays honest because the legs above a
+  surviving guarded leg cover every variant, so only an out-of-set value
+  reaches the trap. Record: `capture-clones.md` §11.
+
+### 11.4 §4.2's `json.vl`, per §9.6 — and one thing §9.6 did not know
+
+Taken, in §9.6's corrected shape. §4.2's "13 call sites become `v.kind() ==
+JsonKind::Number`" is exactly right and §9.6's two amendments both hold:
+the sites pay nothing (same `===`, same literal) and get no trap (an `==`
+is not a match). The four predicate wrappers stop being emitted, which is
+where the −351 bytes come from.
+
+§9.6 inherited §8.3's sweep — "no caller outside `json.vl` itself" — and
+that sweep was short by one **class** of caller, not by a site:
+`docs/std/encoding.md` has a **gated fence** (upgraded from a fragment on
+2026-08-08) that calls `kind()` and `is_string()`, so the docs gate is a
+real compile-time caller. Re-verified for `.vl` source, where it holds
+exactly: nothing in `vilan/std/src` outside `json.vl`, `vilan/test`,
+`vilan/examples`, `vilan/benchmarks` or any Rust fixture std calls
+`kind()` or the four predicates.
+
+**The honest edge §2.2 through §9.6 all miss: `kind()`'s set is not closed
+over `JsonValue`.** It is closed over JSON. `__json_kind` is `typeof` with
+arrays and `null` named, and a `JsonValue` is whatever the host handed
+over — so `value.field("absent")` is `undefined` and its kind is
+`"undefined"`, a seventh string. §2.2's diagnosis ("the set is closed in
+prose and open in the type system") was right about the prose being wrong
+in the OTHER direction too.
+
+`JsonKind` ships with the six documented members and not a seventh, for
+two reasons. `undefined` is not a JSON type, so naming it would make the
+type lie about what it is; and it would not close the set anyway — `typeof`
+can also answer `function`, `bigint`, `symbol` for a host value that never
+saw `JSON.parse`. The behavior is therefore: `==` answers `false` for an
+out-of-set kind, exactly as the deleted predicates did (this is what keeps
+the 13 sites byte-equivalent), and an exhaustive `match` over `JsonKind`
+traps and names it — which is the trap doing precisely the job §9 built it
+for, at the first place in std where the boundary is genuinely open.
+Pinned, and documented in `docs/std/encoding.md` beside `has_field`, which
+is the check that keeps a caller out of the case.
+
+### 11.5 bindgen — §9 is silent, and the answer is DELETE, not switch
+
+§9 says nothing about bindgen (§9.5's slices stop at `json.vl`), so this is
+recorded rather than inherited. §4.1's summary was "bindgen goes back to
+emitting signatures only, **plus one one-line `parse` forwarder in return
+position**". The qualifier existed for §7.2's deferral and nothing else, so
+it goes with it, and §4.1's own sentence lands unqualified: bindgen emits
+signatures only. There is no generated body left anywhere in the emitter.
+
+Two consequences neither §4.1 nor §8.4 anticipated, and they are why this
+is a deletion rather than a switch:
+
+- **`Position::Nested` stops being a special case.** It bound the raw
+  `str` "conservatively... the direction it travels is not knowable here"
+  — an argument wholly about needing a forwarder POSITION, which a nested
+  type does not have. With no forwarder anywhere, direction stops
+  mattering: `List<Align>` and a closure's own parameter both bind the
+  enum. The closure case is B107's shape, and it is the trap that makes
+  binding it honest rather than optimistic.
+- **§8.4's "bindgen's PROPERTIES keep their TODO" closes unprompted.** Its
+  stated reason — "a property is both, through separate externs, so one
+  bound type cannot serve it" — was true only while the getter wanted
+  `str` and the setter wanted `Align`. They want the same type now. §8.4
+  proposed "widening the property emitter to a raw pair plus two
+  forwarders"; the property emitter needed a DELETION instead, and the
+  TODO class disappears rather than being served.
+
+Dead with them: `Mapped::string_enum`, `emit_one_binding`'s
+`return_string_enum` and the `_raw`/`[doc(hidden)]` naming it drove, the
+`extra` forwarder channel threaded through four callers, and
+`needs_option`/`header_end` (the `Option` import only the forwarder
+needed). `Enum::parse` survives in the generated file's DOC COMMENT, as
+the shape to hand-edit toward — which is the right place for it, the
+generated file being ordinary source the author owns.
+
+### 11.6 What (b) does NOT cover — one residual, pinned `#[ignore]`d
+
+The trap is asked of the match's own subject: the final leg's pattern must
+be a `Variant` of a backed enum. A backed enum reached through a PAYLOAD
+pattern is not covered —
+
+```vilan
+match p { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e" }
+```
+
+— because the final leg drops its whole condition, the nested `Align` test
+with it, so an out-of-set `Align` inside the payload still lands on the
+last arm confidently. This is the same hazard §9 exists to remove, one
+level down.
+
+It is recorded rather than guessed at because closing it needs a message
+design §9 does not have: a leg's condition can carry more than one backed
+test, and which of them failed is not knowable at runtime, so the trap
+cannot name "the enum and the raw value" the way §9.4 requires. The
+generalization also changes the emission of matches over UNBACKED enums
+(their last leg's condition would have to be kept whenever any nested
+backed test rides in it), which is a corpus-wide byte question §9's
+measurement did not ask. Pinned as `b76_the_trap_arm_does_not_reach_a_nested_backed_pattern`,
+`#[ignore]`d, asserting the desired outcome.
+
+> **CLOSED by B114 (cycle 15) — see §12.** Both worries turned out to be
+> answerable: the message needs no redesign, and the unbacked emission does
+> not move at all. The pin is live, renamed
+> `b114_the_trap_arm_reaches_a_nested_backed_pattern`.
+
+### 11.7 Ledger
+
+- **B107 is MOOT, as §9.5.1 predicted** — the incomplete check deletes with
+  the lift rather than being completed. Its repro is kept as a live
+  regression pin (`b76_a_callback_parameter_is_covered_by_the_trap_not_by_enumeration`),
+  because what it now asserts is a different claim: not that the shape is
+  refused, but that it runs and traps.
+- **`ExternalFunction::return_type_span`** was added for the refusal's
+  diagnostic and had no other reader; it goes too.
+- **Pins: 13** across the arc (5 trap-arm emission/behavior, 1 edge-shape,
+  4 lift, 3 `JsonKind`), plus the rewritten byte-equality pin, 2 rewritten
+  bindgen pins and 1 new one. Every load-bearing pin proven non-vacuous by
+  plant: the trap disabled (4 red), the trap widened to every enum (1 red),
+  the leg read from the wrong end (1 red), the refusal restored (2 red).
+- **Goldens moved: 6.** `enum-discriminant.mjs` (+167, the trap);
+  `derive-enum.mjs`/`derive-json.mjs`/`json-roundtrip.mjs` (−351 together,
+  the predicate wrappers no longer emitted); `bindgen/unions.vl` and
+  `bindgen/only_closure.vl` (the direct return, the property, the doc
+  comment). Each verified by reading the diff.
+
+## 12. B114 — the trap follows the pattern, not the subject (cycle 15)
+
+§11.6's residual, closed. The trap arm's question was asked of the final
+leg's pattern *root* — `ExprPattern::Variant` of a backed enum — so a
+backed enum reached through a payload (`Pair::Of(Align::Start)`) kept the
+bare `else` §9 exists to remove. It is now asked of the pattern **tree**:
+every backed test the leg carries, at the accessor `compile_pattern` reads
+it from.
+
+§11.6 filed two reasons for recording it rather than guessing, and the
+build answered both — one of them by measurement, the other by asking a
+different question. Neither answer is the one §11.6 expected.
+
+### 12.1 The message needs no redesign — a second question does
+
+§11.6: *"a leg's condition can carry more than one backed test, and which
+of them failed is not knowable at runtime, so the trap cannot name 'the
+enum and the raw value' the way §9.4 requires."*
+
+The premise is exact and the conclusion does not follow. **Which test
+failed is not knowable; which VALUE left its set is.** They are different
+questions and only the second one matters:
+
+| the leg's own test | the trap's question |
+|---|---|
+| `$a[1] === "flex-end"` — did this arm match | `$a[1] === "flex-start" \|\| $a[1] === "flex-end"` — is it an `Align` at all |
+
+The first is false for `Align::Start`, which is a perfectly good `Align`.
+The second is false only for a value that was never one. So a leg carrying
+K backed tests emits K−1 membership-guarded traps and one bare one:
+
+```js
+} else {
+    if (!($a[1] === "flex-start" || $a[1] === "flex-end")) {
+        __enum_trap("Align", $a[1]);
+    }
+    __enum_trap("Display", $a[2]);
+}
+```
+
+The last needs no guard: it is what is left when none of the others
+answered. Driven both ways, an out-of-set `Align` names `Align` and an
+out-of-set `Display` names `Display` — pinned. §9.4's message, the
+`__enum_trap` helper and its interpreter twin are all untouched, and
+**K = 1 emits exactly what shipped in cycle 14**, byte for byte, because
+the sole test is unconditional and its accessor is the subject itself when
+the pattern's root is the backed test. That is what keeps §11's whole pin
+set green without a line of rewriting.
+
+The membership chain costs bytes only inside a trap block, which runs
+never, and only when a single leg tests two or more backed enums — a shape
+that does not occur anywhere in the tree (§12.2).
+
+### 12.2 The unbacked emission does not move — the narrow rule is the true one
+
+§11.6: *"the generalization also changes the emission of matches over
+UNBACKED enums … which is a corpus-wide byte question §9's measurement did
+not ask."*
+
+Asked, both ways, and the answer is **zero** — because the generalization
+does not have to touch them. The trap keys on a **backed test**, not on a
+refutable one:
+
+- an unbacked enum's discriminant is written by the language itself
+  (§1.2's tagged array), so its runtime domain **is** its variant set and
+  §1.5's proof *is* a proof about the value — exactly the argument §9.5
+  makes for why a backed enum is different, applied one level down;
+- a nested LITERAL pattern (`Wrapped::Of(1)`) is the same argument for a
+  primitive.
+
+So `match p { Pair::Of(Inner::A) => .., Pair::Of(Inner::B) => .. }` keeps
+the bare `else` it always had, at any depth. Measured rather than
+asserted: **0 goldens moved** across the 114-program corpus gate, and an
+instrumented binary reports **0** sites even for the WIDER rule — no final
+leg anywhere in `vilan/test`, `vilan/examples`, `vilan/benchmarks` or the
+`docs` fences carries a refutable nested pattern at all, backed or not.
+The fourth time this family has measured a return of zero (§11.5 of
+`element-clones.md` counts three).
+
+The narrow rule is also the *true* one, which is the reason to prefer it
+over the cheap one: widening the trap to unbacked nested tests would
+convert a missing compile-time check into a runtime throw. §12.4 files
+that check.
+
+### 12.3 The shapes, probed before choosing
+
+Every one built and driven with this worktree's binary.
+
+| shape | source | trap |
+|---|---|---|
+| payload, one level | `Pair::Of(Align::End)` | `__enum_trap("Align", $a[1])` |
+| payload, two levels | `Outer::Of(Mid::Of(Align::End))` | `__enum_trap("Align", $a[1][1])` |
+| tuple subject | `(Align::End, false)` | `__enum_trap("Align", $c[0])` |
+| two backed tests in one leg | `Two::Of(Align::End, Display::Inline)` | §12.1's ordered pair |
+| mixed backed / unbacked | `Pair::Of(Align::End)` under an unbacked `Pair` | the payload only — `Pair`'s own tag is not asked |
+| B59 SEQUENCE emitter | a guard needing statement slots | `if (!($d)) __enum_trap("Align", $a[1])` |
+| a WRITTEN `_` arm | `Pair::Of(Align::Start) => .., _ => ..` | none — P13's rule, unchanged |
+| unbacked nested / nested literal | `Pair::Of(Inner::A)`, `Wrapped::Of(1)` | none — §12.2 |
+
+The backed test is always a LEAF, which is what makes the walk total: a
+backed enum may not have payload variants (§3.3), so nothing is ever
+reached *through* one.
+
+### 12.4 Two shapes found probing, both filed rather than guessed at
+
+- **A backed test in an EARLIER leg still reaches the bare `else`.**
+  `match p { Pair::Of(Align::Start) => .., Pair::Of(Align::End) => ..,
+  Pair::Other => .. }` — the final leg carries no backed test, so it drops
+  its condition as it always did, and an out-of-set payload falls through
+  to answer `Pair::Other` confidently. This is B114's hazard reached by a
+  different route, and the message §12.1 solves does not solve it: which
+  payload slot holds the offending value depends on which variant the
+  subject is, and the final arm is reached from all of them. Naming it
+  wants either a per-variant re-dispatch in the trap block or a different
+  design entirely. Pinned `#[ignore]`d as
+  `b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`.
+- **Exhaustiveness is checked on the top-level variant set only**, so a
+  refutable NESTED pattern is accepted as total: `match p {
+  Pair::Of(Inner::A) => "a" }` compiles clean and answers `"a"` for
+  `Pair::Of(Inner::B)` — silent wrong code for a perfectly in-set value,
+  and nothing to do with the host boundary. `Wrapped::Of(1)` over `i32` is
+  the same shape with an infinite domain. This is the analyzer's, not the
+  trap's: the right answer is the compile error §1.5 already knows how to
+  write, and a trap here would paper over a missing check. Pinned
+  `#[ignore]`d as `b114_a_refutable_nested_pattern_is_not_exhaustive`,
+  asserting the refusal.
+
+  The two interact at exactly one point, and it is worth stating so the
+  message is not read as more than it claims: under this hole a match can
+  reach the trap with every value **in** set, and the trap then names an
+  in-set value as out-of-set. It is still strictly better than the silent
+  wrong answer it replaces, it points at the right enum and the right
+  value, and it stops being reachable the moment the exhaustiveness check
+  is fixed.
+
+### 12.5 Ledger
+
+- **Pins: 9** (7 live, 2 `#[ignore]`d), all in `crates/vilan-core/tests/inference.rs`.
+  §11.6's `#[ignore]`d pin is live and renamed.
+- **Plants: 3**, each red on the pins it should be:
+  the walk stopped at the pattern root (5 red — the shipped §11.6 behavior
+  restored), the membership question dropped (1 red), the trap widened to
+  every nested variant test (6 red, `b114_a_match_carrying_no_backed_test_keeps_its_bare_else`
+  among them).
+- **Goldens moved: 0.**
+- `docs/spec/types.md`'s trap-arm section gains the nested form and the
+  unbacked non-form, in the same commit.
+
+## 13. B121 — the trap follows the VARIANT too, not just the pattern (cycle 17)
+
+§12.4's first filed shape, closed: a backed test living in an EARLIER leg
+than the one that becomes the bare `else`.
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // together, `Of`'s only handler
+    Pair::Other            => "o",
+}
+```
+
+`Other`'s own leg carries no backed test, so `backed_pattern_tests(final_leg.pattern,
+..)` (§12.1's whole mechanism) returns empty and its condition is still
+dropped, exactly as an ordinary bare `else` always was. But the two `Of` legs
+above, TOGETHER, are `Of`'s only handler, and each tests one specific
+`Align` literal. An out-of-set `Align` payload fails BOTH — not because it
+left `Pair::Of`, but because it left `Align` — and falls through to answer
+`Pair::Other`, confidently and wrongly. §12.4 filed the shape and pinned it
+`#[ignore]`d (`b114_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`)
+because §12.1's message does not transfer: it asks the FINAL leg's own
+pattern, which is not where the hazard lives here, and — as §12.4 put it —
+"which payload slot holds it depends on which variant the subject is, and
+the final leg's arm is reached from all of them."
+
+### 13.1 The design: a per-variant re-dispatch, gated on the tag
+
+§12.4 floated two directions: "a per-variant re-dispatch in the trap block,
+or a different design entirely." The re-dispatch is what shipped, and once
+stated precisely it needs no new machinery — only a new REASON to reach the
+existing one.
+
+**Where it fires.** Not at the final leg's pattern — there is nothing there
+to ask — but at the exact point where the exhaustiveness-over-tags proof is
+CONSUMED: the moment the compiler decides an unguarded final leg's own
+condition may be dropped because every earlier leg's tag test failing
+already proves it. That proof is true about `Pair`'s tag; it says nothing
+about `Align`'s runtime domain, and the dropped-condition final leg's BODY
+is where the trap now lives, wrapped around the leg's own — untouched —
+body:
+
+```js
+if ($a[0] === 0 && $a[1] === "flex-start") {
+    $b = "s";
+} else if ($a[0] === 0 && $a[1] === "flex-end") {
+    $b = "e";
+} else {
+    if ($a[0] === 0) {
+        __enum_trap("Align", $a[1]);
+    } else {
+        $b = "o";
+    }
+}
+```
+
+The `else` block's OWN new test (`$a[0] === 0`, i.e. "is the tag actually
+`Of`") is not a new discriminant invented for the trap — it is
+`compile_pattern`'s own tag-test shape (factored out as `variant_tag_test`
+so the two constructions cannot drift apart), asked of a variant the FINAL
+leg never mentions. Reaching the `else` with that tag can only mean every
+`Of` leg's literal failed, which — since those legs are `Of`'s only
+handler — can only mean the payload left `Align`'s set. The tag that
+DOESN'T match any partitioned variant is what is left over: `Pair::Other`,
+whose own body runs completely unchanged underneath.
+
+**What it says.** `__enum_trap("Align", $a[1])` — the SAME call, the SAME
+message (`Align: "middle" is not one of its values`), §12.1's `trap_body`
+helper reused verbatim (factored out of the final-leg case for exactly this
+reuse). The filing worried the message could not "name the value in
+general" because the slot depends on the variant; the resolution is that it
+never has to CHOOSE a slot at the message level — the re-dispatch chooses
+the slot by choosing the BRANCH first (tag `Of` reads `$a[1]` as `Align`;
+a second partitioned tag `Alt` would read its OWN slot as its OWN enum, in
+its OWN branch — see §13.3). Each branch asks its own, unambiguous question;
+none of them ever had to ask "which slot, in general."
+
+### 13.2 Grouping, and the K → K−1 shape reused
+
+An earlier leg contributes to the re-dispatch only if, walked with
+§12.1's own `backed_pattern_tests`, it yields at least one `BackedTest` —
+so a leg over an UNBACKED nested enum (`Pair::Of(Inner::A)`) contributes
+nothing, and a match built entirely of such legs gets no trap of any kind,
+§12.2's narrow rule unchanged
+(`b121_earlier_legs_over_an_unbacked_nested_enum_keep_the_bare_else`).
+Legs are grouped by their OUTER variant (the tag `Pair::Of` names), not by
+enum: two `Of` legs testing the SAME `Align` slot (the pinned shape)
+contribute the identical accessor twice, deduplicated (`same_trap_accessor`,
+a narrow structural equality over the `Local`/`PropertyIndex`/`Number` chain
+`backed_pattern_tests` ever builds — nothing else needs comparing, and
+comparing wrongly only costs a redundant, harmless test) down to ONE
+`BackedTest`, so the K=1 case emits the unconditional, unguarded
+`__enum_trap` call directly — no membership check, because there is nothing
+to disambiguate among. A variant whose several backed slots are tested
+independently across its legs keeps them separate BY ENUM (`Two::Of(Align,
+Display)` legs contribute both), which feeds the SAME K → K−1
+membership-guarded shape §12.1 already defined for a single leg's multiple
+tests — reused by construction, since `trap_body` is one function now, not
+two independent copies of the same logic.
+
+### 13.3 Several partitioned variants chain, in declaration order
+
+Nothing in the mechanism assumes exactly one non-final variant is
+partitioned. Two backed-tested variants (`Of`/`Align`, `Alt`/`Display`)
+sharing one true bare leg (`Other`) chain as `if (tag===Of) {trap Align}
+else if (tag===Alt) {trap Display} else {original body}`, each testing its
+own enum in its own branch, in the order the tags first appear among the
+legs (`b121_two_partitioned_variants_each_trap_their_own_enum`).
+
+### 13.4 The mechanism's own boundary — dead code, not a wrong trap
+
+A variant with an IRREFUTABLE payload leg of its own
+(`Pair::Of(let _) => ..`, added after the two literal legs, say for
+clarity) already matches THAT leg — an unconditional pattern test at its
+own position in the else-if chain — before the dropped final leg is ever
+reached. The re-dispatch still contains an `if ($a[0] === 0) { trap }`
+branch for `Of` (nothing here tries to detect that it is unreachable), but
+it never runs: control never falls that far for tag `Of` once a leg of its
+own already claims it, in-set or not
+(`b121_a_variant_with_a_written_catch_all_payload_never_reaches_the_trap`).
+This is deliberately left as harmless dead code rather than pruned —
+detecting "is this tag ALSO fully covered by an earlier irrefutable-payload
+leg" is a second, independent analysis with its own edge cases, and the
+cost of not doing it is a few unreachable bytes, never a wrong answer.
+
+### 13.5 Composition with §12.1, and the zero-movement guarantee
+
+The two mechanisms are mutually exclusive by construction, not by
+convention: §13's re-dispatch is gated on `trap_tests.is_empty()` — the
+EXACT condition under which §12.1's own mechanism today does nothing at
+all (drops the final leg's condition, appends no trap). So every shape
+§12.1 already had bytes for (the final leg itself carrying one or more
+backed tests, at any nesting) is completely untouched — `earlier_variant_traps`
+is not even computed when `trap_tests` is non-empty — and every shape
+neither mechanism has anything to say about (an all-unbacked match, a
+written `_` final leg) is equally untouched, since an empty
+`earlier_variant_traps` changes nothing. New bytes appear ONLY for the
+genuinely new shape this section adds a trap for. Measured, not assumed:
+`cargo test -p vilan-cli --test corpus` (rebuilt binary) moved **0**
+goldens — no program in `vilan/test`, `vilan/examples`, `vilan/benchmarks`
+or the docs fences carries this shape either, the same "zero" §12.2
+measured for the unbacked case, a fifth instance of the family.
+
+### 13.6 Ledger
+
+- **Pins: 6**, all in `crates/vilan-core/tests/inference.rs`, all live (the
+  filed `#[ignore]`d pin — renamed `b121_a_backed_test_in_an_earlier_leg_reaches_the_bare_else`
+  — is un-ignored): the anchor (JS shape + the legitimate `Other` path), a
+  driven-both-ways run naming the out-of-set value instead of misfiling it,
+  two partitioned variants chaining and each trapping its own enum, the
+  written-catch-all boundary (dead code, never taken), and the unbacked
+  control (no trap of any kind, bare `else` byte-identical).
+- **Plant: 1** (the re-dispatch's whole condition short-circuited to
+  `false`): 3 of the 6 pins go red — the three that assert the trap
+  actually fires — while the two controls (no-resource-shape and
+  written-catch-all) correctly stay green, since neither depends on the
+  disabled mechanism.
+- **Goldens moved: 0** (§13.5).
+- `docs/spec/types.md`'s trap-arm section gains the multi-leg form, in the
+  same commit.
+- **B118 interaction, noted for the merge, not acted on here.** The
+  coverage-walk lane is concurrently teaching the CHECKER to refuse a
+  refutable nested payload pattern (§12.4's SECOND filed shape,
+  `b114_a_refutable_nested_pattern_is_not_exhaustive`, untouched by this
+  section). §13's re-dispatch groups EARLIER legs by variant without asking
+  whether those legs are themselves guarded or jointly exhaustive over
+  their OWN payload — it only asks "does this leg's pattern carry a backed
+  test", the same question §12.1 already asks of the final leg. So a GUARDED
+  earlier leg (`Pair::Of(Align::Start) if cond => ..`) is grouped exactly
+  like an unguarded one today: an in-set `Align::Start` value that the guard
+  rejects falls through to the SAME re-dispatch and traps as if it were
+  out-of-set — a false positive, the identical trade §12.4's ledger already
+  accepted for the final leg's own guard composition ("under this hole a
+  match can reach the trap with every value IN set... strictly better than
+  the silent wrong answer it replaces... stops being reachable the moment
+  the exhaustiveness check is fixed"). Nothing here extends or narrows what
+  the checker accepts; when B118 refuses a shape outright, that shape simply
+  stops reaching this trap at all, and the trade above becomes moot for it
+  the same way.

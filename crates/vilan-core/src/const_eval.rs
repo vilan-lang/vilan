@@ -6,11 +6,12 @@
 //! enum), or an immutable binding whose initializer is a literal or another
 //! `const` expression.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget, Node};
 use crate::error::{Error, Note};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::interpreter::{self, ConstValue, FailureKind, Limits};
 use crate::options::BuildOptions;
@@ -72,9 +73,9 @@ pub fn evaluate(
     // transformer's entity lookups (used to build const mini-programs) assume
     // a clean program, exactly as `transform` itself does.
     if !program.diagnostics.is_empty() {
-        return (HashMap::new(), Vec::new(), Vec::new());
+        return (HashMap::default(), Vec::new(), Vec::new());
     }
-    let mut state = State::new(program, options, Mode::Explicit, HashSet::new());
+    let mut state = State::new(program, options, Mode::Explicit, HashSet::default());
     state.check_const_only(graph);
     for &expr_id in &program.const_exprs {
         state.evaluate_one(expr_id);
@@ -102,11 +103,11 @@ pub fn infer(program: &Program, options: &BuildOptions) -> HashMap<Id, ConstValu
     // `evaluate` skips it — the transformer's entity lookups assume a clean
     // program.
     if !options.infer_const || !program.diagnostics.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     let candidates = inference_candidates(program);
     if candidates.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     let mut state = State::new(
         program,
@@ -286,7 +287,7 @@ struct GenericRegions {
 
 impl GenericRegions {
     fn build(program: &Program) -> Self {
-        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+        let mut by_source: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
         let mut mentions = TypeParameterScan::new(program);
         for (function_id, function) in &program.functions {
             let dependent = !function.generic_parameter_constraint_ids.is_empty()
@@ -355,12 +356,12 @@ impl<'p, 'src> TypeParameterScan<'p, 'src> {
     fn new(program: &'p Program<'src>) -> Self {
         Self {
             program,
-            seen: HashMap::new(),
+            seen: HashMap::default(),
         }
     }
 
     fn reaches_a_type_parameter(&mut self, type_id: TypeId) -> bool {
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         self.walk(type_id, &mut visiting)
     }
 
@@ -446,7 +447,7 @@ struct LocalIndex {
 
 impl LocalIndex {
     fn build(program: &Program) -> Self {
-        let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::new();
+        let mut by_source: HashMap<u32, Vec<(usize, usize, Id, Id)>> = HashMap::default();
         for (id, expr) in &program.entity_map {
             if let Expr::Local(binding) = expr
                 && let Some(source) = program.source_of(*id)
@@ -539,10 +540,10 @@ impl<'p, 'src> State<'p, 'src> {
             const_set: program.const_exprs.iter().copied().collect(),
             inferable,
             locals: LocalIndex::build(program),
-            results: HashMap::new(),
+            results: HashMap::default(),
             assets: Vec::new(),
-            failed: HashSet::new(),
-            in_progress: HashSet::new(),
+            failed: HashSet::default(),
+            in_progress: HashSet::default(),
             errors: Vec::new(),
         }
     }
@@ -713,10 +714,10 @@ impl<'p, 'src> State<'p, 'src> {
             .and_then(|scope| scope.name_to_id_map.get("main").copied());
 
         // Seed: nodes calling `emit` directly through a non-const site.
-        let mut in_r: HashSet<Id> = HashSet::new();
+        let mut in_r: HashSet<Id> = HashSet::default();
         let mut worklist: Vec<Id> = Vec::new();
         let mut boundary_errors: Vec<(Id, Id)> = Vec::new(); // (call site, callee)
-        let mut owned_calls: HashSet<Id> = HashSet::new();
+        let mut owned_calls: HashSet<Id> = HashSet::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
                 owned_calls.insert(call.call_id);
@@ -840,7 +841,7 @@ impl<'p, 'src> State<'p, 'src> {
 
         // An immediately-applied closure literal is `CallTarget::Closure`; any
         // R closure that is NOT one of those exists only as a value.
-        let mut applied: HashSet<Id> = HashSet::new();
+        let mut applied: HashSet<Id> = HashSet::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
                 if let CallTarget::Closure(target) = call.target {

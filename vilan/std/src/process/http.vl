@@ -1,12 +1,16 @@
 // `std::http` — a small HTTP server over `node:http`, exposed through an
 // abstract `Server`/`Response` API. The raw `node:http` calls are `[extern]`
 // host bindings used internally (and by `std::rpc_server`, which needs partial
-// writes for SSE); everything else is ordinary Vilan. This module is pure HTTP —
-// protocol mounts (RPC, the connected server) live in `std::rpc_server`.
+// writes for SSE); everything else is ordinary Vilan. The routing and protocol
+// machinery for a mounted RPC service lives in `std::rpc_server` — this module
+// only carries `ServerBuilder.services` and folds it in at `build()`
+// (`fullstack-dx.md` §4), so a plain HTTP app never has to know the type exists.
 
+import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
 import pkg::json::JsonValue;
 import pkg::option::Option::{ None, Some, self };
+import pkg::rpc_server::{ Service, fold_service_requests, fold_service_upgrades };
 
 // --- Raw node:http bindings ---
 
@@ -29,6 +33,12 @@ impl NodeServer {
 	/// arrives as `(request, raw socket, head)` instead of a normal request.
 	[extern(method, "on")]
 	external fun on_upgrade(self, event: str, handler: |NodeRequest, NodeSocket, Bytes| void);
+
+	/// Stop accepting new connections and close once existing ones end (node's
+	/// own `close([callback])`); `on_closed` fires once that has actually
+	/// happened — what `Server::stop` fires `on_stop` from (§9.1).
+	[extern(method, "close")]
+	external fun close(self, on_closed: || void);
 }
 
 /// The `AddressInfo` a listening server reports (`{ address, family, port }`).
@@ -250,9 +260,15 @@ struct Server {
 	port: i32,
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
+	on_stop: |Server| void,
 	/// A WebSocket-style protocol upgrade handler, when the app mounted one
 	/// (`ServerBuilder::on_upgrade`): `(request, raw socket, head bytes)`.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
+	/// The live listener, once bound — what `stop()` closes. `start()`
+	/// populates it on the copy of `Server` it hands to `on_start`, so
+	/// stopping a `Server` value that was never started (or started
+	/// elsewhere) is a no-op rather than an error (§9.1).
+	node: Option<NodeServer>,
 }
 
 struct ServerBuilder {
@@ -263,6 +279,16 @@ struct ServerBuilder {
 	on_start: |Server| void,
 	on_stop: |Server| void,
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
+	/// Rpc services installed with `with_service` (`std::rpc_server`,
+	/// `fullstack-dx.md` §4) — folded in front of `request_handler` and
+	/// `upgrade_handler` at `build()`. Empty for a plain HTTP app, which is
+	/// what keeps this module's own knowledge of `Service` to one field.
+	services: List<Service>,
+	/// The build artifacts `serve_build` installed, folded in front of
+	/// `request_handler` by `build()` — so these routes answer first however
+	/// the chain was written, and the app's own handler still gets every path
+	/// they do not claim.
+	assets: List<BuildAsset>,
 }
 
 impl Server {
@@ -273,6 +299,8 @@ impl Server {
 			on_start = |server| {},
 			on_stop = |server| {},
 			upgrade_handler = None,
+			services = [],
+			assets = [],
 		}
 	}
 
@@ -324,11 +352,29 @@ impl Server {
 		}
 		node_server.listen(port, || {
 			// The server handed to `on_start` carries the port it actually
-			// bound, which is the whole point of being allowed to request 0.
+			// bound, which is the whole point of being allowed to request 0 —
+			// and the live listener `stop()` needs (§9.1).
 			mut started = server;
 			started.port = bound_port(node_server);
+			started.node = Some(node_server);
 			on_start(started);
 		});
+	}
+
+	/// Stop listening and fire `on_stop` once the listener has actually
+	/// closed (§9.1) — a no-op on a `Server` value `start()` never populated
+	/// (built but not started, or a copy taken before `on_start` ran).
+	fun stop(self) {
+		match self.node {
+			Some(let node_server) => {
+				let on_stop = self.on_stop;
+				let stopped = self;
+				node_server.close(|| {
+					on_stop(stopped);
+				});
+			},
+			None => {},
+		}
 	}
 }
 
@@ -366,12 +412,94 @@ impl ServerBuilder {
 		self
 	}
 
+	/// Serve one leg's build output (`fullstack-dx.md` §5.4): one route per
+	/// artifact at `/<file name>`, with the content type its extension implies.
+	/// Repeatable — a server may front more than one leg.
+	///
+	/// This is what deletes the three boot reads and the content-type table
+	/// every server in this language used to write. Every part of that block
+	/// was derivable — the url from the artifact's file name, the MIME type
+	/// from its extension, the body from the read — and none of it was a
+	/// decision the application made. `build_of("client")` knows all three.
+	///
+	/// The routes answer BEFORE `on_request`, independently of the order the
+	/// chain was written, so the app's catch-all still gets every path they do
+	/// not claim — which is what keeps a client-routed SPA's deep links
+	/// working. A leg that gains `split = true` gains its chunk routes here
+	/// with no server edit, which is what the chunk manifest was for.
+	///
+	/// The artifacts are read at boot; one the build named and did not write
+	/// stops the server rather than 404ing per request. Under `run --watch`
+	/// each is re-read per request instead (`asset_body`), so an edit that
+	/// rebuilt `dist/` is served without a restart.
+	fun serve_build(own self, build: LegBuild): ServerBuilder {
+		for asset in load_build(build) {
+			self.assets.push(asset);
+		}
+		self
+	}
+
+	/// Fold the installed services and build assets in front of
+	/// `request_handler` (`fullstack-dx.md` §4.2 and §5.4) and hand the result
+	/// to `Server`. Services answer first (their mounts are the most specific
+	/// claims and their wire is pinned), then the build's asset routes, then
+	/// the app's own handler for every path neither claims. Both folds are
+	/// pure functions of their fields — with neither installed, the handlers
+	/// come through exactly as the app wrote them, so a plain HTTP app is
+	/// unaffected down to the wire.
 	fun build(self): Server {
+		let assets = self.assets;
+		let fallback = self.request_handler;
 		Server {
 			port = self.port,
-			request_handler = self.request_handler,
+			request_handler = fold_service_requests(self.services, |request| respond_from_build(assets, fallback, request)),
 			on_start = self.on_start,
-			upgrade_handler = self.upgrade_handler,
+			on_stop = self.on_stop,
+			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),
+			node = None,
 		}
 	}
+}
+
+/// `serve_build`'s fold as a plain handler, for a boot function that builds its
+/// own `Server` and hands the app only a fallback — `std::rpc_server`'s
+/// `serve_service` and `serve_connected`. The same reads, the same routes and
+/// the same dev-mode freshness; the only difference is where it is installed.
+///
+/// Composable in the way `std::rpc_server::rpc_response` is. Reach for
+/// `ServerBuilder::serve_build` whenever the app owns its builder — this exists
+/// because the `serve_*` boot functions do not hand one over.
+fun build_handler(build: LegBuild, fallback: |Request| Response): |Request| Response {
+	let assets = load_build(build);
+	// The one thing this cannot share with `respond_from_build` is the
+	// fallback's COLOR: `ServerBuilder`'s handler is `async` and
+	// `serve_service`'s is not, and a closure calling an async one is async.
+	// Both answer from `asset_response`, which is where the policy lives.
+	|request| match asset_for(assets, request.path()) {
+		Some(let asset) => asset_response(asset),
+		None => fallback(request),
+	}
+}
+
+/// The build's routes, then the app's own handler — `serve_build`'s half of
+/// `build()`'s fold.
+fun respond_from_build(
+	assets: List<BuildAsset>,
+	fallback: async |Request| Response,
+	request: Request,
+): Response {
+	match asset_for(assets, request.path()) {
+		Some(let asset) => asset_response(asset),
+		None => fallback(request),
+	}
+}
+
+/// One artifact's response: its extension's content type, and the bytes the
+/// dev-mode freshness policy says to serve right now (`asset_body` — the
+/// boot-time copy, or a fresh read while watching).
+fun asset_response(asset: BuildAsset): Response {
+	Response::builder()
+		.set_header("Content-Type", asset.content_type)
+		.body(asset_body(asset))
+		.build()
 }

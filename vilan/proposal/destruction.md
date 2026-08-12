@@ -81,6 +81,38 @@ Nothing in Tier 1 forecloses Tier 2.
   `Session` above needs no modifier; writing it is legal and checked (declaring
   `resource` on a type is always allowed — intent: "will gain teardown / must not be
   copied" — but omitting it never hides resource-ness).
+  *(Verified 2026-08-10 — B113, the containment-verify lane. No change: the rule
+  holds as written.)* B109's arc observed a plain struct with a resource field
+  running **no** scope-end destructor, and corrected a draft pin to match. The
+  observation was **probe idiom**, and the probe's own words are the diagnosis:
+  it wrote `impl Res { fun drop(own self) { .. } }` — an *inherent method* whose
+  name happens to be `drop` — where the language hook is the trait impl `impl
+  Res with Drop { fun drop(&mut self) }` (§5; a by-value receiver on the trait
+  is itself rejected). No destructor was ever registered, so none could run.
+  - **The control that clears containment** is the same idiom with the
+    containing struct *deleted*: a bare `resource` local with an inherent
+    `drop` method is equally silent. The silence is identical with and without
+    containment, so containment was never the variable — pinned as
+    `b113_an_inherent_method_named_drop_never_runs`.
+  - **Every shape tears down, and inference buys the WHOLE R-rule surface, not
+    teardown alone.** Measured across the matrix: a plain struct's field, two
+    fields (reverse declaration order), a plain struct nested in a plain struct
+    (recursive, one order rule per level), a tuple local, a move into an `own`
+    parameter (the callee's scope end owns it), an R2 overwrite (old at the
+    write, new at the scope end), and an R4 return (the callee must *not* drop
+    what it moved out). The same struct is also move-only under R1, fenced out
+    of `List` by R10, and refused by R12 — so there is no "teardown without
+    affinity" tier here and none was designed: §3 makes containment decide
+    resource-*ness*, and every R-rule then reads off that one answer. Nine pins
+    (`b113_*` in `crates/vilan-core/tests/inference.rs`).
+  - **Three independent witnesses, and a counterfactual.** The corpus has been
+    byte-pinning this all along without saying so: `resource.vl`'s `Counted` is
+    the file's only unmodified struct, and its golden emits the `try`/`finally`
+    and prints `counted`. Planting the deletion — `compute_resource`'s
+    `Type::Struct` arm returning "not a resource" instead of descending its
+    fields — turns seven of the nine pins red and reproduces the arc's exact
+    output (`body`, no leaf), which is the world the observation was read as
+    describing.
 - **The modifier is required at leaves**: an `external struct` is opaque, so host-object
   resources (`Database`) must say so themselves.
 - **`Drop` may be implemented only for resource types** — an impl on a data type errors,
@@ -213,6 +245,52 @@ second-class view (`self`/`&`/`&mut` conventions), no ownership change, rule-4 p
     own item. The fixed-array spelling `[Guard; 2]` is correct in both halves
     (rejected by nothing, dropped in reverse element order) and is pinned by
     B99's `an_element_write_drops_the_old_value`.
+  *(Amended 2026-08-10 — B103, shipped in the v0.36.0 list-resource-escape lane.)*
+  **Containment decides whatever the type's PROVENANCE.** The rule now reads "per
+  instantiation" with no qualifier: `mut arr = [Guard { .. }]` is refused exactly
+  as its annotated twin is, and so is every other route inference takes to the
+  same type. The written-application list was never the rule — it was the only
+  place the rule had been asked, and the collection seam is the whole root
+  cause: `walk_type_node`'s `Node::AccessorWithGenerics` arm recorded a candidate
+  per SPELLING, and an inferred type has no spelling. Asking the question of every
+  type a value carries closes it.
+  - **Which world: ALL-REJECTED.** The second half needed no planner change, and
+    that is a finding, not an assumption. R10 admits no route — `Option` (a vilan
+    enum, a resource by containment) and the fixed arrays (value aggregates,
+    likewise) are the sanctioned resource containers and both already tear down
+    correctly. So once (a) rejects every native container at a resource, no
+    binding of one can exist for the teardown question to be asked of, and the
+    "a `List` is not a resource by containment" half becomes unreachable rather
+    than wrong. It stays true, and it stays right: a `List`'s internals are host
+    code, so a teardown over them is exactly what the rule refuses to promise.
+  - **Two seams, one rule.** The whole-program sweep answers for every type a
+    value carries — bindings, parameters, expression types, and the receiver type
+    a native method call's substitution writes down when nothing else records it.
+    The per-INSTANTIATION seam answers for the half no sweep can reach: `fun
+    stash<T>(own value: T) { let items = [value]; }` builds a `List<Guard>` that
+    exists only inside the instantiated body, and the caller — `stash(Guard { ..
+    })` — never has the type. Asked of the DELTA, per the pass's standing rule
+    (B101's phrasing): a container that offends without the substitution is the
+    sweep's, with its own span.
+  - **Two descent holes closed on the way, both pre-existing and both about
+    nesting.** `List<List<Guard>>` holds no resource *argument* — `List<Guard>` is
+    not a resource — so the head answered "no", and only the separately-recorded
+    inner spelling ever reported; delete the annotation and nothing did. A tuple
+    or fixed array had no descent arm at all, so `(1, [Guard { .. }])` was
+    invisible. The descent now mirrors `compute_resource`'s in full.
+  - **Multiplicity is part of the rule (B5).** A written spelling is a site a
+    user can point at, so each still reports. An inferred type is not, and one
+    inferred `List<Guard>` reaches the check as the literal, the binding, every
+    read of it, and the aggregate holding it — so the inferred tier reports once
+    per offending CONTAINER, never for one a spelling already named. `TypeId`
+    cannot key that: the analyzer interns per application rather than
+    structurally (B95's doctrine), so a binding's type and its own annotation's
+    type are different ids for one type. The key is the canonical rendering.
+  - **The sweep is clean, and the goldens did not move.** Nothing in std, the
+    corpus, the examples or the benchmarks builds a container at a resource —
+    R10's annotated form had already fenced the tree — so the widening flips
+    nothing, and a rejection emits nothing, so no golden could move. Both
+    verified rather than assumed.
 - **R11 — generics must be move-clean per instantiation.** Instantiating a type parameter
   with a resource type re-checks the instantiated body under the affine rules (T := the
   resource): every T-typed value used at most once as a move, no captures, no copies.

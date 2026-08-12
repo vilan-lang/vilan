@@ -20,7 +20,6 @@
 //! process-global data, mirroring `load_package_module`'s parse cache.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -28,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::analyzer::SourceId;
 use crate::error::Error;
+use crate::fx::FxHashMap as HashMap;
 use crate::id::Id;
 use crate::interpreter::{self, Limits};
 use crate::node::{Func, ImportBranch, Node, NodeList, Pattern};
@@ -135,7 +135,7 @@ pub(crate) fn scope_for<'r>(
     key: &ModuleKey,
     nodes: &NodeList,
 ) -> MacroScope<'r> {
-    let mut names: HashMap<String, &MacroDef> = HashMap::new();
+    let mut names: HashMap<String, &MacroDef> = HashMap::default();
     // 1. The std prelude.
     for (module_key, macros) in &registry.by_module {
         if matches!(module_key, ModuleKey::Std(_)) {
@@ -704,6 +704,37 @@ pub(crate) fn world_prelude_nodes(
     Some(root)
 }
 
+/// Compiled worlds by `world_key` (the definition segments' content).
+static WORLDS: OnceLock<Mutex<HashMap<u64, Arc<World>>>> = OnceLock::new();
+/// Failed compiles, by `failure_key`. A failure inserts nothing into
+/// [`WORLDS`], so without this a buffer holding a BROKEN macro definition
+/// would recompile the world — and re-leak its text — on every analysis,
+/// edited or not (backlog E23).
+static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new();
+
+/// Drops every compiled macro world, so the next dispatch analyzes one afresh.
+/// The test surface that makes a macro world's COLD path reachable twice in a
+/// process — without it, the first compile in a test binary is the only one,
+/// and a warm-vs-cold differential over a macro world cannot be written.
+/// Sibling of `analyzer::base_cache_clear` — and to be used WITH it: a stored
+/// base world carries a macro registry whose `MacroDef`s memoize their own
+/// compiled world, so clearing this map alone leaves those reachable.
+#[doc(hidden)]
+pub fn macro_world_cache_clear() {
+    if let Some(worlds) = WORLDS.get() {
+        worlds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    if let Some(failures) = FAILURES.get() {
+        failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 fn compile_world(
     blanked: String,
     world_key: u64,
@@ -712,17 +743,11 @@ fn compile_world(
     std: &PackageSpec,
     macro_std: &PackageSpec,
 ) -> Result<Arc<World>, Vec<Error>> {
-    static WORLDS: OnceLock<Mutex<HashMap<u64, Arc<World>>>> = OnceLock::new();
-    // Failed compiles, by `failure_key`. A failure inserts nothing into
-    // `WORLDS`, so without this a buffer holding a BROKEN macro definition
-    // would recompile the world — and re-leak its text — on every analysis,
-    // edited or not (backlog E23).
-    static FAILURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<Error>>>>> = OnceLock::new();
-    let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let worlds = WORLDS.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(world) = worlds.lock().unwrap().get(&world_key) {
         return Ok(world.clone());
     }
-    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    let failures = FAILURES.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(errors) = failures.lock().unwrap().get(&failure_key) {
         // The cached spans are true for this definition layout; only a span
         // at the END of a since-shortened file could overshoot — clamp it.
@@ -872,9 +897,18 @@ struct Expander<'r, 'd> {
     rust_source: String,
     rust_traits: std::collections::HashSet<&'static str>,
     rust_any_service: bool,
-    /// Whether this module declared a backed enum, so the generated block gets
-    /// `Option` in scope for its `parse` (backed-enums.md §3.8).
+    /// Whether this module declared a backed enum whose `value()`/`parse()` were
+    /// generated, so the generated block gets `Option` in scope for its `parse`
+    /// (backed-enums.md §3.8).
     backed_enums: bool,
+    /// Whether this module declared a bare-lowered enum, so the generated block
+    /// gets `Hashable`/`Hash`/`canonical_hash` in scope for its synthesized
+    /// `impl .. with Hashable` (backed-enums.md §7.1). Tracked apart from
+    /// `backed_enums` because the two are not the same set: `enum Level { Low =
+    /// 0, Mid, High }` is bare-lowered — one explicit value converts the whole
+    /// declaration — but has no written literal for `Mid`/`High` to reprint, so
+    /// it gets the Hashable impl and no conversions.
+    bare_lowered_enums: bool,
     diagnostics: &'d mut Vec<Error>,
     /// The per-splice-site counter that stamps `__m<N>` gensym placeholders
     /// unique (§7): deterministic — sites are visited in file/node order.
@@ -902,9 +936,10 @@ pub(crate) fn expand_source(
         std,
         limits,
         rust_source: String::new(),
-        rust_traits: std::collections::HashSet::new(),
+        rust_traits: std::collections::HashSet::default(),
         rust_any_service: false,
         backed_enums: false,
+        bare_lowered_enums: false,
         diagnostics,
         site_counter,
         output: ExpansionOutput::default(),
@@ -916,9 +951,10 @@ pub(crate) fn expand_source(
 }
 
 impl Expander<'_, '_> {
-    /// The synthesized `value()` / `parse()` members of every backed enum this
-    /// module declares (backed-enums.md §3.8), collected in ONE pass over the
-    /// item tree rather than inside the macro dispatch below.
+    /// The synthesized members of every backed enum this module declares —
+    /// `value()` / `parse()` (backed-enums.md §3.8) and `impl .. with Hashable`
+    /// (§7.1) — collected in ONE pass over the item tree rather than inside the
+    /// macro dispatch below.
     ///
     /// Separate because it is not a macro: a backing value is not a `[derive]`
     /// and does not depend on one, so the generation must reach an enum however
@@ -927,18 +963,40 @@ impl Expander<'_, '_> {
     /// whose arm does not recurse.
     fn collect_backed_enum_impls(&mut self, nodes: &NodeList) {
         for node in nodes {
-            self.collect_backed_enum_impls_in(node);
+            self.collect_backed_enum_impls_in(node, false);
         }
     }
 
-    fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>) {
+    /// `derived_hashable` is set once a `[derive(Hashable)]` has been passed on
+    /// the way down to the enum. The synthesized `Hashable` then STANDS DOWN, so
+    /// exactly one impl exists either way: the derive's generator and this one
+    /// emit the identical `canonical_hash(self)` body, so there is nothing for a
+    /// duplicate-impl error to protect — and a program that wrote the derive
+    /// before the impl was synthesized keeps compiling. (A HAND-WRITTEN `impl
+    /// Align with Hashable` is a different case and stays a duplicate error: it
+    /// may mean something else, and which impl wins is B73's open specificity
+    /// question, not this pass's to answer.)
+    fn collect_backed_enum_impls_in(&mut self, node: &Spanned<Node>, derived_hashable: bool) {
         match &node.0 {
             Node::Export(inner)
-            | Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) => self.collect_backed_enum_impls_in(inner),
+            | Node::MacroAttribute(_, _, _, inner) => {
+                self.collect_backed_enum_impls_in(inner, derived_hashable)
+            }
+            Node::Derive(names, inner) => {
+                let derived_hashable =
+                    derived_hashable || names.iter().any(|(name, _)| *name == "Hashable");
+                self.collect_backed_enum_impls_in(inner, derived_hashable)
+            }
             Node::Module(_, body) => self.collect_backed_enum_impls(&body.0),
             Node::Enum(..) => {
+                if !derived_hashable {
+                    let hashable = crate::analyzer::backed_enum_hashable_source(node);
+                    if !hashable.is_empty() {
+                        self.bare_lowered_enums = true;
+                        self.rust_source.push_str(&hashable);
+                    }
+                }
                 let source = crate::analyzer::backed_enum_impl_source(node);
                 if !source.is_empty() {
                     self.backed_enums = true;
@@ -992,6 +1050,19 @@ impl Expander<'_, '_> {
             // missing impl surfaces at the use site).
             Node::Derive(names, item) => {
                 for (name, name_span) in names.iter() {
+                    // `Wire`/`Json` on a `resource` type is refused HERE, above
+                    // the backend split, so the vilan macros and the Rust
+                    // generators cannot disagree — and so nothing is generated
+                    // to fail later inside a body the author never wrote (B117;
+                    // `analyzer::resource_derive_refusal` carries the rule).
+                    if let Some(refusal) = crate::analyzer::resource_derive_refusal(name, item) {
+                        self.diagnostics.push(Error {
+                            note: None,
+                            span: *name_span,
+                            msg: refusal,
+                        });
+                        continue;
+                    }
                     if self.scope.get(name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
                     } else if let Some(known) =
@@ -1192,7 +1263,10 @@ impl Expander<'_, '_> {
         if self.rust_traits.contains("Debug") {
             prelude.push_str("import std::debug::Debug;\n");
         }
-        if self.rust_traits.contains("Hashable") {
+        // One import line serves both producers of an `impl .. with Hashable`:
+        // the `[derive(Hashable)]` fallback generator and a bare-lowered enum's
+        // synthesized impl. A module with both must not import it twice.
+        if self.rust_traits.contains("Hashable") || self.bare_lowered_enums {
             prelude.push_str("import std::hash::{ Hashable, Hash, canonical_hash };\n");
         }
         if self.backed_enums {
@@ -1559,7 +1633,7 @@ fn cached_run(
         arguments.hash(&mut hasher);
         hasher.finish()
     };
-    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let expansions = EXPANSIONS.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(raw) = expansions.lock().unwrap().get(&key).copied() {
         return Ok(raw);
     }
@@ -1661,7 +1735,7 @@ fn parse_cached(text: &str) -> Result<(&'static NodeList<'static>, &'static str)
     static PARSES: OnceLock<Mutex<HashMap<u64, (&'static NodeList<'static>, &'static str)>>> =
         OnceLock::new();
     let key = content_key(text);
-    let parses = PARSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let parses = PARSES.get_or_init(|| Mutex::new(HashMap::default()));
     if let Some(cached) = parses.lock().unwrap().get(&key).copied() {
         return Ok(cached);
     }

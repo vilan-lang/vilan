@@ -4,7 +4,9 @@
 live-update loop `vilan run --watch` runs for a full-stack project (see
 [The dev loop](../guide/dev-loop.md) for the whole picture). Browser-only,
 and every hook here is a **no-op outside a hot reload**: importing it costs
-nothing in a production build, so you can leave the calls in place.
+nothing in a production build, so you can leave the calls in place. For a
+hand-rolled *server's* own dev-mode surface — asking a connected browser
+to reload — see [`std::watch`](process.md).
 
 ```vilan,fragment
 fun hmr_active(): bool                       // is a hot-reload session live?

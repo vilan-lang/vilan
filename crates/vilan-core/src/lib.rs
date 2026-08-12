@@ -7,11 +7,13 @@ pub mod async_infer;
 pub mod bindgen;
 pub mod call_graph;
 pub mod chunks;
+pub mod closest_name;
 pub mod const_eval;
 pub mod context;
 pub mod elements;
 pub mod error;
 pub mod formatter;
+pub mod fx;
 pub mod git_dep;
 pub mod id;
 pub mod init_order;
@@ -36,6 +38,8 @@ pub mod util;
 pub use analyzer::{Layer, PackageSpec, Program, Workspace, analyze};
 pub use error::Error;
 pub use macros::MacroLimits;
+#[doc(hidden)]
+pub use macros::macro_world_cache_clear;
 pub use manifest::Manifest;
 pub use options::{BuildOptions, Preset};
 pub use span::{Span, Spanned};
@@ -493,6 +497,12 @@ pub fn post_analysis_passes(
     let call_graph =
         context::thread_contexts(program).unwrap_or_else(|| call_graph::CallGraph::build(program));
     async_infer::infer(program, &call_graph);
+    // E3's implicit half (B119, view-invalidation.md §7): a view may not live
+    // across a call that CAN SUSPEND, which is the call graph's answer, not the
+    // `await` token's. `check_invalidation` recorded the candidate sites inside
+    // `analyze()` (it owns view liveness); this decides them against the
+    // suspension set `async_infer` just settled.
+    analyzer::check_view_suspensions(program, &call_graph);
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async
     // only by inference, so this cannot run inside `analyze`.

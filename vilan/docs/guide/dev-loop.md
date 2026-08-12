@@ -149,6 +149,42 @@ The rules are short:
   it in the command if you pipe the build.)
 - `vilan check` produces no artifacts, so it runs no hooks.
 
+## Freshness for a hand-rolled server
+
+A running server that reads a file once at boot (`fs::read_file_to_str`
+before `Server::builder()...start()`, say) keeps serving those bytes for
+the life of the process — editing that file produces no round the server
+itself ever sees. `std::watch` closes that gap for code you wrote by hand:
+
+```vilan,norun
+import std::fs;
+import std::http::{ Response, Server };
+import std::watch;
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.on_request(|request| {
+			// Cheap: re-read on every request instead of once at boot.
+			let shell = fs::read_file_to_str("dist/app.html");
+			// Tell every connected browser to reload once it has the fresh
+			// bytes. A no-op outside `run --watch`, so it costs nothing to
+			// leave the call in a shipped build.
+			watch::force_refresh();
+			Response::builder().body(shell).build()
+		})
+		.build()
+		.start();
+}
+```
+
+`force_refresh()` only ever reloads a browser connected to the SAME dev
+channel this server's `run --watch` session started — it has no effect on
+a plain `vilan run`, and it is not how `run --watch`'s own `swap`/`css`
+push works (those fire automatically, on a round; this is the manual,
+explicit escape hatch for state a round can't see). Reference:
+[`std::watch`](../std/process.md).
+
 ## Picking which server to run
 
 You only need this section if your project has two or more runnable Node
@@ -297,14 +333,16 @@ fun main() {
 ### Serving the chunks
 
 A chunk is fetched from the same directory the bundle was served from, so a
-static host needs nothing: serve `dist/` and you are done. A hand-written
-server iterates `dist/client.chunks.json` instead of hard-coding a route per
-file — it lists every artifact the build wrote, so adding, renaming or
-removing a route arm needs no server change:
+static host needs nothing: serve `dist/` and you are done. A vilan server
+needs nothing either — `dist/client.chunks.json` is the leg's **build
+manifest**, and `serve_build` turns it into routes:
 
 ```json
 {
+	"leg": "client",
 	"entry": "client.js",
+	"styles": "client.css",
+	"classic_script": true,
 	"chunks": [
 		{ "arm": "Route::Home", "tag": 0, "file": "client.Route_Home.js" },
 		{ "arm": "Route::Docs(..)", "tag": 1, "file": "client.Route_Docs.js" }
@@ -312,10 +350,17 @@ removing a route arm needs no server change:
 }
 ```
 
-`examples/fullstack`'s server does exactly that: it reads the manifest at
-boot, keeps each named file in memory beside `client.js`, and serves them by
-path. A leg that does not split writes no manifest, and that code path is
-then simply empty — so the same server works either way.
+Every build of a browser leg writes it, split or not — a leg that does not
+split gets `"chunks": []` and `"classic_script": false`. That is deliberate:
+an absent file cannot tell "did not split" from "was never built", and
+`build_of` needs the difference. `styles` is `null` when the leg compiled no
+`const style()`, which is the one thing an `fs::exists` probe could never
+answer in both directions.
+
+`examples/fullstack`'s server reads it with `build_of("client")` and hands
+the result to `serve_build`, which installs one route per artifact — so
+adding, renaming or removing a route arm needs no server change, and neither
+does turning `split` on.
 
 ### Is it worth it?
 

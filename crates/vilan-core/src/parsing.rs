@@ -12,11 +12,22 @@
 //! S4-repointed to run against BOTH frontends), the recovery-mode differential
 //! (`tests/parse_recovery_differential.rs`), and this module's own pins.
 //!
-//! S4 adds RECOVERY and rich errors on top of the clean grammar: the ten
+//! S4 adds RECOVERY and rich errors on top of the clean grammar: the
 //! `nested_delimiters` sites reproduce their placeholders ([`Parser::recover_delimited`]),
 //! the top-level parse keeps whatever prefix parsed, and [`ParseError`] carries the
 //! found/expected/context/hint a real renderer ([`render`]) needs — messages that
 //! may IMPROVE on chumsky's (§6a), never wired into the pipeline (that is S5).
+//!
+//! `editing-dx.md` S1 finishes the recovery design `frontend.md` §2 ratified and
+//! the cutover left unbuilt: **statement/item boundaries synchronize on
+//! `;`/`}`/item keywords** ([`Parser::recover_statement`]). Both statement loops
+//! used to `break` on the first statement that declined, which is what the survey
+//! measured as the *blackout* — while a file does not parse, everything after the
+//! break stops being analyzed, so the diagnostics the rest of the file already had
+//! disappear from the editor. They now report that statement, skip to the next
+//! boundary and resume, which retired the block site's region-skipping recovery
+//! (nine `nested_delimiters` sites remain: a body salvages statement by statement
+//! instead of collapsing to an empty block).
 //!
 //! With S3 the grammar is COMPLETE — the whole file, not just its expressions.
 //! S2 covered the *expression* and *type* grammar plus the block-bearing forms
@@ -89,6 +100,16 @@ pub enum ParseErrorReason {
     /// prohibition explains itself and names the sanctioned spelling). The
     /// misplaced-`resource` steer is the one case today.
     Rule(&'static str),
+    /// A statement ran out without its terminating `;` (`editing-dx.md` §4.4, S2).
+    /// The span is the GAP — the last character of the token before the one that
+    /// could not continue the statement — so the diagnostic sits where the `;`
+    /// goes, not on the next statement's head.
+    MissingTerminator,
+    /// A delimited region that was opened and never closed before the enclosing
+    /// block's `}` or end of input (`editing-dx.md` §5.3 — the defining mid-edit
+    /// shape). The span is the OPENER the user typed; the closer they have not
+    /// typed yet is what the message asks for.
+    Unclosed { delimiter: char },
     /// An unbalanced / garbled delimited region recovered at `production` — one of
     /// the ten `nested_delimiters` sites. `delimiter` is the opening bracket; the
     /// span is the recovered region.
@@ -105,6 +126,61 @@ pub enum Found {
     Token(String),
     Character(char),
     EndOfInput,
+}
+
+/// The expectation a statement terminator records ([`Parser::note_terminator`]),
+/// and the marker [`Parser::emit_failure`] reads to route a failure to the gap
+/// anchor and the `;` message. Spelled like every other `expect_ctrl` expectation
+/// so a set that mixes it with others still renders.
+const TERMINATOR_EXPECTED: &str = "';'";
+
+/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
+/// `resource` modifiers that lead one. An item is never part of an expression, so
+/// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
+/// is skipping (a `{` above it excepted: a block or closure body holds ordinary
+/// statements, and a nested `fun` is one of them).
+fn starts_item(token: &Token<'_>) -> bool {
+    matches!(
+        token,
+        Token::Fun
+            | Token::Struct
+            | Token::Enum
+            | Token::Impl
+            | Token::Trait
+            | Token::Mod
+            | Token::Import
+            | Token::Use
+            | Token::Export
+            | Token::Macro
+            | Token::External
+            | Token::Resource
+    )
+}
+
+/// A keyword that can only begin a fresh statement or item — the token-class half
+/// of `frontend.md:137-140`'s sync points ("statement/item boundaries synchronize
+/// on `;`/`}`/item keywords"), used by [`Parser::scan_to_sync_point`].
+///
+/// Item heads and statement heads (`let`/`mut`/`ret`/`jump`/`if`/`for`/`match`/
+/// `const`/`async`) are both here, because both are places a recovering parse can
+/// pick up cleanly. Identifiers and literals are deliberately NOT: they begin an
+/// expression statement, but they also appear all through a broken one, so
+/// stopping at them would resume mid-garbage and report again (the cascade
+/// `editing-dx.md` §9 records vilan as not having).
+fn starts_statement_or_item(token: &Token<'_>) -> bool {
+    starts_item(token)
+        || matches!(
+            token,
+            Token::Let
+                | Token::Mut
+                | Token::Ret
+                | Token::Jump
+                | Token::If
+                | Token::For
+                | Token::Match
+                | Token::Const
+                | Token::Async
+        )
 }
 
 /// The closing bracket that matches an opening one — for the `Unbalanced` message.
@@ -134,6 +210,11 @@ pub fn render(error: &ParseError) -> String {
 
     let mut message = match &error.reason {
         ParseErrorReason::Rule(rule) => rule.to_string(),
+        ParseErrorReason::MissingTerminator => "expected `;` to end this statement".to_string(),
+        ParseErrorReason::Unclosed { delimiter } => format!(
+            "unclosed `{delimiter}`: expected a matching `{}`",
+            matching_close(*delimiter)
+        ),
         ParseErrorReason::Unbalanced {
             production,
             delimiter,
@@ -176,12 +257,15 @@ pub fn render(error: &ParseError) -> String {
 /// Parse `source` into its statement list (with spans) and any diagnostics. For a
 /// CLEAN source the tree is the same `Spanned<NodeList>` the chumsky parser produces
 /// (byte-identical, spans included — the S3 differential) and the error list is
-/// empty. For a BROKEN source (S4) the parser RECOVERS: the ten `nested_delimiters`
-/// sites produce their placeholders, the `.`/`?.` member cases and the `resource`
-/// steer synchronize, and the top-level `statement*` keeps whatever prefix parsed —
-/// so a tree ALWAYS comes back (like chumsky's `into_output_errors`), alongside a
-/// non-empty error list. The clean-or-decline contract the differential relies on is
-/// therefore the ERROR LIST (empty ⇒ clean), not a missing tree.
+/// empty. For a BROKEN source (S4) the parser RECOVERS: the `nested_delimiters`
+/// sites produce their placeholders, a declined statement is reported and skipped
+/// past at the next `;`/`}`/item boundary (`editing-dx.md` S1) instead of stopping
+/// the parse, the `.`/`?.` member cases and the `resource`
+/// steer synchronize — so a tree ALWAYS comes back (like chumsky's
+/// `into_output_errors`), covering the WHOLE file rather than the prefix before its
+/// first syntax error, alongside a non-empty error list. The clean-or-decline
+/// contract the differential relies on is therefore the ERROR LIST (empty ⇒ clean),
+/// not a missing tree.
 ///
 /// (This is a deliberate improvement chumsky's top-level parse does not make — it is
 /// all-or-nothing, discarding the whole tree on any leftover; see
@@ -219,17 +303,14 @@ fn parse_with(
 ) -> (Option<Spanned<NodeList<'_>>>, Vec<ParseError>) {
     let (tokens, lex_errors) = lexing::tokenize(source);
 
-    let mut parser = Parser::new(&tokens, source.len(), preserve_paren_groups);
+    let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
     let root = parser.parse_program();
-    if parser.position != tokens.len() {
-        // The top-level `statement*` stopped before consuming everything — an
-        // unparseable statement (a genuine syntax error). Chumsky's `.parse()`
-        // reports "expected end of input" here and still returns the partial
-        // tree; reproduce that, but anchored at the FARTHEST the deepest attempt
-        // reached (a better location than the leftover token, which is only where
-        // the last statement declined) so the message speaks to the real problem.
-        parser.emit_leftover_error();
-    }
+    debug_assert_eq!(
+        parser.position,
+        tokens.len(),
+        "the statement/item synchronizer consumes the whole token stream: an \
+         unparseable statement is reported and skipped past, never left over",
+    );
 
     // The lexer never discards its stream (S1): un-lexable characters are skipped
     // and reported, and the parser recovers over the surviving tokens. So a tree
@@ -265,6 +346,10 @@ fn parse_with(
 struct Parser<'a, 'src> {
     tokens: &'a [Spanned<Token<'src>>],
     position: usize,
+    /// The source the tokens index into — read only to place the **gap anchor** of
+    /// a missing statement terminator on the last CHARACTER of the preceding token
+    /// ([`Parser::gap_span`]), which needs a char boundary, not a byte offset.
+    source: &'src str,
     /// The end-of-input offset (`source.len()`), the span the chumsky parser reports
     /// at EOI — `.map((end..end).into(), …)` in every call site.
     eoi: usize,
@@ -417,11 +502,16 @@ fn is_known_attribute_marker(name: &str) -> bool {
 }
 
 impl<'a, 'src> Parser<'a, 'src> {
-    fn new(tokens: &'a [Spanned<Token<'src>>], eoi: usize, preserve_paren_groups: bool) -> Self {
+    fn new(
+        tokens: &'a [Spanned<Token<'src>>],
+        source: &'src str,
+        preserve_paren_groups: bool,
+    ) -> Self {
         Parser {
             tokens,
             position: 0,
-            eoi,
+            source,
+            eoi: source.len(),
             errors: Vec::new(),
             farthest_failure: None,
             context_stack: Vec::new(),
@@ -673,23 +763,15 @@ impl<'a, 'src> Parser<'a, 'src> {
         result
     }
 
-    /// Build the top-level decline diagnostic when statements remain unparsed:
-    /// anchored at the farthest failure (or the leftover token if nothing deeper
-    /// was recorded), naming what was found and the curated expectations, plus the
-    /// structural `!=`-soup hint when it applies.
-    fn emit_leftover_error(&mut self) {
-        match self.farthest_failure.take() {
-            Some(failure) if failure.position >= self.position => {
-                self.emit_failure(failure.position, failure.expected, failure.context);
-            }
-            // Nothing deeper than where the last statement declined: fall back to
-            // the leftover token and the top-level expectation.
-            _ => self.emit_failure(
-                self.position,
-                vec!["an item".to_string(), "end of input".to_string()],
-                Vec::new(),
-            ),
-        }
+    /// Record that a statement's terminating `;` was wanted here — the committed
+    /// side of `frontend.md:24-31`'s noting rule, which `;` was never put on
+    /// (`editing-dx.md` §4.2/S2). Called at the three STATEMENT-terminator demands
+    /// (`expression ;`, `import … ;`, `use … ;`) and nowhere else: the `[T; N]`
+    /// array type and the `[value; length]` repeat fork spell `;` as a speculative
+    /// fork between two readings, not as a committed demand, so noting them would
+    /// put "expected `;` to end this statement" on a type-position failure.
+    fn note_terminator(&mut self) {
+        self.note_expected(TERMINATOR_EXPECTED);
     }
 
     /// Push an `Expected` error for a failure at `position`: the found token, its
@@ -698,6 +780,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// and delimiter recovery (which surfaces the real inner error, not a claim the
     /// region was unclosed).
     fn emit_failure(&mut self, position: usize, expected: Vec<String>, context: Vec<&'static str>) {
+        // A missing statement terminator is not a "found X expected Y" — the token
+        // at `position` is a perfectly good next statement, and the mistake is in
+        // the whitespace before it (`editing-dx.md` §4.4). It reports at the gap,
+        // and says `;`.
+        if expected.iter().any(|one| one == TERMINATOR_EXPECTED) {
+            let span = self.gap_span(position);
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::MissingTerminator,
+                context,
+                hint: None,
+            });
+            return;
+        }
         let span = self.token_span(position);
         let found = self.found_at(position);
         let hint = self.soup_hint(position);
@@ -707,6 +803,30 @@ impl<'a, 'src> Parser<'a, 'src> {
             context,
             hint,
         });
+    }
+
+    /// The anchor for a missing statement terminator: the LAST CHARACTER of the
+    /// token before `position` — the gap where the `;` belongs (`editing-dx.md`
+    /// §4.4, drawn under the `}` of `… y = 4 }`). One character rather than the
+    /// zero-width point the same section also describes, because the editor is the
+    /// instrument that matters and a zero-width LSP range draws as nothing there
+    /// (§3.2); `line_index.rs` converts both ends verbatim, so nothing downstream
+    /// would widen it. Char-aligned, so a token ending in a multi-byte character
+    /// still yields a slice-able span.
+    fn gap_span(&self, position: usize) -> Span {
+        match position
+            .checked_sub(1)
+            .and_then(|previous| self.tokens.get(previous))
+        {
+            Some((_, span)) => {
+                let start = self.source[span.start..span.end]
+                    .chars()
+                    .next_back()
+                    .map_or(span.start, |last| span.end - last.len_utf8());
+                (start..span.end).into()
+            }
+            None => self.token_span(position),
+        }
     }
 
     /// Take the recorded farthest failure iff it lies strictly inside the token
@@ -753,6 +873,253 @@ impl<'a, 'src> Parser<'a, 'src> {
             Some((token, _)) => Found::Token(token.to_string()),
             None => Found::EndOfInput,
         }
+    }
+
+    // --- Statement/item synchronization (frontend.md §2, editing-dx.md S1) ---
+
+    /// Recover from a statement that declined at token `start`: report ONE
+    /// diagnostic for it and move the cursor to the next statement/item boundary,
+    /// so the statements after it are parsed instead of dropped.
+    ///
+    /// This is `frontend.md:137-140`'s ratified "statement/item boundaries
+    /// synchronize on `;`/`}`/item keywords" clause, which the H6 cutover never
+    /// built — both statement loops simply `break`, which is what
+    /// `editing-dx.md` §2 measures as the *blackout*: everything after the first
+    /// broken statement stops being parsed, so every diagnostic it would have
+    /// produced disappears from the editor while the user types.
+    ///
+    /// Which diagnostic, in the order the survey's grades ask for:
+    /// 1. a delimiter opened inside the statement and never closed, with no
+    ///    committed demand failing *inside* it — the `print(1` mid-edit shape —
+    ///    reports `unclosed \`(\`` at the OPENER (§5.3), not `found '}'` at a brace
+    ///    the user never touched;
+    /// 2. otherwise the farthest failure, which is the located "found X expected Y"
+    ///    (§5.1's already-good separator/closer messages, and S2's missing-`;`);
+    /// 3. otherwise — nothing recorded anything, so the statement's very first
+    ///    token is unparseable — the position's own fallback.
+    ///
+    /// The cursor always advances at least one token, so the caller's loop cannot
+    /// spin.
+    ///
+    /// Returns a statement RECOVERED from inside the abandoned region, when one
+    /// exists — `editing-dx.md` §8 clause 3's one residual (§15.8/§17.5): a
+    /// statement written where a call's arguments were expected (`print(` then
+    /// `let swallowed: i32 = 2;`) is read as an argument, and lost with the whole
+    /// abandoned call when its `attempt` backtracks. See
+    /// [`Parser::recover_swallowed_statement`].
+    fn recover_statement(&mut self, start: usize, in_block: bool) -> Option<Spanned<Node<'src>>> {
+        let (resume, unclosed) = self.scan_to_sync_point(start, in_block);
+        // A committed demand that failed strictly INSIDE the unclosed region
+        // located the real error (`distance(1, 2;` fails at the `;`, wanting `,`
+        // or `)`) — that message is better than naming the opener, and §5.1 grades
+        // it the best in the survey. Only a region nothing complained inside of is
+        // reported as unclosed.
+        let inside = unclosed.and_then(|opener| self.take_failure_within(opener, resume));
+        let swallowed = match (unclosed, inside) {
+            (_, Some(failure)) => {
+                self.emit_failure(failure.position, failure.expected, failure.context);
+                unclosed.and_then(|opener| self.recover_swallowed_statement(opener, resume))
+            }
+            (Some(opener), None) => {
+                let delimiter = match self.tokens.get(opener) {
+                    Some((Token::Ctrl(character), _)) => *character,
+                    _ => '(',
+                };
+                self.errors.push(ParseError {
+                    span: self.token_span(opener),
+                    reason: ParseErrorReason::Unclosed { delimiter },
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+                self.farthest_failure = None;
+                None
+            }
+            (None, None) => {
+                self.emit_statement_failure(start, in_block);
+                None
+            }
+        };
+        // Unconditional, regardless of what `recover_swallowed_statement`'s own
+        // attempt left `self.position` at (its own `attempt` already restores it
+        // to `opener + 1` on decline): `resume` is the scan's own authoritative
+        // answer, never second-guessed by the recovery it enables.
+        self.position = resume;
+        swallowed
+    }
+
+    /// The one case of `recover_statement`'s abandoned region that is not
+    /// actually garbled: a call left unclosed by a statement typed where an
+    /// argument was expected. `opener` and `resume` box that statement's tokens
+    /// exactly — `scan_to_sync_point` stops at the first token that cannot be
+    /// part of a parenthesized region, so `(opener + 1)..resume` is precisely
+    /// "one statement, plus the `;` that ended it" whenever the abandoned
+    /// region genuinely holds one. Retried from a fresh position as an ordinary
+    /// statement; kept only when that retry both succeeds AND lands EXACTLY on
+    /// `resume` — nothing more, nothing less — so a region shaped any other way
+    /// (more than one statement, a genuinely garbled head, a nested unclosed
+    /// delimiter of its own) declines rather than guesses, and the caller's
+    /// existing jump-to-`resume` behavior is exactly as before it.
+    ///
+    /// Scoped to `(` on purpose: `[value; length]`'s own `;` fork and a
+    /// block's `{ statement* }` already parse their contents as themselves, so
+    /// only a call's argument list can swallow a foreign statement whole.
+    fn recover_swallowed_statement(
+        &mut self,
+        opener: usize,
+        resume: usize,
+    ) -> Option<Spanned<Node<'src>>> {
+        if !matches!(self.tokens.get(opener), Some((Token::Ctrl('('), _))) {
+            return None;
+        }
+        self.position = opener + 1;
+        let recovered = self
+            .attempt(Self::parse_statement)
+            .filter(|_| self.position == resume);
+        // Either outcome may have left farthest-failure tracking pointed at a
+        // committed demand from INSIDE the region this call already reported
+        // on (the retry's own clean demands on success; `attempt`'s rollback
+        // does not touch this field on decline) — cleared so it cannot be
+        // mistaken for a later statement's failure.
+        self.farthest_failure = None;
+        recovered
+    }
+
+    /// Recover a statement whose only fault is the missing `;`: the body parsed to
+    /// completion and the token after it can only begin a fresh statement or item
+    /// (or end the block, or the file), so the terminator is the one thing absent.
+    /// Report it at the gap and KEEP the statement.
+    ///
+    /// Skipping it instead would be honest about the syntax and wrong about the
+    /// program: dropping `import std::print` because its `;` is missing unbinds
+    /// `print` at every call site below, and dropping `let origin = …` unbinds
+    /// `origin` — a screenful of "cannot find" on lines that are correct, from a
+    /// statement the parser read perfectly well. This is `editing-dx.md` §8
+    /// clause 3 in the direction the survey did not measure: a parse error that
+    /// must not remove a diagnostic must not manufacture one either.
+    ///
+    /// The boundary condition is what keeps it from cascading. Only a KEYWORD
+    /// head (or `}`, or end of input) counts, never an identifier or a literal:
+    /// `print 1);` would resume at `1`, which is not a statement anyone wrote, so
+    /// it takes the skipping path and reports once (§5.2's accepted outcome).
+    fn recover_missing_terminator(&mut self) -> Option<Spanned<Node<'src>>> {
+        let statement = self.attempt(|parser| {
+            // The three forms that take a terminator — the same three
+            // `note_terminator` records one for.
+            let body = parser
+                .attempt(Self::parse_expression)
+                .or_else(|| parser.attempt(Self::parse_import))
+                .or_else(|| parser.attempt(Self::parse_use))?;
+            let at_a_fresh_statement = parser.at_end()
+                || parser.peek_is_ctrl('}')
+                || parser.peek().is_some_and(starts_statement_or_item);
+            at_a_fresh_statement.then_some(body)
+        })?;
+        self.emit_failure(
+            self.position,
+            vec![TERMINATOR_EXPECTED.to_string()],
+            Vec::new(),
+        );
+        Some(statement)
+    }
+
+    /// The located diagnostic for a statement that declined at `start`: the
+    /// farthest failure when it lies at or past the statement's head (the deepest
+    /// the parser got), else the head token itself with the position's own
+    /// expectation — an item at file scope, a statement inside a block. Mirrors
+    /// [`Parser::emit_leftover_error`], which is the same choice made once at the
+    /// end of a parse that stopped instead of synchronizing.
+    fn emit_statement_failure(&mut self, start: usize, in_block: bool) {
+        match self.farthest_failure.take() {
+            Some(failure) if failure.position >= start => {
+                self.emit_failure(failure.position, failure.expected, failure.context)
+            }
+            _ => {
+                let expected = if in_block {
+                    vec!["a statement".to_string(), "'}'".to_string()]
+                } else {
+                    vec!["an item".to_string(), "end of input".to_string()]
+                };
+                self.emit_failure(start, expected, Vec::new())
+            }
+        }
+    }
+
+    /// Scan forward from the declined statement at `start` for the next
+    /// statement/item boundary, WITHOUT moving the cursor. Returns the token index
+    /// to resume at — always `> start` — and the index of the outermost delimiter
+    /// still open when the scan stopped, if any.
+    ///
+    /// The boundaries are `frontend.md`'s: a `;` at statement depth (resume after
+    /// it), a `}` closing the enclosing block (resume ON it, so the block closes
+    /// normally), and an item keyword. A statement-head keyword joins them —
+    /// `let`/`mut`/`ret`/`if`/`for`/`match` cannot continue the broken statement,
+    /// and stopping there is what keeps the *next* statement's diagnostics alive
+    /// after a missing `;` (§8 clause 3) instead of swallowing it to the following
+    /// terminator.
+    ///
+    /// Delimiters nest, and a `}` that does not match the innermost opener ends the
+    /// scan: the enclosing block's closer outranks a region the user has not
+    /// finished typing, which is exactly how `print(` stops eating the rest of the
+    /// file (§2.2 mechanism 3). At FILE scope there is no enclosing block, so a
+    /// stray closer is consumed rather than stopped at — otherwise `}}}}` would
+    /// report once per brace.
+    ///
+    /// Two of the boundaries reach INSIDE an unfinished region, because the token
+    /// they stop on cannot be part of one:
+    /// - a `;` whose innermost opener is `(` — a call's arguments and a
+    ///   parenthesized expression admit no semicolon (the constructs that do,
+    ///   `[value; length]` and a block's statements, sit under `[` or `{`), so it
+    ///   terminates a statement written BELOW the region;
+    /// - an ITEM keyword with no `{` open above it — `fun`/`struct`/`impl`/… are
+    ///   never part of a parenthesized expression, so an unclosed `(` in an item's
+    ///   own header stops eating the items below it. A `{` on the stack means a
+    ///   block or closure body, where a nested item is ordinary code, so the scan
+    ///   keeps going there. Statement heads get no such reach: `if`/`match`/`async`
+    ///   are perfectly good arguments.
+    fn scan_to_sync_point(&self, start: usize, in_block: bool) -> (usize, Option<usize>) {
+        let mut open: Vec<(usize, char)> = Vec::new();
+        let mut index = start;
+        while let Some((token, _)) = self.tokens.get(index) {
+            let outermost_open = open.first().map(|(at, _)| *at);
+            if let Token::Ctrl(character) = token {
+                let character = *character;
+                if matches!(character, '(' | '[' | '{') {
+                    open.push((index, matching_close(character)));
+                    index += 1;
+                    continue;
+                }
+                if matches!(character, ')' | ']' | '}') {
+                    if open.last().is_some_and(|(_, closer)| *closer == character) {
+                        open.pop();
+                        index += 1;
+                        continue;
+                    }
+                    if character == '}' && in_block {
+                        return (index, outermost_open);
+                    }
+                    index += 1;
+                    continue;
+                }
+                if character == ';' && open.last().is_none_or(|(_, closer)| *closer == ')') {
+                    return (index + 1, outermost_open);
+                }
+                index += 1;
+                continue;
+            }
+            if index > start {
+                let inside_a_block = open.iter().any(|(_, closer)| *closer == '}');
+                let stops = if open.is_empty() {
+                    starts_statement_or_item(token)
+                } else {
+                    !inside_a_block && starts_item(token)
+                };
+                if stops {
+                    return (index, outermost_open);
+                }
+            }
+            index += 1;
+        }
+        (index, open.first().map(|(at, _)| *at))
     }
 
     // --- Delimiter recovery (chumsky `nested_delimiters`) --------------------
@@ -898,9 +1265,10 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- Program / statements ------------------------------------------------
 
-    /// The whole source: a sequence of statements. Stops at the first token that
-    /// begins no S2 statement (an unimplemented item, or an error); [`parse`] then
-    /// sees leftover tokens and declines.
+    /// The whole source: a sequence of statements. A token that begins no statement
+    /// is REPORTED and SYNCHRONIZED past ([`Parser::recover_statement`]) rather than
+    /// stopping the parse, so an item after a broken one still reaches the analyzer
+    /// (`editing-dx.md` §2.2 mechanism 3 — the file-tail blackout).
     fn parse_program(&mut self) -> Spanned<NodeList<'src>> {
         let mut statements = Vec::new();
         loop {
@@ -909,7 +1277,14 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             match self.parse_statement() {
                 Some(statement) => statements.push(statement),
-                None => break,
+                None => match self.recover_missing_terminator() {
+                    Some(statement) => statements.push(statement),
+                    None => {
+                        if let Some(swallowed) = self.recover_statement(self.position, false) {
+                            statements.push(swallowed);
+                        }
+                    }
+                },
             }
         }
         (statements, self.span_from(0))
@@ -964,6 +1339,12 @@ impl<'a, 'src> Parser<'a, 'src> {
             }
             if is_block_like(&expression.0) && !parser.peek_is_ctrl('}') {
                 return Some(expression);
+            }
+            // The expression is complete and its `;` is not there. Record the
+            // demand (S2). A block-bearing form only reaches here at the end of its
+            // block, where it is the block's VALUE and wants no `;`.
+            if !is_block_like(&expression.0) {
+                parser.note_terminator();
             }
             None
         }) {
@@ -2060,45 +2441,83 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// A brace-delimited block: `statement* trailing_expression?`. The trailing
     /// expression is the block's value; with none, the value is `void` at the
-    /// closing brace. A garbled body recovers to an empty block — no statements, a
-    /// `Void` tail at the closing brace (chumsky's `nested_delimiters` on `block`,
-    /// site 6 of 10).
+    /// closing brace.
+    ///
+    /// A broken body no longer recovers by SKIPPING the whole `{…}` region to an
+    /// empty block (chumsky's `nested_delimiters` on `block`, site 6 of 10):
+    /// [`Parser::parse_block_clean`] recovers statement by statement instead, so
+    /// the siblings of a broken statement survive — `editing-dx.md` §2.2's
+    /// mechanism 2, the one that made a body's every diagnostic disappear while
+    /// its last statement was half-typed. The region-skipping arm is gone with it:
+    /// past the `{`, the clean parse can no longer decline, so it was unreachable.
     fn parse_block(&mut self) -> Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>> {
-        if let Some(clean) = self.attempt(Self::parse_block_clean) {
-            return Some(clean);
-        }
-        self.recover_delimited("block", '{', '}', &[('(', ')'), ('[', ']')])
-            .map(|span| {
-                let void = Box::new((Node::Void, (span.end..span.end).into()));
-                ((Vec::new(), void), span)
-            })
+        self.attempt(Self::parse_block_clean)
     }
 
-    /// The clean `{ statement* trailing_expression? }` parse, wrapped by
-    /// [`Parser::parse_block`]'s recovery.
+    /// The `{ statement* trailing_expression? }` parse. Once the `{` is consumed
+    /// this always produces a block: a statement that declines is either the
+    /// block's trailing expression, or it is broken — reported and synchronized
+    /// past ([`Parser::recover_statement`]), leaving its siblings in the tree.
+    ///
+    /// That is `editing-dx.md` §2.2's mechanism 2: before S1 a body with one
+    /// half-typed statement in it was thrown away wholesale and replaced by an
+    /// EMPTY block, so every diagnostic every other statement in that body would
+    /// have produced vanished with it — measured keystroke by keystroke in P30.
+    /// A body that runs out of input is likewise kept, with `unclosed \`{\``
+    /// reported at the opening brace (§5.3) instead of `found end of input` at the
+    /// far end of the file.
     fn parse_block_clean(&mut self) -> Option<Spanned<(NodeList<'src>, Box<Spanned<Node<'src>>>)>> {
         let start = self.position;
         self.expect_ctrl('{')?;
         let mut statements = Vec::new();
+        let mut tail = None;
         loop {
             if self.peek_is_ctrl('}') || self.at_end() {
                 break;
             }
-            match self.parse_statement() {
-                Some(statement) => statements.push(statement),
-                None => break,
+            if let Some(statement) = self.parse_statement() {
+                statements.push(statement);
+                continue;
+            }
+            // No statement starts here. The block's trailing expression is the
+            // other legitimate reading (it is the one thing in a block that needs
+            // no `;`), and it must close the block to be one.
+            if let Some(expression) = self.attempt(|parser| {
+                let expression = parser.parse_expression()?;
+                parser.peek_is_ctrl('}').then_some(expression)
+            }) {
+                tail = Some(expression);
+                break;
+            }
+            if let Some(statement) = self.recover_missing_terminator() {
+                statements.push(statement);
+                continue;
+            }
+            if let Some(swallowed) = self.recover_statement(self.position, true) {
+                statements.push(swallowed);
             }
         }
-        let tail = if self.peek_is_ctrl('}') {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
-        self.expect_ctrl('}')?;
+        if !self.eat_ctrl('}') {
+            // The loop only leaves on `}` or end of input, so this is a `{` the
+            // user has not closed yet. Report it where they typed it.
+            self.errors.push(ParseError {
+                span: self.token_span(start),
+                reason: ParseErrorReason::Unclosed { delimiter: '{' },
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let span = self.span_from(start);
+        // S3 (editing-dx.md §3.5/§3.9): the closing brace itself — width one,
+        // exactly `}` — not the zero-width point one byte PAST it. `}` is a
+        // single ASCII byte, so `span.end - 1..span.end` IS the brace; the old
+        // `span.end..span.end` sat just after it, which an editor draws as
+        // nothing at all (a caret, not an underline) — the doc comment above
+        // already claimed "at the closing brace"; this is what makes it true.
+        let void_span = (span.end.saturating_sub(1)..span.end).into();
         let tail = tail
             .map(Box::new)
-            .unwrap_or_else(|| Box::new((Node::Void, (span.end..span.end).into())));
+            .unwrap_or_else(|| Box::new((Node::Void, void_span)));
         Some(((statements, tail), span))
     }
 
@@ -3436,7 +3855,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `import <namespace_path> ;` — an import used as a statement.
     fn parse_import_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         let import = self.parse_import()?;
-        self.expect_ctrl(';')?;
+        if !self.eat_ctrl(';') {
+            self.note_terminator();
+            return None;
+        }
         Some(import)
     }
 
@@ -3451,7 +3873,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `use <namespace_path> ;` — a use used as a statement.
     fn parse_use_statement(&mut self) -> Option<Spanned<Node<'src>>> {
         let use_ = self.parse_use()?;
-        self.expect_ctrl(';')?;
+        if !self.eat_ctrl(';') {
+            self.note_terminator();
+            return None;
+        }
         Some(use_)
     }
 
@@ -3981,7 +4406,7 @@ mod tests {
     fn expr_in_mode(source: &str, preserve_paren_groups: bool) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len(), preserve_paren_groups);
+        let mut parser = Parser::new(&tokens, source, preserve_paren_groups);
         let node = parser.parse_expression().expect("expression did not parse");
         assert_eq!(
             parser.position,
@@ -3995,7 +4420,7 @@ mod tests {
     fn condition(source: &str) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len(), false);
+        let mut parser = Parser::new(&tokens, source, false);
         let node = parser.parse_condition().expect("condition did not parse");
         assert_eq!(
             parser.position,
@@ -4009,7 +4434,7 @@ mod tests {
     fn type_(source: &str) -> Spanned<Node<'_>> {
         let (tokens, errors) = lexing::tokenize(source);
         assert!(errors.is_empty(), "lex errors on {source:?}: {errors:?}");
-        let mut parser = Parser::new(&tokens, source.len(), false);
+        let mut parser = Parser::new(&tokens, source, false);
         let node = parser.parse_type().expect("type did not parse");
         assert_eq!(
             parser.position,
@@ -4354,7 +4779,7 @@ mod tests {
         // is `default<Id>()` above.
         let (tokens, errors) = lexing::tokenize("foo<T>");
         assert!(errors.is_empty());
-        let mut parser = Parser::new(&tokens, "foo<T>".len(), false);
+        let mut parser = Parser::new(&tokens, "foo<T>", false);
         let node = parser.parse_expression().expect("prefix parses");
         assert!(matches!(node.0, Node::Binary(BinaryOp::Lt, _, _)));
     }
@@ -5064,8 +5489,12 @@ mod tests {
             ("fun main() { let x = (1 +); }\n", "Some((Error, 21..26))"),
             ("fun main() { let x = [1 +]; }\n", "Some((Error, 21..26))"),
             (
+                // The synthesized tail `Void` carries the CLOSING BRACE's span
+                // (editing-dx.md §16's S3 anchor rule), not a zero-width point
+                // past it — composed with S1's recovery, which declines the
+                // broken statement and leaves the body empty.
                 "fun main() { let x = 1 + ; }\n",
-                "body: Some((([], (Void, 28..28)",
+                "body: Some((([], (Void, 27..28)",
             ),
             (
                 "struct S { 1 2 3 }\n",

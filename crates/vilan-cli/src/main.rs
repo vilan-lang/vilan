@@ -715,6 +715,7 @@ fn hmr_round(
         let (javascript, assets, sources) = match compile_unit(
             unit,
             *platform,
+            CompileGoal::Emit,
             false,
             matches!(platform, Platform::Browser),
             Some(&mut overlay_text),
@@ -808,9 +809,6 @@ fn hmr_round(
                 bundle_path.display()
             );
         }
-        // This round emitted the leg whole, so nothing of a previous split
-        // build of it may remain (`bundle-splitting.md` §S3, item 4).
-        sweep_stale_chunks(&bundle_path, &[]);
         if let Some(css) = &leg.css {
             let css_path = dist.join(format!("{}.css", leg.name));
             if let Err(error) = fs::write(&css_path, css) {
@@ -821,6 +819,15 @@ fn hmr_round(
                 );
             }
         }
+        // This round emitted the leg whole, so nothing of a previous split build
+        // of it may remain (`bundle-splitting.md` §S3, item 4) — and a browser
+        // leg still writes its build manifest, because the dev loop is exactly
+        // where a server asks what its client leg emitted (`serve_build`'s watch
+        // policy re-reads per request, but the DESCRIPTION is read once at boot,
+        // and a watch round that swept it would leave the restarted server with
+        // nothing to describe).
+        let styles = leg.css.as_ref().map(|_| format!("{}.css", leg.name));
+        let _ = write_chunks(&bundle_path, &[], styles.as_deref(), leg.is_browser);
     }
     for (name, kind, content) in &other_assets {
         let asset_path = dist.join(format!("{name}.{kind}"));
@@ -853,7 +860,11 @@ fn hmr_round(
                 // `dist/` bundles, exactly as `run_workspace` /
                 // `build_and_spawn_run`.
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
-                match spawn_node(&script, args, Some(&root)) {
+                // `dev-refresh.md` §5 item 2: the dev channel's port, so the
+                // child's `std::watch::force_refresh()` (a no-op without it)
+                // knows where to POST.
+                let extra = [("VILAN_HMR_PORT", channel.port().to_string())];
+                match spawn_watched_node(&script, args, Some(&root), &extra) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
                         eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -963,13 +974,14 @@ fn build_and_spawn_run(
     if run_build_hooks(&project).is_err() {
         return None;
     }
-    let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd) {
-        Ok(child) => Some(child),
-        Err(error) => {
-            eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
-            None
-        }
-    };
+    let launch =
+        |script: &Path, cwd: Option<&Path>| match spawn_watched_node(script, args, cwd, &[]) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
+                None
+            }
+        };
     match project {
         Project::Single { unit, platform, .. } => {
             let platform = platform.unwrap_or_default();
@@ -981,8 +993,16 @@ fn build_and_spawn_run(
                 );
                 return None;
             }
-            let (javascript, assets, _sources) =
-                compile_unit(&unit, Platform::default(), false, false, None, None).ok()?;
+            let (javascript, assets, _sources) = compile_unit(
+                &unit,
+                Platform::default(),
+                CompileGoal::Emit,
+                false,
+                false,
+                None,
+                None,
+            )
+            .ok()?;
             // Assets go beside the *canonical* build output — `<entry>.css`, where
             // `build` writes them and the served program reads them — not beside the
             // /tmp watch script Node executes (which nothing serves). Each watch
@@ -1681,9 +1701,26 @@ fn git_deps() -> vilan_core::git_dep::GitDeps {
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the
 /// emitted JavaScript (or a failure code after reporting).
+/// What a compile is FOR — the one thing that changes how a file which did not
+/// parse cleanly is treated (`editing-dx.md` S6/§13.1).
+///
+/// `Emit` keeps the historical contract: a file whose parse was not clean is not
+/// analyzed at all, so a broken build reports its parse errors and nothing else.
+/// `Check` analyzes the salvaged tree instead — the same tree, on the same parse,
+/// that the language server has analyzed since the H6 cutover — so a syntax error
+/// in one statement stops hiding the type errors everywhere else in the file
+/// (§2.2 mechanism 1, measured as P29). Neither goal ever emits JavaScript from a
+/// recovered tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompileGoal {
+    Emit,
+    Check,
+}
+
 fn compile_unit(
     unit: &Unit,
     platform: Platform,
+    goal: CompileGoal,
     emit_debug: bool,
     hmr: bool,
     overlay: Option<&mut String>,
@@ -1713,6 +1750,7 @@ fn compile_unit(
         &unit.entry,
         &unit.pkg_root,
         platform,
+        goal,
         &options,
         &workspace,
         emit_debug,
@@ -1735,6 +1773,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     let (javascript, assets, _sources) = match compile_unit(
         unit,
         platform,
+        CompileGoal::Emit,
         emit_debug,
         false,
         None,
@@ -1750,8 +1789,13 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
         return ExitCode::SUCCESS;
     }
     let output_path = unit.entry.with_extension(platform.script_extension());
-    write_assets(&output_path, &assets);
-    if let Err(code) = write_chunks(&output_path, &chunks) {
+    let styles = write_assets(&output_path, &assets);
+    if let Err(code) = write_chunks(
+        &output_path,
+        &chunks,
+        styles.as_deref(),
+        matches!(platform, Platform::Browser),
+    ) {
         return code;
     }
     match fs::write(&output_path, javascript) {
@@ -1777,7 +1821,15 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
 
 /// Type-checks a lone package / bare file, writing no output.
 fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
-    match compile_unit(unit, platform, emit_debug, false, None, None) {
+    match compile_unit(
+        unit,
+        platform,
+        CompileGoal::Check,
+        emit_debug,
+        false,
+        None,
+        None,
+    ) {
         Ok(_) => {
             println!(
                 "{}: {}",
@@ -1794,7 +1846,7 @@ fn check_single(unit: &Unit, platform: Platform, emit_debug: bool) -> ExitCode {
 fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
     let platform = Platform::default();
     let (javascript, assets, _sources) =
-        match compile_unit(unit, platform, false, false, None, None) {
+        match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
             Ok(compiled) => compiled,
             Err(code) => return code,
         };
@@ -1886,12 +1938,18 @@ fn build_workspace_artifacts(
         let mut chunks = Vec::new();
         let sink = (emission == Emission::AsDeclared).then(|| (unit.name.as_str(), &mut chunks));
         let (javascript, assets, _sources) =
-            compile_unit(unit, *platform, debug, false, None, sink)?;
+            compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink)?;
         let output = artifact_path(&dist, &unit.name, *platform);
-        write_assets(&output, &assets);
+        let styles = write_assets(&output, &assets);
         // Unconditional: this is also where a previous build's chunks are swept
-        // when this one wrote none.
-        write_chunks(&output, &chunks)?;
+        // when this one wrote none, and where a browser leg's build manifest is
+        // written whether it split or not (`fullstack-dx.md` §10.3).
+        write_chunks(
+            &output,
+            &chunks,
+            styles.as_deref(),
+            matches!(platform, Platform::Browser),
+        )?;
         if let Err(error) = fs::write(&output, javascript) {
             eprintln!(
                 "{} cannot write {}: {error}",
@@ -1915,7 +1973,16 @@ fn build_workspace_artifacts(
 fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> ExitCode {
     let mut ok = true;
     for (unit, platform) in members {
-        ok &= compile_unit(unit, *platform, debug, false, None, None).is_ok();
+        ok &= compile_unit(
+            unit,
+            *platform,
+            CompileGoal::Check,
+            debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok();
     }
     if ok {
         ExitCode::SUCCESS
@@ -2169,6 +2236,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         file,
         &pkg_root,
         Platform::default(),
+        CompileGoal::Emit,
         &options,
         &workspace,
         false,
@@ -2262,29 +2330,68 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
 /// Writes the build's accumulated assets (const-eval.md §3) beside the
 /// compiled output: `<output>.css` for kind "css", deduplicated and
 /// deterministically ordered by `assemble_assets`.
-fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
+///
+/// Returns the STYLE SIDECAR's file name when this build emitted one — the
+/// `styles` field of the leg's build manifest ([`write_chunks`]). A leg with no
+/// `const style()` collects no `css` entry and so writes no file, and that
+/// absence is the fact a shell cannot see today (`fullstack-dx.md` §5.2, F1/F2):
+/// the manifest states it positively instead of leaving a server to probe the
+/// filesystem for it.
+fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) -> Option<String> {
+    let mut styles = None;
     for (kind, content) in vilan_core::const_eval::assemble_assets(assets) {
         let path = output_js.with_extension(kind.as_str());
+        let is_styles = kind.as_str() == "css" && !content.is_empty();
         if let Err(error) = fs::write(&path, content) {
             eprintln!(
                 "{} cannot write {}: {error}",
                 paint::error_prefix(),
                 path.display()
             );
-        } else {
-            println!(
-                "{}  {}",
-                paint::out(paint::Style::GREEN, "Emitted"),
-                paint::out(paint::Style::BOLD, &path.display().to_string())
-            );
+            continue;
+        }
+        println!(
+            "{}  {}",
+            paint::out(paint::Style::GREEN, "Emitted"),
+            paint::out(paint::Style::BOLD, &path.display().to_string())
+        );
+        if is_styles {
+            styles = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
         }
     }
+    styles
 }
 
-/// Writes a split leg's route chunks beside its bundle, plus the
-/// `<leg>.chunks.json` sidecar listing every artifact — the manifest a
-/// hand-written server iterates instead of hard-coding one route per file
-/// (`bundle-splitting.md` §3, adopted by the fullstack example in S4).
+/// Writes a browser leg's BUILD MANIFEST — `<leg>.chunks.json` — plus the route
+/// chunks it describes, when the leg split.
+///
+/// The sidecar started as a list of chunk files a hand-written server could
+/// iterate instead of hard-coding one route per file (`bundle-splitting.md` §3).
+/// `fullstack-dx.md` §10.3 (RATIFIED 2026-08-11) made it the leg's build
+/// manifest — *what this leg's build emitted*, the value `std::build::build_of`
+/// reads and `serve_build` serves — which means it is written on EVERY build of
+/// a browser leg, chunks or none, carrying:
+///
+/// - `leg` / `entry` — the leg's name and its eager bundle's file name;
+/// - `styles` — the style sidecar's file name, or `null` when the leg compiled
+///   no styles (F1/F2: the fact a shell cannot see and a `fs::exists` probe
+///   cannot check in both directions);
+/// - `classic_script` — whether the bundle must be loaded as a classic script,
+///   true exactly when the leg split, because chunk resolution reads
+///   `document.currentScript` (§3.5);
+/// - `chunks` — the route chunks, `[]` for a leg that does not split.
+///
+/// That reverses `bundle-splitting.md` §9's "dropping `split` takes the manifest
+/// with it", and STRENGTHENS its invariant rather than weakening it: the
+/// invariant is *the leg's last build owns the file*, and a present-but-empty
+/// chunk list is a positive statement where an absent file is an ambiguity
+/// between "did not split" and "was never built" (§5.9). `build_of` needs that
+/// difference — a leg that was never built is a named error, not an empty build.
+///
+/// A NODE leg writes none: the manifest describes what a browser loads, and
+/// `classic_script` has no meaning off the browser.
 ///
 /// Chunk names are `<leg>.<arm>.js`, and a leg name is a manifest-checked
 /// identifier (no `.`), so a chunk can never collide with another leg's
@@ -2300,12 +2407,17 @@ fn write_assets(output_js: &std::path::Path, assets: &[(String, String)]) {
 /// files lying beside it. They would be inert (a whole bundle names no chunk)
 /// but a `chunks.json` that outlived its chunks is a manifest that lies, and a
 /// server iterating it would serve code the bundle no longer knows about.
-fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<(), ExitCode> {
+fn write_chunks(
+    output_js: &std::path::Path,
+    chunks: &[EmittedChunk],
+    styles: Option<&str>,
+    is_browser: bool,
+) -> Result<(), ExitCode> {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
-    sweep_stale_chunks(output_js, chunks);
-    if chunks.is_empty() {
-        return Ok(());
-    }
+    // The manifest this build is about to write is not stale; one left by a
+    // build that wrote a manifest where this one will not (a leg retargeted off
+    // the browser) is, and the sweep takes it.
+    sweep_stale_chunks(output_js, chunks, is_browser);
     for chunk in chunks {
         let path = directory.join(&chunk.file);
         if let Err(error) = fs::write(&path, &chunk.source) {
@@ -2323,25 +2435,44 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
             chunk.arm
         );
     }
+    if !is_browser {
+        return Ok(());
+    }
+    let leg = output_js
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let entry = output_js
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let listing = chunks
-        .iter()
-        .map(|chunk| {
-            format!(
-                "\t\t{{ \"arm\": {}, \"tag\": {}, \"file\": {} }}",
-                json_string(&chunk.arm),
-                chunk.tag,
-                json_string(&chunk.file)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",\n");
+    let listing = if chunks.is_empty() {
+        "[]".to_string()
+    } else {
+        let rows = chunks
+            .iter()
+            .map(|chunk| {
+                format!(
+                    "\t\t{{ \"arm\": {}, \"tag\": {}, \"file\": {} }}",
+                    json_string(&chunk.arm),
+                    chunk.tag,
+                    json_string(&chunk.file)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{rows}\n\t]")
+    };
     let manifest = format!(
-        "{{\n\t\"entry\": {},\n\t\"chunks\": [\n{listing}\n\t]\n}}\n",
-        json_string(&entry)
+        "{{\n\t\"leg\": {},\n\t\"entry\": {},\n\t\"styles\": {},\n\t\"classic_script\": {},\n\t\"chunks\": {listing}\n}}\n",
+        json_string(&leg),
+        json_string(&entry),
+        styles.map_or_else(|| "null".to_string(), json_string),
+        // A split leg's chunk `import()` resolves against
+        // `document.currentScript`, which is `null` in a module script — so a
+        // leg that split must be loaded by a classic `<script>` and a leg that
+        // did not may be loaded either way (`fullstack-dx.md` §3.5, F6).
+        !chunks.is_empty(),
     );
     let manifest_path = output_js.with_extension("chunks.json");
     if let Err(error) = fs::write(&manifest_path, manifest) {
@@ -2352,11 +2483,17 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
         );
         return Err(ExitCode::FAILURE);
     }
-    println!(
-        "{}    {}",
-        paint::out(paint::Style::GREEN, "Chunk"),
-        paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
-    );
+    // Announced only when it describes chunks: a non-splitting leg's manifest is
+    // as routine as its `.css` sidecar and says nothing a reader of a build log
+    // needs. (Byte-identical `vilan build` output for every project that has one
+    // today, which is every project.)
+    if !chunks.is_empty() {
+        println!(
+            "{}    {}",
+            paint::out(paint::Style::GREEN, "Chunk"),
+            paint::out(paint::Style::BOLD, &manifest_path.display().to_string())
+        );
+    }
     Ok(())
 }
 
@@ -2366,7 +2503,14 @@ fn write_chunks(output_js: &std::path::Path, chunks: &[EmittedChunk]) -> Result<
 /// leg owns all of it. A failed removal is reported and otherwise ignored: a
 /// stray is a tidiness problem, never a correctness one, and it must not fail a
 /// build that otherwise succeeded.
-fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk]) {
+///
+/// `writes_manifest` says whether the caller is about to write `<leg>.chunks.json`
+/// itself — true for every browser leg since `fullstack-dx.md` §10.3 made the
+/// sidecar the leg's build manifest. The manifest is swept only when this build
+/// will leave none, which is a leg retargeted off the browser: a manifest
+/// describing a bundle no browser loads is the same lie as one outliving its
+/// chunks.
+fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk], writes_manifest: bool) {
     let directory = output_js.parent().unwrap_or(std::path::Path::new("."));
     let Some(leg) = output_js.file_stem().map(|stem| stem.to_string_lossy()) else {
         return;
@@ -2388,7 +2532,7 @@ fn sweep_stale_chunks(output_js: &std::path::Path, wrote: &[EmittedChunk]) {
         if (!is_chunk && !is_manifest) || keep.contains(&name.as_str()) {
             continue;
         }
-        if is_manifest && !wrote.is_empty() {
+        if is_manifest && writes_manifest {
             continue;
         }
         if let Err(error) = fs::remove_file(entry.path()) {
@@ -2433,6 +2577,7 @@ fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
     platform: Platform,
+    goal: CompileGoal,
     options: &BuildOptions,
     workspace: &Workspace,
     emit_debug: bool,
@@ -2508,17 +2653,24 @@ fn compile_to_js(
     let mut overlay_diagnostics: Vec<hmr::OverlayDiagnostic> = Vec::new();
 
     // On a cache miss the handwritten frontend parses the entry, always returning
-    // a (possibly recovered) tree alongside every diagnostic. A batch compile does
-    // not analyze a file that failed to parse cleanly — its parse errors are
-    // reported and the build fails — so the freshly parsed tree is taken only when
-    // the parse produced no diagnostics.
+    // a (possibly recovered) tree alongside every diagnostic.
+    //
+    // `build` does not analyze a file that failed to parse cleanly — its parse
+    // errors are reported and the build fails — so the freshly parsed tree is
+    // taken only when the parse produced no diagnostics. `check` DOES analyze it
+    // (`editing-dx.md` S6/§13.1): its whole job is to answer questions about a
+    // file the user is still writing, and dropping the tree meant one missing `;`
+    // anywhere blinded it to everything else in the file (§2.2 mechanism 1,
+    // measured as P29). The tree is the same one `analyze_source` has handed the
+    // language server since the H6 cutover, now that S1's synchronizer makes it
+    // cover the whole file rather than the prefix before the first syntax error.
     let mut parse_errors: Vec<vilan_core::parsing::ParseError> = Vec::new();
     let fresh_root: Option<vilan_core::Spanned<vilan_core::node::NodeList>> = match &cached {
         None => {
             let (tree, errors) = vilan_core::parsing::parse(src.as_str());
-            let clean = errors.is_empty();
+            let analyzable = errors.is_empty() || goal == CompileGoal::Check;
             parse_errors = errors;
-            tree.filter(|_| clean).map(|(mut items, span)| {
+            tree.filter(|_| analyzable).map(|(mut items, span)| {
                 // Elements desugar, then bare-`?` marks become lift regions,
                 // before analysis (element-syntax.md §4, expression-lifting.md);
                 // the cached path gets both inside `parse_clean_cached`, so
@@ -2643,7 +2795,12 @@ fn compile_to_js(
             );
         }
 
-        if analyzer_errors.is_empty() && noted_errors == 0 {
+        // Never emit from a recovered tree — `check` reaches here with one, and
+        // codegen over a tree with statements missing would describe a program
+        // nobody wrote. (`clean` below already refuses to RETURN the output; this
+        // is what stops it being produced, and with it every transformer panic a
+        // salvaged tree could provoke.)
+        if analyzer_errors.is_empty() && noted_errors == 0 && parse_errors.is_empty() {
             // `--print-chunks` (bundle-splitting.md S1): report what a split
             // build would chunk. Analysis-only — the emitted JavaScript below
             // is untouched — and gated on a clean analysis, so a failing build
@@ -2807,10 +2964,46 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// round's kill takes the program's whole process tree, and the CLI's own death
 /// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
 fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
+    spawn_node_with_env(script, args, cwd, &[])
+}
+
+/// The environment variable a `--watch` session sets on its Node child, and the
+/// whole of `std::watch::is_watching()`'s plumbing (`dev-refresh.md` §1, and
+/// §5 item 2's thin surface): no wire protocol, no socket, nothing that can
+/// fail independently of the process actually starting, and nothing to clean up
+/// after a crashed watcher. `is_watching()` is defined under every run and is
+/// `true` only when this is set.
+const WATCHING_ENV: &str = "VILAN_WATCHING";
+
+/// [`spawn_node`] for a child a `--watch` session owns — [`WATCHING_ENV`], plus
+/// whatever `extra` the round carries (the HMR round adds `VILAN_HMR_PORT`,
+/// `dev-refresh.md` §5 item 2 — the plain restart loop adds nothing). Both
+/// watch paths go through it; plain `vilan run` does not, which is what makes
+/// `is_watching()` answer the question it is named for.
+fn spawn_watched_node(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    extra: &[(&str, String)],
+) -> std::io::Result<ManagedChild> {
+    let mut env: Vec<(&str, String)> = vec![(WATCHING_ENV, "1".to_string())];
+    env.extend(extra.iter().map(|(name, value)| (*name, value.clone())));
+    spawn_node_with_env(script, args, cwd, &env)
+}
+
+fn spawn_node_with_env(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(&str, String)],
+) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
     command.arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    for (name, value) in env {
+        command.env(name, value);
     }
     command.spawn().map(ManagedChild::adopt)
 }
@@ -3345,7 +3538,15 @@ mod tests {
         assert_eq!(snippet(multibyte, &(5..7)), "");
         // Past the end — a span from a longer file.
         assert_eq!(snippet(multibyte, &(400..420)), "");
-        // Inverted — never produced, never sliced either.
-        assert_eq!(snippet(multibyte, &(6..4)), "");
+        // Inverted — never produced, never sliced either. The range is
+        // DELIBERATELY reversed (this pins that `snippet` tolerates one, not
+        // that anyone would write `6..4` by accident), so clippy's "probably a
+        // mistake" lint is silenced for this one assertion rather than fixed
+        // away. (The allow needs its own block: clippy ignores an attribute
+        // placed directly on a macro-invocation statement.)
+        #[allow(clippy::reversed_empty_ranges)]
+        {
+            assert_eq!(snippet(multibyte, &(6..4)), "");
+        }
     }
 }

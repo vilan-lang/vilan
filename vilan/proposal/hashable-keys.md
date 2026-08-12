@@ -65,6 +65,19 @@ Keeping `Hash` opaque (not a plain `struct Hash { key: str }`) seals the
 representation: callers can't peek at or depend on the internal string, so it
 stays the swap seam (§5).
 
+**How the `PartialEq` impl is written (cycle 14).** The bullet shipped as a
+paper claim: `impl Hash with PartialEq` did not exist, and `==` on a `Hash`
+reported "type 'Hash' does not implement the `PartialEq` operator". Writing the
+obvious body is a trap — `self == b` on a non-native type dispatches back into
+the very impl being defined, and the emitted `function eq(self, b) { return
+eq(self, b); }` compiles clean and blows the stack at runtime. The body calls a
+`hashes_equal` intrinsic (`a === b`, no helper) instead. `Hash` is deliberately
+NOT added to the compiler's native-operator list, which is the other way to
+break the recursion: that predicate governs *every* operator, so an opaque key
+would silently accept `<` and `-` — emitting a lexicographic compare of the
+canonical JSON, or `NaN` — where it reports a missing `PartialOrd` today.
+Equality is the whole of a `Hash`'s operator surface, per §9's "no ordering".
+
 ### 3.3 The uniform hasher
 
 One builtin does the work for every stock impl:
@@ -215,3 +228,42 @@ struct with a non-`Hashable` field fails the derive naming the field; primitive
   keys) — documented, not special-cased.
 - **`Hash` ordering / persistence** — `Hash` is an in-memory keying value, not a
   stable serialization format; no cross-run stability is promised.
+
+## 10. Enum keys, settled (cycle 13)
+
+§3.4 gave structs and enums one route to `Hashable` — `[derive(Hashable)]`
+— and that is still the route for every aggregate. A **bare-lowered** enum
+is now the exception, and it is an exception to the *aggregate* premise
+rather than to the derive rule: it is not an aggregate. `enum Align {
+Start = "flex-start" }` lowers to the plain JS string, which §3.3's
+`__hash` returns unchanged, so it was already a §3.4 "primitive" in every
+respect except that no impl said so. One is now synthesized by the compiler
+beside the enum's `value()`/`parse()`, off the same `= "flex-start"`
+opt-in. See `backed-enums.md` §9 for the mechanism, the rejected
+alternatives, and the collision rules.
+
+Three boundaries this does NOT move, all pinned:
+
+- **An unbacked enum** (`enum Plain { A, B }`) keeps the tagged-array
+  lowering, so it is exactly §1's by-reference hazard and keeps needing the
+  derive. `Hashable` tracks the lowering, not "is an enum".
+- **A payload-carrying enum** is refused at the key with §3.5's ordinary
+  bound diagnostic — not a runtime surprise — and admitted only by the
+  derive, whose all-fields check is unchanged.
+- **A resource** is still not a key, however it lowers.
+
+§9's deferred tails are untouched: tuple keys, a real native hash table,
+and identity keys all stay out.
+
+Two items for this paper's own ledger, found while pinning the above:
+
+- **§3.2's `impl Hash with PartialEq` did not ship.** `k.hash() ==
+  k.hash()` is "type 'Hash' does not implement the `PartialEq` operator",
+  though §3.2 specifies the impl and §8's test plan asks for the pin. The
+  enum-key coherence pins route around it through a `Map<Hash, V>`, which
+  observes the keying rather than an operator, but the gap is real.
+- **§3.4's tuple / `List` blanket shipped only half.** `List<T: Hashable>`
+  and `Option<T: Hashable>` exist in `std/hash.vl`; the tuple impl does
+  not, and `map.vl`/`set.vl` still advertised "a struct/enum/**tuple** key
+  works". Those two comments are corrected to the shipped rule; the tuple
+  tail itself remains deferred (backlog).

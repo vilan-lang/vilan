@@ -16,21 +16,12 @@ function __try_parse_json(text) {
 		return [ 1 ];
 	}
 }
-function is_number(self) {
-	return __json_kind(self) === "number";
-}
-function is_string(self) {
-	return __json_kind(self) === "string";
-}
-function is_array(self) {
-	return __json_kind(self) === "array";
-}
 function has_field(self, name) {
 	return Object.hasOwn(self, name);
 }
 function from_json_value(value) {
 	let $B = null;
-	if (is_string(value)) {
+	if (__json_kind(value) === "string") {
 		$B = [ 0, String(value) ];
 	} else {
 		$B = [ 1, "expected a string" ];
@@ -39,7 +30,7 @@ function from_json_value(value) {
 }
 function from_json_value2(value) {
 	let $f = null;
-	if (is_number(value)) {
+	if (__json_kind(value) === "number") {
 		$f = [ 0, Number(value) ];
 	} else {
 		$f = [ 1, "expected a number" ];
@@ -88,7 +79,7 @@ function from_json_value3(value) {
 }
 function $d(value) {
 	let $e = null;
-	if (!(is_array(value))) {
+	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
 	$e;
@@ -173,7 +164,7 @@ function $u(self, err) {
 }
 function $D(value) {
 	let $E = null;
-	if (!(is_array(value))) {
+	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
 	$E;
@@ -225,7 +216,7 @@ function $N(self) {
 }
 function $T(value) {
 	let $U = null;
-	if (!(is_array(value))) {
+	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
 	$U;

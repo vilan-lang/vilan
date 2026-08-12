@@ -338,9 +338,6 @@ struct Mapped {
     /// `T | null` returns, and burying 6.5k real TODOs under them would defeat
     /// the point of marking anything.
     notes: Vec<String>,
-    /// The string-literal-union enum this parameter really wants, when the
-    /// mapped text is the raw `str` standing in for it (§3.3).
-    string_enum: Option<String>,
 }
 
 impl Mapped {
@@ -350,7 +347,6 @@ impl Mapped {
             todos: Vec::new(),
             is_async: false,
             notes: Vec::new(),
-            string_enum: None,
         }
     }
 
@@ -360,7 +356,6 @@ impl Mapped {
             todos: vec![todo.into()],
             is_async: false,
             notes: Vec::new(),
-            string_enum: None,
         }
     }
 }
@@ -419,11 +414,6 @@ struct Emitter<'options> {
     nominal: HashSet<String>,
     /// String-literal-union aliases, by name.
     string_enums: HashMap<String, StringEnum>,
-    /// Byte offset just past the header, where the `Option` import is inserted
-    /// when a `parse` forwarder needs it.
-    header_end: usize,
-    /// Whether any `Enum::parse` forwarder was emitted (§4.1).
-    needs_option: bool,
     /// The constructor idiom (E37(a)), keyed by the type the constructor
     /// yields. A `Vec` because two globals can construct one type —
     /// `HTMLImageElement` has both its own `declare var` and `Image`'s.
@@ -460,8 +450,6 @@ impl<'options> Emitter<'options> {
             declared: HashSet::new(),
             nominal: HashSet::new(),
             string_enums: HashMap::new(),
-            header_end: 0,
-            needs_option: false,
             constructor_globals: HashMap::new(),
             constructor_global_subjects: BTreeMap::new(),
             transparent_aliases: HashMap::new(),
@@ -848,21 +836,13 @@ impl<'options> Emitter<'options> {
              // `undefined` binds as the BARE type, and the absence is yours to guard.\n\
              // Each such binding carries a `///` note saying so.\n\n",
         );
-        self.header_end = self.out.len();
     }
 
+    /// The generated file, as emitted. Bindgen writes NO bodies now that both
+    /// directions of a closed string set bind the enum itself (§4.1, §9), so
+    /// there is nothing left that needs an import the header did not write.
     fn finish(self) -> String {
-        // A `parse` forwarder returns `Option<Enum>` (§4.1), so the file needs
-        // `Option` in scope. Inserted after the header rather than written into
-        // it, because whether any forwarder was generated is only known once
-        // every declaration has been emitted — and an unused import in a
-        // generated file is noise a reader has to explain away.
-        if !self.needs_option {
-            return self.out;
-        }
-        let mut out = self.out;
-        out.insert_str(self.header_end, "import std::option::Option;\n\n");
-        out
+        self.out
     }
 
     // --- Declarations -----------------------------------------------------
@@ -926,7 +906,9 @@ impl<'options> Emitter<'options> {
                 out,
                 "/// `{}` — the closed string set `{}`.\n\
                  /// A backed enum: each variant IS the host string it names, so it crosses\n\
-                 /// the boundary unchanged. `parse` guards the return direction.",
+                 /// the boundary unchanged, in both directions. A host value outside the set\n\
+                 /// panics at the first `match`; bind `str` and use `parse` instead where\n\
+                 /// such a value is expected rather than a bug.",
                 alias.name,
                 string_enum
                     .variants
@@ -1171,19 +1153,14 @@ impl<'options> Emitter<'options> {
             // nothing to fall back to here.
             let signature = first.clone();
             let binding = format!("[extern(new, \"{}\")]", global.global);
-            let mut extra = Vec::new();
-            let mut text = self.emit_function(
+            let text = self.emit_function(
                 &global.global,
                 &name,
                 &signature,
                 &binding,
                 None,
                 &overloads,
-                &mut extra,
             );
-            for line in extra {
-                text.push_str(&line);
-            }
             self.coverage.members += global.constructors.len();
             self.coverage.members_bound += global.constructors.len();
             let _ = writeln!(
@@ -1328,19 +1305,14 @@ impl<'options> Emitter<'options> {
             .map(|parameter| parameter.name.clone())
             .collect();
         let binding = format!("[extern(\"{}\")]", signature.name);
-        let mut extra = Vec::new();
-        let mut text = self.emit_function(
+        let text = self.emit_function(
             "",
             &to_snake_case(&signature.name),
             signature,
             &binding,
             None,
             overloads,
-            &mut extra,
         );
-        for line in extra {
-            text.push_str(&line);
-        }
         self.scope.clear();
         format!("{text}\n")
     }
@@ -1395,7 +1367,6 @@ impl<'options> Emitter<'options> {
                 }
                 let binding = format!("[extern(new, \"{owner}\")]");
                 let name = unique_name("new", names);
-                let mut extra = Vec::new();
                 // A TS `constructor(…)` declares no return type; `new Foo(…)`
                 // obviously yields a `Foo<…>`, and the binding has to say so.
                 // The class's own type parameters are in scope here.
@@ -1414,12 +1385,7 @@ impl<'options> Emitter<'options> {
                     }),
                     ..signature.clone()
                 };
-                let mut text = self.emit_function(
-                    owner, &name, &signature, &binding, None, overloads, &mut extra,
-                );
-                for line in extra {
-                    text.push_str(&line);
-                }
+                let text = self.emit_function(owner, &name, &signature, &binding, None, overloads);
                 Rendered::bound(indent(&text))
             }
             Member::Call(signature) => {
@@ -1497,22 +1463,13 @@ impl<'options> Emitter<'options> {
             ));
         };
         let context = format!("{owner}{}", to_pascal_case(&property.name));
+        // §8.4's "properties keep their TODO" is closed by the same stroke.
+        // A property is read AND written through separate externs, and the
+        // reason one bound type could not serve both was that the two
+        // directions wanted different types — the enum to write, the raw `str`
+        // plus `parse` to read. They want the same type now, so the property
+        // binds the enum in both directions with nothing to say about it.
         let mut mapped = self.map_type(declared, Position::Return, &context);
-        if let Some(enum_name) = mapped.string_enum.take() {
-            // A property is read AND written through separate externs, in
-            // opposite directions: the setter could take the backed enum
-            // outright, while the getter is §7.2's deferred case and needs the
-            // raw `str` plus `parse`. Binding one type for both is what the
-            // property emitter does, so the raw `str` is bound and named —
-            // `Enum::parse` is now the spelling for the read side, which is
-            // what this TODO could not say before backed enums existed.
-            self.coverage.note_todo("string-literal union property");
-            mapped.todos.push(format!(
-                "property `{}` is the closed string set `{enum_name}` — the raw `str` is bound; \
-                 read it with `{enum_name}::parse(..)`, and write `{enum_name}::Variant.value()`",
-                property.name
-            ));
-        }
         if property.optional {
             mapped = self.note_absence(mapped, &format!("Property `{}`", property.name));
         }
@@ -1581,13 +1538,7 @@ impl<'options> Emitter<'options> {
         };
         let receiver = (!method.is_static).then_some("self");
         let name = unique_name(&escape_reserved(&to_snake_case(&signature.name)), names);
-        let mut extra = Vec::new();
-        let mut text = self.emit_function(
-            owner, &name, signature, &binding, receiver, overloads, &mut extra,
-        );
-        for line in extra {
-            text.push_str(&line);
-        }
+        let text = self.emit_function(owner, &name, signature, &binding, receiver, overloads);
         Rendered::bound(indent(&text))
     }
 
@@ -1603,7 +1554,6 @@ impl<'options> Emitter<'options> {
         binding: &str,
         receiver: Option<&str>,
         overloads: &[Signature],
-        extra: &mut Vec<String>,
     ) -> String {
         let outer_scope = self.scope.clone();
         for parameter in &signature.generics {
@@ -1620,19 +1570,18 @@ impl<'options> Emitter<'options> {
         }
 
         // A closed string set in RETURN position is what §4.1's biggest win is
-        // about: it used to be a TODO — 375 of them on `lib.dom.d.ts` — because
-        // there was no spelling for string -> variant. `Enum::parse` is that
-        // spelling, so the extern binds the raw `str` (§7.2 is deferred: an
-        // extern may not RETURN a backed enum) and a one-line forwarder guards
-        // it into `Option<Enum>`.
-        let (return_text, return_string_enum, is_async) = match &signature.return_type {
+        // about: it used to be a TODO — 375 of them on `lib.dom.d.ts` —
+        // because there was no spelling for string -> variant. It is now the
+        // enum itself, with no forwarder and no wrapper, because §9's trap arm
+        // made the direct return safe to generate.
+        let (return_text, is_async) = match &signature.return_type {
             Some(declared) => {
                 let mapped = self.map_type(declared, Position::Return, &context);
                 todos.extend(mapped.todos.iter().cloned());
                 notes.extend(mapped.notes.iter().cloned());
-                (mapped.text, mapped.string_enum, mapped.is_async)
+                (mapped.text, mapped.is_async)
             }
-            None => ("void".to_string(), None, false),
+            None => ("void".to_string(), false),
         };
 
         let mut out = String::new();
@@ -1687,10 +1636,8 @@ impl<'options> Emitter<'options> {
                 receiver,
                 &parameters[..required],
                 &return_text,
-                return_string_enum.as_deref(),
                 is_async,
                 &own_generics,
-                extra,
             ));
             let suffix: Vec<String> = parameters[required..]
                 .iter()
@@ -1713,10 +1660,8 @@ impl<'options> Emitter<'options> {
                 receiver,
                 &parameters,
                 &return_text,
-                return_string_enum.as_deref(),
                 is_async,
                 &own_generics,
-                extra,
             ));
         } else {
             out.push_str(&self.emit_one_binding(
@@ -1725,10 +1670,8 @@ impl<'options> Emitter<'options> {
                 receiver,
                 &parameters,
                 &return_text,
-                return_string_enum.as_deref(),
                 is_async,
                 &own_generics,
-                extra,
             ));
         }
 
@@ -1736,20 +1679,24 @@ impl<'options> Emitter<'options> {
         out
     }
 
-    /// One `external fun`, plus the `parse` forwarder when the RETURN type is a
-    /// closed string set (§4.1). Split out because an optional parameter
-    /// produces more than one binding of the same host symbol.
+    /// One `external fun`. Split out because an optional parameter produces
+    /// more than one binding of the same host symbol.
     ///
-    /// The parameter direction has no wrapper: a backed enum IS the host string
-    /// at runtime, so the extern takes the enum and the arm block that used to
-    /// translate it — emitted per parameter, per binding — is gone.
+    /// NEITHER direction has a wrapper: a backed enum IS the host string at
+    /// runtime, so the extern takes the enum and returns the enum, and bindgen
+    /// is back to emitting signatures only — §3.3's own summary of the wrapper
+    /// as "real generated logic beyond a bare declaration, which is new
+    /// territory for bindgen relative to every other row in this table",
+    /// resolved the way it wanted to resolve.
     ///
-    /// The return direction keeps a boundary, and deliberately: §7.2 is
-    /// DEFERRED, so an `external fun` may not return a backed enum. The host may
-    /// answer outside the set, and an exhaustive `match` has no trap arm to
-    /// catch it with. So the extern binds the raw `str` and the forwarder is
-    /// `Enum::parse`, which answers `None` — the 375 `lib.dom.d.ts` getters that
-    /// bindgen used to give up on with a TODO become real bindings.
+    /// The return direction reached that shape a cycle later than the
+    /// parameter direction. It used to bind the raw `str` and forward through
+    /// `Enum::parse`, because §7.2's deferral was in force and a host value
+    /// outside the set would otherwise become whichever variant sorted last.
+    /// §9's trap arm guards that at the `match`, so the generator no longer
+    /// has to guard it at the boundary — and `Enum::parse` remains the shape
+    /// to hand-edit toward when a value outside the set is an expected input
+    /// rather than a bug.
     #[allow(clippy::too_many_arguments)]
     fn emit_one_binding(
         &mut self,
@@ -1758,58 +1705,18 @@ impl<'options> Emitter<'options> {
         receiver: Option<&str>,
         parameters: &[RenderedParameter],
         return_text: &str,
-        return_string_enum: Option<&str>,
         is_async: bool,
         own_generics: &str,
-        extra: &mut Vec<String>,
     ) -> String {
-        let raw_name = match return_string_enum {
-            Some(_) => format!("{name}_raw"),
-            None => name.to_string(),
-        };
-
         let mut out = String::new();
         let _ = writeln!(out, "{binding}");
-        if return_string_enum.is_some() {
-            out.push_str("[doc(hidden)]\n");
-        }
         let _ = writeln!(out, "[platform(\"{}\")]", self.options.platform);
         let signature_parameters = render_parameters(receiver, parameters);
         let _ = writeln!(
             out,
-            "{}external fun {raw_name}{own_generics}({signature_parameters}): {return_text};\n",
+            "{}external fun {name}{own_generics}({signature_parameters}): {return_text};\n",
             if is_async { "async " } else { "" }
         );
-
-        if let Some(enum_name) = return_string_enum {
-            self.needs_option = true;
-            let enum_name = escape_reserved(enum_name);
-            let mut forwarder = String::new();
-            let _ = writeln!(
-                forwarder,
-                "/// `{name}` — `{raw_name}` guarded by `{enum_name}::parse`: the host may answer\n\
-                 /// outside the set, which is `None`."
-            );
-            let _ = writeln!(
-                forwarder,
-                "{}fun {name}{own_generics}({signature_parameters}): Option<{enum_name}> {{",
-                if is_async { "async " } else { "" }
-            );
-            let call_receiver = if receiver.is_some() { "self." } else { "" };
-            let arguments: Vec<String> = parameters
-                .iter()
-                .map(|parameter| parameter.name.clone())
-                .collect();
-            let call = format!("{call_receiver}{raw_name}({})", arguments.join(", "));
-            let call = if is_async {
-                format!("await {call}")
-            } else {
-                call
-            };
-            let _ = writeln!(forwarder, "\t{enum_name}::parse({call})");
-            forwarder.push_str("}\n\n");
-            extra.push(forwarder);
-        }
         out
     }
 
@@ -1889,7 +1796,6 @@ impl<'options> Emitter<'options> {
             todos: mapped.todos,
             notes,
             is_async: mapped.is_async,
-            string_enum: mapped.string_enum,
         }
     }
 
@@ -1907,7 +1813,6 @@ impl<'options> Emitter<'options> {
                     todos: element.todos,
                     is_async: false,
                     notes: Vec::new(),
-                    string_enum: None,
                 }
             }
             TsType::Tuple(elements) => {
@@ -1937,7 +1842,6 @@ impl<'options> Emitter<'options> {
                     todos,
                     notes,
                     is_async: false,
-                    string_enum: None,
                 }
             }
             TsType::Union(members) => self.map_union(members, position, context),
@@ -2031,7 +1935,6 @@ impl<'options> Emitter<'options> {
                     todos: element.todos,
                     is_async: false,
                     notes: Vec::new(),
-                    string_enum: None,
                 };
             }
             "Promise" | "PromiseLike" => {
@@ -2100,30 +2003,17 @@ impl<'options> Emitter<'options> {
         }
         if self.string_enums.contains_key(name) {
             // A backed enum IS the host string, so it crosses the boundary
-            // unchanged: a PARAMETER is typed as the enum, with no wrapper
-            // (`proposal/backed-enums.md` §4.1).
+            // unchanged and the mapping needs no direction at all: parameter,
+            // return, closure parameter, `List<..>` element — every position
+            // is the enum (`proposal/backed-enums.md` §4.1, completed by §9).
             //
-            // A RETURN stays the raw `str`, and that is §7.2's deferral rather
-            // than a limitation of the mapping: the host may answer outside the
-            // set, and an exhaustive `match` has no trap arm to catch it with.
-            // The caller pairs the raw extern with an `Enum::parse` forwarder,
-            // which is where the honest `None` comes from. `string_enum` says
-            // which enum, for exactly that.
-            //
-            // NESTED is the raw `str` too, conservatively: a closed set inside
-            // `List<..>` or a closure parameter has no forwarder position, and
-            // the direction it travels is not knowable here.
-            let enum_name = name.to_string();
-            return Mapped {
-                text: match position {
-                    Position::Parameter => escape_reserved(name),
-                    Position::Return | Position::Nested => "str".to_string(),
-                },
-                todos: Vec::new(),
-                is_async: false,
-                notes: Vec::new(),
-                string_enum: Some(enum_name),
-            };
+            // The return direction used to be the raw `str` plus an
+            // `Enum::parse` forwarder, and that was §7.2's deferral rather
+            // than a fact about the mapping: a host value outside the set
+            // silently became whichever variant sorted last, so the boundary
+            // had to be guarded HERE. §9's trap arm guards it at the `match`
+            // instead, which is a place bindgen does not have to find.
+            return Mapped::plain(escape_reserved(name));
         }
         if self.declared.contains(name) {
             let mut todos = Vec::new();
@@ -2145,7 +2035,6 @@ impl<'options> Emitter<'options> {
                 todos,
                 notes,
                 is_async: false,
-                string_enum: None,
             };
         }
         if let Some((parameters, value)) = self.transparent_aliases.get(name).cloned() {
@@ -2282,7 +2171,6 @@ impl<'options> Emitter<'options> {
             todos,
             notes,
             is_async: false,
-            string_enum: None,
         }
     }
 

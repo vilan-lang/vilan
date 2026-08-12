@@ -50,44 +50,60 @@ fun main() {
 }
 ```
 
-## On the server: render and splice
+## On the server: render into the document
 
-The server reads the client bundle and an HTML shell from disk, then serves. The
-shell has a marker where the app goes; the handler replaces it with the render.
-The splice is plain user code (one `str::replace`, no framework):
+The server serves the client leg's build and an HTML shell. `require_shell`
+reads that shell and checks it against the build ([the
+reference](../std/process.md#stddocument)); `render(view)` puts the markup
+*inside the mount element* — the same `<div id="app">` the client mounts into:
 
 ```vilan,norun
-import std::fs;
+import std::build::require_build;
+import std::document::require_shell;
 import std::http::{ Server, Request, Response };
-import std::ui::{ view, View, render };
+import std::ui::{ view, View };
 
 fun app(): View {
 	view("main").child(view("h1").text("Tasks"))
 }
 
-fun main() {
-	let client_js = fs::read_file_to_str("dist/client.js");
-	let shell = fs::read_file_to_str("src/app.html");
+async fun main() {
+	let build = require_build("client");
+	let page = require_shell("src/app.html", build);
 	Server::builder()
 		.port(8791)
-		.on_request(|request| {
-			match request.path() {
-				"/client.js" => Response::builder().set_header("Content-Type", "text/javascript").body(client_js).build(),
-				// Create, serialize, discard: a fresh render per request, spliced
-				// into the shell. No effects, no subscriptions survive the response.
-				_ => Response::builder().set_header("Content-Type", "text/html").body(shell.replace("<!--ssr-->", render(app()))).build(),
-			}
-		})
+		.serve_build(build)
+		// Create, serialize, discard: a fresh render per request, into a copy
+		// of the document. No effects, no subscriptions survive the response.
+		.on_request(|request| Response::builder().set_header("Content-Type", "text/html").body(page.render(app()).html()).build())
 		.build()
 		.start();
 }
 ```
 
-The shell puts the marker inside the mount point:
+`serve_build` installs the client leg's artifacts — here just `/client.js` —
+in front of `on_request`, so the handler is only ever asked about the page.
+
+The shell needs no marker, only the mount point it already had:
 
 ```html
-<div id="app"><!--ssr--></div>
+<div id="app"></div>
 <script type="module" src="/client.js"></script>
+```
+
+There used to be a `<!--ssr-->` comment in there, replaced by hand with one
+`str::replace`. It is gone, and the reason is the reason this page's advice
+changed: the marker was a string literal in `.vl` that had to equal a string
+literal in `.html`, and a mismatch was a *silent no-op* — the client still
+rendered the page correctly, so the only observer of the bug was a crawler.
+The document knows where the mount element is, so there is nothing left to
+spell wrong.
+
+If you would rather not write the shell at all, `Document::of(build)` generates
+one from the build — the same value, the same `render`:
+
+```vilan,fragment
+let page = Document::of(build).title("Tasks").render(app()).html();
 ```
 
 ## On the client: mount replaces
@@ -169,5 +185,5 @@ script runs. Load it in a browser and the client boots and replaces it in place.
 To build the same thing from nothing instead, `vilan init my-app --template
 fullstack` gives you the one-package/two-entries scaffold this page assumes
 (see [Start a project](../tour/hello-vilan.md#start-a-project)); add the
-shared `app()` module, `render` on the server leg, and the `<!--ssr-->` marker
-in the shell, as above.
+shared `app()` module and `page.render(app())` on the server leg, as above —
+the scaffold's shell already carries the mount element the render lands in.

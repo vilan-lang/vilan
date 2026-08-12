@@ -3,6 +3,7 @@
 // `Hashable` turns a value into a `Hash` — an opaque canonical key. `Map` and
 // `Set` bound their key on it, and anyone can build their own container the
 // same way: bound on `K: Hashable`, call `key.hash()`, key a `Map<Hash, ..>`.
+import pkg::compare::PartialEq;
 import pkg::option::Option;
 
 /// An opaque canonical key. Its runtime form IS its key — a primitive as-is, an
@@ -20,9 +21,26 @@ trait Hashable {
 /// obligation is consistency with the equality the key is used under.
 external fun canonical_hash(value: any): Hash;
 
+/// Native `===` on the two canonical keys — the comparison `Hash`'s `PartialEq`
+/// is. `Hash` is opaque by design (§5 keeps the representation the swap seam),
+/// so the impl below has no comparable projection to reach for and no way to
+/// spell the comparison in vilan without dispatching back into itself.
+external fun hashes_equal(a: Hash, b: Hash): bool;
+
 impl Hash with Hashable {
 	fun hash(self): Hash {
 		self
+	}
+}
+
+/// Two hashes are equal exactly when their canonical keys are (§3.2): a `Hash`
+/// IS its key at runtime and that key is always a JS primitive, so the
+/// comparison is native `===`. This is what lets a caller compare two hashes,
+/// and what makes `Hash` satisfy a `T: PartialEq` bound — including the
+/// conditional impls, so `Option<Hash>` and `List<Hash>` compare too.
+impl Hash with PartialEq {
+	fun eq(self, b: Hash): bool {
+		hashes_equal(self, b)
 	}
 }
 

@@ -175,8 +175,23 @@ so callers await it regardless).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"match is not exhaustive: missing …"** · **"match is not exhaustive: add a catch-all `_` leg"**
-Some variants have no arm. Handle them or add `_ => …`. This error is
-the feature: it's what fires everywhere when you add a variant.
+Some values have no arm. Handle them or add `_ => …`. This error is
+the feature: it's what fires everywhere when you add a variant. A
+**guarded** leg does not count towards it — a guard tests the value, and
+the check reasons about the type — so `B if ready => …` leaves `B`
+missing, and a note points at the guard to say so. That also means the
+last leg may not be guarded: give it a `_ => …` after it, so the value
+the guard rejects has somewhere to go.
+
+The hole may be **below** the top level, and then the message names one
+uncovered value as a pattern that would cover it —
+*"missing `Pair::Of(Align::End)`"*, *"missing `Wrapped::Of(_)`"*,
+*"missing `(Align::End, Align::Start)`"*. Coverage is judged over the
+whole pattern tree: a payload or tuple element tested with a literal
+proves nothing about the values it does not equal, and only a binder or
+`_` covers an unbounded one. Where the hole is the subject's whole
+domain the message asks for a catch-all instead, since naming a value
+there would say nothing the `_` does not.
 → [Control flow](../tour/control-flow.md)
 
 **"struct '…' has no field '…'"** · **"variant '…' does not belong to the matched enum"**
@@ -365,6 +380,17 @@ A resource is not plain data: it cannot be sent over the wire, hashed by
 value, or compared by copy. Drop it from the derived type, or carry a
 plain-data handle (an id, a key) in its place.
 → [Resources](../tour/resources.md)
+
+**"`Wire` / `Json` cannot be derived for the resource struct / enum `…`: …"**
+The same rule with the resource in the other position — the derived type
+*is* the resource. Serializing it copies a handle out of its owner, and the
+reading half is worse: `Wire`'s `rebuild` and `Json`'s `from_json` build a
+value out of bytes, which for a resource is a second handle nothing owns
+and nothing will close. Send a plain-data name for the resource instead
+(an id, an `Arena` handle) and keep the resource on the side that owns it.
+The other derives are unaffected: `PartialEq` and `Debug` read a resource's
+fields through the loan and stay available.
+→ [Resources](../tour/resources.md), [Services](../guide/services.md)
 
 **"`…` implements `Drop` but is not a resource: … declare it a `resource` …"**
 `Drop` (the destruction hook) may be implemented only for a `resource`

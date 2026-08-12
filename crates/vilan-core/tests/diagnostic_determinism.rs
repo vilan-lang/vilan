@@ -116,6 +116,15 @@ fn render_all(source: &'static str, platform: Platform) -> Vec<String> {
 /// Analyze `source` cold [`ATTEMPTS`] times and hand back the distinct
 /// renderings with their counts. One entry means deterministic.
 fn cold_renderings(source: &'static str, platform: Platform) -> BTreeMap<Vec<String>, usize> {
+    // The repetition above only proves anything if the attempts can DISAGREE.
+    // `std`'s `RandomState` reseeded every table, so it supplied that on its
+    // own; E48 put the analyzer's id-keyed tables on a constant-seeded hasher
+    // (`fx.rs`), under which an order-dependent answer would be stably wrong and
+    // thirty attempts would agree on it. This puts the variation back — one seed
+    // per table, from a process counter — so these pins keep the power they were
+    // written with. Without it they still pass, and mean nothing.
+    vilan_core::fx::enable_seed_shuffle();
+
     let source = source.to_string();
     let source: &'static str = Box::leak(source.into_boxed_str());
     // The 256 MB worker every other compiler-behavior harness uses: a deep
@@ -137,11 +146,93 @@ fn cold_renderings(source: &'static str, platform: Platform) -> BTreeMap<Vec<Str
         .expect("the analysis worker panicked")
 }
 
+/// [`cold_renderings`] for a MULTI-FILE program. The files are written into a
+/// throwaway package directory once and `entry` is analyzed against it on every
+/// attempt, so the diagnostics span more than one `SourceId` and the canonical
+/// order's LEADING column — the file (`normalize_diagnostic_order`'s key) —
+/// carries real weight rather than being constant.
+///
+/// Single-file pins cannot see that column at all: every user diagnostic in
+/// them is `SourceId(0)`, so a check that attributed to the wrong file was
+/// indistinguishable from one that attributed to the right one (B112).
+fn cold_package_renderings(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> BTreeMap<Vec<String>, usize> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("vilan_determinism_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    for (relative, contents) in files {
+        let path = directory.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let entry_path = directory.join(entry);
+    let source: &'static str = Box::leak(
+        std::fs::read_to_string(&entry_path)
+            .unwrap()
+            .into_boxed_str(),
+    );
+    let worker_directory = directory.clone();
+    let seen = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let mut seen: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+            for _ in 0..ATTEMPTS {
+                vilan_core::analyzer::base_cache_clear();
+                let (program, errors) = analyze_source(
+                    source,
+                    &std_spec(),
+                    &worker_directory,
+                    &entry_path,
+                    Some(platform),
+                    &Workspace::default(),
+                );
+                let rendering = match program {
+                    Some(program) => program
+                        .diagnostics
+                        .iter()
+                        .enumerate()
+                        .map(|(index, error)| {
+                            render_one(&program, error, program.diagnostic_source(index))
+                        })
+                        .collect(),
+                    None => vec![format!("<no program>, {} diagnostics", errors.len())],
+                };
+                *seen.entry(rendering).or_default() += 1;
+            }
+            seen
+        })
+        .expect("spawn the analysis worker")
+        .join()
+        .expect("the analysis worker panicked");
+    let _ = std::fs::remove_dir_all(&directory);
+    seen
+}
+
+/// [`assert_cold_rendering_is_stable`] for [`cold_package_renderings`].
+#[track_caller]
+fn assert_cold_package_rendering_is_stable(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Vec<String> {
+    report_one_rendering(cold_package_renderings(files, entry, platform))
+}
+
 /// Assert one rendering across every attempt, reporting each variant and how
 /// often it won when there is more than one.
 #[track_caller]
 fn assert_cold_rendering_is_stable(source: &'static str, platform: Platform) -> Vec<String> {
-    let renderings = cold_renderings(source, platform);
+    report_one_rendering(cold_renderings(source, platform))
+}
+
+#[track_caller]
+fn report_one_rendering(renderings: BTreeMap<Vec<String>, usize>) -> Vec<String> {
     if renderings.len() == 1 {
         return renderings.into_keys().next().expect("one rendering");
     }
@@ -415,5 +506,46 @@ fn the_const_only_reports_are_one_per_site_on_every_cold_analysis() {
             .iter()
             .any(|line| line.contains("this closure (it reaches `asset::emit`)")),
         "the closure escape must be reported: {rendering:#?}"
+    );
+}
+
+/// The canonical order's LEADING column, over a program that actually has more
+/// than one user file: the diagnostics come out grouped by file, in source
+/// order, the same way every time.
+///
+/// Every pin above is single-file, so all of their user diagnostics carry
+/// `SourceId(0)` and the sort key's first component is constant — the column
+/// that decides everything for a real project was untested. It was also, until
+/// B112, a lie: the post-`build()` checks all attributed to the entry, so a
+/// module's violations sorted in among the entry's by raw byte offset, as if the
+/// two files' offsets were comparable. Now they group, and the grouping is what
+/// this pins — reordering a multi-file program's diagnostics is exactly what the
+/// fix does, and it is the order the overlay's cap and the terminal now read.
+///
+/// Both files break the same rule so the two diagnostics are word-for-word
+/// identical apart from their file: nothing but the source column can separate
+/// them, which is the point.
+#[test]
+fn a_multi_file_programs_diagnostics_group_by_file_every_time() {
+    let entry = "import std::print;\nimport std::drop::Drop;\nimport pkg::store::keep;\n\
+                 resource struct Guard { label: str }\n\
+                 impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
+                 fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n";
+    let module = "import pkg::main::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n";
+    let rendering = assert_cold_package_rendering_is_stable(
+        &[("main.vl", entry), ("store.vl", module)],
+        "main.vl",
+        Platform::default(),
+    );
+    let files: Vec<&str> = rendering
+        .iter()
+        .filter(|line| line.contains("cannot hold the resource `Guard`"))
+        .map(|line| line.split(':').next().expect("the rendered file name"))
+        .collect();
+    assert_eq!(
+        files,
+        vec!["main.vl", "store.vl"],
+        "each file reports its own, entry first (the entry is `SourceId(0)`, so it \
+         leads the canonical order): {rendering:#?}"
     );
 }

@@ -101,6 +101,15 @@ there is nowhere to put a payload in a bare string. `match` still matches
 *variants*: `match align { "flex-start" => … }` is an error, because the
 backing value is a representation, not a second spelling of the name.
 
+Because the variant *is* the host's own value, an `external fun` can take
+one and return one — no wrapper, no conversion. That also means a host
+can hand you a value that is none of the variants, and an exhaustive
+`match` says so rather than guessing: it tests every variant and panics
+on anything else, with the value in the message
+(`Align: "middle" is not one of its values`). Where an unrecognized value
+is an answer you expect rather than a bug, bind the `str` and use
+`parse`, which gives you `None` instead.
+
 ## impl: methods and statics
 
 Methods live in `impl` blocks, separate from the data:
@@ -291,7 +300,7 @@ write the boilerplate:
 | `PartialEq` | structural `==` |
 | `Debug` | `.debug()`: a developer-facing rendering |
 | `Default` | `Default::default()` built from the fields' defaults |
-| `Hashable` | usability as a `Map` key or `Set` member (`std::hash`) |
+| `Hashable` | usability as a `Map` key or `Set` member (`std::hash`) — a backed enum already has it |
 | `Json` | JSON encode/decode (`std::json`) |
 | `Wire` | serialization for rpc payloads (`std::wire`) |
 

@@ -17,9 +17,8 @@
 //! of a particular type substitution, so every instance inherits whatever the
 //! pass decides for the single node.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::analyzer::{Expr, ExprIfBranch, ExprPattern, GenericDispatch, Program};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 
 /// What a single call site resolves to.
@@ -212,7 +211,7 @@ impl CallGraph {
                 global_references: Vec::new(),
                 function_references: Vec::new(),
                 await_sites: Vec::new(),
-                visited: HashSet::new(),
+                visited: HashSet::default(),
             };
             collector.walk(initial);
             graph.initializer_calls.insert(binding, collector.calls);
@@ -252,7 +251,7 @@ impl CallGraph {
             global_references: Vec::new(),
             function_references: Vec::new(),
             await_sites: Vec::new(),
-            visited: HashSet::new(),
+            visited: HashSet::default(),
         };
         walk(&mut collector);
         for closure_id in collector.nested_closures {
@@ -273,7 +272,7 @@ impl CallGraph {
     }
 
     fn build_reverse_edges(&mut self) {
-        let mut callers: HashMap<Id, Vec<Node>> = HashMap::new();
+        let mut callers: HashMap<Id, Vec<Node>> = HashMap::default();
         for node in &self.nodes {
             for call in &self.calls[&node.id()] {
                 let callee = match call.target {

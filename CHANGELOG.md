@@ -6,6 +6,278 @@ deprecation period; patch versions are fixes. Each release below links
 the highlights — the [book](https://vilan-lang.org/docs/) always
 tracks the latest state.
 
+## v0.34.0 — 2026-08-12
+
+**`std::fs` can read raw bytes, list a directory, and stat a path — and `read_file_bytes` stopped lying about what it returns.** The module was twenty lines: `read_file_bytes(path, encoding): str` (decoded to a string despite the name), `read_file_to_str`, `write_file`, `exists`. No vilan program could serve an image, a font, or a favicon; nothing could enumerate a directory; and a hand-rolled dev-time change-detector had no `stat` to poll.
+
+`read_bytes(path): Bytes` is the true binary read — a host `Buffer` binds directly to `Bytes` (the same interop `std::http`'s `read_request_bytes` already relies on), with no decode in between. `read_dir(path): List<str>` lists a directory's immediate entries by name, flat and unordered (v1 deliberately does not recurse or expose file-vs-directory kind — call `stat` per entry for that). `stat(path): Option<Stat>` reads size, last-modified time (`modified_at_ms`, epoch milliseconds), and `is_directory`; unlike every other read in this module, a missing path is `None` rather than a thrown exception — `stat` exists for a caller that wants to ask "is this here yet", not one that already expects it to be. The misleadingly-named `read_file_bytes` is renamed to `read_file_encoded` (no alias kept — pre-1.0, and its only caller, `read_file_to_str`, moved with it in the same commit).
+
+---
+
+**`JsonValue.kind()` returns a `JsonKind` instead of a `str`.** The type it answers with was closed in a doc comment — `"number"`/`"string"`/`"boolean"`/`"array"`/`"object"`/`"null"` — and open in the type system, and the consequence was exactly what you would expect: of the six, only four ever got an `is_*` predicate. `"object"` and `"null"` were unreachable except by comparing a raw string, and nothing noticed, because there was nothing to notice with.
+
+`JsonKind` is a backed enum carrying those six strings, so `value.kind() == JsonKind::Number` is the same single comparison against `"number"` that `is_number()` compiled to, and `JsonKind::Object` and `JsonKind::Null` are now as ordinary as the rest. The four predicates — `is_number`, `is_string`, `is_bool`, `is_array` — are **removed**; write the comparison. `is_null()` stays: it is a different question, testing the value against `null` rather than reading its kind.
+
+The emitted code got smaller rather than larger: the four wrappers stop being emitted and each call site keeps the comparison it always had, which is 351 bytes off the three regression programs that decode JSON.
+
+One honest edge, now that the type is closed: a `JsonValue` is whatever the host handed over, so `value.field(name)` for a key an object does not have is `undefined`, whose kind is none of the six. `==` answers `false` for it, exactly as the predicates did. An exhaustive `match` over `JsonKind` is the one construct that will not guess — it panics naming the value — and `has_field` is the check that keeps you out of the case.
+
+---
+
+**An exhaustive `match` over a backed enum no longer lies about a value it has never seen.** `enum Align { Start = "flex-start", Center = "center", End = "flex-end" }` compiles to those three strings, and a `match` over all three compiled its last arm to a bare `else` — so a value that was none of them, arriving from the host, came back as `Align::End`. Not as an error, not as a wrong-looking answer: as `Align::End`, confidently, exit 0.
+
+The last arm is now tested like every other one, and the `else` panics with the enum's name and the raw value: `Align: "middle" is not one of its values`. Exhaustiveness was always checked over the *variant set*, by name — a proof about the vilan side of the boundary, never about the runtime value, because a backed enum lowers to a bare host string or number and its runtime domain is the host's. The trap is where the compiler stops assuming those two are the same thing.
+
+Only the exhaustive form changes. A `match` you gave a `_` arm keeps it — an out-of-set value takes the arm you wrote, which is what you asked for — and `is` and `==` were never affected, because comparing against a literal already answers `false` for a value outside the set. An enum with no backing value is untouched: it lowers to the tagged array, whose tag the language writes itself.
+
+The cost is one `===` on the last-variant path and about fifty bytes per exhaustive match, plus the panic helper once per file that has one. Across the whole regression corpus that is a single `match`, in a single program.
+
+---
+
+**A guarded last `match` arm no longer runs when its guard is false.** `match a { A => …, B if ready => … }` compiled the last arm to a bare `else` and threw the guard away with the arm's own test, so `B`'s arm answered for every value that reached it — the one the guard rejects included. No error, no wrong-looking output: the arm you guarded, taken anyway, exit 0.
+
+The arm keeps its guard now, and the shape that made the bug reachable is refused before it runs. Exhaustiveness is proven by *unguarded* arms only — a guard tests the value, and the compiler is reasoning about the type, so a guarded arm proves nothing about what a `match` covers — which means a `match` whose last arm is guarded has to be exhaustive without it. Write the arm you meant to fall through to: `B if ready => …, _ => …`.
+
+Two ways in, both closed. A `match` over a tuple or a generic skipped the exhaustiveness question entirely, and that exemption is about which values the subject can take; it never licensed a guard. And a tuple pattern that *tests* — `(1, 2)` — was read as one that *destructures* — `(let a, let b)` — so a `match` could appear to have a catch-all it never wrote.
+
+Where a guarded last arm still means something, because the arms above it already cover the subject, it compiles and its guard is tested where it stands. On a backed enum that composes with the trap arm rather than competing with it: the arm keeps its test and its guard, and the `else` still panics for a value outside the set.
+
+The diagnostics say why: a variant written only on a guarded arm is still reported missing, with a note on the guard — *this leg is guarded, and a guarded leg cannot prove exhaustiveness* — because otherwise "missing 'B'" is unreadable next to a `B` you can see in the match.
+
+---
+
+**An out-of-set value inside an earlier `match` arm's payload no longer gets silently filed under a different variant.** `match pair { Pair::Of(Align::Start) => "s", Pair::Of(Align::End) => "e", Pair::Other => "o" }` — a `Pair::Of` value whose `Align` payload was neither `Start` nor `End` (invented by a host caller, not something the language itself can construct) failed both `Of` arms and fell through to `Pair::Other`'s, answering `"o"` for a value that was never a `Pair::Other` at all. The exhaustive-`match` trap already catches this when the mismatched test is in the *last* arm; here it was in two *earlier* ones, and the last arm — carrying no backed test of its own — still dropped its condition and became a bare, unquestioning `else`. It now re-checks the subject's own variant before running that arm's body: reaching `Pair::Other` this way is only legitimate if the value's tag genuinely is `Other`; a value tagged `Of` traps instead, naming the enum and the value it actually got (`Align: "middle" is not one of its values`), and a real `Pair::Other` runs exactly as before.
+
+---
+
+**A `match` that narrows a payload no longer claims to cover the values it left out.** `enum Pair { Of(Align) }` has one variant, so `match p { Pair::Of(Align::Start) => "s" }` was accepted as complete — and answered `"s"` for `Pair::Of(Align::End)`. Not a host value, not a boundary: an ordinary vilan value, built by vilan, silently given the wrong arm's answer, exit 0. The same hole had two other doors. A tuple subject skipped the completeness question altogether, so `match p { (1, 2) => "x", (3, 4) => "y" }` compiled and answered `"y"` for `(7, 8)`. And any payload with an unbounded type behaved the same way: `match w { Wrapped::Of(1) => "one", Wrapped::Of(2) => "two" }` over an `i32` was "complete" and answered `"two"` for `9`.
+
+All three were one mistake. Completeness was decided from the outermost name a pattern wrote — which variant, and nothing below it — so any test *inside* the pattern was invisible to the check and free to fail at run time with nowhere left to go. It is now decided from the whole pattern, all the way down: an enum position needs every variant named and each of those variants' payloads covered in turn; a tuple position needs its elements covered as a product; and a position with an unbounded type (`i32`, `str`, a struct) is covered only by a binder or `_`, because no list of literals exhausts one.
+
+The error names a value that has nowhere to go, spelled as the arm that would take it — *"missing `Pair::Of(Align::End)`"*, *"missing `Wrapped::Of(_)`"*, *"missing `(Align::End, Align::Start)`"*, *"missing `Outer::Of(Mid::Of(Align::End))`"* — so the fix is to paste it. Where the gap is the subject's whole domain the message asks for a catch-all instead, since naming a value there would tell you nothing that `_` does not.
+
+Nothing that was already complete changes: `_` and a binder still cover everything at every depth, a guarded arm still proves nothing (it tests the value, which the check does not reason about), and a subject whose type is not yet known, or is `any`, `never`, or a generic parameter, is still exempt. Nothing in the standard library, the examples, the documentation, or the regression corpus was relying on the hole, so no emitted output moved. If one of your own matches goes red, it was answering the wrong arm for some value before it stopped compiling.
+
+---
+
+**Returning `&self.inner` from a by-value signature now hands back a value.** `fun grab(&self): Inner { &self.inner }` gave the caller the receiver's field itself, so a later write to `h.inner` showed through the result — while `fun grab(&self): Inner { self.inner }`, one character away, copied as the rule says. The copy rule reads the *return*, not the leaf, and the leaf is where it stopped looking: a reference is not a place, so nothing in the return seam ever saw it. The same hole sat one indirection over, behind a `borrows` call: `fun get(h: &Holder): (i32, i32) { peek(h) }` handed back whatever `peek` projected out of `h`.
+
+Both return their own value now. A returned expression can *name* storage without being a place, and the seam reads through it to find out whose: a reference names what it points at, and a `borrows` call names the arguments its callee projects — which the call site can see, because the receiver is right there in it. Chains (`o.mid_mut().slot()`) are followed to the end. What is *not* copied is unchanged and deliberate: a call with no `borrows` clause owns its result, and a projection of a **local** is a dead owner donating its storage on the way out.
+
+---
+
+**A `&mut i32` forwarded out of a by-value return is an `i32` again.** `fun same(v: &mut i32): i32 { v }` printed `[ [ 5 ], 0 ]` — a scalar view's runtime representation, leaking through a signature that promised a number. The copy machinery is shaped for aggregates and a scalar has no aggregate to copy, so the seam had nothing to do and did nothing. But a scalar's copy is its **read**, and that is what it emits now — for the plain spelling, for `&self.n`, for a scalar `borrows` call, and for a generic `fun same<T>(v: &T): T { v }` at any scalar `T`, which previously deep-copied the pair instead of collapsing it.
+
+---
+
+**A resource can no longer slip out of a loan behind a `&`.** `fun take(&self): Guard { &self.g }` compiled, handed back the `Guard`, and ran no destructor at all — the resource left its owner uncopied *and* undestroyed. Its twin without the `&` has always been refused ("cannot move a resource field out of a live aggregate"), and both now get the same answer: a resource cannot copy, so a by-value return of one out of a loan is a move out of a loan. Under a **view** return the identical body is still rule 3's sanctioned projection and still compiles — the return type is what decides, as it does for every other case here.
+
+One conservatism is worth naming because it is visible: a by-value return whose tail is a reference or a `borrows` call is still *classified* as projecting its parameter, so its result cannot be `mut` and counts as a live view for the invalidation rule, even though the value is now a copy. That refuses some programs it does not have to and mis-copies none; loosening it is a separate question with its own consequences.
+
+Nothing in the standard library, the examples, the documentation, or the regression corpus returns a place through a reference or a `borrows` call, so nothing had to change and no emitted output moved.
+
+---
+
+**Deleting a type annotation no longer lets a resource escape into a `List`.** `mut arr: List<Guard> = [Guard { .. }]` was refused, as designed — a native container's internals are host code the move checker cannot see, so it cannot promise to close what you put in one. Delete the annotation and the identical program compiled. Worse, it ran: the `Guard` was never destroyed, because a `List` is not a resource by containment and so the binding took no scope-end teardown at all. Two rules missed the same program at once, and which one you got came down to whether you had written the type down.
+
+The rule reads the same now whatever the type's provenance, because containment is a question about a type and not about a spelling. `mut arr = [Guard { .. }]`, `mut arr = []` grown by a `push`, a function whose return type is inferred, a closure's result, `Shared::new(Guard { .. })`, a `Guard` list reaching a container through an inferred `Inner { items = .. }`, one nested inside another list or sitting in a tuple, and a list built inside a generic body out of that body's own `T` — every one of them is refused, once, at the earliest place the value appears.
+
+The last of those is the case no whole-program check can see: `fun stash<T>(own value: T) { let items = [value]; }` builds a `List<Guard>` that exists only inside the instantiated body, and the caller writes `stash(Guard { .. })` and never has the type. It is refused at the instantiation site, with a note pointing at the line in the generic body that builds the container.
+
+Two older holes closed with it, both about nesting and both reachable from a written type too. `List<List<Guard>>` holds no resource *argument* — a `List<Guard>` is not itself a resource — so the outer type answered "nothing here", and only the separately-written inner spelling ever reported. A tuple or a fixed array was not descended into at all, so a `Guard` list inside one was invisible.
+
+What is *not* refused is the fixed-array spelling, and that is the point of the boundary: `[Guard; 2]` is a value aggregate, a resource by containment, and its elements drop in reverse order at the end of the scope. `Option<Guard>` is likewise unaffected — it is the sanctioned resource container. If you want several resources, hold them in a fixed array or in a struct of your own.
+
+Nothing in the standard library, the examples, the documentation, or the regression corpus builds a container at a resource, so nothing had to change and no emitted output moved.
+
+---
+
+**A view-returning function's escape check now looks at each RETURN separately, instead of asking one question about the whole thing.** Two shapes disagreed with what is the same program spelled two ways. `if flag { ret &self.inner; } Inner { n = 0 }` was refused — "a view cannot escape its scope" — while its conditional-tail twin, `if flag { Inner { n = 0 } } else { &self.inner }`, compiled clean: a sound view of a loaned parameter, refused only because it arrived beside an owned sibling through an early `ret`. And, the direction that actually matters: `if flag { Inner { n = 0 } } else { &local }`, a view of a LOCAL escaping through one arm of a conditional tail, compiled — exactly what this check exists to catch — because "is this whole `if` a view expression" is never true for an `if` with an owned arm, so the arm holding the view was never examined at all.
+
+Both traced to the same gap: the check asked its question of a return position as a whole rather than of each value an `if` or `match` tail can actually evaluate to. It now walks every such leaf on its own — whichever arm holds the view, however deeply nested the conditional, and whether the tail is an `if` chain or a `match` — so a sound view and an unsound one sitting in sibling arms of the same return are told apart correctly, and the diagnostic for the unsound one points at that arm, not at the enclosing expression.
+
+The standard library (every module, both platform layers), the regression corpus, and every example and benchmark project were swept under both the old and new rule: nothing in the shipped tree hits either shape, so nothing moved.
+
+---
+
+**A closure's escape check now looks at each return LEAF, not the whole conditional tail.** The same gap the previous fix closed for a named function's return position was still open at a closure's: `escapes_as_view(closure.return_)` asked whether the closure's whole `if`/`match` tail was itself a view expression, which is never true for a conditional with an owned arm — so the arm that actually held a view was never examined. `let grab = |flag: bool| { let local = Inner { n = 3 }; if flag { Inner { n = 0 } } else { &local } };` compiled clean: a view of a closure-local escaping through the untaken arm, exactly what the check exists to catch. The identical shape spelled with an early `ret &local;` was already refused, because a closure's `ret`s are checked by a separate, already leaf-wise mechanism — the two spellings disagreed only because one of them fed a whole-position question and the other didn't.
+
+The closure seam now walks every tail leaf the same way the function seam does. Unlike a named function, a closure has no exemption to weigh afterward: it may not declare `borrows`, so it has no sound view to return at all — every view leaf found this way is an escape. The regression corpus and every documented example compile byte-for-byte and error-for-error identical under the old and new rule: nothing in the shipped tree hits the shape.
+
+---
+
+**A view can no longer sit live across an implicit `await`.** The rule that a view may not be held across a suspension point — not as a parameter, not as a live binding, not as an async closure's capture — only ever looked for the `await` keyword. Calling an async function without it is the sanctioned spelling, and it suspends exactly the same way, so `async fun stash(viewed: &mut Point) { let beat = tick(); viewed.x = beat; }` compiled and emitted `const beat = await (tick());` with the caller's view live across the yield. All three forms of the rule had the same blind spot.
+
+The check now asks whether the call **can suspend** rather than whether you wrote the keyword: the callee is declared `async`, or reaches something that is. Writing `await` still refuses exactly what it refused before — every existing diagnostic is unchanged, down to the text — it simply is not the only way to be caught. A sync-looking function in between makes no difference: `fun hop(): i32 { tick() }` suspends too, and the caller is told so.
+
+What has *not* changed is that a declared-`async` function whose body never suspends keeps its view parameters. A body runs to its first suspension before yielding anything, so a view it never holds across one was never at risk — which is why an `async` implementation of a sync trait method stays legal. The declaration is read of the function you *call*, never of the one being checked.
+
+---
+
+**A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
+
+---
+
+**`ServerBuilder::on_stop` now actually fires.** It compiled, type-checked, and read correctly since it shipped, and never ran: `build()` dropped the callback on the floor, and there was no `Server::stop` that could have fired it anyway. `Server::stop()` now exists — it closes the listener and fires `on_stop` once the listener has actually finished closing, not merely been asked to. Stopping a `Server` value `start()` never touched (built but never started, or a copy taken before `on_start` ran) is a no-op rather than an error.
+
+---
+
+**A server can now ask what a browser leg's build emitted.** `build_of("client")` returns a `LegBuild` — the leg's name, its bundle's file name, the style sidecar's file name *or `None` if the leg compiled no styles*, every route chunk, and whether the bundle must be loaded as a classic script. Until now none of that was reachable from the server leg: a server restated it as string literals (`"dist/client.js"`, `"dist/client.css"`) that nothing checked against what the build actually wrote, so renaming a leg left every one of those lines compiling and the page blank.
+
+The channel is the leg's build manifest, `dist/<leg>.chunks.json`, which **every build of a browser leg now writes** — it used to appear only when the leg declared `split = true`, which no project in this repository does, so the one artifact describing a leg's output was absent for every leg that existed. A leg that does not split gets `"chunks": []` and `"classic_script": false`, and that is the point: an absent file could not tell "did not split" from "was never built", and `build_of` reports the second as a named error (`no build manifest at dist/client.chunks.json — build the leg first`) rather than an empty build or a bare `ENOENT`. A node leg writes none; the manifest describes what a browser loads. `require_build(leg)` is the boot form — a server that cannot describe its own build stops with that message instead of starting and 404ing every asset.
+
+---
+
+**A full-stack server now serves its own build in one line.** `Server::builder().serve_build(build_of("client")!)` installs one route per artifact the build wrote — the bundle, the stylesheet if the leg compiled any styles, every route chunk — each with the content type its extension implies. That replaces the block every server in this language used to write by hand: three `fs::read_file_to_str` calls over paths typed from memory, and a five-line `match request.path()` table in which nothing was a decision the application made (the url comes from the file's name, the MIME type from its extension, the body from the read). The routes answer before `on_request` however the chain was written, so your own catch-all still gets every path they do not claim — deep links keep working — and **a leg that gains `split = true` gains its chunk routes with no server edit at all**. For the `serve_service` shape, which builds its own server and hands you only a fallback, `build_handler(build, fallback)` is the same thing.
+
+Two things it does deliberately. An artifact the build *named* and did not write **stops the server at boot**, naming the file and the leg, instead of 404ing for the life of the process — a broken build is not a routing question. And an extension the table does not name is not served: `serve_build` serves a build, not a directory.
+
+The blessed examples and the `vilan init` fullstack scaffold adopt it together. The scaffold's server goes from 25 lines to 16, and from 22 lines of setup to 7 — including losing the `fs::exists("dist/client.css")` guard, because the build now says whether it emitted a stylesheet. `examples/fullstack` drops from 56 lines to 25: its `ChunkFile` struct, its manifest reader and its chunk lookup are all gone, and nothing in it names a route.
+
+---
+
+**Assets stop going stale under `vilan run --watch`.** A server reads `dist/client.js` once at the top of `main` and holds it in a closure for the life of the process, so a css- or client-only watch round — which correctly does not restart the server — left it serving bytes from before your edit. `serve_build` closes that at the one call site that can: while watching, it revalidates each asset per request; otherwise it serves the copy it read at boot, with no syscall per request. No signalling protocol is involved, which is the point — every request is already an opportunity to be fresh.
+
+The signal is `std::process::is_watching()`, a new process-layer primitive for hand-rolled servers too. It is defined under every run and `true` only under `vilan run --watch`, carried by a `VILAN_WATCHING` environment variable the watcher sets on the Node child it spawns. Server-side hot-swapping of *code* remains a non-goal — the node leg restarts, and this is about data. `std::fs` also gains `read_file_to_str_sync` for the read inside a handler that cannot suspend.
+
+---
+
+**An HTML shell that does not match its build now stops the server instead of shipping.** A page whose stylesheet `<link>` was deleted — or never added — renders unstyled and entirely correct-looking, while the build keeps writing `dist/client.css` and nothing ever loads it. That is the bug this arc was written about, and it has siblings, every one of them silent today: a `<link>` to a stylesheet the build no longer emits (answered by your catch-all with the HTML document, at 200, and dropped by the browser without a word), a `<script src>` for a chunk that stopped being written, a page that loads no bundle at all, a mount `<div id>` that drifted from `mount_root(id, …)`, and — latent in every shell in this repository — `type="module"` over a leg that splits, whose chunk resolution reads `document.currentScript` and finds `null`.
+
+`std::document::check_shell(shell, build, mount)` holds a document against what a leg's build actually emitted and reports **every** fault, not the first, each with its own fix. `require_shell("src/app.html", build)` is the boot form: it reads the file, checks it, and either hands back a `Document` or stops the server *before it starts*, naming the file, the leg and each fault: *"src/app.html does not match the `client` build: the build emitted the stylesheet client.css and this document links no stylesheet — add `<link rel="stylesheet" href="/client.css" />` inside &lt;head&gt;"*. The `vilan init` fullstack scaffold adopts it in one line, so a scaffolded project that loses its `<link>` no longer boots.
+
+Two deliberate limits. It checks a document against **one build** and has an opinion only about that build's own namespace — `client.js`, `client.css`, `client.<Arm>.js`, the files the leg's last build owns — so a `/theme.css` your app serves itself and a stylesheet on a font CDN are yours, uninspected: a check that can refuse to boot has to be sound about what it does not know. And the check is the primitive rather than a property of generated pages: `check_shell` takes a plain `str`, so it works on a shell read from disk, templated, or fetched from a CMS, and it returns a `Result` — an app that genuinely means it says so, once, in code.
+
+---
+
+**A server can now write its HTML document from the build — and server-side rendering lost its marker string.** `Document::of(build)` produces the page a browser leg needs: doctype, `<html lang>`, charset, viewport, `<title>`, the stylesheet `<link>` *if and only if* the build emitted styles, the mount element, and the bundle's `<script>` in the form the build requires (a classic script for a leg that splits, whose chunk resolution reads `document.currentScript` and finds nothing inside a module). `.title(…)`, `.lang(…)`, `.mount(…)` name the parts that vary; `.head(markup)` and `.body(markup)` take raw markup for the favicon, the `og:` tag, the CSP, the `<noscript>` — everything else is derived, so there is nothing to keep in step. `html()` returns a `str`, not a response: the app still decides the status code, the headers and which paths get it.
+
+Generation is sugar over the check rather than a second implementation of it, and that is pinned as a property: **every document `Document::of` can produce passes `check_shell`** — 1152 of them, over every combination of the builder's options, held against the same rules a hand-written shell is. The escape hatches are not an exemption either: a `<link>` you add through `.head(…)` to a stylesheet the build did not emit is caught exactly as it would be in a shell you wrote yourself.
+
+---
+
+**`Document::render(view)` replaces the `<!--ssr-->` convention.** Server-side rendering used to splice with `shell.replace("<!--ssr-->", render(app()))` — a string literal in `.vl` that had to equal a string literal in `.html`, whose mismatch was a *silent no-op*: the client still rendered the page correctly, so the only observer of the bug was a crawler. The document already knows where the mount element is, so `render` puts the markup inside it by construction, at both rungs — a generated document, and a hand-authored shell, whose mount element the check located when it read it. `examples/ssr` drops the marker; its end-to-end proof (server-rendered content before any JS, a replacing client boot) is unchanged.
+
+---
+
+**`ServerBuilder` composes an rpc service instead of replacing a boot function to get one.** `Service::new(protocol)` + `ServerBuilder::with_service` install an rpc service's routes and WebSocket handshake directly on a `Server::builder()` chain, answering before `on_request` — so an app that starts as a plain page and later wants rpc adds `.with_service(...)` rather than rewriting its whole boot function into `serve_service`. Two services coexist on separate mounts (`Service::new(protocol).at("/admin/")`), each answering only its own `{mount}events`/`{mount}send`/`{mount}rpc` routes and its own WebSocket upgrades, picked by longest mount and independent of the order `.with_service` was called in. `serve_rpc`, `serve_service` and `serve_connected` keep their exact signatures — they're four-line bodies over this layer now, and every existing caller (examples, the guide, the e2e suite, the benchmarks) is untouched down to the wire.
+
+One route-matching bug is fixed along the way: a service used to swallow any path merely *starting with* one of its routes (`/rpc` matching `/rpcs`, `/sendmail`, `/events-archive` too), silently shadowing an application route with no way for the app to see it happen. Matching is now a path SEGMENT — the route itself, or the route followed by `?` — so only the real route answers.
+
+---
+
+**A hand-rolled server can now ask a connected browser to reload, on demand.** `std::watch::force_refresh()` POSTs to the dev channel `run --watch` already runs, which broadcasts a one-shot reload to every connected browser. It's for the case the automatic `swap`/`css` push doesn't reach: a server that reads a file once at boot (a stylesheet, a template) and now re-reads it on request — call `force_refresh()` after the re-read and the browser picks up the fresh bytes. A no-op outside `run --watch`, so the call costs nothing left in a shipped build. See [the dev loop guide](https://vilan-lang.org/docs/guide/dev-loop.html#freshness-for-a-hand-rolled-server).
+
+---
+
+**An `external fun` may now return a backed enum.** `external fun get_align(): Align` was refused, and the refusal was right while it stood: the host could answer `"middle"` and the value would become `Align::End` without a word. That was the one hazard, and the trap arm removes it, so the boundary opens — for a return type, for a `Option<Align>` or `List<Align>` inside one, for a method on an `external struct`, and for a callback the host calls with a value it chose.
+
+That last shape is the one worth naming, because it was already getting through. `external fun on_align_change(handler: |Align| void)` compiled clean under the refusal — a function-typed parameter's parameters are return positions in disguise, and the check, which worked by listing the positions a host can supply a value from, had not listed them. Any check built on that list has to be complete to be worth anything, and this one was not. The trap never asks where a value came from, so there is no list to be incomplete.
+
+Nothing checks the boundary itself, and the docs say so: a host value outside the set enters unremarked, exactly as it does for an `external fun f(): i32` that answers `"hello"`. The difference is what happens next. Both shapes are now available and the choice is about the value, not about safety — return the enum where a value outside the set means something is wrong, or bind the backing type and `parse` it, which answers `None`, where an unrecognized value is one of the answers you expect.
+
+---
+
+**`Map<Align, T>` compiles.** A backed enum is now a `Map` key and a `Set` member with nothing to remember — no `[derive(Hashable)]`, no import, no ceremony. This was the first thing anyone was going to try after `enum Align { Start = "flex-start" }` shipped, and it met `Error: 'Align' does not implement trait 'Hashable'`, which is a strange answer when the enum *is* the string `"flex-start"` and the host's own `Map` keys strings by value.
+
+The reason it works is the reason `value()` costs nothing: the enum is not a wrapper around the backing value, it *is* the backing value. Hashing it and hashing that value are the same operation on the same runtime datum, so `Align::Start.hash()` and `Align::Start.value().hash()` are one key. The implementation is written by the compiler beside `value()` and `parse()`, off the same opt-in — writing `= "flex-start"` is what makes the enum that value, so it is also what makes the value its key. Both backings come along, integer and string, and so does the C-style tail: `enum Walked { A = 5, B, C }` is bare-lowered because one explicit value converts the whole declaration, so it keys too.
+
+An **unbacked** enum is deliberately left where it was. `enum Plain { A, B }` has no backing value, so it lowers to the tagged array `[0]`/`[1]` — a fresh array per mention, which is exactly the by-reference footgun value keys exist to prevent. It is an aggregate, and like every other aggregate it needs `[derive(Hashable)]`, which works as it always did. A payload-carrying enum is the same story: refused at the key with the ordinary bound diagnostic rather than a surprise at runtime, and admitted by the derive, whose all-fields check still names a payload it cannot hash.
+
+Two smaller things fall out. A backed enum is now accepted as a *field* of a `[derive(Hashable)]` struct — the derive's field check and the key check had two separate answers for "is this hashable", and they now agree. And writing `[derive(Hashable)]` on a backed enum anyway keeps compiling and does nothing: the derive and the compiler emit the identical body, so there is nothing to disagree about. A *hand-written* `impl Align with Hashable` is still a duplicate-impl error — it might mean something else — and that error now lands on your impl with a note saying the other one is the compiler's, rather than pointing your own declaration back at itself.
+
+---
+
+**A `resource` enum with backing values can be declared again.** `resource enum Handle { Open = 1 }` failed at its own declaration with "cannot move the resource `self` out of this function" — an error about a body nobody wrote, because `value()` was being synthesized for it and `fun value(self)` reads a resource out of a loan. A resource's identity is not its copyable backing value, so it is offered no `value()`, no `parse`, and no `Hashable`, and the declaration simply compiles.
+
+---
+
+**Typing an import now completes it.** `import std::` offered nothing at all — not one module — and the position before it, `import s`, offered keywords, `for …` templates, and every local name in scope, none of which may follow `import`. The whole path completes now, at every level: the head offers the origins (`std`, `pkg`, and each dependency by the name you import it under), `std::` offers the standard library's modules, `pkg::` offers your own package's, and a module segment offers what that module has to give. `import std::json::{ Json, ` completes inside the braces too, because each name in the set is one more member of the same module.
+
+The reason it offered nothing was structural rather than a filter being too strict. `std` names an *origin*, not a module, and the lookup had no notion of one, so the head of every import path came back empty. Past the head there was a deeper problem: candidates were read out of the analyzed program, which only holds modules something has already imported — and the entire point of typing an import is to reach one that nothing has. So the modules are enumerated from the package tree itself, through the same resolution the compiler's loader uses, layers and all; and a module's members are read by loading that module on demand, which is why `import std::random::` completes in a file that has never mentioned `std::random`. The load is the loader's own, so it shares the compiler's parse cache: about half a millisecond the first time and none of it after.
+
+---
+
+**The editor now offers to add a missing import — on its own, or in one sweep.** An unresolved name that's importable now gets a QUICKFIX: hover the "cannot find `X`" diagnostic and the editor offers "Import `X` from std::json" (one action per module, when more than one exports the name — never a guess between them). A "Add All Missing Imports" source action fixes every unambiguous name in the file in one edit, skipping any that are ambiguous. And completing a name you haven't imported yet now offers it directly — labeled with the module it comes from (`std::json`), ranked below the names already in scope, and carrying the import as part of accepting it, so choosing the completion writes both the name and its import in one action.
+
+The edit itself reuses the formatter's understanding of import structure rather than splicing text by hand: adding a name to a module already imported nearby extends its brace set (or turns a bare `import std::json::Json;` into `import std::json::{ Encode, Json };`); reaching a module for the first time inserts a new `import` line in its canonically sorted position. The element-syntax note — "element syntax lowers to `std::ui::view`; add `import std::ui::{ view, View };`" — is the first diagnostic this reaches: the fix for its "cannot find `view`" is now one click away instead of a comment to copy by hand.
+
+---
+
+**A misspelled field in a struct initializer now gets a suggestion — and a fix.** `Config { entires = 5 }` against a struct with an `entries` field used to answer with a bare "struct 'Config' has no field 'entires'". It now adds a note, "did you mean `entries`?", when a real field is a close-enough edit distance away — close enough that `"entires"` suggests `"entries"` but `"x"` never suggests anything at all, however similar `entries` may look to a human skimming the diagnostics list. The scan runs only once the plain name lookup has already failed, so correctly-spelled code pays nothing for it. The editor turns the suggestion into a quickfix, "Change to `entries`", that rewrites exactly the misspelled name — and the diagnostic's own span moved to match, from the field's value to the field's name, which is what a rename needs to replace.
+
+---
+
+**`vilan bindgen` writes no bodies at all any more.** A named union of string literals in a `.d.ts` becomes a backed enum, and every position now binds that enum directly: a parameter, a return, a property's getter *and* its setter, a `List<Align>`, a callback's own parameter. The generated file is signatures, attributes, and comments — nothing else.
+
+Two shapes disappear with the last generated body. The return direction used to bind a `[doc(hidden)]` raw `str` and forward it through a hand-written `Align::parse(..)` into `Option<Align>`, because the language would not let an extern return a backed enum. And a *property* got a `TODO(bindgen)` instead of a binding — a property is read and written through separate externs, and the two directions wanted different types, so no single bound type served it. They want the same type now, so the TODO is gone and the getter reads `Align` while the setter takes it.
+
+The generated file is still ordinary source you own. Where you would rather have `None` than a panic for a value the host might legitimately answer with, hand-edit the binding back to the guarded shape — bind the `str`, forward through `parse`. That edit is now yours to make rather than the generator's to assume.
+
+---
+
+**A syntax error no longer blanks out every other diagnostic in the file.** Half-typed code is what a compiler is asked about most of the time — a 150 ms debounce means a typing user asks the analyzer a question about twice a second, and almost none of those questions are about a program that parses. Until now the answer was: nothing. While a file did not parse, the editor lost every diagnostic the file already had and showed one instead, usually anchored on a line the user was not editing. Typing `print(1);` under a standing type error made that error vanish for two of the nine keystrokes, and `vilan check` was worse — one missing `;` anywhere in a file hid every type error in the rest of it.
+
+The parser now recovers at statement and item boundaries. A statement it cannot read is reported and skipped to the next `;`, `}`, or declaration keyword, and parsing resumes there — so the statements around it, the functions below it and the whole file tail still reach the analyzer, and the diagnostics they already had stay on screen. A function body with one broken statement in it used to be discarded whole and replaced by an empty one; now it loses the broken statement and keeps the rest. A `{` that is not closed yet keeps everything typed inside it. And `vilan check` type-checks that salvaged file instead of stopping at the syntax error, so both surfaces — editor and terminal — answer the same way. (`vilan build` does not: a recovered file is not something to emit from, and its output is unchanged.)
+
+---
+
+**Two parse messages that could not name what they wanted, now can.** A missing semicolon could not say `;` — the token was in no expectation set anywhere in the parser — so it blamed the *next* statement's first token and demanded `}` (`found 'let' expected '}'`, on a line that was entirely correct). It now reads *"expected `;` to end this statement"*, anchored at the gap where the `;` goes: the last character before it, not the head of the statement below. The same message answers a missing `;` after an `import` or a `use`, which used to produce `found 'import' expected an expression` pointing at the `import` keyword itself.
+
+A delimiter you have opened and not closed yet — the defining shape of code mid-edit — used to anchor on whatever the parser tripped over next, a `}` several lines down or the end of the file, and never mentioned the delimiter at all. It now says *"unclosed `(`: expected a matching `)`"* on the `(` you typed. A closing delimiter *inside* a finished list keeps its existing, better message (`found ';' expected ',' or ')'`, on the exact character where the list broke) — that one was already right.
+
+---
+
+**A missing return value now points at the one character that would fix it, not the whole closure (or the whole call).** `let scale: |i32| i32 = |value| { value * 2; };` used to underline all 22 characters of the closure — `points.map(|point| { .. })` underlined the whole call — to say a value never came back; the fix is almost always the trailing `;` that discarded it, and nothing on the line said so. The diagnostic now anchors on the callable's closing brace, one character wide, with a message that names the mistake: `` this body ends without producing a value `` when there's no tail at all, `` the `;` discards this body's last value `` when there is one and a stray `;` threw it away. A closure with its own `: T` return annotation is checked against it directly for the first time — previously written, parsed, and silently ignored. Passing the wrong-*typed* value (a `str` where an `i32` closure was expected) is unaffected: that anchor was already right, and stays on the whole value, which is what's actually wrong there. Live in the editor this also fixes an outright bug: the old anchor was a zero-width point one byte *past* the brace, which VS Code draws as nothing at all — the most common shape of this diagnostic was invisible while editing, even though the CLI rendered it tolerably.
+
+---
+
+**A missing-return diagnostic on an `if` with no `else` now names the gap.** `fun classify(n: i32): str { if n > 0 { "positive" } }` failed with the generic `` Expected str, but got void instead. `` — correct, but silent about *why* the value came back void, unlike every other shape of this mistake (which already say "this body ends without producing a value" or "the `;` discards this body's last value"). It now reads `` Expected str, but got void instead: an `if` with no `else` produces void. `` for exactly this shape — an `if`/`else if` chain with no final `else`, in tail position — leaving the fix (add the missing branch) implied by naming the cause. Every other route to a void tail (no tail at all, a discarded last statement, a void call) is unaffected; the anchor was already correct here and does not move.
+
+---
+
+**Argument- and field-count mismatches now name what's mismatched.** `Expected 2 arguments, but got 1 instead.` didn't say whose two arguments — in `print(distance(3))`, two calls on one line, the reader had to work out which. It now does: `` `distance` expects 2 arguments, but got 1 instead: `y: i32` is missing. `` — the callee, and, for a call short on arguments, the specific missing parameter and its type (arguments bind positionally, so which one is missing is unambiguous; too many gets no such guess, since which extra argument to drop isn't). A struct initializer gets the same treatment in both directions, since struct fields are named and an extra one *is* identifiable: `` `Point` expects 2 fields, but got 1 instead: `y` is missing. ``  and `` `Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`. ``, the latter now anchored at the offending field's name rather than the whole `{ .. }` literal. A wrapped argument list's count diagnostic no longer draws a multi-line rectangle across the whole call — the span clamps to the first line, since a count is a property of the list as a whole, not of how many lines the formatter split it across.
+
+---
+
+**An argument- or field-count mismatch now notes where the subject was declared.** `` `distance` expects 2 arguments, but got 1 instead: `y: i32` is missing. `` named the callee, but not where to go look at it — the same gap a struct-field-count mismatch had for the struct. Both now carry a secondary note pointing at the subject's own declaration (`` `distance` is declared here ``, `` `Point` is declared here ``), in the same style the compiler already uses for a note elsewhere in the file (a trait's own declaration of a missing method, a compile-time call chain). A plain function call, a method call, and a struct initializer all get it; the message itself is unchanged.
+
+---
+
+**Two more diagnostics now offer a quick fix: a missing `;`, and the `;` that silently discarded a return value.** Both steers already existed as message text; the editor now offers to apply them directly. "Expected `;` to end this statement" gets an "Insert `;`" action at exactly the gap the diagnostic points at. "...the `;` discards this body's last value" — a function or closure whose last statement would satisfy the declared return type if its trailing `;` weren't there — gets a "Remove `;`" action, which finds the right `;` from the same bookkeeping the diagnostic itself used, not by guessing backward from the closing brace; a comment sitting between the statement and its `;` (an unusual shape) is left alone rather than risking a wrong edit.
+
+---
+
+**A `Name::` in your code no longer completes names you never imported.** `Ordering::` offered `Less`, `Equal`, and `Greater` in a file that had never heard of `std::compare`; `JsonKind::` offered `Number` without `std::json`. The name to the left of `::` was matched against every type in the program by string equality and never resolved through scope, and the compiler always loads a handful of standard-library modules for the derive prelude — so their types were on offer everywhere, permanently. The same leak reached your own code the moment anything pulled in a sibling module: its types completed in files that never imported them.
+
+The left side resolves through scope now, exactly as the receiver of a `.` always has. Everything you imported, and everything the file declares itself, completes as it did; a same-named type in a module you merely happen to have loaded does not, because it is not a name your file has. Inside an `import` path the old whole-program lookup is kept deliberately and stays exactly as broad — reaching a name that is not in scope yet is the entire job there.
+
+---
+
+**Auto-import completion now surfaces your own package's names before it reaches for std's.** That completion is capped at 20 candidates so a std-heavy file's loaded surface can't flood the popup, but the cap used to fill purely alphabetically — and `std`'s always-loaded prelude contributes enough capitalized trait and type names (`Add`, `BitAnd`, `BitOr`, …) to fill all 20 slots on their own, ahead of a small real file's own unimported names, which are ordinary lowercase identifiers and so sorted behind every one of them. A real project's own names could be crowded out entirely by a library it merely has loaded.
+
+Every `pkg` candidate now ranks ahead of every `std` one, regardless of what either is named — the file you're actually writing wins the cap first, and `std` only spends the slots your own names didn't need. The cap itself stays at 20; the count was never the problem, only the order that filled it.
+
+---
+
+**Completion holds still while you type, like every other editor feature.** The language server keeps two views of an open file — the text you are editing and the text it last analyzed — and every feature built from analysis is supposed to answer in the older text's coordinates until the newer analysis lands, a few dozen milliseconds later. Completion was the one exception: it converted the cursor straight through the *current* buffer's coordinates and fed that offset to the scope and receiver lookups, which are answered from the analysis. While the two stayed in step — the common case — nothing showed. Mid-edit, an unrelated change elsewhere in the file (anything typed above the cursor, including on an earlier line) could resolve the cursor's scope wrong, so completion silently offered a different set of names than the ones actually in scope, or a `.` resolved a stale receiver's members instead of the one you are looking at.
+
+The one part of completion that legitimately reads the buffer you are mid-keystroke in — deciding whether the cursor sits right after `.`, `?.`, or `::` — is unchanged; that decision is about the character just typed and always answers correctly. Only the lookups that walk the analyzed program now convert the cursor through the analyzed text first, the same conversion hover, go-to-definition, references, rename, the outline, and inlay hints already made.
+
+---
+
+**Organize Imports no longer prunes a module import used only through `::`.** `import std::math;` referenced only as `math::min(1, 2)` — never by its bare name — was reported unused and removed on save. A static accessor's subject resolves through the same type-position lookup as a struct, an enum, a trait, or a generic, and the definition it records feeds every "is this import used" check in the editor; a module was the one namespace kind that lookup forgot, so `math`'s use site recorded no definition at all and looked referenced nowhere. It now resolves like the others — a module reached only through `::` keeps its import, in a single import or shrunk out of a brace set, exactly like a struct or function would. Go-to-definition on a module name at a `::` use site picks up the same fix and now jumps to the module; it already worked on the module name written inside the `import` statement itself.
+
+---
+
+**A css-only edit under `run --watch` no longer round-trips a stale server.** The `css` hot-swap used to "refresh" a stylesheet by cache-busting the `<link>`'s own href — which is the app's own server route (`/client.css` in the common shape), and the common idiom (`examples/todo`) reads that file once at server boot and serves the same bytes for the rest of the process. A css-only round never restarts that server (only a bundle change does), so the cache-bust landed right back on the boot-time snapshot: a style edit that visibly did nothing.
+
+A `css` event now fetches the changed sidecar from the CLI's own dev channel — which already served current `dist/*.css` bytes every round — and applies them as an injected `<style>` that supersedes the stale `<link>` (disabled, its href left untouched). Asset-matching and the never-reload-on-failure behavior are unchanged: a named sidecar updates only its matching `<link>`, and a fetch that fails warns and leaves the current stylesheet exactly as it was.
+
+---
+
+**`mount`/`mount_root` on a missing element id now fails loud, naming the id.** `get_element_by_id` hands back JS `null` typed as `Element` when nothing on the page has that id, and mounting into it used to throw "Cannot read properties of null (reading …)" — the id the caller got wrong appeared nowhere in the message. The shared lookup both `mount` and `mount_root` go through now checks for that first and panics naming the id (`mount: no element with id 'app'`) instead of leaving the null dereference to speak for itself. The happy path — an id that exists — is unchanged.
+
 ## v0.33.0 — 2026-08-08
 
 **Implementing one trait twice for one type is now an error instead of a coin flip.** Two `impl Bag with Show` blocks compiled. `bag.show()` ran the first one, a `T: Show` bound ran the first one, and the second was emitted nowhere at all — no diagnostic, no warning, no output. Which of the two survived came down to the order the blocks happened to be written in, and across files, the order the modules happened to load in.

@@ -1,9 +1,35 @@
 // `std::fs` — minimal async filesystem access over `node:fs/promises`. The raw
 // bindings are `async` (promise-returning host functions), so calls to them are
 // implicitly awaited.
+//
+// Error posture (F13, fullstack-dx.md §9.3): `read_bytes`, `read_file_to_str`,
+// `read_dir`, and `write_file` all throw host-side on ANY failure — a missing
+// path is treated the same as a permissions error, exactly `read_file_to_str`'s
+// posture from before this file grew. `stat` alone is different BY DESIGN: it
+// exists to let a caller ask "is this here yet, and what does it look like"
+// (dev-refresh.md §2(i)'s mtime-revalidating poller is the motivating
+// customer), so a missing path is an expected outcome it returns (`None`), not
+// an exception it throws. Any other `stat` failure still throws.
 
+import pkg::bytes::Bytes;
+import pkg::option::Option::{ None, Some, self };
+
+/// Reads a file, decoded as text under `encoding` (a `node:fs` encoding name —
+/// `"utf8"`, `"latin1"`, …). Renamed off `read_file_bytes` (2026-08-11, F13):
+/// that name promised bytes and delivered a decoded string — the exact
+/// survey-flagged lie. No deprecated alias kept (pre-1.0; the sole caller was
+/// `read_file_to_str`, updated in the same commit — `numeric-types.md` §8's
+/// precedent for a rename that fixes a wrong name).
 [extern("node:fs/promises", "readFile")]
-async external fun read_file_bytes(path: str, encoding: str): str;
+async external fun read_file_encoded(path: str, encoding: str): str;
+
+/// Reads a whole file's raw bytes — the binary read F13 asked for. `readFile`
+/// called with NO encoding argument hands back a host `Buffer`, which IS a
+/// `Uint8Array` (runtime-verified: `buffer instanceof Uint8Array` is `true`),
+/// so it binds directly to `Bytes` with no conversion — the same interop
+/// `std::http`'s `read_request_bytes` already relies on.
+[extern("node:fs/promises", "readFile")]
+async external fun read_bytes(path: str): Bytes;
 
 [extern("node:fs/promises", "writeFile")]
 async external fun write_file(path: str, contents: str): void;
@@ -16,5 +42,79 @@ external fun exists(path: str): bool;
 /// Reads a UTF-8 text file to a string. Async (it awaits `readFile`), so callers
 /// implicitly await it.
 fun read_file_to_str(path: str): str {
-	read_file_bytes(path, "utf8")
+	read_file_encoded(path, "utf8")
+}
+
+/// Lists a directory's immediate entries by NAME ONLY (files and
+/// subdirectories alike, not path-joined — join with `path` yourself), in
+/// whatever order the host filesystem hands them back (NOT guaranteed
+/// alphabetical or otherwise stable across platforms). Deliberately flat for
+/// v1 (F13): no recursion, and no dirent-kind distinction — a caller that
+/// needs to know file vs. directory calls `stat` per entry. Throws host-side
+/// on a missing or unreadable directory, matching `read_file_to_str`'s
+/// posture above.
+[extern("node:fs/promises", "readdir")]
+async external fun read_dir(path: str): List<str>;
+
+// --- stat --------------------------------------------------------------
+
+/// The raw host `fs.Stats` object (`node:fs/promises` `stat`). Kept opaque
+/// and internal — `stat` below copies the three fields v1 needs into a plain
+/// `Stat`, so no caller touches the host shape directly.
+external struct RawStat;
+
+impl RawStat {
+	[extern(get, "size")]
+	external fun size(self): i32;
+
+	/// Milliseconds since the epoch, as an ordinary (fractional) number.
+	/// `fs.Stats` only yields a `BigInt` here under the `{ bigint: true }`
+	/// stat option, which this binding never passes — runtime-verified: a
+	/// plain stat's `mtimeMs` is `typeof "number"`, not `"bigint"`.
+	[extern(get, "mtimeMs")]
+	external fun mtime_ms(self): f64;
+
+	[extern(method, "isDirectory")]
+	external fun is_directory(self): bool;
+}
+
+/// A path's metadata: byte size, last-modified time (milliseconds since the
+/// epoch), and whether it names a directory.
+struct Stat {
+	size: i32,
+	modified_at_ms: f64,
+	is_directory: bool,
+}
+
+/// `fs.promises.stat(path)`, wrapped so a missing path reads back `None`
+/// (`ENOENT`) instead of throwing; every other failure (permissions, …)
+/// still throws. `vilan` has no `try`/`catch`, so the ENOENT-to-`None`
+/// translation is host-side glue (`__fs_stat`, `transformer.rs`) — the same
+/// "`Option` array form" convention `std::process::env` and `Database.first`
+/// already use at this boundary.
+[extern("__fs_stat")]
+async external fun raw_stat(path: str): Option<RawStat>;
+
+/// Probes `path`: `None` if nothing exists there yet, `Some(stat)` otherwise.
+fun stat(path: str): Option<Stat> {
+	match raw_stat(path) {
+		Some(let raw) => Some(Stat { size = raw.size(), modified_at_ms = raw.mtime_ms(), is_directory = raw.is_directory() }),
+		None => None,
+	}
+}
+
+/// The synchronous read (`node:fs` `readFileSync`) — for a read that must
+/// complete inside a callback that cannot suspend.
+///
+/// Prefer `read_file_to_str`: this one blocks the event loop for the length of
+/// the read, which is the wrong trade for anything on a server's hot path. It
+/// exists because a synchronous request handler has no other option, and
+/// `serve_build`'s dev-mode revalidation is exactly that — a re-read per
+/// request, under `run --watch` only, of a file the build just wrote.
+[extern("node:fs", "readFileSync")]
+external fun read_file_bytes_sync(path: str, encoding: str): str;
+
+/// Reads a UTF-8 text file to a string, synchronously. See `read_file_bytes_sync`.
+fun read_file_to_str_sync(path: str): str {
+	read_file_bytes_sync(path, "utf8")
 }

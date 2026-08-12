@@ -79,6 +79,12 @@ values must be unique across the enum, counting the values implicitly
 continued from the previous variant; see the grammar chapter for the full
 rule.
 
+An **integer** backing value must lie in `-9007199254740991 ..=
+9007199254740991` (`i53`), because that is the widest integer a runtime
+number holds exactly and the variant *is* that number: a discriminant
+past the bound would cross a host boundary as a different value than the
+source wrote. The continuation stops at the same edge.
+
 ### Backed-enum conversions
 
 Every backed enum gets two members, synthesized by the compiler — no
@@ -99,6 +105,47 @@ receiver already *is* that value, so the call lowers to the receiver.
 fallible parse, matching `str::parse_i32`. Declaring your own `value` or
 `parse` on a backed enum is a duplicate-member error.
 
+Every variant takes part, including one that *continued* the sequence
+instead of writing a value. There is one rule about what a variant is
+worth, and the conversions read the same answer the lowering does:
+
+```vilan
+import std::print;
+import std::option::Option::{ self, Some, None };
+
+enum Level { Low = 0, Mid, High }
+
+fun main() {
+	print(Level::Mid.value());  // 1 — continued from Low
+	print(match Level::parse(2) {
+		Some(let level) => level.value(),
+		None => -1,
+	});                         // 2 — High
+}
+```
+
+(A **string** backing is the exception, and not a new one: there is no
+successor of `"start"`, so every variant must write its own.)
+
+A backed enum is also **`Hashable`**, implemented by the compiler on the
+same opt-in and for the same reason `value()` costs nothing: the enum IS
+its backing value, and that value is already a key.
+
+```vilan,fragment
+mut widths: Map<Align, i32> = Map::new();
+widths.insert(Align::Start, 1);          // keyed by "flex-start"
+```
+
+So `Map<Align, V>` and `Set<Align>` need no `[derive(Hashable)]`, and
+`Align::Start.hash()` is `Align::Start.value().hash()`. Writing the derive
+anyway is harmless and does nothing; a hand-written `impl Align with
+Hashable` is a duplicate-impl error, because the compiler's is already
+there. An **unbacked** enum is unaffected — it lowers to the tagged array,
+so it is an aggregate and needs the derive like a struct.
+
+A `resource` enum gets none of the three — no `value()`, no `parse`, no
+`Hashable`. Its identity is not its copyable backing value.
+
 Two rules follow from the backing value being a *representation* rather
 than a second name for the variant. A `match` still matches variants, not
 values — `match align { "flex-start" => … }` is an error, exactly as
@@ -108,11 +155,95 @@ lexicographically (`Size::Large < Size::Small` because `"lg" < "sm"`),
 and ordering by declaration index cannot be offered, because bare
 lowering erases the index. Integer backings order as before.
 
-An `external fun` may take a backed enum but may **not return one**: the
-host can answer with a value outside the set, and an exhaustive `match`
-compiles its last arm to a bare `else`, so a bogus value would silently
-become whichever variant happened to be last. Bind the backing type and
-convert with `parse`, which answers `None`.
+### The trap arm
+
+A backed enum lowers to a bare host value, so its runtime domain is the
+*host's* and not the variant set. Exhaustiveness is checked over that
+variant set, by name — which is a proof about the vilan side of the
+boundary and never was one about the value. So an **exhaustive** `match`
+over a backed enum tests every variant, including the last, and its
+`else` traps:
+
+```vilan,fragment
+match align {
+    Align::Start => "s",
+    Align::End   => "e",       // tested, not assumed
+}
+// a value outside the set panics:
+//   Align: "middle" is not one of its values
+```
+
+The trap follows the backed enum **wherever the pattern tests it**, not
+only when it is the subject. A backed enum reached through a payload is
+the same value on the same boundary:
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // tested, not assumed
+}
+// an out-of-set payload panics, naming the payload's own value:
+//   Align: "middle" is not one of its values
+```
+
+If one arm tests **more than one** backed enum, the panic names whichever
+value actually left its set.
+
+A backed test can also live in an EARLIER arm than the one that becomes the
+`else` — a different variant's payload, tested across several arms with no
+arm of its own left over for it:
+
+```vilan,fragment
+match pair {
+    Pair::Of(Align::Start) => "s",
+    Pair::Of(Align::End)   => "e",   // together, `Of`'s only handler
+    Pair::Other            => "o",
+}
+// an out-of-set `Of` payload traps instead of silently answering `Other`:
+//   Align: "middle" is not one of its values
+```
+
+`Other`'s own arm carries no backed test, so the exhaustiveness proof that
+drops its condition is still a proof about `Pair`'s VARIANT set, not about
+`Align`'s runtime domain — the same gap the payload form above closes, one
+level up. The two `Of` arms above are the only place `Align` is ever tested,
+so reaching the `else` with the subject's tag actually `Of` is possible only
+when its payload left `Align`'s set; the trap fires there, naming `Align`
+and the raw value, and `Other`'s own arm still answers for a genuine
+`Pair::Other`.
+
+Only the exhaustive form is affected. A `match` you gave a `_` arm keeps
+it — an out-of-set value takes the arm you wrote, which is the answer you
+asked for — and `is` and `==` compare against a literal, so they answer
+`false` outside the set, as they always did. An enum with no backing
+value keeps the tagged array form and no trap: the language itself writes
+that tag, so there its exhaustiveness proof *is* a proof about the value.
+That holds nested too — a `match` whose arms test only unbacked enums
+emits exactly what it always did, at any depth.
+
+An `external fun` may both **take and return** a backed enum, and so may
+a callback it is handed. Nothing checks the boundary: a host value
+outside the set enters unremarked, exactly as it does for an
+`external fun f(): i32` that answers `"hello"`. What the trap arm buys is
+that such a value can no longer become a *confident* variant — the first
+exhaustive `match` to meet it panics with the raw value.
+
+Which of the two shapes to write is a question about the value, not about
+safety:
+
+```vilan,fragment
+[extern("getAlign")]
+external fun get_align(): Align;              // out of set is a BUG — trap
+
+[extern("getAlign")]
+[doc(hidden)]
+external fun get_align_raw(): str;            // out of set is an INPUT
+fun read_align(): Option<Align> { Align::parse(get_align_raw()) }
+```
+
+Return the enum where the host's set is genuinely closed and a value
+outside it means something is wrong; bind the backing type and `parse`
+where an unrecognized value is one of the answers you expect.
 
 ## 5.4 Impls
 

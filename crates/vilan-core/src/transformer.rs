@@ -3,6 +3,7 @@ use crate::analyzer::{
     Intrinsic, LiftDispatch, Program, TransferForm, TryDispatch,
 };
 use crate::error::Error;
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::interpreter::ConstValue;
 use crate::node::{BinaryOp, Convention, ExternBinding};
@@ -11,7 +12,7 @@ use crate::span::Span;
 use crate::type_::{SCALAR_PRIMITIVE_NAMES, Type, TypeId};
 use indexmap::IndexMap;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn transform<'src>(program: &Program<'src>, options: &BuildOptions) -> Result<String, Error> {
     Transformer::new(program, options).transform_entry()
@@ -60,7 +61,7 @@ pub fn transform_functions<'src>(
     let global_variables = crate::init_order::initialization_order(program, program.call_graph());
     let t_global_variables = transformer.walk_list(&global_variables);
 
-    let mut names = HashMap::new();
+    let mut names = HashMap::default();
     for root in roots {
         transformer.ensure_function_emitted(*root);
         names.insert(*root, transformer.ng.name_for(*root));
@@ -688,6 +689,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_column",
         "__db_is_null",
         "__db_close",
+        "__fs_stat",
         "__local_get",
         "__session_get",
         "__router_path",
@@ -700,6 +702,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__chunk_ready",
         "__chunk_load",
         "__chunk_preload",
+        "__is_null",
     ];
     EXTERN_HELPERS.iter().find(|name| **name == symbol).copied()
 }
@@ -829,6 +832,13 @@ fn helper_source(name: &str) -> &'static str {
              \t__chunk_load(arm, () => {}, () => {});\n\
              }"
         }
+        // `std::ui::mount_target` (A24, fullstack-dx.md §9.5): the one peek at
+        // whether a host value is JS `null`/`undefined` — `Element` (and any
+        // other opaque `external struct` handle) has no vilan-visible way to
+        // ask this itself.
+        "__is_null" => {
+            "function __is_null(value) {\n\treturn value === null || value === undefined;\n}"
+        }
         "__random_int" => {
             "function __random_int(low, high) {\n\
              \treturn Math.floor(Math.random() * (high - low + 1)) + low;\n\
@@ -926,6 +936,26 @@ fn helper_source(name: &str) -> &'static str {
         // `Database`'s `Drop` closes the handle (destruction.md §9). No public
         // `close()` surfaces this — the destructor is the only caller.
         "__db_close" => "function __db_close(database) {\n\tdatabase.close();\n}",
+        // `std::fs::stat` (F13, fullstack-dx.md §9.3): `fs.promises.stat`
+        // wrapped so a missing path reads back the `Option` array `None`
+        // instead of throwing — vilan has no `try`/`catch`, so the ENOENT
+        // catch has to live here. Every other failure re-throws, matching
+        // `read_bytes`/`read_dir`/`read_file_to_str`'s posture. The dynamic
+        // `import` is self-contained on purpose (no co-declared static
+        // import to coordinate with, the same reason `__hmac_sha512` reaches
+        // for the global `crypto` instead) and Node caches module resolution,
+        // so a hot loop does not re-resolve the module per call.
+        "__fs_stat" => {
+            "async function __fs_stat(path) {\n\
+             \tconst fsPromises = await import(\"node:fs/promises\");\n\
+             \ttry {\n\
+             \t\treturn [ 0, await fsPromises.stat(path) ];\n\
+             \t} catch (error) {\n\
+             \t\tif (error && error.code === \"ENOENT\") return [ 1 ];\n\
+             \t\tthrow error;\n\
+             \t}\n\
+             }"
+        }
         // Cryptographically random bytes.
         "__random_bytes" => {
             "function __random_bytes(length) {\n\treturn crypto.getRandomValues(new Uint8Array(length));\n}"
@@ -1004,6 +1034,16 @@ fn helper_source(name: &str) -> &'static str {
         // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // The trap arm of an exhaustive `match` over a BACKED enum
+        // (backed-enums.md §9): the enum lowers to a bare host primitive, so its
+        // runtime domain is the host's, not the variant set the analyzer proved
+        // total over. Reaching this means the subject holds a value outside the
+        // set — a panic naming the enum and the raw value, rather than the
+        // confident wrong variant a bare `else` used to answer. `JSON.stringify`
+        // so a string backing is quoted and a number is not.
+        "__enum_trap" => {
+            "function __enum_trap(name, value) {\n\tthrow name + \": \" + JSON.stringify(value) + \" is not one of its values\";\n}"
+        }
         // The externally-tagged enum discriminator: a bare `"Variant"` is its own
         // tag, a `{"Variant":..}` object's tag is its single key.
         "__json_tag" => {
@@ -1355,6 +1395,15 @@ struct MatchLeg<'src> {
     body: Vec<js::Node<'src>>,
 }
 
+/// One BACKED-enum test inside a match leg's pattern, and where the value it
+/// tests is read from (`backed_enum_name`'s enum, `compile_pattern`'s accessor).
+/// The trap arm names both (backed-enums.md §9.4, §11.6).
+struct BackedTest<'src> {
+    enum_name: &'src str,
+    enum_id: Id,
+    value: js::Node<'src>,
+}
+
 struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
@@ -1406,6 +1455,10 @@ struct Transformer<'src> {
     // Captures introduced by an `is` test, aliased to the subject's payload
     // slots (e.g. `t[1]`) since they can't be JS bindings in expression position.
     is_bindings: HashMap<Id, js::Node<'src>>,
+    // Expressions already evaluated into a temp, which every occurrence names
+    // instead of re-evaluating: a compound assignment's INDEXED target subscript,
+    // walked once for the write and once for the synthesized re-read (B105).
+    hoisted_values: HashMap<Id, js::Node<'src>>,
     // While `Some`, every `is_bindings` lookup records the capture it resolved.
     // A match guard is walked with this on, so the leg's lowering can tell
     // whether the guard READS a capture whose copy has to be declared ahead of
@@ -1519,7 +1572,7 @@ impl<'src> Transformer<'src> {
         // names identifiers after and `Annotated` annotates them with. `Plain`
         // needs none.
         let source_names = if matches!(style, NameStyle::Plain) {
-            HashMap::new()
+            HashMap::default()
         } else {
             program
                 .variables
@@ -1569,25 +1622,26 @@ impl<'src> Transformer<'src> {
             drop_fn_id: program.drop_fn_id,
             program,
             required_functions: IndexMap::new(),
-            emitting: HashSet::new(),
-            current_substitution: HashMap::new(),
+            emitting: HashSet::default(),
+            current_substitution: HashMap::default(),
             current_adapted: Vec::new(),
             current_instance: None,
             current_origin: None,
-            referenced_globals: HashSet::new(),
-            instances: HashMap::new(),
+            referenced_globals: HashSet::default(),
+            instances: HashMap::default(),
             current_self_type: None,
-            default_instances: HashMap::new(),
-            drop_helpers: HashMap::new(),
+            default_instances: HashMap::default(),
+            drop_helpers: HashMap::default(),
             monomorphized: Vec::new(),
-            is_bindings: HashMap::new(),
+            is_bindings: HashMap::default(),
+            hoisted_values: HashMap::default(),
             is_binding_reads: None,
             used_helpers: BTreeSet::new(),
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
             unresolved_drop_sinks: Vec::new(),
-            chunk_members: HashMap::new(),
+            chunk_members: HashMap::default(),
             chunk_count: 0,
             chunk_gate: None,
             gate_call_names: BTreeMap::new(),
@@ -2314,6 +2368,106 @@ impl<'src> Transformer<'src> {
         )));
     }
 
+    /// The compound-assignment subscript hoist (B105). `x[i] op= v` desugars to
+    /// `x[i] = x[i] op v`, and the two `x[i]`s are two independent walks of the
+    /// same source place — so every effectful subscript in the target ran TWICE
+    /// (`ys[bump()] += 1` emitted `__at_put(ys, bump(), __at(ys, bump()) + 1)`).
+    /// Each is evaluated ONCE into a temp declared ahead of the statement, and
+    /// both occurrences name the temp.
+    ///
+    /// The compound-ness comes from the analyzer's own record rather than from
+    /// the shape: `ys[f()] = ys[g()] + 1` has the same shape and two genuinely
+    /// different subscripts.
+    fn hoist_compound_target(
+        &mut self,
+        target_id: Id,
+        value_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        // The re-read is the synthesized left operand of the desugared binary. An
+        // OVERLOADED operator keeps this shape — its dispatch is a side map
+        // (`binary_op_dispatch`), not a different expression — and a VIEW target
+        // wraps both halves alike in R5's synthetic `Dereference`, under which the
+        // analyzer's mark sits.
+        let Some(&Expr::Binary(_, left_id, _)) = self.program.entity_map.get(&value_id) else {
+            return;
+        };
+        let reread_id = match self.program.entity_map.get(&left_id) {
+            Some(&Expr::Dereference(operand)) => operand,
+            _ => left_id,
+        };
+        if !self.program.compound_rereads.contains(&reread_id) {
+            return;
+        }
+        self.hoist_compound_place(target_id, reread_id, block);
+    }
+
+    /// The two place spines in lockstep — they are the same source place walked
+    /// twice, so they match node for node, and pairing them is what lets the
+    /// re-read name the write's temp.
+    ///
+    /// Descends to the ROOT first, so the temps land in source order (`grid[f()][g()]`
+    /// evaluates `f()` before `g()`), which is also the order the un-hoisted
+    /// emission ran them in — a JS call evaluates its arguments left to right, and
+    /// the subscript is `__at_put`'s second argument while the read is its third.
+    /// Nothing but the duplication changes.
+    ///
+    /// A **pure** subscript is deliberately left alone: evaluating `i` twice is
+    /// not an observable difference, and a temp for it would churn goldens with
+    /// nothing to show for it.
+    fn hoist_compound_place(
+        &mut self,
+        target_id: Id,
+        reread_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) {
+        let matched = match (
+            self.program.entity_map.get(&target_id),
+            self.program.entity_map.get(&reread_id),
+        ) {
+            (
+                Some(&Expr::Index(target_subject, target_index)),
+                Some(&Expr::Index(reread_subject, reread_index)),
+            ) => Some((
+                target_subject,
+                reread_subject,
+                Some((target_index, reread_index)),
+            )),
+            (
+                Some(&Expr::Field(target_subject, _, _)),
+                Some(&Expr::Field(reread_subject, _, _)),
+            )
+            | (
+                Some(&Expr::TupleIndex(target_subject, _, _)),
+                Some(&Expr::TupleIndex(reread_subject, _, _)),
+            )
+            | (
+                Some(&Expr::Dereference(target_subject)),
+                Some(&Expr::Dereference(reread_subject)),
+            ) => Some((target_subject, reread_subject, None)),
+            _ => None,
+        };
+        let Some((target_subject, reread_subject, index)) = matched else {
+            return;
+        };
+        self.hoist_compound_place(target_subject, reread_subject, block);
+        if let Some((target_index, reread_index)) = index
+            && self.expr_has_side_effects(target_index)
+        {
+            let value = self
+                .walk_entity(target_index, block)
+                .unwrap_or(js::Node::Void);
+            let name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(value),
+            }));
+            let temp = js::Node::Local(name);
+            self.hoisted_values.insert(target_index, temp.clone());
+            self.hoisted_values.insert(reread_index, temp);
+        }
+    }
+
     /// Whether an expression may have a side effect — a call, an `await`, or an
     /// assignment, or anything containing one. An unused `let` binding can be
     /// dropped only if its initializer is side-effect-free; a side-effecting one
@@ -2364,21 +2518,62 @@ impl<'src> Transformer<'src> {
     /// parameter, or `&place` of a scalar place directly.
     fn derefs_scalar_view(&self, operand: Id) -> bool {
         match self.program.entity_map.get(&operand) {
+            Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
+            _ => self.emits_scalar_view_pair(operand),
+        }
+    }
+
+    /// Whether an expression's own emission IS a scalar `(base, key)` pair — a
+    /// scalar view binding / parameter, or a call returning a scalar view.
+    ///
+    /// Deliberately not the `&place` case, which `derefs_scalar_view` adds for
+    /// its own question: at B108's return seam a `&place` leaf emits the PLACE
+    /// READ, not a pair (the `Expr::Reference` arm decides that with the seam in
+    /// hand), so asking "is this already a pair" must say no about it.
+    fn emits_scalar_view_pair(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
             Some(Expr::Local(binding)) => {
                 self.program.primitive_views.contains(binding)
                     || self.generic_ref_param_is_scalar(*binding)
             }
-            Some(Expr::Reference(..)) => self.program.scalar_view_refs.contains(&operand),
             // `*obj.slot()` — a `borrows` call returning a scalar view. A
             // scalar `Shared::write()` is one too: it lowers to the `(base,
             // key)` pair, and the analyzer cannot classify it (the pointee is
             // generic until this monomorphization).
             Some(Expr::Call(..)) => {
-                self.program.scalar_view_calls.contains(&operand)
-                    || self.call_is_scalar_shared_write(operand)
+                self.program.scalar_view_calls.contains(&id) || self.call_is_scalar_shared_write(id)
             }
             _ => false,
         }
+    }
+
+    /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
+    /// A view produced by a CALL is bound to a temp first, so the two reads do
+    /// not evaluate it twice; a plain binding or reference is cheap to repeat.
+    fn emit_scalar_view_read(
+        &mut self,
+        view_id: Id,
+        view: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let mut view = view;
+        if matches!(self.program.entity_map.get(&view_id), Some(Expr::Call(..))) {
+            let name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(view),
+            }));
+            view = js::Node::Local(name);
+        }
+        let base = js::Node::PropertyIndex(
+            Box::new(view.clone()),
+            Box::new(js::Node::Number("0".to_string(), None)),
+        );
+        let key = js::Node::PropertyIndex(
+            Box::new(view),
+            Box::new(js::Node::Number("1".to_string(), None)),
+        );
+        js::Node::PropertyIndex(Box::new(base), Box::new(key))
     }
 
     /// Whether a call expression is a `Shared::write()` with a scalar pointee.
@@ -2625,6 +2820,15 @@ impl<'src> Transformer<'src> {
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
+        // B108: the same seam for a leaf whose runtime representation is a
+        // scalar `(base, key)` view — a `&mut i32` parameter forwarded straight
+        // out, a scalar `borrows` call, a generic `&T` at a scalar
+        // instantiation. `__clone` cannot collapse a pair (and the type filter
+        // rightly kept scalars out of `return_clone_sites`); a scalar's copy IS
+        // its read (B81), so the crossing emits the read.
+        if self.program.return_view_reads.contains(&id) && self.emits_scalar_view_pair(id) {
+            return Some(self.emit_scalar_view_read(id, node, block));
+        }
         // Rule 1's return clause: a tail/`ret` leaf that hands back a place the
         // body does not own copies HERE, where the place itself is emitted, so
         // that a tail `if`/`match` copies only in the arms that owe it. Keyed by
@@ -2653,6 +2857,11 @@ impl<'src> Transformer<'src> {
         // never short-circuits an evaluation.
         if let Some(value) = self.program.const_results.get(&id) {
             return Some(const_value_to_js(value));
+        }
+        // An expression already evaluated into a temp (B105) names the temp: the
+        // whole point is that the second occurrence does not run it again.
+        if let Some(hoisted) = self.hoisted_values.get(&id) {
+            return Some(hoisted.clone());
         }
         let entity = self.program.entity_map.get(&id).unwrap();
 
@@ -3591,7 +3800,14 @@ impl<'src> Transformer<'src> {
             // aggregate is the value's own JS reference (an aggregate is its own
             // view), so it passes through unchanged.
             Expr::Reference(operand, _) => {
-                if self.emits_scalar_view_ref(id, *operand) {
+                // B108/B109: at a by-value return seam the reference CROSSES to a
+                // value, so what leaves is the place the reference names — its
+                // read, never the pair. (An aggregate view is the value's own JS
+                // reference, so it takes this path anyway; only a scalar's
+                // representation differs, which is the whole of B108.)
+                if self.emits_scalar_view_ref(id, *operand)
+                    && !self.program.return_view_reads.contains(&id)
+                {
                     let (base, key) = match self.program.entity_map.get(operand) {
                         Some(Expr::Field(subject, _, field_index)) => (
                             self.walk_entity(*subject, block).unwrap_or(js::Node::Void),
@@ -3628,29 +3844,11 @@ impl<'src> Transformer<'src> {
             // Deref of an aggregate view is the operand itself; deref of a scalar
             // `(base, key)` view reads/writes through `operand[0][operand[1]]`.
             Expr::Dereference(operand) => {
-                let value = self.walk_entity(*operand, block);
-                if self.derefs_scalar_view(*operand) {
-                    let mut view = value.unwrap_or(js::Node::Void);
-                    // A view produced by a call (`*obj.slot()`) is bound to a temp
-                    // first, so the `[0]` and `[1]` reads don't evaluate the call
-                    // twice; a plain binding / reference is cheap to repeat.
-                    if matches!(self.program.entity_map.get(operand), Some(Expr::Call(..))) {
-                        let name = self.ng.next_name();
-                        block.push(js::Node::ConstVariable(js::Variable {
-                            name: name.clone(),
-                            value: Box::new(view),
-                        }));
-                        view = js::Node::Local(name);
-                    }
-                    let base = js::Node::PropertyIndex(
-                        Box::new(view.clone()),
-                        Box::new(js::Node::Number("0".to_string(), None)),
-                    );
-                    let key = js::Node::PropertyIndex(
-                        Box::new(view),
-                        Box::new(js::Node::Number("1".to_string(), None)),
-                    );
-                    return Some(js::Node::PropertyIndex(Box::new(base), Box::new(key)));
+                let operand = *operand;
+                let value = self.walk_entity(operand, block);
+                if self.derefs_scalar_view(operand) {
+                    let view = value.unwrap_or(js::Node::Void);
+                    return Some(self.emit_scalar_view_read(operand, view, block));
                 }
                 return value;
             }
@@ -3770,6 +3968,12 @@ impl<'src> Transformer<'src> {
                 }
             }
             Expr::Assignment(target_id, value_id) => {
+                // B105: a compound assignment desugars to `x = x op v`, which walks
+                // the target place TWICE — so an effectful subscript in it ran
+                // twice. Evaluate each one here, first, into a temp both walks
+                // name; source order puts the subscript ahead of everything the
+                // write does, the drop below included.
+                self.hoist_compound_target(*target_id, *value_id, block);
                 // R2 (destruction.md §5): assigning onto a place that still holds
                 // a resource drops the OLD value first, then moves the new one in.
                 // The analyzer flagged the assignment and resolved the overwritten
@@ -4239,7 +4443,7 @@ impl<'src> Transformer<'src> {
                             let mut copies = Vec::new();
                             self.materialize_captures(&leg.pattern, &mut copies);
                             let mut guard_prelude = Vec::new();
-                            let outer_reads = self.is_binding_reads.replace(HashSet::new());
+                            let outer_reads = self.is_binding_reads.replace(HashSet::default());
                             guard_condition = self.walk_entity(guard_id, &mut guard_prelude);
                             let guard_reads =
                                 std::mem::replace(&mut self.is_binding_reads, outer_reads)
@@ -4320,13 +4524,171 @@ impl<'src> Transformer<'src> {
                         break;
                     }
                 }
-                // The analyzer verified exhaustiveness, so the final leg can
-                // always be the `else` branch — its whole test, guard and
-                // guard prelude included, is dropped.
-                if let Some(last_leg) = compiled_legs.last_mut() {
+                // backed-enums.md §9 (candidate (b), ratified): the one match
+                // whose final leg does NOT become a bare `else`. A backed enum
+                // lowers to a bare host primitive (§3.5), so §1.5's
+                // exhaustiveness proof is over the vilan-side VARIANT SET and
+                // never was a proof about the runtime value's domain — the
+                // host's. The final leg keeps its variant test and the `else`
+                // traps, so a value outside the set is named instead of
+                // silently becoming whichever variant the analyzer ordered
+                // last (P11). Asked of the leg's own pattern, never of where
+                // the subject came from — that is the whole point of (b) over
+                // (a).
+                //
+                // §11.6 / B114: asked of the whole pattern, not of its root. A
+                // backed test nested in a payload (`Pair::Of(Align::Start)`) is
+                // the same hazard, and dropping the leg's condition drops that
+                // `===` with the rest. The trap keys on backed tests ONLY, so a
+                // match carrying none emits exactly as it always did.
+                let mut trap_tests = Vec::new();
+                if let Some(final_leg) = compiled_legs
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|index| legs.get(index))
+                {
+                    self.backed_pattern_tests(
+                        &final_leg.pattern,
+                        js::Node::Local(subject_name.clone()),
+                        &mut trap_tests,
+                    );
+                }
+                // B121 (backed-enums.md §13): a backed test in an EARLIER leg
+                // can ALSO be what the bare `else` needs to trap for — a
+                // hazard §12.1 does not reach because it only asks the FINAL
+                // leg's own pattern. `Pair::Of(Align::Start) => .., Pair::Of
+                // (Align::End) => .., Pair::Other => ..` carries no backed
+                // test in `Other`'s leg (so `trap_tests` above is empty, same
+                // as an ordinary bare `else`), but every `Of` leg tests a
+                // SPECIFIC `Align` literal — together they are `Of`'s only
+                // handler, so reaching this point with the subject's tag
+                // actually `Of` is possible only when the payload left
+                // `Align`'s set. §12.1's message still applies (which VALUE
+                // left its set, not which TEST failed) but its trap point
+                // does not: the payload slot depends on which variant the
+                // subject turns out to be, which the final leg's own pattern
+                // cannot say. So this re-dispatches on the tag INSIDE the
+                // dropped leg's body instead — one partitioned variant at a
+                // time, in the order its legs first appear — and traps only
+                // for a tag that never got an unconditional (irrefutable-
+                // payload) leg of its own; a tag covered that way already
+                // matches its own leg earlier in the chain and never reaches
+                // here, so re-testing it would-be dead code, not a wrong
+                // trap. The final leg's own tag is what is left once none of
+                // the partitioned ones matched, and it keeps the author's own
+                // body underneath, unchanged.
+                let mut earlier_variant_traps: Vec<(usize, js::Node<'src>, Vec<BackedTest<'src>>)> =
+                    Vec::new();
+                if trap_tests.is_empty()
+                    && let Some(final_leg_index) = compiled_legs.len().checked_sub(1)
+                    && let Some((final_enum_id, final_variant_index)) = legs
+                        .get(final_leg_index)
+                        .and_then(|leg| match &leg.pattern {
+                            ExprPattern::Variant(enum_id, variant_index, _) => {
+                                Some((*enum_id, *variant_index))
+                            }
+                            _ => None,
+                        })
+                {
+                    for leg in legs.iter().take(final_leg_index) {
+                        let ExprPattern::Variant(enum_id, variant_index, _) = &leg.pattern else {
+                            continue;
+                        };
+                        if *enum_id != final_enum_id || *variant_index == final_variant_index {
+                            continue;
+                        }
+                        let mut tests = Vec::new();
+                        self.backed_pattern_tests(
+                            &leg.pattern,
+                            js::Node::Local(subject_name.clone()),
+                            &mut tests,
+                        );
+                        if tests.is_empty() {
+                            continue;
+                        }
+                        match earlier_variant_traps
+                            .iter_mut()
+                            .find(|(index, _, _)| index == variant_index)
+                        {
+                            Some((_, _, existing)) => {
+                                for test in tests {
+                                    let already_seen = existing.iter().any(|seen: &BackedTest| {
+                                        seen.enum_id == test.enum_id
+                                            && Self::same_trap_accessor(&seen.value, &test.value)
+                                    });
+                                    if !already_seen {
+                                        existing.push(test);
+                                    }
+                                }
+                            }
+                            None => {
+                                let tag_test = self.variant_tag_test(
+                                    *enum_id,
+                                    *variant_index,
+                                    &js::Node::Local(subject_name.clone()),
+                                );
+                                earlier_variant_traps.push((*variant_index, tag_test, tests));
+                            }
+                        }
+                    }
+                }
+                // The analyzer verified exhaustiveness, so an UNGUARDED final
+                // leg can always be the `else` branch — its whole test is
+                // dropped. Backed tests are the exception (§9/§11.6): the leg
+                // keeps its condition and the `else` traps.
+                //
+                // B115: a GUARDED final leg never carries that proof — the
+                // analyzer's walk counts unguarded legs only, so the legs
+                // BEFORE this one are what make the match exhaustive, and this
+                // one keeps its test, its prelude and its guard. The trap
+                // composes cleanly: an in-set value this guard rejects was
+                // taken by an earlier leg, so only an out-of-set value reaches
+                // the trap, exactly as when the final leg is unguarded.
+                let last_leg_droppable = compiled_legs
+                    .last()
+                    .is_some_and(|leg| leg.guard_condition.is_none());
+                if last_leg_droppable && trap_tests.is_empty() && !earlier_variant_traps.is_empty()
+                {
+                    let mut chain = js::IfBranch::Else(std::mem::take(
+                        &mut compiled_legs.last_mut().expect("checked above").body,
+                    ));
+                    for (_, tag_test, tests) in earlier_variant_traps.into_iter().rev() {
+                        let trap = self.trap_body(tests);
+                        chain = js::IfBranch::If(Box::new(tag_test), trap, Some(Box::new(chain)));
+                    }
+                    let last_leg = compiled_legs.last_mut().expect("checked above");
+                    last_leg.body = vec![js::Node::If(chain)];
                     last_leg.pattern_condition = None;
-                    last_leg.guard_condition = None;
                     last_leg.prelude.clear();
+                } else if let Some(last_leg) = compiled_legs.last_mut()
+                    && last_leg.guard_condition.is_none()
+                {
+                    if trap_tests.is_empty() {
+                        last_leg.pattern_condition = None;
+                    }
+                    last_leg.prelude.clear();
+                }
+                if !trap_tests.is_empty() {
+                    // ONE backed test is the whole story: reaching the trap
+                    // proves that value left its set, so it is named
+                    // unconditionally — which is the shipped §9 emission when
+                    // the test is the pattern's root (the accessor is the
+                    // subject itself), byte for byte.
+                    //
+                    // SEVERAL backed tests in one leg (`Two::Of(Align::End,
+                    // Display::Inline)`) is the case §11.6 said needed a message
+                    // design §9 does not have, and it needs none: which value
+                    // failed is not knowable from the leg's condition, but it IS
+                    // knowable by asking each value whether it is in its enum's
+                    // set at all. The first that is not is named; the last is
+                    // what is left when none of the others answered.
+                    let trap_body = self.trap_body(trap_tests);
+                    compiled_legs.push(MatchLeg {
+                        pattern_condition: None,
+                        prelude: Vec::new(),
+                        guard_condition: None,
+                        body: trap_body,
+                    });
                 }
                 if compiled_legs.iter().all(|leg| leg.prelude.is_empty()) {
                     self.emit_match_chain(compiled_legs, block);
@@ -4460,6 +4822,19 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// The name of `enum_id` if it is a BACKED enum, else `None`. `bool` is
+    /// excluded deliberately: it lowers to a native scalar through its own
+    /// special case rather than through a backing value (§3.4 rejects a `bool`
+    /// backing), and a `match` over it is not what §9's trap arm guards.
+    fn backed_enum_name(&self, enum_id: Id) -> Option<&'src str> {
+        if Some(enum_id) == self.program.bool_enum_id {
+            return None;
+        }
+        let enum_ = self.program.enums.get(&enum_id)?;
+        enum_.backing?;
+        Some(enum_.name)
+    }
+
     /// For a variant of an enum that lowers to a native scalar — `bool`
     /// (`subject === true`) or a backed enum (`subject === backing value`) — the
     /// equality test. `None` for array-form enums, which test the `[0]` slot.
@@ -4483,6 +4858,172 @@ impl<'src> Transformer<'src> {
             Box::new(subject.clone()),
             Box::new(value),
         ))
+    }
+
+    /// Every BACKED-enum test `pattern` carries, in source order, each paired
+    /// with the accessor that reads the value it tests.
+    ///
+    /// This is §9's trap question asked of the pattern TREE rather than of its
+    /// root (§11.6, B114). A backed enum reached through a payload —
+    /// `Pair::Of(Align::Start)` — is the same hazard one level down: its `===`
+    /// rides in the leg's condition, and the final leg drops that condition
+    /// whole. The walk mirrors `compile_pattern`'s accessors exactly, so the
+    /// value named at the trap is the value the dropped test compared.
+    ///
+    /// A backed enum has no payload variants (§3.3), so a backed test is always
+    /// a LEAF — the walk never recurses through one, and a variant's payload is
+    /// only descended for the array-form enums that have one.
+    fn backed_pattern_tests(
+        &self,
+        pattern: &ExprPattern,
+        subject: js::Node<'src>,
+        out: &mut Vec<BackedTest<'src>>,
+    ) {
+        match pattern {
+            // Irrefutable, or refutable against something that is not an enum
+            // value: a literal pattern's domain is the primitive's own, which no
+            // host value can leave.
+            ExprPattern::Wildcard | ExprPattern::Binding(_) | ExprPattern::Literal(_) => {}
+            ExprPattern::Variant(enum_id, _, payload) => {
+                if let Some(enum_name) = self.backed_enum_name(*enum_id) {
+                    out.push(BackedTest {
+                        enum_name,
+                        enum_id: *enum_id,
+                        value: subject,
+                    });
+                    return;
+                }
+                // `bool` lowers to a native scalar too (and carries no payload),
+                // but its two values ARE its domain — nothing to trap.
+                if Some(*enum_id) == self.program.bool_enum_id {
+                    return;
+                }
+                for (data_index, sub_pattern) in payload.iter().enumerate() {
+                    let element = js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number((data_index + 1).to_string(), None)),
+                    );
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+            ExprPattern::Tuple(elements) => {
+                let mut leaves = Vec::new();
+                Self::flatten_tuple_pattern(elements, &subject, 0, &mut leaves);
+                for (sub_pattern, element) in leaves {
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+            ExprPattern::Array(elements) => {
+                for (index, sub_pattern) in elements.iter().enumerate() {
+                    let element = js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number(index.to_string(), None)),
+                    );
+                    self.backed_pattern_tests(sub_pattern, element, out);
+                }
+            }
+        }
+    }
+
+    /// `value === v1 || value === v2 || …` over every variant of a backed enum:
+    /// the runtime question "is this one of its values AT ALL", which is a
+    /// different question from "did this leg's test match". Only the trap block
+    /// asks it, and only when one leg carries more than one backed test — see
+    /// `Expr::Match`.
+    fn backed_value_membership(
+        &self,
+        enum_id: Id,
+        value: &js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let enum_ = self.program.enums.get(&enum_id)?;
+        (0..enum_.variants.len())
+            .filter_map(|variant_index| self.scalar_variant_test(enum_id, variant_index, value))
+            .reduce(|a, b| js::Node::Binary(BinaryOp::Or, Box::new(a), Box::new(b)))
+    }
+
+    /// The runtime test for "is this value variant `variant_index` of
+    /// `enum_id`" — a native scalar comparison for `bool`/backed enums, else
+    /// the array's own discriminant slot at index 0. `compile_pattern`'s
+    /// `Variant` arm builds exactly this (inline, for the pattern it is
+    /// walking); B121's earlier-leg re-dispatch needs the same test for a leg
+    /// it is NOT walking through `compile_pattern` (it reads straight off the
+    /// leg list), so it is pulled out here rather than duplicated ad hoc.
+    fn variant_tag_test(
+        &self,
+        enum_id: Id,
+        variant_index: usize,
+        subject: &js::Node<'src>,
+    ) -> js::Node<'src> {
+        self.scalar_variant_test(enum_id, variant_index, subject)
+            .unwrap_or_else(|| {
+                js::Node::Binary(
+                    BinaryOp::Eq,
+                    Box::new(js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number("0".to_string(), None)),
+                    )),
+                    Box::new(js::Node::Number(variant_index.to_string(), None)),
+                )
+            })
+    }
+
+    /// Whether two trap accessors read the exact same slot. Restricted to the
+    /// `Local`/`PropertyIndex`/`Number` shapes `backed_pattern_tests` ever
+    /// builds (a chain of property reads off the match subject) — B121's
+    /// per-variant grouping uses it to tell "the same `Align` slot, tested by
+    /// two different legs of the same variant" from "two different slots that
+    /// happen to share an enum", without a general `js::Node` equality that
+    /// would have to answer for every other variant too. Anything outside
+    /// that shape compares unequal, which only costs a redundant (harmless)
+    /// trap test — never a wrong one.
+    fn same_trap_accessor(a: &js::Node<'src>, b: &js::Node<'src>) -> bool {
+        match (a, b) {
+            (js::Node::Local(left), js::Node::Local(right)) => left == right,
+            (js::Node::Number(left, _), js::Node::Number(right, _)) => left == right,
+            (
+                js::Node::PropertyIndex(left_object, left_index),
+                js::Node::PropertyIndex(right_object, right_index),
+            ) => {
+                Self::same_trap_accessor(left_object, right_object)
+                    && Self::same_trap_accessor(left_index, right_index)
+            }
+            _ => false,
+        }
+    }
+
+    /// The `__enum_trap` sequence for a set of backed tests read while
+    /// reaching one point of a match: `K` tests become `K − 1`
+    /// membership-guarded traps and one bare one (backed-enums.md §12.1) —
+    /// the last needs no guard because it is what is left once none of the
+    /// others answered. Factored out of `Expr::Match`'s final-leg trap so
+    /// B121's earlier-leg re-dispatch can build the identical shape for a
+    /// DIFFERENT reason to be there (a variant whose own legs, not the final
+    /// one, exhausted their literals) without a second implementation to
+    /// drift out of step with the first.
+    fn trap_body(&mut self, tests: Vec<BackedTest<'src>>) -> Vec<js::Node<'src>> {
+        self.used_helpers.insert("__enum_trap");
+        let final_test = tests.len() - 1;
+        let mut body = Vec::new();
+        for (index, test) in tests.into_iter().enumerate() {
+            let trap = js::Node::Call(
+                Box::new(js::Node::Local("__enum_trap".to_string())),
+                vec![
+                    js::Node::String(Cow::Borrowed(test.enum_name)),
+                    test.value.clone(),
+                ],
+            );
+            match self.backed_value_membership(test.enum_id, &test.value) {
+                Some(membership) if index < final_test => {
+                    body.push(js::Node::If(js::IfBranch::If(
+                        Box::new(js::Node::Unary('!', Box::new(membership))),
+                        vec![trap],
+                        None,
+                    )))
+                }
+                _ => body.push(trap),
+            }
+        }
+        body
     }
 
     /// B53 (rule 1): whether this capture's slot read copies AT THIS EMISSION.
@@ -4545,7 +5086,9 @@ impl<'src> Transformer<'src> {
         let leg_count = legs.len();
         for (index, leg) in legs.into_iter().enumerate() {
             let mut body = leg.body;
-            // The final leg is the `else`: nothing follows it to fall through to.
+            // Nothing follows the final leg to fall through to, so it has no
+            // flag to set — whether it is the `else` (unguarded) or keeps a test
+            // of its own (a guarded final leg, B115).
             if index + 1 < leg_count {
                 // Record the match BEFORE the body runs, so a body that returns,
                 // breaks, or continues cannot leave the flag behind.
@@ -5089,6 +5632,14 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            // `a === b` — the body of `impl Hash with PartialEq`. A `Hash` is
+            // always a JS primitive, so native equality IS its equality
+            // (hashable-keys.md §3.2); no helper, the comparison is the node.
+            Intrinsic::HashEq => js::Node::Binary(
+                BinaryOp::Eq,
+                Box::new(args.next().unwrap_or(js::Node::Void)),
+                Box::new(args.next().unwrap_or(js::Node::Void)),
+            ),
             // `Array.from(document.querySelectorAll(selector))` — the NodeList as a
             // real array, so `List` operations (`map`/`push`/…) behave.
             Intrinsic::QuerySelectorAll => {
@@ -5404,7 +5955,7 @@ impl<'src> Transformer<'src> {
             self.program.functions.get(&from),
             self.program.functions.get(&to),
         ) else {
-            return HashMap::new();
+            return HashMap::default();
         };
         from.generic_parameter_constraint_ids
             .iter()
@@ -5533,7 +6084,7 @@ impl<'src> Transformer<'src> {
         {
             return Dispatch::Extern(member_id, binding);
         }
-        let mut substitution = HashMap::new();
+        let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
         if !own_generic_values.is_empty() {
             if let Some(function) = self.program.functions.get(&member_id) {
@@ -5654,7 +6205,7 @@ impl<'src> Transformer<'src> {
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        let mut substitution = HashMap::new();
+        let mut substitution = HashMap::default();
         let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
             return substitution;
         };
@@ -6065,7 +6616,7 @@ impl<'src> Transformer<'src> {
     /// Searches a trait and its supertraits for a default (bodied) member.
     fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
         let mut stack = vec![trait_id];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
@@ -6243,10 +6794,10 @@ impl<'src> Transformer<'src> {
     /// caller falls back to a plain (generic) emission.
     fn inherited_substitution(&self, target_id: Id) -> HashMap<TypeId, TypeId> {
         if self.current_substitution.is_empty() {
-            return HashMap::new();
+            return HashMap::default();
         }
         let Some(function) = self.program.functions.get(&target_id) else {
-            return HashMap::new();
+            return HashMap::default();
         };
         let mut generics = Vec::new();
         for parameter_id in &function.parameters {
@@ -7104,7 +7655,7 @@ pub fn transform_const_program<'src>(
 
     // Emitting a binding's initializer can reference more bindings (and
     // require more functions) — iterate to a fixpoint.
-    let mut declared: HashSet<Id> = HashSet::new();
+    let mut declared: HashSet<Id> = HashSet::default();
     let mut unresolved: Vec<Id> = Vec::new();
     let mut prelude: Vec<js::Node<'src>> = Vec::new();
     loop {
@@ -7483,11 +8034,11 @@ impl NameGenerator {
                 .chars()
                 .collect(),
             counter: 0,
-            names: HashMap::new(),
+            names: HashMap::default(),
             source_names,
             style,
             taken: reserved,
-            minted: HashSet::new(),
+            minted: HashSet::default(),
         }
     }
 
@@ -7946,7 +8497,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
         NameStyle::Plain => true,
     };
     // Each renameable binding's current (unique) name -> its source name.
-    let mut source_of: HashMap<String, String> = HashMap::new();
+    let mut source_of: HashMap<String, String> = HashMap::default();
     for (id, name) in &ng.names {
         if let Some(source) = ng.source_names.get(id) {
             source_of.insert(name.clone(), source.clone());
@@ -7981,7 +8532,7 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
     // the name the generator minted, which is a name this pass can otherwise
     // mint again. Reserving the unreached names makes the allocator's output
     // disjoint from the kept names whatever the walk did or did not see.
-    let mut reached = HashSet::new();
+    let mut reached = HashSet::default();
     collect_reached_names(&global, &mut reached);
     reserved.extend(
         renameable
@@ -7989,11 +8540,11 @@ fn rename_for_scopes(ng: &NameGenerator, program: &Program, nodes: &mut Vec<js::
             .filter(|name| !reached.contains(*name))
             .cloned(),
     );
-    let mut rename = HashMap::new();
+    let mut rename = HashMap::default();
     allocate_scope(
         &global,
         &reserved,
-        &HashMap::new(),
+        &HashMap::default(),
         release,
         &source_of,
         &mut rename,

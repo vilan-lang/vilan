@@ -2,20 +2,21 @@
 //! handlers run against it: position→entity lookup, hover, go-to-definition,
 //! find-references, and rename.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
 use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Implementation, Parameter, SourceId};
+use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
 use vilan_core::lexing::tokenize;
 use vilan_core::node::Convention;
 use vilan_core::token::Token;
 use vilan_core::type_::Type;
 use vilan_core::{
-    Error, Manifest, Platform as BuildPlatform, Program, Span, Workspace as BuildWorkspace,
-    analyze_source,
+    Error, Manifest, PackageSpec, Platform as BuildPlatform, Program, Span,
+    Workspace as BuildWorkspace, analyze_source,
 };
 
 use crate::line_index::LineIndex;
@@ -44,6 +45,63 @@ impl ProjectContext {
             pkg_root: None,
             workspace: BuildWorkspace::default(),
             manifest_problem: None,
+        }
+    }
+}
+
+/// The package roots an `import`/`use` path in this file resolves against, kept
+/// from the analysis that produced the `Program` (E57).
+///
+/// Import-path completion cannot read its candidates out of the `Program`: the
+/// point of an import is to reach a module that has NOT been loaded, and the
+/// head of the path names an *origin* — `std`, `pkg`, a dependency package —
+/// which is not an entity at all. So it reads the package tree, and it must read
+/// the same tree the loader would: these are the very values
+/// `analyze_on_this_thread` handed to `analyze_source`, kept instead of dropped.
+///
+/// The platform is not among them — it selects which of a library's layers a
+/// module resolves from, and the analysis records the one it settled on as
+/// `Program::platform`.
+struct ImportRoots {
+    /// The `std` library's layered spec (`resolve_std`).
+    std: PackageSpec,
+    /// Where `import pkg::..` siblings live — this file's package source root.
+    pkg_root: PathBuf,
+    /// The entry package's direct dependencies, each under the name an import
+    /// addresses it by.
+    dependencies: Vec<(String, PackageSpec)>,
+}
+
+impl ImportRoots {
+    /// The source roots `origin::` resolves its modules from, in the loader's
+    /// own order, together with the package SURFACE (`lib.vl`) that origin
+    /// publishes. `None` when `origin` names no origin.
+    ///
+    /// A library has a surface — `import std::print` names a leaf of std's
+    /// `lib.vl`, which declares nothing and re-exports everything. The entry
+    /// package does not: a `[package]` has a `main.vl`, and its modules are
+    /// addressed by path. This mirrors the loader exactly, which searches the
+    /// layered `search_roots` for `std` and a dependency, and the single
+    /// `pkg_root` for the entry's own `pkg::`.
+    fn origin_roots(
+        &self,
+        origin: &str,
+        platform: BuildPlatform,
+    ) -> Option<(Vec<&Path>, Option<PathBuf>)> {
+        fn library(spec: &PackageSpec, platform: BuildPlatform) -> (Vec<&Path>, Option<PathBuf>) {
+            (
+                spec.search_roots(platform),
+                spec.surface.then(|| spec.base_root.join("lib.vl")),
+            )
+        }
+        match origin {
+            "std" => Some(library(&self.std, platform)),
+            "pkg" => Some((vec![self.pkg_root.as_path()], None)),
+            _ => self
+                .dependencies
+                .iter()
+                .find(|(name, _)| name == origin)
+                .map(|(_, spec)| library(spec, platform)),
         }
     }
 }
@@ -318,6 +376,28 @@ pub struct Completion {
     /// (`CompletionKind::Snippet`, from [`CONSTRUCT_SNIPPETS`]); `None` for every
     /// other candidate (E14).
     pub snippet: Option<SnippetInsertion>,
+    /// The import this candidate needs before it resolves (E54c) — `None` for
+    /// a candidate already reachable without one (every candidate except the
+    /// ones [`Document::auto_import_completions`] adds). The server
+    /// (`to_completion_item`) turns `Some` into a labeled `detail` (the
+    /// module, e.g. `std::json`) and the `additionalTextEdits` that insert
+    /// the import when the candidate is accepted.
+    pub needs_import: Option<AutoImport>,
+}
+
+/// The ready-made import edit an auto-import completion candidate carries
+/// (E54c): the module path (for the popup's `detail` label) and the
+/// [`vilan_core::formatter::insert_import`] edit that adds it, already
+/// computed against the live buffer.
+pub struct AutoImport {
+    pub module_path: Vec<String>,
+    pub edit_span: Span,
+    pub edit_replacement: String,
+    /// This candidate's auto-import ranking tier (E59, [`import_origin_tier`]),
+    /// carried through so the server (`main::to_completion_item`) can bucket
+    /// the client-visible `sort_text` by it without re-deriving it from
+    /// `module_path` — one computation, read in two places.
+    pub origin_tier: u8,
 }
 
 impl Completion {
@@ -331,6 +411,7 @@ impl Completion {
             documentation: None,
             call_parameters: None,
             snippet: None,
+            needs_import: None,
         }
     }
 
@@ -349,6 +430,7 @@ impl Completion {
                 body: body.to_string(),
                 fallback: keyword.to_string(),
             }),
+            needs_import: None,
         }
     }
 }
@@ -689,21 +771,81 @@ fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
 
 /// Whether `offset` sits inside a `use`/`import` item — where a name is being
 /// bound into scope, not called, so even a function completes to a bare name
-/// (`use std::math::sqrt`, not `sqrt(…)`). Imports are single-line,
-/// newline-terminated items, so this reads the current line's leading keyword
-/// (a leading `export` prefix — `export import …` — is skipped). Multi-line
-/// braced groups past their first line are not recognized; the corpus has none.
+/// (`use std::math::sqrt`, not `sqrt(…)`), and where the candidates themselves
+/// come from the package tree rather than from scope (E57).
 fn in_import_path(text: &str, offset: usize) -> bool {
+    import_path_prefix(text, offset).is_some()
+}
+
+/// The import path typed so far on the line ending at `offset` — everything
+/// after the `import`/`use` keyword — or `None` when the line is not an import
+/// item.
+///
+/// Imports are single-line, newline-terminated items, so this reads the current
+/// line's leading keyword (a leading `export` prefix — `export import …` — is
+/// skipped). Multi-line braced groups past their first line are not recognized;
+/// the corpus has none.
+fn import_path_prefix(text: &str, offset: usize) -> Option<&str> {
     let offset = offset.min(text.len());
     let line_start = text[..offset].rfind('\n').map(|at| at + 1).unwrap_or(0);
-    let mut words = text[line_start..offset].split_whitespace();
-    let first = words.next().unwrap_or("");
-    let keyword = if first == "export" {
-        words.next().unwrap_or("")
-    } else {
-        first
+    let mut line = text[line_start..offset].trim_start();
+    if let Some(after_export) = strip_keyword(line, "export") {
+        line = after_export.trim_start();
+    }
+    let after_keyword = strip_keyword(line, "import").or_else(|| strip_keyword(line, "use"))?;
+    Some(after_keyword.trim_start())
+}
+
+/// `text` with a leading `keyword` removed — only when it stands there as a
+/// WHOLE word, so `imported = 5` is an assignment and `used` is a name.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    match rest.as_bytes().first() {
+        Some(byte) if is_identifier_byte(*byte) => None,
+        _ => Some(rest),
+    }
+}
+
+/// The import path's COMPLETED segments to the left of the cursor — the partial
+/// name being typed is never one of them, so `import std::js|` yields `["std"]`
+/// and `import s|` yields `[]`.
+///
+/// A brace set completes at the same level as the path before it: every leaf in
+/// `import std::json::{ Json, |` is one more member of `std::json`, so the
+/// innermost open brace splits the path from the partial name exactly as the
+/// final `::` does otherwise — which is what makes brace-position completion
+/// fall out of the routing rather than need its own machinery.
+///
+/// `None` when the line is not an import path, or when a segment is not an
+/// identifier (a nested brace set, a half-typed operator): completion answers
+/// nothing rather than guessing at a shape it does not understand.
+fn import_path_segments(text: &str, offset: usize) -> Option<Vec<&str>> {
+    let prefix = import_path_prefix(text, offset)?;
+    let (path, in_braces) = match prefix.rfind('{') {
+        Some(brace) => (&prefix[..brace], true),
+        None => (prefix, false),
     };
-    keyword == "import" || keyword == "use"
+    let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+    if in_braces {
+        // The text before a brace ends at its `::`, leaving a trailing empty
+        // piece; a brace directly after the keyword (`import { … }`) leaves the
+        // whole path empty.
+        segments.retain(|segment| !segment.is_empty());
+    } else {
+        // The last piece is the partial name under the cursor — empty right
+        // after a `::`, and never a completed segment.
+        segments.pop();
+    }
+    segments
+        .iter()
+        .all(|segment| is_identifier(segment))
+        .then_some(segments)
+}
+
+/// Whether `name` is a vilan identifier — a non-empty run of identifier bytes
+/// that does not start with a digit.
+fn is_identifier(name: &str) -> bool {
+    !name.is_empty() && !name.as_bytes()[0].is_ascii_digit() && name.bytes().all(is_identifier_byte)
 }
 
 /// Clamp a rendered hover preview to its display budget, cutting at a char
@@ -808,6 +950,11 @@ pub struct Document {
     /// The `vilan.toml` failure behind this analysis, if any — published as one
     /// diagnostic on the manifest itself (see [`ManifestProblem`]).
     manifest_problem: Option<ManifestProblem>,
+    /// What an `import`/`use` path in this file can reach (E57) — the analysis's
+    /// own `std` spec, package root, and dependency packages, kept so completion
+    /// can enumerate modules the `Program` never loaded. `None` on the degraded
+    /// internal-error document, which resolved nothing.
+    import_roots: Option<ImportRoots>,
 }
 
 /// A semantic-token classification (E2): precision highlighting from the
@@ -1005,8 +1152,9 @@ impl Document {
             entity_spans: Vec::new(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
-            platform_requirements: HashMap::new(),
+            platform_requirements: HashMap::default(),
             manifest_problem: None,
+            import_roots: None,
         }
     }
 
@@ -1034,6 +1182,22 @@ impl Document {
         // `std` is resolved as a library (its layered roots) from the std directory
         // — the manifest when present, else a bare base layer (L2).
         let std = vilan_core::manifest::resolve_std(std_dir);
+        // The same roots the analysis just resolved, kept for import-path
+        // completion — which reaches modules the analysis never loaded, so the
+        // `Program` cannot tell it where they live (E57).
+        let import_roots = ImportRoots {
+            std: std.clone(),
+            pkg_root: pkg_root.clone(),
+            dependencies: context
+                .workspace
+                .entry_dependencies
+                .iter()
+                .filter_map(|(name, index)| {
+                    let spec = context.workspace.packages.get(*index)?;
+                    Some((name.clone(), spec.clone()))
+                })
+                .collect(),
+        };
         let (program, diagnostics) = analyze_source(
             leaked,
             &std,
@@ -1047,6 +1211,17 @@ impl Document {
         if let Some(program) = &program {
             for (id, span) in &program.span_map {
                 if program.source_of(*id) != Some(SourceId(0)) {
+                    continue;
+                }
+                // A synthesized `Expr::Void` (S3, editing-dx.md §3.9: the
+                // parser's filler for a block with no trailing expression,
+                // now spanning the closing brace instead of a zero-width
+                // point past it) is not something the user wrote and has no
+                // meaningful hover — excluded here so a cursor on the brace
+                // still finds the next-smallest REAL entity around it (the
+                // enclosing function, as before this span widened from
+                // zero).
+                if matches!(program.entity_map.get(id), Some(Expr::Void)) {
                     continue;
                 }
                 let range = span.into_range();
@@ -1097,6 +1272,7 @@ impl Document {
             retained_tail_start: usize::MAX,
             platform_requirements,
             manifest_problem,
+            import_roots: Some(import_roots),
         }
     }
 
@@ -1323,6 +1499,22 @@ impl Document {
         self.analyzed_index.offset(position)
     }
 
+    /// The ANALYZED-space offset a LIVE-space offset names: through the live
+    /// index's line/character coordinates, then `analyzed_offset` — the same
+    /// conversion every other query performs starting straight from the LSP
+    /// `Position` (S1). `completion` is the one query whose dispatch is
+    /// computed from the live text (the `.`/`?.`/`::` trigger scan legitimately
+    /// reads it — the prefix being typed is live by nature), so its derived
+    /// offsets (the dot, the receiver's end) still need translating before
+    /// they touch `program` data: `scope_at`, `entity_at`, and anything built
+    /// on them would otherwise resolve the wrong scope or entity the moment
+    /// the two snapshots diverge (E52). Both indices clamp out-of-range input
+    /// rather than panicking, so this is safe on any offset the live-text scan
+    /// produces — including one past the end of a shorter analyzed text.
+    fn to_analyzed_offset(&self, live_offset: usize) -> usize {
+        self.analyzed_offset(self.line_index.position(live_offset))
+    }
+
     /// Whether the live buffer has advanced past the analyzed text — i.e. an
     /// analysis is pending and program answers describe an older text.
     ///
@@ -1386,6 +1578,7 @@ impl Document {
             entity_spans,
             platform_requirements,
             manifest_problem,
+            import_roots,
         } = analysis;
         // The analysis side, in full.
         self.analyzed_index = analyzed_index;
@@ -1398,6 +1591,7 @@ impl Document {
         self.entity_spans = entity_spans;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
+        self.import_roots = import_roots;
         // The live side, only when the buffer has not moved on.
         if self.text == analyzed_text {
             self.text = analyzed_text;
@@ -2369,6 +2563,191 @@ impl Document {
         )
     }
 
+    // --- Quickfixes: add-import, closest-name field rename (E54, E58) ------
+
+    /// Every place `name` may be imported from — origins in loader order
+    /// (`std`, `pkg`, each dependency by its import name), the package's own
+    /// surface before its modules within an origin — searched via the E57
+    /// machinery (import-path completion's own candidate source, repointed at
+    /// a NAME instead of a path prefix). Each hit is the segments an `import`
+    /// needs before `name` (`["std", "json"]` for `Json`; `["std"]` for a
+    /// name std's own surface re-exports directly, like `print`). More than
+    /// one hit is a genuine ambiguity: the caller decides (E54b offers one
+    /// action per candidate; E54d's "fix all" skips the name rather than
+    /// guess).
+    ///
+    /// One full-origin scan per call — bounded by std's own module count
+    /// (E57: ~0.64 ms cold / 0.035 ms warm per module through the shared
+    /// parse cache), which is fine for an on-demand quickfix but too slow to
+    /// pay per candidate on every keystroke; [`Self::auto_import_completions`]
+    /// uses the cheaper already-loaded `Program` maps instead.
+    fn import_candidates(&self, program: &Program, name: &str) -> Vec<Vec<String>> {
+        let Some(roots) = self.import_roots.as_ref() else {
+            return Vec::new();
+        };
+        let mut origins: Vec<String> = vec!["std".to_string(), "pkg".to_string()];
+        origins.extend(
+            roots
+                .dependencies
+                .iter()
+                .map(|(dep_name, _)| dep_name.clone()),
+        );
+        let mut candidates = Vec::new();
+        for origin in &origins {
+            let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
+                continue;
+            };
+            if let Some(surface_path) = &surface {
+                if vilan_core::analyzer::module_importables(surface_path)
+                    .iter()
+                    .any(|importable| importable.name == name)
+                {
+                    candidates.push(vec![origin.clone()]);
+                }
+            }
+            let mut seen_modules: HashSet<String> = HashSet::new();
+            for root in &module_roots {
+                for (module_name, module_path) in vilan_core::analyzer::modules_in_root(root) {
+                    if module_name == "lib" || !seen_modules.insert(module_name.clone()) {
+                        continue;
+                    }
+                    if vilan_core::analyzer::module_importables(&module_path)
+                        .iter()
+                        .any(|importable| importable.name == name)
+                    {
+                        candidates.push(vec![origin.clone(), module_name]);
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The quickfix menu for the diagnostics overlapping `range` (LIVE
+    /// space — safe because the caller gates staleness first, S3: while
+    /// non-stale, live spans and this document's own `diagnostics` spans
+    /// address the same text): one action per unambiguous add-import
+    /// candidate (E54b — several when a name is AMBIGUOUS across modules,
+    /// never guessed), and the field-rename fix on a closest-name suggestion
+    /// (E58c). Reads THIS document's own diagnostics directly rather than the
+    /// client-echoed `context.diagnostics` — only ours carries the span and
+    /// note data a fix needs, and the staleness refusal is what makes that a
+    /// safe substitution.
+    pub fn quickfixes(&self, program: &Program, range: Span) -> Vec<QuickFix> {
+        let mut fixes = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue; // an edit can only ever reach this document
+            }
+            if !spans_overlap(diagnostic.span, range) {
+                continue;
+            }
+            if let Some(name) = unresolved_name(&diagnostic.msg) {
+                for module_path in self.import_candidates(program, name) {
+                    let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+                    let Some(edit) =
+                        vilan_core::formatter::insert_import(&self.text, &path_refs, name)
+                    else {
+                        continue;
+                    };
+                    fixes.push(QuickFix {
+                        title: format!("Import `{name}` from {}", module_path.join("::")),
+                        span: edit.span,
+                        replacement: edit.replacement,
+                    });
+                }
+            } else if let Some(suggestion) = diagnostic
+                .note
+                .as_ref()
+                .and_then(|note| closest_name_suggestion(&note.msg))
+            {
+                fixes.push(QuickFix {
+                    title: format!("Change to `{suggestion}`"),
+                    span: diagnostic.span,
+                    replacement: suggestion.to_string(),
+                });
+            } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
+                // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
+                // span IS the gap — the parser's `gap_span` already computed
+                // "the last character before the `;` belongs", one character
+                // wide (§4.4/§15.5) — so the fix is a zero-width insertion
+                // right after it. No program lookup needed: the parser's
+                // anchor is the whole answer.
+                let insertion = diagnostic.span.end;
+                fixes.push(QuickFix {
+                    title: "Insert `;`".to_string(),
+                    span: Span::from(insertion..insertion),
+                    replacement: ";".to_string(),
+                });
+            } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
+                && let Some(semicolon_span) =
+                    trailing_semicolon_to_remove(&self.text, program, diagnostic.span)
+            {
+                // Regime 1' (S3, editing-dx.md §17.4): the diagnostic anchors
+                // at the callable's closing BRACE, not the `;` — the fix
+                // locates the `;` from the program's own last-statement
+                // bookkeeping (the same question `missing_return_value_
+                // message` asks analyzer-side) rather than guessing from the
+                // brace backwards through possible comments.
+                fixes.push(QuickFix {
+                    title: "Remove `;`".to_string(),
+                    span: semicolon_span,
+                    replacement: String::new(),
+                });
+            }
+        }
+        fixes
+    }
+
+    /// Every unambiguous missing-import fix in the file, folded into ONE edit
+    /// (E54d, the "add all missing imports" source action): each unresolved
+    /// name with EXACTLY one candidate module gets imported; an AMBIGUOUS
+    /// name (more than one candidate) is skipped outright — this action never
+    /// guesses between modules. Fixes apply SEQUENTIALLY against a running
+    /// copy of the text, so two names newly imported from the same module
+    /// merge into one brace set exactly as two separate manual add-imports
+    /// would (`insert_import` sees the first one already landed on the
+    /// second call). `None` when there's nothing unambiguous to add.
+    pub fn add_all_missing_imports_edit(&self, program: &Program) -> Option<(Span, String)> {
+        let mut names: Vec<&str> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+            {
+                continue;
+            }
+            if let Some(name) = unresolved_name(&diagnostic.msg) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        let mut working = self.text.clone();
+        let mut changed = false;
+        for name in names {
+            let candidates = self.import_candidates(program, name);
+            let [module_path] = candidates.as_slice() else {
+                continue; // zero or ambiguous candidates: never guess
+            };
+            let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+            if let Some(edit) = vilan_core::formatter::insert_import(&working, &path_refs, name) {
+                working = splice(&working, edit.span, &edit.replacement);
+                changed = true;
+            }
+        }
+        changed.then(|| (Span::from(0..self.text.len()), working))
+    }
+
     /// A struct/enum/trait target when the cursor is on a type *use* (e.g.
     /// `Option` in `Option<T>`), which lives in `type_references` rather than as
     /// an entity.
@@ -2637,9 +3016,22 @@ impl Document {
         symbols
     }
 
-    /// Completion candidates at `offset`, dispatched by the syntax just before the
-    /// cursor: members after `.`, path items after `::`, else names in scope plus
-    /// keywords. The editor filters the list by whatever prefix is being typed.
+    /// Completion candidates at `offset` — a LIVE-space offset (the caller
+    /// converts an LSP `Position` through `line_index`, never `analyzed_offset`:
+    /// completion's dispatch reads the buffer the user is mid-keystroke in).
+    /// Dispatched by the syntax just before the cursor: members after `.`, path
+    /// items after `::`, else names in scope plus keywords. The editor filters
+    /// the list by whatever prefix is being typed.
+    ///
+    /// The trigger scan below (`start`, the `.`/`?.`/`::` check, the
+    /// open-paren/import sniffs) legitimately stays in LIVE space throughout —
+    /// it is reading the character the user just typed. But every candidate
+    /// gatherer that walks `program` data (`scope_completions`, and
+    /// `member_completions`/`lifted_member_completions` by way of
+    /// `receiver_nominal_id`) must resolve its scope/entity in ANALYZED space,
+    /// via `to_analyzed_offset` — or a scope or receiver resolved from the live
+    /// offset against a stale program answers the wrong question the moment the
+    /// two snapshots diverge (E52).
     pub fn completion(&self, offset: usize) -> Vec<Completion> {
         let Some(program) = self.program.as_ref() else {
             return Vec::new();
@@ -2665,7 +3057,16 @@ impl Document {
         if start >= 1 && bytes[start - 1] == b'(' && text[..start - 1].ends_with("[derive") {
             return self.macro_name_completions(program);
         }
-        let mut candidates = if start >= 1 && bytes[start - 1] == b'.' {
+        // An import path is its own world (E57): a name there is being reached
+        // FOR THE FIRST TIME, so none of the in-scope machinery below applies —
+        // candidates come from the package tree, and the head of the path names
+        // an origin (`std`, `pkg`, a dependency), which is not an entity at all.
+        // This check routes the GATHERING; the shaping post-pass below is the
+        // separate, older use of it.
+        let in_import = in_import_path(text, offset);
+        let mut candidates = if in_import {
+            self.import_completions(program, text, offset)
+        } else if start >= 1 && bytes[start - 1] == b'.' {
             // `a?.` completes on the LIFTED element (`Option<Profile>` offers
             // Profile's members — proposal/try-and-lift.md §5).
             if start >= 2 && bytes[start - 2] == b'?' {
@@ -2674,9 +3075,24 @@ impl Document {
                 self.member_completions(program, start - 1)
             }
         } else if start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':' {
-            self.path_completions(program, text, start - 2)
+            self.code_path_completions(program, text, start - 2)
         } else {
-            self.scope_completions(program, offset)
+            // No member/path trigger: the cursor's own scope, resolved in
+            // ANALYZED space (E52) — `path_completions` needs no such
+            // conversion, since it answers by NAME across the whole program
+            // rather than by scope containment.
+            let mut scope_candidates =
+                self.scope_completions(program, self.to_analyzed_offset(offset));
+            // E54c: importable-but-unimported names, LABELED and edit-carrying
+            // (E53's rule stands — nothing here is silent). Only at this bare
+            // scope position; a `.`/`::` receiver is already resolved to
+            // something in scope, so there is nothing to import there.
+            let in_scope: HashSet<&str> = scope_candidates
+                .iter()
+                .map(|candidate| candidate.label.as_str())
+                .collect();
+            scope_candidates.extend(self.auto_import_completions(program, &in_scope));
+            scope_candidates
         };
         // A call-shaped insertion is wrong when the callee is already
         // parenthesized — the char right after the cursor is `(`, so the user
@@ -2685,10 +3101,10 @@ impl Document {
         // for every candidate; the signature and docs still show (WO-3 escape
         // hatches).
         let next_is_open_paren = bytes.get(offset).copied() == Some(b'(');
-        let in_import = in_import_path(text, offset);
         // An import path takes names, so the construct snippets (`for …`,
-        // `fun …`) have no business there — drop them entirely (E14). (Member
-        // and path positions never produce snippets in the first place.)
+        // `fun …`) have no business there — drop them entirely (E14). Import
+        // completion no longer produces any (it never reaches
+        // `scope_completions`), so this now only guards the invariant.
         if in_import {
             candidates.retain(|candidate| !matches!(candidate.kind, CompletionKind::Snippet));
         }
@@ -2719,7 +3135,7 @@ impl Document {
     }
 
     /// Fields and methods of the receiver value ending just before the `.` at
-    /// `dot_offset`.
+    /// `dot_offset` (LIVE space — see `completion`).
     fn member_completions(&self, program: &Program, dot_offset: usize) -> Vec<Completion> {
         let Some(type_id) = self.receiver_nominal_id(program, dot_offset) else {
             return Vec::new();
@@ -2744,18 +3160,21 @@ impl Document {
 
     /// Members of the ELEMENT under a lifted chain (`a?.` on an
     /// `Option<Profile>` offers Profile's members): the receiver ends just
-    /// before the `?` at `question_offset`; its container's first type
-    /// argument is the element.
+    /// before the `?` at `question_offset` (LIVE space — see `completion`);
+    /// its container's first type argument is the element.
     fn lifted_member_completions(
         &self,
         program: &Program,
         question_offset: usize,
     ) -> Vec<Completion> {
-        // A bare name (`p?.`): the binding's declared container type.
+        // A bare name (`p?.`): the binding's declared container type. The NAME
+        // comes off the live text, but resolving it is a `program` lookup, so
+        // it converts to ANALYZED space first (E52).
         if let Some(name) = identifier_ending_at(self.line_index.text(), question_offset) {
+            let analyzed_offset = self.to_analyzed_offset(question_offset);
             let binding = self
-                .binding_in_scope(program, name, question_offset)
-                .or_else(|| self.same_file_variable(program, name, question_offset));
+                .binding_in_scope(program, name, analyzed_offset)
+                .or_else(|| self.same_file_variable(program, name, analyzed_offset));
             let element = binding
                 .and_then(|id| {
                     program
@@ -2786,9 +3205,11 @@ impl Document {
             }
         }
         // A complex receiver (`find(x)?.`): its rendered type's first generic
-        // argument names the element.
+        // argument names the element — another `program` lookup, so `entity_at`
+        // also takes the ANALYZED offset (E52).
         question_offset
             .checked_sub(1)
+            .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| self.hover_label(program, receiver))
             .and_then(|label| first_generic_argument(&label).map(str::to_string))
@@ -2798,23 +3219,30 @@ impl Document {
     }
 
     /// The nominal struct/enum id of the receiver value ending just before the `.`
-    /// at `dot_offset`.
+    /// at `dot_offset` (LIVE space — see `completion`).
     fn receiver_nominal_id(&self, program: &Program, dot_offset: usize) -> Option<Id> {
         // A bare name (`p.`): resolve through scope, or — when the cursor's own
         // statement failed to parse and dropped its local scope — the nearest
         // same-file binding of that name, then read its declared type. Robust while
-        // the buffer is mid-edit, which is exactly when completion fires.
+        // the buffer is mid-edit, which is exactly when completion fires. The
+        // NAME comes off the live text (`dot_offset` is where it is), but
+        // resolving that name against a scope is a `program` lookup, so it
+        // converts to ANALYZED space first (E52).
         if let Some(name) = identifier_ending_at(self.line_index.text(), dot_offset) {
+            let analyzed_offset = self.to_analyzed_offset(dot_offset);
             let binding = self
-                .binding_in_scope(program, name, dot_offset)
-                .or_else(|| self.same_file_variable(program, name, dot_offset));
+                .binding_in_scope(program, name, analyzed_offset)
+                .or_else(|| self.same_file_variable(program, name, analyzed_offset));
             if let Some(nominal) = binding.and_then(|id| self.binding_nominal_id(program, id)) {
                 return Some(nominal);
             }
         }
-        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered type.
+        // A complex receiver (`foo().`, `a.b.`): the parsed entity's rendered
+        // type — another `program` lookup, so `entity_at` also takes the
+        // ANALYZED offset (E52).
         dot_offset
             .checked_sub(1)
+            .map(|offset| self.to_analyzed_offset(offset))
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| self.hover_label(program, receiver))
             .and_then(|label| self.nominal_id_by_name(program, base_type_name(&label)))
@@ -2839,14 +3267,20 @@ impl Document {
     }
 
     /// The nearest same-file `let`/`mut` binding named `name` declared before
-    /// `offset` — a fallback for when the cursor's statement failed to parse and so
-    /// dropped its enclosing scope from the analysis.
-    fn same_file_variable(&self, program: &Program, name: &str, offset: usize) -> Option<Id> {
+    /// `analyzed_offset` (ANALYZED space — `variable.name_span` is a program
+    /// span) — a fallback for when the cursor's statement failed to parse and
+    /// so dropped its enclosing scope from the analysis.
+    fn same_file_variable(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
         let mut best: Option<(usize, Id)> = None;
         for (id, variable) in &program.variables {
             let start = variable.name_span.into_range().start;
             if variable.name == name
-                && start < offset
+                && start < analyzed_offset
                 && program.source_of(*id) == Some(SourceId(0))
                 && best.is_none_or(|(best_start, _)| start > best_start)
             {
@@ -2856,10 +3290,71 @@ impl Document {
         best.map(|(_, id)| id)
     }
 
-    /// Items reachable through `left::` — an enum's variants and methods, a
-    /// struct's methods, or a module's members — where `left` is the identifier
-    /// ending just before the `::` at `colon_offset`.
-    fn path_completions(
+    /// Candidates for an `import`/`use` path (E57), routed by how many segments
+    /// precede the cursor:
+    ///
+    /// - **none** (`import |`, `import s|`) — the ORIGINS: `std`, `pkg`, and
+    ///   each dependency package's import name. Not the names in scope, not the
+    ///   keywords, not the construct snippets — none of them may follow
+    ///   `import`, and offering them is what the head position did before.
+    /// - **one** (`import std::|`) — that origin's modules, enumerated from its
+    ///   source roots, plus the package's own `lib.vl` surface where it has one
+    ///   (`import std::print`).
+    /// - **two or more** (`import std::json::|`) — the named module's importable
+    ///   names, LOADED ON DEMAND. The point of an import is to reach a module
+    ///   the program has not loaded, so the analyzed `Program` cannot answer;
+    ///   the load is the loader's own, through its content-keyed parse cache.
+    ///   A further segment descends into an enum's variants
+    ///   (`import std::option::Option::Some`), the only namespace past a module
+    ///   that `resolve_import` descends into.
+    ///
+    /// A head naming none of the origins falls back to the whole-`Program`
+    /// lookup by name — that is what serves a same-file `mod` block
+    /// (`import geometry::area`), and global reach is correct HERE, which is the
+    /// half of E53's split that stays.
+    ///
+    /// Anything that does not resolve answers EMPTY. A completion request is
+    /// answered on the editor's critical path: it never errors, and a module
+    /// that is not there is simply not offered.
+    fn import_completions(&self, program: &Program, text: &str, offset: usize) -> Vec<Completion> {
+        let Some(segments) = import_path_segments(text, offset) else {
+            return Vec::new();
+        };
+        let Some(roots) = self.import_roots.as_ref() else {
+            // The degraded internal-error document resolved no package tree, so
+            // there is nothing to enumerate.
+            return Vec::new();
+        };
+        let Some((origin, rest)) = segments.split_first() else {
+            return origin_completions(roots);
+        };
+        let Some((module_roots, surface)) = roots.origin_roots(origin, program.platform) else {
+            // Not an origin — a same-file `mod`, or a namespace already in the
+            // program under some other name. The last segment is the namespace
+            // being descended into, which is all the by-name lookup reads.
+            return self.namespace_completions_by_name(program, rest.last().unwrap_or(origin));
+        };
+        match rest.split_first() {
+            None => origin_member_completions(&module_roots, surface.as_deref()),
+            Some((module, past_module)) => {
+                module_member_completions(&module_roots, module, past_module)
+            }
+        }
+    }
+
+    /// Items reachable through `left::` in CODE — an enum's variants and
+    /// statics, a struct's statics, or a module's members — where `left` is the
+    /// identifier ending just before the `::` at `colon_offset`.
+    ///
+    /// `left` is resolved THROUGH SCOPE (E53). Matching it against every loaded
+    /// module's declarations by name, which is what this did, offered whatever
+    /// any module in the process happened to declare — and nine std modules are
+    /// ALWAYS loaded for the derive prelude, so `Json::` completed `parse`,
+    /// `stringify`, and friends in a file that never imported `std::json`. An
+    /// import path is the opposite case, where reaching what is not in scope is
+    /// the entire point; it is served by [`Self::import_completions`], which
+    /// keeps the by-name lookup ([`Self::namespace_completions_by_name`]).
+    fn code_path_completions(
         &self,
         program: &Program,
         text: &str,
@@ -2868,42 +3363,214 @@ impl Document {
         let Some(left) = identifier_ending_at(text, colon_offset) else {
             return Vec::new();
         };
+        let analyzed_offset = self.to_analyzed_offset(colon_offset);
+        let Some(namespace) = self.namespace_in_scope(program, left, analyzed_offset) else {
+            return Vec::new();
+        };
+        self.namespace_completions(program, namespace)
+    }
+
+    /// The struct / enum / module `name` denotes at `analyzed_offset` — the
+    /// cursor's scope out to global: locals, parameters, this file's top-level
+    /// items, and everything a `use`/`import` bound.
+    ///
+    /// No same-file fallback of the kind [`Self::same_file_variable`] gives
+    /// member completion, and none is needed: a type is declared at a file's TOP
+    /// LEVEL, so it lives in the global scope that every scope chains to, and it
+    /// stays reachable however badly the cursor's own statement is mid-edit. The
+    /// fallback exists for member completion because a `let` binding lives in
+    /// the very scope a broken statement drops.
+    fn namespace_in_scope(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
+        self.binding_in_scope(program, name, analyzed_offset)
+            .filter(|id| self.is_namespace(program, *id))
+    }
+
+    /// Whether `id` names something a `::` path descends into.
+    fn is_namespace(&self, program: &Program, id: Id) -> bool {
+        program.enums.contains_key(&id)
+            || program.structs.contains_key(&id)
+            || program.modules.contains_key(&id)
+    }
+
+    /// The items `namespace::` offers: an enum's variants plus its statics, a
+    /// struct's statics, a module's members. Empty for anything else.
+    fn namespace_completions(&self, program: &Program, namespace: Id) -> Vec<Completion> {
         let mut items = Vec::new();
-        for (enum_id, enumeration) in &program.enums {
-            if enumeration.name == left {
-                for variant in &enumeration.variants {
-                    items.push(Completion::bare(
-                        variant.name.to_string(),
-                        CompletionKind::EnumVariant,
-                    ));
-                }
-                self.push_methods(program, *enum_id, false, &mut items);
+        if let Some(enumeration) = program.enums.get(&namespace) {
+            for variant in &enumeration.variants {
+                items.push(Completion::bare(
+                    variant.name.to_string(),
+                    CompletionKind::EnumVariant,
+                ));
             }
-        }
-        for (struct_id, structure) in &program.structs {
-            if structure.name == left {
-                self.push_methods(program, *struct_id, false, &mut items);
-            }
-        }
-        for module in program.modules.values() {
-            if module.name == left {
-                if let Some(scope) = program.scopes.get(&module.body.1) {
-                    for (name, id) in &scope.name_to_id_map {
-                        let kind = self.kind_of(program, *id);
-                        items.push(self.entity_completion(program, name.to_string(), *id, kind));
-                    }
+            self.push_methods(program, namespace, false, &mut items);
+        } else if program.structs.contains_key(&namespace) {
+            self.push_methods(program, namespace, false, &mut items);
+        } else if let Some(module) = program.modules.get(&namespace) {
+            if let Some(scope) = program.scopes.get(&module.body.1) {
+                for (name, id) in &scope.name_to_id_map {
+                    let kind = self.kind_of(program, *id);
+                    items.push(self.entity_completion(program, name.to_string(), *id, kind));
                 }
             }
         }
         items
     }
 
-    /// Names visible at `offset` (the cursor's scope, then each enclosing scope up
-    /// to global) plus the language keywords.
-    fn scope_completions(&self, program: &Program, offset: usize) -> Vec<Completion> {
+    /// The items `name::` offers, looked up across the WHOLE program by name —
+    /// every loaded enum, struct, and module, in scope or not.
+    ///
+    /// Correct in an import path and wrong everywhere else (E53). An import is
+    /// how a name gets into scope, so requiring it to be in scope already would
+    /// answer nothing; and this is what serves a same-file `mod` block
+    /// (`import geometry::area`), whose namespace is not an origin's.
+    fn namespace_completions_by_name(&self, program: &Program, name: &str) -> Vec<Completion> {
+        let mut items = Vec::new();
+        for (id, enumeration) in &program.enums {
+            if enumeration.name == name {
+                items.extend(self.namespace_completions(program, *id));
+            }
+        }
+        for (id, structure) in &program.structs {
+            if structure.name == name {
+                items.extend(self.namespace_completions(program, *id));
+            }
+        }
+        for (id, module) in &program.modules {
+            if module.name == name {
+                items.extend(self.namespace_completions(program, *id));
+            }
+        }
+        items
+    }
+
+    /// Importable-but-unimported candidates at a bare scope position (E54c):
+    /// every function/struct/enum/trait/module-level value a directly-loaded
+    /// `std` or `pkg` child module declares as its OWN top-level item (not a
+    /// re-export or an import it merely forwards — a plain `import`/`use`
+    /// inside a module lands in that module's scope too, and counting it
+    /// would offer the same name a second time), whose name isn't already in
+    /// `in_scope`.
+    ///
+    /// This is the SAME whole-program-by-name territory E53 walled off from
+    /// silent, unscoped completion ([`Self::namespace_completions_by_name`],
+    /// just above) — reused here on purpose and EXPLICITLY: every candidate
+    /// is LABELED with its declaring module (`to_completion_item` shows it as
+    /// `detail`) and carries the text edit that adds the import, so accepting
+    /// one is never a surprise (E53's rule stands: nothing silent came back).
+    ///
+    /// Dependency packages are not scanned here — reaching them the way
+    /// [`Self::import_candidates`] does is a disk-bound full-origin scan, fine
+    /// for an on-demand quickfix but too slow to pay on every keystroke.
+    ///
+    /// **Position-aware filtering, declined (E59):** the caller (`completion`)
+    /// reaches this function from one branch only — no preceding `.` or `::`
+    /// — used identically for a bare value expression and a bare type
+    /// annotation; neither it nor this function is told which. Telling them
+    /// apart is not a read of data some earlier pass already computed (the
+    /// analyzed `Program`'s own `type_references` only covers RESOLVED code,
+    /// not the very position being typed); it is new syntactic analysis —
+    /// scanning back past whatever sits before the cursor to find the
+    /// enclosing form (`let x: |`, `fun f(): |`, `List<|>`, `x as |`, a
+    /// struct field type, …), each a different shape, unlike
+    /// [`in_import_path`]'s single-line anchor. Declined here; recorded as
+    /// E59's residual.
+    ///
+    /// Ranked by [`import_origin_tier`] (E59), THEN alphabetically within a
+    /// tier, and capped at [`AUTO_IMPORT_COMPLETION_CAP`] — applied in that
+    /// order, before the truncation, which is the point: a plain alphabetical
+    /// sort let the always-loaded `std` prelude's capitalized trait/type names
+    /// (`Add`, `BitAnd`, …) fill the whole cap ahead of a small real file's
+    /// own unimported names, which sort no higher than any other lowercase
+    /// identifier. Tiering the user's own `pkg` ahead of `std` means the
+    /// cap's last-to-survive candidates are always `std`'s, never `pkg`'s —
+    /// a std-heavy file's loaded surface still cannot flood the popup, and
+    /// now `std` only spends slots `pkg` didn't need.
+    fn auto_import_completions(
+        &self,
+        program: &Program,
+        in_scope: &HashSet<&str>,
+    ) -> Vec<Completion> {
+        let mut candidates: Vec<(u8, String, CompletionKind, Vec<String>)> = Vec::new();
+        for root in ["std", "pkg"] {
+            let Some(&root_module_id) = program.module_id_by_name.get(root) else {
+                continue;
+            };
+            let Some(root_module) = program.modules.get(&root_module_id) else {
+                continue;
+            };
+            let Some(root_scope) = program.scopes.get(&root_module.body.1) else {
+                continue;
+            };
+            let tier = import_origin_tier(root);
+            for &child_id in root_scope.name_to_id_map.values() {
+                let Some(child_module) = program.modules.get(&child_id) else {
+                    continue;
+                };
+                let Some(child_scope) = program.scopes.get(&child_module.body.1) else {
+                    continue;
+                };
+                let child_source = program.source_of(child_id);
+                for (&name, &entity_id) in &child_scope.name_to_id_map {
+                    if in_scope.contains(name) {
+                        continue;
+                    }
+                    if program.source_of(entity_id) != child_source {
+                        continue;
+                    }
+                    let kind = self.kind_of(program, entity_id);
+                    if matches!(
+                        kind,
+                        CompletionKind::Module | CompletionKind::Keyword | CompletionKind::Snippet
+                    ) {
+                        continue;
+                    }
+                    candidates.push((
+                        tier,
+                        name.to_string(),
+                        kind,
+                        vec![root.to_string(), child_module.name.to_string()],
+                    ));
+                }
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        candidates.truncate(AUTO_IMPORT_COMPLETION_CAP);
+        let source = self.line_index.text();
+        candidates
+            .into_iter()
+            .filter_map(|(tier, name, kind, module_path)| {
+                let path_refs: Vec<&str> = module_path.iter().map(String::as_str).collect();
+                let edit = vilan_core::formatter::insert_import(source, &path_refs, &name)?;
+                Some(Completion {
+                    label: name,
+                    kind,
+                    detail: None,
+                    documentation: None,
+                    call_parameters: None,
+                    snippet: None,
+                    needs_import: Some(AutoImport {
+                        module_path,
+                        edit_span: edit.span,
+                        edit_replacement: edit.replacement,
+                        origin_tier: tier,
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// Names visible at `analyzed_offset` (ANALYZED space — the cursor's scope,
+    /// then each enclosing scope up to global) plus the language keywords.
+    fn scope_completions(&self, program: &Program, analyzed_offset: usize) -> Vec<Completion> {
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        let mut scope_id = self.scope_at(program, offset);
+        let mut scope_id = self.scope_at(program, analyzed_offset);
         while let Some(id) = scope_id {
             let Some(scope) = program.scopes.get(&id) else {
                 break;
@@ -2936,23 +3603,30 @@ impl Document {
         items
     }
 
-    /// The scope of the entity at — or nearest before — the cursor, so the current
-    /// function's locals are in scope even when the cursor sits in fresh text.
-    fn scope_at(&self, program: &Program, offset: usize) -> Option<Id> {
-        let entity = self.entity_at(offset).or_else(|| {
+    /// The scope of the entity at — or nearest before — `analyzed_offset`
+    /// (ANALYZED space), so the current function's locals are in scope even
+    /// when the cursor sits in fresh text.
+    fn scope_at(&self, program: &Program, analyzed_offset: usize) -> Option<Id> {
+        let entity = self.entity_at(analyzed_offset).or_else(|| {
             self.entity_spans
                 .iter()
-                .filter(|(_, end, _)| *end <= offset)
+                .filter(|(_, end, _)| *end <= analyzed_offset)
                 .max_by_key(|(_, end, _)| *end)
                 .map(|(_, _, id)| *id)
         })?;
         program.entity_scope_map.get(&entity).copied()
     }
 
-    /// The binding `name` resolves to in the scope at `offset` (searching the
-    /// enclosing scopes up to global) — a local, parameter, or top-level item.
-    fn binding_in_scope(&self, program: &Program, name: &str, offset: usize) -> Option<Id> {
-        let mut scope_id = self.scope_at(program, offset);
+    /// The binding `name` resolves to in the scope at `analyzed_offset`
+    /// (ANALYZED space, searching the enclosing scopes up to global) — a
+    /// local, parameter, or top-level item.
+    fn binding_in_scope(
+        &self,
+        program: &Program,
+        name: &str,
+        analyzed_offset: usize,
+    ) -> Option<Id> {
+        let mut scope_id = self.scope_at(program, analyzed_offset);
         while let Some(id) = scope_id {
             let scope = program.scopes.get(&id)?;
             if let Some(binding) = scope.name_to_id_map.get(name) {
@@ -3085,6 +3759,282 @@ impl Document {
 
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The cap [`Document::auto_import_completions`] truncates to (E54c) — a
+/// std-heavy file can have a large loaded surface, and this is what keeps a
+/// bare scope completion from drowning the popup in auto-import candidates
+/// beneath the names actually in scope.
+///
+/// Kept at 20 by E59: the filing that found the flood was explicit that the
+/// cap's SIZE was never the bug — a popup already offers 20 auto-import
+/// candidates beneath the in-scope ones, plenty for a human to scan, and
+/// [`import_origin_tier`] fixes which 20 those are. No evidence turned up
+/// that a real file needs more of its own names surfaced at once than this;
+/// raising it would only hand `std` back more of the slots `pkg` still
+/// doesn't need.
+const AUTO_IMPORT_COMPLETION_CAP: usize = 20;
+
+/// An auto-import candidate's ranking tier by where it comes from (E59): the
+/// user's own package (`pkg`) outranks the standard library (`std`) — a real
+/// file's own unimported names are a far likelier completion target than the
+/// always-loaded prelude's surface, which used to fill the whole cap first
+/// purely because its capitalized trait/type names (`Add`, `BitAnd`, …) sort
+/// ahead of an ordinary lowercase identifier in bare alphabetical order. Used
+/// both pre-truncation ([`Document::auto_import_completions`]'s sort) and in
+/// the client-visible `sort_text` (`main::to_completion_item`, via
+/// [`AutoImport::origin_tier`]) — the one mapping, read in both places.
+///
+/// Tier 1 is reserved for a dependency package's names, ranked between the
+/// two: closer to the user's intent than `std`'s always-loaded surface (the
+/// user chose to add the dependency), but not the user's own authored code.
+/// It is unreachable today — `auto_import_completions` only ever calls this
+/// with `"std"` or `"pkg"`, since E54 scoped this keystroke-path candidate
+/// gathering to those two roots (a dependency scan is the disk-bound
+/// full-origin one `Document::import_candidates` pays for the on-demand
+/// quickfix, not this path) — recorded here for whenever that changes rather
+/// than left for a future tier scheme to rediscover.
+fn import_origin_tier(root: &str) -> u8 {
+    match root {
+        "pkg" => 0,
+        "std" => 2,
+        _ => 1,
+    }
+}
+
+/// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
+/// `(span, replacement)` this document's own text needs — LIVE space, same
+/// convention as [`Document::organize_import_edits`].
+pub struct QuickFix {
+    pub title: String,
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
+/// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
+/// find" shapes B4's import steer already targets
+/// (`analyzer.rs::import_steer`/`import_steer_inner`). `None` for every other
+/// diagnostic shape (a module-path segment, a trait, a struct field, a
+/// context …) — E54's add-import quickfix is deliberately scoped to these
+/// two; the others are the filing's own later customers (E58d's rule for the
+/// closest-name primitive applies here too).
+fn unresolved_name(message: &str) -> Option<&str> {
+    for prefix in ["cannot find '", "cannot find type '"] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some(end) = rest.find('\'') {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    None
+}
+
+/// The suggested name in a "did you mean" note E58 attaches to the
+/// invalid-initializer-field diagnostic (`analyzer.rs`) — the note text IS
+/// the fix's source of truth, so the LSP quickfix never recomputes its own
+/// closest-name guess and risks disagreeing with the diagnostic it's fixing.
+/// Anchored to the note starting with EXACTLY `did you mean` — the unrelated
+/// field/method-callable ambiguity note (`analyzer.rs`, "...: did you mean
+/// the plain access `x.member`?") uses the same words mid-sentence, never at
+/// the very start, so it can never match here.
+fn closest_name_suggestion(note_message: &str) -> Option<&str> {
+    note_message
+        .strip_prefix("did you mean `")?
+        .strip_suffix("`?")
+}
+
+/// S2's parse-error message (`parsing.rs::render`, `ParseErrorReason::
+/// MissingTerminator`) — matched by PREFIX since a curated parse error can
+/// carry a trailing `" in <context>"` label (`render`'s own context loop),
+/// which none of the three `note_terminator` call sites currently reach but
+/// nothing guarantees against structurally.
+const MISSING_TERMINATOR_MESSAGE: &str = "expected `;` to end this statement";
+
+/// Regime 1's message suffix (`analyzer.rs::missing_return_value_message`) —
+/// matched by SUFFIX (own sentence, own period) so it can't fire on regime
+/// 1's sibling wording ("this body ends without producing a value.") which
+/// names a DIFFERENT, non-fixable gap (no statement to blame at all).
+const DISCARDED_VALUE_MESSAGE: &str = "the `;` discards this body's last value.";
+
+/// The `;` a regime-1' diagnostic ("the `;` discards this body's last
+/// value") names, located from the program's own bookkeeping rather than
+/// guessed from the brace backwards. `diagnostic_span` is the callable's
+/// closing-brace anchor (S3, editing-dx.md §16/§3.9) — unique per callable
+/// in one file — so it pairs with exactly one function or (braced) closure,
+/// whose last STATEMENT id (excluding the trailing `;`, consumed separately
+/// per §15.6) is already what the analyzer's own
+/// `missing_return_value_message` asks about. From that statement's span
+/// end, `;` is found by scanning forward past ASCII whitespace only — a
+/// comment in the gap declines the fix rather than guessing past it (B4:
+/// no fix is better than a wrong one).
+fn trailing_semicolon_to_remove(
+    text: &str,
+    program: &Program,
+    diagnostic_span: Span,
+) -> Option<Span> {
+    let last_statement_id = program
+        .functions
+        .values()
+        .find(|function| {
+            program
+                .span_map
+                .get(&function.body.1)
+                .is_some_and(|span| **span == diagnostic_span)
+        })
+        .and_then(|function| function.body.0.last().copied())
+        .or_else(|| {
+            program.closures.values().find_map(|closure| {
+                let Expr::Block((statement_ids, _)) = program.entity_map.get(&closure.return_)?
+                else {
+                    return None;
+                };
+                let block_span = **program.span_map.get(&closure.return_)?;
+                let brace_span = Span {
+                    start: block_span.end.saturating_sub(1),
+                    end: block_span.end,
+                };
+                if brace_span != diagnostic_span {
+                    return None;
+                }
+                statement_ids.last().copied()
+            })
+        })?;
+    let statement_span = **program.span_map.get(&last_statement_id)?;
+    let bytes = text.as_bytes();
+    let mut cursor = statement_span.end;
+    loop {
+        match bytes.get(cursor) {
+            Some(byte) if byte.is_ascii_whitespace() => cursor += 1,
+            Some(b';') => return Some(Span::from(cursor..cursor + 1)),
+            _ => return None,
+        }
+    }
+}
+
+/// Whether two spans share at least one byte position — touching counts, so
+/// a zero-width cursor range sitting right at a diagnostic's edge still
+/// overlaps it.
+fn spans_overlap(a: Span, b: Span) -> bool {
+    a.start <= b.end && b.start <= a.end
+}
+
+/// Replaces the byte range `span` in `source` with `replacement`. The
+/// primitive [`Document::add_all_missing_imports_edit`] folds a SEQUENCE of
+/// `insert_import` edits through, each computed against the previous
+/// splice's result — so two new imports from the same not-yet-imported
+/// module land in one merged brace set, exactly as two separate manual
+/// add-imports would.
+fn splice(source: &str, span: Span, replacement: &str) -> String {
+    let range = span.into_range();
+    let mut result =
+        String::with_capacity(source.len() - (range.end - range.start) + replacement.len());
+    result.push_str(&source[..range.start]);
+    result.push_str(replacement);
+    result.push_str(&source[range.end..]);
+    result
+}
+
+/// The origins an import path may start with: the two the loader always knows
+/// (`std`, `pkg`) plus every dependency package, under the name this file
+/// addresses it by (E57).
+fn origin_completions(roots: &ImportRoots) -> Vec<Completion> {
+    let mut items = vec![
+        Completion::bare("std".to_string(), CompletionKind::Module),
+        Completion::bare("pkg".to_string(), CompletionKind::Module),
+    ];
+    items.extend(
+        roots
+            .dependencies
+            .iter()
+            .map(|(name, _)| Completion::bare(name.clone(), CompletionKind::Module)),
+    );
+    items
+}
+
+/// What `origin::` offers: every module under the origin's source roots, in the
+/// loader's own root order (an earlier root shadows a later one, so a matching
+/// platform layer wins over the base), followed by the names its `lib.vl`
+/// surface publishes.
+fn origin_member_completions(module_roots: &[&Path], surface: Option<&Path>) -> Vec<Completion> {
+    let mut items = Vec::new();
+    let mut seen: HashSet<String> = HashSet::default();
+    for root in module_roots {
+        for (name, _path) in vilan_core::analyzer::modules_in_root(root) {
+            // `lib.vl` is the package's SURFACE, integrated into the package
+            // name itself — its members are offered right here, one loop down,
+            // and `import std::lib` is not how anyone reaches them.
+            if name == "lib" || !seen.insert(name.clone()) {
+                continue;
+            }
+            items.push(Completion::bare(name, CompletionKind::Module));
+        }
+    }
+    for importable in surface
+        .map(vilan_core::analyzer::module_importables)
+        .unwrap_or_default()
+    {
+        if seen.insert(importable.name.to_string()) {
+            items.push(importable_completion(&importable));
+        }
+    }
+    items
+}
+
+/// What `origin::module::` offers: the module's own importable names, read on
+/// demand from its source file. `past_module` are the segments beyond it — an
+/// enum name descends into that enum's variants, which is the only descent
+/// `resolve_import` makes past a module; anything deeper offers nothing.
+fn module_member_completions(
+    module_roots: &[&Path],
+    module: &str,
+    past_module: &[&str],
+) -> Vec<Completion> {
+    let Some(path) = vilan_core::analyzer::module_source_file(module_roots, module) else {
+        return Vec::new();
+    };
+    let importables = vilan_core::analyzer::module_importables(&path);
+    let Some((name, past_enum)) = past_module.split_first() else {
+        return importables.iter().map(importable_completion).collect();
+    };
+    if !past_enum.is_empty() {
+        return Vec::new();
+    }
+    importables
+        .iter()
+        .find(|importable| {
+            importable.name == *name
+                && importable.kind == vilan_core::analyzer::ImportableKind::Enum
+        })
+        .map(|enumeration| {
+            enumeration
+                .variants
+                .iter()
+                .map(|variant| Completion::bare(variant.to_string(), CompletionKind::EnumVariant))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One importable name as a completion candidate. Bare by construction — an
+/// import binds a name, it never calls it — so the shaping post-pass in
+/// [`Document::completion`] has nothing left to strip.
+fn importable_completion(importable: &vilan_core::analyzer::Importable) -> Completion {
+    use vilan_core::analyzer::ImportableKind;
+    let kind = match importable.kind {
+        ImportableKind::Function => CompletionKind::Function,
+        ImportableKind::Macro => CompletionKind::Macro,
+        ImportableKind::Struct => CompletionKind::Struct,
+        ImportableKind::Enum => CompletionKind::Enum,
+        ImportableKind::Trait => CompletionKind::Trait,
+        ImportableKind::Value => CompletionKind::Variable,
+        ImportableKind::Module => CompletionKind::Module,
+        // A re-export names whatever it points at, and the module file that
+        // publishes it does not say what that is — following the path to find
+        // out is a further load per candidate, deliberately not paid here.
+        ImportableKind::Reexport => CompletionKind::Variable,
+    };
+    Completion::bare(importable.name.to_string(), kind)
 }
 
 /// The nominal name in a rendered type label: `struct Point` -> `Point`,
@@ -3264,6 +4214,440 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- E54/E58: the quickfix home, add-import, auto-import completion ------
+    // (E59 adds the pkg-above-std ordering the cap truncates by — see
+    // `import_origin_tier` and `auto_import_completions`'s doc.)
+
+    // A single unambiguous candidate: one quickfix, titled with its module,
+    // whose edit — applied and re-analyzed — actually resolves the name.
+    #[test]
+    fn quickfix_offers_and_applies_an_add_import_for_an_unambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+        ]);
+        let program = document
+            .program
+            .as_ref()
+            .expect("analyzed cleanly enough to have a program");
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(fixes[0].title.contains("help_topic"), "{}", fixes[0].title);
+        assert!(fixes[0].title.contains("pkg::topic"), "{}", fixes[0].title);
+        assert_eq!(fixes[0].replacement, "import pkg::topic::help_topic;\n");
+        // Applied: splice the edit in and re-analyze — the name now resolves.
+        let mut applied = text.to_string();
+        applied.replace_range(fixes[0].span.into_range(), &fixes[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The ratified first target (E54): element syntax with no `view` in
+    // scope. `<div/>` desugars to an unresolved `view` accessor, which
+    // already carries the "element syntax lowers to std::ui::view" note
+    // (element-syntax S4) — the quickfix comes from the SAME general
+    // unresolved-name path as any other name, reaching `view` in real std
+    // via `import_candidates`' disk scan, not from the note's text.
+    #[test]
+    fn quickfix_offers_the_add_import_fix_for_an_unresolved_element_view() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet _x = <div/>;\n}\n")]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let view_fixes: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title.contains("`view`"))
+            .collect();
+        assert_eq!(
+            view_fixes.len(),
+            1,
+            "expected exactly one unambiguous `view` fix: {:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(
+            view_fixes[0].title.contains("std::ui"),
+            "{}",
+            view_fixes[0].title
+        );
+        assert_eq!(view_fixes[0].replacement, "import std::ui::view;\n");
+        // Applied and re-analyzed: the element head resolves.
+        let mut applied = text.to_string();
+        applied.replace_range(view_fixes[0].span.into_range(), &view_fixes[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed
+                .diagnostics
+                .iter()
+                .all(|error| !error.msg.contains("cannot find 'view'")),
+            "applying the fix should resolve the element head: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An AMBIGUOUS name — two sibling modules each declare it — offers one
+    // quickfix PER CANDIDATE, never a guess.
+    #[test]
+    fn quickfix_offers_one_action_per_candidate_for_an_ambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\tshared();\n}\n"),
+            ("alpha.vl", "fun shared() {}\n"),
+            ("beta.vl", "fun shared() {}\n"),
+        ]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let mut fixes = document.quickfixes(program, whole_file);
+        fixes.sort_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(
+            fixes.len(),
+            2,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert!(fixes[0].title.contains("pkg::alpha"), "{}", fixes[0].title);
+        assert!(fixes[1].title.contains("pkg::beta"), "{}", fixes[1].title);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // "Add all missing imports" fixes every UNAMBIGUOUS name and skips the
+    // ambiguous one outright — never guessing between `alpha` and `beta`.
+    #[test]
+    fn add_all_missing_imports_skips_an_ambiguous_name() {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", "fun main() {\n\thelp_topic();\n\tshared();\n}\n"),
+            ("topic.vl", "fun help_topic() {}\n"),
+            ("alpha.vl", "fun shared() {}\n"),
+            ("beta.vl", "fun shared() {}\n"),
+        ]);
+        let program = document.program.as_ref().unwrap();
+        let (_span, new_text) = document
+            .add_all_missing_imports_edit(program)
+            .expect("the unambiguous fix alone is still something to add");
+        assert!(
+            new_text.contains("import pkg::topic::help_topic;"),
+            "{new_text}"
+        );
+        // `shared()` (the call) is untouched original text — what must be
+        // ABSENT is an IMPORT of it, from either candidate module.
+        assert!(
+            !new_text.contains("import pkg::alpha::shared")
+                && !new_text.contains("import pkg::beta::shared"),
+            "an ambiguous name must never be guessed: {new_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E58c: the field-rename quickfix rewrites exactly the diagnostic's span
+    // (the field name) with the closest-name suggestion the analyzer noted.
+    #[test]
+    fn quickfix_rewrites_a_misspelled_initializer_field_to_the_closest_name() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Config {\n\tentries: i32,\n}\n\nfun main() {\n\tlet _ = Config { entires = 5 };\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(fixes[0].title, "Change to `entries`");
+        assert_eq!(fixes[0].replacement, "entries");
+        let expected_start = text.find("entires").unwrap();
+        assert_eq!(
+            fixes[0].span,
+            Span {
+                start: expected_start,
+                end: expected_start + "entires".len(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E61/S2 (editing-dx.md §17.4): the missing-terminator diagnostic's own
+    // gap span becomes an insertion point, exercised directly against
+    // `quickfixes` (main.rs's end-to-end tests cover the handler wiring).
+    #[test]
+    fn quickfix_offers_an_insert_semicolon_fix_at_the_gap() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "fun main() {\n\tlet x: i32 = 1\n\tx;\n}\n")]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert_eq!(
+            fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(fixes[0].title, "Insert `;`");
+        assert_eq!(fixes[0].replacement, ";");
+        let insertion = text.find(" 1\n").map(|p| p + 2).unwrap(); // right after `1`
+        assert_eq!(
+            fixes[0].span,
+            Span {
+                start: insertion,
+                end: insertion,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E61/S3-residual (editing-dx.md §17.4), the CLOSURE shape: regime 1'
+    // fires the same way for a closure whose expected return type is known
+    // (S3-ii, `check_return_position` reached through the closure's
+    // annotation route) — the `;`-locating scan reaches it through
+    // `program.closures`, not `program.functions`, proving that branch is
+    // not dead code.
+    #[test]
+    fn quickfix_removes_a_discarding_semicolon_inside_a_closure() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet scale: |i32| i32 = |value| { value * 2; };\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let remove_fixes: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title == "Remove `;`")
+            .collect();
+        assert_eq!(
+            remove_fixes.len(),
+            1,
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        assert_eq!(remove_fixes[0].replacement, "");
+        // The `;` right before the closure's own closing brace — not the
+        // outer `let`'s statement-terminating `;` two characters later.
+        let semicolon = text.find("2; }").map(|p| p + 1).unwrap();
+        assert_eq!(
+            remove_fixes[0].span,
+            Span {
+                start: semicolon,
+                end: semicolon + 1,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E54c: an unimported name in an ALREADY-LOADED module (loaded because a
+    // sibling name from it is imported) is offered at a bare scope position,
+    // labeled with its module and carrying the brace-set-extension edit.
+    //
+    // Natural, unprefixed names on purpose (E59): real std is analyzed
+    // alongside this tiny fixture (the LSP always loads it), and its OWN
+    // loaded prelude modules contribute plenty of unimported candidates of
+    // their own — capitalized type/trait names (`Add`, `BitAnd`, …) that, in
+    // bare alphabetical order, sort ahead of an ordinary lowercase
+    // identifier like `farewell`. Before E59's `pkg`-above-`std` tiering,
+    // this test needed its names `AAA_`-prefixed to survive
+    // `AUTO_IMPORT_COMPLETION_CAP` at all; the tiering makes that
+    // unnecessary — a `pkg` candidate now outranks every `std` one
+    // regardless of its label, so the plain name proves the natural case.
+    #[test]
+    fn auto_import_completion_offers_a_labeled_edit_carrying_sibling_from_an_already_loaded_module()
+    {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun greet() {}\n\nfun farewell() {}\n"),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let farewell = candidates
+            .iter()
+            .find(|candidate| candidate.label == "farewell")
+            .expect("an unimported sibling in an already-loaded module is offered");
+        let auto_import = farewell
+            .needs_import
+            .as_ref()
+            .expect("labeled with the import it needs");
+        assert_eq!(
+            auto_import.module_path,
+            vec!["pkg".to_string(), "helper".to_string()]
+        );
+        // `helper` is already imported (bare `greet`): the edit EXTENDS it
+        // into a two-member set rather than inserting a new line.
+        assert_eq!(auto_import.edit_replacement, "{ farewell, greet }");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A name already offered from SCOPE is never duplicated as an auto-import
+    // candidate — the in-scope one is the only match on the menu. (Same
+    // natural-name reasoning as above — E59.)
+    #[test]
+    fn a_name_already_in_scope_is_not_offered_as_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun farewell() {}\n\n\
+                 fun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun greet() {}\n\nfun farewell() {}\n"),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let farewells: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.label == "farewell")
+            .collect();
+        assert_eq!(
+            farewells.len(),
+            1,
+            "the in-scope declaration only, no auto-import duplicate"
+        );
+        assert!(farewells[0].needs_import.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E54c's cap: a module with many unimported siblings doesn't flood the
+    // popup — the count never exceeds `AUTO_IMPORT_COMPLETION_CAP`, though at
+    // least one still comes through. Natural, unprefixed names (E59, see
+    // above) so this fixture's own 30 unimported candidates are what compete
+    // for the cap's 20 slots, not std's much larger loaded surface — proven
+    // by `origin_tier`, not by out-sorting std alphabetically.
+    #[test]
+    fn auto_import_completions_are_capped() {
+        let many_functions: String = (0..30)
+            .map(|index| format!("fun sibling{index:02}() {{}}\n"))
+            .collect();
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::sibling00;\n\nfun main() {\n\tsibling00();\n\t\n}\n",
+            ),
+            ("helper.vl", &many_functions),
+        ]);
+        let marker = "sibling00();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let auto_import_labels: Vec<&str> = candidates
+            .iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        assert!(
+            auto_import_labels.len() <= AUTO_IMPORT_COMPLETION_CAP,
+            "expected the cap to hold, got {}: {auto_import_labels:?}",
+            auto_import_labels.len()
+        );
+        assert!(
+            auto_import_labels
+                .iter()
+                .all(|label| label.starts_with("sibling")),
+            "expected the fixture's own 29 unimported siblings to fill the \
+             cap, not std's: {auto_import_labels:?}"
+        );
+        assert_eq!(
+            auto_import_labels.len(),
+            AUTO_IMPORT_COMPLETION_CAP,
+            "29 candidates over a cap of {AUTO_IMPORT_COMPLETION_CAP} should saturate it: {auto_import_labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E59: the pin proving the filing's own case — a small real file's own
+    // pkg name (alphabetically LAST among its siblings, deliberately named
+    // to lose against std's capitalized prelude in bare string order) still
+    // appears, ahead of every std candidate, because `pkg` outranks `std` by
+    // tier rather than by label. Plant-proof: reverting `import_origin_tier`
+    // to return the same tier for every root turns this red (`zzz_local` is
+    // squeezed out by std's >20 capitalized prelude names before the sort
+    // ever reaches it) — restored after confirming it.
+    #[test]
+    fn a_pkg_name_that_loses_alphabetically_still_outranks_stds_surface() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::anchor;\n\nfun main() {\n\tanchor();\n\t\n}\n",
+            ),
+            ("helper.vl", "fun anchor() {}\n\nfun zzz_local() {}\n"),
+        ]);
+        let marker = "anchor();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let candidates = document.completion(offset);
+        let local = candidates
+            .iter()
+            .find(|candidate| candidate.label == "zzz_local")
+            .expect(
+                "a pkg name must survive the cap even when it sorts after \
+                 std's entire loaded surface alphabetically",
+            );
+        assert_eq!(
+            local
+                .needs_import
+                .as_ref()
+                .expect("labeled with the import it needs")
+                .origin_tier,
+            0,
+            "pkg is tier 0"
+        );
+        let std_present = candidates.iter().any(|candidate| {
+            candidate.needs_import.as_ref().is_some_and(|auto_import| {
+                auto_import.module_path.first().map(String::as_str) == Some("std")
+            })
+        });
+        assert!(
+            std_present,
+            "the pkg tier (2 names) doesn't come close to filling the cap, \
+             so std candidates still appear behind them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A published set's messages — `PublishedDiagnostic` is not `Debug`, and
     /// the message is what an assertion failure needs to read.
     fn messages(published: &[PublishedDiagnostic]) -> Vec<&str> {
@@ -3336,6 +4720,46 @@ pub(crate) mod tests {
                 .find("let Z: i32 = A + 2")
                 .expect("Z's declaration"),
             "the note is spanned in zeta.vl's own text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── B112: a post-`build()` check publishes on the file its span indexes ──
+    //
+    // The editor half of the bug. R10 runs after `build()`, where the analyzer's
+    // "current file" is the entry, so a written `List<Guard>` in an imported
+    // module published against THIS document at the module's offsets — a
+    // squiggle over unrelated text in the file the user has open, and nothing at
+    // all in the file that has the mistake.
+    #[test]
+    fn a_container_resource_in_a_module_publishes_on_the_module() {
+        let module = "import std::print;\nimport std::drop::Drop;\n\
+                      resource struct Guard { label: str }\n\
+                      impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
+                      fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::store::keep;\nfun main() { keep(); }\n",
+            ),
+            ("store.vl", module),
+        ]);
+        let published = document.published_diagnostics();
+        let item = published
+            .iter()
+            .find(|item| item.message.contains("cannot hold the resource `Guard`"))
+            .unwrap_or_else(|| panic!("R10 should publish: {:?}", messages(&published)));
+        let path = item.path.as_ref().expect("attributed to a file");
+        assert!(path.ends_with("store.vl"), "{path:?}");
+        // And the span is an offset into store.vl's own text — the half that
+        // makes the path worth having.
+        let annotation = module
+            .find("List<Guard>")
+            .expect("the annotation is in store.vl");
+        assert_eq!(
+            item.span.into_range(),
+            annotation..annotation + "List<Guard>".len(),
+            "spanned at the annotation, in store.vl's own text"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5030,6 +6454,28 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("no `{label}` completion offered"))
     }
 
+    /// The completion labels at the `|` cursor in the FIRST of `files`, with the
+    /// whole set written to a real package directory on disk — what
+    /// [`completion_items_at_cursor`] cannot give, since `import pkg::…` needs
+    /// siblings to find and a sibling module needs a file.
+    fn workspace_completions_at_cursor(files: &[(&str, &str)]) -> Vec<String> {
+        let (entry_name, entry_source) = files[0];
+        let offset = entry_source
+            .find('|')
+            .expect("test source needs a `|` cursor marker");
+        let entry_text = entry_source.replace('|', "");
+        let mut written: Vec<(&str, &str)> = vec![(entry_name, &entry_text)];
+        written.extend_from_slice(&files[1..]);
+        let (directory, document) = analyze_workspace(&written);
+        let labels = document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        labels
+    }
+
     #[test]
     fn lifted_member_completion_offers_the_element() {
         let labels = completions_at_cursor(
@@ -5255,6 +6701,43 @@ pub(crate) mod tests {
         assert!(!in_import_path("used = 5", 8), "a word starting with `use`");
     }
 
+    // E57: the path split that routes every level of import completion. The
+    // partial name under the cursor is never a completed segment — that is what
+    // makes `import s|` a HEAD position and `import std::|` a one-segment one —
+    // and a brace set splits at its brace exactly as the path splits at `::`.
+    #[test]
+    fn import_path_segments_are_the_completed_ones() {
+        fn at_end(line: &str) -> Option<Vec<&str>> {
+            import_path_segments(line, line.len())
+        }
+        assert_eq!(at_end("import "), Some(vec![]), "the head, nothing typed");
+        assert_eq!(at_end("import s"), Some(vec![]), "the head, mid-word");
+        assert_eq!(at_end("import std::"), Some(vec!["std"]));
+        assert_eq!(at_end("import std::js"), Some(vec!["std"]), "mid-word");
+        assert_eq!(at_end("import std::json::"), Some(vec!["std", "json"]));
+        assert_eq!(
+            at_end("export import pkg::shapes::Point::"),
+            Some(vec!["pkg", "shapes", "Point"]),
+            "an `export` prefix is skipped, and the path runs as deep as it is typed"
+        );
+        assert_eq!(
+            at_end("import std::json::{ Json, J"),
+            Some(vec!["std", "json"]),
+            "a brace set is one more member of the namespace before it"
+        );
+        assert_eq!(
+            at_end("import std::{ "),
+            Some(vec!["std"]),
+            "a brace set directly under an origin"
+        );
+        assert_eq!(at_end("fun main() { sqrt"), None, "not an import line");
+        assert_eq!(
+            at_end("import std::{ json::{ pa"),
+            None,
+            "a nested brace set is a shape this does not read — it guesses at nothing"
+        );
+    }
+
     // E14: at a scope position (an open function body) each shape-heavy
     // construct completes as a SNIPPET-kind template carrying its exact
     // tab-stopped body. The bodies are pinned verbatim — house style (tab
@@ -5331,18 +6814,18 @@ pub(crate) mod tests {
         );
     }
 
-    // E14: an import path (`import st|`, which reaches scope completion — the
-    // char before `st` is a space) offers no construct snippets; the post-pass
-    // drops them. Bare keywords survive (so the list is non-vacuous), proving
-    // the drop is targeted at snippets, not the whole list.
+    // E14: an import path (`import st|`) offers no construct snippets. It once
+    // reached `scope_completions` and had them dropped by a post-pass; E57
+    // routes it to import completion instead, which never produces one. The
+    // non-vacuity witness moves with it: the list is the ORIGINS now, not the
+    // keywords, because a keyword may not follow `import` either — which is the
+    // same argument E14 made about the snippets, carried to its conclusion.
     #[test]
     fn construct_snippets_are_absent_in_import_path() {
         let items = completion_items_at_cursor("import st|\nfun main() {}\n");
         assert!(
-            items
-                .iter()
-                .any(|c| matches!(c.kind, CompletionKind::Keyword)),
-            "the import-path completion still ran (keywords present): {:?}",
+            items.iter().any(|c| c.label == "std"),
+            "the import-path completion still ran (origins present): {:?}",
             items.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
         assert!(
@@ -5701,6 +7184,254 @@ pub(crate) mod tests {
         );
     }
 
+    // --- E53: a code-position `Name::` answers from SCOPE, not from every
+    // module the process happens to have loaded ---
+
+    // The headline case. `compare.vl` is one of the nine std modules the loader
+    // ALWAYS pulls in for the derive prelude, so its `enum Ordering` sits in
+    // every program ever analyzed — and matching the left of `::` against
+    // `program.enums` by name offered its variants in a file that had never
+    // heard of `std::compare`.
+    #[test]
+    fn code_path_completion_excludes_the_always_loaded_prelude() {
+        let labels = completions_at_cursor("fun main() {\n\tlet o = Ordering::|\n}\n");
+        assert!(
+            !labels.contains(&"Less".to_string()),
+            "`std::compare` was never imported: {labels:?}"
+        );
+        let json = completions_at_cursor("fun main() {\n\tlet k = JsonKind::|\n}\n");
+        assert!(
+            !json.contains(&"Number".to_string()),
+            "`std::json` was never imported: {json:?}"
+        );
+    }
+
+    // The same exclusion for a type in the user's own package: a sibling module
+    // is loaded (the entry imports something else from it) and declares `Color`,
+    // but this file never brought `Color` into scope.
+    #[test]
+    fn code_path_completion_excludes_an_unimported_same_named_type() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "import pkg::palette::shade;\nfun main() {\n\tlet c = Color::|\n}\n",
+            ),
+            (
+                "palette.vl",
+                "enum Color { Red, Green, Blue }\nfun shade(): i32 { 1 }\n",
+            ),
+        ]);
+        assert!(
+            !labels.contains(&"Red".to_string()),
+            "`Color` is declared in a loaded module but never imported here: {labels:?}"
+        );
+    }
+
+    // The flip side, and the reason the exclusion is a scope question rather
+    // than a "std is off limits" rule: import the very same type and it
+    // completes.
+    #[test]
+    fn code_path_completion_includes_an_imported_type() {
+        let labels = completions_at_cursor(
+            "import std::compare::Ordering;\nfun main() {\n\tlet o = Ordering::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Less".to_string()),
+            "an imported enum completes: {labels:?}"
+        );
+        let workspace = workspace_completions_at_cursor(&[
+            (
+                "main.vl",
+                "import pkg::palette::Color;\nfun main() {\n\tlet c = Color::|\n}\n",
+            ),
+            ("palette.vl", "enum Color { Red, Green, Blue }\n"),
+        ]);
+        assert!(
+            workspace.contains(&"Red".to_string()),
+            "an imported package enum completes: {workspace:?}"
+        );
+    }
+
+    // A type declared in the file being edited is in scope by declaration, and
+    // stays so even when the cursor's own statement has not parsed — the case
+    // `same_file_namespace` exists for, and the one a naive scope-only rule
+    // would have broken.
+    #[test]
+    fn code_path_completion_survives_an_unparsed_statement() {
+        let labels = completions_at_cursor(
+            "enum Color { Red, Green, Blue }\nfun main() {\n\tlet c = ((( Color::|\n}\n",
+        );
+        assert!(
+            labels.contains(&"Red".to_string()),
+            "a locally-declared enum completes mid-edit: {labels:?}"
+        );
+    }
+
+    // --- E57: import-path completion ---
+
+    // The head of an import path names an ORIGIN, which is not an entity: no
+    // lookup against the program can ever answer it, which is why `import std::`
+    // completed nothing at all. It offers the origins, and only those — a
+    // keyword, a construct snippet, and a name in scope are all ungrammatical
+    // after `import`.
+    #[test]
+    fn import_head_offers_the_origins_and_nothing_else() {
+        let items =
+            completion_items_at_cursor("fun helper() {}\nimport |\nfun main() { helper(); }\n");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"std"), "the std origin: {labels:?}");
+        assert!(labels.contains(&"pkg"), "the pkg origin: {labels:?}");
+        assert!(
+            !labels.contains(&"fun"),
+            "a keyword may not follow `import`: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"helper"),
+            "a name in scope may not follow `import`: {labels:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Snippet)),
+            "no construct snippets: {labels:?}"
+        );
+    }
+
+    // `import std::` lists the std tree — the embedded/checked-out std the
+    // analysis itself resolved, enumerated from its layered roots. Asserted by
+    // membership, never as a frozen list: std grows.
+    #[test]
+    fn import_lists_the_std_modules() {
+        let labels = completions_at_cursor("import std::|\nfun main() {}\n");
+        for module in ["json", "math", "option", "list"] {
+            assert!(
+                labels.contains(&module.to_string()),
+                "`std::{module}` is a module: {labels:?}"
+            );
+        }
+        // A layer directory is not a path segment: `src/process/fs.vl` is
+        // `std::fs`, and `process` is a module in its own right, not a namespace.
+        assert!(
+            labels.contains(&"fs".to_string()),
+            "a layered module lists under its own name: {labels:?}"
+        );
+        // `lib.vl` is the package SURFACE, not a module of it — and its
+        // re-exports are offered right here, under the origin.
+        assert!(
+            !labels.contains(&"lib".to_string()),
+            "`import std::lib` is not a thing: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"print".to_string()),
+            "std's `lib.vl` surface is reachable as `std::print`: {labels:?}"
+        );
+    }
+
+    // `import pkg::` lists the package's OWN source files, by the same names the
+    // module loader resolves them under — including the directory form.
+    #[test]
+    fn import_lists_the_packages_own_modules() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::|\nfun main() {}\n"),
+            ("palette.vl", "enum Color { Red }\n"),
+            ("shapes/lib.vl", "struct Point { x: i32 }\n"),
+        ]);
+        assert!(
+            labels.contains(&"palette".to_string()),
+            "a flat sibling module: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"shapes".to_string()),
+            "a directory module resolves under its directory's name: {labels:?}"
+        );
+    }
+
+    // The load-on-demand case, in the shape it actually happens: the buffer is
+    // ahead of the analysis (150 ms of debounce), so the program the document
+    // holds knows nothing of `std::math` — and the candidates still arrive,
+    // because they come from the module file, not from the program.
+    #[test]
+    fn import_members_load_a_module_the_program_never_did() {
+        let mut document = analyze_text("fun main() {}\n");
+        assert!(
+            !document
+                .program
+                .as_ref()
+                .expect("analyzed")
+                .modules
+                .values()
+                .any(|module| module.name == "random"),
+            "`std::random` is outside the always-loaded prelude's closure"
+        );
+        let typed = "import std::random::\nfun main() {}\n";
+        document.set_text(typed);
+        let labels: Vec<String> = document
+            .completion(typed.find('\n').expect("end of the import line"))
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        assert!(
+            labels.contains(&"range".to_string()) && labels.contains(&"Random".to_string()),
+            "`std::random`'s members, loaded on demand: {labels:?}"
+        );
+    }
+
+    // A brace set completes at the level of the path before it — one more member
+    // of the same namespace — which falls out of splitting the path at the brace
+    // exactly as it splits at the final `::`.
+    #[test]
+    fn import_completes_inside_a_brace_set() {
+        let labels = completions_at_cursor("import std::compare::{ Ordering, |\nfun main() {}\n");
+        assert!(
+            labels.contains(&"PartialEq".to_string()),
+            "a further member of the same module: {labels:?}"
+        );
+    }
+
+    // Past a module, an enum is the one namespace an import descends into —
+    // `resolve_import` descends through modules and enums and nothing else.
+    #[test]
+    fn import_descends_into_an_enums_variants() {
+        let labels = completions_at_cursor("import std::compare::Ordering::|\nfun main() {}\n");
+        assert!(
+            labels.contains(&"Less".to_string()),
+            "an enum's variants are importable: {labels:?}"
+        );
+    }
+
+    // A module that does not resolve answers EMPTY. The request is on the
+    // editor's critical path: it degrades, it never errors, and it never panics.
+    #[test]
+    fn an_import_of_a_module_that_is_not_there_is_empty() {
+        assert!(
+            completions_at_cursor("import std::no_such_module::|\nfun main() {}\n").is_empty(),
+            "a module that fails to load offers nothing"
+        );
+        assert!(
+            completions_at_cursor("import no_such_origin::|\nfun main() {}\n").is_empty(),
+            "a head that names no origin and no loaded namespace offers nothing"
+        );
+    }
+
+    // The routing is one-way: import completion answers import lines, and a
+    // plain code position is untouched — no origins leak into it.
+    #[test]
+    fn origins_do_not_leak_into_a_code_position() {
+        let items = completion_items_at_cursor("fun main() {\n\tlet x = |\n}\n");
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Keyword)),
+            "a code position still offers keywords"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.kind, CompletionKind::Snippet)),
+            "a code position still offers construct snippets"
+        );
+    }
+
     // --- E8: editor support for macros ---
 
     // Hover on a macro attribute shows the macro's signature; definition
@@ -5964,6 +7695,166 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- E51: a module import used only through `::` static access ---------
+    //
+    // A static accessor's SUBJECT (`math` in `math::min(..)`) resolves through
+    // the TYPE-position walk (`walk_type_node`'s `Node::Accessor` arm feeding
+    // `prepped_type_locals`), whose `definition_id` match used to omit
+    // `Type::Module` — so the use site recorded `definition: None` in
+    // `type_references` and, since the accessor's own resolution binds only the
+    // MEMBER (`min`) into `entity_map`, `import_leaf_is_used` found the module
+    // referenced nowhere and pruned it.
+
+    // The reported shape: a module import referenced only via `::`, never as a
+    // bare name, stays.
+    #[test]
+    fn organize_keeps_a_module_import_used_only_via_static_access() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "a module import used only via `::` was pruned",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The brace-set variant: a set with one module leaf used only via `::` and
+    // one dead sibling shrinks to the live branch, keeping the module leaf.
+    #[test]
+    fn organize_shrinks_a_brace_set_keeping_a_module_leaf_used_via_static_access() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::{ io, math };\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let result = organized(&document).expect("a dead branch offers a shrink edit");
+        assert_eq!(
+            result,
+            "import std::{ math };\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The element-syntax companion (backlog's "companion pin owed"): markup
+    // desugars to a bare `view` accessor in VALUE position, which the entity-map
+    // check ((B) in `import_leaf_is_used`) already detects — this should already
+    // pass; the pin guards it from regressing alongside the module fix above.
+    #[test]
+    fn organize_keeps_a_view_import_used_only_by_markup() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::ui::view;\nfun page() {\n\t<div>\"hi\"</div>\n}\n",
+        )]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "an import used only through markup's desugared `view` accessor was pruned",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The negative: a module import referenced nowhere — not as a bare name, not
+    // through `::` — is still pruned. The fix must not turn every module import
+    // into a permanent keeper.
+    #[test]
+    fn organize_prunes_a_genuinely_unused_module_import() {
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", "import std::math;\nfun main() {}\n")]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        let result = organized(&document).expect("a wholly unused module import offers a prune");
+        assert_eq!(result, "fun main() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The analyzer-level statement, pinned directly (`inference.rs`'s harness
+    // exposes only compile success/failure, not `type_references` — this is the
+    // LSP-layer pin the task calls for instead): a static accessor's module
+    // SUBJECT records the SAME definition id in `type_references` as the
+    // import's own leaf reference, rather than `None`. Plant the bug (drop the
+    // `Type::Module` arm from the `definition_id` match in analyzer.rs) and
+    // `use_definition` goes from `Some(..)` to `None`.
+    #[test]
+    fn a_module_static_accessors_subject_shares_the_imports_definition_id() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        let program = document.program.as_ref().expect("the program analyzes");
+        let text = document.text.clone();
+        let leaf_offset = text.find("math").expect("the import leaf");
+        let use_offset = text.rfind("math::min").expect("the use site");
+        let find_definition = |offset: usize| {
+            program
+                .type_references
+                .iter()
+                .find(|(source, span, _, _)| {
+                    *source == SourceId(0) && span.into_range().start == offset
+                })
+                .and_then(|(_, _, definition, _)| *definition)
+        };
+        let leaf_definition =
+            find_definition(leaf_offset).expect("the import's own leaf records a definition");
+        let use_definition = find_definition(use_offset).expect(
+            "the use site's module SUBJECT must record a definition id (E51's root cause: the \
+             definition_id match omitted Type::Module, so this was None and Organize Imports \
+             saw the module referenced nowhere)",
+        );
+        assert_eq!(
+            leaf_definition, use_definition,
+            "the use site resolved to a different entity than the import's own leaf",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A survey side effect of the fix, pinned deliberately (not a regression
+    // guard for E51 itself): go-to-definition on the module SUBJECT of a `::`
+    // use site now jumps to the module, same as it already did for the module
+    // name written inside the `import` statement itself (`resolve_import`
+    // records a reference on every segment, including the root). Before the
+    // fix, `definition()`'s `let definition = definition?;` short-circuited on
+    // the `None` this use site recorded and answered nothing at all — not a
+    // wrong jump, no jump. The landing spot is the module's registered location
+    // ("its file, at the top", analyzer.rs) rather than a name span, because a
+    // module has no name token of its own to land on.
+    #[test]
+    fn goto_definition_on_a_modules_static_access_subject_jumps_to_the_module() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "import std::math;\nfun main() {\n\tmath::min(1, 2);\n}\n",
+        )]);
+        let use_offset = document.text.rfind("math::min").expect("the use site") + 1;
+        let (source, _span) = document
+            .definition(use_offset)
+            .expect("go-to-definition on the module subject of a `::` use site");
+        assert_ne!(
+            source,
+            SourceId(0),
+            "the module's definition should live in std's math.vl, not the entry",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- WO-5: LSP features survive recoverable errors ---------------------
     //
     // Since the handwritten frontend cut over (H6 S5), `parsing::parse` salvages
@@ -5976,9 +7867,9 @@ pub(crate) mod tests {
     // broken region and parsing continues, so the items above AND below the
     // error all survive. `let x = ;` is the syntax error; nothing else is wrong.
     const RECOVERABLE_INBODY: &str = "struct Widget { size: i32 }\n\nfun above(w: Widget): i32 {\n\tw.size\n}\n\nfun broken() {\n\tlet x = ;\n}\n\nfun below(): i32 {\n\thelper()\n}\n\nfun helper(): i32 {\n\t7\n}\n";
-    // A stray token at file scope: the top-level statement loop declines and
-    // stops, so only the PREFIX (everything before the token) is salvaged; the
-    // tail after it is not recovered. This is the other salvage regime.
+    // A stray token at file scope: the top-level statement loop reports it and
+    // synchronizes to the next item keyword (`editing-dx.md` S1), so the prefix
+    // AND the tail are salvaged. This is the other salvage regime.
     const RECOVERABLE_TOPLEVEL: &str =
         "fun above(): i32 {\n\t42\n}\n\n$ garbage here $\n\nfun below(): i32 {\n\t7\n}\n";
     // A clean parse with an analyzer error in the middle (`no_such_name` is
@@ -6160,11 +8051,13 @@ pub(crate) mod tests {
         assert_eq!(&RECOVERABLE_INBODY[span.into_range()], "helper");
     }
 
-    // The reality of the top-level regime: a stray token at file scope stops the
-    // statement loop, so only the prefix is salvaged. `above` (before) works;
-    // `below` (after) is not in the program at all. Contrast the in-body case.
+    // The top-level regime, since the statement/item synchronizer shipped
+    // (`editing-dx.md` S1): a stray token at file scope is reported and skipped to
+    // the next item boundary, so the items on BOTH sides of it survive. This pin
+    // used to assert the opposite — that `below` was not in the program at all —
+    // which is precisely the file-tail blackout §2.2 mechanism 3 measured.
     #[test]
-    fn a_top_level_error_salvages_the_prefix_and_drops_the_tail() {
+    fn a_top_level_error_keeps_the_items_on_both_sides() {
         let document = analyze_text(RECOVERABLE_TOPLEVEL);
         assert!(document.program.is_some());
         assert!(!document.diagnostics.is_empty());
@@ -6178,8 +8071,8 @@ pub(crate) mod tests {
             "prefix kept: {names:?}"
         );
         assert!(
-            !names.contains(&"below".to_string()),
-            "the tail after a top-level stray token is not recovered: {names:?}",
+            names.contains(&"below".to_string()),
+            "the tail after a top-level stray token is recovered too: {names:?}",
         );
         assert!(
             document
@@ -6187,10 +8080,11 @@ pub(crate) mod tests {
                 .is_some_and(|hover| hover.contains("fun above(): i32")),
             "the prefix item still hovers",
         );
-        assert_eq!(
-            document.hover(offset_at(RECOVERABLE_TOPLEVEL, "fun below", 4)),
-            None,
-            "the dropped tail item has nothing to hover",
+        assert!(
+            document
+                .hover(offset_at(RECOVERABLE_TOPLEVEL, "fun below", 4))
+                .is_some_and(|hover| hover.contains("fun below(): i32")),
+            "and so does the item below the error",
         );
     }
 
@@ -6691,9 +8585,14 @@ pub(crate) mod tests {
     #[test]
     fn a_salvage_break_keeps_the_byte_identical_tail_highlighted() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
-        // A stray top-level token: salvage keeps the parsed prefix and drops
-        // everything below — the exact blank-tail shape B38 exists for.
-        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        // An unterminated interpolated triple-quoted string: there is no
+        // resynchronisation point inside one, so the LEXER stops there and every
+        // token below is gone — the blank-tail shape B38 exists for. (A stray
+        // top-level token used to do this too; since the statement/item
+        // synchronizer shipped, `editing-dx.md` S1, the parse skips it and the
+        // tail is analyzed normally, which is the blackout's death and leaves the
+        // lexer-level break as the honest premise here.)
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let zeta = offset_at(broken, "zeta", 0);
 
         // Premise: the broken text's own analysis has no token at `zeta`.
@@ -6726,7 +8625,7 @@ pub(crate) mod tests {
     fn an_edited_line_below_the_break_stays_unhighlighted() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let broken_and_edited =
-            "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet quux = 8;\n}\n";
+            "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet quux = 8;\n}\n";
         let quux = offset_at(broken_and_edited, "quux", 0);
         let mut document = analyze_text(whole);
         document.adopt_analysis(analyze_text(broken_and_edited));
@@ -6745,7 +8644,7 @@ pub(crate) mod tests {
     #[test]
     fn a_complete_analysis_suppresses_the_retained_tail() {
         let whole = "fun alpha() {\n\tlet a = 1;\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
-        let broken = "fun alpha() {\n\tlet a = 1;\n}\n)\nfun omega() {\n\tlet zeta = 9;\n}\n";
+        let broken = "fun alpha() {\n\tlet a = i\"\"\";\n}\nfun omega() {\n\tlet zeta = 9;\n}\n";
         let mut document = analyze_text(whole);
         document.adopt_analysis(analyze_text(broken));
         // The user closes the string; the next analysis is whole again.

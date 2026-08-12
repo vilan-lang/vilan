@@ -987,13 +987,15 @@ fn derive_in_a_dependency_library_resolves() {
 
 // --- Diagnostic source attribution (backlog E1) --------------------------------
 
-/// As [`analyze_package_raw`], but returns `(message, source-file name)` pairs —
-/// the attribution the LSP publishes by.
+/// As [`analyze_package_raw`], but returns `(message, source-file name, note's
+/// source-file name)` triples — the attribution the LSP publishes by. The note's
+/// file is `None` when the note carries no source of its own, which means "the
+/// diagnostic's own file".
 fn analyze_package_attributed(
     files: &[(&str, &str)],
     entry: &str,
     platform: Platform,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, Option<String>)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("vilan_attr_{}_{unique}", std::process::id()));
@@ -1020,12 +1022,19 @@ fn analyze_package_attributed(
         .iter()
         .zip(program.diagnostic_sources.iter())
         .map(|(error, source)| {
-            let name = program
-                .source_path(*source)
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "<none>".to_string());
-            (error.msg.clone(), name)
+            let file_of = |source| {
+                program
+                    .source_path(source)
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<none>".to_string())
+            };
+            let note_file = error
+                .note
+                .as_ref()
+                .and_then(|note| note.source)
+                .map(file_of);
+            (error.msg.clone(), file_of(*source), note_file)
         })
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1050,7 +1059,7 @@ fn a_type_error_in_an_imported_module_is_attributed_to_that_module() {
     );
     let mismatch = attributed
         .iter()
-        .find(|(msg, _)| msg.contains("Expected i32"))
+        .find(|(msg, ..)| msg.contains("Expected i32"))
         .expect("the return mismatch should be reported");
     assert_eq!(
         mismatch.1, "broken.vl",
@@ -1075,12 +1084,12 @@ fn name_errors_attribute_to_their_own_files() {
     );
     let helper_error = attributed
         .iter()
-        .find(|(msg, _)| msg.contains("missing_in_helper"))
+        .find(|(msg, ..)| msg.contains("missing_in_helper"))
         .expect("the helper's name error should be reported");
     assert_eq!(helper_error.1, "helper.vl", "{attributed:?}");
     let entry_error = attributed
         .iter()
-        .find(|(msg, _)| msg.contains("missing_in_entry"))
+        .find(|(msg, ..)| msg.contains("missing_in_entry"))
         .expect("the entry's name error should be reported");
     assert_eq!(entry_error.1, "main.vl", "{attributed:?}");
 }
@@ -1102,7 +1111,7 @@ fn module_parse_errors_attribute_to_the_broken_module() {
     );
     let parse_error = attributed
         .iter()
-        .find(|(msg, _)| msg.contains("parse error in"))
+        .find(|(msg, ..)| msg.contains("parse error in"))
         .expect("the module parse error should be reported");
     assert_eq!(parse_error.1, "util.vl", "{attributed:?}");
 }
@@ -1366,4 +1375,420 @@ fn rust_fallback_derives_parse_through_the_content_cache() {
          content cache"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- B112: a post-`build()` check attributes to its span's own file ------------
+//
+// The checks that run after `build()` push into one diagnostics vector with no
+// file walk to inherit an attribution mark from, so every one of them defaulted
+// to `current_source_id` — which `analyze` leaves at the entry. A written
+// `List<Guard>` inside an IMPORTED module therefore claimed the entry file, and
+// the editor drew the label over whatever the entry happened to hold at the
+// module's offsets (the harm E16/E1 exist to stop).
+//
+// A single-file program cannot see any of this: every user diagnostic in one is
+// `SourceId(0)`, so a check attributing to the wrong file is indistinguishable
+// from one attributing to the right file. That is why these live here rather
+// than beside the single-source pins in `inference.rs` — the same reason B74's
+// cross-module duplicate does.
+
+/// The `resource Guard` preamble the resource-rule cases share, since a `Guard`
+/// declaration is most of each of them.
+const GUARD_PREAMBLE: &str = "import std::print;\nimport std::drop::Drop;\n\
+    resource struct Guard { label: str }\n\
+    impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
+
+fn guarded(body: &str) -> String {
+    format!("{GUARD_PREAMBLE}{body}")
+}
+
+/// The one diagnostic containing `message`, and the file it was attributed to.
+#[track_caller]
+fn attributed_to(files: &[(&str, &str)], message: &str) -> (String, Option<String>) {
+    let attributed = analyze_package_attributed(files, "main.vl", Platform::default());
+    let found = attributed
+        .iter()
+        .find(|(text, ..)| text.contains(message))
+        .unwrap_or_else(|| panic!("no diagnostic contains {message:?}; got {attributed:#?}"));
+    (found.1.clone(), found.2.clone())
+}
+
+// The filed shape: a WRITTEN `List<Guard>` inside an imported user module. R10's
+// tier 1 collects the application at `walk_type_node` and reports it long after
+// the walk, so the file has to ride along with the span.
+#[test]
+fn b112_a_written_container_resource_in_a_module_attributes_to_that_module() {
+    let (file, _) = attributed_to(
+        &[
+            (
+                "main.vl",
+                "import pkg::store::keep;\nfun main() { keep(); }\n",
+            ),
+            (
+                "store.vl",
+                &guarded("fun keep() {\n\tmut arr: List<Guard> = [];\n}\n"),
+            ),
+        ],
+        "`List` cannot hold the resource `Guard`",
+    );
+    assert_eq!(
+        file, "store.vl",
+        "R10 must report in the file that wrote it"
+    );
+}
+
+// Every post-`build()` family, one row each: the violation is written in the
+// MODULE, and the diagnostic must name the module. Plant-proven as a table —
+// making `attribute_diagnostics_to_anchor` a no-op turns every row red, so no
+// row is passing on the entry's account.
+#[test]
+fn b112_every_post_build_check_attributes_to_the_module_it_fired_in() {
+    let call_go = "import pkg::m::go;\nfun main() { go(); }\n";
+    // (the check family, the module's source, the entry's source, the message)
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        (
+            "R10, written application",
+            guarded("fun go() {\n\tmut arr: List<Guard> = [];\n}\n"),
+            call_go,
+            "`List` cannot hold the resource `Guard`",
+        ),
+        (
+            "R10, inferred type",
+            guarded("fun go() {\n\tmut arr = [Guard { label = \"one\" }];\n}\n"),
+            call_go,
+            "`List` cannot hold the resource `Guard`",
+        ),
+        (
+            "R10, native-method receiver",
+            guarded("fun go() {\n\tlet n = [Guard { label = \"one\" }].len();\n}\n"),
+            call_go,
+            "`List` cannot hold the resource `Guard`",
+        ),
+        (
+            "R1, use after move",
+            guarded(
+                "fun sink(own g: Guard) {}\nfun go() {\n\tlet g = Guard { label = \"one\" };\n\
+                 \tsink(g);\n\tsink(g);\n}\n",
+            ),
+            call_go,
+            "after it was moved",
+        ),
+        (
+            "R12, resource into `any`",
+            guarded(
+                "fun show(v: any) {}\nfun go() {\n\tlet g = Guard { label = \"one\" };\n\
+                 \tshow(g);\n}\n",
+            ),
+            call_go,
+            "cannot be used where `any` is expected",
+        ),
+        (
+            "the `mut` resource parameter reject",
+            guarded("fun take(mut g: Guard) {}\nfun go() {}\n"),
+            call_go,
+            "a resource never copies",
+        ),
+        (
+            "`Drop` on a non-resource",
+            "import std::print;\nimport std::drop::Drop;\nstruct Plain { n: i32 }\n\
+             impl Plain with Drop { fun drop(&mut self) { print(\"x\"); } }\nfun go() {}\n"
+                .to_string(),
+            call_go,
+            "implements `Drop` but is not a resource",
+        ),
+        (
+            "view escape",
+            "fun go(): List<&i32> {\n\tlet v = 1;\n\t[&v]\n}\n".to_string(),
+            call_go,
+            "a view cannot escape its scope",
+        ),
+        (
+            "readonly mutation",
+            "fun go() {\n\tlet n = 1;\n\tn = 2;\n}\n".to_string(),
+            call_go,
+            "cannot mutate immutable 'n'",
+        ),
+        (
+            "the async view-parameter rule",
+            "async fun tick() { let _beat = 1; }\n\
+             async fun go(value: &mut i32) {\n\tawait tick();\n\tvalue += 1;\n}\n"
+                .to_string(),
+            "import pkg::m::go;\nfun main() {\n\tmut a = 5;\n\tgo(&mut a);\n}\n",
+            "an async function cannot take '&mut' parameters",
+        ),
+        (
+            "the Wire boundary",
+            "[derive(Wire)]\nstruct Holder {\n\tcallback: |i53| i53,\n}\n".to_string(),
+            "import pkg::m::Holder;\nfun main() { }\n",
+            "of `[derive(Wire)]` type `Holder` is `_`, which is not Wire",
+        ),
+        (
+            "the Hashable boundary",
+            "import std::hash::Hashable;\n[derive(Hashable)]\n\
+             struct Handler { name: str, callback: || void }\n"
+                .to_string(),
+            "import pkg::m::Handler;\nfun main() { }\n",
+            "which is not `Hashable`",
+        ),
+        (
+            "the `[rpc]` signature rule",
+            "struct Password { hash: str }\nstruct Service {}\n\
+             impl Service {\n\t[rpc] fun store(self, secret: Password) {}\n}\n"
+                .to_string(),
+            "import pkg::m::Service;\nfun main() { }\n",
+            "parameter `secret` of `[rpc]` method `store` is `Password`, which is not Wire",
+        ),
+        (
+            "the `[expose]` rule",
+            "import std::reactive::Signal;\nstruct Password { hash: str }\n\
+             struct Session {\n\t[expose] secret: Signal<Password>,\n}\n"
+                .to_string(),
+            "import pkg::m::Session;\nfun main() { }\n",
+            "is `[expose]`d, but its element `Password` is not Wire",
+        ),
+        (
+            "the tuple-spread rule",
+            "import std::print;\nfun forward(items: (i32, i32)): i32 { items.0 }\n\
+             fun go() {\n\tlet pair = (1, 2);\n\tprint(forward(..pair));\n}\n"
+                .to_string(),
+            call_go,
+            "`..` splices a tuple's elements into a tuple construction",
+        ),
+        // The `external` backed-return row retired at the merge: backed-enums
+        // §9's ratified lift DELETED that refusal (the trap arm covers the
+        // boundary now), so its program compiles by design and there is no
+        // diagnostic left to attribute.
+    ];
+    // Every row is checked before anything is asserted, so a plant that breaks
+    // attribution reports which families it broke rather than only the first.
+    let mut wrong: Vec<String> = Vec::new();
+    for (family, module, entry, message) in cases {
+        let (file, _) = attributed_to(&[("main.vl", entry), ("m.vl", &module)], message);
+        if file != "m.vl" {
+            wrong.push(format!("{family}: attributed to {file}, want m.vl"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a module's violation must name the module:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// The other half of the claim: the ENTRY's own post-`build()` violations are
+// unchanged. Both files break the same rule in one program, and each diagnostic
+// goes home — a fix that simply moved everything off the entry would fail here.
+#[test]
+fn b112_the_entrys_own_violations_still_attribute_to_the_entry() {
+    let attributed = analyze_package_attributed(
+        &[
+            (
+                "main.vl",
+                &guarded(
+                    "import pkg::store::keep;\nfun main() {\n\tkeep();\n\
+                     \tmut mine: List<Guard> = [];\n}\n",
+                ),
+            ),
+            (
+                "store.vl",
+                "import pkg::main::Guard;\nfun keep() {\n\tmut theirs: List<Guard> = [];\n}\n",
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    let files: Vec<&str> = attributed
+        .iter()
+        .filter(|(message, ..)| message.contains("cannot hold the resource `Guard`"))
+        .map(|(_, file, _)| file.as_str())
+        .collect();
+    assert!(
+        files.contains(&"main.vl") && files.contains(&"store.vl"),
+        "each spelling reports in its own file: {attributed:#?}"
+    );
+}
+
+// A cross-file NOTE pair, with neither end in the entry: the conformance
+// mismatch is written in `impls.vl` and the trait it violates is declared in
+// `traits.vl`. The note's `source` means "the diagnostic's own file" when it is
+// `None`, so it had to stop being compared against `current_source_id` — that
+// was the same thing as the diagnostic's file only while every post-`build()`
+// diagnostic claimed the entry.
+#[test]
+fn b112_a_cross_file_note_names_the_file_it_points_into() {
+    let (file, note_file) = attributed_to(
+        &[
+            (
+                "main.vl",
+                "import pkg::impls::Cat;\nfun main() { let c = Cat { n = 1 }; }\n",
+            ),
+            ("traits.vl", "trait Greet { fun greet(self): str; }\n"),
+            (
+                "impls.vl",
+                "import pkg::traits::Greet;\nstruct Cat { n: i32 }\n\
+                 impl Cat with Greet { fun greet(self): i32 { 1 } }\n",
+            ),
+        ],
+        "match the declared return type",
+    );
+    assert_eq!(file, "impls.vl", "the impl's mistake is the impl's file");
+    assert_eq!(
+        note_file.as_deref(),
+        Some("traits.vl"),
+        "and the note names the file the trait is declared in"
+    );
+}
+
+// The same pair for R11, whose primary is the INSTANTIATION and whose note is in
+// the generic BODY: two different modules, and neither is the entry.
+#[test]
+fn b112_an_r11_violation_splits_across_the_caller_and_the_generic() {
+    let (file, note_file) = attributed_to(
+        &[
+            (
+                "main.vl",
+                "import pkg::caller::run;\nfun main() { run(); }\n",
+            ),
+            (
+                "generic.vl",
+                "import std::print;\nfun twice<T>(own value: T) {\n\tlet a = value;\n\
+                 \tlet b = value;\n\tprint(\"x\");\n}\n",
+            ),
+            (
+                "caller.vl",
+                &guarded(
+                    "import pkg::generic::twice;\nfun run() {\n\
+                     \ttwice(Guard { label = \"one\" });\n}\n",
+                ),
+            ),
+        ],
+        "is not move-clean when instantiated with a resource",
+    );
+    assert_eq!(file, "caller.vl", "the instantiation is the caller's");
+    assert_eq!(
+        note_file.as_deref(),
+        Some("generic.vl"),
+        "and the note points into the generic body's own file"
+    );
+}
+
+// --- The import-path enumeration primitives (E57) ---------------------------
+//
+// Import-path completion has to answer about modules the program has NOT
+// loaded, so it reads the package tree directly: `modules_in_root` lists what an
+// origin holds, `module_source_file` resolves one name through the loader's own
+// root order, and `module_importables` reads a module's importable names through
+// the loader's own content-keyed parse cache. These pin that trio against the
+// REAL std tree — the same source of truth the loader resolves from — rather
+// than a fixture, because a hardcoded module list is exactly the failure mode.
+
+/// The std module names an import may reach for `platform`, deduped in the
+/// loader's own root order (an earlier root shadows a later one).
+fn std_module_names(platform: Platform) -> Vec<String> {
+    let spec = std_spec();
+    let mut names: Vec<String> = Vec::new();
+    for root in spec.search_roots(platform) {
+        for (name, _path) in vilan_core::analyzer::modules_in_root(root) {
+            if name != "lib" && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn the_std_listing_comes_from_the_std_tree() {
+    let names = std_module_names(Platform::default());
+    for expected in ["json", "math", "option", "list", "string"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "`std::{expected}` is a std module: {names:?}"
+        );
+    }
+    // A layer's directory is NOT a path segment: `src/process/fs.vl` is
+    // `std::fs`, and the layer name never appears in an import.
+    assert!(
+        names.contains(&"fs".to_string()),
+        "a layered module lists under its own name: {names:?}"
+    );
+    assert!(
+        !names.contains(&"lib".to_string()),
+        "the package surface `lib.vl` is not a module: {names:?}"
+    );
+}
+
+#[test]
+fn module_source_file_resolves_through_the_loaders_root_order() {
+    let spec = std_spec();
+    let platform = Platform::default();
+    let roots = spec.search_roots(platform);
+    let json = vilan_core::analyzer::module_source_file(&roots, "json")
+        .expect("`std::json` resolves to a file");
+    assert!(json.ends_with("json.vl"), "resolved {json:?}");
+    assert_eq!(
+        vilan_core::analyzer::module_source_file(&roots, "no_such_std_module"),
+        None,
+        "a name that is not a module resolves to nothing"
+    );
+}
+
+#[test]
+fn module_importables_reads_a_modules_declarations_on_demand() {
+    let spec = std_spec();
+    let roots = spec.search_roots(Platform::default());
+    let path = vilan_core::analyzer::module_source_file(&roots, "json").expect("std::json");
+    let importables = vilan_core::analyzer::module_importables(&path);
+    let named = |name: &str| importables.iter().find(|item| item.name == name).cloned();
+    let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
+
+    let json = named("Json").unwrap_or_else(|| panic!("`Json` is declared in json.vl: {names:?}"));
+    assert_eq!(json.kind, vilan_core::analyzer::ImportableKind::Trait);
+    // An `external struct` / `external fun` is importable like any other
+    // declaration — `import std::json::JsonValue` is the common case.
+    assert_eq!(
+        named("JsonValue").map(|item| item.kind),
+        Some(vilan_core::analyzer::ImportableKind::Struct),
+        "an external struct is importable: {names:?}"
+    );
+    // An enum carries its variants, so a further segment
+    // (`std::json::JsonKind::Number`) has something to complete against.
+    let kind = named("JsonKind").expect("`JsonKind` is an enum in json.vl");
+    assert_eq!(kind.kind, vilan_core::analyzer::ImportableKind::Enum);
+    assert!(
+        kind.variants.contains(&"Number") && kind.variants.contains(&"Object"),
+        "JsonKind's variants: {:?}",
+        kind.variants
+    );
+    // json.vl's own implementation imports are NOT published through it.
+    assert!(
+        named("Shared").is_none(),
+        "a module's own `import` is not importable through it: {names:?}"
+    );
+}
+
+#[test]
+fn module_importables_publishes_a_libs_reexports() {
+    // std's `lib.vl` declares nothing at all — it is entirely `export import`,
+    // and those leaves are exactly what `import std::print` names.
+    let spec = std_spec();
+    let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("lib.vl"));
+    let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
+    assert!(names.contains(&"print"), "std's surface: {names:?}");
+    assert!(names.contains(&"panic"), "std's surface: {names:?}");
+    assert!(
+        importables
+            .iter()
+            .all(|item| item.kind == vilan_core::analyzer::ImportableKind::Reexport),
+        "every one of them is a re-export: {names:?}"
+    );
+}
+
+#[test]
+fn module_importables_of_an_unreadable_file_is_empty() {
+    // A module that fails to load answers EMPTY. An editor query degrades; it
+    // never fails, and it never panics.
+    assert!(
+        vilan_core::analyzer::module_importables(&PathBuf::from("/no/such/module.vl")).is_empty()
+    );
 }

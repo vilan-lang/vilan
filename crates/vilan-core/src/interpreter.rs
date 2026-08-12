@@ -1347,6 +1347,19 @@ impl Interpreter {
                 };
                 Ok(Value::Str(Rc::from(kind)))
             }
+            // The backed-enum trap arm (backed-enums.md §9), worded exactly as
+            // the emitted `__enum_trap` helper throws it. `Thrown`, not
+            // `Internal`: a macro-time value outside the set is the macro's own
+            // bug, like a `panic` in its body.
+            "__enum_trap" => {
+                let name = expect_str(&take(0))?;
+                let mut value = String::new();
+                json_stringify(&take(1), &mut value)?;
+                Err(Failure::new(
+                    FailureKind::Thrown,
+                    format!("{name}: {value} is not one of its values"),
+                ))
+            }
             // The canonical key: a primitive keys as itself; an aggregate (array
             // or object) canonicalizes to its JSON string (mirrors `__hash`).
             "__hash" => {

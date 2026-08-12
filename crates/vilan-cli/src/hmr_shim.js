@@ -336,27 +336,89 @@
         (document.body || document.documentElement).appendChild(backdrop);
     }
 
-    // A `css` event swaps stylesheets without a reload: bump a cache-busting
-    // query so the browser refetches the sidecar. `asset` (when the CLI names it)
-    // is the changed sidecar's filename (`client.css`) — bump only the <link>
-    // whose href IS that file (hmr.md §2), so a multi-browser-leg workspace
-    // refreshes exactly the stylesheet that changed; with no name (an older CLI),
-    // bump every stylesheet. The buster is a LOCAL counter, not the build version
-    // — css-only rounds deliberately don't bump the version (a bump without a
-    // bundle rewrite would send fresh tabs into a reload loop), so consecutive
-    // css edits would otherwise produce the same URL and skip the refetch.
-    var cssBump = 0;
+    // A `css` event hot-swaps stylesheets without a reload. `asset` (when the
+    // CLI names it) is the changed sidecar's filename (`client.css`) — touch
+    // only the <link> whose href IS that file (hmr.md §2), so a multi-browser-
+    // leg workspace refreshes exactly the stylesheet that changed; with no name
+    // (an older CLI), touch every stylesheet <link>.
+    //
+    // The bytes come from the DEV CHANNEL's `/asset/<name>` route — never from
+    // re-fetching the <link>'s own href. That href is the USER'S OWN server
+    // route (e.g. `/client.css`), and the common serving idiom (the todo
+    // example) reads that file ONCE at server boot and serves the same bytes
+    // for the life of the process: exactly the hazard `fetchAndSwap` above
+    // avoids for JS, and just as real for CSS — a css-only round never restarts
+    // that server (hmr.md §6), so its route stays stale for the life of the
+    // session. `dist/<leg>.css` is rewritten fresh every watch round, and the
+    // dev channel always serves those current bytes with `Cache-Control:
+    // no-cache` (`hmr.rs::serve_asset`), so there is no cache-busting query to
+    // invent here either.
+    //
+    // Applied as an injected <style> that supersedes the original <link>
+    // (disabled, its href left untouched) rather than a `blob:` URL: a <style>
+    // updates the CSSOM synchronously with no second trip through the
+    // browser's own stylesheet loader, updates in place on a later css event
+    // (no object URL to revoke or leak), and — since the <link> is merely
+    // disabled, never replaced — a plain page reload always starts clean (a
+    // fresh `app.html` re-enables it) rather than carrying a dangling swap
+    // artifact forward.
+    //
+    // A fetch that 404s or errors (the dev channel lacks the asset, or is
+    // unreachable) warns and changes nothing, leaving the current stylesheet
+    // exactly as it was — mirroring `fetchAndSwap`'s never-reload reasoning:
+    // reloading would only re-request the user's own stale route.
+    var cssShadows = new WeakMap(); // <link> -> the <style> now superseding it.
+
+    function assetBasename(href) {
+        var base = href.split("?")[0];
+        var slash = base.lastIndexOf("/");
+        return slash === -1 ? base : base.slice(slash + 1);
+    }
+
+    function applyFreshCss(link, text) {
+        link.disabled = true;
+        var style = cssShadows.get(link);
+        if (!style) {
+            style = document.createElement("style");
+            (document.head || document.documentElement).appendChild(style);
+            cssShadows.set(link, style);
+        }
+        style.textContent = text;
+    }
+
+    function fetchAndApplyCss(link, name) {
+        return fetch("http://127.0.0.1:" + PORT + "/asset/" + name)
+            .then(function (response) {
+                if (!response.ok) {
+                    throw new Error("unexpected status " + response.status);
+                }
+                return response.text();
+            })
+            .then(function (text) {
+                applyFreshCss(link, text);
+            })
+            .catch(function (error) {
+                if (typeof console !== "undefined" && console.warn) {
+                    console.warn(
+                        "[vilan] hmr: could not fetch fresh css (" + name + "); keeping the current stylesheet",
+                        error
+                    );
+                }
+            });
+    }
+
     function bumpStylesheets(asset) {
-        cssBump += 1;
         var links = document.querySelectorAll('link[rel="stylesheet"]');
+        var pending = [];
         for (var index = 0; index < links.length; index++) {
             var link = links[index];
             var base = link.href.split("?")[0];
             if (asset && !(base === asset || base.endsWith("/" + asset))) {
                 continue;
             }
-            link.href = base + "?v=" + VERSION + "-" + cssBump;
+            pending.push(fetchAndApplyCss(link, assetBasename(link.href)));
         }
+        return pending.length ? Promise.all(pending) : undefined;
     }
 
     // A staleness signal (a `swap` event, or a `connected` whose version is
@@ -415,8 +477,7 @@
                 reload();
                 break;
             case "css":
-                bumpStylesheets(data.asset);
-                break;
+                return bumpStylesheets(data.asset);
             case "error":
                 showOverlay(data.message);
                 break;

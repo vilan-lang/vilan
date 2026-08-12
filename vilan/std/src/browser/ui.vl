@@ -30,6 +30,7 @@ import pkg::dom::{
 	create_text_node,
 	get_element_by_id,
 };
+import pkg::io::panic;
 import pkg::option::Option::{ None, Some, self };
 import pkg::reactive::{
 	Disposable,
@@ -657,13 +658,36 @@ impl Signal<str> with AttrValue {
 	}
 }
 
+/// Whether a host value is JS `null`/`undefined` — the one peek this module
+/// needs at `get_element_by_id`'s result. `get_element_by_id` (`browser/dom.vl`)
+/// has no `Option` return, so a missing id reads back as `null` typed as
+/// `Element`; giving IT an `Option<Element>` signature is a wider API question
+/// (A24, fullstack-dx.md §9.5) deliberately NOT taken here — this is a private
+/// guard at the mount seam alone.
+[extern("__is_null")]
+external fun is_null(value: Element): bool;
+
+/// The lookup `mount`/`mount_root` share: fails loud, naming the id, instead
+/// of leaving `element.clear()` below to throw "Cannot read properties of
+/// null" with the wrong id nowhere in the message (A24, fullstack-dx.md
+/// §9.5 — "the cheapest loud win in the whole survey"). The happy path is
+/// unchanged: an existing id resolves exactly as `get_element_by_id` already
+/// did.
+fun mount_target(id: str): Element {
+	let element = get_element_by_id(id);
+	if is_null(element) {
+		panic(i"mount: no element with id '{id}'");
+	}
+	element
+}
+
 /// Attach a view to the page element with the given id — CLEARING the container
 /// first (`replaceChildren`) so the freshly built UI REPLACES whatever was there
 /// (proposal/ssr.md §1 step 3). A no-op for the empty container every client app
 /// mounts into today; on a server-rendered page it discards the server markup and
 /// mounts the live tree in its place. Render, then replace — no adoption.
 fun mount(id: str, view: View) {
-	let element = get_element_by_id(id);
+	let element = mount_target(id);
 	element.clear();
 	element.append(view.element);
 }

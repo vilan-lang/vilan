@@ -248,9 +248,10 @@ with the element count checked against the type (works in parameter
 position too).
 
 > **Going deeper.** `Map` and `Set` key **by value**. Scalar keys (`i32`,
-> `str`) work directly; a struct, enum, or `List` key works once it derives
-> `Hashable` (`[derive(Hashable)]`), so two equal values are the same key.
-> See [collections](../std/collections.md).
+> `str`) and backed enums (`enum Align { Start = "flex-start" }` — the enum
+> *is* the string) work directly; a struct, an unbacked enum, or a `List`
+> key works once it derives `Hashable` (`[derive(Hashable)]`), so two equal
+> values are the same key. See [collections](../std/collections.md).
 
 ## Where's `null`?
 

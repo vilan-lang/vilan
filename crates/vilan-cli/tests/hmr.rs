@@ -1107,3 +1107,533 @@ fn the_overlay_locates_a_module_diagnostic_in_its_own_module() {
     let _ = std::fs::remove_dir_all(&dir);
     outcome.unwrap();
 }
+
+// --- E55 (css half): the css hot-swap must not round-trip a stale server -----
+
+/// A server shaped exactly like `examples/todo/src/server.vl`: `fs::read` the
+/// browser's stylesheet ONCE at boot and serve that snapshot at `/client.css`
+/// for the life of the process. A css-only watch round never restarts this
+/// server (hmr.md §6, `classify`), so its route is the trap the shim must not
+/// fall into — proving the fix needs a server that behaves exactly like the
+/// real-world idiom it's fixing, not a stand-in.
+fn boot_time_css_server_source() -> String {
+    "import std::fs;\nimport std::http::{ Server, Response };\nimport std::print;\nimport std::process;\n\n\
+     fun main() {\n\
+     \tlet client_css = fs::read_file_to_str(\"dist/client.css\");\n\
+     \tServer::builder()\n\
+     \t\t.port(0)\n\
+     \t\t.on_request(|request| {\n\
+     \t\t\tmatch request.path() {\n\
+     \t\t\t\t\"/client.css\" => Response::builder().set_header(\"Content-Type\", \"text/css\").body(client_css).build(),\n\
+     \t\t\t\t\"/shutdown\" => {\n\
+     \t\t\t\t\tprocess::exit(0);\n\
+     \t\t\t\t\tResponse::builder().body(\"\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t\t_ => Response::builder().code(404).body(\"\").build(),\n\
+     \t\t\t}\n\
+     \t\t})\n\
+     \t\t.on_start(|server| print(i\"css-server-up {server.port()}\"))\n\
+     \t\t.build()\n\
+     \t\t.start();\n\
+     }\n"
+        .to_string()
+}
+
+/// Waits (bounded) for this test's own boot marker (`css-server-up <port>`,
+/// printed by [`boot_time_css_server_source`]) and returns the port it names —
+/// `wait_for_port`'s twin for the OTHER server this test runs.
+fn wait_for_css_server_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u16> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if let Some(port) = line
+                    .strip_prefix("css-server-up ")
+                    .and_then(|rest| rest.trim().parse().ok())
+                {
+                    return Some(port);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    None
+}
+
+/// The node harness that drives the REAL shipped shim (the bytes served by the
+/// dev channel, unmodified) under a minimal DOM stub. `__SERVER_PORT__` is the
+/// boot-time-stale server's port — substituted before writing. Three stub
+/// `<link>`s stand in for a page: `ghost` names an asset the dev channel does
+/// NOT have (the 404/keep-old-sheet path), `client` is the one the css event
+/// actually names, and `other` is a sidecar the event must leave untouched
+/// (the asset-matching semantics, hmr.md §2). Node's own global `fetch` is
+/// used unstubbed, so a request to `http://127.0.0.1:<PORT>/asset/...` is a
+/// REAL request to the REAL dev channel spawned by this test — the wiring
+/// under test, not a mock of it.
+const CSS_HARNESS_TEMPLATE: &str = r#"import fs from "node:fs";
+
+class StubLink {
+    constructor(href) { this.href = href; this.rel = "stylesheet"; this.disabled = false; }
+}
+class StyleHost {
+    constructor() { this.children = []; }
+    appendChild(el) { this.children.push(el); return el; }
+}
+class StubStyle {
+    constructor(tag) { this.tagName = tag; this._text = ""; }
+    set textContent(t) { this._text = t; }
+    get textContent() { return this._text; }
+}
+
+const ghostLink = new StubLink("http://127.0.0.1:__SERVER_PORT__/ghost.css");
+const clientLink = new StubLink("http://127.0.0.1:__SERVER_PORT__/client.css");
+const otherLink = new StubLink("http://127.0.0.1:__SERVER_PORT__/other.css");
+const clientHref = clientLink.href;
+const head = new StyleHost();
+
+globalThis.window = globalThis;
+globalThis.document = {
+    querySelectorAll: (selector) =>
+        selector === 'link[rel="stylesheet"]' ? [ghostLink, clientLink, otherLink] : [],
+    createElement: (tag) => new StubStyle(tag),
+    // `handleEvent` clears a lingering error overlay on every non-error event
+    // (removeOverlay → getElementById) — none is ever present here.
+    getElementById: () => null,
+    head,
+    documentElement: head,
+};
+globalThis.location = { reload: () => { globalThis.__reloaded = true; } };
+// No EventSource under node — the shim's own connect() no-ops without one.
+
+let failures = 0;
+function check(condition, message) {
+    if (condition) { console.log("ok   - " + message); }
+    else { failures += 1; console.error("FAIL - " + message); }
+}
+
+await import("./bundleA.mjs");
+const hmr = globalThis.window.__VILAN_HMR__;
+check(!!hmr, "the shim installed the singleton");
+
+const freshOnDisk = fs.readFileSync("dist/client.css", "utf8");
+const staleSnapshot = fs.readFileSync("stale-snapshot.css", "utf8");
+check(freshOnDisk !== staleSnapshot, "harness sanity: round 2's css differs from the boot-time snapshot");
+
+// (1) The event names an asset the dev channel does NOT have (`dist/ghost.css`
+// was never written) — the fetch 404s. Sane failure: warn, touch nothing.
+await hmr.handleEvent({ kind: "css", version: hmr.version, asset: "ghost.css" });
+check(head.children.length === 0, "a missing asset creates no <style>");
+check(ghostLink.disabled === false, "a missing asset leaves its <link> enabled");
+
+// (2) The real fix: a `css` event for `client.css` fetches the CURRENT bytes
+// from the dev channel and applies them — never the stale server route.
+await hmr.handleEvent({ kind: "css", version: hmr.version, asset: "client.css" });
+check(clientLink.disabled === true, "the stale <link> is disabled once fresh css lands");
+check(clientLink.href === clientHref, "the <link> href is left untouched (never re-pointed at the stale route)");
+check(head.children.length === 1, "exactly one <style> was injected");
+const style = head.children[0];
+check(style.textContent === freshOnDisk, "the injected <style> carries the CURRENT dist/client.css bytes");
+check(style.textContent !== staleSnapshot, "the injected <style> differs from the server's boot-time snapshot");
+check(otherLink.disabled === false, "an unrelated sidecar's <link> is untouched (asset-matching preserved)");
+
+// (3) A second `css` event for the SAME asset updates the SAME <style> —
+// no duplicate element, no href churn, no reload.
+await hmr.handleEvent({ kind: "css", version: hmr.version, asset: "client.css" });
+check(head.children.length === 1, "a repeated css event updates the existing <style>, no duplicate");
+check(head.children[0] === style, "the same <style> element is reused across swaps");
+check(!globalThis.__reloaded, "a css hot-swap never reloads the page");
+
+// The verdict travels on stdout, not only the exit code: node's Windows
+// shutdown race (see the tolerance at the call site) can abort the process
+// AFTER this line runs, corrupting the status of a fully-passed run.
+console.log(failures === 0 ? "css harness verdict: PASS" : "css harness verdict: FAIL");
+process.exit(failures === 0 ? 0 : 1);
+"#;
+
+/// The E55 css half, pinned end to end: a style-only edit reaches the browser
+/// leg through the dev channel even though the workspace's own server — shaped
+/// exactly like `examples/todo` — reads its stylesheet once at boot and is
+/// never restarted by a css-only round (hmr.md §6). Before the fix,
+/// `bumpStylesheets` only cache-busted the `<link>`'s existing href, which
+/// pointed right back at that stale boot-time snapshot; this test fails red
+/// against that code (verified by reverting the shim change) because no
+/// `<style>` element — and no request to the dev channel — is ever produced.
+///
+/// The bundle driven here is not hand-written: it's fetched from the dev
+/// channel exactly as a real page would, so the harness exercises the shim
+/// byte-for-byte as shipped, not a copy of it.
+#[test]
+fn a_css_push_heals_a_boot_time_stale_server_route() {
+    let dir = temp_project("css_fresh");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &client_source("a", "x1"));
+    write(&dir, "src/server.vl", &boot_time_css_server_source());
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    // E60: the server leg deliberately breaks the house quick-exit rule (the
+    // whole point is a server that OUTLIVES rounds), so it must die by the
+    // harness's hand — killing the watcher only orphans its node grandchild.
+    // The port escapes the assertion closure so cleanup runs red or green.
+    let css_server_port = std::cell::Cell::new(None::<u16>);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let dev_port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        assert!(
+            wait_for_file(&dir.join("dist/client.css"), deadline),
+            "round 1 should have written dist/client.css"
+        );
+        let server_port = wait_for_css_server_port(&lines, deadline)
+            .expect("the boot-time-stale server should announce `css-server-up <port>`");
+        css_server_port.set(Some(server_port));
+
+        // Round 1's boot-time snapshot — what the server read once, at start,
+        // and will keep serving verbatim through a css-only round.
+        let stale_snapshot = http_get(server_port, "/client.css");
+        assert_eq!(
+            stale_snapshot,
+            b".x1{color:red}\n".to_vec(),
+            "the server's boot-time read should be round 1's css"
+        );
+
+        let mut sse = SseClient::connect(dev_port);
+
+        // A style-only edit (the bundle stays byte-identical) → a `css` event
+        // naming its sidecar.
+        write(&dir, "src/client.vl", &client_source("a", "x2"));
+        let css_event = sse.expect_event("css", deadline);
+        assert!(
+            css_event.contains("\"asset\":\"client.css\""),
+            "the css event should name its changed sidecar: {css_event}"
+        );
+
+        // The hazard, confirmed directly: the server was never restarted, so
+        // its OWN route still serves round 1's bytes — anything relying on
+        // THIS route (a cache-busted refetch of the <link>'s own href, the
+        // pre-fix behavior) would round-trip the very staleness this fix
+        // closes.
+        let still_stale = http_get(server_port, "/client.css");
+        assert_eq!(
+            still_stale, stale_snapshot,
+            "a css-only round must not restart the server — its route stays stale"
+        );
+
+        // The dev channel, meanwhile, already has the fresh bytes (S0/S1 —
+        // `write_assets` runs every round); this is the route the fix must use.
+        let dev_channel_css = http_get(dev_port, "/asset/client.css");
+        assert_eq!(
+            dev_channel_css,
+            b".x2{color:red}\n".to_vec(),
+            "the dev channel should serve round 2's css"
+        );
+
+        std::fs::write(dir.join("stale-snapshot.css"), &stale_snapshot).unwrap();
+
+        // The bundle the browser actually runs — fetched from the dev channel,
+        // exactly as the real shim's own `<script>` origin would be.
+        let bundle_a = http_get(dev_port, "/bundle/client.js");
+        assert!(
+            String::from_utf8_lossy(&bundle_a).contains("window.__VILAN_HMR__"),
+            "the served bundle should carry the dev-runtime shim"
+        );
+        std::fs::write(dir.join("bundleA.mjs"), &bundle_a).unwrap();
+
+        let harness = CSS_HARNESS_TEMPLATE.replace("__SERVER_PORT__", &server_port.to_string());
+        std::fs::write(dir.join("harness.mjs"), harness).unwrap();
+
+        let run = Command::new("node")
+            .arg("harness.mjs")
+            .current_dir(&dir)
+            .output()
+            .expect("run node harness");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        // Windows only: node's own shutdown race, not a harness failure.
+        // `uv_async_send` aborts on a closing handle during exit teardown
+        // (nodejs/node#56645 / #58091 — rpc_http.rs documents the same
+        // tolerance), and the abort lands strictly AFTER the harness's
+        // complete stdout, corrupting the exit code of a fully-passed run.
+        // The stdout verdict sentinel is the truth on that path: a failed
+        // check prints FAIL and stays red regardless of this tolerance.
+        let windows_teardown_abort = cfg!(windows)
+            && stdout.contains("css harness verdict: PASS")
+            && stderr.contains("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)")
+            && stderr.contains("async.c");
+        assert!(
+            run.status.success() || windows_teardown_abort,
+            "css harness failed:\n{stdout}\n{stderr}"
+        );
+    }));
+
+    support::kill_watcher(&mut watcher);
+    // The server survives the watcher by design, so ask it to exit and — on
+    // the green path only, so a red run's own panic is never masked — assert
+    // it actually died. Each poll RE-SENDS /shutdown: a request that lands
+    // exits the process within milliseconds, and a connect that refuses is
+    // the death witness. This assert is the pin that E60's leak cannot
+    // silently return.
+    if let Some(port) = css_server_port.get() {
+        let start = Instant::now();
+        let dead = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => break true,
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = stream.write_all(
+                        b"GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    if start.elapsed() > support::WATCH_LIVENESS {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if outcome.is_ok() {
+            assert!(
+                dead,
+                "the boot-time-stale server must exit on /shutdown — \
+                 an orphan here is E60's leak returning"
+            );
+        }
+    }
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
+
+// --- dev-refresh.md §5 item 2: `std::watch::force_refresh()` -------------------
+
+/// A server that calls `std::watch::force_refresh()` on every request except
+/// `/shutdown` (E60: this server deliberately outlives rounds — the whole
+/// point is to answer a trigger request after round 1 — so it needs its own
+/// death, exactly the css e2e's mimic-server shape).
+fn force_refresh_server_source() -> String {
+    "import std::watch;\nimport std::http::{ Response, Server };\nimport std::print;\nimport std::process;\n\n\
+     fun main() {\n\
+     \tServer::builder()\n\
+     \t\t.port(0)\n\
+     \t\t.on_request(|request| {\n\
+     \t\t\tmatch request.path() {\n\
+     \t\t\t\t\"/shutdown\" => {\n\
+     \t\t\t\t\tprocess::exit(0);\n\
+     \t\t\t\t\tResponse::builder().body(\"\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t\t_ => {\n\
+     \t\t\t\t\twatch::force_refresh();\n\
+     \t\t\t\t\tResponse::builder().body(\"triggered\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t}\n\
+     \t\t})\n\
+     \t\t.on_start(|server| print(i\"refresh-server-up {server.port()}\"))\n\
+     \t\t.build()\n\
+     \t\t.start();\n\
+     }\n"
+        .to_string()
+}
+
+/// Waits (bounded) for this test's own boot marker (`refresh-server-up
+/// <port>`, printed by [`force_refresh_server_source`]) and returns the port
+/// it names — `wait_for_port`'s twin for the OTHER server this test runs.
+fn wait_for_refresh_server_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u16> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if let Some(port) = line
+                    .strip_prefix("refresh-server-up ")
+                    .and_then(|rest| rest.trim().parse().ok())
+                {
+                    return Some(port);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    None
+}
+
+/// The pin: a server program calls `force_refresh()`, and a connected fake
+/// browser — the raw [`SseClient`] this file already has, standing in for the
+/// dev channel's real audience — receives the `reload` event over the exact
+/// wire path `dev-refresh.md` §5 item 2 describes: the watcher hands the
+/// server `VILAN_HMR_PORT` (the node-child spawn site), the app POSTs
+/// `/refresh`, and the channel broadcasts `reload`.
+///
+/// The doctrine half — `reload` fires ONCE and no `css`/`swap`/`connected`
+/// event path ever calls `location.reload()` — is `hmr_shim.js`'s
+/// `fetchAndSwap` comment, unchanged here: `css`'s never-reload is pinned by
+/// `a_css_push_heals_a_boot_time_stale_server_route` (this file) and
+/// `swap`/`connected`'s by `hmr_swap.rs`'s "heal" assertions (a stale
+/// `connected` swaps, never reloads — the exact shape `fetchAndSwap` also
+/// serves `swap` through). Both were verified non-vacuous by planting the
+/// violation the doctrine forbids (making a version-gap `connected` call
+/// `reload()` instead of swapping) and watching `hmr_swap.rs` go red, then
+/// reverting — a manual check, not a standing test, since it plants a bug in
+/// shipped code rather than in this fixture.
+#[test]
+fn force_refresh_reloads_a_connected_browser_once() {
+    let dir = temp_project("force_refresh");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &client_source("a", "x1"));
+    write(&dir, "src/server.vl", &force_refresh_server_source());
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    // E60: escapes the assertion closure so cleanup runs red or green.
+    let refresh_server_port = std::cell::Cell::new(None::<u16>);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let dev_port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        let server_port = wait_for_refresh_server_port(&lines, deadline)
+            .expect("the force-refresh server should announce `refresh-server-up <port>`");
+        refresh_server_port.set(Some(server_port));
+
+        let mut sse = SseClient::connect(dev_port);
+
+        // Trigger the server's route — it calls `force_refresh()`, which
+        // POSTs `/refresh` on the dev channel it was handed over
+        // `VILAN_HMR_PORT` at spawn.
+        let body = http_get(server_port, "/trigger");
+        assert_eq!(
+            body,
+            b"triggered".to_vec(),
+            "the server route should have run (and called force_refresh on the way)"
+        );
+
+        // The connected fake browser sees the broadcast `reload` event.
+        sse.expect_kind("reload", deadline);
+    }));
+
+    support::kill_watcher(&mut watcher);
+    // The server survives the watcher by design (E60): ask it to exit and —
+    // on the green path only, so a red run's own panic is never masked —
+    // assert it actually died.
+    if let Some(port) = refresh_server_port.get() {
+        let start = Instant::now();
+        let dead = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => break true,
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = stream.write_all(
+                        b"GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    if start.elapsed() > support::WATCH_LIVENESS {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if outcome.is_ok() {
+            assert!(
+                dead,
+                "the force-refresh server must exit on /shutdown — \
+                 an orphan here is E60's leak returning"
+            );
+        }
+    }
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
+
+/// The other half of the pin: with no watch session — a plain `vilan run`,
+/// so `VILAN_HMR_PORT` is never set — `force_refresh()` is a no-op. No dev
+/// channel exists to POST to, so the only way this could fail is by hanging
+/// or panicking; a clean exit with the program's own trailing print is the
+/// whole assertion.
+#[test]
+fn force_refresh_is_a_no_op_outside_a_watch_session() {
+    let dir = temp_project("force_refresh_noop");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::watch;\nimport std::print;\n\nfun main() {\n\twatch::force_refresh();\n\tprint(\"done\");\n}\n",
+    );
+
+    let liveness = support::run_liveness();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vilan run");
+    let deadline = Instant::now() + liveness;
+    let status = loop {
+        match child.try_wait().expect("poll vilan run") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`vilan run` (no --watch, no VILAN_HMR_PORT) did not exit within {liveness:?} \
+                     — force_refresh() should be a no-op, not a hang"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "force_refresh() outside a watch session must not fail the program:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "done");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

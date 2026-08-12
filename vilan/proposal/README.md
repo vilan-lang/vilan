@@ -105,6 +105,7 @@ is the historical record everything shipped gets moved into.
 | `canvas.md` | draft — awaiting review | Immediate-mode typed 2D canvas layer, proposed home `std::canvas` (A17). |
 | `backed-enums.md` | draft — awaiting review | A variant carries the value the host speaks (`= "start"`) as a generalization of the integer discriminant (B76); the survey found three silent holes in the discriminant grammar it extends. |
 | `trait-objects.md` | draft — awaiting review | B4's design paper: recommends declining trait objects on the demand survey and building the missing `Type::Trait` distinction instead — the survey found a live resource leak where a bare trait annotation suppresses a destructor. |
+| `editing-dx.md` | draft — awaiting owner review | E49's DX survey of diagnostics on code mid-edit, graded per shape against both `vilan check` and what the LSP publishes — the survey found that a parse error blacks out every other diagnostic in the file, above all five named shapes. |
 
 **Not yet in this directory, in flight:** `optimistic-lifecycle.md` (A14's
 remaining "optimistic-write → reconcile lifecycle" bullet) is drafted on the

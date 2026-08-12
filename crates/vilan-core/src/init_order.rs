@@ -60,13 +60,14 @@
 //! among themselves, canonically; everything that merely depends on a cycle
 //! still orders after it.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use indexmap::IndexMap;
 
 use crate::analyzer::{Expr, ExprIfBranch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget, IndirectReason};
 use crate::error::{Error, Note};
+use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::span::Span;
 
@@ -298,8 +299,8 @@ fn shortest_cycle(component: &[Id], dependencies: &IndexMap<Id, Vec<Id>>) -> Vec
     if edges_of(start).contains(&start) {
         return vec![start, start];
     }
-    let mut previous: HashMap<Id, Id> = HashMap::new();
-    let mut seen: HashSet<Id> = HashSet::new();
+    let mut previous: HashMap<Id, Id> = HashMap::default();
+    let mut seen: HashSet<Id> = HashSet::default();
     seen.insert(start);
     let mut queue: VecDeque<Id> = VecDeque::new();
     queue.push_back(start);
@@ -451,7 +452,7 @@ fn canonical_topological_order(bindings: &[Id], dependencies: &IndexMap<Id, Vec<
     for component in &mut components {
         component.sort_by_key(canonical_key);
     }
-    let mut component_of: HashMap<Id, usize> = HashMap::new();
+    let mut component_of: HashMap<Id, usize> = HashMap::default();
     for (index, component) in components.iter().enumerate() {
         for member in component {
             component_of.insert(*member, index);
@@ -530,9 +531,9 @@ fn strongly_connected_components(
         node: Id,
         next_edge: usize,
     }
-    let mut index_of: HashMap<Id, u32> = HashMap::new();
-    let mut low_of: HashMap<Id, u32> = HashMap::new();
-    let mut on_stack: HashSet<Id> = HashSet::new();
+    let mut index_of: HashMap<Id, u32> = HashMap::default();
+    let mut low_of: HashMap<Id, u32> = HashMap::default();
+    let mut on_stack: HashSet<Id> = HashSet::default();
     let mut stack: Vec<Id> = Vec::new();
     let mut next_index: u32 = 0;
     let mut components: Vec<Vec<Id>> = Vec::new();
@@ -642,7 +643,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
         LoadTimeWalk {
             program,
             graph,
-            entered: HashMap::new(),
+            entered: HashMap::default(),
         }
     }
 
@@ -652,7 +653,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
     /// silently drop it.
     fn evaluated_globals(&mut self, binding: Id) -> Vec<Id> {
         let mut reads: BTreeSet<u32> = BTreeSet::new();
-        let mut seen: HashSet<Id> = HashSet::new();
+        let mut seen: HashSet<Id> = HashSet::default();
         seen.insert(binding);
         let mut pending = vec![binding];
         while let Some(unit) = pending.pop() {
@@ -684,7 +685,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
         // `false` is the better value, so a unit already reached directly is
         // never re-queued, and one first reached by dispatch is re-queued if a
         // direct path turns up later.
-        let mut dispatched_at: HashMap<Id, bool> = HashMap::new();
+        let mut dispatched_at: HashMap<Id, bool> = HashMap::default();
         dispatched_at.insert(binding, false);
         let mut queue: VecDeque<Id> = VecDeque::new();
         queue.push_back(binding);
@@ -766,7 +767,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
             // `HOLDER.run()` reaches the closures `HOLDER` holds through this
             // too. Conservative: it only ever ADDS edges.
             if let Some(function_call) = self.program.function_calls.get(&call.call_id) {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 let mut values = Vec::new();
                 self.value_bodies(function_call.subject_id, &mut values, &mut seen);
                 for argument in &function_call.argument_ids {
@@ -987,7 +988,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
     /// the shapes that reach a body through a call's inputs.
     fn direct_call_closure(&self, start: Id) -> Vec<Id> {
         let mut reached = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         seen.insert(start);
         let mut pending = vec![start];
         while let Some(unit) = pending.pop() {
