@@ -1,0 +1,488 @@
+// `std::document` — the HTML document a browser leg is loaded by, held against
+// what that leg's build emitted (`fullstack-dx.md` §5.5–§5.6, RATIFIED
+// 2026-08-11).
+//
+// The founding bug: a shell that linked no stylesheet, over a build that emitted
+// one. Nothing failed. The page rendered — unstyled, and correct-looking — and
+// shipped. It is one of a family (§5.1's F1–F6) that share a single root, *a
+// fact the build knew, restated by hand in an HTML file, with nothing comparing
+// the two copies*: a `<link>` for a stylesheet that no longer exists, a
+// `<script src>` naming a leg that was renamed, a mount `<div id>` that drifted
+// from `mount_root(id, …)`, a `type="module"` over a leg that splits. Every one
+// of them is silent today, and the loudest of them costs one console line.
+//
+// `std::build` made the build's own knowledge reachable (`LegBuild`). This
+// module compares a document against it.
+//
+// **Validation is the primitive; generation is sugar over it** (§5.6). A
+// generator only protects documents it generated, and the person who most needs
+// the check is exactly the one who dropped to a hand-written shell — for a CSP
+// header, a font preload, an analytics snippet. So the primitive, `check_shell`,
+// takes a plain `str`: a shell read from disk, templated, or fetched from a CMS.
+// `Document` is a value over the same rules, and `Document::from_shell` is the
+// rung-0 escape hatch made safe — the markup is yours, and we will still tell
+// you when it is wrong.
+//
+// **How loud is loud** (§10.7, ruled): a fault stops the server from STARTING,
+// naming the file, the fault and the fix. That is defensible precisely because
+// the check is cheap, total, and about the BUILD rather than about a request —
+// it cannot fail intermittently, and a server that starts with a document that
+// cannot work is worse than one that does not start. `check_shell` returns a
+// `Result`, so an application that genuinely means it says so, once, in code.
+
+import pkg::build::LegBuild;
+import pkg::fs;
+import pkg::io::panic;
+import pkg::option::Option::{ None, Some, self };
+import pkg::result::Result::{ Err, Ok, self };
+
+/// The mount element's id when nothing says otherwise — what every shell in
+/// this tree uses, and the other end of `mount_root("app", …)`.
+let default_mount: str = "app";
+
+/// What is wrong between a document and the build it loads. Each variant is one
+/// of `fullstack-dx.md` §5.1's failures, and each was silent before this check
+/// existed.
+///
+/// The payload is always the thing the fault is ABOUT — the file the build
+/// emitted, or the url the document named — so a report can quote it back.
+enum ShellFault {
+	/// The build emitted styles and the document links no stylesheet (F1) — the
+	/// owner's own bug, and the reason this module exists. The payload is the
+	/// sidecar the build wrote.
+	StylesNotLinked(str),
+	/// The document links a stylesheet in this leg's namespace that the build
+	/// did not emit (F2) — what deleting the last `const style()` leaves
+	/// behind. The payload is the `href`.
+	LinkedStyleMissing(str),
+	/// The document loads a script in this leg's namespace that the build did
+	/// not emit (F3) — a chunk that stopped being written, a bundle under an
+	/// old name. The payload is the `src`.
+	ScriptNotEmitted(str),
+	/// This build's bundle is loaded by no `<script>` in the document (F3): the
+	/// page ships without its own application. The payload is the bundle.
+	BundleNotLoaded(str),
+	/// No element carries the id the client mounts into (F4) — the failure that
+	/// reads as `Cannot read properties of null` at boot. The payload is the
+	/// id.
+	MountMissing(str),
+	/// The leg splits and its bundle is loaded as a module script (F6), so
+	/// chunk resolution will miss on every nested route. The payload is the
+	/// bundle.
+	ModuleScriptWithChunks(str),
+}
+
+impl ShellFault {
+	/// One line: what is wrong, and what to do about it.
+	///
+	/// The document's own name is deliberately not in here — a fault is about
+	/// MARKUP, and markup arrives from anywhere — so a caller that knows where
+	/// its markup came from says so itself (`require_shell` names the file it
+	/// read).
+	fun message(self): str {
+		match self {
+			ShellFault::StylesNotLinked(let file) => i"the build emitted the stylesheet {file} and this document links no stylesheet — add `<link rel=\"stylesheet\" href=\"/{file}\" />` inside <head>",
+			ShellFault::LinkedStyleMissing(let href) => i"this document links {href}, which this build did not emit — remove the link, or restore the styles it names (a leg with no `const style()` emits no stylesheet at all)",
+			ShellFault::ScriptNotEmitted(let src) => i"this document loads {src}, which this build did not emit — remove the script tag, or restore the build that wrote it",
+			ShellFault::BundleNotLoaded(let file) => i"this build's bundle {file} is loaded by no script in this document — add `<script src=\"/{file}\"></script>` before </body>",
+			ShellFault::MountMissing(let id) => i"no element in this document carries id=\"{id}\", which is where the client mounts — add `<div id=\"{id}\"></div>` inside <body>",
+			ShellFault::ModuleScriptWithChunks(let file) => i"{file} is loaded as a module script and this leg SPLITS — chunk resolution reads `document.currentScript`, which is null in a module, so every nested route would fail to load its chunk; drop `type=\"module\"` from its script tag",
+		}
+	}
+}
+
+/// Check a hand-authored shell against a leg's build.
+///
+/// EVERY fault, not the first — a shell with two problems should report two,
+/// because a boot-time check that reports one costs a restart per problem. The
+/// order is fixed (styles, scripts, mount), so two runs over the same shell
+/// report the same list.
+///
+/// What it checks is what a build KNOWS, which is also what bounds it. This
+/// leg's artifacts are `<leg>.js`, `<leg>.css` and `<leg>.<Arm>.js`: the leg's
+/// last build owns that namespace (`bundle-splitting.md` Appendix A), so a
+/// document loading `<leg>.…` files this build did not emit is loading its own
+/// stale output and is told so. A `/theme.css` the application serves itself is
+/// outside the namespace and outside this check's knowledge — it says nothing
+/// about it, which is the only honest answer and the one that keeps a refusal
+/// to boot sound.
+fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>> {
+	mut stylesheets: List<str> = [];
+	mut scripts: List<Tag> = [];
+	mut mounted = false;
+	for tag in tags_of(shell) {
+		if tag.name == "link" && is_stylesheet_rel(attribute(tag, "rel")) {
+			stylesheets.push(attribute(tag, "href"));
+		}
+		if tag.name == "script" && attribute(tag, "src") != "" {
+			scripts.push(tag);
+		}
+		if mount != "" && attribute(tag, "id") == mount {
+			mounted = true;
+		}
+	}
+
+	mut faults: List<ShellFault> = [];
+
+	// F1 — the build emitted a stylesheet and nothing links it.
+	match build.styles {
+		Some(let sidecar) => {
+			mut linked = false;
+			for href in stylesheets {
+				if is_local(href) && file_name_of(href) == sidecar {
+					linked = true;
+				}
+			}
+			if !linked {
+				faults.push(ShellFault::StylesNotLinked(sidecar));
+			}
+		},
+		None => {},
+	}
+
+	// F2 — a link into this leg's namespace that the build did not write.
+	for href in stylesheets {
+		if is_local(href) && leg_owns(build, file_name_of(href)) && !is_emitted_style(build, file_name_of(href)) {
+			faults.push(ShellFault::LinkedStyleMissing(href));
+		}
+	}
+
+	// F3 — the scripts: what is loaded that was not emitted, and whether the
+	// bundle is loaded at all. F6 rides on the bundle's own tag.
+	mut loads_bundle = false;
+	for script in scripts {
+		let src = attribute(script, "src");
+		if is_local(src) {
+			let file = file_name_of(src);
+			if file == build.bundle {
+				loads_bundle = true;
+				if build.classic_script && attribute(script, "type").to_lowercase_ascii() == "module" {
+					faults.push(ShellFault::ModuleScriptWithChunks(build.bundle));
+				}
+			} else if leg_owns(build, file) && !is_emitted_chunk(build, file) {
+				faults.push(ShellFault::ScriptNotEmitted(src));
+			}
+		}
+	}
+	if !loads_bundle {
+		faults.push(ShellFault::BundleNotLoaded(build.bundle));
+	}
+
+	// F4 — the mount element, the other end of `mount_root(id, …)`.
+	if !mounted {
+		faults.push(ShellFault::MountMissing(mount));
+	}
+
+	if faults.is_empty() {
+		Ok({})
+	} else {
+		Err(faults)
+	}
+}
+
+/// The HTML document a browser leg is loaded by, built from what that leg's
+/// build emitted — so the `<script>`, the `<link>` and the mount element cannot
+/// disagree with the artifacts they name.
+///
+/// A string builder, not a `View`, and that is a decision (§5.5): a document is
+/// not a reactive tree, nothing binds to it, and it is serialized once per
+/// request — while a `View`-shaped document would reopen `ssr.md` §6(a)'s
+/// ratified fragment-only process layer for no gain.
+struct Document {
+	/// The markup, supplied (`from_shell`) — and checked before this value
+	/// existed.
+	shell: str,
+}
+
+impl Document {
+	/// A hand-authored shell, CHECKED: the rung-0 escape hatch made safe — the
+	/// same `Document` value, its markup supplied rather than generated.
+	///
+	/// The mount element is `"app"`, which is what every shell in this tree
+	/// uses. A shell that mounts elsewhere calls `check_shell(shell, build,
+	/// id)` directly and serves its own string: the primitive is public
+	/// precisely so that dropping a rung never drops the check.
+	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
+		match check_shell(shell, build, default_mount) {
+			Ok(let _checked) => Ok(Document { shell = shell }),
+			Err(let faults) => Err(faults),
+		}
+	}
+
+	/// The document as markup. A `str`, not a `Response` (§5.5): the
+	/// application decides the status code, the headers, and which paths get
+	/// it. A document that knew about HTTP would have to know about routing,
+	/// and then it is a framework.
+	fun html(self): str {
+		self.shell
+	}
+}
+
+/// The shell at `path`, read and checked against `build` — or a stop naming the
+/// file, every fault and its fix. The server-boot idiom, and §10.7's "refuse to
+/// boot" doctrine spelled once.
+///
+/// It is an addition beyond §5.6's sketch, for two reasons. The language one is
+/// `require_build`'s (§12.4): `Document::from_shell(…)!` cannot be written in
+/// the `async fun main()` every server has, because `!` asserts-or-RETURNS and a
+/// void `main` has no residual to carry. The better one is the message — a
+/// `ShellFault` is about markup and cannot know where the markup came from,
+/// while the founding bug's report wants to say `src/app.html` first.
+fun require_shell(path: str, build: LegBuild): Document {
+	match Document::from_shell(fs::read_file_to_str(path), build) {
+		Ok(let document) => document,
+		Err(let faults) => panic(fault_report(path, build, faults)),
+	}
+}
+
+/// `path` does not match `build`, spelled for a person: the file, the leg, and
+/// one line per fault.
+fun fault_report(path: str, build: LegBuild, faults: List<ShellFault>): str {
+	mut report = i"{path} does not match the `{build.leg}` build:";
+	for fault in faults {
+		report = report + "\n  - " + fault.message();
+	}
+	report
+}
+
+// --- Reading the markup ---------------------------------------------------
+
+/// One tag, as the scanner found it.
+struct Tag {
+	/// The tag name, lowercased — `link`, `script`, `div`.
+	name: str,
+	/// Its attributes in source order, as `(lowercased name, raw value)`.
+	attributes: List<(str, str)>,
+	/// Where its `<` sits.
+	start: i32,
+	/// One past its `>`, i.e. where its content begins.
+	end: i32,
+}
+
+/// The value of `tag`'s `name` attribute, or `""` when it carries none. A bare
+/// attribute (`<script defer>`) has the empty value too — no check here
+/// distinguishes the two, and none should have to.
+fun attribute(tag: Tag, name: str): str {
+	for entry in tag.attributes {
+		let (attribute_name, value) = entry;
+		if attribute_name == name {
+			ret value;
+		}
+	}
+	""
+}
+
+/// Whether a `<link rel>` value names a stylesheet. The attribute is a
+/// space-separated, case-insensitive token list (`rel="stylesheet preload"` is
+/// legal), so it is read as one rather than compared whole.
+fun is_stylesheet_rel(rel: str): bool {
+	for token in rel.to_lowercase_ascii().split(" ") {
+		if token == "stylesheet" {
+			ret true;
+		}
+	}
+	false
+}
+
+/// Whether `url` addresses something this build could have emitted — i.e. not
+/// another origin. An absolute url, a protocol-relative one and a data url are
+/// all somebody else's business, and a check that guessed otherwise would
+/// refuse to boot over a font CDN.
+fun is_local(url: str): bool {
+	!url.contains("://") && !url.starts_with("//") && !url.starts_with("data:")
+}
+
+/// The file name `url` addresses: its last path segment, without the query
+/// string or fragment a cache-buster adds (`/client.js?v=2` is `client.js`,
+/// which is also how `serve_build` routes it).
+fun file_name_of(url: str): str {
+	let path = url.split("?")[0].split("#")[0];
+	let segments = path.split("/");
+	segments[segments.len() - 1]
+}
+
+/// Whether `file` is in this leg's own namespace — the `<leg>.` prefix its
+/// build writes and its last build owns (`bundle-splitting.md` Appendix A).
+/// This is the boundary of what a fault may be reported about: inside it, a
+/// file the build did not emit is this leg's stale output; outside it, the
+/// application's own.
+fun leg_owns(build: LegBuild, file: str): bool {
+	file.starts_with(build.leg + ".")
+}
+
+/// Whether `file` is the style sidecar this build emitted.
+fun is_emitted_style(build: LegBuild, file: str): bool {
+	match build.styles {
+		Some(let sidecar) => sidecar == file,
+		None => false,
+	}
+}
+
+/// Whether `file` is one of the route chunks this build emitted.
+fun is_emitted_chunk(build: LegBuild, file: str): bool {
+	for chunk in build.chunks {
+		if chunk == file {
+			ret true;
+		}
+	}
+	false
+}
+
+/// Every tag in `markup`, in document order — the whole of this module's HTML
+/// reading.
+///
+/// Not a parser: it finds tags and their attributes and skips everything else,
+/// because every question asked here is about a tag. Three details are handled
+/// rather than approximated, since each one would otherwise produce a WRONG
+/// answer instead of a coarse one: a comment is skipped whole, so a
+/// commented-out `<link>` links nothing; `<script>` and `<style>` bodies are raw
+/// text and are skipped to their closing tag, so `"<div id=\"app\">"` inside a
+/// script is not a mount element; and a quoted attribute value may contain `>`.
+fun tags_of(markup: str): List<Tag> {
+	let length = markup.len();
+	mut tags: List<Tag> = [];
+	mut index = 0;
+	for index < length {
+		if markup.substring(index, index + 1) != "<" {
+			index = index + 1;
+			jump continue;
+		}
+		if markup.substring(index, index + 4) == "<!--" {
+			index = past(index_of(markup, "-->", index + 4), 3, length);
+			jump continue;
+		}
+		let after = markup.substring(index + 1, index + 2);
+		// A doctype, a processing instruction or a closing tag: nothing to read
+		// off it, so skip to its `>`.
+		if after == "!" || after == "?" || after == "/" {
+			index = past(index_of(markup, ">", index + 1), 1, length);
+			jump continue;
+		}
+		if !is_name_start(after) {
+			// A bare `<` in text — not the start of anything.
+			index = index + 1;
+			jump continue;
+		}
+		mut cursor = index + 1;
+		for cursor < length && is_name_char(markup.substring(cursor, cursor + 1)) {
+			cursor = cursor + 1;
+		}
+		let name = markup.substring(index + 1, cursor).to_lowercase_ascii();
+		let (attributes, end) = attributes_of(markup, cursor);
+		tags.push(Tag { name = name, attributes = attributes, start = index, end = end });
+		index = if name == "script" || name == "style" {
+			skip_raw_text(markup, end, name)
+		} else {
+			end
+		};
+	}
+	tags
+}
+
+/// A found index plus `offset`, or `fallback` when the search came up empty —
+/// the "skip past this delimiter, or give up on the rest of the document" step
+/// the scanner takes four times.
+fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
+	match found {
+		Some(let at) => at + offset,
+		None => fallback,
+	}
+}
+
+/// The attributes of the tag whose name ends at `from`, and the index one past
+/// its `>`.
+fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
+	let length = markup.len();
+	mut attributes: List<(str, str)> = [];
+	mut index = from;
+	for index < length {
+		let character = markup.substring(index, index + 1);
+		if character == ">" {
+			ret (attributes, index + 1);
+		}
+		// Whitespace between attributes, and the `/` of a self-closing tag —
+		// whose `>` ends the tag on the next turn.
+		if is_space(character) || character == "/" {
+			index = index + 1;
+			jump continue;
+		}
+		mut cursor = index;
+		for cursor < length && !is_attribute_break(markup.substring(cursor, cursor + 1)) {
+			cursor = cursor + 1;
+		}
+		let name = markup.substring(index, cursor).to_lowercase_ascii();
+		index = skip_spaces(markup, cursor);
+		mut value = "";
+		if markup.substring(index, index + 1) == "=" {
+			index = skip_spaces(markup, index + 1);
+			let quote = markup.substring(index, index + 1);
+			if quote == "\"" || quote == "'" {
+				let close = past(index_of(markup, quote, index + 1), 0, length);
+				value = markup.substring(index + 1, close);
+				index = if close < length { close + 1 } else { length };
+			} else {
+				mut end = index;
+				for end < length && !is_space(markup.substring(end, end + 1)) && markup.substring(end, end + 1) != ">" {
+					end = end + 1;
+				}
+				value = markup.substring(index, end);
+				index = end;
+			}
+		}
+		attributes.push((name, value));
+	}
+	(attributes, length)
+}
+
+/// Past a raw-text element's body (`<script>`, `<style>`): its content is not
+/// markup, so the scanner resumes at its closing tag.
+fun skip_raw_text(markup: str, from: i32, name: str): i32 {
+	// Lowercased for the search only — `to_lowercase_ascii` maps ASCII in
+	// place, so the index it reports is an index into `markup` too.
+	past(index_of(markup.to_lowercase_ascii(), "</" + name, from), 0, markup.len())
+}
+
+/// The first index at or after `from` that is not whitespace.
+fun skip_spaces(markup: str, from: i32): i32 {
+	let length = markup.len();
+	mut index = from;
+	for index < length && is_space(markup.substring(index, index + 1)) {
+		index = index + 1;
+	}
+	index
+}
+
+/// The index of `needle` in `text` at or after `from`, or `None`. (`str` can
+/// answer whether it `contains` something, but not where.)
+fun index_of(text: str, needle: str, from: i32): Option<i32> {
+	let limit = text.len() - needle.len();
+	mut index = if from < 0 { 0 } else { from };
+	for index <= limit {
+		if text.substring(index, index + needle.len()) == needle {
+			ret Some(index);
+		}
+		index = index + 1;
+	}
+	None
+}
+
+/// Whether `character` can open a tag name.
+fun is_name_start(character: str): bool {
+	let lower = character.to_lowercase_ascii();
+	lower >= "a" && lower <= "z"
+}
+
+/// Whether `character` can continue a tag name (`h1`, `font-face`, `svg:use`).
+fun is_name_char(character: str): bool {
+	is_name_start(character) || (character >= "0" && character <= "9") || character == "-" || character == ":"
+}
+
+/// Whether `character` ends an attribute name.
+fun is_attribute_break(character: str): bool {
+	is_space(character) || character == "=" || character == ">" || character == "/"
+}
+
+/// Whether `character` is HTML whitespace.
+fun is_space(character: str): bool {
+	character == " " || character == "\t" || character == "\n" || character == "\r"
+}
