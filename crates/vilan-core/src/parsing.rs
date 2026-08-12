@@ -134,18 +134,12 @@ pub enum Found {
 /// so a set that mixes it with others still renders.
 const TERMINATOR_EXPECTED: &str = "';'";
 
-/// A keyword that can only begin a fresh statement or item — the token-class half
-/// of `frontend.md:137-140`'s sync points ("statement/item boundaries synchronize
-/// on `;`/`}`/item keywords"), used by [`Parser::scan_to_sync_point`].
-///
-/// Item heads (`fun`/`struct`/…, plus the `external`/`resource` modifiers that
-/// lead one) and statement heads (`let`/`mut`/`ret`/`jump`/`if`/`for`/`match`/
-/// `const`/`async`) are both here, because both are places a recovering parse can
-/// pick up cleanly. Identifiers and literals are deliberately NOT: they begin an
-/// expression statement, but they also appear all through a broken one, so
-/// stopping at them would resume mid-garbage and report again (the cascade
-/// `editing-dx.md` §9 records vilan as not having).
-fn starts_statement_or_item(token: &Token<'_>) -> bool {
+/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
+/// `resource` modifiers that lead one. An item is never part of an expression, so
+/// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
+/// is skipping (a `{` above it excepted: a block or closure body holds ordinary
+/// statements, and a nested `fun` is one of them).
+fn starts_item(token: &Token<'_>) -> bool {
     matches!(
         token,
         Token::Fun
@@ -160,16 +154,33 @@ fn starts_statement_or_item(token: &Token<'_>) -> bool {
             | Token::Macro
             | Token::External
             | Token::Resource
-            | Token::Let
-            | Token::Mut
-            | Token::Ret
-            | Token::Jump
-            | Token::If
-            | Token::For
-            | Token::Match
-            | Token::Const
-            | Token::Async
     )
+}
+
+/// A keyword that can only begin a fresh statement or item — the token-class half
+/// of `frontend.md:137-140`'s sync points ("statement/item boundaries synchronize
+/// on `;`/`}`/item keywords"), used by [`Parser::scan_to_sync_point`].
+///
+/// Item heads and statement heads (`let`/`mut`/`ret`/`jump`/`if`/`for`/`match`/
+/// `const`/`async`) are both here, because both are places a recovering parse can
+/// pick up cleanly. Identifiers and literals are deliberately NOT: they begin an
+/// expression statement, but they also appear all through a broken one, so
+/// stopping at them would resume mid-garbage and report again (the cascade
+/// `editing-dx.md` §9 records vilan as not having).
+fn starts_statement_or_item(token: &Token<'_>) -> bool {
+    starts_item(token)
+        || matches!(
+            token,
+            Token::Let
+                | Token::Mut
+                | Token::Ret
+                | Token::Jump
+                | Token::If
+                | Token::For
+                | Token::Match
+                | Token::Const
+                | Token::Async
+        )
 }
 
 /// The closing bracket that matches an opening one — for the `Unbalanced` message.
@@ -960,10 +971,24 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// file (§2.2 mechanism 3). At FILE scope there is no enclosing block, so a
     /// stray closer is consumed rather than stopped at — otherwise `}}}}` would
     /// report once per brace.
+    ///
+    /// Two of the boundaries reach INSIDE an unfinished region, because the token
+    /// they stop on cannot be part of one:
+    /// - a `;` whose innermost opener is `(` — a call's arguments and a
+    ///   parenthesized expression admit no semicolon (the constructs that do,
+    ///   `[value; length]` and a block's statements, sit under `[` or `{`), so it
+    ///   terminates a statement written BELOW the region;
+    /// - an ITEM keyword with no `{` open above it — `fun`/`struct`/`impl`/… are
+    ///   never part of a parenthesized expression, so an unclosed `(` in an item's
+    ///   own header stops eating the items below it. A `{` on the stack means a
+    ///   block or closure body, where a nested item is ordinary code, so the scan
+    ///   keeps going there. Statement heads get no such reach: `if`/`match`/`async`
+    ///   are perfectly good arguments.
     fn scan_to_sync_point(&self, start: usize, in_block: bool) -> (usize, Option<usize>) {
         let mut open: Vec<(usize, char)> = Vec::new();
         let mut index = start;
         while let Some((token, _)) = self.tokens.get(index) {
+            let outermost_open = open.first().map(|(at, _)| *at);
             if let Token::Ctrl(character) = token {
                 let character = *character;
                 if matches!(character, '(' | '[' | '{') {
@@ -978,26 +1003,27 @@ impl<'a, 'src> Parser<'a, 'src> {
                         continue;
                     }
                     if character == '}' && in_block {
-                        return (index, open.first().map(|(at, _)| *at));
+                        return (index, outermost_open);
                     }
                     index += 1;
                     continue;
                 }
-                // A `;` at statement depth ends the search. So does one directly
-                // inside an unfinished `(`: a semicolon is not grammatical there
-                // (a call's arguments and a parenthesized expression admit none —
-                // the ones that do, `[value; length]` and a block's statements,
-                // sit under `[` or `{`), so it is the terminator of a statement
-                // the user wrote BELOW the region they have not closed, and the
-                // statements past it are worth resuming for.
                 if character == ';' && open.last().is_none_or(|(_, closer)| *closer == ')') {
-                    return (index + 1, None);
+                    return (index + 1, outermost_open);
                 }
                 index += 1;
                 continue;
             }
-            if index > start && open.is_empty() && starts_statement_or_item(token) {
-                return (index, None);
+            if index > start {
+                let inside_a_block = open.iter().any(|(_, closer)| *closer == '}');
+                let stops = if open.is_empty() {
+                    starts_statement_or_item(token)
+                } else {
+                    !inside_a_block && starts_item(token)
+                };
+                if stops {
+                    return (index, outermost_open);
+                }
             }
             index += 1;
         }

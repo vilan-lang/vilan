@@ -686,6 +686,51 @@ fn a_broken_statement_keeps_the_items_below_it() {
 }
 
 #[test]
+fn an_unclosed_paren_in_an_item_header_keeps_the_items_below_it() {
+    // The reach an item keyword gets that a statement head does not: `fun broken(`
+    // never closes, so the scan would otherwise run to end of input, swallowing
+    // the whole file inside the unfinished parameter list — the file-tail blackout
+    // again, one layer up. `fun` cannot appear inside a parenthesized region
+    // (only inside a block within one, which the scan tracks), so it ends the
+    // region.
+    let source =
+        "fun broken( {\n\tprint(1);\n}\nfun below(): i32 {\n\t7\n}\nstruct After { x: i32 }\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one broken header, one diagnostic: {reported:#?}"
+    );
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"below\""),
+        "the item below survives: {tree}"
+    );
+    assert!(tree.contains("\"After\""), "and the one after it: {tree}");
+}
+
+#[test]
+fn a_nested_item_inside_an_unfinished_call_is_not_a_boundary() {
+    // The other side of that rule: a `fun` declared inside a closure body is
+    // ordinary code, so it must NOT end the region — the `{` above it says so —
+    // and neither does the `;` of a statement in that body. Stopping at either
+    // would resume mid-expression and report a second time. One unfinished call,
+    // one diagnostic, and the item after the enclosing function still parses.
+    let source = "fun main() {\n\tapply(|| {\n\t\tfun helper() {}\n\t\tlet a: i32 = 1;\n\t}\n}\nfun below(): i32 {\n\t7\n}\n";
+    let reported = diagnostics(source);
+    assert_eq!(
+        reported.len(),
+        1,
+        "one unfinished call, one diagnostic: {reported:#?}"
+    );
+    let tree = tree_of(source);
+    assert!(
+        tree.contains("\"below\""),
+        "the item after the broken one survives: {tree}"
+    );
+}
+
+#[test]
 fn a_broken_statement_in_a_nested_block_keeps_its_enclosing_body() {
     // Nested: the unclosed `(` is two blocks deep. The `}` that stops the scan is
     // the INNER block's, so the `if`'s body closes, the outer body keeps going,
