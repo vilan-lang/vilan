@@ -853,7 +853,13 @@ fn hmr_round(
                 // `dist/` bundles, exactly as `run_workspace` /
                 // `build_and_spawn_run`.
                 let script = artifact_path(Path::new("dist"), &unit.name, NODE_LEG);
-                match spawn_node(&script, args, Some(&root)) {
+                // `dev-refresh.md` §5 item 2: the dev channel's port, so the
+                // child's `std::dev::force_refresh()` (a no-op without it)
+                // knows where to POST. HEADS-UP for the merge: the serve-build
+                // lane adds `VILAN_WATCHING` at this same spawn site — union
+                // the two `envs` entries, don't pick one.
+                let envs = [("VILAN_HMR_PORT", channel.port().to_string())];
+                match spawn_node(&script, args, Some(&root), &envs) {
                     Ok(spawned) => Some(spawned),
                     Err(error) => {
                         eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -963,7 +969,7 @@ fn build_and_spawn_run(
     if run_build_hooks(&project).is_err() {
         return None;
     }
-    let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd) {
+    let launch = |script: &Path, cwd: Option<&Path>| match spawn_node(script, args, cwd, &[]) {
         Ok(child) => Some(child),
         Err(error) => {
             eprintln!("{} failed to launch `node`: {error}", paint::error_prefix());
@@ -2033,6 +2039,7 @@ fn run_workspace(
         &artifact_path(Path::new("dist"), &server.name, NODE_LEG),
         args,
         Some(root),
+        &[],
     )
     .and_then(|mut child| child.wait());
     exit_code_of(status)
@@ -2791,7 +2798,7 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let status = spawn_node(&script, args, None).and_then(|mut child| child.wait());
+    let status = spawn_node(&script, args, None, &[]).and_then(|mut child| child.wait());
     let _ = fs::remove_file(&script);
     exit_code_of(status)
 }
@@ -2806,11 +2813,23 @@ fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
 /// assigned to a kill-on-close Job object (`windows-support.md` §6) — a restart
 /// round's kill takes the program's whole process tree, and the CLI's own death
 /// reaps it. On unix the wrapper is a transparent newtype: unchanged behavior.
-fn spawn_node(script: &Path, args: &[String], cwd: Option<&Path>) -> std::io::Result<ManagedChild> {
+///
+/// `envs` are additional environment variables set on the child beyond what it
+/// inherits (`dev-refresh.md` §5 item 2's `VILAN_HMR_PORT`, the HMR watch
+/// round's own addition — every other caller passes `&[]`).
+fn spawn_node(
+    script: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    envs: &[(&str, String)],
+) -> std::io::Result<ManagedChild> {
     let mut command = std::process::Command::new("node");
     command.arg(script).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    for (key, value) in envs {
+        command.env(key, value);
     }
     command.spawn().map(ManagedChild::adopt)
 }

@@ -10,6 +10,11 @@
 //!   from `dist/`, with `Access-Control-Allow-Origin: *`. Only bare
 //!   `<name>.<ext>` names resolve; anything with a path separator or `..` is a
 //!   404 (the traversal guard).
+//! - `POST /refresh` — `std::watch::force_refresh()`'s wire target
+//!   (`dev-refresh.md` §5 item 2; §6 records it as shipped): broadcasts a
+//!   `reload` event to every connected browser and answers `204`. No body, no
+//!   auth — a localhost-only dev convenience, same trust boundary as every
+//!   other route here.
 //!
 //! The browser side is [`SHIM`], a small dev-runtime prepended to browser-leg
 //! bundles by an HMR-active `run --watch` (never by `build`, so goldens are
@@ -109,15 +114,23 @@ impl DevChannel {
     /// Frames one payload as SSE and writes it to every connected client,
     /// pruning any whose socket has closed (detected on write failure).
     fn broadcast(&self, payload: &str) {
-        let frame = sse_frame(payload);
-        let mut clients = self.clients.lock().unwrap();
-        clients.retain_mut(|stream| {
-            stream
-                .write_all(frame.as_bytes())
-                .and_then(|()| stream.flush())
-                .is_ok()
-        });
+        broadcast_to(&self.clients, payload);
     }
+}
+
+/// [`DevChannel::broadcast`]'s framing-and-fanout, factored free so the
+/// `/refresh` HTTP route in [`handle`] can reach it too: that handler only
+/// has the client registry the accept loop threads to every connection (no
+/// `&DevChannel` — the channel that owns it is on the main watch thread).
+fn broadcast_to(clients: &Arc<Mutex<Vec<TcpStream>>>, payload: &str) {
+    let frame = sse_frame(payload);
+    let mut clients = clients.lock().unwrap();
+    clients.retain_mut(|stream| {
+        stream
+            .write_all(frame.as_bytes())
+            .and_then(|()| stream.flush())
+            .is_ok()
+    });
 }
 
 /// The SSE wire framing for one payload: `data: <json>\n\n`. The payload is
@@ -191,6 +204,19 @@ fn handle(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    if method == "POST" && path == "/refresh" {
+        // `std::watch::force_refresh()`'s target (`dev-refresh.md` §5
+        // item 2): a `reload` event, one-shot, to every connected browser.
+        // The shim's never-reload doctrine (`fetchAndSwap`'s comment) is about
+        // VERSION-GAP-triggered automatic reloads looping against a stale
+        // server; this is neither automatic nor version-gap-driven — it is
+        // one explicit call, and the reloaded page's shim has nothing left to
+        // re-fire from it.
+        let payload = event_json("reload", version.load(Ordering::SeqCst), None, None);
+        broadcast_to(&clients, &payload);
+        respond_204(&mut stream);
+        return;
+    }
     if method != "GET" {
         respond_404(&mut stream);
         return;
@@ -305,6 +331,13 @@ pub fn is_safe_asset_name(name: &str, ext: &str) -> bool {
 fn respond_404(stream: &mut TcpStream) {
     let response = "HTTP/1.1 404 Not Found\r\n\
          Content-Length: 0\r\n\
+         Access-Control-Allow-Origin: *\r\n\r\n";
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// `POST /refresh`'s success response: no body to report.
+fn respond_204(stream: &mut TcpStream) {
+    let response = "HTTP/1.1 204 No Content\r\n\
          Access-Control-Allow-Origin: *\r\n\r\n";
     let _ = stream.write_all(response.as_bytes());
 }
@@ -720,6 +753,18 @@ mod tests {
         assert_eq!(
             event_json("css", 5, None, Some("client.css")),
             "{\"kind\":\"css\",\"version\":5,\"asset\":\"client.css\"}"
+        );
+    }
+
+    #[test]
+    fn a_reload_event_carries_no_message_or_asset() {
+        // force_refresh's wire shape (`dev-refresh.md` §5 item 2): a bare
+        // `{"kind":"reload","version":N}`, same as `swap` — the shim's
+        // `reload` case needs nothing more than the kind to fire a one-shot
+        // `location.reload()`.
+        assert_eq!(
+            event_json("reload", 7, None, None),
+            "{\"kind\":\"reload\",\"version\":7}"
         );
     }
 

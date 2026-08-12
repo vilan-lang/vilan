@@ -8,6 +8,10 @@ tracks the latest state.
 
 ## Unreleased
 
+**A hand-rolled server can now ask a connected browser to reload, on demand.** `std::dev::force_refresh()` (the process-layer `std::dev`, alongside the browser one) POSTs to the dev channel `run --watch` already runs, which broadcasts a one-shot reload to every connected browser. It's for the case the automatic `swap`/`css` push doesn't reach: a server that reads a file once at boot (a stylesheet, a template) and now re-reads it on request — call `force_refresh()` after the re-read and the browser picks up the fresh bytes. A no-op outside `run --watch`, so the call costs nothing left in a shipped build. See [the dev loop guide](https://vilan-lang.org/docs/guide/dev-loop.html#freshness-for-a-hand-rolled-server).
+
+---
+
 **A resource field inside a `[derive(Json)]` struct is refused, naming the field — it used to compile and fail with a generated-code error.** `resource struct Db { .. }; [derive(Json)] struct Envelope { db: Db }` compiled clean and only broke where `Envelope`'s serializer tried to call `db.to_json()` — a method a resource never gets, so the error pointed at code the derive generated and nobody wrote, and it took a resource's own field type (`Db`) to say why. `Wire` has refused a resource field this way since it shipped; `Json` never got the twin. It does now, at the same field, with the same voice: *"field `db` of `[derive(Json)]` type `Envelope` is the resource `Db`: a resource is not plain data and cannot be serialized … serialize a plain-data projection (an id, a key) instead"* — for a direct field, a field nested two structs deep, and an enum variant's payload alike. A plain-data `[derive(Json)]` type is unaffected, and a `[derive(Json)] resource struct` (the derive's own SUBJECT declared a resource) keeps its one, separate refusal from the resource's field check firing a second time on it.
 
 ---

@@ -1419,3 +1419,221 @@ fn a_css_push_heals_a_boot_time_stale_server_route() {
     }
     outcome.unwrap();
 }
+
+// --- dev-refresh.md §5 item 2: `std::dev::force_refresh()` -------------------
+
+/// A server that calls `std::dev::force_refresh()` on every request except
+/// `/shutdown` (E60: this server deliberately outlives rounds — the whole
+/// point is to answer a trigger request after round 1 — so it needs its own
+/// death, exactly the css e2e's mimic-server shape).
+fn force_refresh_server_source() -> String {
+    "import std::dev;\nimport std::http::{ Response, Server };\nimport std::print;\nimport std::process;\n\n\
+     fun main() {\n\
+     \tServer::builder()\n\
+     \t\t.port(0)\n\
+     \t\t.on_request(|request| {\n\
+     \t\t\tmatch request.path() {\n\
+     \t\t\t\t\"/shutdown\" => {\n\
+     \t\t\t\t\tprocess::exit(0);\n\
+     \t\t\t\t\tResponse::builder().body(\"\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t\t_ => {\n\
+     \t\t\t\t\tdev::force_refresh();\n\
+     \t\t\t\t\tResponse::builder().body(\"triggered\").build()\n\
+     \t\t\t\t}\n\
+     \t\t\t}\n\
+     \t\t})\n\
+     \t\t.on_start(|server| print(i\"refresh-server-up {server.port()}\"))\n\
+     \t\t.build()\n\
+     \t\t.start();\n\
+     }\n"
+        .to_string()
+}
+
+/// Waits (bounded) for this test's own boot marker (`refresh-server-up
+/// <port>`, printed by [`force_refresh_server_source`]) and returns the port
+/// it names — `wait_for_port`'s twin for the OTHER server this test runs.
+fn wait_for_refresh_server_port(lines: &mpsc::Receiver<String>, deadline: Duration) -> Option<u16> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if let Some(port) = line
+                    .strip_prefix("refresh-server-up ")
+                    .and_then(|rest| rest.trim().parse().ok())
+                {
+                    return Some(port);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    None
+}
+
+/// The pin: a server program calls `force_refresh()`, and a connected fake
+/// browser — the raw [`SseClient`] this file already has, standing in for the
+/// dev channel's real audience — receives the `reload` event over the exact
+/// wire path `dev-refresh.md` §5 item 2 describes: the watcher hands the
+/// server `VILAN_HMR_PORT` (the node-child spawn site), the app POSTs
+/// `/refresh`, and the channel broadcasts `reload`.
+///
+/// The doctrine half — `reload` fires ONCE and no `css`/`swap`/`connected`
+/// event path ever calls `location.reload()` — is `hmr_shim.js`'s
+/// `fetchAndSwap` comment, unchanged here: `css`'s never-reload is pinned by
+/// `a_css_push_heals_a_boot_time_stale_server_route` (this file) and
+/// `swap`/`connected`'s by `hmr_swap.rs`'s "heal" assertions (a stale
+/// `connected` swaps, never reloads — the exact shape `fetchAndSwap` also
+/// serves `swap` through). Both were verified non-vacuous by planting the
+/// violation the doctrine forbids (making a version-gap `connected` call
+/// `reload()` instead of swapping) and watching `hmr_swap.rs` go red, then
+/// reverting — a manual check, not a standing test, since it plants a bug in
+/// shipped code rather than in this fixture.
+#[test]
+fn force_refresh_reloads_a_connected_browser_once() {
+    let dir = temp_project("force_refresh");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+    );
+    write(&dir, "src/client.vl", &client_source("a", "x1"));
+    write(&dir, "src/server.vl", &force_refresh_server_source());
+
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", "--watch", "--hmr-port", "0", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run --watch");
+    let lines = drain_both(
+        watcher.stdout.take().unwrap(),
+        watcher.stderr.take().unwrap(),
+    );
+
+    // E60: escapes the assertion closure so cleanup runs red or green.
+    let refresh_server_port = std::cell::Cell::new(None::<u16>);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = support::WATCH_LIVENESS;
+        let dev_port = wait_for_port(&lines, deadline)
+            .expect("the CLI should announce `hmr: dev channel on 127.0.0.1:<port>`");
+        let server_port = wait_for_refresh_server_port(&lines, deadline)
+            .expect("the force-refresh server should announce `refresh-server-up <port>`");
+        refresh_server_port.set(Some(server_port));
+
+        let mut sse = SseClient::connect(dev_port);
+
+        // Trigger the server's route — it calls `force_refresh()`, which
+        // POSTs `/refresh` on the dev channel it was handed over
+        // `VILAN_HMR_PORT` at spawn.
+        let body = http_get(server_port, "/trigger");
+        assert_eq!(
+            body,
+            b"triggered".to_vec(),
+            "the server route should have run (and called force_refresh on the way)"
+        );
+
+        // The connected fake browser sees the broadcast `reload` event.
+        sse.expect_kind("reload", deadline);
+    }));
+
+    support::kill_watcher(&mut watcher);
+    // The server survives the watcher by design (E60): ask it to exit and —
+    // on the green path only, so a red run's own panic is never masked —
+    // assert it actually died.
+    if let Some(port) = refresh_server_port.get() {
+        let start = Instant::now();
+        let dead = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => break true,
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = stream.write_all(
+                        b"GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    if start.elapsed() > support::WATCH_LIVENESS {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if outcome.is_ok() {
+            assert!(
+                dead,
+                "the force-refresh server must exit on /shutdown — \
+                 an orphan here is E60's leak returning"
+            );
+        }
+    }
+    if outcome.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    outcome.unwrap();
+}
+
+/// The other half of the pin: with no watch session — a plain `vilan run`,
+/// so `VILAN_HMR_PORT` is never set — `force_refresh()` is a no-op. No dev
+/// channel exists to POST to, so the only way this could fail is by hanging
+/// or panicking; a clean exit with the program's own trailing print is the
+/// whole assertion.
+#[test]
+fn force_refresh_is_a_no_op_outside_a_watch_session() {
+    let dir = temp_project("force_refresh_noop");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        "import std::dev;\nimport std::print;\n\nfun main() {\n\tdev::force_refresh();\n\tprint(\"done\");\n}\n",
+    );
+
+    let liveness = support::run_liveness();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["run", dir.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vilan run");
+    let deadline = Instant::now() + liveness;
+    let status = loop {
+        match child.try_wait().expect("poll vilan run") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`vilan run` (no --watch, no VILAN_HMR_PORT) did not exit within {liveness:?} \
+                     — force_refresh() should be a no-op, not a hang"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "force_refresh() outside a watch session must not fail the program:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "done");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

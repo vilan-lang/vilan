@@ -2,9 +2,13 @@
 
 `std::dev` is the app-facing surface of **hot module replacement**: the
 live-update loop `vilan run --watch` runs for a full-stack project (see
-[The dev loop](../guide/dev-loop.md) for the whole picture). Browser-only,
-and every hook here is a **no-op outside a hot reload**: importing it costs
-nothing in a production build, so you can leave the calls in place.
+[The dev loop](../guide/dev-loop.md) for the whole picture). This page
+covers the browser layer's `std::dev` — every hook here is a **no-op
+outside a hot reload**, so importing it costs nothing in a production
+build. The process layer has a *different* module of the same name (the
+layer system resolves `std::dev` per platform, like `std::ui`):
+[`force_refresh()`](process.md), for a hand-rolled server that wants to
+push a browser reload.
 
 ```vilan,fragment
 fun hmr_active(): bool                       // is a hot-reload session live?

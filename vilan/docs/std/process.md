@@ -1,8 +1,8 @@
 # Process modules reference
 
 The process layer (Node/Deno/Bun builds): `std::db`, `std::http`,
-`std::fs`, `std::process`, `std::rpc_server`. Task-oriented usage:
-[Persistence and the server](../guide/persistence.md).
+`std::fs`, `std::process`, `std::rpc_server`, `std::dev`. Task-oriented
+usage: [Persistence and the server](../guide/persistence.md).
 
 ## std::db: SQLite
 
@@ -148,3 +148,41 @@ fun scan(): str                  // read a line from stdin
 
 A completed `main` ends the process; long-lived programs must hold it open
 (a listening server does; a socket-holding client needs an explicit wait).
+
+## std::dev (process)
+
+```vilan,fragment
+fun force_refresh(): void   // ask every connected browser to reload once
+```
+
+The process-layer half of the dev-mode surface (`dev-refresh.md` §5 item
+2) — the manual channel for a hand-rolled server's own freshness: re-read
+whatever changed on disk yourself, then call `force_refresh()` so every
+browser connected to the dev channel reloads once and re-pulls it.
+`force_refresh()` is a **no-op outside `vilan run --watch`** — it costs
+nothing to leave the call in a shipped build.
+
+```vilan,norun
+import std::dev;
+import std::fs;
+import std::http::{ Response, Server };
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.on_request(|request| {
+			// Re-read whatever this route serves fresh on every request,
+			// then ask the browser to pick it up.
+			let shell = fs::read_file_to_str("dist/app.html");
+			dev::force_refresh();
+			Response::builder().body(shell).build()
+		})
+		.build()
+		.start();
+}
+```
+
+This is a *different* module from the browser `std::dev`
+([documented separately](dev.md), hot-swap hooks like `on_teardown` and
+`stash`/`take`) — the same import name resolved per platform, the way
+`std::ui` already is. A build only ever sees the one for its own platform.
