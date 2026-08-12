@@ -11792,7 +11792,8 @@ fn a_correctly_named_initializer_field_gets_no_diagnostic() {
 
 // The field-COUNT mismatch is a different diagnostic entirely (it returns
 // before the per-field, closest-name-scanning loop even runs) — pinned
-// unaffected by the E58 edit.
+// unaffected by the E58 edit. Message per S4 (editing-dx.md §7.1): names
+// the struct and the missing field.
 #[test]
 fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
     assert_fails_with(
@@ -11806,7 +11807,7 @@ fn initializer_field_count_mismatch_is_unaffected_by_the_closest_name_scan() {
         	let _ = Config { entries = 5 };
         }
         "#,
-        "Expected 2 fields, but got 1 instead.",
+        "`Config` expects 2 fields, but got 1 instead: `limit` is missing.",
     );
 }
 
@@ -24146,7 +24147,9 @@ fn a_fn_typed_binding_checks_its_arguments() {
 #[test]
 fn a_fn_typed_binding_checks_its_arity() {
     // The arity check comes from the same path, so it reports the declaration's
-    // parameter count rather than silently accepting.
+    // parameter count rather than silently accepting — and (S4,
+    // editing-dx.md §6.2) names it by the DECLARATION's name, `helper`, even
+    // though the call goes through the binding `f`.
     assert_fails_with(
         r#"
         fun helper(i: i32): i32 {
@@ -24158,7 +24161,177 @@ fn a_fn_typed_binding_checks_its_arity() {
             let bad = f(1, 2);
         }
         "#,
-        "Expected 1 argument, but got 2 instead.",
+        "`helper` expects 1 argument, but got 2 instead.",
+    );
+}
+
+// --- S4: count messages name their subject (editing-dx.md §6-7) -----------
+// `Expected 2 arguments, but got 1 instead.` named neither the callee nor
+// what was missing; a struct-field count named neither the struct. Both now
+// do, and the too-few direction also names the missing parameter/field by
+// name and (for a call) its declared type — arguments and fields bind
+// positionally/by-name, so which one is missing is unambiguous. Too many
+// names the callee (P15/P16) but, for a call, not which argument is extra
+// (B4: no principled guess); a struct literal's extra field IS identifiable
+// (P18), since fields are named.
+
+// P15 — a plain function call, too few arguments.
+#[test]
+fn call_argument_count_too_few_names_the_callee_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3);
+        }
+        "#,
+        "(3)",
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+}
+
+// P15 — the same call, too many arguments: the callee is named; which
+// argument is extra is not (B4 — no principled guess).
+#[test]
+fn call_argument_count_too_many_names_only_the_callee() {
+    assert_fails_spanning(
+        r#"
+        fun distance(x: i32, y: i32): i32 {
+        	x + y
+        }
+
+        fun main() {
+        	distance(3, 4, 5);
+        }
+        "#,
+        "(3, 4, 5)",
+        "`distance` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// P16 — a method call behaves identically, naming the METHOD (not the
+// receiver or the struct).
+#[test]
+fn method_argument_count_too_few_names_the_method_and_the_missing_parameter() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1);
+        }
+        "#,
+        "(1)",
+        "`shift` expects 2 arguments, but got 1 instead: `dy: i32` is missing.",
+    );
+}
+
+#[test]
+fn method_argument_count_too_many_names_only_the_method() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+        impl Point {
+        	fun shift(self, dx: i32, dy: i32): Point {
+        		Point { x = self.x + dx, y = self.y + dy }
+        	}
+        }
+
+        fun main() {
+        	let origin: Point = Point { x = 0, y = 0 };
+        	origin.shift(1, 2, 3);
+        }
+        "#,
+        "(1, 2, 3)",
+        "`shift` expects 2 arguments, but got 3 instead.",
+    );
+}
+
+// P17 — a wrapped argument list clamps its span to the first line: a count
+// is a property of the whole list, not of how many lines the formatter
+// split it across (§13.3). Checked by byte offset, not `assert_fails_spanning`,
+// because the clamped span is not a source SUBSTRING (it ends mid-line at
+// the newline, not at a token boundary the snippet-search would find).
+#[test]
+fn call_argument_count_span_clamps_to_the_first_line_of_a_wrapped_list() {
+    let source = "
+        fun distance(x: i32, y: i32): i32 {
+        \tx + y
+        }
+
+        fun main() {
+        \tdistance(
+        \t\t3,
+        \t);
+        }
+        ";
+    let diagnostics = failure_diagnostics(source);
+    let (message, range) = diagnostics
+        .iter()
+        .find(|(message, _)| message.contains("`distance` expects 2 arguments"))
+        .expect("the arity diagnostic is published");
+    assert_eq!(
+        message,
+        "`distance` expects 2 arguments, but got 1 instead: `y: i32` is missing.",
+    );
+    let call_open_paren = source.rfind("distance(").unwrap() + "distance".len();
+    let first_line_end = source[call_open_paren..].find('\n').unwrap() + call_open_paren;
+    assert_eq!(
+        range.start, call_open_paren,
+        "starts at the argument list's `(`"
+    );
+    assert!(
+        range.end <= first_line_end,
+        "clamped to the first line: {range:?} runs past {first_line_end} into the second"
+    );
+    assert!(
+        range.end > call_open_paren,
+        "not clamped into nothing: {range:?}"
+    );
+}
+
+// P18 — a struct initializer, too few fields: names the struct and the
+// missing field; the brace region stays the anchor (the gap has no
+// narrower home).
+#[test]
+fn struct_initializer_field_count_too_few_names_the_struct_and_the_missing_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3 };
+        }
+        "#,
+        "{ x = 3 }",
+        "`Point` expects 2 fields, but got 1 instead: `y` is missing.",
+    );
+}
+
+// P18 — too many fields: unlike an extra call argument, an extra struct
+// field IS identifiable (fields are named), so this direction gets a steer
+// too, and the anchor moves to the offending field's NAME.
+#[test]
+fn struct_initializer_field_count_too_many_names_the_struct_and_spans_the_extra_field() {
+    assert_fails_spanning(
+        r#"
+        struct Point { x: i32, y: i32 }
+
+        fun main() {
+        	let origin: Point = Point { x = 3, y = 4, z = 5 };
+        }
+        "#,
+        "z",
+        "`Point` expects 2 fields, but got 3 instead: `z` is not a field of `Point`.",
     );
 }
 
@@ -47434,9 +47607,9 @@ fn b74_a_static_and_a_method_of_one_name_collide() {
     // The truth about namespaces, pinned: there is only ONE. `declarations` is
     // keyed by name alone, and the static is the declaration that dies —
     // `Bag::tag()` resolves the inherent METHOD first and then fails on arity
-    // ("Expected 1 argument, but got 0"), a report of a declaration that was
-    // never reachable by either call form. So they collide, and the error lands
-    // where the fix does.
+    // ("`tag` expects 1 argument, but got 0 instead"), a report of a
+    // declaration that was never reachable by either call form. So they
+    // collide, and the error lands where the fix does.
     assert_fails_spanning_nth(
         r#"
         struct Bag { n: i32 }

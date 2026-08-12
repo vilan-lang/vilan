@@ -23473,6 +23473,85 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// The declared name of a callable, looked up by whichever `Id` names it:
+    /// a `Function`/`ExternalFunction` id directly (a call subject), or an
+    /// expression id that RESOLVES to one (a method's `member_id`, the same
+    /// indirection `method_signature` follows). S4 (editing-dx.md §6.2/§7.1):
+    /// a count-mismatch message names its subject rather than leaving the
+    /// reader to find it.
+    fn callable_name(&self, id: Id) -> Option<&'src str> {
+        if let Some(function) = self.functions.get(&id) {
+            return Some(function.name);
+        }
+        if let Some(external) = self.external_functions.get(&id) {
+            return Some(external.name);
+        }
+        match self.expr_id_to_expr_map.get(&id)? {
+            Expr::Function(function_id) => self.functions.get(function_id).map(|f| f.name),
+            Expr::ExternalFunction(function_id) => {
+                self.external_functions.get(function_id).map(|f| f.name)
+            }
+            _ => None,
+        }
+    }
+
+    /// S4 (editing-dx.md §6.2): the call-argument-count message, naming the
+    /// callee and — for the too-few case — the first missing parameter by
+    /// name and declared type. Arguments bind positionally, so with fewer
+    /// supplied than declared, which one is missing is unambiguous; with
+    /// more supplied than declared, which one is extra is not (B4 forbids
+    /// a speculative steer), so that direction stops after the count.
+    /// `parameter_ids` is the callee's own parameter list, already stripped
+    /// of `self` for a method.
+    fn argument_count_message(
+        &self,
+        callee_name: Option<&str>,
+        parameter_ids: &[Id],
+        got: usize,
+    ) -> String {
+        let expected = parameter_ids.len();
+        let subject = callee_name.unwrap_or("this call");
+        let head = format!(
+            "`{subject}` expects {expected} {}, but got {got} instead",
+            plural(expected, "argument", "arguments")
+        );
+        if got < expected
+            && let Some(parameter) = parameter_ids
+                .get(got)
+                .and_then(|id| self.parameters.get(id))
+        {
+            let parameter_type =
+                self.pretty_print_type(&parameter.type_id.get_type(self), &HashMap::default());
+            return format!(
+                "{head}: `{}: {}` is missing.",
+                parameter.name, parameter_type
+            );
+        }
+        format!("{head}.")
+    }
+
+    /// Clamps `span` to its first line — for a count mismatch, where a
+    /// multi-line rectangle over a wrapped argument list is not more
+    /// informative than its first line, and is considerably more disruptive
+    /// (editing-dx.md §6.2, §13.3: filed as an arity-only clamp, not the
+    /// general multi-line-span policy §13.3 raises separately). `id` is any
+    /// entity from the same source as `span`, used only to find its text.
+    fn clamp_span_to_first_line(&self, span: Span, id: Id) -> Span {
+        let Some(source) = self
+            .source_of_id(id)
+            .and_then(|source| self.source_text(source))
+        else {
+            return span;
+        };
+        match source[span.into_range()].find('\n') {
+            Some(offset) => Span {
+                start: span.start,
+                end: span.start + offset,
+            },
+            None => span,
+        }
+    }
+
     fn wire_call(
         &mut self,
         call_id: Id,
@@ -23822,9 +23901,9 @@ impl<'src> Analyzer<'src> {
                     return Resolution::Resolved;
                 }
                 let function_data = match &target {
-                    Expr::Function(function_id) | Expr::ExternalFunction(function_id) => {
-                        self.callable_signature(*function_id)
-                    }
+                    Expr::Function(function_id) | Expr::ExternalFunction(function_id) => self
+                        .callable_signature(*function_id)
+                        .map(|(parameters, generics)| (*function_id, parameters, generics)),
                     // A binding that HOLDS a function (`let f = helper; f(1)` —
                     // B75). The target is the binding, not the declaration, so
                     // the arm above finds nothing; the subject's TYPE names the
@@ -23853,12 +23932,15 @@ impl<'src> Analyzer<'src> {
                             if self.coercible_function_signature(*function_id).is_some() =>
                         {
                             self.callable_signature(*function_id)
+                                .map(|(parameters, generics)| (*function_id, parameters, generics))
                         }
                         _ => None,
                     },
                 };
 
-                if let Some((parameters, generic_parameter_constraint_ids)) = function_data {
+                if let Some((function_id, parameters, generic_parameter_constraint_ids)) =
+                    function_data
+                {
                     // `...` is a call convention over an ordinary tuple
                     // parameter: collect the pack here and the rest of this
                     // function — and every pass after it — sees the tuple form.
@@ -23878,12 +23960,11 @@ impl<'src> Analyzer<'src> {
                     if argument_ids.len() != parameters.len() {
                         self.diagnostics.push(Error {
                             note: None,
-                            span: arguments_span,
-                            msg: format!(
-                                "Expected {} {}, but got {} instead.",
-                                parameters.len(),
-                                plural(parameters.len(), "argument", "arguments"),
-                                argument_ids.len()
+                            span: self.clamp_span_to_first_line(arguments_span, call_id),
+                            msg: self.argument_count_message(
+                                self.callable_name(function_id),
+                                &parameters,
+                                argument_ids.len(),
                             ),
                         });
                         return Resolution::Failed;
@@ -24718,14 +24799,16 @@ impl<'src> Analyzer<'src> {
             .unwrap_or_default();
         let expected = parameter_ids.len().saturating_sub(1);
         if argument_ids.len() != expected {
+            // `self` is parameter 0 — the arguments a caller writes line up
+            // with parameters 1.. only.
+            let argument_parameter_ids = parameter_ids.get(1..).unwrap_or(&[]);
             self.diagnostics.push(Error {
                 note: None,
-                span: arguments_span,
-                msg: format!(
-                    "Expected {} {}, but got {} instead.",
-                    expected,
-                    plural(expected, "argument", "arguments"),
-                    argument_ids.len()
+                span: self.clamp_span_to_first_line(arguments_span, call_id),
+                msg: self.argument_count_message(
+                    self.callable_name(member_id),
+                    argument_parameter_ids,
+                    argument_ids.len(),
                 ),
             });
             return Resolution::Failed;
@@ -26666,6 +26749,53 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
+    /// S4 (editing-dx.md §7.1): the struct-initializer field-count message,
+    /// naming the struct and — per direction — the field responsible.
+    /// Missing: the struct's declared fields the literal never supplied,
+    /// named by set difference; the brace region stays the anchor (the gap
+    /// has no narrower home). Extra: unlike an extra call argument, an
+    /// extra struct field IS identifiable — struct fields are named — so
+    /// this direction gets a steer too, and the diagnostic re-anchors at the
+    /// offending field's NAME span (E58's `field_name_span`, reused). A
+    /// count wrong only through a duplicate of a REAL field name (every
+    /// supplied name matches a declared field) has no single offending
+    /// field to point at, and falls back to the bare count.
+    fn struct_field_count_message(
+        &self,
+        struct_name: &'src str,
+        struct_fields: &[Field<'src>],
+        fields: &[(&'src str, Id, Span, Span)],
+        fields_span: Span,
+    ) -> (String, Span) {
+        let expected = struct_fields.len();
+        let got = fields.len();
+        let head = format!(
+            "`{struct_name}` expects {expected} {}, but got {got} instead",
+            plural(expected, "field", "fields")
+        );
+        if got < expected
+            && let Some(missing_field) = struct_fields
+                .iter()
+                .find(|field| !fields.iter().any(|(name, ..)| *name == field.name))
+        {
+            return (
+                format!("{head}: `{}` is missing.", missing_field.name),
+                fields_span,
+            );
+        }
+        if got > expected
+            && let Some((name, _, _, name_span)) = fields
+                .iter()
+                .find(|(name, ..)| !struct_fields.iter().any(|field| field.name == *name))
+        {
+            return (
+                format!("{head}: `{name}` is not a field of `{struct_name}`."),
+                *name_span,
+            );
+        }
+        (format!("{head}."), fields_span)
+    }
+
     /// `Struct { field = value, .. }`: resolve the struct by name (lexically),
     /// check field count, infer each value against its declared field type
     /// (binding the struct's type arguments), and record the initializer. Defers
@@ -26725,15 +26855,16 @@ impl<'src> Analyzer<'src> {
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
         if constraint.fields.len() != struct_fields.len() {
+            let (msg, span) = self.struct_field_count_message(
+                constraint.struct_name,
+                &struct_fields,
+                &constraint.fields,
+                constraint.fields_span,
+            );
             self.diagnostics.push(Error {
                 note: None,
-                span: constraint.fields_span.clone(),
-                msg: format!(
-                    "Expected {} {}, but got {} instead.",
-                    struct_fields.len(),
-                    plural(struct_fields.len(), "field", "fields"),
-                    constraint.fields.len()
-                ),
+                span,
+                msg,
             });
             return Resolution::Failed;
         }
